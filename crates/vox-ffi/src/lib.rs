@@ -129,14 +129,16 @@ fn outcome(_what: &str, out: Outcome) -> Result<(), VoxError> {
     }
 }
 
+/// Internal room, entry and cursor IDs retain their canonical wire grammar.
 fn digest(text: &str, what: &'static str) -> Result<Digest32, VoxError> {
-    if what == "fingerprint" {
-        vox_core::node::link::copied_identity(text)
-            .map(|(fp, _)| fp)
-            .map_err(|e| failed(e.to_string()))
-    } else {
-        b32_decode(text.trim(), what).map_err(|e| failed(e.to_string()))
-    }
+    b32_decode(text.trim(), what).map_err(|e| failed(e.to_string()))
+}
+
+/// Fingerprint arguments share the CLI's person-input parser, including copied identities.
+fn input_fingerprint(text: &str) -> Result<Digest32, VoxError> {
+    vox_core::node::link::copied_identity(text)
+        .map(|(fp, _)| fp)
+        .map_err(|e| failed(e.to_string()))
 }
 
 /// A node's fingerprint as a person reads it (ADR-028 K-1, L-9): what the app draws wherever it
@@ -594,7 +596,7 @@ impl VoxNode {
         name: String,
         passphrase: Option<String>,
     ) -> Result<(), VoxError> {
-        let fingerprint = digest(&fingerprint, "fingerprint")?;
+        let fingerprint = input_fingerprint(&fingerprint)?;
         self.keyring_change(
             "trusting",
             NodeCommand::Trust {
@@ -616,7 +618,7 @@ impl VoxNode {
         fingerprint: String,
         passphrase: Option<String>,
     ) -> Result<(), VoxError> {
-        let fingerprint = digest(&fingerprint, "fingerprint")?;
+        let fingerprint = input_fingerprint(&fingerprint)?;
         self.keyring_change(
             "removing from the keyring",
             NodeCommand::Untrust { fingerprint },
@@ -659,7 +661,7 @@ impl VoxNode {
         labels: Vec<String>,
         datagrams: bool,
     ) -> Result<Arc<AppStream>, VoxError> {
-        let (room, peer) = (digest(&room, "room id")?, digest(&peer, "fingerprint")?);
+        let (room, peer) = (digest(&room, "room id")?, input_fingerprint(&peer)?);
         let hub = Arc::clone(self.node.app());
         let stream = self
             .on_node(async move {

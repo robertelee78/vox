@@ -27,7 +27,7 @@ use vox_core::node::link::b32_encode;
 use vox_core::node::paths::Paths;
 
 use crate::app::AppError;
-use crate::tunnel_cli::resolve_prefix;
+use crate::tunnel_cli::{resolve_fingerprint, resolve_prefix};
 
 async fn client(paths: &Paths) -> Result<IpcClient, AppError> {
     crate::client::open(&crate::client::one_shot(paths)?).await
@@ -49,7 +49,7 @@ async fn room(c: &mut IpcClient, prefix: &str) -> Result<Digest32, AppError> {
 /// Resolve a member prefix against the room's roster.
 async fn member(c: &mut IpcClient, room: Digest32, prefix: &str) -> Result<Digest32, AppError> {
     match c.request(&Request::Roster { channel_id: room }).await {
-        Ok(Frame::Members { members }) => resolve_prefix(prefix, &members),
+        Ok(Frame::Members { members }) => resolve_fingerprint(prefix, &members),
         Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
         Ok(other) => Err(crate::client::unexpected(&other)),
         Err(e) => Err(AppError::Usage(e.to_string())),

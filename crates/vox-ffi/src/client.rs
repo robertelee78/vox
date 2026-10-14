@@ -30,7 +30,7 @@ use vox_core::node::paths::Account;
 use vox_core::node::resolver::ShareState;
 use zeroize::Zeroizing;
 
-use crate::{digest, failed, VoxError};
+use crate::{digest, failed, input_fingerprint, VoxError};
 
 /// A passphrase, held by Rust in a buffer that is wiped when it is dropped or [`Passphrase::wipe`]d.
 ///
@@ -1181,7 +1181,7 @@ fn addressed(to: &[String]) -> Result<Addressed, VoxError> {
     let mut sessions = Vec::new();
     for t in to {
         let (node, session) = vox_agentcomms::envelope::addressee(t.trim());
-        let fp = digest(node, "addressee's fingerprint")?;
+        let fp = input_fingerprint(node)?;
         match session {
             Some(id) => {
                 sessions.push((fp, id.to_owned()));
@@ -1927,7 +1927,7 @@ fn pinned_anchor_set(
         if anchor.addresses.len() > MAX_ENDPOINTS {
             return Err(failed("an anchor has more than 8 endpoints"));
         }
-        let id = digest(&anchor.fingerprint, "anchor fingerprint")?;
+        let id = input_fingerprint(&anchor.fingerprint)?;
         let mut endpoints = Vec::new();
         for text in anchor.addresses {
             let address = Multiaddr::parse(&text)
@@ -2118,7 +2118,7 @@ impl VoxClient {
     ) -> Result<FfiSessionRead, VoxError> {
         use vox_core::node::session_view::{read, OPENING_NOT_RECEIVED};
         let channel_id = digest(&room, "room id")?;
-        let node = digest(&node, "node's fingerprint")?;
+        let node = input_fingerprint(&node)?;
         let (mut page, actor) = on_held!(self, |c| {
             let actor = c.me().ok_or_else(not_attached)?;
             let (sessions, _) = exact_session(c, channel_id, node, &session_id).await?;
@@ -2601,7 +2601,7 @@ impl VoxClient {
     /// Remove only the manual source; a room's independent source remains visible.
     pub async fn remove_anchor(&self, fingerprint: String) -> Result<Vec<AnchorSummary>, VoxError> {
         self.anchor_request(DaemonRequest::AnchorRemove {
-            fingerprint: digest(&fingerprint, "anchor fingerprint")?,
+            fingerprint: input_fingerprint(&fingerprint)?,
         })
         .await
     }
@@ -2936,7 +2936,7 @@ impl VoxClient {
             return Err(failed("A held room window may name at most 128 messages."));
         }
         let channel_id = digest(&room, "room id")?;
-        let actor = digest(&node, "fingerprint")?;
+        let actor = input_fingerprint(&node)?;
         let instance: [u8; 16] = instance
             .try_into()
             .map_err(|_| failed("The saved room identity must contain exactly 16 bytes."))?;
@@ -3275,7 +3275,7 @@ impl VoxClient {
         let root = digest(&root, "thread root")?;
         let after_author = after_author
             .as_deref()
-            .map(|fp| digest(fp, "fingerprint"))
+            .map(|fp| digest(fp, "author cursor"))
             .transpose()?;
         on_held!(self, |c| {
             let names = names(c).await?;
@@ -3479,7 +3479,7 @@ impl VoxClient {
         anchors: Vec<RoomAnchorEndpoint>,
         node: String,
     ) -> Result<RoomLinkPreview, VoxError> {
-        let expected = digest(&node, "creating node")?;
+        let expected = input_fingerprint(&node)?;
         let anchors = pinned_anchor_set(anchors)?;
         on_held!(self, |c| {
             if c.me() != Some(expected) {
@@ -3536,7 +3536,7 @@ impl VoxClient {
         anchors: Vec<RoomAnchorEndpoint>,
         node: String,
     ) -> Result<String, VoxError> {
-        let expected = digest(&node, "creating node")?;
+        let expected = input_fingerprint(&node)?;
         let anchors = pinned_anchor_set(anchors)?;
         on_held!(self, |c| {
             if c.me() != Some(expected) {
@@ -3687,7 +3687,7 @@ impl VoxClient {
     pub async fn is_admin(&self, room: String, member: String) -> Result<bool, VoxError> {
         use vox_core::node::api::{GovernancePage, GovernanceQuery};
         let channel_id = digest(&room, "room id")?;
-        let target = digest(&member, "member fingerprint")?;
+        let target = input_fingerprint(&member)?;
         on_held!(self, |c| match ask(
             c,
             &Request::GovernancePage {
@@ -3859,7 +3859,7 @@ impl VoxClient {
         fingerprint: String,
     ) -> Result<(), VoxError> {
         let channel_id = digest(&room, "room id")?;
-        let remove = Some(digest(&fingerprint, "anchor fingerprint")?);
+        let remove = Some(input_fingerprint(&fingerprint)?);
         on_held!(self, |c| done(
             c,
             &Request::ChangeRoomAnchors {
@@ -3883,7 +3883,7 @@ impl VoxClient {
     ) -> Result<(), VoxError> {
         let req = Request::SetAdmin {
             channel_id: digest(&room, "room id")?,
-            member: digest(&member, "member's fingerprint")?,
+            member: input_fingerprint(&member)?,
             admin,
         };
         on_held!(self, |c| done(c, &req).await)
@@ -3891,7 +3891,7 @@ impl VoxClient {
 
     /// A remote name authenticated by this node's current connection, or missing-name fallback.
     pub async fn presented_name(&self, fingerprint: String) -> Result<Option<String>, VoxError> {
-        let target = digest(&fingerprint, "fingerprint")?;
+        let target = input_fingerprint(&fingerprint)?;
         on_held!(
             self,
             |c| match ask(c, &Request::Presentation { target }).await? {
@@ -3966,7 +3966,7 @@ impl VoxClient {
         &self,
         fingerprint: String,
     ) -> Result<IndividualTrustEligibility, VoxError> {
-        let member = digest(&fingerprint, "node fingerprint")?;
+        let member = input_fingerprint(&fingerprint)?;
         on_held!(self, |c| {
             match ask(c, &Request::IndividualTrustEligibility { member }).await? {
                 Frame::IndividualTrustEligibility { can_manage, reason } => {
@@ -4097,7 +4097,7 @@ impl VoxClient {
     /// A malformed fingerprint, or the node's refusal.
     pub async fn dismiss_offer(&self, fingerprint: String) -> Result<(), VoxError> {
         let req = Request::DismissOffer {
-            member: digest(&fingerprint, "fingerprint")?,
+            member: input_fingerprint(&fingerprint)?,
         };
         on_held!(self, |c| done(c, &req).await)
     }
@@ -4113,7 +4113,7 @@ impl VoxClient {
         identity_passphrase: Option<Arc<Passphrase>>,
     ) -> Result<(), VoxError> {
         let req = Request::Rename {
-            target: digest(&fingerprint, "fingerprint")?,
+            target: input_fingerprint(&fingerprint)?,
             petname: name,
             identity_passphrase: copy_of(identity_passphrase.as_ref()),
         };
@@ -4132,7 +4132,7 @@ impl VoxClient {
         identity_passphrase: Option<Arc<Passphrase>>,
     ) -> Result<(), VoxError> {
         let req = Request::SetCapability {
-            target: digest(&fingerprint, "fingerprint")?,
+            target: input_fingerprint(&fingerprint)?,
             drive,
             identity_passphrase: copy_of(identity_passphrase.as_ref()),
         };
@@ -4149,7 +4149,7 @@ impl VoxClient {
         identity_passphrase: Option<Arc<Passphrase>>,
     ) -> Result<(), VoxError> {
         let req = Request::Untrust {
-            target: digest(&fingerprint, "fingerprint")?,
+            target: input_fingerprint(&fingerprint)?,
             identity_passphrase: copy_of(identity_passphrase.as_ref()),
         };
         on_held!(self, |c| done(c, &req).await)
@@ -4712,7 +4712,7 @@ impl VoxClient {
         session_id: String,
     ) -> Result<Option<FfiSession>, VoxError> {
         let room = digest(&room, "room id")?;
-        let node = digest(&node, "node fingerprint")?;
+        let node = input_fingerprint(&node)?;
         on_held!(self, |c| {
             let (sessions, summaries) = exact_session(c, room, node, &session_id).await?;
             let known = Known::of(c).await?;
@@ -4784,7 +4784,7 @@ impl VoxClient {
             ));
         }
         let channel_id = digest(&room, "room id")?;
-        let node = digest(&node, "node's fingerprint")?;
+        let node = input_fingerprint(&node)?;
         let expected: [u8; 16] = instance
             .try_into()
             .map_err(|_| failed("invalid saved room instance"))?;
@@ -4873,7 +4873,7 @@ impl VoxClient {
     ) -> Result<FfiSessionRead, VoxError> {
         use vox_core::node::{drive::SessionFilter, session_view::read};
         let channel_id = digest(&room, "room id")?;
-        let node = digest(&node, "node's fingerprint")?;
+        let node = input_fingerprint(&node)?;
         let before = before
             .as_deref()
             .map(|id| digest(id, "entry"))
@@ -4943,7 +4943,7 @@ impl VoxClient {
     ) -> Result<DriveAnswer, VoxError> {
         use vox_agentcomms::drive::{Action, Request as Drive};
         let channel_id = digest(&room, "room id")?;
-        let node = digest(&node, "Session node fingerprint")?;
+        let node = input_fingerprint(&node)?;
         // A file is served before it is said: its share is started once the Session's node is
         // known, below.
         let mut file = None;
@@ -5525,7 +5525,7 @@ impl VoxClient {
     /// # Errors
     /// A malformed id, the room not open here, or the daemon's refusal.
     pub async fn join_said(&self, room: String, member: String) -> Result<String, VoxError> {
-        let who = digest(&member, "member fingerprint")?;
+        let who = input_fingerprint(&member)?;
         let (open, names) = self.open_snap(&room).await?;
         let Some(open) = open else {
             return Err(failed("the room is not open on this node"));
@@ -5796,7 +5796,7 @@ impl VoxClient {
             return Err(failed("A held room window may mark at most 128 messages."));
         }
         let channel_id = digest(&room, "room id")?;
-        let actor = digest(&node, "fingerprint")?;
+        let actor = input_fingerprint(&node)?;
         let instance: [u8; 16] = instance
             .try_into()
             .map_err(|_| failed("The saved room identity must contain exactly 16 bytes."))?;
@@ -5827,7 +5827,7 @@ impl VoxClient {
     /// Cursor, authority and durable-mark failures abort without claiming whole-room success.
     pub async fn mark_room_read(&self, room: String, node: String) -> Result<u64, VoxError> {
         let channel_id = digest(&room, "room id")?;
-        let actor = digest(&node, "fingerprint")?;
+        let actor = input_fingerprint(&node)?;
         on_held!(self, |c| {
             if c.me() != Some(actor) {
                 return Err(failed(

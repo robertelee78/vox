@@ -1161,14 +1161,7 @@ final class NodeModel: ObservableObject {
     }
 
     func identityInput(_ text: String) -> CopiedIdentity? {
-        let raw = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        if raw.hasSuffix(">"), let start = raw.range(of: " <", options: .backwards) {
-            let name = String(raw[..<start.lowerBound])
-            let tail = raw[start.upperBound...].dropLast()
-            let fp = tail.filter { !$0.isWhitespace && $0 != "-" && $0 != "·" }.lowercased()
-            return try? parseCopiedIdentity(text: "\(name) <\(fp)>")
-        }
-        return try? parseCopiedIdentity(text: raw.filter { !$0.isWhitespace && $0 != "-" && $0 != "·" }.lowercased())
+        try? parseCopiedIdentity(text: text)
     }
 
     func presentedName(_ fingerprint: String) async -> String? {
