@@ -179,6 +179,27 @@ pub struct RoomAnchorAuthority {
     pub can_manage: bool,
 }
 
+/// An anchor and the addresses named by this room's own signed configuration.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct RoomAnchorEndpoint {
+    /// Full anchor identity.
+    pub fingerprint: String,
+    /// Only the addresses recorded for this anchor in the selected room.
+    pub addresses: Vec<String>,
+}
+
+/// The held node's current observation of one room's signed anchor configuration.
+/// Identity-level reach observations are separate and do not prove these addresses were dialed.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct RoomAnchorConfiguration {
+    /// Full room identity that was queried.
+    pub room: String,
+    /// Full identity of the held actor that answered.
+    pub node: String,
+    /// The room's anchors only; machine and other-room sources are excluded.
+    pub anchors: Vec<RoomAnchorEndpoint>,
+}
+
 /// A room the acting node holds.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct RoomSummary {
@@ -3035,6 +3056,42 @@ impl VoxClient {
                     room: b32_encode(&channel_id),
                     node: b32_encode(&me),
                     can_manage: members.contains(&me),
+                }),
+                other => Err(unexpected(&other)),
+            }
+        })
+    }
+
+    /// Read only this room's signed anchor configuration, preserving each address's scope.
+    /// A caller must fence room/node changes before publishing this snapshot, just as it does
+    /// for room_anchor_authority. The daemon refuses stale or unavailable observations.
+    ///
+    /// # Errors
+    /// A malformed room, no held actor, a closed room, or unavailable room provenance.
+    pub async fn room_anchor_configuration(
+        &self,
+        room: String,
+    ) -> Result<RoomAnchorConfiguration, VoxError> {
+        let channel_id = digest(&room, "room id")?;
+        on_held!(self, |c| {
+            let me = c.me().ok_or_else(not_attached)?;
+            match ask(c, &Request::RoomAnchors { channel_id }).await? {
+                Frame::RoomAnchors { anchors } => Ok(RoomAnchorConfiguration {
+                    room: b32_encode(&channel_id),
+                    node: b32_encode(&me),
+                    anchors: anchors
+                        .nodes()
+                        .iter()
+                        .map(|anchor| RoomAnchorEndpoint {
+                            fingerprint: b32_encode(&anchor.id),
+                            addresses: anchor
+                                .endpoints
+                                .addrs()
+                                .iter()
+                                .map(ToString::to_string)
+                                .collect(),
+                        })
+                        .collect(),
                 }),
                 other => Err(unexpected(&other)),
             }
