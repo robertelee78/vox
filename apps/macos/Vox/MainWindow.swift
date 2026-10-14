@@ -2328,26 +2328,33 @@ private struct ServiceCard: View {
     }
 }
 
-/// The room's Sessions (ADR-029 CL-2), then its members and their trust (L-4).
+/// The right panel shows the room's members; an open thread replaces it (ADR-033 LY-6).
 private struct Inspector: View {
     @ObservedObject var model: NodeModel
     let room: String
 
     var body: some View {
-        // It scrolls (P13): a room with many Sessions or members cut off the bottom, the family
-        // LAN section with it. Each section's heading stays in view while its rows scroll.
+        // The roster scrolls under its pinned heading, including in a short window (P13).
         ScrollView {
             LazyVStack(alignment: .leading, spacing: Space.s8, pinnedViews: [.sectionHeaders]) {
                 Section {
-                    SessionsList(model: model, heading: false)
-                } header: {
-                    heading("SESSIONS")
-                }
-                Section {
+                    VStack(alignment: .leading, spacing: Space.s4) {
+                        Text("\(model.node) (you)").fontWeight(.bold)
+                            .accessibilityIdentifier("member-self")
+                        role(model.me)
+                    }
+                    if let problem = model.memberRolesError {
+                        Text(problem).secondaryText().fixedSize(horizontal: false, vertical: true)
+                            .accessibilityIdentifier("member-roles-unavailable")
+                    }
                     ForEach(model.members) { member in
                         TrustMark(name: member.name, trust: member.trust)
                             .nodeCard(model, member.id, name: member.name)
                             .accessibilityIdentifier("member-\(member.name)")
+                        role(member.id)
+                        Text(member.trust.sentence(member.name)).caption().secondaryText()
+                            .fixedSize(horizontal: false, vertical: true)
+                            .accessibilityIdentifier("member-trust-directions-" + member.id)
                         MemberTrustActions(model: model, fingerprint: member.id, name: member.name, room: room)
                         // What this node's keyring grants it (K-14), once it is in the keyring.
                         if member.trust.inKeyring {
@@ -2380,15 +2387,8 @@ private struct Inspector: View {
                             .accessibilityIdentifier("member-platform-\(member.name)")
                         }
                     }
-                    Hairline().padding(.vertical, Space.s8)
-                    FamilyLan(model: model, room: room)
                 } header: {
                     heading("MEMBERS")
-                }
-                Section {
-                    RoomAnchorsView(model: model, room: room)
-                } header: {
-                    heading("ANCHORS")
                 }
             }
             .padding(Space.s12)
@@ -2397,6 +2397,26 @@ private struct Inspector: View {
         // A container, so each row keeps its own identifier (member-<name>) under this one.
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("inspector")
+        .task(id: model.me + "/" + room + "/" + (model.ended ?? "")) {
+            while !Task.isCancelled, model.roomOnScreen == room, model.ended == nil {
+                await model.loadMemberRoles(room)
+                do { try await Task.sleep(for: .seconds(2)) }
+                catch { return }
+            }
+        }
+    }
+
+    @ViewBuilder private func role(_ fingerprint: String) -> some View {
+        if let role = model.memberRoles[fingerprint] {
+            if role != .member {
+                Text(role.rawValue).eyebrow().secondaryText()
+                    .accessibilityIdentifier("member-role-" + fingerprint)
+            }
+        } else {
+            Text(model.memberRolesLoading ? "Checking room role…" : "Room role unavailable")
+                .caption().secondaryText()
+                .accessibilityIdentifier("member-role-" + fingerprint)
+        }
     }
 
     /// A section's heading, pinned while its rows scroll under it: drawn on the inspector's own
@@ -2416,28 +2436,6 @@ enum Platform {
     static func words(_ p: NodePlatform) -> String {
         let os = [p.os, p.osVersion].filter { !$0.isEmpty }.joined(separator: " ")
         return p.arch.isEmpty ? os : "\(os) (\(p.arch))"
-    }
-}
-
-/// The room's family LAN status (ADR-013). Controls live in the Room menu (ADR-033 LY-7).
-private struct FamilyLan: View {
-    @ObservedObject var model: NodeModel
-    let room: String
-
-    var body: some View {
-        Text("FAMILY LAN").eyebrow().secondaryText()
-            .accessibilityAddTraits(.isHeader)
-        Text(model.lanOn.contains(room) ? "On" : "Off")
-            .accessibilityIdentifier("family-lan-status")
-        if let said = model.lanSaid[room] {
-            Text(said).font(Theme.text).secondaryText().textSelection(.enabled)
-                .accessibilityIdentifier("family-lan-said")
-        }
-        if let failed = model.lanFailed[room] {
-            StateMark(kind: .danger, words: failed).textSelection(.enabled)
-                .accessibilityIdentifier("family-lan-failed")
-        }
-
     }
 }
 
