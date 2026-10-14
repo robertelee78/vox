@@ -276,7 +276,49 @@ pub fn recorded(paths: &Paths) -> impl Iterator<Item = Pulled> + use<> {
 
 /// Every pull this node has recorded, with the file that records it.
 fn records(paths: &Paths) -> impl Iterator<Item = (PathBuf, Pulled)> + use<> {
-    records_in(&paths.pulls_dir())
+    records_in(&paths.pulls_dir()).chain(
+        std::fs::read_dir(paths.pulls_dir().join("records"))
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .flat_map(|entry| records_in(&entry.path())),
+    )
+}
+
+fn entry_receipts(paths: &Paths, entry: &Digest32) -> PathBuf {
+    paths.pulls_dir().join("records").join(b32_encode(entry))
+}
+
+/// Keep the existing receipt until its exact replacement directory entry is durable. If a
+/// previous attempt stopped after linking it, only that same file may complete the move.
+fn move_legacy_receipt(paths: &Paths, file: &Path, entry: &Digest32) -> Result<(), String> {
+    let group = entry_receipts(paths, entry);
+    let to = group.join(file.file_name().ok_or("receipt has no name")?);
+    crate::node::paths::create_private_dir(&group).map_err(|e| e.to_string())?;
+    crate::node::paths::sync_dir(&group).map_err(|e| e.to_string())?;
+    if let Some(parent) = group.parent() {
+        crate::node::paths::sync_dir(parent).map_err(|e| e.to_string())?;
+    }
+    if let Err(error) = std::fs::hard_link(file, &to) {
+        #[cfg(unix)]
+        let same = {
+            use std::os::unix::fs::MetadataExt as _;
+            std::fs::metadata(file)
+                .ok()
+                .zip(std::fs::metadata(&to).ok())
+                .is_some_and(|(a, b)| a.dev() == b.dev() && a.ino() == b.ino())
+        };
+        #[cfg(not(unix))]
+        let same = false;
+        if error.kind() != std::io::ErrorKind::AlreadyExists || !same {
+            return Err(error.to_string());
+        }
+    }
+    crate::node::paths::sync_dir(&to).map_err(|e| e.to_string())?;
+    std::fs::remove_file(file).map_err(|e| e.to_string())?;
+    crate::node::paths::sync_dir(file).map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_file(receipt_index(paths, entry));
+    Ok(())
 }
 
 /// Where a folder pull under way is recorded until it completes: so one cut short is resumed in
@@ -328,9 +370,20 @@ fn records_in(dir: &Path) -> impl Iterator<Item = (PathBuf, Pulled)> + use<> {
 }
 
 fn read_record(path: &Path) -> Option<Pulled> {
-    let v =
-        serde_json::from_reader::<_, serde_json::Value>(std::fs::File::open(path).ok()?).ok()?;
-    Pulled::from_json(&v)
+    read_record_checked(path).ok().flatten()
+}
+
+fn read_record_checked(path: &Path) -> Result<Option<Pulled>, String> {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    let value = serde_json::from_reader::<_, serde_json::Value>(file)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    Pulled::from_json(&value)
+        .map(Some)
+        .ok_or_else(|| format!("{}: invalid pull receipt", path.display()))
 }
 
 fn receipt_index(paths: &Paths, entry: &Digest32) -> PathBuf {
@@ -361,6 +414,11 @@ fn index_record(paths: &Paths, file: &Path, entry: &Digest32) {
 /// streaming fallback upgrades the derived pointer for receipts written by an earlier build.
 #[must_use]
 pub fn recorded_entry(paths: &Paths, entry: &Digest32) -> Option<Pulled> {
+    if let Some((_, pulled)) =
+        records_in(&entry_receipts(paths, entry)).find(|(_, pulled)| pulled.entry == *entry)
+    {
+        return Some(pulled);
+    }
     let prefix = format!("{}.", b32_encode(entry));
     if let Ok(name) = std::fs::read_to_string(receipt_index(paths, entry)) {
         let name = Path::new(&name);
@@ -404,7 +462,10 @@ pub fn recorded_entry(paths: &Paths, entry: &Digest32) -> Option<Pulled> {
 pub fn record(paths: &Paths, pulled: &Pulled) -> Result<(), String> {
     let mut nonce = [0u8; 8];
     getrandom::fill(&mut nonce).map_err(|e| format!("no randomness for the record: {e}"))?;
-    let dir = paths.pulls_dir();
+    // The authoritative receipts themselves are addressed by entry. A not-yet-pulled offer
+    // therefore costs an exact directory lookup, not a walk over every completed transfer.
+    // The flat earlier layout remains readable and is moved incrementally by the sweeper.
+    let dir = entry_receipts(paths, &pulled.entry);
     let file = dir.join(format!(
         "{}.{}.json",
         b32_encode(&pulled.entry),
@@ -412,10 +473,13 @@ pub fn record(paths: &Paths, pulled: &Pulled) -> Result<(), String> {
     ));
     crate::node::paths::create_private_dir(&dir)
         .and_then(|()| {
+            crate::node::paths::sync_dir(&dir)?;
+            if let Some(parent) = dir.parent() {
+                crate::node::paths::sync_dir(parent)?;
+            }
             crate::node::paths::write_private_file(&file, pulled.to_json().to_string().as_bytes())
         })
         .map_err(|e| e.to_string())?;
-    index_record(paths, &file, &pulled.entry);
     Ok(())
 }
 
@@ -543,6 +607,7 @@ pub enum PullState {
 struct ScanCursor {
     last_room: Option<Digest32>,
     pages: BTreeMap<Digest32, Option<crate::node::api::HistoryCursor>>,
+    session_pages: BTreeMap<Digest32, Option<crate::node::api::HistoryCursor>>,
 }
 
 /// A retained directory cursor costs no per-receipt memory. Even invalid/non-record files
@@ -550,25 +615,127 @@ struct ScanCursor {
 #[derive(Default)]
 struct ExpireCursor {
     entries: Option<std::fs::ReadDir>,
+    group_entries: Option<std::fs::ReadDir>,
     phase: usize,
+    folder: Option<FolderExpiry>,
+    failure: Option<String>,
+}
+
+/// At most one expired folder waits while its other receipts are checked in bounded turns.
+/// Keeping an iterator, rather than completing that scan inside one sweep slot, avoids an
+/// entire-history walk for each folder on one daemon turn.
+struct FolderExpiry {
+    receipt: PathBuf,
+    pulled: Pulled,
+    other: Box<dyn Iterator<Item = Result<PathBuf, String>> + Send>,
+    revision: [Option<std::time::SystemTime>; 3],
+}
+
+fn receipt_paths(paths: &Paths) -> impl Iterator<Item = Result<PathBuf, String>> + use<> {
+    let paths = paths.clone();
+    let mut cursor = ExpireCursor::default();
+    let mut done = false;
+    std::iter::from_fn(move || {
+        if done {
+            return None;
+        }
+        let file = cursor.next(&paths);
+        if let Some(why) = cursor.failure.take() {
+            done = true;
+            return Some(Err(why));
+        }
+        let file = file?;
+        if cursor.phase == 3 {
+            done = true;
+            return None;
+        }
+        Some(Ok(file))
+    })
+}
+
+fn receipt_revision(paths: &Paths) -> Result<[Option<std::time::SystemTime>; 3], String> {
+    let modified = |dir: PathBuf| match std::fs::metadata(&dir) {
+        Ok(meta) => meta
+            .modified()
+            .map(Some)
+            .map_err(|e| format!("{}: {e}", dir.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("{}: {e}", dir.display())),
+    };
+    Ok([
+        modified(paths.pulls_dir())?,
+        modified(paths.pulls_dir().join("records"))?,
+        modified(pending_dir(paths))?,
+    ])
+}
+
+fn forget_receipt(paths: &Paths, receipt: &Path, entry: &Digest32) {
+    if std::fs::remove_file(receipt).is_ok() {
+        let index = receipt_index(paths, entry);
+        if std::fs::read_to_string(&index)
+            .is_ok_and(|name| Some(std::ffi::OsStr::new(&name)) == receipt.file_name())
+        {
+            let _ = std::fs::remove_file(index);
+        }
+        let group = entry_receipts(paths, entry);
+        if receipt.parent() == Some(group.as_path()) {
+            let _ = std::fs::remove_dir(group);
+        }
+    }
 }
 
 impl ExpireCursor {
+    fn open_dir(&mut self, path: &Path) -> Option<std::fs::ReadDir> {
+        match std::fs::read_dir(path) {
+            Ok(entries) => Some(entries),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                self.failure = Some(format!("{}: {e}", path.display()));
+                None
+            }
+        }
+    }
+
+    fn entry_path(&mut self, entry: std::io::Result<std::fs::DirEntry>) -> PathBuf {
+        match entry {
+            Ok(entry) => entry.path(),
+            Err(e) => {
+                self.failure = Some(e.to_string());
+                PathBuf::new()
+            }
+        }
+    }
+
     fn next(&mut self, paths: &Paths) -> Option<PathBuf> {
-        for _ in 0..3 {
+        for _ in 0..4 {
+            if self.phase == 1 {
+                if let Some(entries) = &mut self.group_entries {
+                    if let Some(entry) = entries.next() {
+                        return Some(self.entry_path(entry));
+                    }
+                    self.group_entries = None;
+                    return Some(PathBuf::new());
+                }
+            }
             if self.entries.is_none() {
                 let dir = match self.phase {
                     0 => paths.pulls_dir(),
-                    1 => pending_dir(paths),
+                    1 => paths.pulls_dir().join("records"),
+                    2 => pending_dir(paths),
                     _ => paths.pulls_dir().join("states"),
                 };
-                self.entries = std::fs::read_dir(dir).ok();
+                self.entries = self.open_dir(&dir);
             }
             if let Some(entry) = self.entries.as_mut().and_then(Iterator::next) {
-                return Some(entry.ok().map_or_else(PathBuf::new, |e| e.path()));
+                if self.phase == 1 {
+                    let path = self.entry_path(entry);
+                    self.group_entries = self.open_dir(&path);
+                    return Some(PathBuf::new());
+                }
+                return Some(self.entry_path(entry));
             }
             self.entries = None;
-            self.phase = (self.phase + 1) % 3;
+            self.phase = (self.phase + 1) % 4;
             if self.phase == 0 {
                 return None;
             }
@@ -1023,9 +1190,10 @@ impl Pulls {
                 .filter(|p| p.room == room && p.path.exists())
                 .or_else(|| {
                     let prefix = format!("{}.", b32_encode(&entry));
-                    std::fs::read_dir(paths.pulls_dir())
+                    std::fs::read_dir(entry_receipts(paths, &entry))
                         .into_iter()
                         .flatten()
+                        .chain(std::fs::read_dir(paths.pulls_dir()).into_iter().flatten())
                         .flatten()
                         .filter(|f| f.file_name().to_string_lossy().starts_with(&prefix))
                         .filter_map(|f| read_record(&f.path()))
@@ -1085,6 +1253,11 @@ impl Pulls {
             .await?
             .into_iter()
             .next();
+        let session = if row.is_none() {
+            self.history.session_file(*room, *entry).await?
+        } else {
+            None
+        };
         let now = now_ms();
         let view = self.view.borrow();
         let me = view.identity.as_ref().map(|i| i.fingerprint);
@@ -1098,7 +1271,7 @@ impl Pulls {
                 return Err("that message has not arrived yet".into());
             }
             (r.author, r.created_millis, offer_fields(&r.text, None))
-        } else if let Some(r) = d.session_files.iter().find(|r| r.entry_hash == *entry) {
+        } else if let Some(r) = session.as_ref() {
             (r.author, r.created_millis, offer_in_session(&r.body))
         } else {
             return Err("no message in this room has that id".into());
@@ -1150,7 +1323,7 @@ impl Pulls {
         let now = now_ms();
         // One room and one bounded offer page per turn. A completed cycle starts again,
         // so granting trust later still discovers an older offer.
-        let (room, after) = {
+        let (room, after, session_after) = {
             let mut cursor = self.cursor.lock().await;
             let view = self.view.borrow();
             if view.locked || view.identity.is_none() {
@@ -1158,6 +1331,9 @@ impl Pulls {
             }
             cursor
                 .pages
+                .retain(|room, _| view.open_channels.iter().any(|d| d.channel_id == *room));
+            cursor
+                .session_pages
                 .retain(|room, _| view.open_channels.iter().any(|d| d.channel_id == *room));
             // Rotate after one page, even on a read failure. An unending offer stream in
             // one room cannot prevent another open room's file from being considered.
@@ -1172,11 +1348,15 @@ impl Pulls {
                 return;
             };
             cursor.last_room = Some(room);
-            (room, cursor.pages.get(&room).copied().flatten())
+            (
+                room,
+                cursor.pages.get(&room).copied().flatten(),
+                cursor.session_pages.get(&room).copied().flatten(),
+            )
         };
         let page = match self
             .history
-            .typed_page(room, vec![crate::node::shares::FILE.to_owned()], after, 64)
+            .typed_page(room, vec![crate::node::shares::FILE.to_owned()], after, 32)
             .await
         {
             Ok(page) => page,
@@ -1185,6 +1365,19 @@ impl Pulls {
                     note: format!("could not read file offers; will retry: {e}"),
                 });
                 return;
+            }
+        };
+        let session_page = match self
+            .history
+            .session_files_page(room, session_after, 32)
+            .await
+        {
+            Ok(page) => Some(page),
+            Err(e) => {
+                let _ = self.events.send(crate::node::api::NodeEvent::NodeNote {
+                    note: format!("could not read Session file offers; will retry: {e}"),
+                });
+                None
             }
         };
         let mut found: Vec<Offer> = Vec::new();
@@ -1230,7 +1423,7 @@ impl Pulls {
                 }
                 // **A file a Session sent out** (ADR-029 DR-1.8): this node opened its entry, so
                 // its node trusts it with drive; it is pulled as a share addressed to it is.
-                for r in &d.session_files {
+                for r in session_page.as_ref().into_iter().flat_map(|p| &p.rows) {
                     let Some((name, size, sha256, tag, http, files)) = offer_in_session(&r.body)
                     else {
                         continue;
@@ -1260,6 +1453,13 @@ impl Pulls {
             }
         }
         self.cursor.lock().await.pages.insert(room, page.next);
+        if let Some(page) = session_page {
+            self.cursor
+                .lock()
+                .await
+                .session_pages
+                .insert(room, page.next);
+        }
         let mut running = self.running.lock().await;
         running.retain(|_, offer| offer.strong_count() > 0);
         for offer in found {
@@ -1444,15 +1644,20 @@ impl Pulls {
     /// collected into a second copy of all the node's retained history.
     fn expire(&self) {
         let now = now_ms();
-        let retention: BTreeMap<Digest32, u64> = {
+        let retention: Option<BTreeMap<Digest32, u64>> = {
             let view = self.view.borrow();
-            if view.locked {
-                return;
+            (!view.locked).then(|| {
+                view.open_channels
+                    .iter()
+                    .map(|d| (d.channel_id, d.retention))
+                    .collect()
+            })
+        };
+        let Some(retention) = retention else {
+            if let Ok(mut cursor) = self.expiry.lock() {
+                *cursor = ExpireCursor::default();
             }
-            view.open_channels
-                .iter()
-                .map(|d| (d.channel_id, d.retention))
-                .collect()
+            return;
         };
         let due = |p: &Pulled| {
             retention.get(&p.room).is_some_and(|ttl| {
@@ -1464,13 +1669,68 @@ impl Pulls {
         };
         let files = self.paths.files_dir();
         for _ in 0..64 {
-            let Some(file) = cursor.next(&self.paths) else {
+            if let Some(mut folder) = cursor.folder.take() {
+                // Retention may have changed while this bounded scan was suspended.
+                if !due(&folder.pulled) {
+                    continue;
+                }
+                match folder.other.next() {
+                    Some(Err(why)) => {
+                        self.say_state_error(why);
+                    }
+                    Some(Ok(file)) => {
+                        let still_held = if file != folder.receipt
+                            && file.extension().is_some_and(|x| x == "json")
+                        {
+                            match read_record_checked(&file) {
+                                Ok(other) => other.is_some_and(|other| {
+                                    other.path == folder.pulled.path && !due(&other)
+                                }),
+                                Err(why) => {
+                                    self.say_state_error(why);
+                                    continue;
+                                }
+                            }
+                        } else {
+                            false
+                        };
+                        if still_held {
+                            forget_receipt(&self.paths, &folder.receipt, &folder.pulled.entry);
+                        } else {
+                            cursor.folder = Some(folder);
+                        }
+                    }
+                    None => {
+                        match receipt_revision(&self.paths) {
+                            Ok(revision) if revision != folder.revision => {
+                                folder.revision = revision;
+                                folder.other = Box::new(receipt_paths(&self.paths));
+                                cursor.folder = Some(folder);
+                                continue;
+                            }
+                            Err(why) => {
+                                self.say_state_error(why);
+                                continue;
+                            }
+                            Ok(_) => {}
+                        }
+                        remove_folder_copy(&folder.pulled.path, &folder.pulled.files);
+                        forget_receipt(&self.paths, &folder.receipt, &folder.pulled.entry);
+                    }
+                }
+                continue;
+            }
+            let file = cursor.next(&self.paths);
+            if let Some(why) = cursor.failure.take() {
+                self.say_state_error(why);
+            }
+            let Some(file) = file else {
                 break;
             };
             if !file.extension().is_some_and(|x| x == "json") {
                 continue;
             }
-            if cursor.phase == 2 {
+            if cursor.phase == 3 {
                 let saved = std::fs::File::open(&file)
                     .ok()
                     .and_then(|f| serde_json::from_reader::<_, SavedState>(f).ok());
@@ -1487,8 +1747,10 @@ impl Pulls {
                 continue;
             };
             if !due(&p) {
-                if cursor.phase == 0 && !receipt_index(&self.paths, &p.entry).exists() {
-                    index_record(&self.paths, &file, &p.entry);
+                if cursor.phase == 0 {
+                    if let Err(why) = move_legacy_receipt(&self.paths, &file, &p.entry) {
+                        self.say_state_error(why);
+                    }
                 }
                 continue;
             }
@@ -1498,14 +1760,20 @@ impl Pulls {
                     .components()
                     .any(|c| c == std::path::Component::ParentDir);
             if ours && p.folder.is_some() {
-                // A newer unexpired receipt for the same folder keeps it. Keep the directory
-                // handles and at most one other receipt, not an all-record or all-due vector.
-                let still_held = records(&self.paths)
-                    .chain(records_in(&pending_dir(&self.paths)))
-                    .any(|(f, other)| f != file && other.path == p.path && !due(&other));
-                if !still_held {
-                    remove_folder_copy(&p.path, &p.files);
-                }
+                let revision = match receipt_revision(&self.paths) {
+                    Ok(revision) => revision,
+                    Err(why) => {
+                        self.say_state_error(why);
+                        continue;
+                    }
+                };
+                cursor.folder = Some(FolderExpiry {
+                    receipt: file,
+                    pulled: p,
+                    other: Box::new(receipt_paths(&self.paths)),
+                    revision,
+                });
+                continue;
             } else if ours {
                 match std::fs::remove_file(&p.path) {
                     Ok(()) => {}
@@ -1513,14 +1781,7 @@ impl Pulls {
                     Err(_) => continue,
                 }
             }
-            if std::fs::remove_file(&file).is_ok() && cursor.phase == 0 {
-                let index = receipt_index(&self.paths, &p.entry);
-                if std::fs::read_to_string(&index)
-                    .is_ok_and(|name| Some(std::ffi::OsStr::new(&name)) == file.file_name())
-                {
-                    let _ = std::fs::remove_file(index);
-                }
-            }
+            forget_receipt(&self.paths, &file, &p.entry);
         }
     }
 }

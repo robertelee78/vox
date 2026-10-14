@@ -2594,6 +2594,7 @@ async fn read_room(
     parent_rows.extend(rows.iter().cloned());
     let pulled = parent_rows
         .iter()
+        .filter(|row| pulled_share(row, me.as_ref()).is_some())
         .filter_map(|row| vox_core::node::pulls::recorded_entry(paths, &row.entry_hash))
         .filter(|p| p.room == channel_id)
         .map(|p| (p.entry, p.path))
