@@ -147,7 +147,7 @@ final class NodeModel: ObservableObject {
         didSet {
             roomMessageRevision = UUID()
             byID = Dictionary(messages.map { ($0.id, $0) }) { $1 }
-            if let root = openThread { threadRootMessage = byID[root] }
+            if let root = openThread, let visible = byID[root] { threadRootMessage = visible }
 
             var said: [String: NodePlatform] = [:]
             for message in messages { if let p = message.platform { said[message.author] = p } }
@@ -187,6 +187,7 @@ final class NodeModel: ObservableObject {
     @Published private(set) var roomReloadNeeded = false
     private static let roomWindowLimit = 128
     @Published private var roomReadingOlder = false
+    private var roomOlderRead = UUID()
 
     /// The room on screen's messages by id, for what is in view.
     private(set) var byID: [String: RoomMessage] = [:]
@@ -269,7 +270,8 @@ final class NodeModel: ObservableObject {
     @Published private(set) var sessionsHistoryNext: String?
     @Published private(set) var sessionsMetadataLoading = false
     private var sessionsOpenAfter: String?
-    private var sessionsHistoryAfter: String?
+    @Published private var sessionsHistoryAfter: String?
+    var sessionsHistoryPaged: Bool { sessionsHistoryAfter != nil }
     private var sessionsMetadataRead = UUID()
     @Published private(set) var selectedSessionMetadata: FfiSession?
     @Published private(set) var selectedSessionMetadataKnown = false
@@ -830,13 +832,21 @@ final class NodeModel: ObservableObject {
             return
         }
         guard let room = roomOnScreen, let before = roomBefore, !roomReadingOlder, ended == nil else { return }
-        let generation = roomReadGeneration
+        let generation = roomReadGeneration, epoch = nodeObservationEpoch
         timelineFollowingNewest = false
+        let revision = roomMessageRevision, request = UUID()
+        roomOlderRead = request
         roomReadingOlder = true
-        defer { if generation == roomReadGeneration { roomReadingOlder = false } }
+        func current() -> Bool {
+            generation == roomReadGeneration && epoch == nodeObservationEpoch
+                && revision == roomMessageRevision && roomOlderRead == request
+                && roomOnScreen == room && roomBefore == before
+                && !timelineFollowingNewest && ended == nil
+        }
+        defer { if roomOlderRead == request { roomReadingOlder = false } }
         do {
             let page = try await client.roomReadOlder(room: room, before: before)
-            guard generation == roomReadGeneration, roomOnScreen == room, roomBefore == before, ended == nil else { return }
+            guard current() else { return }
             let held = Set(messages.map(\.id))
             guard roomInstance == page.instance else {
                 throw VoxError.Failed(reason: "The saved room changed while loading older messages.")
@@ -848,7 +858,7 @@ final class NodeModel: ObservableObject {
             roomOlder = page.older
             roomBefore = page.before
         } catch {
-            guard generation == roomReadGeneration, roomOnScreen == room, ended == nil else { return }
+            guard current() else { return }
             retireRefusedRoomRead(error)
             reportBackground(error)
         }
@@ -2963,6 +2973,8 @@ extension NodeModel {
     func readNewestTimeline() async {
         guard let room = roomOnScreen else { return }
         let destination = showing, epoch = nodeObservationEpoch
+        roomOlderRead = UUID()
+        roomReadingOlder = false
         timelineFollowingNewest = true
         if showingSession {
             sessionReloadNeeded = false

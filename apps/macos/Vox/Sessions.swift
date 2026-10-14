@@ -114,7 +114,7 @@ struct SessionsList: View {
                 }
             }.disabled(model.sessionsMetadataLoading)
             let ended = model.endedSessions
-            if !ended.isEmpty || model.sessionsHistoryNext != nil {
+            if !ended.isEmpty || model.sessionsHistoryNext != nil || model.sessionsHistoryPaged {
                 Button { endedOpen.toggle() } label: {
                     Label("Session history (\(ended.count) ended on this page)", systemImage: endedOpen ? "chevron.down" : "chevron.right")
                 }

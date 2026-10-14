@@ -25,18 +25,17 @@ struct SessionPages: Equatable {
     /// Following replaces the window with the authoritative newest page. While the reader
     /// is on older activity, refresh only held rows; new output must not move that window.
     mutating func newest(_ page: FfiSessionRead, following: Bool) {
-        if following || entries.isEmpty {
+        if following {
             instance = page.instance
             entries = page.entries
             older = page.older
             before = page.before
             hasNewer = false
         } else {
-            let current = Dictionary(page.entries.map { ($0.id, $0) },
-                                     uniquingKeysWith: { _, latest in latest })
-            entries = entries.map { current[$0.id] ?? $0 }
-            hasNewer = hasNewer || page.entries.last?.id != entries.last?.id
-            boundOlderWindow()
+            // Exact revalidation is authoritative for the held window. The newest page
+            // only tells the reader that later activity is available; it cannot restore
+            // expired rows or overwrite a newer exact lookup of a request's resolution.
+            hasNewer = hasNewer || (!page.entries.isEmpty && page.entries.last?.id != entries.last?.id)
         }
     }
 
