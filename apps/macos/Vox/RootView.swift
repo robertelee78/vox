@@ -612,10 +612,23 @@ private struct AppNodeChooser: View {
                 Text("Current node: \(current.node) — \(current.me)").textSelection(.enabled)
             }
             Text("Changing the node moves this app's automatic drive role. Cancel keeps the current node and its drafts.").secondaryText()
-            ForEach(model.appNodeChoices, id: \.fingerprint) { node in
-                Button { chosen = node.fingerprint } label: {
-                    Text("\(node.name) — \(node.fingerprint)")
-                }.accessibilityIdentifier("app-node-choice-\(node.name)")
+            ScrollView {
+                VStack(alignment: .leading, spacing: Space.s8) {
+                    ForEach(model.appNodeChoices, id: \.fingerprint) { node in
+                        Button { chosen = node.fingerprint } label: {
+                            HStack {
+                                Image(systemName: chosen == node.fingerprint ? "checkmark.circle.fill" : "circle")
+                                Text("\(node.name) — \(node.fingerprint)")
+                                    .textSelection(.disabled)
+                            }.selectionMark(chosen == node.fingerprint)
+                        }
+                        .accessibilityIdentifier("app-node-choice-\(node.name)")
+                        .accessibilityAddTraits(chosen == node.fingerprint ? .isSelected : [])
+                    }
+                }.frame(maxWidth: .infinity, alignment: .leading)
+            }.frame(maxHeight: 240)
+            if let choice = model.appNodeChoices.first(where: { $0.fingerprint == chosen }) {
+                Text("Chosen node: \(choice.name) — \(choice.fingerprint)").secondaryText()
             }
             SecureInput(holder: field) { submit() }
                 .accessibilityLabel("Chosen node's identity passphrase; empty for a node made with none")
