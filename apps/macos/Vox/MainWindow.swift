@@ -907,12 +907,11 @@ private struct RoomView: View {
         // kept from last time.
         HStack(spacing: 0) {
             VStack(spacing: 0) {
-                Color.clear.frame(height: 0)
-                    .navigationTitle(model.roomName(room))
+                // The interactive tab row belongs to the content, outside title-bar dragging.
+                RoomTabs(model: model, room: room)
+                    .navigationTitle("")
                     .navigationSubtitle("")
-                    .toolbar {
-                        ToolbarItem(placement: .principal) { RoomTabs(model: model, room: room) }
-                    }
+                Divider()
                 // A trust offer from one of its members, at the top of its conversation (the
                 // decider, v0.4.3: offers are in the room they concern, not a sidebar section).
                 if model.showing == .general {
