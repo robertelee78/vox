@@ -2282,7 +2282,7 @@ private struct Inspector: View {
                     heading("MEMBERS")
                 }
                 Section {
-                    RoomAnchorsView(room: room)
+                    RoomAnchorsView(model: model, room: room)
                 } header: {
                     heading("ANCHORS")
                 }

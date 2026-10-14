@@ -133,24 +133,53 @@ struct NetworkSettingsView: View {
 
 /// The selected room's source in the same machine list, including its honest stale/unknown state.
 struct RoomAnchorsView: View {
+    @ObservedObject var model: NodeModel
     let room: String
-    @StateObject private var model = AnchorNetworkModel()
 
     var body: some View {
-        let anchors = model.anchors.filter { $0.sources.contains { $0.room == room } }
         VStack(alignment: .leading, spacing: Space.s8) {
-            if !model.loaded && model.busy { ProgressView("Reading anchors…") }
-            if model.loaded && model.reachable && anchors.isEmpty { Text("This room has no anchors.").secondaryText() }
-            ForEach(anchors, id: \.fingerprint) { anchor in
-                AnchorNetworkRow(anchor: anchor, reachable: model.reachable)
-            }
-            if let problem = model.actionProblem ?? model.problem {
-                Text(problem).secondaryText().fixedSize(horizontal: false, vertical: true)
-                    .accessibilityIdentifier("room-anchors-problem")
+            if model.roomOnScreen == room {
+                if model.roomAnchorLoading { ProgressView("Reading anchors…") }
+                if model.roomAnchorAuthority != nil, !model.roomAnchorLoading,
+                   model.roomAnchorError == nil, model.roomAnchorEntries.isEmpty {
+                    Text("This room has no anchors.").secondaryText()
+                }
+                ForEach(model.roomAnchorEntries, id: \.fingerprint) { anchor in
+                    VStack(alignment: .leading, spacing: Space.s4) {
+                        Text(String(anchor.fingerprint.prefix(12))).font(Theme.mono)
+                        // Addresses come only from this room's authenticated configuration;
+                        // the machine inventory's union is never presented as its endpoints.
+                        Text(anchor.addresses.joined(separator: ", ")).font(Theme.mono)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Text("from room " + model.roomName(room)
+                             + (model.roomAnchorError == nil ? "" : " (last known configuration)"))
+                            .secondaryText()
+                        Text("Identity reach across this machine's sources: "
+                             + (model.roomAnchorReachError == nil && model.roomAnchorError == nil
+                                ? (model.roomAnchorReach[anchor.fingerprint] ?? "No current observation.")
+                                : "unavailable; last known: " + (model.roomAnchorReach[anchor.fingerprint] ?? "none")))
+                            .secondaryText().accessibilityIdentifier("anchor-reach-" + anchor.fingerprint)
+                    }
+                    .textSelection(.enabled)
+                    .accessibilityElement(children: .contain)
+                    .accessibilityIdentifier("anchor-row-" + anchor.fingerprint)
+                }
+                if let problem = model.roomAnchorError ?? model.roomAnchorReachError {
+                    Text(problem).secondaryText().fixedSize(horizontal: false, vertical: true)
+                        .accessibilityIdentifier("room-anchors-problem")
+                }
             }
         }
         .accessibilityIdentifier("room-anchors")
-        .task { await model.follow() }
+        .task(id: model.me + "/" + room) {
+            // Use the selected node's held client and its room/actor/request fences. No
+            // independent account client can leak another actor's inventory into this room.
+            while !Task.isCancelled, model.roomOnScreen == room, model.ended == nil {
+                await model.loadRoomAnchorState()
+                do { try await Task.sleep(for: .seconds(3)) }
+                catch { return }
+            }
+        }
     }
 }
 
