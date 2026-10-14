@@ -2074,13 +2074,14 @@ fn enrolled_computers_follow_node_changes_and_retire_removed_authority() {
     assert!(ok, "PRODUCT: managed-node rename: {out}{err}");
     ready(&a, "renamed");
     assert!(
-        wait_until(Duration::from_secs(30), || computer(&c, &["status"])
-            ["nodes"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|n| n["fingerprint"] == added && n["name"] == "renamed")),
-        "PRODUCT: authenticated rename/fingerprint did not propagate"
+        wait_until(Duration::from_secs(30), || {
+            let status = computer(&c, &["status"]);
+            status["computers"].as_array().is_some_and(|v| v.len() == 3)
+                && status["nodes"].as_array().unwrap().iter().any(|n| {
+                    n["fingerprint"] == added && n["computer"] == a_id && n["name"] == "renamed"
+                })
+        }),
+        "PRODUCT: authenticated rename did not preserve its fingerprint, manager and membership"
     );
     assert!(
         ring(&b, "worker")
