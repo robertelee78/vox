@@ -341,9 +341,19 @@ below. Repository binding (ADR-029), thread audiences and pause (ADR-033) still 
 - **RA-5. Adapter boundary.** Busy sessions receive ordinary attention at a supported safe
   boundary, without cancelling work or escalating urgency. Idle delivery MUST use the existing
   session's supported input adapter, which must reject an ended conversation without reopening
-  it. Claude Code uses its authenticated messaging socket; OpenCode uses its existing plugin
-  endpoint and `promptAsync`. Their actual busy, idle and ended-session behavior MUST be measured
-  before acceptance. An adapter that cannot establish the required boundary reports unavailable;
+  it. Claude Code uses its authenticated messaging socket with the exact session's live
+  registration; a socket path or token shared across conversation changes is not that boundary.
+  OpenCode's server plugin and `promptAsync` alone MUST NOT authorize a wake: a saved session
+  can receive input after its attached client closes. Its wake receiver MUST belong to the
+  actual client, bind a fresh client/route identity to the exact open session, and check that
+  client's route and disposal lifecycle when accepting input. The supported TUI plugin's
+  current-route and lifecycle APIs are an implementation direction; their presence is not proof
+  of delivery. The server plugin may retain its transcript/context role. A separate server-side
+  presence check followed by an unrestricted submission is insufficient. Background terminal
+  clients remain eligible, and an operator's unsent draft MUST be preserved. Input accepted
+  before closure is not retrospectively cancelled; a lost acknowledgement remains unknown.
+  Actual busy, idle, route-change and ended-client behavior MUST be measured before acceptance.
+  An adapter that cannot establish the required boundary reports unavailable;
   it MUST NOT substitute another node, SSH, a new harness, or a new model run.
 - **RA-6. Codex exception.** For v0.4.5 Codex MUST deliver at the next ordinary hook turn, including
   when a room question arrives while it is idle. Vox MUST NOT use queue/add, turn/start,
