@@ -784,7 +784,7 @@ final class NodeModel: ObservableObject {
                 daemonReachable = true
                 ended = fresh.first(where: { $0.name == node })?.status == "Locked"
                     ? "Node \(node) is Locked." : "Node \(node) is unavailable."
-                clearThreadState()
+                releaseHistoryViews()
                 peers = 0
                 return
             }
@@ -988,7 +988,10 @@ final class NodeModel: ObservableObject {
             keyringDid = nil
             keyringFailed = nil
         }
-        guard case .room = selection else { return }
+        guard case .room = selection else {
+            releaseHistoryViews()
+            return
+        }
         messages = []
         roomReadingOlder = false
         roomOlder = 0
@@ -2530,13 +2533,33 @@ final class NodeModel: ObservableObject {
         roomNeedsPage = false
         // An ended stream does not establish whether a protected node is Locked or a
         // passphraseless node is already Ready again. Display only the fresh snapshot.
-        clearThreadState()
+        releaseHistoryViews()
         ended = "Node \(node) is unavailable."
         machineStateKnown = false
         daemonReachable = text.localizedCaseInsensitiveContains("detached")
             || text.localizedCaseInsensitiveContains("Locked")
         if !daemonReachable { daemonFailure = text }
         Task { [weak self] in await self?.readFacts() }
+    }
+
+    /// Recoverable history is reloaded from the node after leaving a view or losing its
+    /// owner. Drafts are user working state and are preserved independently of these caches.
+    private func releaseHistoryViews() {
+        clearThreadState()
+        messages = []
+        roomOlder = 0
+        roomBefore = nil
+        unreadFrom = nil
+        unreadCount = 0
+        sessionPages.clear()
+        sessionWindowRevision = UUID()
+        selectedEarlierRequest = nil
+        sessionNote = nil
+        sessionLoading = false
+        readBy = [:]
+        whereabouts = [:]
+        pulledBy = [:]
+        pulled = [:]
     }
 
     /// Resume the same window after its owner has unlocked the node. Credentials and
