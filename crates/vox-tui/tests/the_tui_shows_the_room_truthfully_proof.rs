@@ -108,18 +108,15 @@
 //!   one path `vox room post --to … --urgent` takes, reaches Alice with `to` naming her and
 //!   `urgent` (W-4, #513);
 //! - `sessions`: Alice's hooks open two Sessions and end one. Before Alice grants Bob drive,
-//!   neither the CLI nor TUI exposes them (ADR-031 SA-1–SA-3); after the terminal grant, Bob's
-//!   Sessions pane lists the open one and keeps the ended one apart, All shows their lifecycle,
-//!   and the open Session names its source and offers a composer;
-//! - `session-order`: Alice posts, then her hook opens a new Session, within one wall-clock second:
-//!   in Bob's All the post reads first and "<label> opened" under it (#562: a Session's opened line
-//!   follows no message, so it is placed by its time, kept in milliseconds);
+//!   neither CLI nor TUI exposes them; after the grant, a live horizontal tab and Ended menu
+//!   replace the vertical Sessions list, General excludes lifecycle and has no All choice,
+//!   and the open Session names its source and offers a composer (ADR-033 LY-1–LY-4);
 //! - `drive`: once Alice gives Bob drive (`vox trust drive`, typed at a terminal) and her open
 //!   Session runs a turn through Claude Code's hook (a tool call, its result, the reply), Bob's
 //!   `:session` shows each line his `vox room session` prints, and not "Only members …"; `d` on the
 //!   tool call's line shows its output (ADR-029 SC-1, CL-1, #553);
 //! - `approve`: Alice's session asks to run a command through Claude Code's PermissionRequest
-//!   hook: Bob's TUI lists the room with "waiting 1" and the Session "· waiting on you"; `a` on the
+//!   hook: Bob's TUI lists the room with "waiting 1" and the Session tab with `@!`; `a` on the
 //!   request's line approves it, the waiting hook gives Claude Code "allow", and the line then
 //!   reads "approved here" (ADR-029 DR-1.4, CL-2, #553);
 //! - `answer`: Alice's session asks one question through the PermissionRequest hook: `:answer 1;
@@ -190,8 +187,8 @@
 //! (`drive`), `a` sending a rejection (`approve`),
 //! `:interrupt` sent as a stop (`steer`),
 //! a Session's `:share` sending the path as text (`share`), notices placed by time again
-//! (`order`), or times rounded to the second (`session-order`). It passes only on the script's PASS with
-//! all 52 claims ok. Also: the dismissals not kept across a restart (`offer`), a dismissal kept
+//! (`order`). It passes only on the script's PASS with all remaining claims ok; the removed All
+//! lifecycle view has no ordering claim (ADR-033 LY-3). Also: the dismissals not kept across a restart (`offer`), a dismissal kept
 //! against the member rather than its join, so no offer when it joins again (`reoffer`), or no
 //! offer from a consent grant, so no offer back (`offerback`).
 //!
@@ -290,7 +287,7 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
     let claims: Vec<&str> = said.lines().filter(|l| l.contains(" CLAIM ")).collect();
     let green = claims.iter().filter(|l| l.contains(" ok: ")).count();
     eprintln!(
-        "{said}\n[proof] claims ok: {green} of {} (52 expected); the driver took {:?}; its last \
+        "{said}\n[proof] claims ok: {green} of {} (51 expected); the driver took {:?}; its last \
          stage: {:?}; the runner's longest stall: {stall:?}",
         claims.len(),
         out.took,
@@ -304,8 +301,8 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
             );
             assert_eq!(
                 (claims.len(), green),
-                (52, 52),
-                "APPARATUS: the driver said PASS without all 52 claims ok: {said}"
+                (51, 51),
+                "APPARATUS: the driver said PASS without all 51 claims ok: {said}"
             );
         }
         Some(2) => panic!("APPARATUS, CANNOT MEASURE: the TUI proof's driver failed: {said}"),
