@@ -286,6 +286,7 @@ struct NodeSheets: View {
 /// joined room keeps the name its members gave it (ADR-028 R-1).
 private struct RoomForm: View {
     @ObservedObject var model: NodeModel
+    @ObservedObject private var app = AppModel.shared
     let joining: Bool
     @State private var link = ""
     @State private var name = ""
@@ -362,11 +363,15 @@ private struct RoomForm: View {
         let secret = field.copyAllowingEmpty()
         let (l, n) = (link, name)
         let kept = anchors.kept, context = model.anchorChoiceContext
-        let request = UUID(), actor = model.me
+        let request = UUID(), actor = model.me, owner = app.nodeWindowGeneration
         submission = request
         Task {
             let ok = joining ? await model.joinRoom(l, passphrase: secret)
-                : await model.createRoom(n, passphrase: secret, anchors: kept, context: context)
+                : await model.createRoom(n, passphrase: secret, anchors: kept, context: context) {
+                    submission == request && app.nodeWindowGeneration == owner
+                        && app.node === model && app.signedInAs == model.node
+                        && app.phase == .attached(node: model.node, fingerprint: actor)
+                }
             guard !Task.isCancelled, submission == request, model.me == actor,
                   model.sheet == (joining ? .joinRoom : .newRoom) else { return }
             submitting = false

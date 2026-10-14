@@ -889,13 +889,15 @@ final class NodeModel: ObservableObject {
 
     func refreshMachineState() async { await readFacts() }
 
-    private func readFacts() async {
+    private var observationNeedsRestart = false
+
+    private func readFacts(restartObservation: Bool = true) async {
         let epoch = nodeObservationEpoch
         // Reachability first: failed reads must not leave stale node/peer states visible.
         do {
             let fresh = try await client.nodes()
             guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
-            let recovering = !daemonReachable
+            let recovering = !daemonReachable || observationNeedsRestart
             machineStateKnown = true
             daemonFailure = nil
             if fresh != nodes { nodes = fresh }
@@ -921,7 +923,7 @@ final class NodeModel: ObservableObject {
             if fresh.first(where: { $0.name == node })?.state == "attached" {
                 ended = nil
             }
-            if recovering {
+            if recovering && restartObservation {
                 // A live connection does not establish that the selected room's snapshot
                 // or its watcher survived the interruption. Preserve its visible content
                 // until an authoritative page and roster replace it together.
@@ -936,8 +938,12 @@ final class NodeModel: ObservableObject {
 
                 try await client.subscribe(listener: Listener(model: self))
                 guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
-                await refresh()
+                let refreshed = await refresh(restartObservation: false)
                 guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
+                // Reachability and installed observation do not establish a published inventory.
+                // Keep recovery owned by the follow loop until the authoritative refresh lands.
+                guard refreshed else { observationNeedsRestart = true; return }
+                observationNeedsRestart = false
                 await reconcileUnread()
                 guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
             }
@@ -1063,11 +1069,12 @@ final class NodeModel: ObservableObject {
     }
 
     /// The rooms, the keyring, the nodes on this Mac and the peers, read again.
-    func refresh() async {
+    @discardableResult
+    func refresh(restartObservation: Bool = true) async -> Bool {
         let epoch = nodeObservationEpoch
         do {
             let fresh = try await client.rooms()
-            guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
+            guard epoch == nodeObservationEpoch, !Task.isCancelled else { return false }
             let now = fresh.map { r in
                 var room = Room(id: r.id, name: name(of: r), open: r.open)
                 if let held = rooms.first(where: { $0.id == r.id }) {
@@ -1086,18 +1093,20 @@ final class NodeModel: ObservableObject {
             if now != rooms { rooms = now }
             for room in now {
                 await readLast(room.id)
-                guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
+                guard epoch == nodeObservationEpoch, !Task.isCancelled else { return false }
             }
             await readWaiting()
-            guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
-            await readFacts()
-            guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
+            guard epoch == nodeObservationEpoch, !Task.isCancelled else { return false }
+            await readFacts(restartObservation: restartObservation)
+            guard epoch == nodeObservationEpoch, !Task.isCancelled else { return false }
             let back = await readTrustsBack()
-            guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
+            guard epoch == nodeObservationEpoch, !Task.isCancelled else { return false }
             if back != trustsBack { trustsBack = back }
+            return true
         } catch {
-            guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
+            guard epoch == nodeObservationEpoch, !Task.isCancelled else { return false }
             reportBackground(error)
+            return false
         }
     }
 
@@ -1833,23 +1842,34 @@ final class NodeModel: ObservableObject {
     /// Create from a snapshot of explicitly kept, already numeric endpoints. Search and DNS
     /// never hold this mutation, and closing/changing the sheet retires its UI publication.
     func createRoom(_ name: String, passphrase secret: Secret, anchors: [RoomAnchorEndpoint],
-                    context: String) async -> Bool {
+                    context: String, currentOwner: @MainActor () -> Bool) async -> Bool {
         let operation = "create-room", attempt = begin("create-room")
         defer { end(attempt) }
-        guard context == anchorChoiceContext, sheet == .newRoom, ended == nil else { secret.wipe(); return false }
+        guard currentOwner(), context == anchorChoiceContext, sheet == .newRoom, ended == nil else { secret.wipe(); return false }
+        let editor = sheetInstance, origin = selection
+        // The mutation opens a room, so its ChannelOpened event may restart observation and
+        // retire the old read epoch. That does not retire the person's creation intent.
+        // Keep the exact sheet and navigation fences; reads still use their own fresh epochs.
+        func current(_ expected: Selection?) -> Bool {
+            currentOwner() && !Task.isCancelled && sheet == .newRoom && sheetInstance == editor && selection == expected
+        }
         do {
             let passphrase = try secret.passphrase()
             defer { passphrase.wipe() }
             let room = try await client.createRoomWithAnchors(name: name, passphrase: passphrase,
                                                              anchors: anchors, node: me)
-            guard !Task.isCancelled, context == anchorChoiceContext, ended == nil else { return false }
+            guard current(origin) else { return false }
             report(operation: operation, done: "Created the room.")
+            // Publish the successful navigation before yielding to observation recovery.
+            // Neither a cancelled sheet nor a later navigation may be taken over on return.
+            let destination = Selection.room(room)
+            select(destination)
             await refresh()
-            guard !Task.isCancelled, context == anchorChoiceContext, ended == nil else { return false }
-            await show(.room(room))
-            return true
+            guard current(destination) else { return false }
+            await show(destination)
+            return current(destination)
         } catch {
-            guard !Task.isCancelled, context == anchorChoiceContext, ended == nil else { return false }
+            guard current(origin) else { return false }
             report(error, operation: operation)
             return false
         }
@@ -2848,6 +2868,7 @@ final class NodeModel: ObservableObject {
     }
 
     fileprivate func stopped(_ text: String) async {
+        observationNeedsRestart = true
         waitingLedger = nil
         nodeObservationEpoch = UUID()
         roomReadGeneration = UUID()
@@ -2862,7 +2883,10 @@ final class NodeModel: ObservableObject {
         daemonReachable = text.localizedCaseInsensitiveContains("detached")
             || text.localizedCaseInsensitiveContains("Locked")
         if !daemonReachable { daemonFailure = text }
-        await readFacts()
+        // Resubscribing aborts the old Rust observer, which is awaiting this callback.
+        // Read readiness here; the existing follow loop (or an independent user action)
+        // performs the pending restart and authoritative refresh outside that callback.
+        await readFacts(restartObservation: false)
     }
 
     /// Recoverable history is reloaded from the node after leaving a view or losing its

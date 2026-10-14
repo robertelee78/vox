@@ -379,6 +379,10 @@ final class AppModel: ObservableObject {
 
     private var nodeRequestGeneration: UInt64 = 0
 
+    /// A submitted window action belongs to this owner request, even if the same identity
+    /// is subsequently detached, unlocked or selected again.
+    var nodeWindowGeneration: UInt64 { nodeRequestGeneration }
+
     private func beginNodeRequest() -> UInt64 {
         nodeRequestGeneration &+= 1
         return nodeRequestGeneration
