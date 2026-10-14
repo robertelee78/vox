@@ -222,53 +222,57 @@ struct RoomAnchorEditor: View {
     var body: some View {
         VStack(alignment: .leading, spacing: Space.s16) {
             Text("Room Anchors").font(.title2)
-            Text("Anchors bridge peers that cannot connect directly. Changes apply to this room's members only; direct connections do not need one.")
-                .secondaryText().fixedSize(horizontal: false, vertical: true)
-            RoomAnchorSearch(model: model, choices: choices, applyingToRoom: true)
-            RoomAnchorInput(input: $input, busy: model.roomAnchorChanging,
-                            allowed: model.canManageRoomAnchors) {
-                let value = input.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !value.isEmpty else { return }
-                Task { if await model.changeRoomAnchor(input: value) { input = "" } }
-            }
+            // One scrollable body keeps search, signed entries and Remove reachable at
+            // the existing sheet size, including larger text. Title and Done stay pinned.
             ScrollView {
                 VStack(alignment: .leading, spacing: Space.s16) {
-                    if model.roomAnchorEntries.isEmpty && model.roomAnchorError == nil && !model.roomAnchorLoading {
-                        Text("This room has no anchors.").secondaryText()
+                    Text("Anchors bridge peers that cannot connect directly. Changes apply to this room's members only; direct connections do not need one.")
+                        .secondaryText().fixedSize(horizontal: false, vertical: true)
+                    RoomAnchorSearch(model: model, choices: choices, applyingToRoom: true)
+                    RoomAnchorInput(input: $input, busy: model.roomAnchorChanging,
+                                    allowed: model.canManageRoomAnchors) {
+                        let value = input.trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard !value.isEmpty else { return }
+                        Task { if await model.changeRoomAnchor(input: value) { input = "" } }
                     }
-                    ForEach(model.roomAnchorEntries, id: \.fingerprint) { anchor in
-                        HStack(alignment: .top) {
-                            VStack(alignment: .leading, spacing: Space.s4) {
-                                Text(anchor.fingerprint).font(Theme.mono).textSelection(.enabled)
-                                Text(anchor.addresses.joined(separator: ", ")).font(Theme.mono)
-                                    .fixedSize(horizontal: false, vertical: true)
-                                Text(model.roomAnchorError == nil
-                                     ? "From this room's configuration."
-                                     : "Room configuration unavailable; showing last known configuration.")
-                                    .secondaryText()
-                                Text("Identity reach across this machine's sources: "
-                                     + (model.roomAnchorReachError == nil
-                                        ? (model.roomAnchorReach[anchor.fingerprint] ?? "No current observation.")
-                                        : "unavailable; last known: " + (model.roomAnchorReach[anchor.fingerprint] ?? "none")))
-                                    .secondaryText()
-                                    .accessibilityIdentifier("room-anchor-reach-" + anchor.fingerprint)
-                            }
-                            Spacer()
-                            Button("Remove from Room") {
-                                Task { await model.changeRoomAnchor(removing: anchor.fingerprint) }
-                            }
-                            .disabled(!model.canManageRoomAnchors || model.roomAnchorChanging)
-                            .accessibilityIdentifier("room-anchor-remove-" + anchor.fingerprint)
+                    VStack(alignment: .leading, spacing: Space.s16) {
+                        if model.roomAnchorEntries.isEmpty && model.roomAnchorError == nil && !model.roomAnchorLoading {
+                            Text("This room has no anchors.").secondaryText()
                         }
+                        ForEach(model.roomAnchorEntries, id: \.fingerprint) { anchor in
+                            HStack(alignment: .top) {
+                                VStack(alignment: .leading, spacing: Space.s4) {
+                                    Text(anchor.fingerprint).font(Theme.mono).textSelection(.enabled)
+                                    Text(anchor.addresses.joined(separator: ", ")).font(Theme.mono)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                    Text(model.roomAnchorError == nil
+                                         ? "From this room's configuration."
+                                         : "Room configuration unavailable; showing last known configuration.")
+                                        .secondaryText()
+                                    Text("Identity reach across this machine's sources: "
+                                         + (model.roomAnchorReachError == nil
+                                            ? (model.roomAnchorReach[anchor.fingerprint] ?? "No current observation.")
+                                            : "unavailable; last known: " + (model.roomAnchorReach[anchor.fingerprint] ?? "none")))
+                                        .secondaryText()
+                                        .accessibilityIdentifier("room-anchor-reach-" + anchor.fingerprint)
+                                }
+                                Spacer()
+                                Button("Remove from Room") {
+                                    Task { await model.changeRoomAnchor(removing: anchor.fingerprint) }
+                                }
+                                .disabled(!model.canManageRoomAnchors || model.roomAnchorChanging)
+                                .accessibilityIdentifier("room-anchor-remove-" + anchor.fingerprint)
+                            }
+                        }
+                    }.frame(maxWidth: .infinity, alignment: .leading)
+                    if model.roomAnchorChanging || model.roomAnchorLoading { ProgressView("Checking with Vox…") }
+                    if let problem = model.roomAnchorError {
+                        Text(problem).foregroundStyle(VoxTokens.Colors.danger)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .accessibilityIdentifier("room-anchor-problem")
                     }
                 }.frame(maxWidth: .infinity, alignment: .leading)
-            }
-            if model.roomAnchorChanging || model.roomAnchorLoading { ProgressView("Checking with Vox…") }
-            if let problem = model.roomAnchorError {
-                Text(problem).foregroundStyle(VoxTokens.Colors.danger)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .accessibilityIdentifier("room-anchor-problem")
-            }
+            }.accessibilityIdentifier("room-anchor-editor-body")
             HStack { Spacer(); Button("Done") { dismiss() }.keyboardShortcut(.defaultAction) }
         }
         .padding(Space.s24)
@@ -361,36 +365,38 @@ struct RoomAnchorSearch: View {
                 Text(applyingToRoom ? "No anchors found. This room's configuration is unchanged."
                      : "No anchors found. You can create without one.").secondaryText()
             }
-            ScrollView {
-                VStack(alignment: .leading, spacing: Space.s8) {
-                    ForEach(choices.found, id: \.fingerprint) { endpoint in
-                        VStack(alignment: .leading, spacing: Space.s4) {
-                            Text(endpoint.fingerprint).font(Theme.mono).textSelection(.enabled)
-                            Text(endpoint.addresses.joined(separator: ", ")).font(Theme.mono).textSelection(.enabled)
-                            if !applyingToRoom && choices.kept.contains(where: {
-                                $0.fingerprint == endpoint.fingerprint && Set($0.addresses) == Set(endpoint.addresses)
-                            }) {
-                                Button("Remove") { choices.remove(endpoint) }
-                            } else {
-                                Button(applyingToRoom ? "Keep for This Room"
-                                       : (choices.kept.contains(where: { $0.fingerprint == endpoint.fingerprint })
-                                          ? "Keep Additional Addresses" : "Keep")) {
-                                    if applyingToRoom {
-                                        let context = model.anchorChoiceContext
-                                        Task {
-                                            for address in endpoint.addresses {
-                                                guard !Task.isCancelled, model.anchorChoiceContext == context else { return }
-                                                guard await model.changeRoomAnchor(input: endpoint.fingerprint + "@" + address) else { return }
-                                                guard !Task.isCancelled, model.anchorChoiceContext == context else { return }
+            if !choices.found.isEmpty {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: Space.s8) {
+                        ForEach(choices.found, id: \.fingerprint) { endpoint in
+                            VStack(alignment: .leading, spacing: Space.s4) {
+                                Text(endpoint.fingerprint).font(Theme.mono).textSelection(.enabled)
+                                Text(endpoint.addresses.joined(separator: ", ")).font(Theme.mono).textSelection(.enabled)
+                                if !applyingToRoom && choices.kept.contains(where: {
+                                    $0.fingerprint == endpoint.fingerprint && Set($0.addresses) == Set(endpoint.addresses)
+                                }) {
+                                    Button("Remove") { choices.remove(endpoint) }
+                                } else {
+                                    Button(applyingToRoom ? "Keep for This Room"
+                                           : (choices.kept.contains(where: { $0.fingerprint == endpoint.fingerprint })
+                                              ? "Keep Additional Addresses" : "Keep")) {
+                                        if applyingToRoom {
+                                            let context = model.anchorChoiceContext
+                                            Task {
+                                                for address in endpoint.addresses {
+                                                    guard !Task.isCancelled, model.anchorChoiceContext == context else { return }
+                                                    guard await model.changeRoomAnchor(input: endpoint.fingerprint + "@" + address) else { return }
+                                                    guard !Task.isCancelled, model.anchorChoiceContext == context else { return }
+                                                }
                                             }
-                                        }
-                                    } else { choices.keep(endpoint) }
-                                }.disabled(applyingToRoom && (!model.canManageRoomAnchors || model.roomAnchorChanging))
-                            }
-                        }.accessibilityIdentifier("room-anchor-choice-" + endpoint.fingerprint)
+                                        } else { choices.keep(endpoint) }
+                                    }.disabled(applyingToRoom && (!model.canManageRoomAnchors || model.roomAnchorChanging))
+                                }
+                            }.accessibilityIdentifier("room-anchor-choice-" + endpoint.fingerprint)
+                        }
                     }
-                }
-            }.frame(maxHeight: 140)
+                }.frame(height: Theme.scaled(140))
+            }
             if let problem = choices.problem { Text(problem).foregroundStyle(VoxTokens.Colors.danger) }
             if !applyingToRoom {
                 Text(choices.kept.isEmpty ? "The room link will carry no anchors."
