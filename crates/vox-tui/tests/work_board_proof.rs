@@ -138,6 +138,8 @@ fn two_agents_split_work_and_only_one_holds_a_contested_resource() {
         "PRODUCT: bob must see it held by someone who is not him: {bob_board:?}"
     );
 
+    member_work_roundtrip(alice, bob, &room);
+
     // ---- (4) a release frees it, and the new claim succeeds ----
     let (ok, _, err) = vox(alice, &["room", "release", &room, "port-the-codec"]);
     assert!(ok, "PRODUCT: alice could not release: {err}");
@@ -235,5 +237,180 @@ fn two_agents_split_work_and_only_one_holds_a_contested_resource() {
     println!(
         "[proof] contested claim: 1 winner, loser refused naming the holder; release freed it; \
          a {TTL_SECS}s ttl bound bob while live and freed itself once it lapsed"
+    );
+}
+
+/// ADR-033 WD: this is also the narrow on-demand excerpt for the member-panel backend.
+/// The daemon owns the fold; the native panel consumes the same Work rows through FFI.
+/// Native rendering, plain non-link text and reopening are observed separately in the app.
+fn member_work_roundtrip(alice: &Worker, bob: &Worker, room: &str) {
+    const WORK: &str = "gwa:example/room:member-work";
+    let claim = alice.vox(
+        Some("alice"),
+        &[
+            "room", "claim", room, "--work", WORK, "--task", "#769", "--json",
+        ],
+    );
+    claim.expect_ok("claim the member-panel work item");
+    until(
+        bob,
+        None,
+        "the tagged claim's public row",
+        &["room", "read", room, "--json"],
+        |o| o.ok && o.stdout.contains(WORK),
+    );
+    let board = bob.vox(Some("bob"), &["room", "board", room, "--json"]);
+    board.expect_ok("read the member work board");
+    let json = board.json();
+    let work = json["work"]
+        .as_array()
+        .expect("PRODUCT: board omitted its work rows");
+    assert!(work.iter().any(|r| r["type"] == "claim" && r["member"] == alice.b32()
+        && r["session"] == "alice" && r["work"] == WORK
+        && r["tags"].as_array().is_some_and(|ts| ts.iter().any(|t| t == "task:#769"))),
+        "PRODUCT: daemon board omitted the current member/Session claim, task or plain work reference: {board:?}");
+
+    let ask = alice.vox(
+        Some("alice"),
+        &[
+            "room", "post", room, "WD_ASK", "--type", "ask", "--to", "bob", "--work", WORK,
+            "--json",
+        ],
+    );
+    ask.expect_ok("address a work ask to bob");
+    let ask_id = ask.json()["entry_hash"]
+        .as_str()
+        .expect("PRODUCT: posted ask has no hash")
+        .to_owned();
+    until(
+        bob,
+        None,
+        "the addressed ask's public row",
+        &["room", "read", room, "--json"],
+        |o| o.ok && o.stdout.contains(&ask_id),
+    );
+    let unread = bob.vox(Some("bob"), &["room", "board", room, "--json"]);
+    unread.expect_ok("read the unanswered ask");
+    assert!(
+        unread.json()["work"].as_array().is_some_and(|rs| rs
+            .iter()
+            .any(|r| r["type"] == "ask" && r["entry_hash"] == ask_id && r["member"] == bob.b32())),
+        "PRODUCT: the addressed, unanswered ask is absent from bob's board: {unread:?}"
+    );
+    let unrelated = alice.vox(
+        Some("alice"),
+        &[
+            "room",
+            "post",
+            room,
+            "WD_SENDER_FOLLOWUP",
+            "--re",
+            &ask_id,
+            "--json",
+        ],
+    );
+    unrelated.expect_ok("post the asker's own follow-up");
+    let still = alice.vox(Some("alice"), &["room", "board", room, "--json"]);
+    still.expect_ok("read the ask after an unrelated responder");
+    assert!(
+        still.json()["work"]
+            .as_array()
+            .is_some_and(|rs| rs.iter().any(|r| r["entry_hash"] == ask_id)),
+        "PRODUCT: the asker's own reply incorrectly answered bob's ask: {still:?}"
+    );
+    let answer = bob.vox(
+        Some("bob"),
+        &[
+            "room",
+            "post",
+            room,
+            "WD_ANSWER",
+            "--type",
+            "answer",
+            "--re",
+            &ask_id,
+            "--json",
+        ],
+    );
+    answer.expect_ok("bob answers the addressed ask");
+    let answer_id = answer.json()["entry_hash"]
+        .as_str()
+        .expect("PRODUCT: answer has no hash")
+        .to_owned();
+    until(
+        alice,
+        None,
+        "bob's answer's public row",
+        &["room", "read", room, "--json"],
+        |o| o.ok && o.stdout.contains(&answer_id),
+    );
+    let answered = alice.vox(Some("alice"), &["room", "board", room, "--json"]);
+    answered.expect_ok("read the answered work board");
+    assert!(
+        answered.json()["work"]
+            .as_array()
+            .is_some_and(|rs| !rs.iter().any(|r| r["entry_hash"] == ask_id)),
+        "PRODUCT: bob's exact reply did not clear his addressed ask: {answered:?}"
+    );
+
+    let blocked = alice.vox(
+        Some("alice"),
+        &[
+            "room",
+            "post",
+            room,
+            "WD_BLOCKED",
+            "--type",
+            "blocked",
+            "--work",
+            WORK,
+            "--data",
+            "{\"reason\":\"waiting for the member response\"}",
+            "--json",
+        ],
+    );
+    blocked.expect_ok("publish the owner's blocked reason");
+    let waiting = alice.vox(Some("alice"), &["room", "board", room, "--json"]);
+    waiting.expect_ok("read the blocked work");
+    assert!(
+        waiting.json()["work"].as_array().is_some_and(|rs| rs
+            .iter()
+            .any(|r| r["type"] == "blocked" && r["work"] == WORK)),
+        "PRODUCT: board omitted the owner's blocked work: {waiting:?}"
+    );
+    alice
+        .vox(
+            Some("alice"),
+            &[
+                "room",
+                "post",
+                room,
+                "WD_WORKING",
+                "--type",
+                "working",
+                "--work",
+                WORK,
+                "--json",
+            ],
+        )
+        .expect_ok("publish the owner's resumed work");
+    let resumed = alice.vox(Some("alice"), &["room", "board", room, "--json"]);
+    resumed.expect_ok("read resumed work");
+    assert!(
+        resumed.json()["work"].as_array().is_some_and(|rs| !rs
+            .iter()
+            .any(|r| r["type"] == "blocked" && r["work"] == WORK)),
+        "PRODUCT: owner's working post did not clear blocked work: {resumed:?}"
+    );
+    alice
+        .vox(Some("alice"), &["room", "release", room, WORK, "--json"])
+        .expect_ok("release member-panel work");
+    let fresh = alice.vox(Some("alice"), &["room", "board", room, "--json"]);
+    fresh.expect_ok("reopen the work board after release");
+    assert!(
+        fresh.json()["work"]
+            .as_array()
+            .is_some_and(|rs| !rs.iter().any(|r| r["type"] == "claim" && r["work"] == WORK)),
+        "PRODUCT: a fresh board retained the released claim: {fresh:?}"
     );
 }

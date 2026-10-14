@@ -87,3 +87,4 @@ pub mod syncstream;
 pub mod trust;
 pub mod tunnel;
 pub mod up;
+pub mod work_board;
