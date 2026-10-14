@@ -40,11 +40,7 @@ impl<'a> Read<'a> {
         self.source.number(self.sek, self.room, root, key)
     }
     /// The first key at or beyond an exact prefix, without walking preceding pages.
-    pub(crate) fn first_at_or_after(
-        &self,
-        root: u64,
-        key: Key,
-    ) -> Result<Option<(Key, u64)>> {
+    pub(crate) fn first_at_or_after(&self, root: u64, key: Key) -> Result<Option<(Key, u64)>> {
         self.source
             .first(self.sek, self.room, root, &key, 0)?
             .map(number)

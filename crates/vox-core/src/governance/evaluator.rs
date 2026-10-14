@@ -318,9 +318,7 @@ impl Evaluator {
             let Some(key) = author_key(&e.author_id) else {
                 continue; // author key unknown: cannot verify, cannot trust
             };
-            if known.is_some_and(|k| k.contains(&e.entry_hash))
-                || e.body.verify(&key).is_ok()
-            {
+            if known.is_some_and(|k| k.contains(&e.entry_hash)) || e.body.verify(&key).is_ok() {
                 verified.push(e);
             }
         }
