@@ -292,9 +292,33 @@ final class RoomAnchorChoices: ObservableObject {
     @Published private(set) var searched = false
     @Published private(set) var noSearchAnswers = false
     @Published private(set) var problem: String?
+    @Published private(set) var linkPreview: RoomLinkPreview?
+    @Published private(set) var previewProblem: String?
+    private var previewGeneration = UUID()
+    var previewIdentity: String {
+        kept.map { $0.fingerprint + "@" + $0.addresses.joined(separator: ",") }.joined(separator: ";")
+    }
     private var generation = UUID()
     func retire() {
         generation = UUID(); found = []; kept = []; busy = false; searched = false; noSearchAnswers = false; problem = nil
+        retirePreview()
+    }
+    private func retirePreview() {
+        previewGeneration = UUID(); linkPreview = nil; previewProblem = nil
+    }
+    func preview(_ model: NodeModel) async {
+        let request = UUID(), context = model.anchorChoiceContext, identity = previewIdentity
+        previewGeneration = request; linkPreview = nil; previewProblem = nil
+        do {
+            let result = try await model.previewRoomAnchorChoices(kept, context: context)
+            guard !Task.isCancelled, previewGeneration == request, previewIdentity == identity,
+                  model.anchorChoiceContext == context else { return }
+            linkPreview = result
+        } catch {
+            guard !Task.isCancelled, previewGeneration == request, previewIdentity == identity,
+                  model.anchorChoiceContext == context else { return }
+            previewProblem = sentence(error)
+        }
     }
     func request(_ model: NodeModel, input: String? = nil) async {
         guard !busy else { return }
@@ -331,10 +355,13 @@ final class RoomAnchorChoices: ObservableObject {
         let previous = kept.first { $0.fingerprint == endpoint.fingerprint }
         let merged = RoomAnchorEndpoint(fingerprint: endpoint.fingerprint,
             addresses: Array(Set((previous?.addresses ?? []) + endpoint.addresses)).sorted())
+        retirePreview()
         kept.removeAll { $0.fingerprint == endpoint.fingerprint }; kept.append(merged)
         found.removeAll { $0.fingerprint == endpoint.fingerprint }; found.append(merged)
     }
-    func remove(_ endpoint: RoomAnchorEndpoint) { kept.removeAll { $0.fingerprint == endpoint.fingerprint } }
+    func remove(_ endpoint: RoomAnchorEndpoint) {
+        retirePreview(); kept.removeAll { $0.fingerprint == endpoint.fingerprint }
+    }
 }
 
 struct RoomAnchorSearch: View {
@@ -399,10 +426,37 @@ struct RoomAnchorSearch: View {
             }
             if let problem = choices.problem { Text(problem).foregroundStyle(VoxTokens.Colors.danger) }
             if !applyingToRoom {
-                Text(choices.kept.isEmpty ? "The room link will carry no anchors."
-                     : "The room link will carry: " + choices.kept.map { $0.fingerprint + "@" + $0.addresses.joined(separator: ", ") }.joined(separator: "; "))
-                    .secondaryText().fixedSize(horizontal: false, vertical: true)
+                ScrollView {
+                    VStack(alignment: .leading, spacing: Space.s4) {
+                if let preview = choices.linkPreview {
+                    Text(preview.anchors.isEmpty ? "The room link will carry no room anchors."
+                         : "Room anchors in this link: " + preview.anchors.map {
+                             $0.fingerprint + "@" + $0.addresses.joined(separator: ", ")
+                         }.joined(separator: "; "))
+                        .accessibilityIdentifier("room-link-anchor-preview")
+                    if let direct = preview.direct {
+                        Text("Direct route to this node: " + direct.fingerprint + "@" + direct.addresses.joined(separator: ", "))
+                            .accessibilityIdentifier("room-link-direct-preview")
+                    }
+                    if preview.omitted > 0 {
+                        Text("\(preview.omitted) selected room anchors cannot fit in this link; they remain in the room's configuration.")
+                            .accessibilityIdentifier("room-link-omitted-preview")
+                    }
+                } else if let problem = choices.previewProblem {
+                    Text("Link preview unavailable: " + problem)
+                        .accessibilityIdentifier("room-link-preview-unavailable")
+                } else {
+                    Text("Checking what this link will carry…")
+                        .accessibilityIdentifier("room-link-preview-pending")
+                }
+                    }.secondaryText().fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }.frame(height: Theme.scaled(120))
+                    .accessibilityIdentifier("room-link-preview")
             }
+        }
+        .task(id: model.anchorChoiceContext + "/" + choices.previewIdentity) {
+            if !applyingToRoom { await choices.preview(model) }
         }
         .onChange(of: model.anchorChoiceContext) { _ in choices.retire() }
         .onDisappear { choices.retire() }

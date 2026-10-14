@@ -9849,23 +9849,14 @@ impl Node {
         // The link names the room's own anchors and this node last. Machine hand-added
         // anchors do not become the room's merely because this node uses them. This node's own
         // addresses may not be, and a joiner tries them in this order.
-        let mut anchors: Vec<BootstrapNode> = Vec::new();
-        if let Some(shared) = self.channels.get(channel_id) {
-            for n in shared.lock().await.anchors().nodes() {
-                anchors.push(n.clone());
-            }
-        }
+        let anchors = match self.channels.get(channel_id) {
+            Some(shared) => shared.lock().await.anchors().clone(),
+            None => crate::nat::bootstrap::BootstrapSet::new(),
+        };
         // **This node always survives the cap** (V210-96, C6): it was appended last and then
         // truncated with the rest, so four anchors left the link naming no route to the host itself,
         // which always holds its room, and a guest who could reach it directly had no way to.
-        anchors.retain(|a| a.id != net.local_id());
-        let me = net
-            .local_endpoints()
-            .ok()
-            .and_then(|own| BootstrapNode::new(net.local_id(), own).ok());
-        anchors.truncate(crate::node::link::MAX_LINK_ANCHORS - usize::from(me.is_some()));
-        anchors.extend(me);
-        anchors
+        crate::node::link::preview_routes(&anchors, net.local_id(), net.local_endpoints().ok()).0
     }
 
     /// **An address is handed out at once whenever a guest could find the host through it**

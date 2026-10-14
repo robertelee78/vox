@@ -4890,6 +4890,7 @@ pub async fn create(
         )));
     }
     let anchors = chosen_anchors(paths, anchor_inputs, find_anchor).await?;
+    show_link_preview(&mut client, &anchors).await?;
     let passphrase = room_passphrase(passphrase_file, "a passphrase for the new room", true)?;
     let kept = zeroize::Zeroizing::new(if bind.is_some() {
         passphrase.clone()
@@ -4976,6 +4977,49 @@ pub async fn create(
     }
 }
 
+/// Show the exact capped link routes, separately from the complete signed room configuration.
+async fn show_link_preview(
+    client: &mut IpcClient,
+    anchors: &vox_core::nat::bootstrap::BootstrapSet,
+) -> Result<(), AppError> {
+    match client
+        .request(&Request::LinkPreview {
+            anchors: anchors.clone(),
+        })
+        .await?
+    {
+        Frame::LinkPreview {
+            node,
+            routes,
+            omitted,
+        } => {
+            if routes.iter().all(|r| r.id == node) {
+                println!("vox: the room link will carry no anchors");
+            }
+            for route in routes {
+                let kind = if route.id == node {
+                    "direct route"
+                } else {
+                    "anchor"
+                };
+                for address in route.endpoints.addrs() {
+                    println!("vox: link {kind} {} at {address}", b32_encode(&route.id));
+                }
+            }
+            if omitted > 0 {
+                println!(
+                    "vox: {omitted} more room anchor(s) stay configured but do not fit in the link"
+                );
+            }
+            Ok(())
+        }
+        Frame::Error { reason } => Err(AppError::Usage(format!(
+            "cannot preview the room link: {reason}"
+        ))),
+        other => Err(crate::client::unexpected(&other)),
+    }
+}
+
 /// Resolve only inputs the person supplied, and search only on their explicit request.
 async fn chosen_anchors(
     paths: &Paths,
@@ -4994,8 +5038,9 @@ async fn chosen_anchors(
     if inputs.is_empty() && !find {
         return Ok(set);
     }
-    let mut daemon = DaemonClient::open(&paths.account().socket()).await?;
     for input in inputs {
+        // A daemon request is a connection's opening, followed by one reply and close.
+        let mut daemon = DaemonClient::open(&paths.account().socket()).await?;
         let spec = match daemon
             .request(DaemonRequest::AnchorResolve {
                 input: input.clone(),
@@ -5019,6 +5064,7 @@ async fn chosen_anchors(
         .map_err(|e| AppError::Usage(e.to_string()))??;
     }
     if find {
+        let mut daemon = DaemonClient::open(&paths.account().socket()).await?;
         match daemon.request(DaemonRequest::AnchorSearch).await? {
             DaemonFrame::AnchorsFound(found) => {
                 if found.is_empty() {

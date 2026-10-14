@@ -188,6 +188,19 @@ pub struct RoomAnchorEndpoint {
     pub addresses: Vec<String>,
 }
 
+/// Exactly what a newly created room's link would carry on this node now.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct RoomLinkPreview {
+    /// Full fingerprint of the node whose addresses were read.
+    pub node: String,
+    /// Room anchors inside the link cap, in the link's order.
+    pub anchors: Vec<RoomAnchorEndpoint>,
+    /// This node's own direct route, separate from the room's anchors.
+    pub direct: Option<RoomAnchorEndpoint>,
+    /// Selected room anchors kept in the configuration but omitted from the link.
+    pub omitted: u32,
+}
+
 /// The held node's current observation of one room's signed anchor configuration.
 /// Identity-level reach observations are separate and do not prove these addresses were dialed.
 #[derive(Debug, Clone, uniffi::Record)]
@@ -3055,6 +3068,60 @@ impl VoxClient {
         };
         on_held!(self, |c| done(c, &req).await)?;
         self.new_room(before, "the room was created").await
+    }
+
+    /// Preview exactly the link routes for the resolved anchors the person kept, without
+    /// creating a room, searching or dialing. Fence the full selected-node fingerprint.
+    pub async fn preview_room_link(
+        &self,
+        anchors: Vec<RoomAnchorEndpoint>,
+        node: String,
+    ) -> Result<RoomLinkPreview, VoxError> {
+        let expected = digest(&node, "creating node")?;
+        let anchors = pinned_anchor_set(anchors)?;
+        on_held!(self, |c| {
+            if c.me() != Some(expected) {
+                return Err(failed(
+                    "the selected node changed; review the room before creating it",
+                ));
+            }
+            match ask(c, &Request::LinkPreview { anchors }).await? {
+                Frame::LinkPreview {
+                    node,
+                    routes,
+                    omitted,
+                } if node == expected => {
+                    let mut anchors = Vec::new();
+                    let mut direct = None;
+                    for route in routes {
+                        let endpoint = RoomAnchorEndpoint {
+                            fingerprint: b32_encode(&route.id),
+                            addresses: route
+                                .endpoints
+                                .addrs()
+                                .iter()
+                                .map(ToString::to_string)
+                                .collect(),
+                        };
+                        if route.id == node {
+                            direct = Some(endpoint);
+                        } else {
+                            anchors.push(endpoint);
+                        }
+                    }
+                    Ok(RoomLinkPreview {
+                        node: b32_encode(&node),
+                        anchors,
+                        direct,
+                        omitted: omitted as u32,
+                    })
+                }
+                Frame::LinkPreview { .. } => Err(failed(
+                    "the selected node changed; review the room before creating it",
+                )),
+                other => Err(unexpected(&other)),
+            }
+        })
     }
 
     /// Create using only the already resolved anchors the person kept. Check the full expected
