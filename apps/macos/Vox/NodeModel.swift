@@ -161,6 +161,9 @@ final class NodeModel: ObservableObject {
     @Published private(set) var threadError: String?
     private var threadGeneration = UUID()
     private var threadRefreshID = UUID()
+    private var threadSummaryVersions: [String: UUID] = [:]
+    private var threadAuthorRequests: [String: UUID] = [:]
+    private var threadPageDirty = false
     private var threadRefreshDirty = false
     private var threadPagesLoaded = 1
     private var threadRefreshTask: Task<Void, Never>?
@@ -2370,6 +2373,9 @@ extension NodeModel {
         threadRefreshTask = nil
         threadRefreshID = UUID()
         threadRefreshDirty = false
+        threadSummaryVersions = [:]
+        threadAuthorRequests = [:]
+        threadPageDirty = false
         threadPagesLoaded = 1
         threadPageTask?.cancel()
         threadSummaries = [:]
@@ -2418,12 +2424,14 @@ extension NodeModel {
                             throw VoxError.Failed(reason: "The reply summary belongs to another message.")
                         }
                         self.threadSummaries[root] = summary
+                        self.threadSummaryVersions[root] = UUID()
                         self.threadSummaryErrors[root] = nil
                     } catch {
                         guard !Task.isCancelled, self.roomReadGeneration == generation,
                               self.nodeObservationEpoch == epoch, self.roomOnScreen == room,
                               self.ended == nil else { return }
                         self.threadSummaries[root] = nil
+                        self.threadSummaryVersions[root] = UUID()
                         self.threadSummaryErrors[root] = sentence(error)
                     }
                 }
@@ -2437,6 +2445,7 @@ extension NodeModel {
         threadPageTask?.cancel()
         threadLoading = false
         threadPagesLoaded = 1
+        threadPageDirty = false
         openThread = message.id
         threadRootMessage = message
         threadReplies = []
@@ -2451,6 +2460,7 @@ extension NodeModel {
         threadGeneration = UUID()
         threadPageTask?.cancel()
         threadPagesLoaded = 1
+        threadPageDirty = false
         openThread = nil
         threadRootMessage = nil
         threadReplies = []
@@ -2460,7 +2470,12 @@ extension NodeModel {
     }
 
     private func refreshOpenThread() {
-        guard openThread != nil, !threadLoading else { return }
+        guard openThread != nil else { return }
+        if threadLoading {
+            threadPageDirty = true
+            return
+        }
+        threadPageDirty = false
         loadThreadPage(replacing: true)
     }
 
@@ -2480,6 +2495,10 @@ extension NodeModel {
             defer {
                 if self.threadGeneration == generation, self.openThread == root {
                     self.threadLoading = false
+                    if self.threadPageDirty {
+                        self.threadPageDirty = false
+                        self.refreshOpenThread()
+                    }
                 }
             }
             func current() -> Bool {
@@ -2538,22 +2557,41 @@ extension NodeModel {
         threadRootMessage?.id == id ? threadRootMessage : threadReplies.first { $0.id == id }
     }
 
+    func retryThreadSummary(_ root: String) {
+        if threadSummaries[root]?.nextAuthor != nil {
+            Task { await moreThreadAuthors(root) }
+        } else {
+            scheduleThreadRefresh()
+        }
+    }
+
     func moreThreadAuthors(_ root: String) async {
         guard let room = roomOnScreen, let held = threadSummaries[root],
               let after = held.nextAuthor, ended == nil else { return }
         let generation = roomReadGeneration
         let epoch = nodeObservationEpoch
+        let snapshot = threadSummaryVersions[root]
+        let request = UUID()
+        threadAuthorRequests[root] = request
+        threadSummaryErrors[root] = nil
+        func current() -> Bool {
+            roomOnScreen == room && roomReadGeneration == generation
+                && nodeObservationEpoch == epoch && ended == nil && !Task.isCancelled
+                && threadSummaryVersions[root] == snapshot && threadAuthorRequests[root] == request
+        }
         do {
             let page = try await client.threadSummary(room: room, root: root, afterAuthor: after)
-            guard roomOnScreen == room, roomReadGeneration == generation,
-                  nodeObservationEpoch == epoch, ended == nil, !Task.isCancelled,
-                  threadSummaries[root]?.nextAuthor == after else { return }
+            guard current(), let latest = threadSummaries[root],
+                  latest.root == held.root, latest.replyCount == held.replyCount,
+                  latest.lastReplyMillis == held.lastReplyMillis,
+                  latest.nextAuthor == held.nextAuthor,
+                  latest.authors.map({ $0.fingerprint + "\u{0}" + $0.name })
+                    == held.authors.map({ $0.fingerprint + "\u{0}" + $0.name }) else { return }
             guard page.root == root, page.nextAuthor != after else {
                 throw VoxError.Failed(reason: "The thread's author page did not advance.")
             }
             // Only combine pages from the same authoritative count/time snapshot.
             guard page.replyCount == held.replyCount, page.lastReplyMillis == held.lastReplyMillis else {
-                threadSummaries[root] = page
                 scheduleThreadRefresh()
                 return
             }
@@ -2562,9 +2600,9 @@ extension NodeModel {
                 lastReplyMillis: held.lastReplyMillis,
                 authors: held.authors + page.authors.filter { !known.contains($0.fingerprint) },
                 nextAuthor: page.nextAuthor)
+            threadSummaryVersions[root] = UUID()
         } catch {
-            guard roomOnScreen == room, roomReadGeneration == generation,
-                  nodeObservationEpoch == epoch, ended == nil else { return }
+            guard current() else { return }
             threadSummaryErrors[root] = sentence(error)
         }
     }
