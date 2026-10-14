@@ -1512,7 +1512,7 @@ private struct RoomTimelineView: View {
             HStack(spacing: Space.s8 * scale) {
                 Text("\(model.node) ▸").font(Theme.text).secondaryText()
                     .lineLimit(1).truncationMode(.middle)
-                    .frame(maxWidth: 80 * scale)
+                    .frame(minWidth: 48 * scale, idealWidth: 80 * scale, maxWidth: 80 * scale, alignment: .leading)
                     .help("Posting as \(model.node)")
                     .accessibilityIdentifier("compose-as")
                 ComposerTokens(model: model, to: $to, urgent: urgency)
@@ -1525,7 +1525,6 @@ private struct RoomTimelineView: View {
                     .accessibilityLabel("Message \(model.roomName(room)), as \(model.node)")
                     .textFieldStyle(.plain)
                     .frame(minWidth: 80 * scale, maxWidth: .infinity, minHeight: Space.s24 * scale)
-                    .layoutPriority(1)
                     .onSubmit { send(urgent: urgent) }
                     .accessibilityIdentifier("compose")
                 ComposerAddress(model: model, to: $to, urgent: urgency)

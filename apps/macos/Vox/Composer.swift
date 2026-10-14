@@ -141,7 +141,8 @@ struct ComposerTokens: View {
                 }
             }
             .scrollIndicators(.hidden)
-            .frame(maxWidth: 160 * scale)
+            // Keep a usable viewport beside the elastic text field, even in a narrow room.
+            .frame(minWidth: 96 * scale, idealWidth: 160 * scale, maxWidth: 160 * scale)
             .frame(height: Space.s24 * scale)
         }
     }
