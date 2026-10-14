@@ -7059,11 +7059,9 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             }
         }
         Request::RoomDisplayRevision { channel_id } => {
-            match handle.room_display_revision(&channel_id) {
-                Some(revision) => Frame::RoomDisplayRevision { revision },
-                None => Frame::Error {
-                    reason: "room not open".into(),
-                },
+            match handle.room_display_revision(&channel_id).await {
+                Ok(revision) => Frame::RoomDisplayRevision { revision },
+                Err(reason) => Frame::Error { reason },
             }
         }
         Request::ThreadSummary {

@@ -4194,34 +4194,25 @@ impl NodeHandle {
         ])
     }
 
-    /// An opaque cache token for one open room's published rows and display names (#754).
-    /// Borrows the watch: no timeline scan, snapshot construction or retained view clone.
-    /// Name hashing is proportional to the current keyring/presentations, not room history.
-    /// Callers discard tokens when replacing their selected-node connection.
-    pub(crate) fn room_display_revision(&self, channel_id: &Digest32) -> Option<Digest32> {
-        use sha2::{Digest, Sha256};
-        let view = self.view_rx.borrow();
-        let detail = view
-            .open_channels
-            .iter()
-            .find(|d| &d.channel_id == channel_id)?;
-        let mut hash = Sha256::new();
-        hash.update(b"vox-room-display-revision-v1");
-        hash.update(self.display_incarnation);
-        hash.update(view.identity.as_ref()?.fingerprint);
-        hash.update(channel_id);
-        hash.update(detail.display_revision.to_be_bytes());
-        // Alias collisions depend on the whole keyring. A name change can alter a shown
-        // author's suffix even when the renamed fingerprint is not a thread participant.
-        for names in [&view.trusted, &view.presented] {
-            hash.update((names.len() as u64).to_be_bytes());
-            for (fingerprint, name) in names {
-                hash.update(fingerprint);
-                hash.update((name.len() as u64).to_be_bytes());
-                hash.update(name.as_bytes());
-            }
+    /// An opaque token for the authoritative selected history and current display names.
+    /// The actor reads the sealed revision under the same gate and room lock as Find; a
+    /// busy room cannot substitute an older published watch value. No rows are collected.
+    pub(crate) async fn room_display_revision(
+        &self,
+        channel_id: &Digest32,
+    ) -> std::result::Result<Digest32, String> {
+        use crate::node::channel::history::{Query, Reply};
+        match self
+            .room_history(*channel_id, Query::DisplayRevision)
+            .await?
+        {
+            Reply::DisplayRevision(revision) => Ok(crate::hash::sha256_concat(&[
+                b"vox-room-display-revision-v2",
+                &self.display_incarnation,
+                &revision,
+            ])),
+            _ => Err("unexpected history revision answer".into()),
         }
-        Some(hash.finalize().into())
     }
 
     /// A receiver that resolves whenever the view changes.
@@ -9441,12 +9432,41 @@ impl Node {
                 reply,
             } => {
                 let result = match (self.channels.get(&channel_id), self.profile.as_ref()) {
-                    (Some(shared), Some(profile)) => shared.lock().await.history_query(
-                        profile.store(),
-                        query,
-                        crate::node::ipc::rows_budget(),
-                        (self.clock)(),
-                    ),
+                    (Some(shared), Some(profile)) => {
+                        use crate::node::channel::history::Reply;
+                        let mut room = shared.lock().await;
+                        match room.history_query(
+                            profile.store(),
+                            query,
+                            crate::node::ipc::rows_budget(),
+                            (self.clock)(),
+                        ) {
+                            Ok(Reply::DisplayRevision(revision)) => {
+                                use sha2::{Digest, Sha256};
+                                let mut hash = Sha256::new();
+                                hash.update(b"vox-room-display-names-v1");
+                                hash.update(profile.fingerprint());
+                                hash.update(revision);
+                                // Alias collisions depend on the entire current keyring.
+                                // These bounded maps are actor-owned and cannot change
+                                // while this serialized query holds the selected room.
+                                hash.update((self.trust.iter().count() as u64).to_be_bytes());
+                                for (fingerprint, name) in self.trust.iter() {
+                                    hash.update(fingerprint);
+                                    hash.update((name.len() as u64).to_be_bytes());
+                                    hash.update(name.as_bytes());
+                                }
+                                hash.update((self.presented.len() as u64).to_be_bytes());
+                                for (fingerprint, (name, _)) in &self.presented {
+                                    hash.update(fingerprint);
+                                    hash.update((name.len() as u64).to_be_bytes());
+                                    hash.update(name.as_bytes());
+                                }
+                                Ok(Reply::DisplayRevision(hash.finalize().into()))
+                            }
+                            other => other,
+                        }
+                    }
                     _ => Err("room not open".into()),
                 };
                 let _ = reply.send(result);

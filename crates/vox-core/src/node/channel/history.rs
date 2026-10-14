@@ -11,6 +11,7 @@ use crate::node::api::{
 
 pub(crate) enum Query {
     Governance(crate::node::api::GovernanceQuery),
+    DisplayRevision,
     ArrivalHead,
     OperationPage {
         author: Digest32,
@@ -80,6 +81,7 @@ pub(crate) enum Query {
 
 pub(crate) enum Reply {
     Governance(crate::node::api::GovernancePage),
+    DisplayRevision(Digest32),
     ArrivalHead(HistoryCursor),
     OperationPage {
         rows: Vec<MessageRow>,
@@ -482,6 +484,22 @@ impl View<'_> {
     fn answer(&self, query: Query, bytes: usize) -> Answer<Reply> {
         let cursor_error = "cursor not in this room's timeline";
         match query {
+            Query::DisplayRevision => {
+                use sha2::{Digest, Sha256};
+                let revision = Revision::of(self.ch, &self.rendered)?;
+                let mut hash = Sha256::new();
+                hash.update(b"vox-room-history-revision-v1");
+                hash.update(self.ch.channel_id());
+                hash.update(self.rendered.history_instance());
+                hash.update(self.ch.projection_state.incarnation.to_be_bytes());
+                for fact in revision.facts {
+                    hash.update(fact.to_be_bytes());
+                }
+                for root in revision.rendered_roots {
+                    hash.update(root.to_be_bytes());
+                }
+                Ok(Reply::DisplayRevision(hash.finalize().into()))
+            }
             Query::Governance(query) => Ok(Reply::Governance(
                 self.ch.governance_page(self.store, query)?,
             )),
@@ -963,13 +981,28 @@ impl ChannelState {
 
 /// A bounded refresh cursor, never a copy of rows. Policy/classification changes must
 /// settle before exact projection answers; ordinary row changes update their own facts.
-#[derive(Default)]
 pub(super) struct State {
+    /// Unique for this open room in this process; the public token also binds the actor's
+    /// random lifetime. An allocator address alone could be reused after closing the room.
+    incarnation: u64,
     policy: Option<[u64; 3]>,
     pending: bool,
     cursor: Option<(Digest32, u64)>,
     through: Option<(Digest32, u64)>,
     pub(super) cleanup_cursor: Option<(Digest32, u64)>,
+}
+impl Default for State {
+    fn default() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self {
+            incarnation: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            policy: None,
+            pending: false,
+            cursor: None,
+            through: None,
+            cleanup_cursor: None,
+        }
+    }
 }
 impl State {
     pub(super) fn owed_range(&mut self, author: Digest32, from: u64, through: u64) {

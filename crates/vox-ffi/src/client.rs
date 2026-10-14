@@ -991,6 +991,8 @@ pub struct FfiSessionRead {
 /// One bounded room-history page, with how to fetch the preceding page on scroll (FR-4).
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct FfiRoomRead {
+    /// Opaque 16-byte saved-room identity for refreshing or marking this held window.
+    pub instance: Vec<u8>,
     /// Messages in room order, oldest first.
     pub messages: Vec<RoomMessage>,
     /// How many older messages precede this page.
@@ -1963,40 +1965,39 @@ macro_rules! on_held {
     }};
 }
 
-impl VoxClient {
-    async fn oldest_retained_room_entry(
-        &self,
-        channel_id: Digest32,
-        entries: &[Digest32],
-    ) -> Result<Option<String>, VoxError> {
-        let entries = entries.to_vec();
-        on_held!(self, |c| {
-            let mut boundary = None;
-            for chunk in entries.chunks(vox_core::node::ipc::MAX_FIND) {
-                let rows = match ask(
-                    c,
-                    &Request::Find {
-                        channel_id,
-                        entries: chunk.to_vec(),
-                    },
-                )
-                .await?
-                {
-                    Frame::Rows { rows } => rows,
-                    other => return Err(unexpected(&other)),
-                };
-                if let Some(id) = chunk
-                    .iter()
-                    .find(|id| rows.iter().any(|r| r.entry_hash == **id))
-                {
-                    boundary = Some(b32_encode(id));
-                    break;
-                }
-            }
-            Ok(boundary)
-        })
-    }
+/// A native window holds at most 128 selected messages and 128 KiB of raw row data.
+/// One legal row may stand alone above the byte budget, as in the daemon's pages.
+const ROOM_WINDOW_ROWS: usize = 128;
+const ROOM_WINDOW_BYTES: usize = vox_core::node::ipc::ROWS_BUDGET;
 
+async fn room_read_fence(
+    client: &mut IpcClient,
+    channel_id: Digest32,
+) -> Result<([u8; 16], Digest32), VoxError> {
+    let instance = match ask(client, &Request::ArrivalHead { channel_id }).await? {
+        Frame::ArrivalHead { head } => head.instance,
+        other => return Err(unexpected(&other)),
+    };
+    let revision = match ask(client, &Request::RoomDisplayRevision { channel_id }).await? {
+        Frame::RoomDisplayRevision { revision } => revision,
+        other => return Err(unexpected(&other)),
+    };
+    Ok((instance, revision))
+}
+
+fn room_window_bytes(rows: &[MessageRow]) -> Result<(), VoxError> {
+    let bytes = rows.iter().fold(0usize, |total, row| {
+        total.saturating_add(row.text.len() + vox_core::node::ipc::ROW_OVERHEAD)
+    });
+    if rows.len() > ROOM_WINDOW_ROWS || (rows.len() > 1 && bytes > ROOM_WINDOW_BYTES) {
+        return Err(failed(
+            "The held room selection exceeds one window's count or byte budget. Refresh fewer messages.",
+        ));
+    }
+    Ok(())
+}
+
+impl VoxClient {
     async fn room_page_read(
         &self,
         room: String,
@@ -2004,31 +2005,41 @@ impl VoxClient {
     ) -> Result<FfiRoomRead, VoxError> {
         let channel_id = digest(&room, "room id")?;
         on_held!(self, |c| {
+            let actor = c.me().ok_or_else(not_attached)?;
+            let fence = room_read_fence(c, channel_id).await?;
             let names = names(c).await?;
-            let me = c.me().map(|f| b32_encode(&f));
-            match ask(
+            let (rows, older) = match ask(
                 c,
                 &Request::RoomPage {
                     channel_id,
                     before,
-                    limit: 0,
+                    limit: ROOM_WINDOW_ROWS as u64,
                 },
             )
             .await?
             {
-                Frame::RoomPage { rows, older } => Ok(FfiRoomRead {
-                    before: rows
-                        .first()
-                        .filter(|_| older > 0)
-                        .map(|r| b32_encode(&r.entry_hash)),
-                    messages: rows
-                        .iter()
-                        .map(|r| rendered(r, &names, me.as_deref()))
-                        .collect(),
-                    older,
-                }),
-                other => Err(unexpected(&other)),
+                Frame::RoomPage { rows, older } => (rows, older),
+                other => return Err(unexpected(&other)),
+            };
+            room_window_bytes(&rows)?;
+            if room_read_fence(c, channel_id).await? != fence || c.me() != Some(actor) {
+                return Err(failed(
+                    "The room changed while reading. Refresh and try again.",
+                ));
             }
+            let me = b32_encode(&actor);
+            Ok(FfiRoomRead {
+                instance: fence.0.to_vec(),
+                before: rows
+                    .first()
+                    .filter(|_| older > 0)
+                    .map(|r| b32_encode(&r.entry_hash)),
+                messages: rows
+                    .iter()
+                    .map(|r| rendered(r, &names, Some(&me)))
+                    .collect(),
+                older,
+            })
         })
     }
     /// A page of a Session, newest first: see [`VoxClient::session_read`].
@@ -2767,61 +2778,96 @@ impl VoxClient {
         self.room_page_read(room, None).await
     }
 
-    /// Reanchor a room while retaining the history extent already loaded by its reader.
-    /// Missing captured entries are pruned; a refused lookup keeps its own error. No cached
-    /// message body is reused: all returned rows come from authoritative history pages.
+    /// Revalidate exactly the held message ids, in their requested order, on the same node
+    /// and saved room. Missing ids are omitted only after every authoritative lookup succeeds.
+    /// This does not add newer messages or walk the gap to the newest page. The caller keeps
+    /// its paging metadata: this exact selection returns `older = 0` and `before = None`.
+    /// At most 128 ids and 128 KiB of raw row data are accepted (one legal large row alone).
     pub async fn room_read_retaining(
         &self,
         room: String,
+        node: String,
+        instance: Vec<u8>,
         loaded: Vec<String>,
     ) -> Result<FfiRoomRead, VoxError> {
+        if loaded.len() > ROOM_WINDOW_ROWS {
+            return Err(failed("A held room window may name at most 128 messages."));
+        }
         let channel_id = digest(&room, "room id")?;
+        let actor = digest(&node, "fingerprint")?;
+        let instance: [u8; 16] = instance
+            .try_into()
+            .map_err(|_| failed("The saved room identity must contain exactly 16 bytes."))?;
         let entries = loaded
             .iter()
             .map(|id| digest(id, "entry"))
             .collect::<Result<Vec<_>, _>>()?;
-        let mut boundary = self
-            .oldest_retained_room_entry(channel_id, &entries)
-            .await?;
-        let mut page = self.room_read(room.clone()).await?;
-        let mut cursors = std::collections::HashSet::new();
-        while let Some(ref oldest) = boundary {
-            if page.messages.iter().any(|row| &row.id == oldest) {
-                break;
+        on_held!(self, |c| {
+            if c.me() != Some(actor) {
+                return Err(failed(
+                    "The acting node changed before refreshing this room.",
+                ));
             }
-            // Retention can prune the selected boundary between Find and pagination.
-            // Recompute it before every older page rather than walking to the room start.
-            boundary = self
-                .oldest_retained_room_entry(channel_id, &entries)
-                .await?;
-            let Some(ref oldest) = boundary else { break };
-            if page.messages.iter().any(|row| &row.id == oldest) {
-                break;
+            let fence = room_read_fence(c, channel_id).await?;
+            if fence.0 != instance {
+                return Err(failed(
+                    "The saved room changed. Open its current page again.",
+                ));
             }
-            let Some(before) = page.before.clone() else {
-                break;
-            };
-            if !cursors.insert(before.clone()) {
-                return Err(VoxError::Failed {
-                    reason: "Room history did not advance while recovering its page.".into(),
-                });
+            let names = names(c).await?;
+            let mut found = HashMap::new();
+            let mut bytes = 0usize;
+            for chunk in entries.chunks(vox_core::node::ipc::MAX_FIND) {
+                // Find itself streams one coherent selection. At most 64 bounded raw rows
+                // exist in this temporary reply, independent of the room's history size.
+                let rows = match ask(
+                    c,
+                    &Request::Find {
+                        channel_id,
+                        entries: chunk.to_vec(),
+                    },
+                )
+                .await?
+                {
+                    Frame::Rows { rows } => rows,
+                    other => return Err(unexpected(&other)),
+                };
+                for row in rows {
+                    if !chunk.contains(&row.entry_hash) {
+                        return Err(failed(
+                            "The room returned a message outside the held selection.",
+                        ));
+                    }
+                    if found.contains_key(&row.entry_hash) {
+                        continue;
+                    }
+                    bytes =
+                        bytes.saturating_add(row.text.len() + vox_core::node::ipc::ROW_OVERHEAD);
+                    if !found.is_empty() && bytes > ROOM_WINDOW_BYTES {
+                        return Err(failed(
+                            "The held room selection exceeds one window's byte budget. Refresh fewer messages.",
+                        ));
+                    }
+                    found.insert(row.entry_hash, row);
+                }
             }
-            let older = self.room_read_older(room.clone(), before).await?;
-            let held: std::collections::HashSet<_> =
-                page.messages.iter().map(|row| row.id.clone()).collect();
-            let mut rows: Vec<_> = older
-                .messages
-                .into_iter()
-                .filter(|row| !held.contains(&row.id))
-                .collect();
-            rows.extend(page.messages);
-            page = FfiRoomRead {
-                messages: rows,
-                older: older.older,
-                before: older.before,
-            };
-        }
-        Ok(page)
+            if room_read_fence(c, channel_id).await? != fence || c.me() != Some(actor) {
+                return Err(failed(
+                    "The room changed while refreshing its held messages. Try again.",
+                ));
+            }
+            let me = b32_encode(&actor);
+            Ok(FfiRoomRead {
+                instance: instance.to_vec(),
+                messages: entries
+                    .iter()
+                    .filter_map(|id| found.remove(id))
+                    .map(|row| rendered(&row, &names, Some(&me)))
+                    .collect(),
+                older: 0,
+                before: None,
+            })
+        })
     }
 
     /// Load the room-history page before `before`, when the person scrolls up (ADR-034 FR-4).
@@ -2953,10 +2999,11 @@ impl VoxClient {
         })
     }
 
-    /// Opaque equality token for the selected room's published display. It changes when the
+    /// Opaque equality token for the selected room's current sealed display. It changes when the
     /// readable timeline changes (including late fills and expiry), on room reopen, or when
     /// display names change. Actor restart changes the token even when this client repairs its
-    /// connection internally. It reads no historical messages or full node snapshot.
+    /// connection internally. The daemon reads it under the same readiness and room-lock
+    /// boundary as exact message lookup, without collecting historical message bodies.
     /// Compare only within this held client's lifetime; discard cached tokens on a new client,
     /// node change, detach or refusal. A newly loaded root still needs its initial summary.
     ///
@@ -5408,6 +5455,46 @@ impl VoxClient {
             entries,
         };
         on_held!(self, |c| done(c, &req).await)
+    }
+
+    /// Mark the messages actually shown from this exact held room window. Even an empty
+    /// selection checks the actor and atomically validates the room instance in the daemon.
+    /// Success means the selected marks were admitted to durable local state.
+    pub async fn mark_read_at(
+        &self,
+        room: String,
+        node: String,
+        instance: Vec<u8>,
+        ids: Vec<String>,
+    ) -> Result<(), VoxError> {
+        if ids.len() > ROOM_WINDOW_ROWS {
+            return Err(failed("A held room window may mark at most 128 messages."));
+        }
+        let channel_id = digest(&room, "room id")?;
+        let actor = digest(&node, "fingerprint")?;
+        let instance: [u8; 16] = instance
+            .try_into()
+            .map_err(|_| failed("The saved room identity must contain exactly 16 bytes."))?;
+        let entries = ids
+            .iter()
+            .map(|id| digest(id, "message id"))
+            .collect::<Result<Vec<_>, _>>()?;
+        on_held!(self, |c| {
+            if c.me() != Some(actor) {
+                return Err(failed(
+                    "The acting node changed before marking this room read.",
+                ));
+            }
+            done(
+                c,
+                &Request::MarkReadAt {
+                    channel_id,
+                    instance,
+                    entries,
+                },
+            )
+            .await
+        })
     }
 
     /// Mark received messages from other members through one captured arrival head.
