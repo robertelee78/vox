@@ -298,7 +298,7 @@ pub(super) fn put(index: &mut Write<'_, '_>, id: u64, row: &SessionRow) -> Resul
     {
         index.set(Tree::ActivitySessions, hash_key(&group), Some(id))?;
     }
-    Ok(())
+    super::activity_fold::appended(index, &fact)
 }
 
 pub(super) fn remove(index: &mut Write<'_, '_>, id: u64) -> Result<()> {
@@ -327,5 +327,5 @@ pub(super) fn remove(index: &mut Write<'_, '_>, id: u64) -> Result<()> {
         .filter(|(key, _)| key[..32] == group)
         .map(|(_, id)| id);
     index.set(Tree::ActivitySessions, hash_key(&group), next)?;
-    Ok(())
+    index.header.activity.invalidate()
 }

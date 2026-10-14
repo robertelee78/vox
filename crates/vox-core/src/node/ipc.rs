@@ -393,6 +393,8 @@ const T_SESSIONS_PAGE_REQ: u64 = 5437;
 const T_SESSIONS_PAGE: u64 = 5438;
 /// Exact Session metadata, using the existing bounded SessionsPage reply.
 const T_SESSION_LOOKUP: u64 = 8721;
+const T_SESSIONS_WAITING_REQ: u64 = 8722;
+const T_SESSIONS_WAITING: u64 = 8723;
 const T_SESSION_LIFECYCLE_REQ: u64 = 8724;
 const T_SESSION_LIFECYCLE: u64 = 8725;
 const T_ROOM_PAGE_REQ: u64 = 5492;
@@ -644,6 +646,11 @@ pub enum Request {
         channel_id: Digest32,
         /// The opening entry of the last Session of the page before; `None` from the start.
         after: Option<Digest32>,
+    },
+    /// Exact number of answerable requests across every currently readable open Session.
+    SessionsWaiting {
+        /// The room.
+        channel_id: Digest32,
     },
     /// The latest opening of this exact node/session, at most one row, or a refusal.
     /// Uses [`Frame::SessionsPage`]; `more` is always false.
@@ -1202,6 +1209,9 @@ impl Request {
             }
             Request::Sessions { channel_id } => {
                 e.array(2).uint(T_SESSIONS_REQ).bytes(channel_id);
+            }
+            Request::SessionsWaiting { channel_id } => {
+                e.array(2).uint(T_SESSIONS_WAITING_REQ).bytes(channel_id);
             }
             Request::SessionLookup {
                 channel_id,
@@ -1968,6 +1978,11 @@ impl Request {
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::SessionEntries { channel_id })
             }
+            (T_SESSIONS_WAITING_REQ, 2) => {
+                let channel_id = digest(&mut d)?;
+                d.finish()?;
+                Ok(Request::SessionsWaiting { channel_id })
+            }
             (T_SESSION_LOOKUP, 4) => {
                 let channel_id = digest(&mut d)?;
                 let node = digest(&mut d)?;
@@ -2443,6 +2458,11 @@ pub enum Frame {
         /// Whether more follow the last: ask again with its opening as `after`.
         more: bool,
     },
+    /// The exact current number of answerable requests across all open Sessions.
+    SessionsWaiting {
+        /// Exact current-room answerable request count, not only the displayed page.
+        waiting: u64,
+    },
     /// A bounded opening/end notice page, oldest first within this page.
     SessionLifecyclePage {
         /// Complete current labels and exact lifecycle positions.
@@ -2721,6 +2741,9 @@ impl Frame {
                         .uint(u64::from(s.waiting));
                 }
                 e.uint(u64::from(*more));
+            }
+            Frame::SessionsWaiting { waiting } => {
+                e.array(2).uint(T_SESSIONS_WAITING).uint(*waiting);
             }
             Frame::SessionLifecyclePage { rows, older } => {
                 e.array(4).uint(T_SESSION_LIFECYCLE);
@@ -3601,6 +3624,9 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 summaries,
                 more,
             });
+        }
+        (T_SESSIONS_WAITING, 2) => {
+            return Ok(Frame::SessionsWaiting { waiting: d.uint()? });
         }
         (T_SESSION_LIFECYCLE, 4) => {
             let sessions = crate::node::sessions::read_rows_bounded(d, SESSIONS_PAGE_ROWS)?;
@@ -6062,6 +6088,14 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 reason: other.to_string(),
             },
         },
+        Request::SessionsWaiting{channel_id} => {
+            use crate::node::channel::session_projection::{Query,Reply};
+            match handle.session_projection(channel_id,Query::Waiting).await {
+                Ok(Reply::Waiting(waiting))=>Frame::SessionsWaiting{waiting},
+                Ok(_)=>Frame::Error{reason:"unexpected Session waiting answer".into()},
+                Err(reason)=>Frame::Error{reason},
+            }
+        }
         Request::Sessions { .. } | Request::SessionsPage { .. } | Request::SessionLookup { .. } | Request::SessionLifecycle { .. } => Frame::Error {
             reason: "Sessions require a reply stream".into(),
         },
@@ -7211,6 +7245,17 @@ impl IpcClient {
     ) -> Result<Frame> {
         let reply = self
             .request(&Request::SessionsPage { channel_id, after })
+            .await?;
+        Ok(self.older_daemon(reply))
+    }
+
+    /// Exact waiting count for all currently readable open Sessions in the room.
+    ///
+    /// # Errors
+    /// The node cannot be reached or answers with a malformed frame.
+    pub async fn sessions_waiting(&mut self, channel_id: Digest32) -> Result<Frame> {
+        let reply = self
+            .request(&Request::SessionsWaiting { channel_id })
             .await?;
         Ok(self.older_daemon(reply))
     }

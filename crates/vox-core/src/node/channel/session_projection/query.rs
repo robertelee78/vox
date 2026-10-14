@@ -80,6 +80,7 @@ pub(crate) struct TextPage {
 
 #[derive(Clone)]
 pub(crate) enum Query {
+    Waiting,
     Lifecycle {
         before: Option<crate::node::sessions::LifecycleCursor>,
         not_before: Option<u64>,
@@ -113,6 +114,7 @@ pub(crate) enum Query {
 }
 
 pub(crate) enum Reply {
+    Waiting(u64),
     Lifecycle {
         rows: Vec<(Row, crate::node::sessions::LifecycleCursor)>,
         older: bool,
@@ -217,7 +219,12 @@ impl ChannelState {
         if self.poisoned {
             return Err(self.save_failure());
         }
-        let result = super::build::advance(self, store);
+        let result = (|| {
+            let metadata = super::build::advance(self, store)?;
+            let activity = super::activity_fold::advance(self, store)?;
+            let waiting = super::waiting::advance(self, store)?;
+            Ok(metadata || activity || waiting)
+        })();
         if let Err(ref error) = result {
             self.poison(error);
         }
@@ -244,6 +251,17 @@ impl ChannelState {
         h.update(&view.session_revision().to_be_bytes());
         h.update(&private.to_be_bytes());
         h.update(&activity.to_be_bytes());
+        // Completing bounded repair changes what the next query can return even
+        // without another incoming row. Publish that transition to every client.
+        if let Some(read) = &read {
+            h.update([u8::from(read.header.activity.ready)]);
+            h.update(&read.header.activity.applied.to_be_bytes());
+            h.update(&read.header.activity.invalidated.to_be_bytes());
+            h.update([u8::from(read.header.activity.waiting.ready)]);
+            h.update(&read.header.activity.waiting.root.to_be_bytes());
+            h.update(&read.header.activity.waiting.metadata.to_be_bytes());
+        }
+
         h.update(&self.legacy_sessions.display_revision().to_be_bytes());
         h.update(&published.0.to_be_bytes());
         h.update(&published.1.to_be_bytes());
@@ -294,6 +312,25 @@ impl ChannelState {
                 Ok(())
             };
             match query {
+                Query::Waiting => {
+                    let waiting = &read.header.activity.waiting;
+                    if !read.header.activity.ready
+                        || !waiting.ready
+                        || waiting.metadata != read.root(Tree::Groups)?
+                    {
+                        return Err(Failure::Request(REFRESHING));
+                    }
+                    let mut total = 0u64;
+                    for author in &authors {
+                        total = total
+                            .checked_add(
+                                read.waiting_find(waiting.root, &hash_key(author))?
+                                    .unwrap_or(0),
+                            )
+                            .ok_or(Error::MalformedAtRest("Session waiting total exhausted"))?;
+                    }
+                    Ok(Reply::Waiting(total))
+                }
                 Query::Lifecycle {
                     before,
                     not_before,
