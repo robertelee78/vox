@@ -2452,7 +2452,9 @@ impl DaemonCore {
         let Some(conn) = self.conn.as_mut() else {
             return;
         };
-        let g = self.governance.as_mut().expect("selected room");
+        let Some(g) = self.governance.as_mut() else {
+            return;
+        };
         for notices in [true, false] {
             let wanted = if notices {
                 g.notices_want
