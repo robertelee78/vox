@@ -100,7 +100,7 @@ impl Account {
         let mut cmd = self.cmd(args);
         // A keyring change's passphrase is typed at a terminal, as a person types it (ADR-028
         // K-13).
-        if typed::is_keyring_change(args) {
+        if typed::is_keyring_change(args) || args.starts_with(&["node", "rename"]) {
             let (ok, shown) = typed::keyring(&cmd);
             return (ok, shown.clone(), shown);
         }
@@ -2061,18 +2061,15 @@ fn enrolled_computers_follow_node_changes_and_retire_removed_authority() {
         )),
         "PRODUCT: new node did not acquire the group read policy"
     );
-    let (ok, out, err) = b.run(
-        &[
-            "trust",
-            "rename",
-            &added,
-            "my-stable-alias",
-            "--node",
-            "worker",
-        ],
-        "",
-    );
-    assert!(ok, "APPARATUS: chosen local alias: {out}{err}");
+    // Each person's alias stays theirs. Choose it through the real terminal before changing
+    // the presented node name; this also supplies the required keyring passphrase premise.
+    for (account, node) in [(&b, "worker"), (&a, "old-personal"), (&a, "new-personal")] {
+        let (ok, out, err) = account.run(
+            &["trust", "rename", &added, "my-stable-alias", "--node", node],
+            "",
+        );
+        assert!(ok, "APPARATUS: chosen local alias: {out}{err}");
+    }
     let (ok, out, err) = a.run(&["node", "rename", "added", "renamed"], "");
     assert!(ok, "PRODUCT: managed-node rename: {out}{err}");
     ready(&a, "renamed");
