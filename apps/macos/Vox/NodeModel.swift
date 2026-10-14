@@ -1697,18 +1697,22 @@ final class NodeModel: ObservableObject {
         }
     }
 
-    /// Copy the room on screen's link (⌘L), saying what it carries.
-    func copyRoomLink() async {
+    /// Copy the requested room's link; menus pass the clicked row, commands use the selected room.
+    func copyRoomLink(room requested: String? = nil) async {
         let operation = "copy-link"
         let attempt = begin(operation)
         defer { end(attempt) }
-        guard let id = roomOnScreen else { return }
+        guard let id = requested ?? roomOnScreen, rooms.contains(where: { $0.id == id }) else { return }
+        let epoch = nodeObservationEpoch, actor = me
         do {
             let link = try await client.link(room: id)
+            guard !Task.isCancelled, nodeObservationEpoch == epoch, me == actor,
+                  rooms.contains(where: { $0.id == id }) else { return }
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(link.url, forType: .string)
             report(operation: operation, done: link.note.isEmpty ? "Room link copied." : "Room link copied. \(link.note)")
         } catch {
+            guard nodeObservationEpoch == epoch, me == actor else { return }
             report(error, operation: operation)
         }
     }
