@@ -170,25 +170,34 @@ struct ComposerTokens: View {
 enum ComposerInput {
     static func tokens(_ input: String, members: [NodeModel.MemberRow], finish: Bool)
         -> (text: String, to: Set<String>, urgent: Bool) {
-        var text = input, urgent = false
-        if let first = text.firstIndex(where: { !$0.isWhitespace }), text[first] == "!" {
-            text.remove(at: first)
-            urgent = true
-        }
+        var text = input, urgent = false, leading = true
+        let aliases = Dictionary(grouping: members, by: { $0.name.lowercased() })
         var addressed: Set<String> = [], removed: [Range<String.Index>] = []
         var start = text.startIndex
         while start < text.endIndex {
             if text[start].isWhitespace { start = text.index(after: start); continue }
             let end = text[start...].firstIndex(where: \.isWhitespace) ?? text.endIndex
-            let word = text[start..<end]
-            if (end < text.endIndex || finish), word.first == "@" {
-                let alias = word.dropFirst().trimmingCharacters(in: .punctuationCharacters.subtracting(["#"]))
-                let matches = members.filter { $0.name.lowercased() == alias.lowercased() }
-                if matches.count == 1 {
-                    addressed.insert(matches[0].id)
-                    removed.append(start..<end)
+            var content = start
+            // Consume the complete leading syntax once. After removing its token, sending
+            // must not find another leading ! left behind by a pasted "!! @name message".
+            if leading {
+                while content < end, text[content] == "!" {
+                    urgent = true
+                    content = text.index(after: content)
                 }
             }
+            let word = text[content..<end]
+            if (end < text.endIndex || finish), word.first == "@" {
+                let alias = word.dropFirst().trimmingCharacters(in: .punctuationCharacters.subtracting(["#"]))
+                if let matches = aliases[alias.lowercased()], matches.count == 1 {
+                    addressed.insert(matches[0].id)
+                    removed.append(start..<end)
+                    start = end
+                    continue
+                }
+            }
+            if content != start { removed.append(start..<content) }
+            if content < end { leading = false }
             start = end
         }
         for range in removed.reversed() { text.removeSubrange(range) }

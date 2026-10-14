@@ -1316,10 +1316,16 @@ private struct RoomTimelineView: View {
                     .onChange(of: model.messages) { _ in markSeen() }
                     // A file dropped on the timeline, or pasted into it, is attached (M-24, F-1).
                     .onDrop(of: [.fileURL], isTargeted: nil) { providers in
-                        firstFile(in: providers) { attaching = Attaching(url: $0) }
+                        firstFile(in: providers) {
+                            tokenizeDraft(finish: true)
+                            attaching = Attaching(url: $0)
+                        }
                     }
                     .onPasteCommand(of: [.fileURL]) { providers in
-                        _ = firstFile(in: providers) { attaching = Attaching(url: $0) }
+                        _ = firstFile(in: providers) {
+                            tokenizeDraft(finish: true)
+                            attaching = Attaching(url: $0)
+                        }
                     }
                     .accessibilityIdentifier("timeline")
                     .accessibilityLabel("Timeline")
@@ -1427,6 +1433,14 @@ private struct RoomTimelineView: View {
             model.roomDrafts[room] = kept
         }
         .onChange(of: to) { model.roomDrafts[room, default: RoomDraft()].to = $0 }
+        // A previous view may have sent this draft before leaving and returning. Reflect its
+        // accepted clear only while this view still holds that revision, never a later edit.
+        .onChange(of: model.roomDrafts[room]?.text) { value in
+            if model.roomDrafts[room]?.textRevision == draftRevision { draft = value ?? "" }
+        }
+        .onChange(of: model.roomDrafts[room]?.urgent) { value in
+            if model.roomDrafts[room]?.urgencyRevision == urgencyRevision { urgent = value ?? false }
+        }
         .onChange(of: model.incoming) { url in
             if let url {
                 tokenizeDraft(finish: true)
@@ -1542,8 +1556,7 @@ private struct RoomTimelineView: View {
                 if urgencyRevision == sentUrgency { urgent = false }
                 // The view may have left while the daemon answered. Clear only the saved
                 // draft revision sent, never a later edit made on returning to this room.
-                if model.roomDrafts[room]?.textRevision == sentDraft { model.roomDrafts[room]?.text = "" }
-                if model.roomDrafts[room]?.urgencyRevision == sentUrgency { model.roomDrafts[room]?.urgent = false }
+                model.clearSentDraft(in: room, text: sentDraft, urgency: sentUrgency)
                 if model.roomOnScreen == room, model.roomPostContext == context, model.replyTo?.id == re {
                     model.replyTo = nil
                 }

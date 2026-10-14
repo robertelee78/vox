@@ -423,6 +423,7 @@ const T_FOOTERS_REQ: u64 = 8741;
 const T_FOOTERS: u64 = 8742;
 const T_ROOM_VIEW_PAGE_REQ: u64 = 8743;
 const T_ROOM_VIEW_FIND: u64 = 8744;
+const T_POST_AT: u64 = 8745;
 const T_ROOM_PAGE_REQ: u64 = 5492;
 const T_ROOM_PAGE: u64 = 5493;
 
@@ -615,6 +616,17 @@ pub enum Request {
         text: String,
         /// Whether the node fetches a link card for its first URL (ADR-028 F-10): `vox room post
         /// --no-card` says not to.
+        card: bool,
+    },
+    /// Append only to the saved room incarnation captured by a native composer.
+    PostAt {
+        /// The room.
+        channel_id: Digest32,
+        /// Captured saved-room incarnation.
+        instance: [u8; 16],
+        /// The text or agent-comms envelope.
+        text: String,
+        /// Fetch a link card as for Post.
         card: bool,
     },
     /// Read a room's rendered timeline, optionally only what follows a cursor.
@@ -1434,6 +1446,19 @@ impl Request {
                     .text(text)
                     .uint(u64::from(*card));
             }
+            Request::PostAt {
+                channel_id,
+                instance,
+                text,
+                card,
+            } => {
+                e.array(5)
+                    .uint(T_POST_AT)
+                    .bytes(channel_id)
+                    .bytes(instance)
+                    .text(text)
+                    .uint(u64::from(*card));
+            }
             Request::MarkRead {
                 channel_id,
                 entries,
@@ -2002,6 +2027,22 @@ impl Request {
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Post {
                     channel_id,
+                    text,
+                    card,
+                })
+            }
+            (T_POST_AT, 5) => {
+                let channel_id = digest(&mut d)?;
+                let instance = d
+                    .bytes()?
+                    .try_into()
+                    .map_err(|_| Error::MalformedIpc("ipc post room instance"))?;
+                let text = d.text()?.to_owned();
+                let card = d.uint()? != 0;
+                d.finish()?;
+                Ok(Request::PostAt {
+                    channel_id,
+                    instance,
                     text,
                     card,
                 })
@@ -6909,6 +6950,87 @@ fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Both post paths use identical envelope/card handling; checked posts keep the captured
+/// incarnation through every sync retry and validate it at final append admission.
+async fn serve_post(
+    handle: &NodeHandle,
+    channel_id: Digest32,
+    text: String,
+    card: bool,
+    instance: Option<[u8; 16]>,
+) -> Frame {
+    // A stale or explicit target cannot publish this session into another repository's
+    // room, including an automatic coordination hello. Check before any append or fetch.
+    if let Ok(env) = vox_agentcomms::envelope::Envelope::parse(&text) {
+        if let Err(reason) =
+            crate::node::sessions::check_working_room(handle.paths(), &env.from, &channel_id)
+        {
+            return Frame::Error { reason };
+        }
+    }
+    // **A link card is fetched here, by the sender's node, once** (ADR-028 F-10), and
+    // travels in the message: no reader's node ever contacts the linked site.
+    let text = if card {
+        crate::node::card::attach(&text).await
+    } else {
+        text
+    };
+    // **The session's name, filled by its node** (ADR-029 MD-2): whatever verb or client
+    // posted, a message from a registered session carries the name its harness gives.
+    let text = crate::node::sessions::fill_name(handle.paths(), &text);
+    // **A post too long says how long, against what, and why** (#549): a post from a
+    // session carries the session's id and name around its words, so words that fit
+    // alone may not fit with them. "That is longer than this field allows" named no field.
+    let max = crate::node::content::MAX_TEXT_LEN;
+    if text.len() > max {
+        let from_session = vox_agentcomms::envelope::Envelope::parse(&text)
+            .is_ok_and(|e| !e.from.trim().is_empty());
+        return Frame::Error {
+            reason: format!(
+                "this post is {} bytes as the room keeps it{}; a post holds at most {max} \
+                 bytes (64 KiB), so it must be {} bytes shorter",
+                text.len(),
+                if from_session {
+                    ", with the id and name of the session posting it"
+                } else {
+                    ""
+                },
+                text.len() - max
+            ),
+        };
+    }
+    // A room just joined is written to once its first sync with another member has ended
+    // (V210-164), usually within a second: `vox room join … && vox room post …` waits for
+    // that rather than failing.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let command = match instance {
+            Some(instance) => crate::node::api::NodeCommand::SendTextAt {
+                channel_id,
+                text: text.clone(),
+                instance,
+            },
+            None => crate::node::api::NodeCommand::SendText {
+                channel_id,
+                text: text.clone(),
+            },
+        };
+        match handle.apply(command).await {
+            crate::node::api::Outcome::Done => break Frame::Ok,
+            crate::node::api::Outcome::Failed(crate::node::api::Fault::RoomNotSynced)
+                if tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            other => {
+                break Frame::Error {
+                    reason: other.to_string(),
+                }
+            }
+        }
+    }
+}
+
 /// Answer one request against the node.
 ///
 /// Every failure comes back as [`Frame::Error`] rather than ending the
@@ -7431,75 +7553,13 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             channel_id,
             text,
             card,
-        } => {
-            // A stale or explicit target cannot publish this session into another repository's
-            // room, including an automatic coordination hello. Check before any append or fetch.
-            if let Ok(env) = vox_agentcomms::envelope::Envelope::parse(&text) {
-                if let Err(reason) = crate::node::sessions::check_working_room(
-                    handle.paths(),
-                    &env.from,
-                    &channel_id,
-                ) {
-                    return Frame::Error { reason };
-                }
-            }
-            // **A link card is fetched here, by the sender's node, once** (ADR-028 F-10), and
-            // travels in the message: no reader's node ever contacts the linked site.
-            let text = if card {
-                crate::node::card::attach(&text).await
-            } else {
-                text
-            };
-            // **The session's name, filled by its node** (ADR-029 MD-2): whatever verb or client
-            // posted, a message from a registered session carries the name its harness gives.
-            let text = crate::node::sessions::fill_name(handle.paths(), &text);
-            // **A post too long says how long, against what, and why** (#549): a post from a
-            // session carries the session's id and name around its words, so words that fit
-            // alone may not fit with them. "That is longer than this field allows" named no field.
-            let max = crate::node::content::MAX_TEXT_LEN;
-            if text.len() > max {
-                let from_session = vox_agentcomms::envelope::Envelope::parse(&text)
-                    .is_ok_and(|e| !e.from.trim().is_empty());
-                return Frame::Error {
-                    reason: format!(
-                        "this post is {} bytes as the room keeps it{}; a post holds at most {max} \
-                         bytes (64 KiB), so it must be {} bytes shorter",
-                        text.len(),
-                        if from_session {
-                            ", with the id and name of the session posting it"
-                        } else {
-                            ""
-                        },
-                        text.len() - max
-                    ),
-                };
-            }
-            // A room just joined is written to once its first sync with another member has ended
-            // (V210-164), usually within a second: `vox room join … && vox room post …` waits for
-            // that rather than failing.
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-            loop {
-                match handle
-                    .apply(crate::node::api::NodeCommand::SendText {
-                        channel_id,
-                        text: text.clone(),
-                    })
-                    .await
-                {
-                    crate::node::api::Outcome::Done => break Frame::Ok,
-                    crate::node::api::Outcome::Failed(crate::node::api::Fault::RoomNotSynced)
-                        if tokio::time::Instant::now() < deadline =>
-                    {
-                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                    }
-                    other => {
-                        break Frame::Error {
-                            reason: other.to_string(),
-                        }
-                    }
-                }
-            }
-        }
+        } => serve_post(handle, channel_id, text, card, None).await,
+        Request::PostAt {
+            channel_id,
+            instance,
+            text,
+            card,
+        } => serve_post(handle, channel_id, text, card, Some(instance)).await,
         Request::Read {
             channel_id,
             since,

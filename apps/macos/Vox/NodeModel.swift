@@ -2462,6 +2462,17 @@ final class NodeModel: ObservableObject {
         }
     }
 
+    /// Notify a returned composer when an older view's send completes, without publishing
+    /// every keystroke through the whole node model. A later draft or urgency edit stays.
+    func clearSentDraft(in room: String, text: UUID, urgency: UUID) {
+        let clearText = roomDrafts[room]?.textRevision == text
+        let clearUrgency = roomDrafts[room]?.urgencyRevision == urgency
+        guard clearText || clearUrgency else { return }
+        objectWillChange.send()
+        if clearText { roomDrafts[room]?.text = "" }
+        if clearUrgency { roomDrafts[room]?.urgent = false }
+    }
+
     /// The composer captures the same actor/attachment/room lifetime it is showing. A queued
     /// button task must not reinterpret its draft after selection, reconnect, or room replacement.
     var roomPostContext: String {
@@ -2475,13 +2486,14 @@ final class NodeModel: ObservableObject {
         let operation = "post"
         let attempt = begin(operation)
         defer { end(attempt) }
-        guard roomOnScreen == room, roomInstance != nil, roomPostContext == context, !showingSession,
+        guard roomOnScreen == room, let instance = roomInstance, roomPostContext == context, !showingSession,
               ended == nil, daemonReachable, !Task.isCancelled else {
             report(VoxError.Failed(reason: "The room or node changed before sending. Your draft is kept."), operation: operation)
             return false
         }
         do {
-            try await client.post(room: room, text: text, to: to, re: re, urgent: urgent)
+            try await client.postAt(room: room, node: me, instance: instance,
+                                    text: text, to: to, re: re, urgent: urgent)
             report(operation: operation, done: "Sent the message.")
             return true
         } catch {

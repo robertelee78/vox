@@ -522,7 +522,7 @@ fn command_name(c: &NodeCommand) -> &'static str {
         NodeCommand::JoinChannel { .. } => "joining a room",
         NodeCommand::CreateChannel { .. } => "creating a room",
         NodeCommand::OpenChannel { .. } => "opening a room",
-        NodeCommand::SendText { .. } => "sending a message",
+        NodeCommand::SendText { .. } | NodeCommand::SendTextAt { .. } => "sending a message",
         NodeCommand::Sync { .. } => "syncing",
         NodeCommand::Agree { .. } => "asking members to agree on a claim",
         NodeCommand::Serve { .. } => "publishing a service",
@@ -5987,7 +5987,16 @@ impl Node {
             NodeCommand::SendText { channel_id, text } => {
                 #[cfg(feature = "test-knobs")]
                 test_panic_on_text(&text);
-                self.send_text(&channel_id, &text).await
+                self.send_text(&channel_id, &text, None).await
+            }
+            NodeCommand::SendTextAt {
+                channel_id,
+                text,
+                instance,
+            } => {
+                #[cfg(feature = "test-knobs")]
+                test_panic_on_text(&text);
+                self.send_text(&channel_id, &text, Some(instance)).await
             }
             NodeCommand::MarkRead {
                 channel_id,
@@ -19220,7 +19229,12 @@ impl Node {
         }
     }
 
-    async fn send_text(&mut self, channel_id: &Digest32, text: &str) -> Outcome {
+    async fn send_text(
+        &mut self,
+        channel_id: &Digest32,
+        text: &str,
+        expected_instance: Option<[u8; 16]>,
+    ) -> Outcome {
         let now_ms = self.now_ms();
         let Some(profile) = self.profile.as_ref() else {
             return Outcome::Failed(Fault::NoIdentity);
@@ -19229,6 +19243,18 @@ impl Node {
             return Outcome::Failed(Fault::ChannelNotOpen);
         };
         let mut ch = shared.lock().await;
+        // Check under the append lock: a leave/rejoin while a link card or another request
+        // was pending must not reinterpret the old composer as a post to the replacement.
+        if let Some(expected) = expected_instance {
+            match ch.history_instance(profile.store()) {
+                Ok(actual) if actual == expected => {}
+                Ok(_) => return Outcome::Failed(Fault::PostSelectionChanged),
+                Err(error) => {
+                    ch.poison(&error);
+                    return Outcome::Failed(fault_of(&error));
+                }
+            }
+        }
         // One read, in milliseconds. NOT `now * 1000` and not seconds-plus-a-second-read: a value
         // composed from two clock reads can go backwards across a second boundary, which is the
         // ordering inversion this change exists to remove.

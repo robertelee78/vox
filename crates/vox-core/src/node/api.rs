@@ -912,6 +912,15 @@ pub enum NodeCommand {
         /// The text.
         text: String,
     },
+    /// Author a message only in the saved room incarnation captured by its composer.
+    SendTextAt {
+        /// The channelID.
+        channel_id: Digest32,
+        /// The text.
+        text: String,
+        /// The saved room incarnation observed before sending.
+        instance: [u8; 16],
+    },
     /// Note that these entries of an open channel were shown to this node's person, or drained
     /// into its agent's turn (ADR-028 RR-1). Done means their local read marks are durably
     /// stored. The node later publishes a signed read record, at most one per room per
@@ -1236,6 +1245,8 @@ pub enum Fault {
     GovernanceRefreshing,
     /// The requested read marks no longer name the room's readable retained selection.
     ReadSelectionChanged,
+    /// The composer selected a room incarnation that no longer exists; no text was appended.
+    PostSelectionChanged,
     /// One admin removal is already being applied over bounded actor turns.
     AdminChangePending,
     /// A previous hosted room deletion is still awaiting its bounded daemon handoff.
@@ -1470,6 +1481,9 @@ impl Fault {
             Fault::ReadSelectionChanged => {
                 "the selected messages changed before they could be marked as read\n       refresh the room and try again"
             }
+            Fault::PostSelectionChanged => {
+                "the room changed before sending; this message was not posted\n       refresh the room and try again"
+            }
             Fault::AdminChangePending => {
                 "an admin change is already being applied on this node\n       wait for its answer before making another admin change"
             }
@@ -1696,6 +1710,7 @@ fault_names!(
     DeliveryBusy,
     GovernanceRefreshing,
     ReadSelectionChanged,
+    PostSelectionChanged,
     AdminChangePending,
     SessionCleanupBusy,
     SessionCleanupUnavailable,
