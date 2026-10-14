@@ -975,6 +975,8 @@ pub struct FfiSessionsPage {
 /// `vox room session` prints it (CL-1).
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct FfiSessionRead {
+    /// Opaque 16-byte saved-room identity for revalidating this held window.
+    pub instance: Vec<u8>,
     /// Its entries, oldest first; none when this node may not see inside it.
     pub entries: Vec<FfiSessionEntry>,
     /// What to say besides: "opening not received yet", or whose trust this node lacks to see
@@ -1259,10 +1261,14 @@ async fn session_page(
     channel_id: Digest32,
     session_id: &str,
     before: Option<Digest32>,
-) -> Result<(Vec<vox_core::node::drive::SessionRow>, u64), VoxError> {
+) -> Result<(Vec<vox_core::node::drive::SessionRow>, u64, [u8; 16]), VoxError> {
     let which = vox_core::node::drive::SessionFilter::Session(session_id.to_owned());
     match c.session_page(channel_id, which, before).await {
-        Ok(Frame::SessionPage { rows, older }) => Ok((rows, older)),
+        Ok(Frame::SessionPage {
+            rows,
+            older,
+            instance,
+        }) => Ok((rows, older, instance)),
         Ok(other) => Err(unexpected(&answered(other)?)),
         Err(e) => Err(listing_failed("a Session's entries", e)),
     }
@@ -2039,7 +2045,7 @@ impl VoxClient {
         let mut page = on_held!(self, |c| {
             let (sessions, _) = exact_session(c, channel_id, node, &session_id).await?;
             let known = Known::of(c).await?;
-            let (rows, older) = session_page(c, channel_id, &session_id, before).await?;
+            let (rows, older, instance) = session_page(c, channel_id, &session_id, before).await?;
             let first_hash = rows.first().map(|r| r.entry_hash);
             if older > 0 && (first_hash.is_none() || first_hash == before) {
                 return Err(failed("the Session activity page made no progress"));
@@ -2058,6 +2064,7 @@ impl VoxClient {
                 (r.state == OPENING_NOT_RECEIVED).then(|| OPENING_NOT_RECEIVED.to_owned())
             });
             Ok(FfiSessionRead {
+                instance: instance.to_vec(),
                 entries: r
                     .lines
                     .iter()
@@ -4355,6 +4362,83 @@ impl VoxClient {
             .await
     }
 
+    /// Re-read at most 128 logical activities already held in this Session window, including
+    /// selected multipart Details. `instance` must be the token of their original page.
+    /// Success contains only current requested entries; missing/expired entries are omitted.
+    /// The caller preserves its pagination cursors separately (`older` is zero here).
+    ///
+    /// # Errors
+    /// Identity/drive/lifetime change, projection/storage failure, more than 128 IDs, or a
+    /// multi-entry selection exceeding one page's byte budget. One legal oversized logical
+    /// activity is streamed whole, just as in an ordinary Session page.
+    pub async fn session_entries(
+        &self,
+        room: String,
+        node: String,
+        session_id: String,
+        instance: Vec<u8>,
+        ids: Vec<String>,
+    ) -> Result<FfiSessionRead, VoxError> {
+        use vox_core::node::{drive::SessionFilter, session_view::read};
+        if ids.len() > 128 {
+            return Err(failed(
+                "at most 128 held Session IDs can be refreshed together",
+            ));
+        }
+        let channel_id = digest(&room, "room id")?;
+        let node = digest(&node, "node's fingerprint")?;
+        let expected: [u8; 16] = instance
+            .try_into()
+            .map_err(|_| failed("invalid saved room instance"))?;
+        let entries: Vec<Digest32> = ids
+            .iter()
+            .map(|id| digest(id, "Session entry id"))
+            .collect::<Result<_, _>>()?;
+        on_held!(self, |c| {
+            let (sessions, _) = exact_session(c, channel_id, node, &session_id).await?;
+            let known = Known::of(c).await?;
+            let which = SessionFilter::Entries {
+                node,
+                session_id: session_id.clone(),
+                entries: entries.clone(),
+                instance: expected,
+            };
+            let (rows, instance) = match c
+                .session_page(channel_id, which, None)
+                .await
+                .map_err(|e| listing_failed("held Session entries", e))?
+            {
+                Frame::SessionPage {
+                    rows,
+                    instance,
+                    older: 0,
+                } if instance == expected => (rows, instance),
+                other => return Err(unexpected(&answered(other)?)),
+            };
+            let r = read(
+                &sessions,
+                rows,
+                &session_id,
+                Some(&node),
+                &|s| known.label(s),
+                &known,
+            )
+            .map_err(failed)?;
+            Ok(FfiSessionRead {
+                instance: instance.to_vec(),
+                entries: r
+                    .lines
+                    .iter()
+                    .filter(|line| entries.contains(&line.id))
+                    .map(|line| session_entry(line, &HashMap::new()))
+                    .collect(),
+                note: r.hidden,
+                older: 0,
+                before: None,
+            })
+        })
+    }
+
     /// One page of pending requests, or of the explicitly named request's resolution history.
     /// `before` continues that same selection; no other requests are silently included or omitted.
     ///
@@ -4385,12 +4469,16 @@ impl VoxClient {
                 },
                 None => SessionFilter::Pending(session_id.clone()),
             };
-            let (rows, older) = match c
+            let (rows, older, instance) = match c
                 .session_page(channel_id, which, before)
                 .await
                 .map_err(|e| listing_failed("a Session's requests", e))?
             {
-                Frame::SessionPage { rows, older } => (rows, older),
+                Frame::SessionPage {
+                    rows,
+                    older,
+                    instance,
+                } => (rows, older, instance),
                 other => return Err(unexpected(&answered(other)?)),
             };
             let next = rows.first().map(|r| r.entry_hash);
@@ -4407,6 +4495,7 @@ impl VoxClient {
             )
             .map_err(failed)?;
             Ok(FfiSessionRead {
+                instance: instance.to_vec(),
                 entries: r
                     .lines
                     .iter()

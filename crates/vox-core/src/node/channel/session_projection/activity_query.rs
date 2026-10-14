@@ -2,7 +2,7 @@
 //! survive an actor turn; the IPC writer carries one authenticated record at a time.
 
 use super::super::ChannelState;
-use super::activity_index::{fact, group, hash_key, member_key, Fact};
+use super::activity_index::{arrival_key, fact, group, hash_key, member_key, Fact, Kind};
 use super::activity_state::ActivityTree as T;
 use super::record::Key;
 use super::storage::{Read, Tree};
@@ -20,6 +20,7 @@ const STEPS: usize = 256;
 #[derive(Clone)]
 pub(crate) struct Revision {
     incarnation: Arc<std::sync::atomic::AtomicU64>,
+    instance: [u8; 16],
     invalidated: u64,
     drive: Digest32,
     boundary: u64,
@@ -32,6 +33,12 @@ pub(crate) struct Plan {
     pub older: u64,
     pub visible: bool,
     pub revision: Revision,
+}
+
+impl Plan {
+    pub(crate) fn instance(&self) -> [u8; 16] {
+        self.revision.instance
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -290,6 +297,7 @@ impl ChannelState {
             }
             let current = Revision {
                 incarnation: self.gen.clone(),
+                instance: self.history_instance(store)?,
                 invalidated: read.header.activity.invalidated,
                 drive: hash.finalize().into(),
                 boundary: read.header.activity.applied,
@@ -297,6 +305,7 @@ impl ChannelState {
             };
             let check = |revision: &Revision| -> Result<()> {
                 if !Arc::ptr_eq(&current.incarnation, &revision.incarnation)
+                    || current.instance != revision.instance
                     || current.invalidated != revision.invalidated
                     || current.drive != revision.drive
                     || current.boundary < revision.boundary
@@ -489,6 +498,95 @@ impl ChannelState {
                         }
                     }
                     let mut revision = current;
+                    if let SessionFilter::Entries {
+                        node,
+                        session_id,
+                        entries,
+                        instance,
+                    } = &which
+                    {
+                        if session_id.is_empty()
+                            || session_id.len() > crate::node::content::MAX_SESSION_ID_LEN
+                        {
+                            return Err(Error::StreamRefused(
+                                "exact Session id is empty or too long",
+                            ));
+                        }
+                        if entries.len() > 128 || before.is_some() {
+                            return Err(Error::StreamRefused(
+                                "exact Session selection exceeds 128 IDs or carries a page cursor",
+                            ));
+                        }
+                        if *instance != revision.instance {
+                            return Err(Error::StreamRefused(CHANGED));
+                        }
+                        if !authors.contains(node) {
+                            return Err(Error::StreamRefused(
+                                "this node no longer has drive access to the selected Session",
+                            ));
+                        }
+                        let mut origins = Vec::new();
+                        let mut bytes = 0u64;
+                        for hash in entries {
+                            let Some(arrival) = super::private_index::find(
+                                &snapshot,
+                                &self.sek,
+                                &self.channel_id,
+                                hash,
+                            )?
+                            else {
+                                continue;
+                            };
+                            if read
+                                .find(Tree::ActivityFacts, &arrival_key(arrival))?
+                                .is_none()
+                            {
+                                return Err(Error::StreamRefused(
+                                    "entry is not a Session activity origin",
+                                ));
+                            }
+                            let f = fact(&read, arrival)?;
+                            // The established Session view includes its owner's activity
+                            // and authorized drivers' explicit drive rows naming this Session.
+                            if f.hash != *hash
+                                || f.session != *session_id
+                                || (f.author != *node && f.kind != Kind::Drive)
+                                || !authors.contains(&f.author)
+                            {
+                                return Err(Error::StreamRefused(
+                                    "entry does not belong to the exact selected Session",
+                                ));
+                            }
+                            if arrival > revision.boundary {
+                                return Err(Error::StreamRefused(REFRESHING));
+                            }
+                            if read
+                                .activity_find(T::Visible, &member_key(&f.group(), arrival))?
+                                .is_none()
+                            {
+                                continue;
+                            }
+                            if origins.contains(&arrival) {
+                                continue;
+                            }
+                            bytes = bytes
+                                .checked_add(cost(&read, &f, &authors, true, revision.boundary)?)
+                                .ok_or_else(bad)?;
+                            origins.push(arrival);
+                        }
+                        // As for ordinary pages, one legal oversized logical activity is
+                        // streamed whole. A larger exact selection is refused, never truncated.
+                        if origins.len() > 1 && bytes > max_bytes as u64 {
+                            return Err(Error::StreamRefused("held Session selection exceeds one page byte budget; refresh fewer IDs"));
+                        }
+                        origins.sort_unstable();
+                        return Ok(Reply::Selected(Plan {
+                            origins,
+                            older: 0,
+                            visible: true,
+                            revision,
+                        }));
+                    }
                     if matches!(&which, SessionFilter::Pending(_)) {
                         if read.activity_next(T::RawRetire, None)?.is_some() {
                             return Err(Error::StreamRefused(REFRESHING));
@@ -569,6 +667,7 @@ impl ChannelState {
 
 fn selection(which: &SessionFilter, authors: &[Digest32]) -> Result<(T, Vec<Digest32>, bool)> {
     Ok(match which {
+        SessionFilter::Entries { .. } => return Err(bad()),
         SessionFilter::All => (T::AllRank, authors.to_vec(), false),
         SessionFilter::FilesOut => (T::FileRank, authors.to_vec(), false),
         SessionFilter::Session(id) => (

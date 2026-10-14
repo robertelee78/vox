@@ -4025,7 +4025,7 @@ pub async fn get_file(
     'pages: while offers.is_empty() {
         let which = vox_core::node::drive::SessionFilter::FilesOut;
         let (rows, older) = match client.session_page(channel_id, which, before).await {
-            Ok(Frame::SessionPage { rows, older }) => (rows, older),
+            Ok(Frame::SessionPage { rows, older, .. }) => (rows, older),
             Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
             Ok(other) => return Err(crate::client::unexpected(&other)),
             Err(error) => {

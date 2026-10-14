@@ -887,7 +887,7 @@ impl DaemonCore {
             conn.client.session_page(room, which, before),
         )?;
         match self.answered(answer) {
-            Ok(Frame::SessionPage { rows, older }) => {
+            Ok(Frame::SessionPage { rows, older, .. }) => {
                 let next = rows.first().map(|r| r.entry_hash);
                 if older > 0 && (next.is_none() || next == before) {
                     self.notice = Some("the Session activity page made no progress".into());

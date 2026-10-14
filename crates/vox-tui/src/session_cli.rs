@@ -95,7 +95,7 @@ pub async fn show(
         .map_err(|_| AppError::Usage(format!("--before {}: not an entry", before.unwrap_or(""))))?;
     let which = vox_core::node::drive::SessionFilter::Session(named);
     let (rows, older) = match client.session_page(channel_id, which, before).await {
-        Ok(Frame::SessionPage { rows, older }) => (rows, older),
+        Ok(Frame::SessionPage { rows, older, .. }) => (rows, older),
         Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
         Ok(other) => return Err(crate::client::unexpected(&other)),
         Err(e) => return Err(AppError::Usage(e.to_string())),

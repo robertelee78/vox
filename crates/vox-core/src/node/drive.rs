@@ -136,6 +136,18 @@ pub enum SessionFilter {
     Session(String),
     /// Raw records for the Session summary's entry count and newest-change marker.
     SessionRaw(String),
+    /// Revalidate at most 128 held logical activity origins in one exact room incarnation.
+    /// Missing/expired entries are omitted; mismatched identities or authority are refused.
+    Entries {
+        /// Exact Session author.
+        node: Digest32,
+        /// Complete harness Session id.
+        session_id: String,
+        /// Logical origins already held by the caller, including any selected Details.
+        entries: Vec<Digest32>,
+        /// Opaque saved-room identity from the page that supplied those entries.
+        instance: [u8; 16],
+    },
     /// Those announcing a file out of a Session (DR-1.8).
     FilesOut,
     /// Requests still answerable, without walking the Session's transcript.

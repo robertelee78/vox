@@ -391,7 +391,7 @@ const T_SESSION_ROWS: u64 = 5432;
 /// is the newest page; `which` is 0 every Session, 1 the Session `session_id`, 2 files out
 /// (ADR-034 FR-4, FR-5).
 const T_SESSION_PAGE_REQ: u64 = 5435;
-/// `[5436, [row, …], older]` — [`Frame::SessionPage`].
+/// `[5436, [row, …], older, instance]` — [`Frame::SessionPage`].
 const T_SESSION_PAGE: u64 = 5436;
 /// `[5437, channel_id, after]` — [`Request::SessionsPage`]; an empty `after` is the start
 /// (ADR-034 FR-1).
@@ -1453,15 +1453,32 @@ impl Request {
                     SessionFilter::SessionRaw(id) => (5, id.as_str()),
                     SessionFilter::Pending(id) => (3, id.as_str()),
                     SessionFilter::Request { session_id, .. } => (4, session_id.as_str()),
+                    SessionFilter::Entries { session_id, .. } => (6, session_id.as_str()),
                 };
-                e.array(if kind == 4 { 6 } else { 5 })
-                    .uint(T_SESSION_PAGE_REQ)
-                    .bytes(channel_id)
-                    .bytes(before.as_ref().map_or(&[][..], |d| &d[..]))
-                    .uint(kind)
-                    .text(id);
+                e.array(match kind {
+                    4 => 6,
+                    6 => 8,
+                    _ => 5,
+                })
+                .uint(T_SESSION_PAGE_REQ)
+                .bytes(channel_id)
+                .bytes(before.as_ref().map_or(&[][..], |d| &d[..]))
+                .uint(kind)
+                .text(id);
                 if let SessionFilter::Request { reference, .. } = which {
                     e.text(reference);
+                }
+                if let SessionFilter::Entries {
+                    node,
+                    entries,
+                    instance,
+                    ..
+                } = which
+                {
+                    e.bytes(node).bytes(instance).array(entries.len());
+                    for hash in entries {
+                        e.bytes(hash);
+                    }
                 }
             }
             Request::Pull { channel_id, entry } => {
@@ -2309,7 +2326,7 @@ impl Request {
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::SessionsPage { channel_id, after })
             }
-            (T_SESSION_PAGE_REQ, 5 | 6) => {
+            (T_SESSION_PAGE_REQ, 5 | 6 | 8) => {
                 use crate::node::drive::SessionFilter;
                 let channel_id = digest(&mut d)?;
                 let before = optional_digest(&mut d)?;
@@ -2318,15 +2335,36 @@ impl Request {
                     .map_err(|_| Error::MalformedIpc("ipc session page kind"))?;
                 let id = text(&mut d, "ipc session page id")?;
                 let which = match kind {
-                    0 => SessionFilter::All,
-                    1 => SessionFilter::Session(id),
-                    2 => SessionFilter::FilesOut,
-                    3 => SessionFilter::Pending(id),
-                    5 => SessionFilter::SessionRaw(id),
-                    4 => SessionFilter::Request {
+                    0 if n == 5 => SessionFilter::All,
+                    1 if n == 5 => SessionFilter::Session(id),
+                    2 if n == 5 => SessionFilter::FilesOut,
+                    3 if n == 5 => SessionFilter::Pending(id),
+                    5 if n == 5 => SessionFilter::SessionRaw(id),
+                    4 if n == 6 => SessionFilter::Request {
                         session_id: id,
                         reference: text(&mut d, "ipc request reference")?,
                     },
+                    6 if n == 8 => {
+                        let node = digest(&mut d)?;
+                        let instance = d
+                            .bytes()?
+                            .try_into()
+                            .map_err(|_| Error::MalformedIpc("Session room instance"))?;
+                        let count = d.array()?;
+                        if count > 128 {
+                            return Err(Error::MalformedIpc("too many held Session IDs"));
+                        }
+                        let mut entries = Vec::with_capacity(count);
+                        for _ in 0..count {
+                            entries.push(digest(&mut d)?);
+                        }
+                        SessionFilter::Entries {
+                            node,
+                            session_id: id,
+                            entries,
+                            instance,
+                        }
+                    }
                     _ => return Err(Error::MalformedIpc("ipc session page kind")),
                 };
                 d.finish()
@@ -2808,6 +2846,8 @@ pub enum Frame {
         rows: Vec<crate::node::drive::SessionRow>,
         /// How many older entries there are: ask again with the first as `before` for them.
         older: u64,
+        /// The saved-room identity under the same authority/revision fence as the rows.
+        instance: [u8; 16],
     },
     /// A room's Sessions, oldest opening first, as a [`Request::Sessions`] asked for.
     Sessions {
@@ -3151,10 +3191,14 @@ impl Frame {
                 e.array(2).uint(T_SESSION_ROWS);
                 encode_session_rows(&mut e, rows);
             }
-            Frame::SessionPage { rows, older } => {
-                e.array(3).uint(T_SESSION_PAGE);
+            Frame::SessionPage {
+                rows,
+                older,
+                instance,
+            } => {
+                e.array(4).uint(T_SESSION_PAGE);
                 encode_session_rows(&mut e, rows);
-                e.uint(*older);
+                e.uint(*older).bytes(instance);
             }
             Frame::Pulled { path } => {
                 e.array(2).uint(T_PULLED).text(path);
@@ -4143,12 +4187,20 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             let rows = decode_session_rows(d)?;
             return Ok(Frame::SessionEntries { rows });
         }
-        (T_SESSION_PAGE, 3) => {
+        (T_SESSION_PAGE, 4) => {
             let rows = decode_session_rows(d)?;
             let older = d
                 .uint()
                 .map_err(|_| Error::MalformedIpc("ipc session page older"))?;
-            return Ok(Frame::SessionPage { rows, older });
+            let instance = d
+                .bytes()?
+                .try_into()
+                .map_err(|_| Error::MalformedIpc("Session room instance"))?;
+            return Ok(Frame::SessionPage {
+                rows,
+                older,
+                instance,
+            });
         }
         (T_PULLED, 2) => {
             let path = text(d, "ipc pulled path")?;
@@ -4923,7 +4975,7 @@ async fn write_session_activity(
     }
     let mut prefix = Encoder::new();
     prefix
-        .array(if whole { 2 } else { 3 })
+        .array(if whole { 2 } else { 4 })
         .uint(if whole {
             T_SESSION_ROWS
         } else {
@@ -4932,7 +4984,7 @@ async fn write_session_activity(
         .array(count);
     if count == 0 {
         if !whole {
-            prefix.uint(plan.older);
+            prefix.uint(plan.older).bytes(&plan.instance());
         }
         found_frame(stream, &prefix.finish(), writing).await?;
         return Ok(true);
@@ -4995,7 +5047,7 @@ async fn write_session_activity(
     }
     if !whole {
         let mut e = Encoder::new();
-        e.uint(plan.older);
+        e.uint(plan.older).bytes(&plan.instance());
         reply_part(stream, &e.finish(), &mut offset, false, writing).await?;
     }
     Ok(true)
