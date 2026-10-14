@@ -1613,6 +1613,14 @@ final class NodeModel: ObservableObject {
             + "/" + (sheet?.rawValue ?? "closed") + "/" + sheetInstance.uuidString
     }
 
+    func previewRoomAnchorChoices(_ anchors: [RoomAnchorEndpoint], context: String) async throws -> RoomLinkPreview {
+        guard context == anchorChoiceContext, ended == nil, sheet == .newRoom else { throw CancellationError() }
+        let preview = try await client.previewRoomLink(anchors: anchors, node: me)
+        guard !Task.isCancelled, context == anchorChoiceContext, ended == nil,
+              preview.node == me else { throw CancellationError() }
+        return preview
+    }
+
     func searchRoomAnchorChoices(context: String) async throws -> [RoomAnchorEndpoint] {
         guard context == anchorChoiceContext, ended == nil,
               sheet == .newRoom || sheet == .roomAnchors else { throw CancellationError() }
