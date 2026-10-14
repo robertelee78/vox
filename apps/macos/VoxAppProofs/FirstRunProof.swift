@@ -4272,7 +4272,14 @@ final class FirstRunProof: XCTestCase {
         try staged(vox, ["room", "post", "--node", "bob", "--re", fromAlice, room, "REPLY-TO-ALICE"],
                    env: voxEnv)
         guard tap(ui, Key.id("thread-summary-" + fromAlice), "open bob's actual reply thread") else { return }
-        let quote = Key.id("quote-" + (entry("REPLY-TO-ALICE") ?? ""))
+        let replyReceiptUntil = Date().addingTimeInterval(30)
+        var quoteReply: String?
+        repeat {
+            quoteReply = entry("REPLY-TO-ALICE")
+            if quoteReply == nil { Thread.sleep(forTimeInterval: 0.25) }
+        } while quoteReply == nil && Date() < replyReceiptUntil
+        guard let quoteReply else { throw Apparatus("Alice did not receive the exact public reply entry needed for the quote click and keyboard premise") }
+        let quote = Key.id("quote-" + quoteReply)
         words(ui, quote, timeout: 30,
               "bob's reply must show what it replies to, quoted above it: \"re you: FROM-ALICE\"",
               until: { $0 == "re you: FROM-ALICE" })
@@ -4332,9 +4339,26 @@ final class FirstRunProof: XCTestCase {
               panel.frame.width > 0, panel.frame.height > 0 else {
             throw Apparatus("the tagged thread has no finite visible viewport")
         }
-        guard let middle = locate(ui, middleKey), inView(ui, middle) else {
-            keepTree(ui, "the retained tagged middle reply was not realized in its thread")
-            throw Apparatus("the tagged middle reply could not be staged in the actual thread panel")
+        func visibleMiddle(_ row: XCUIElement) -> Bool {
+            let frame = row.frame
+            guard let body = textSaying(ui, "TAGGED-THREAD-MIDDLE") else { return false }
+            let bodyFrame = body.frame
+            return frame.width.isFinite && frame.height.isFinite && frame.width > 0 && frame.height > 0
+                && bodyFrame.width.isFinite && bodyFrame.height.isFinite && bodyFrame.width > 0 && bodyFrame.height > 0
+                && panel.frame.contains(bodyFrame)
+                && panel.frame.contains(CGPoint(x: frame.midX, y: frame.midY)) && inView(ui, row)
+        }
+        let panelUntil = Date().addingTimeInterval(20)
+        while Date() < panelUntil {
+            if let row = locate(ui, middleKey), visibleMiddle(row) { break }
+            if let scroll = panel.descendants(matching: .scrollView).allElementsBoundByIndex.first(where: { $0.exists && $0.frame.width > 0 && $0.frame.height > 0 }) {
+                scroll.scroll(byDeltaX: 0, deltaY: -100)
+            }
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        guard let middle = locate(ui, middleKey), visibleMiddle(middle) else {
+            keepTree(ui, "the retained tagged middle reply was not realized in its actual thread viewport")
+            throw Apparatus("the tagged middle body and click point could not be staged inside the thread panel")
         }
         guard tap(ui, middleKey, "bob's thread reply to select it") else { return }
         let selectedUntil = Date().addingTimeInterval(5)

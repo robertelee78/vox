@@ -2630,6 +2630,7 @@ private struct ThreadPanel: View {
                             .map { "\(NodeModel.author($0, me: model.me)), \(NodeModel.copiedTime($0.createdMillis)): \(NodeModel.body($0))" }
                             .joined(separator: "\n")
                     }))
+                .id(focusNotification)
             }
         }
         .padding(Space.s12)

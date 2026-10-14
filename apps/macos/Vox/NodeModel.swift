@@ -2432,6 +2432,7 @@ extension NodeModel {
                     self.threadSummaries = [:]
                     self.threadSummaryVersions = [:]
                     self.threadAuthorRequests = [:]
+                    self.retireThreadSelection()
                     self.threadRootMessage = nil
                     self.threadReplies = []
                     self.threadHasMore = false
@@ -2480,9 +2481,20 @@ extension NodeModel {
     /// Only retained/readable messages of the currently displayed room can be acted on.
     var selectedChatMessage: RoomMessage? {
         guard roomOnScreen != nil, ended == nil, let id = selectedMessage else { return nil }
-        if let current = messages.first(where: { $0.id == id && !$0.owed }) { return current }
-        guard let root = openThread else { return nil }
+        // The center's currently displayed roots/tag rows remain actionable. Hidden General
+        // reply bodies in the room cache are not an authority after a panel read refusal.
+        if let current = timelineItems.compactMap(\.message).first(where: { $0.id == id && !$0.owed }) { return current }
+        guard showing == .general, let root = openThread else { return nil }
         return threadReplies.first { $0.id == id && $0.thread == root && !$0.owed }
+    }
+
+    private func retireThreadSelection() {
+        guard openThread != nil, let id = selectedMessage,
+              threadReplies.contains(where: { $0.id == id })
+                || messages.contains(where: { $0.id == id && !$0.thread.isEmpty }) else { return }
+        selectedMessage = nil
+        selectedMessages = []
+        selectionAnchor = nil
     }
 
     struct ThreadSelectionScope: Equatable {
@@ -2624,6 +2636,7 @@ extension NodeModel {
                 // A read refusal is not an empty thread; old bodies are not retained under a
                 // potentially changed read permission. The room/root identity stays for Retry.
                 self.threadRootMessage = nil
+                self.retireThreadSelection()
                 self.threadReplies = []
                 self.threadHasMore = false
                 self.threadError = sentence(error)
