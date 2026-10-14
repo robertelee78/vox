@@ -4271,7 +4271,8 @@ final class FirstRunProof: XCTestCase {
         }
         try staged(vox, ["room", "post", "--node", "bob", "--re", fromAlice, room, "REPLY-TO-ALICE"],
                    env: voxEnv)
-        let quote = Key.idPrefix("quote-")
+        guard tap(ui, Key.id("thread-summary-" + fromAlice), "open bob's actual reply thread") else { return }
+        let quote = Key.id("quote-" + (entry("REPLY-TO-ALICE") ?? ""))
         words(ui, quote, timeout: 30,
               "bob's reply must show what it replies to, quoted above it: \"re you: FROM-ALICE\"",
               until: { $0 == "re you: FROM-ALICE" })
@@ -4323,35 +4324,19 @@ final class FirstRunProof: XCTestCase {
         guard let fromBob = receivedMiddle else {
             throw Apparatus("Alice's public room history did not receive the staged tagged middle reply within 30 seconds")
         }
-        let middleKey = Key.timelineRow("bob: TAGGED-THREAD-MIDDLE")
-        guard let replyTimeline = locate(ui, Key.id("timeline")) else {
-            throw Apparatus("the timeline could not be found to scroll to the staged middle reply")
+        guard tap(ui, Key.id("thread-close"), "close the earlier quote thread") else { return }
+        guard tap(ui, Key.id("thread-summary-" + taggedRoot), "open the real tagged thread") else { return }
+        let middleKey = Key.id("thread-message-" + fromBob)
+        guard let panel = locate(ui, Key.id("thread-panel")),
+              panel.frame.width.isFinite, panel.frame.height.isFinite,
+              panel.frame.width > 0, panel.frame.height > 0 else {
+            throw Apparatus("the tagged thread has no finite visible viewport")
         }
-        // The prior quote jump deliberately leaves an earlier message selected and in view.
-        // Scroll to the newer reply before asking the virtualized timeline for its row.
-        func middleVisible(_ row: XCUIElement, in bounds: CGRect) -> Bool {
-            guard let body = textSaying(ui, "TAGGED-THREAD-MIDDLE") else { return false }
-            return bounds.contains(body.frame)
-                && bounds.contains(CGPoint(x: row.frame.midX, y: row.frame.midY))
-                && inView(ui, row)
+        guard let middle = locate(ui, middleKey), inView(ui, middle) else {
+            keepTree(ui, "the retained tagged middle reply was not realized in its thread")
+            throw Apparatus("the tagged middle reply could not be staged in the actual thread panel")
         }
-        let visibleUntil = Date().addingTimeInterval(20)
-        while Date() < visibleUntil {
-            if let row = locate(ui, middleKey),
-               middleVisible(row, in: replyTimeline.frame) { break }
-            replyTimeline.scroll(byDeltaX: 0, deltaY: -200)
-            Thread.sleep(forTimeInterval: 0.25)
-        }
-        guard let middle = locate(ui, middleKey) else {
-            keepTree(ui, "the tagged middle reply could not be staged by scrolling")
-            throw Apparatus("the timeline could not be scrolled to the CLI-held tagged middle reply")
-        }
-        guard let timeline = locate(ui, Key.id("timeline")),
-              middleVisible(middle, in: timeline.frame) else {
-            keepTree(ui, "the tagged middle reply was not inside its timeline")
-            throw Apparatus("the tagged middle reply's body and click point could not be staged inside the timeline")
-        }
-        guard tap(ui, middleKey, "bob's reply to select it") else { return }
+        guard tap(ui, middleKey, "bob's thread reply to select it") else { return }
         let selectedUntil = Date().addingTimeInterval(5)
         while Date() < selectedUntil && !middle.isSelected { Thread.sleep(forTimeInterval: 0.2) }
         guard middle.isSelected else {
