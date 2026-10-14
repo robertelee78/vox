@@ -2688,7 +2688,10 @@ extension NodeModel {
             guard roomOnScreen == room, let now = shownSession, now.nodeFingerprint == s.nodeFingerprint,
                   now.sessionId == s.sessionId, now.canDrive, sessionBefore == before,
                   revision == sessionWindowRevision else { return }
-            sessionPages.older(read, asked: before)
+            guard sessionPages.instance == read.instance else {
+                throw VoxError.Failed(reason: "The saved room changed while loading older Session activity.")
+            }
+            guard sessionPages.older(read, asked: before) else { return }
             sessionWindowRevision = UUID()
             await refreshSessionRequests(room: room, session: now)
         } catch {
@@ -2713,7 +2716,12 @@ extension NodeModel {
             guard roomOnScreen == room, let now = shownSession, now.nodeFingerprint == s.nodeFingerprint,
                   now.sessionId == s.sessionId, now.canDrive, selectedRequest == selected,
                   revision == sessionWindowRevision else { return }
-            sessionPages.refreshRequests(current)
+            var pages = sessionPages
+            pages.refreshRequests(current)
+            if pages != sessionPages {
+                sessionPages = pages
+                sessionWindowRevision = UUID()
+            }
             selectedEarlierRequest = current.first { entry in
                 entry.request?.reference == selected && !sessionEntries.contains(where: { $0.id == entry.id })
             }
