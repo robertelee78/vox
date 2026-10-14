@@ -48,6 +48,8 @@
 //!   Ctrl-R and sends q-answer. His post's `re` names q-mid, and the TUI shows it under "┆ alice:
 //!   q-mid…", one level, never q-root, while q-mid itself is off screen (ADR-028 R-9, #485).
 //!   Both replies' `thread` names q-root without passing --thread (ADR-033 TH-1, TH-3);
+//! - `thread-summary`: General shows the authoritative count, repliers and latest time, hides
+//!   replies until opened, then selects indented replies and collapses back to its root (#754);
 //! - `thread`: Bob replies to q-mid with @alice; the shipped post answers q-mid, stays in
 //!   q-root's thread, and addresses Alice (ADR-033 TH-1, TH-3, #753);
 //! - `jump`: Bob selects q-answer and presses Enter, and q-mid is scrolled to and selected;
@@ -189,7 +191,7 @@
 //! `:interrupt` sent as a stop (`steer`),
 //! a Session's `:share` sending the path as text (`share`), notices placed by time again
 //! (`order`), or times rounded to the second (`session-order`). It passes only on the script's PASS with
-//! all 51 claims ok. Also: the dismissals not kept across a restart (`offer`), a dismissal kept
+//! all 52 claims ok. Also: the dismissals not kept across a restart (`offer`), a dismissal kept
 //! against the member rather than its join, so no offer when it joins again (`reoffer`), or no
 //! offer from a consent grant, so no offer back (`offerback`).
 //!
@@ -288,7 +290,7 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
     let claims: Vec<&str> = said.lines().filter(|l| l.contains(" CLAIM ")).collect();
     let green = claims.iter().filter(|l| l.contains(" ok: ")).count();
     eprintln!(
-        "{said}\n[proof] claims ok: {green} of {} (51 expected); the driver took {:?}; its last \
+        "{said}\n[proof] claims ok: {green} of {} (52 expected); the driver took {:?}; its last \
          stage: {:?}; the runner's longest stall: {stall:?}",
         claims.len(),
         out.took,
@@ -302,8 +304,8 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
             );
             assert_eq!(
                 (claims.len(), green),
-                (51, 51),
-                "APPARATUS: the driver said PASS without all 51 claims ok: {said}"
+                (52, 52),
+                "APPARATUS: the driver said PASS without all 52 claims ok: {said}"
             );
         }
         Some(2) => panic!("APPARATUS, CANNOT MEASURE: the TUI proof's driver failed: {said}"),

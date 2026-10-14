@@ -304,9 +304,10 @@ fn detail_of(
     ch: &ChannelState,
     prev: Option<&ChannelDetail>,
     now: crate::time::Ms,
+    sequence: &std::sync::atomic::AtomicU64,
 ) -> ChannelDetail {
     let (frozen, refused_below_checkpoint) = ch.fork_watch();
-    let (timeline, structured, row_index, display_stamp) = if let Some(p) =
+    let (timeline, structured, row_index, display_stamp, display_revision) = if let Some(p) =
         prev.filter(|p| ch.display_is_current(&p.display_stamp))
     {
         (
@@ -314,6 +315,7 @@ fn detail_of(
             p.structured.clone(),
             p.row_index.clone(),
             p.display_stamp.clone(),
+            p.display_revision,
         )
     } else {
         let (rows, stamp) = ch.display_timeline();
@@ -360,7 +362,13 @@ fn detail_of(
                 })
                 .collect(),
         );
-        (timeline, structured, row_index, stamp)
+        (
+            timeline,
+            structured,
+            row_index,
+            stamp,
+            sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        )
     };
     // Who trusts each member (ADR-028 K-7), once: this identity's own entry is `consenting`.
     let trusted_by = ch.trusted_by();
@@ -373,6 +381,7 @@ fn detail_of(
         members: ch.members(),
         timeline,
         display_stamp,
+        display_revision,
         row_index,
         order: ch.order_keys(),
         structured,
@@ -3816,6 +3825,8 @@ const fn worth_another_responder(fault: Fault) -> bool {
 /// and none of them can starve another (ADR-020 §7).
 #[derive(Debug, Clone)]
 pub struct NodeHandle {
+    /// Fresh for each actor lifetime, so a repaired client cannot reuse an old display token.
+    display_incarnation: Digest32,
     computer: Option<Arc<crate::node::computer::Computer>>,
     computer_revision: Arc<std::sync::atomic::AtomicU64>,
     cmd_tx: mpsc::Sender<(NodeCommand, oneshot::Sender<Outcome>)>,
@@ -4008,6 +4019,36 @@ impl NodeHandle {
             }
         }
         view
+    }
+
+    /// An opaque cache token for one open room's published rows and display names (#754).
+    /// Borrows the watch: no timeline scan, snapshot construction or retained view clone.
+    /// Name hashing is proportional to the current keyring/presentations, not room history.
+    /// Callers discard tokens when replacing their selected-node connection.
+    pub(crate) fn room_display_revision(&self, channel_id: &Digest32) -> Option<Digest32> {
+        use sha2::{Digest, Sha256};
+        let view = self.view_rx.borrow();
+        let detail = view
+            .open_channels
+            .iter()
+            .find(|d| &d.channel_id == channel_id)?;
+        let mut hash = Sha256::new();
+        hash.update(b"vox-room-display-revision-v1");
+        hash.update(self.display_incarnation);
+        hash.update(view.identity.as_ref()?.fingerprint);
+        hash.update(channel_id);
+        hash.update(detail.display_revision.to_be_bytes());
+        // Alias collisions depend on the whole keyring. A name change can alter a shown
+        // author's suffix even when the renamed fingerprint is not a thread participant.
+        for names in [&view.trusted, &view.presented] {
+            hash.update((names.len() as u64).to_be_bytes());
+            for (fingerprint, name) in names {
+                hash.update(fingerprint);
+                hash.update((name.len() as u64).to_be_bytes());
+                hash.update(name.as_bytes());
+            }
+        }
+        Some(hash.finalize().into())
     }
 
     /// A receiver that resolves whenever the view changes.
@@ -4231,6 +4272,8 @@ pub struct Node {
     bind: Option<Bind>,
     computer: Option<Arc<crate::node::computer::Computer>>,
     computer_revision: Arc<std::sync::atomic::AtomicU64>,
+    /// One sequence for this actor, including rooms closed and reopened between snapshots.
+    display_sequence: std::sync::atomic::AtomicU64,
     /// The headless transport identity, if this node runs without a vault.
     headless: Option<Arc<crate::identity::composite::SoftwareRootSigner>>,
     /// See [`NodeConfig::anchor_boards`].
@@ -4883,6 +4926,7 @@ impl Node {
         paths: Paths,
         cfg: NodeConfig,
     ) -> crate::error::Result<(NodeHandle, tokio::task::JoinHandle<()>)> {
+        let display_incarnation = crate::identity::rng::random_array::<32>()?;
         let NodeConfig {
             clock,
             millis_clock,
@@ -4942,6 +4986,7 @@ impl Node {
             bind,
             computer,
             computer_revision: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
+            display_sequence: std::sync::atomic::AtomicU64::new(1),
             anchor_ids: anchors.nodes().iter().map(|n| n.id).collect(),
             room_anchors: BTreeMap::new(),
             anchor_inventory,
@@ -5152,6 +5197,7 @@ impl Node {
         let computer_revision = Arc::clone(&node.computer_revision);
         let actor = tokio::spawn(node.run(cmd_rx, net_rx));
         let handle = NodeHandle {
+            display_incarnation,
             computer,
             computer_revision,
             cmd_tx,
@@ -15498,7 +15544,10 @@ impl Node {
             if written.is_ok() {
                 self.fresh_details.insert(
                     channel_id,
-                    (summary_of(&ch), detail_of(&ch, None, self.now_ms())),
+                    (
+                        summary_of(&ch),
+                        detail_of(&ch, None, self.now_ms(), &self.display_sequence),
+                    ),
                 );
             }
             written
@@ -15777,7 +15826,10 @@ impl Node {
             }
             self.fresh_details.insert(
                 *channel_id,
-                (summary_of(&ch), detail_of(&ch, None, self.now_ms())),
+                (
+                    summary_of(&ch),
+                    detail_of(&ch, None, self.now_ms(), &self.display_sequence),
+                ),
             );
         }
         self.note_local_append(channel_id);
@@ -15814,7 +15866,10 @@ impl Node {
             }
             self.fresh_details.insert(
                 *channel_id,
-                (summary_of(&ch), detail_of(&ch, None, self.now_ms())),
+                (
+                    summary_of(&ch),
+                    detail_of(&ch, None, self.now_ms(), &self.display_sequence),
+                ),
             );
         }
         self.note_local_append(channel_id);
@@ -15839,7 +15894,10 @@ impl Node {
             }
             self.fresh_details.insert(
                 *channel_id,
-                (summary_of(&ch), detail_of(&ch, None, self.now_ms())),
+                (
+                    summary_of(&ch),
+                    detail_of(&ch, None, self.now_ms(), &self.display_sequence),
+                ),
             );
         }
         self.note_local_append(channel_id);
@@ -17400,6 +17458,7 @@ impl Node {
                     .iter()
                     .find(|d| d.channel_id == *channel_id),
                 self.now_ms(),
+                &self.display_sequence,
             )
         };
         self.fresh_details
@@ -17678,6 +17737,7 @@ impl Node {
                     .filter(|detail| ch.display_is_current(&detail.display_stamp))
                     .or_else(|| prev.open_channels.iter().find(|d| d.channel_id == *id)),
                 self.now_ms(),
+                &self.display_sequence,
             ));
         }
         let mut channels = Vec::with_capacity(known.len());

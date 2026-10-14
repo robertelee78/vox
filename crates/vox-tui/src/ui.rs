@@ -597,26 +597,16 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
 
     // What the timeline shows (ADR-029 CL-2): the room's conversation (General); that and each
     // Session's opening and end (All); or one Session, whose activity is never the room's (SC-4).
-    let tagged: Vec<MessageView>;
-    let (timeline, notices, shown) = match &ui.showing {
-        Showing::Tag(tag) => {
-            tagged = channel
-                .timeline
-                .iter()
-                .filter(|m| m.tags.iter().any(|t| t == tag))
-                .cloned()
-                .collect();
-            (
-                tagged.as_slice(),
-                Vec::new(),
-                format!(
-                    " — tagged {} (:general for the room)",
-                    vox_agentcomms::envelope::shown(tag, vox_agentcomms::envelope::SHOWN_NAME)
-                ),
-            )
-        }
+    let timeline = crate::state::room_messages(channel, &ui.showing);
+    let (notices, shown) = match &ui.showing {
+        Showing::Tag(tag) => (
+            Vec::new(),
+            format!(
+                " — tagged {} (:general for the room)",
+                vox_agentcomms::envelope::shown(tag, vox_agentcomms::envelope::SHOWN_NAME)
+            ),
+        ),
         Showing::General => (
-            channel.timeline.as_slice(),
             channel.notices.clone(),
             if channel.room_older > 0 {
                 format!(" — {} older · ↑ at top to load", channel.room_older)
@@ -641,7 +631,7 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
                 }
             }
             notices.sort_by_key(|n| n.timestamp);
-            (channel.timeline.as_slice(), notices, " — All".to_owned())
+            (notices, " — All".to_owned())
         }
         Showing::Session(..) => {
             let mut notices = Vec::new();
@@ -683,7 +673,7 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
                     )
                 },
             );
-            (&[][..], notices, shown)
+            (notices, shown)
         }
     };
     // **A Session's name and id are its node's claim** (ADR-029 MD-3): over another node's
@@ -733,7 +723,12 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
             area,
             &channel.held_back,
             timeline,
-            (&notices, &channel.retention, &shown),
+            (
+                &notices,
+                channel,
+                &shown,
+                matches!(ui.showing, Showing::General),
+            ),
             Selection {
                 scroll: ui.timeline_scroll,
                 selected: ui.selected_message,
@@ -1002,17 +997,23 @@ struct Selection {
     focus: bool,
 }
 
-fn render_timeline(
+fn render_timeline<'a>(
     frame: &mut Frame,
     area: Rect,
     held_back: &[String],
-    timeline: &[MessageView],
+    timeline: impl DoubleEndedIterator<Item = &'a MessageView> + Clone,
     // What happened to the room, its retention, and what is shown beyond the room's own
     // conversation (" — All", " — <a Session's label>"), for the header.
-    (room_notices, retention, showing): (&[NoticeView], &str, &str),
+    (room_notices, channel, showing, general): (&[NoticeView], &ChannelView, &str, bool),
     at: Selection,
     images: &mut crate::images::Images,
 ) -> (usize, Vec<Digest32>) {
+    let retention = &channel.retention;
+    let thread = channel.expanded_thread.as_ref().filter(|_| general);
+    let indented: std::collections::HashSet<_> = thread
+        .into_iter()
+        .flat_map(|t| t.replies.iter().map(|r| r.entry_hash))
+        .collect();
     let Selection {
         mut scroll,
         selected,
@@ -1039,7 +1040,7 @@ fn render_timeline(
     // whose message is not in the timeline goes by time.
     let anchored = |n: &NoticeView| {
         n.after
-            .is_some_and(|h| timeline.iter().any(|m| m.entry_hash == h))
+            .is_some_and(|h| timeline.clone().any(|m| m.entry_hash == h))
     };
     let mut said = room_notices
         .iter()
@@ -1065,7 +1066,18 @@ fn render_timeline(
                     owner: Option<Digest32>,
                     pic: Option<usize>,
                     l: Line<'static>| {
-        for row in wrap(l, width).into_iter().rev() {
+        let indent = if owner.is_some_and(|h| indented.contains(&h)) {
+            4
+        } else {
+            0
+        };
+        for mut row in wrap(l, width.saturating_sub(indent).max(1))
+            .into_iter()
+            .rev()
+        {
+            if indent > 0 {
+                row.spans.insert(0, Span::raw("    "));
+            }
             rows.push(row);
             owners.push(owner);
             pics.push(pic);
@@ -1075,7 +1087,7 @@ fn render_timeline(
     // While the selected message must be scrolled to, the rows go on until all of its are in.
     let seek = reveal && selected.is_some();
     let mut found = false;
-    for m in timeline.iter().rev() {
+    for m in timeline.clone().rev() {
         if rows.len() >= want && (!seek || found) {
             reached_oldest = false;
             break;
@@ -1093,6 +1105,59 @@ fn render_timeline(
         // Under a message it sent, who has read it, or where it is while nobody is known to
         // have (ADR-028 R-6). Rows run newest first here, so it goes before the message's own.
         // `pulled by agent-2 · read by ann` (ADR-028 F-7).
+        if general && m.thread.is_none() {
+            if let Some(summary) = channel.threads.get(&m.entry_hash).filter(|s| s.replies > 0) {
+                let ago = vox_core::transport::quic::unix_now_ms()
+                    .saturating_sub(summary.last_reply)
+                    / 1000;
+                let opened = thread.filter(|t| t.root == m.entry_hash);
+                let action = opened.map_or_else(
+                    || "Enter: open thread".to_owned(),
+                    |t| {
+                        format!(
+                            "{} reply page · {}← close; reopen for first page",
+                            if t.first_page { "first" } else { "later" },
+                            if t.more { "→ next page · " } else { "" }
+                        )
+                    },
+                );
+                let authors = vox_agentcomms::envelope::reveal_keeping(&summary.authors, |_| false);
+                push(
+                    &mut rows,
+                    Some(m.entry_hash),
+                    None,
+                    Line::from(Span::styled(
+                        format!(
+                            "  {} {} · {}{} · last reply {ago}s ago · {action}",
+                            summary.replies,
+                            if summary.replies == 1 {
+                                "reply"
+                            } else {
+                                "replies"
+                            },
+                            authors,
+                            if summary.more_authors {
+                                ", and more"
+                            } else {
+                                ""
+                            }
+                        ),
+                        Style::default().add_modifier(Modifier::DIM),
+                    )),
+                );
+            } else if thread.is_some_and(|t| t.root == m.entry_hash) {
+                push(
+                    &mut rows,
+                    Some(m.entry_hash),
+                    None,
+                    Line::from(if channel.threads.contains_key(&m.entry_hash) {
+                        "  No replies yet · Ctrl-R reply in thread · ← close"
+                    } else {
+                        "  Thread summary unavailable · ← close"
+                    }),
+                );
+            }
+        }
         let read = if m.read_by.is_empty() {
             m.whereabouts.clone()
         } else {
@@ -1511,7 +1576,7 @@ fn hint_text(ui: &UiState, vm: &ViewModel) -> String {
             " Tab switch pane · ↑/↓ select · Enter show · :general · :all · :session <name> · : command · Esc back"
         }
         Screen::Channel => {
-            " Tab switch pane · ↑/↓ select · Ctrl-R reply in thread · Enter send, or go to the quoted · PgUp/PgDn scroll · :to <name> · :urgent · :share <path> · :link · :general · :all · :session <name> · :tag <tag> · : command · Esc back"
+            " Tab switch pane · ↑/↓ select · Ctrl-R reply in thread · Enter open thread / go to quote · → next replies · ← close thread · PgUp/PgDn scroll · :to <name> · :urgent · :share <path> · :link · :general · :all · :session <name> · :tag <tag> · : command · Esc back"
         }
         Screen::Tunnels => " ↑/↓ select · x close the selected tunnel · : command · Esc back",
         Screen::Serve if vm.serve_preview.is_some() => " Enter share it · Esc back to the list",
