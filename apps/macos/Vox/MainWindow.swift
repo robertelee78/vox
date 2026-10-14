@@ -211,7 +211,7 @@ private struct Sidebar: View {
         Button("Mark as Read") {
             Task { await model.markRoomRead(room.id) }
         }
-        .disabled(model.busy)
+        .disabled(model.progress(of: "mark-room-read") != nil)
         Button("Copy Name") {
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(room.name, forType: .string)

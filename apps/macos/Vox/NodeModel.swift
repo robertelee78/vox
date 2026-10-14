@@ -1867,8 +1867,10 @@ final class NodeModel: ObservableObject {
     /// Deliberately mark the clicked room's captured received history, not only loaded rows.
     func markRoomRead(_ room: String) async {
         let actor = me, epoch = nodeObservationEpoch
-        guard rooms.contains(where: { $0.id == room }), ended == nil else { return }
-        let operation = "mark-room-read", attempt = begin("mark-room-read")
+        let operation = "mark-room-read"
+        guard progress(of: operation) == nil,
+              rooms.contains(where: { $0.id == room }), ended == nil else { return }
+        let attempt = begin(operation)
         defer { end(attempt) }
         do {
             let count = try await client.markRoomRead(room: room, node: actor)
