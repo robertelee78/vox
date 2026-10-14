@@ -2531,14 +2531,20 @@ private struct ThreadSummaryLine: View {
                         .buttonStyle(.plain)
                         .accessibilityIdentifier("thread-authors-more-" + message.id)
                 }
-            } else if let error = model.threadSummaryErrors[message.id] {
-                Text("Replies unavailable: " + error).secondaryText()
-                    .accessibilityIdentifier("thread-summary-error-" + message.id)
-                Button("Open thread") { model.showThread(message) }
-                    .buttonStyle(.plain)
-            } else if model.threadSummaries[message.id] == nil && !message.owed {
+            } else if model.threadSummaries[message.id] == nil,
+                      model.threadSummaryErrors[message.id] == nil && !message.owed {
                 Text("Replies loading…").secondaryText()
                     .accessibilityIdentifier("thread-summary-loading-" + message.id)
+            }
+            if let error = model.threadSummaryErrors[message.id] {
+                Text("Replies unavailable: " + error).secondaryText()
+                    .accessibilityIdentifier("thread-summary-error-" + message.id)
+                Button("Retry reply summary") { model.retryThreadSummary(message.id) }
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier("thread-summary-retry-" + message.id)
+                if model.threadSummaries[message.id] == nil {
+                    Button("Open thread") { model.showThread(message) }.buttonStyle(.plain)
+                }
             }
         }
     }
