@@ -774,6 +774,10 @@ final class NodeModel: ObservableObject {
             let view = try await client.view()
             guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
             daemonReachable = true
+            // Both public daemon and held-node reads succeeded for this observation epoch.
+            // Retire only a typed background connection fault, even when another poll never
+            // changed daemonReachable. Foreground and unrelated read failures remain visible.
+            if outcome?.operation == "", outcome?.backgroundConnectivity == true { outcome = nil }
             if Int(view.peers) != peers { peers = Int(view.peers) }
             if view.keyring != keyring { keyring = view.keyring }
             if fresh.first(where: { $0.name == node })?.state == "attached" {
@@ -791,7 +795,7 @@ final class NodeModel: ObservableObject {
                     stepRetentionRead = UUID()
                     stepRetentionLoading = false
                 }
-                if outcome?.operation == "" { outcome = nil }
+
                 try await client.subscribe(listener: Listener(model: self))
                 guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
                 lastRead.removeAll()
@@ -2083,7 +2087,10 @@ final class NodeModel: ObservableObject {
     /// never over what a person's own operation came to.
     private func reportBackground(_ error: Error) {
         guard outcome == nil || outcome?.operation == "" else { return }
-        outcome = Outcome(operation: "", kind: Outcome.kind(of: error), words: sentence(error))
+        let connectivity: Bool
+        if case VoxError.Unreachable(_) = error { connectivity = true } else { connectivity = false }
+        outcome = Outcome(operation: "", kind: Outcome.kind(of: error), words: sentence(error),
+                          backgroundConnectivity: connectivity)
     }
 
     // ---- what the node says -------------------------------------------------------------------
@@ -2634,6 +2641,7 @@ struct Outcome: Equatable {
     let kind: Kind
     /// What to say: what it did, or the daemon's sentence for why not.
     let words: String
+    var backgroundConnectivity = false
 
     static func kind(of error: Error) -> Kind {
         if case VoxError.Unknown(_) = error { return .unknown }

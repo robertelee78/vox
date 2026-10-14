@@ -1373,12 +1373,12 @@ impl Held {
         again.using.attach = AttachMode::Hold;
         self.client = IpcClient::open_at(&again)
             .await
-            .map_err(|e| {
-                failed(format!(
+            .map_err(|e| VoxError::Unreachable {
+                reason: format!(
                     "the app's connection to node {} broke, and a new one could not be opened: {}",
                     self.node,
                     said(&self.at.path, e)
-                ))
+                ),
             })?
             .with_answer_bound(REQUEST_WITHIN);
         Ok(())
@@ -1409,7 +1409,9 @@ pub struct VoxClient {
 /// A failure to reach the daemon, said for a person.
 /// The sentence vox-core writes for it, which the CLI shows too (ADR-028 E-7).
 fn said(socket: &std::path::Path, e: Error) -> VoxError {
-    failed(vox_core::node::daemonipc::unreached(socket, None, e))
+    VoxError::Unreachable {
+        reason: vox_core::node::daemonipc::unreached(socket, None, e),
+    }
 }
 
 /// An attach's failure, typed where a client acts on it (P4): a wrong passphrase is asked for
