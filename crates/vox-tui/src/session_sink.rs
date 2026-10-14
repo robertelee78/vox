@@ -25,8 +25,8 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value};
 use tokio::sync::oneshot;
@@ -35,6 +35,9 @@ use vox_core::node::daemonipc::{NodeName, SessionAdmission, ToolCall};
 /// How long text a driver typed into a session is remembered, so the harness's prompt event for
 /// it is not also shown as typed at the terminal.
 const DELIVERED_FOR: Duration = Duration::from_secs(30);
+const DELIVERED_KEPT: usize = 256;
+const OPEN_CALLS_KEPT: usize = 256;
+const OPEN_CALL_BYTES: usize = 1024 * 1024;
 
 /// How often a waiting request's transcript is read for its result.
 const TRANSCRIPT_POLL: Duration = Duration::from_millis(250);
@@ -110,12 +113,94 @@ pub struct Sink {
 struct Session {
     /// Started tool calls not yet ended.
     open: Vec<ToolCall>,
+    /// Once a call could not be tracked, no later apparent unique match is authoritative.
+    open_incomplete: bool,
     /// Requests waiting, by the call they are tied to.
     asks: BTreeMap<String, Ask>,
-    /// Text drivers typed into the session lately, and when (see [`Sink::delivered_text`]).
-    delivered: Vec<(String, std::time::Instant, Arc<()>)>,
+    /// Bounded fingerprints of reserved/delivered prompts (see [`Sink::reserve_delivery`]).
+    delivered: Vec<Delivered>,
     /// Requests settled lately, with what a late answer to each is told.
     settled: std::collections::VecDeque<(String, String)>,
+}
+
+struct Delivered {
+    digest: vox_core::hash::Digest32,
+    bytes: usize,
+    ticket: Arc<()>,
+    /// No expiry while a send is in flight. Its full echo window starts when it finishes.
+    finished: Option<Instant>,
+    consumed: bool,
+}
+
+impl Delivered {
+    fn live(&self) -> bool {
+        self.finished.is_none_or(|at| at.elapsed() < DELIVERED_FOR)
+    }
+}
+
+/// A prompt reserves its echo marker before reaching the harness. Cancellation of an attempted
+/// send has an unknown outcome, so dropping this guard preserves its full echo window too.
+pub struct DeliveryReservation {
+    sink: Weak<Sink>,
+    node: NodeName,
+    session: String,
+    ticket: Arc<()>,
+    attempted: bool,
+}
+
+impl DeliveryReservation {
+    /// From this point, cancellation or an untyped backend error cannot prove no send occurred.
+    pub fn attempting(&mut self) {
+        self.attempted = true;
+    }
+}
+
+impl Drop for DeliveryReservation {
+    fn drop(&mut self) {
+        let Some(sink) = self.sink.upgrade() else {
+            return;
+        };
+        sink.with(|all| {
+            let Some(s) = all.get_mut(&(self.node.clone(), self.session.clone())) else {
+                return;
+            };
+            let Some(i) = s
+                .delivered
+                .iter()
+                .position(|d| Arc::ptr_eq(&d.ticket, &self.ticket))
+            else {
+                return;
+            };
+            if !self.attempted || s.delivered[i].consumed {
+                s.delivered.remove(i);
+            } else {
+                s.delivered[i].finished = Some(Instant::now());
+            }
+        });
+    }
+}
+
+/// An early echo consumes the marker but cannot release an in-flight reservation's slot.
+fn consume_delivery(s: &mut Session, ticket: &Arc<()>) {
+    if let Some(i) = s
+        .delivered
+        .iter()
+        .position(|d| Arc::ptr_eq(&d.ticket, ticket))
+    {
+        if s.delivered[i].finished.is_none() {
+            s.delivered[i].consumed = true;
+        } else {
+            s.delivered.remove(i);
+        }
+    }
+}
+
+fn call_bytes(call: &ToolCall) -> usize {
+    call.id
+        .capacity()
+        .saturating_add(call.tool.capacity())
+        .saturating_add(call.agent.capacity())
+        .saturating_add(call.input.capacity())
 }
 
 /// One approval or question waiting.
@@ -396,8 +481,7 @@ impl Sink {
                 return Vec::new();
             };
             if let Some(echo) = effects.echo {
-                s.delivered
-                    .retain(|(_, _, ticket)| !Arc::ptr_eq(ticket, &echo));
+                consume_delivery(s, &echo);
             }
             s.asks
                 .iter()
@@ -449,6 +533,11 @@ impl Sink {
         bodies: Vec<String>,
         call: Option<ToolCall>,
     ) -> SessionAdmission {
+        // The public daemon request can name any session. Do not create correlation state for
+        // an unregistered/unbound session before the later durable-admission check rejects it.
+        if (self.room_of)(node, session).is_none() {
+            return SessionAdmission::Skipped;
+        }
         // Source identities have the same deduplication and control semantics at the public
         // ingress seam as at the in-daemon adapter; never pass them through the eager path.
         if bodies.iter().any(|body| {
@@ -489,11 +578,18 @@ impl Sink {
         }
         let mut ended: Vec<String> = Vec::new();
         let mut turn_end = false;
+        let mut reset_calls = false;
         let mut kept = Vec::with_capacity(bodies.len());
         for b in bodies {
             let Ok(v) = serde_json::from_str::<Value>(&b) else {
                 continue;
             };
+            // Even a suppressed drive echo starts a known new turn. Reset correlation, while
+            // preserving the existing rule that the duplicate does not expire request waiters.
+            reset_calls |= matches!(
+                v.get("kind").and_then(Value::as_str),
+                Some("user" | "turn-end")
+            );
             if self.was_delivered(node, session, &v) {
                 continue;
             }
@@ -512,16 +608,41 @@ impl Sink {
             kept.push(b);
         }
         let bodies = kept;
-        self.with(|all| {
+        let overflowed = self.with(|all| {
             let s = all.entry((node.clone(), session.to_owned())).or_default();
-            if let Some(c) = call {
-                s.open.push(c);
+            if reset_calls {
+                s.open.clear();
+                s.open_incomplete = false;
             }
             s.open.retain(|c| !ended.contains(&c.id));
+            if let Some(c) = call {
+                if s.open_incomplete || ended.contains(&c.id) {
+                    return false;
+                }
+                // Reserve the maximum Vec allocation in the byte charge; pruning calls does
+                // not release that allocation. String capacity, not length, counts retained RAM.
+                let bytes = s.open.iter().fold(
+                    OPEN_CALLS_KEPT * std::mem::size_of::<ToolCall>(),
+                    |sum, c| sum.saturating_add(call_bytes(c)),
+                );
+                if s.open.len() == OPEN_CALLS_KEPT
+                    || bytes.saturating_add(call_bytes(&c)) > OPEN_CALL_BYTES
+                {
+                    s.open.clear();
+                    s.open_incomplete = true;
+                    return true;
+                }
+                s.open.push(c);
+            }
+            false
         });
         // Revoke answer authority as soon as the harness reports settlement. Saving its
         // transcript must never keep a stale approval waiter alive.
         let mut bodies = bodies;
+        if overflowed {
+            bodies.push(json!({"v": crate::session_mirror::VERSION, "session": session,
+                "kind": "notice", "text": "Vox cannot track more open tool calls in this turn; new permission requests must be answered at the terminal until the next turn"}).to_string());
+        }
         for r in ended {
             let (_, entry) = self.settled_entry(node, session, &r);
             bodies.extend(entry);
@@ -532,21 +653,43 @@ impl Sink {
         self.post_numbered(node, session, bodies).await
     }
 
-    /// A driver's text was delivered to `session` as its input (#544): its `drive` entry already
+    /// Reserve a driver's text before delivering it to `session` (#544): its `drive` entry already
     /// shows it as typed in Vox by that driver, so the harness's own prompt event for the same
     /// text, if it fires one, is not shown again as typed at the terminal. A limit, stated: the
     /// same text typed at the terminal within 30 s (`DELIVERED_FOR`) is shown once, as typed in Vox.
-    pub fn delivered_text(&self, node: &NodeName, session: &str, text: &str) {
+    /// Capacity refuses the send; accepted markers are never evicted to admit a new prompt.
+    ///
+    /// # Errors
+    /// The session is no longer registered in a room, or all delivery slots are occupied.
+    pub fn reserve_delivery(
+        self: &Arc<Self>,
+        node: &NodeName,
+        session: &str,
+        text: &str,
+    ) -> Result<DeliveryReservation, String> {
+        if (self.room_of)(node, session).is_none() {
+            return Err("the session is no longer registered in a room; nothing was sent".into());
+        }
+        let text = text.trim();
+        let ticket = Arc::new(());
+        let digest = vox_core::hash::sha256(text.as_bytes());
         self.with(|all| {
             let s = all.entry((node.clone(), session.to_owned())).or_default();
-            s.delivered
-                .retain(|(_, at, _)| at.elapsed() < DELIVERED_FOR);
-            s.delivered.push((
-                text.trim().to_owned(),
-                std::time::Instant::now(),
-                Arc::new(()),
-            ));
-        });
+            s.delivered.retain(Delivered::live);
+            if s.delivered.len() >= DELIVERED_KEPT {
+                return Err("Vox has too many pending delivery echoes; wait before trying again; nothing was sent".to_owned());
+            }
+            s.delivered.push(Delivered { digest, bytes: text.len(), ticket: Arc::clone(&ticket),
+                finished: None, consumed: false });
+            Ok(())
+        })?;
+        Ok(DeliveryReservation {
+            sink: Arc::downgrade(self),
+            node: node.clone(),
+            session: session.to_owned(),
+            ticket,
+            attempted: false,
+        })
     }
 
     /// Whether `body` is the harness's prompt event for text a driver delivered; that delivery is
@@ -565,16 +708,20 @@ impl Sink {
         if body.get("kind").and_then(Value::as_str) != Some("user") || body.get("part").is_some() {
             return None;
         }
-        let text = body.get("text").and_then(Value::as_str)?;
+        let text = body.get("text").and_then(Value::as_str)?.trim();
+        let digest = vox_core::hash::sha256(text.as_bytes());
         self.with(|all| {
             let s = all.get_mut(&(node.clone(), session.to_owned()))?;
-            s.delivered
-                .retain(|(_, at, _)| at.elapsed() < DELIVERED_FOR);
-            match s.delivered.iter().position(|(t, _, _)| t == text.trim()) {
+            s.delivered.retain(Delivered::live);
+            match s
+                .delivered
+                .iter()
+                .position(|d| !d.consumed && d.bytes == text.len() && d.digest == digest)
+            {
                 Some(i) => {
-                    let ticket = Arc::clone(&s.delivered[i].2);
+                    let ticket = Arc::clone(&s.delivered[i].ticket);
                     if consume {
-                        s.delivered.remove(i);
+                        consume_delivery(s, &ticket);
                     }
                     Some(ticket)
                 }
@@ -601,6 +748,9 @@ impl Sink {
         call: ToolCall,
         transcript: String,
     ) -> Option<String> {
+        if (self.room_of)(node, session).is_none() {
+            return None;
+        }
         let Ok(Value::Object(mut entry)) = serde_json::from_str::<Value>(&body) else {
             return None;
         };
@@ -616,6 +766,9 @@ impl Sink {
         let ticket = Arc::new(());
         let tied = self.with(|all| {
             let s = all.entry((node.clone(), session.to_owned())).or_default();
+            if s.open_incomplete {
+                return Err("Vox's tool-call correlation is incomplete; answer at the terminal until the next turn");
+            }
             let matching: Vec<&ToolCall> = s
                 .open
                 .iter()
@@ -833,6 +986,9 @@ impl Sink {
         session: &str,
         entry: String,
     ) -> Option<oneshot::Receiver<Given>> {
+        if (self.room_of)(node, session).is_none() {
+            return None;
+        }
         let Ok(Value::Object(m)) = serde_json::from_str::<Value>(&entry) else {
             return None;
         };

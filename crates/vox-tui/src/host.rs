@@ -2071,18 +2071,28 @@ impl Router {
             }
             _ => return Err("not an input for the session's terminal".into()),
         };
-        let typed = match &steer {
-            Steer::Text(t) => Some(t.clone()),
+        // Reserve before the harness can emit its prompt echo. A full echo window refuses the
+        // send, and an attempted send's unknown outcome retains the marker even on cancellation.
+        let mut delivery = match &steer {
+            Steer::Text(t) => Some(self.inner.sink.reserve_delivery(node, &reg.session, t)?),
             _ => None,
         };
         let done = match reg.harness.as_str() {
             "codex" if !reg.codex_home.is_empty() => {
+                if let Some(reservation) = &mut delivery {
+                    reservation.attempting();
+                }
                 self.inner
                     .codex
                     .steer(std::path::Path::new(&reg.codex_home), &reg.session, steer)
                     .await
             }
-            "opencode" => self.inner.opencode.steer(&reg.session, steer).await,
+            "opencode" => {
+                if let Some(reservation) = &mut delivery {
+                    reservation.attempting();
+                }
+                self.inner.opencode.steer(&reg.session, steer).await
+            }
             "claude" => {
                 use crate::claude_injector::Act;
                 let act = match steer {
@@ -2093,6 +2103,9 @@ impl Router {
                     Steer::Slash { cmd, args } => Act::Slash(format!("/{cmd} {args}")),
                 };
                 let reg = reg.clone();
+                if let Some(reservation) = &mut delivery {
+                    reservation.attempting();
+                }
                 tokio::task::spawn_blocking(move || crate::claude_injector::drive(&reg, &act))
                     .await
                     .unwrap_or_else(|_| Err("the delivery to the terminal failed".into()))
@@ -2104,9 +2117,9 @@ impl Router {
             ),
             other => Err(format!("Vox cannot drive a {other} session")),
         };
-        if let (Ok(_), Some(t)) = (&done, typed) {
-            self.inner.sink.delivered_text(node, &reg.session, &t);
-        }
+        // Backend string errors do not establish that no bytes reached the harness. Preserve
+        // attempted markers for their full 30 seconds; only a never-attempted route rolls back.
+        drop(delivery);
         done
     }
 
