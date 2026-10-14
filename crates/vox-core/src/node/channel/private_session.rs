@@ -1398,6 +1398,7 @@ impl ChannelState {
         Ok(complete)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn refresh_one_session_record(
         &mut self,
         profile: &Profile,

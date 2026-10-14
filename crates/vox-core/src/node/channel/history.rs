@@ -12,6 +12,13 @@ use crate::node::api::{
 pub(crate) enum Query {
     Governance(crate::node::api::GovernanceQuery),
     ArrivalHead,
+    OperationPage {
+        author: Digest32,
+        op: String,
+        through: HistoryCursor,
+        after: Option<(u64, Digest32)>,
+        revision: Option<u64>,
+    },
     NoticeState,
     NoticeExact {
         entry: Digest32,
@@ -25,6 +32,7 @@ pub(crate) enum Query {
         limit: usize,
     },
     LocateUnread,
+    UnreadSummary,
     Arrival {
         after: Option<u64>,
         limit: usize,
@@ -73,6 +81,12 @@ pub(crate) enum Query {
 pub(crate) enum Reply {
     Governance(crate::node::api::GovernancePage),
     ArrivalHead(HistoryCursor),
+    OperationPage {
+        rows: Vec<MessageRow>,
+        next: Option<(u64, Digest32)>,
+        revision: u64,
+        conflict_at: Option<u64>,
+    },
     NoticeState(NoticeState),
     NoticeExact(Option<NoticeRow>),
     NoticePage(NoticePage),
@@ -102,6 +116,7 @@ pub(crate) enum Reply {
         n: u64,
         last: Option<Digest32>,
     },
+    UnreadSummary(crate::node::api::UnreadSummary),
     Located {
         entries: Vec<Digest32>,
         revision: Revision,
@@ -471,6 +486,85 @@ impl View<'_> {
                 self.ch.governance_page(self.store, query)?,
             )),
             Query::ArrivalHead => Ok(Reply::ArrivalHead(self.head()?)),
+            Query::OperationPage {
+                author,
+                op,
+                through,
+                after,
+                revision,
+            } => {
+                if through.instance != self.rendered.history_instance() {
+                    return Err(Failure::Request(
+                        "the saved room changed during operation lookup; retry",
+                    ));
+                }
+                let (current, conflict_at) = self.rendered.operation_state(&author, &op)?;
+                let conflict_at = conflict_at.filter(|arrival| *arrival <= through.arrival);
+                if revision.is_some_and(|revision| revision != current) {
+                    return Err(Failure::Request(
+                        "the selected operation changed during lookup; retry",
+                    ));
+                }
+                let mut cursor = after;
+                let mut rows = Vec::new();
+                let mut used = 0usize;
+                // Direct created/hash order, with a bounded examined budget even for rows
+                // beyond the fixed arrival horizon. No query scans unrelated room history.
+                for _ in 0..256 {
+                    if rows.len() == crate::node::ipc::PAGE_ENTRIES {
+                        return Ok(Reply::OperationPage {
+                            rows,
+                            next: cursor,
+                            revision: current,
+                            conflict_at,
+                        });
+                    }
+                    let Some((key, fact)) = self.rendered.operation_next(current, cursor)? else {
+                        return Ok(Reply::OperationPage {
+                            rows,
+                            next: None,
+                            revision: current,
+                            conflict_at,
+                        });
+                    };
+                    if fact.cache <= through.arrival {
+                        let row = self
+                            .row(&key.1)?
+                            .ok_or(Error::MalformedAtRest("operation row missing"))?;
+                        if row.author != author
+                            || crate::node::api::structured_kind(&row.text)
+                                .and_then(|(_, found)| found)
+                                .as_deref()
+                                != Some(op.as_str())
+                        {
+                            return Err(Failure::Storage(Error::MalformedAtRest(
+                                "operation row binding",
+                            )));
+                        }
+                        let cost = row
+                            .text
+                            .len()
+                            .saturating_add(crate::node::ipc::ROW_OVERHEAD);
+                        if !rows.is_empty() && used.saturating_add(cost) > bytes {
+                            return Ok(Reply::OperationPage {
+                                rows,
+                                next: cursor,
+                                revision: current,
+                                conflict_at,
+                            });
+                        }
+                        used = used.saturating_add(cost);
+                        rows.push(row);
+                    }
+                    cursor = Some(key);
+                }
+                Ok(Reply::OperationPage {
+                    rows,
+                    next: cursor,
+                    revision: current,
+                    conflict_at,
+                })
+            }
             Query::NoticeState => Ok(Reply::NoticeState(self.notice_state()?)),
             Query::NoticeExact { entry } => Ok(Reply::NoticeExact(
                 self.row(&entry)?
@@ -699,6 +793,49 @@ impl View<'_> {
                     None => self.count_before(None)?,
                 };
                 Ok(Reply::Count { n, last })
+            }
+            Query::UnreadSummary => {
+                use vox_agentcomms::attention::{unread_level, UnreadLevel};
+                let mut summary = crate::node::api::UnreadSummary::default();
+                let me = self.ch.me();
+                let name = crate::node::link::b32_encode(&me);
+                let mut cursor = None;
+                let mut examined = 0;
+                let mut reached_read = false;
+                for _ in 0..UNREAD_LOOKED {
+                    let Some((key, _)) = self.rendered.step(None, true, cursor, true)? else {
+                        break;
+                    };
+                    cursor = Some(key);
+                    examined += 1;
+                    if self.rendered.was_read(&key.1, &me)? {
+                        reached_read = true;
+                        break;
+                    }
+                    let Some(row) = self.row(&key.1)? else {
+                        continue;
+                    };
+                    if row.author == me {
+                        continue;
+                    }
+                    match unread_level(&row.text, Some(&name)) {
+                        UnreadLevel::ToYou => {
+                            summary.addressed += 1;
+                            if vox_agentcomms::envelope::Envelope::parse(&row.text)
+                                .is_ok_and(|e| e.urgent)
+                            {
+                                summary.urgent += 1;
+                            }
+                        }
+                        UnreadLevel::New => summary.new += 1,
+                        UnreadLevel::Coordination => summary.coordination += 1,
+                    }
+                    summary.first = Some(row.entry_hash);
+                }
+                summary.scan_limited = !reached_read
+                    && examined == UNREAD_LOOKED
+                    && self.rendered.step(None, true, cursor, true)?.is_some();
+                Ok(Reply::UnreadSummary(summary))
             }
             Query::LocateUnread => {
                 let entries = self.ch.unread(self.store)?;

@@ -5950,7 +5950,11 @@ impl Node {
             NodeCommand::MarkRead {
                 channel_id,
                 entries,
-            } => self.mark_read(&channel_id, entries).await,
+                expected_instance,
+            } => {
+                self.mark_read(&channel_id, entries, expected_instance)
+                    .await
+            }
             NodeCommand::Invite { channel_id } => self.invite(&channel_id).await,
             // Answered through `begin_join_channel`, which the run loop calls instead of this; a
             // join reaching here would have to be answered inline, which is the stall that
@@ -12350,7 +12354,7 @@ impl Node {
             }
             // The two bounded scans need not be at the same position. Check this target's
             // history exactly before choosing a live re-key, preserving history precedence.
-            if !history.contains_key(&target) {
+            if let std::collections::btree_map::Entry::Vacant(slot) = history.entry(target) {
                 let Some(profile) = self.profile.as_ref() else {
                     return delivered;
                 };
@@ -12360,7 +12364,7 @@ impl Node {
                     .owed_history_for(profile.store(), &target)
                 {
                     Ok(Some(floor)) => {
-                        history.insert(target, floor);
+                        slot.insert(floor);
                     }
                     Ok(None) => {}
                     Err(_) => continue,
@@ -18537,7 +18541,12 @@ impl Node {
 
     /// Done acknowledges durable local read state. Signed receipt publication is bounded
     /// background work; it may wait for sync without retaining or losing a volatile backlog.
-    async fn mark_read(&mut self, channel_id: &Digest32, entries: Vec<Digest32>) -> Outcome {
+    async fn mark_read(
+        &mut self,
+        channel_id: &Digest32,
+        entries: Vec<Digest32>,
+        expected_instance: Option<[u8; 16]>,
+    ) -> Outcome {
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return Outcome::Failed(Fault::ChannelNotOpen);
         };
@@ -18549,6 +18558,18 @@ impl Node {
             return Outcome::Failed(Fault::Locked);
         };
         let mut ch = shared.lock().await;
+        // This check and admission share the same room lock. A previous page read alone
+        // cannot fence another client's leave/rejoin, including a final empty completion.
+        if let Some(expected) = expected_instance {
+            match ch.history_instance(profile.store()) {
+                Ok(actual) if actual == expected => {}
+                Ok(_) => return Outcome::Failed(Fault::ReadSelectionChanged),
+                Err(error) => {
+                    ch.poison(&error);
+                    return Outcome::Failed(fault_of(&error));
+                }
+            }
+        }
         match ch.admit_read_marks(profile, &entries, (self.millis_clock)()) {
             Ok(()) => Outcome::Done,
             Err(error) => {

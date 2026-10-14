@@ -139,6 +139,7 @@ fn next_due(
 fn cutoff(now: u64, ttl: u64) -> Option<u64> {
     (ttl != 0).then(|| now.saturating_sub(ttl.saturating_mul(1_000)))
 }
+#[allow(clippy::too_many_arguments)]
 fn due(
     source: &Source<'_>,
     sek: &Sek,

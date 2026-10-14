@@ -249,6 +249,151 @@ const parents = new Map()
 /** Requests OpenCode asked (permission or question id → the Session it was shown in). */
 const asked = new Map()
 const MAX_ASKED = 1024
+const MAX_MIRROR_BYTES = 4 << 20
+const MAX_MIRROR_EVENTS = 64
+const MAX_MESSAGE_ROLES = 256
+let mirrorFailure = null
+
+/** A bounded optimization only. A cache miss is resolved against OpenCode's own message. */
+function mirrorEvents(client) {
+  const messages = new Map()
+  const queue = []
+  let bytes = 0
+  let count = 0
+  let running = false
+  const fail = (why) => {
+    if (mirrorFailure) return
+    mirrorFailure = String(why)
+    log("mirror: stopped: " + mirrorFailure)
+    const line = JSON.stringify({ type: "mirror-error", error: mirrorFailure }) + "\n"
+    for (const writers of followers.values()) for (const write of writers) write(line)
+  }
+  const remember = (info) => {
+    if (!info || typeof info.id !== "string" || typeof info.sessionID !== "string"
+      || !["user", "assistant"].includes(info.role)) return null
+    const value = { id: info.id, sessionID: info.sessionID, role: info.role }
+    for (const field of ["agent", "providerID", "modelID"]) {
+      if (typeof info[field] === "string") value[field] = info[field]
+    }
+    if (Buffer.byteLength(JSON.stringify(value)) > 4096) throw new Error("message metadata exceeds its bound")
+    const key = JSON.stringify([value.sessionID, value.id])
+    messages.delete(key)
+    messages.set(key, value)
+    if (messages.size > MAX_MESSAGE_ROLES) messages.delete(messages.keys().next().value)
+    return value
+  }
+  const enrich = async (event) => {
+    if (event.type === "message.updated") remember(event.properties?.info)
+    if (event.type !== "message.part.updated") return event
+    const part = event.properties?.part
+    if (typeof part?.sessionID !== "string" || typeof part?.messageID !== "string") {
+      throw new Error("a part has no authoritative message identity")
+    }
+    const key = JSON.stringify([part.sessionID, part.messageID])
+    let info = messages.get(key)
+    if (!info) {
+      const controller = new AbortController()
+      const deadline = setTimeout(() => controller.abort(), AUTH_IDLE_MS)
+      deadline.unref?.()
+      let candidate
+      try {
+        const transport = client._client.getConfig().fetch ?? globalThis.fetch
+        const result = await client._client.request({ method: "GET", parseAs: "stream",
+          responseStyle: "fields", signal: controller.signal,
+          url: `/session/${encodeURIComponent(part.sessionID)}/message/${encodeURIComponent(part.messageID)}`,
+          // The SDK normally buffers error bodies too. Refuse a non-success before it can
+          // do so; the diagnostic needs its status, never OpenCode's whole response body.
+          fetch: async (request) => {
+            const response = await transport(request)
+            if (!response.ok) {
+              await response.body?.cancel()
+              throw new Error("OpenCode message lookup answered " + response.status)
+            }
+            return response
+          },
+        })
+        const reader = result?.data?.getReader?.()
+        if (!reader) throw new Error("OpenCode did not stream its message lookup")
+        const body = new Uint8Array(MAX_MIRROR_BYTES)
+        let used = 0
+        try {
+          for (;;) {
+            const { value, done } = await reader.read()
+            if (done) break
+            if (value.byteLength > body.length - used) {
+              throw new Error("OpenCode message lookup exceeds the mirror bound")
+            }
+            body.set(value, used)
+            used += value.byteLength
+          }
+          candidate = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(body.subarray(0, used)))?.info
+        } finally {
+          await reader.cancel().catch(() => {})
+          reader.releaseLock()
+        }
+      } finally {
+        clearTimeout(deadline)
+      }
+      if (candidate?.id !== part.messageID || candidate?.sessionID !== part.sessionID) {
+        throw new Error("OpenCode could not resolve a part's message")
+      }
+      info = remember(candidate)
+      if (!info) throw new Error("OpenCode supplied no user or assistant role for a part")
+    }
+    return { ...event, properties: { ...event.properties, voxMessage: info } }
+  }
+  const drain = async () => {
+    if (running) return
+    running = true
+    try {
+      while (queue.length) {
+        const item = queue.shift()
+        try {
+          if (!mirrorFailure) {
+            const event = await enrich(JSON.parse(item.line))
+            if (Buffer.byteLength(JSON.stringify({ type: "event", event })) + 1 > MAX_MIRROR_BYTES) {
+              throw new Error("an enriched mirror event exceeds its line bound")
+            }
+            fanout(event, item.writers)
+          }
+        } catch (error) {
+          fail(error?.message ?? error)
+        } finally {
+          bytes -= item.bytes
+          count -= 1
+          item.done()
+        }
+      }
+    } finally {
+      running = false
+    }
+  }
+  return (event, targets = null) => {
+    if (mirrorFailure) return Promise.resolve()
+    const owner = ownerOf(event)
+    const writers = targets ?? [...(followers.get(owner) ?? [])]
+    if (!owner || !writers.length) return Promise.resolve()
+    if (!targets && event.type === "session.updated" && event.properties?.info?.id === owner) {
+      for (const write of writers) write.titleUpdated = true
+    }
+    const line = JSON.stringify(event)
+    const size = Buffer.byteLength(line)
+    // Admission is synchronous. A concurrent hook cannot create an unbounded chain of
+    // promises retaining bodies while one authoritative lookup is awaiting its response.
+    if (count === MAX_MIRROR_EVENTS || size > MAX_MIRROR_BYTES - bytes) {
+      fail("OpenCode events exceeded the bounded mirror queue; observation must restart")
+      return Promise.resolve()
+    }
+    count += 1
+    bytes += size
+    return new Promise((done) => {
+      // Capture recipients now. A later subscriber receives only the title snapshot, not
+      // old part events that happened to be awaiting another session's metadata lookup.
+      queue.push({ line, bytes: size, done, writers })
+      void drain()
+    })
+  }
+}
 
 /** The session an event belongs to, and the Session it is shown in (its parent's, for a sub-agent). */
 function ownerOf(event) {
@@ -261,7 +406,7 @@ function ownerOf(event) {
   return parents.get(sid) ?? sid
 }
 
-function fanout(event) {
+function fanout(event, writers) {
   const owner = ownerOf(event)
   if (!owner) return
   if (event.type === "permission.asked" || event.type === "question.asked") {
@@ -271,8 +416,7 @@ function fanout(event) {
       if (asked.size > MAX_ASKED) asked.delete(asked.keys().next().value)
     }
   }
-  const writers = followers.get(owner)
-  if (!writers?.size) return
+  if (!writers?.length) return
   const line = JSON.stringify({ type: "event", event }) + "\n"
   for (const write of writers) write(line)
 }
@@ -336,7 +480,7 @@ async function runCall(client, session, call) {
  * OpenCode is handed it: OpenCode may run the prompt's `chat.message` before `promptAsync`
  * returns, and that turn must know the message is Vox's notice, not the operator's (V030-21).
  */
-function wakeChannel(client, relayed) {
+function wakeChannel(client, relayed, mirrorEvent) {
   try {
     // `mkdtemp` makes the directory 0700, so only this user can reach the socket;
     // the token keeps every other process of theirs out as well.
@@ -373,7 +517,13 @@ function wakeChannel(client, relayed) {
       let following = null // the session this connection follows, once subscribed
       const write = (line) => {
         try {
-          if (!conn.destroyed) conn.write(line)
+          if (conn.destroyed || conn.writableEnded) return
+          if (conn.writableLength + Buffer.byteLength(line) > MAX_MIRROR_BYTES) {
+            conn.end(JSON.stringify({ type: "mirror-error", error:
+              "the mirror reader could not keep up; observation must restart" }) + "\n")
+            return
+          }
+          conn.write(line)
         } catch {}
       }
       conn.on("close", () => {
@@ -425,6 +575,10 @@ function wakeChannel(client, relayed) {
           followers.get(following).add(write)
           log("mirror: following " + following)
           write(JSON.stringify({ type: "subscribed", session: following }) + "\n")
+          if (mirrorFailure) {
+            write(JSON.stringify({ type: "mirror-error", error: mirrorFailure }) + "\n")
+            return
+          }
           // Its title as it is now, said as OpenCode's bus says a change of it: a title set before
           // this follow began (OpenCode's own, or a /rename) is the Session's name from the start
           // (ADR-029 MD-1), not only after the session is next updated.
@@ -433,9 +587,9 @@ function wakeChannel(client, relayed) {
             .request({ method: "GET", url: `/session/${followed}` })
             .then((res) => {
               const info = res?.data
-              if (info?.id === followed && typeof info.title === "string") {
+              if (info?.id === followed && typeof info.title === "string" && !write.titleUpdated) {
                 const event = { type: "session.updated", properties: { info } }
-                write(JSON.stringify({ type: "event", event }) + "\n")
+                void mirrorEvent(event, [write])
               }
             })
             .catch(() => {})
@@ -513,14 +667,15 @@ function wakeChannel(client, relayed) {
 export default async function vox({ $, client }) {
   log("plugin loaded (cwd=" + process.cwd() + ")")
   const relayed = new Map()
-  const wake = wakeChannel(client, relayed)
+  const mirrorEvent = mirrorEvents(client)
+  const wake = wakeChannel(client, relayed, mirrorEvent)
   return {
     // Every event of OpenCode's bus, to the connections following its session (#542). The
     // `event` hook is fed in-process with the full set (permission.asked, question.asked,
     // message.*, session.*), and runs for every OpenCode, TUI or not.
     event: async ({ event }) => {
       try {
-        fanout(event)
+        await mirrorEvent(event)
       } catch (e) {
         log("event: threw: " + e)
       }

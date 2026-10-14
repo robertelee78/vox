@@ -136,7 +136,13 @@ impl Queue {
             let replay = self.replay.is_some() && (!forward || self.replay_next);
             let id = if replay {
                 // An active replay always has an unvisited position (retired below).
-                self.replay.as_ref().expect("active replay").through + 1
+                self.replay
+                    .as_ref()
+                    .ok_or(crate::error::Error::MalformedAtRest(
+                        "key package replay missing",
+                    ))?
+                    .through
+                    + 1
             } else if forward {
                 self.through + 1
             } else {
@@ -161,7 +167,12 @@ impl Queue {
                 }
             };
             if replay {
-                let scan = self.replay.as_mut().expect("active replay");
+                let scan = self
+                    .replay
+                    .as_mut()
+                    .ok_or(crate::error::Error::MalformedAtRest(
+                        "key package replay missing",
+                    ))?;
                 scan.through = id;
                 if scan.through == scan.end {
                     self.replay = None;

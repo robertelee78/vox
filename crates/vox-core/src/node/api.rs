@@ -877,6 +877,8 @@ pub enum NodeCommand {
         channel_id: Digest32,
         /// The entries shown.
         entries: Vec<Digest32>,
+        /// When supplied, admission must use this exact saved room incarnation.
+        expected_instance: Option<[u8; 16]>,
     },
     /// Produce a `vox://` invite link for a channel this node holds open, naming this
     /// node, and any anchors the room uses, as where to reach the room, with this node as
@@ -2364,4 +2366,22 @@ impl NodeEvent {
             NodeEvent::Shutdown => "the node stopped".into(),
         }
     }
+}
+
+/// Scalar unread facts under the existing newest-1,000-rows, until-first-read rule.
+/// No retained message bodies or lifetime message IDs cross this boundary.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UnreadSummary {
+    /// Unread messages addressed to this identity.
+    pub addressed: u64,
+    /// Urgent messages among those addressed to this identity.
+    pub urgent: u64,
+    /// Unread room conversation.
+    pub new: u64,
+    /// Unread coordination messages.
+    pub coordination: u64,
+    /// Oldest unread message in the examined range, in display order.
+    pub first: Option<Digest32>,
+    /// Older rows exist beyond the existing unread examination limit.
+    pub scan_limited: bool,
 }

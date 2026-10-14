@@ -176,7 +176,7 @@ impl ChannelState {
                 membership,
             };
             self.append_control_kind(profile, &floor.wire(), now, EntryKind::Content)?;
-            self.drive.omitted.clear();
+            self.drive.clear_omissions();
         }
         Ok(())
     }
@@ -320,7 +320,7 @@ impl ChannelState {
                     )?;
                     batch.commit()?;
                 }
-                self.drive.omitted.clear();
+                self.drive.clear_omissions();
             }
             self.observe_legacy_drive_generation(&entry)?;
         }
@@ -360,14 +360,9 @@ impl ChannelState {
                 }
             }
             if missing {
-                self.drive
-                    .omitted
-                    .entry(peer)
-                    .or_insert_with(|| (std::time::Instant::now(), BTreeSet::new()))
-                    .1
-                    .insert(position);
-            } else if let Some(omitted) = self.drive.omitted.get_mut(&peer) {
-                omitted.1.remove(&position);
+                self.drive.note_omission(peer, position);
+            } else {
+                self.drive.note_body_from(&peer, &position);
             }
         }
         Ok(())

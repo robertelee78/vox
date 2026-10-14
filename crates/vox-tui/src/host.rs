@@ -302,13 +302,16 @@ impl Router {
                             Box::pin(async move {
                                 match weak.upgrade() {
                                     Some(inner) => {
-                                        Router { inner }
-                                            .post_session(&node, &session, room, bodies)
-                                            .await
+                                        let mut fresh = false;
+                                        let admission = Router { inner }
+                                            .post_session(&node, &session, room, bodies, &mut fresh)
+                                            .await;
+                                        crate::session_sink::Posted { admission, fresh }
                                     }
                                     None => vox_core::node::daemonipc::SessionAdmission::Refused(
                                         "the daemon stopped".into(),
-                                    ),
+                                    )
+                                    .into(),
                                 }
                             })
                         },
@@ -2216,6 +2219,7 @@ impl Router {
         session: &str,
         room: Digest32,
         bodies: Vec<String>,
+        fresh: &mut bool,
     ) -> vox_core::node::daemonipc::SessionAdmission {
         use vox_core::node::{
             daemonipc::SessionAdmission,
@@ -2289,10 +2293,17 @@ impl Router {
             );
         }
         match save_session_batch(&handle, room, session, bodies.clone()).await {
-            Ok(saved) => SessionAdmission::Committed {
-                first: saved.first,
-                last: saved.last,
-            },
+            Ok(saved) => {
+                *fresh = saved.fresh;
+                if saved.first == 0 && saved.last == 0 {
+                    SessionAdmission::Skipped
+                } else {
+                    SessionAdmission::Committed {
+                        first: saved.first,
+                        last: saved.last,
+                    }
+                }
+            }
             Err(SessionSaveError::Save(error))
                 if matches!(error, vox_core::error::Error::Storage { .. }) =>
             {

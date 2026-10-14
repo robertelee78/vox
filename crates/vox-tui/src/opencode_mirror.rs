@@ -23,9 +23,10 @@
 //!   ([`Sink::request`]) and retired by OpenCode's own `permission.replied`, `question.replied`
 //!   or `question.rejected` (DR-4).
 //!
-//! A sub-agent's entries carry `agent_id` (its session id) and `agent` (its agent's name).
+//! A sub-agent's entries carry `agent_id` and its authoritative name when available;
+//! otherwise its exact session id is also the displayed label.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Map, Value};
@@ -92,14 +93,12 @@ impl OpenCodeMirror {
             node: node.clone(),
             session: session.to_owned(),
             sink: Arc::clone(&self.sink),
-            roles: BTreeMap::new(),
-            agents: BTreeMap::new(),
+            agent: None,
             texts: Vec::new(),
-            started: BTreeSet::new(),
-            finished: BTreeSet::new(),
             asks: BTreeMap::new(),
             model: None,
             ended: false,
+            failed: false,
             title: None,
             next_id: 1,
             calls: BTreeMap::new(),
@@ -148,20 +147,18 @@ struct Follow {
     node: NodeName,
     session: String,
     sink: Arc<Sink>,
-    /// Message id → its role (`user`, `assistant`).
-    roles: BTreeMap<String, String>,
-    /// A sub-agent's session id → its agent's name.
-    agents: BTreeMap<String, String>,
-    /// The assistant's text parts not yet posted: (session, part id, text).
-    texts: Vec<(String, String, String)>,
-    started: BTreeSet<String>,
-    finished: BTreeSet<String>,
+    /// Current authoritative sub-agent label. An unavailable label falls back to exact agent_id.
+    agent: Option<(String, String)>,
+    /// Live assistant text parts not yet posted: (session, part id, text, agent label).
+    texts: Vec<(String, String, String, Option<String>)>,
     asks: BTreeMap<String, Ask>,
     /// The provider and model of the session's last assistant message, which /compact needs.
     model: Option<(String, String)>,
     /// Whether the last thing posted was a turn's end: OpenCode reports a session idle more than
     /// once around an abort, and one turn ends once.
     ended: bool,
+    /// An explicit producer failure ends this observation rather than guessing missing roles.
+    failed: bool,
     /// The session's title as last said: OpenCode sends `session.updated` for much besides a
     /// rename, and only a new title renames the Session.
     title: Option<String>,
@@ -246,6 +243,7 @@ impl Follow {
                         Ok(_) => {
                             if let Ok(v) = serde_json::from_slice::<Value>(&line) {
                                 self.line(&v).await;
+                                if self.failed { break; }
                             }
                         }
                     }
@@ -374,6 +372,13 @@ impl Follow {
 
     async fn line(&mut self, v: &Value) {
         match v.get("type").and_then(Value::as_str) {
+            Some("mirror-error") => {
+                let why = v
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("OpenCode could not supply authoritative message metadata");
+                self.fail(why).await;
+            }
             Some("result") => {
                 let Some((reply, done)) = v
                     .get("id")
@@ -410,9 +415,12 @@ impl Follow {
         // A sub-agent's entries belong to its parent's Session, labelled (SE-2).
         if sid != self.session {
             m.insert("agent_id".into(), json!(sid));
-            if let Some(a) = self.agents.get(sid) {
-                m.insert("agent".into(), json!(a));
-            }
+            let label = self
+                .agent
+                .as_ref()
+                .filter(|(of, _)| of == sid)
+                .map_or(sid, |(_, name)| name.as_str());
+            m.insert("agent".into(), json!(label));
         }
         m
     }
@@ -426,24 +434,93 @@ impl Follow {
         }
     }
 
+    async fn fail(&mut self, why: &str) {
+        eprintln!(
+            "vox daemon: {}: OpenCode Session {} observation stopped: {why}",
+            self.node, self.session
+        );
+        let mut entry = self.envelope(&self.session, "notice", None);
+        entry.insert(
+            "summary".into(),
+            json!(format!("OpenCode observation stopped: {why}")),
+        );
+        self.post(split(entry, "summary")).await;
+        self.failed = true;
+    }
+
+    /// The ingress transaction remembers exact source identities, including split parts.
+    /// Timestamp changes on a repeated bus event do not change its source content revision.
+    async fn post_source(&mut self, sid: &str, id: &str, mut entry: Map<String, Value>, big: &str) {
+        if id.is_empty() {
+            self.fail("an activity event has no source identity").await;
+            return;
+        }
+        let source = vox_core::hash::sha256(
+            json!(["opencode", sid, entry["kind"], id])
+                .to_string()
+                .as_bytes(),
+        );
+        let echo = (entry["kind"] == "user")
+            .then(|| entry.get("text").and_then(Value::as_str).map(str::to_owned))
+            .flatten();
+        let timestamp = entry.remove("ts");
+        let revision = vox_core::hash::sha256(Value::Object(entry.clone()).to_string().as_bytes());
+        if let Some(timestamp) = timestamp {
+            entry.insert("ts".into(), timestamp);
+        }
+        let mut bodies = split(entry, big);
+        let parts = bodies.len();
+        for (part, body) in bodies.iter_mut().enumerate() {
+            let Ok(Value::Object(mut object)) = serde_json::from_str::<Value>(body) else {
+                unreachable!("split returns objects")
+            };
+            object.insert(
+                "_vox_source".into(),
+                json!({"id": source, "revision": revision, "part": part + 1, "parts": parts}),
+            );
+            *body = Value::Object(object).to_string();
+        }
+        let posted = self
+            .sink
+            .source_activity(&self.node, &self.session, bodies, echo.as_deref())
+            .await;
+        if let vox_core::node::daemonipc::SessionAdmission::Refused(why)
+        | vox_core::node::daemonipc::SessionAdmission::Unconfirmed(why) = &posted.admission
+        {
+            self.fail(why).await;
+            return;
+        }
+        if posted.fresh
+            || matches!(
+                posted.admission,
+                vox_core::node::daemonipc::SessionAdmission::Held(_)
+            )
+        {
+            self.ended = false;
+        }
+    }
+
     /// Post the assistant's text not yet posted, as one reply per session it came from.
     async fn flush_replies(&mut self) {
         let texts = std::mem::take(&mut self.texts);
-        let mut by: Vec<(String, String)> = Vec::new();
-        for (sid, _, t) in texts {
+        let mut by: Vec<(String, String, Option<String>)> = Vec::new();
+        for (sid, _, t, agent) in texts {
             if t.trim().is_empty() {
                 continue;
             }
-            match by.iter_mut().find(|(s, _)| *s == sid) {
-                Some((_, all)) => {
+            match by.iter_mut().find(|(s, _, _)| *s == sid) {
+                Some((_, all, _)) => {
                     all.push_str("\n\n");
                     all.push_str(&t);
                 }
-                None => by.push((sid, t)),
+                None => by.push((sid, t, agent)),
             }
         }
-        for (sid, text) in by {
+        for (sid, text, agent) in by {
             let mut e = self.envelope(&sid, "reply", None);
+            if let Some(agent) = agent {
+                e.insert("agent".into(), json!(agent));
+            }
             e.insert("text".into(), json!(text));
             self.post(split(e, "text")).await;
         }
@@ -461,16 +538,10 @@ impl Follow {
         match ev.get("type").and_then(Value::as_str).unwrap_or_default() {
             "message.updated" => {
                 let info = &p["info"];
-                if let (Some(id), Some(role)) = (
-                    info.get("id").and_then(Value::as_str),
-                    info.get("role").and_then(Value::as_str),
-                ) {
-                    self.roles.insert(id.to_owned(), role.to_owned());
-                }
                 if info.get("role").and_then(Value::as_str) == Some("assistant") {
                     if sid != self.session {
                         if let Some(a) = info.get("agent").and_then(Value::as_str) {
-                            self.agents.insert(sid.clone(), a.to_owned());
+                            self.agent = Some((sid.clone(), a.to_owned()));
                         }
                     } else if let (Some(pr), Some(mo)) = (
                         info.get("providerID").and_then(Value::as_str),
@@ -481,7 +552,34 @@ impl Follow {
                 }
             }
             "message.part.updated" => {
-                self.part(&sid, &p["part"]).await;
+                let info = &p["voxMessage"];
+                let part = &p["part"];
+                if info.get("id").and_then(Value::as_str)
+                    != part.get("messageID").and_then(Value::as_str)
+                    || info.get("sessionID").and_then(Value::as_str) != Some(sid.as_str())
+                    || !matches!(
+                        info.get("role").and_then(Value::as_str),
+                        Some("user" | "assistant")
+                    )
+                {
+                    self.fail("a part arrived without its authoritative message role")
+                        .await;
+                    return;
+                }
+                self.agent = info
+                    .get("agent")
+                    .and_then(Value::as_str)
+                    .map(|agent| (sid.clone(), agent.to_owned()));
+                if sid == self.session && info["role"] == "assistant" {
+                    if let (Some(provider), Some(model)) = (
+                        info.get("providerID").and_then(Value::as_str),
+                        info.get("modelID").and_then(Value::as_str),
+                    ) {
+                        self.model = Some((provider.to_owned(), model.to_owned()));
+                    }
+                }
+                self.part(&sid, part, info["role"].as_str().expect("checked role"))
+                    .await;
             }
             // **A rename is the Session's name at once** (ADR-029 MD-1): OpenCode's title, set by
             // `/rename`, by Vox's own rename, or made by OpenCode itself, arrives only here.
@@ -553,20 +651,16 @@ impl Follow {
         }
     }
 
-    async fn part(&mut self, sid: &str, part: &Value) {
+    async fn part(&mut self, sid: &str, part: &Value, role: &str) {
         let pid = part.get("id").and_then(Value::as_str).unwrap_or_default();
-        let mid = part
-            .get("messageID")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
         match part.get("type").and_then(Value::as_str).unwrap_or_default() {
             "text" => {
                 let text = part.get("text").and_then(Value::as_str).unwrap_or_default();
-                match self.roles.get(mid).map(String::as_str) {
-                    Some("user") => {
+                match role {
+                    "user" => {
                         // A user message's text, once, when it is final; a sub-agent's prompt
                         // is its parent's tool call, already shown.
-                        if sid != self.session || !self.started.insert(format!("user:{pid}")) {
+                        if sid != self.session {
                             return;
                         }
                         let Some(text) = typed(text) else { return };
@@ -575,14 +669,32 @@ impl Follow {
                         }
                         let mut e = self.envelope(sid, "user", None);
                         e.insert("text".into(), json!(text));
-                        self.post(split(e, "text")).await;
+                        self.post_source(sid, pid, e, "text").await;
                     }
-                    _ => match self.texts.iter_mut().find(|(_, id, _)| id == pid) {
-                        Some(slot) => slot.2 = text.to_owned(),
-                        None => self
-                            .texts
-                            .push((sid.to_owned(), pid.to_owned(), text.to_owned())),
+                    "assistant" => match self
+                        .texts
+                        .iter_mut()
+                        .find(|(of, id, _, _)| of == sid && id == pid)
+                    {
+                        Some(slot) => {
+                            slot.2 = text.to_owned();
+                            slot.3 = self
+                                .agent
+                                .as_ref()
+                                .filter(|(of, _)| of == sid)
+                                .map(|(_, name)| name.clone());
+                        }
+                        None => self.texts.push((
+                            sid.to_owned(),
+                            pid.to_owned(),
+                            text.to_owned(),
+                            self.agent
+                                .as_ref()
+                                .filter(|(of, _)| of == sid)
+                                .map(|(_, name)| name.clone()),
+                        )),
                     },
+                    _ => unreachable!("checked role"),
                 }
             }
             "tool" => self.tool(sid, part).await,
@@ -608,8 +720,7 @@ impl Follow {
             .and_then(Value::as_str)
             .unwrap_or_default();
         let input = state.get("input").cloned().unwrap_or(json!({}));
-        if matches!(status, "running" | "completed" | "error") && self.started.insert(call.clone())
-        {
+        if matches!(status, "running" | "completed" | "error") {
             // Admit earlier reply text before this call, without spawning an unbounded waiter.
             self.flush_replies().await;
             let text = input_text(&tool, &input);
@@ -617,11 +728,14 @@ impl Follow {
             e.insert("tool".into(), json!(tool));
             e.insert("summary".into(), json!(one_line(&text)));
             e.insert("input".into(), json!(text));
-            self.post(split(e, "input")).await;
+            self.post_source(sid, &call, e, "input").await;
+            if self.failed {
+                return;
+            }
         }
         match status {
             "running" => {}
-            "completed" | "error" if self.finished.insert(call.clone()) => {
+            "completed" | "error" => {
                 let ok = status == "completed";
                 let output = if ok {
                     state
@@ -650,7 +764,7 @@ impl Follow {
                 e.insert("ok".into(), json!(ok));
                 e.insert("summary".into(), json!(one_line(&summary)));
                 e.insert("output".into(), json!(output));
-                self.post(split(e, "output")).await;
+                self.post_source(sid, &call, e, "output").await;
             }
             _ => {}
         }

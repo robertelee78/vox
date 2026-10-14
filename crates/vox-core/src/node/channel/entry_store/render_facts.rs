@@ -81,6 +81,39 @@ pub(crate) struct RenderFact {
     pub shown: u64,
     pub created: u64,
 }
+
+/// An operation's earliest semantic witness and first conflicting arrival survive
+/// retention. No message body or lifetime member list is retained in these facts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct OperationFact {
+    pub semantic: Digest32,
+    pub first: u64,
+    pub conflict: u64,
+}
+
+impl OperationFact {
+    pub(super) fn write(self, e: &mut Encoder) {
+        e.array(4)
+            .uint(6)
+            .bytes(&self.semantic)
+            .uint(self.first)
+            .uint(self.conflict);
+    }
+    pub(super) fn read(d: &mut Decoder<'_>) -> Result<Self> {
+        let fact = Self {
+            semantic: d
+                .bytes()?
+                .try_into()
+                .map_err(|_| invalid("operation semantic digest"))?,
+            first: d.uint()?,
+            conflict: d.uint()?,
+        };
+        if fact.first == 0 || (fact.conflict != 0 && fact.conflict < fact.first) {
+            return Err(invalid("operation arrival facts"));
+        }
+        Ok(fact)
+    }
+}
 impl RenderFact {
     pub(super) fn write(self, e: &mut Encoder) {
         e.array(5)
@@ -233,6 +266,15 @@ fn filter_key(filter: &Filter, display: bool) -> Key {
     key[32] = u8::from(display);
     key
 }
+fn operation_key(author: &Digest32, op: &str, selector: u8) -> Key {
+    let mut key = hashed(&crate::hash::sha256_concat(&[
+        b"render-operation\0",
+        author,
+        op.as_bytes(),
+    ]));
+    key[32] = selector;
+    key
+}
 fn filters(row: &super::super::Rendered) -> Vec<Filter> {
     let mut out = vec![Filter::Author(row.author)];
     if let Some((kind, op)) = crate::node::api::structured_kind(&row.text) {
@@ -264,7 +306,9 @@ fn filters(row: &super::super::Rendered) -> Vec<Filter> {
     out
 }
 
-fn session_key((created, clock, hash): (u64, u64, Digest32)) -> Key {
+type SessionOrderKey = (u64, u64, Digest32);
+
+fn session_key((created, clock, hash): SessionOrderKey) -> Key {
     let mut key = [0; 64];
     key[..8].copy_from_slice(&created.to_be_bytes());
     key[8..16].copy_from_slice(&clock.to_be_bytes());
@@ -488,6 +532,66 @@ impl Write<'_, '_> {
         )?;
         Ok(())
     }
+    fn change_operation(
+        &mut self,
+        roots: &mut Roots,
+        row: &super::super::Rendered,
+        fact: Option<RenderFact>,
+    ) -> Result<()> {
+        let Ok(envelope) = vox_agentcomms::envelope::Envelope::parse(&row.text) else {
+            return Ok(());
+        };
+        let Some(op) = vox_agentcomms::ops::op_of(&envelope) else {
+            return Ok(());
+        };
+        let key = operation_key(&row.author, op, 2);
+        let root = Source::Batch(self.batch)
+            .number(self.sek, self.channel, roots.filters, &key)?
+            .unwrap_or(0);
+        let changed =
+            self.change_rendered(root, ordered((row.created_millis, row.entry_hash)), fact)?;
+        roots.filters = self.change_value(
+            roots.filters,
+            key,
+            (changed != 0).then_some(Value::Number(changed)),
+        )?;
+        if fact.is_none() {
+            return Ok(());
+        } // Pruning never makes a known conflict valid again.
+        let key = operation_key(&row.author, op, 3);
+        let semantic = crate::hash::sha256(vox_agentcomms::ops::semantic(&envelope).as_bytes());
+        let old = match Source::Batch(self.batch).find_value(
+            self.sek,
+            self.channel,
+            roots.filters,
+            &key,
+        )? {
+            Some(Value::Operation(fact)) => Some(fact),
+            None => None,
+            _ => return Err(invalid("operation witness kind")),
+        };
+        let mut next = old.unwrap_or(OperationFact {
+            semantic,
+            first: row.arrival,
+            conflict: 0,
+        });
+        if next.semantic != semantic {
+            let conflict = next.first.max(row.arrival);
+            next.conflict = if next.conflict == 0 {
+                conflict
+            } else {
+                next.conflict.min(conflict)
+            };
+        }
+        if row.arrival < next.first {
+            next.first = row.arrival;
+            next.semantic = semantic;
+        }
+        if old != Some(next) {
+            roots.filters = self.change_value(roots.filters, key, Some(Value::Operation(next)))?;
+        }
+        Ok(())
+    }
     /// Queue renderer locators and concrete filter facts with their cache write.
     pub(crate) fn put_rendered(&mut self, row: &super::super::Rendered, shown: u64) -> Result<()> {
         let mut roots = self.render_roots()?;
@@ -553,6 +657,7 @@ impl Write<'_, '_> {
                 Some(fact),
             )?;
         }
+        self.change_operation(&mut roots.rendered, row, Some(fact))?;
         let author = hashed(&row.author);
         let n = Source::Batch(self.batch)
             .number(self.sek, self.channel, roots.rendered.authors, &author)?
@@ -622,6 +727,7 @@ impl Write<'_, '_> {
             )?;
             self.change_filter(&mut roots.rendered, &filter, (clock, *hash), true, None)?;
         }
+        self.change_operation(&mut roots.rendered, &row, None)?;
         let author = hashed(&row.author);
         let n = Source::Batch(self.batch)
             .number(self.sek, self.channel, roots.rendered.authors, &author)?
@@ -792,6 +898,54 @@ impl RenderView<'_> {
             }),
         }
     }
+    /// One exact operation's canonical rows and retained conflict witness, from this same
+    /// pinned snapshot. Other authors using the same op id do not invalidate its root.
+    pub(crate) fn operation_state(
+        &self,
+        author: &Digest32,
+        op: &str,
+    ) -> Result<(u64, Option<u64>)> {
+        let source = self.source();
+        let root = source
+            .number(
+                self.order.read.sek,
+                self.order.read.channel,
+                self.roots().filters,
+                &operation_key(author, op, 2),
+            )?
+            .unwrap_or(0);
+        let conflict = match source.find_value(
+            self.order.read.sek,
+            self.order.read.channel,
+            self.roots().filters,
+            &operation_key(author, op, 3),
+        )? {
+            Some(Value::Operation(fact)) => (fact.conflict != 0).then_some(fact.conflict),
+            None if root == 0 => None,
+            _ => return Err(invalid("operation witness missing")),
+        };
+        Ok((root, conflict))
+    }
+    pub(crate) fn operation_next(
+        &self,
+        root: u64,
+        after: Option<OrderKey>,
+    ) -> Result<Option<(OrderKey, RenderFact)>> {
+        let key = match after {
+            Some(key) => match successor(ordered(key)) {
+                Some(key) => key,
+                None => return Ok(None),
+            },
+            None => [0; 64],
+        };
+        self.source()
+            .first(self.order.read.sek, self.order.read.channel, root, &key, 0)?
+            .map(|(key, value)| match value {
+                Value::Rendered(fact) => Ok((order_key(key)?, fact)),
+                _ => Err(invalid("operation candidate kind")),
+            })
+            .transpose()
+    }
     pub(crate) fn summary(&self, filter: &Filter) -> Result<(u64, u64)> {
         let summary = self.source().render_summary(
             self.order.read.sek,
@@ -844,8 +998,8 @@ impl RenderView<'_> {
     /// One public Session/name candidate in stable created-time/canonical order.
     pub(crate) fn session_candidate(
         &self,
-        after: Option<(u64, u64, Digest32)>,
-    ) -> Result<Option<((u64, u64, Digest32), RenderFact)>> {
+        after: Option<SessionOrderKey>,
+    ) -> Result<Option<(SessionOrderKey, RenderFact)>> {
         let key = match after {
             Some(key) => match successor(session_key(key)) {
                 Some(key) => key,

@@ -43,8 +43,8 @@ pub use client::{
     Member, NodeSummary, NodeView, NoticeCursor, OfferedService, Passphrase, PulledFile, ReadBy,
     RoomAdmins, RoomAnchorAuthority, RoomAnchorConfiguration, RoomAnchorEndpoint, RoomConsentPage,
     RoomConsents, RoomGroup, RoomLink, RoomLinkPreview, RoomMessage, RoomNotices, RoomServices,
-    RoomSummary, ServiceCursor, SharedService, ThreadAuthor, ThreadSummary, TrustedNode,
-    UnreadLevel, VoxClient,
+    RoomSummary, RoomUnread, ServiceCursor, SharedService, ThreadAuthor, ThreadSummary,
+    TrustedNode, UnreadLevel, VoxClient,
 };
 pub use computer::{
     ComputerApplication, ComputerBindingAction, ComputerIdentity, ComputerNode, ComputerStatus,

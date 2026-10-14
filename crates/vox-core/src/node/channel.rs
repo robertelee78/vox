@@ -1784,7 +1784,7 @@ impl ChannelState {
         let mut admission = AdmissionPolicy::new();
         admission.admit(channel_id, epoch, me);
         let origin_ms = genesis.body.created_ms;
-        governance::prepare(profile.store(), &sek, &channel_id)?;
+        governance::prepare(profile.store(), &sek, channel_id)?;
         let governance_display = governance::Display::genesis(&genesis);
         let mut room = Self {
             channel_id,
@@ -2552,7 +2552,7 @@ impl ChannelState {
         for author in authors.keys() {
             admission.admit(*channel_id, epoch, *author);
         }
-        governance::prepare(profile.store(), &sek, &channel_id)?;
+        governance::prepare(profile.store(), &sek, channel_id)?;
         let governance_display = governance::Display::genesis(genesis);
         Ok(Self {
             channel_id: *channel_id,
@@ -3978,7 +3978,6 @@ impl ChannelState {
     /// identity's own entry is who consents to it reading them, the inbound half of `consented`
     /// (V030-17). A consent grant is what a member's node writes once its owner trusts the other (ADR-007
     /// G-9), so this is what a client says of a newcomer: which members already trust it.
-    #[must_use]
     pub fn trusted_by(&self, store: &Store) -> Result<BTreeMap<Digest32, BTreeSet<Digest32>>> {
         let view = self.current_governance(store)?;
         let members = self.members();
@@ -4005,7 +4004,6 @@ impl ChannelState {
     /// record published by a member, for an identity that never held the room
     /// passphrase — is an author here and still gets nothing unless the operator
     /// put its fingerprint in the keyring.
-    #[must_use]
     pub fn owed_consents(
         &self,
         store: &Store,
@@ -4354,7 +4352,6 @@ impl ChannelState {
     /// released generation never needs more than `MAX_SKIP` steps of it.
     ///
     /// [`MAX_RETAINED_ORIGINS`]: crate::group::history::MAX_RETAINED_ORIGINS
-    #[must_use]
     pub fn history_plan(
         &self,
         store: &Store,
@@ -4678,7 +4675,6 @@ impl ChannelState {
 
     /// Whether `member` sets this room's retention: its creator, or an admin it named — a holder
     /// of the `policy` capability (V030-32). Anyone else sets only their own node's.
-    #[must_use]
     pub fn governs_retention(
         &self,
         store: &Store,
@@ -5986,11 +5982,11 @@ impl ChannelState {
                         writer.seal()?;
                         return Ok(Ok(Vec::new()));
                     };
-                    let wire_kind = refuse!(classify_payload(&payload));
+                    let wire_kind = refuse!(classify_payload(payload));
                     let gov = match wire_kind {
                         EntryKind::Governance | EntryKind::Content
                             if wire_kind == EntryKind::Governance
-                                || crate::governance::step_policy::is_step_policy(&payload) =>
+                                || crate::governance::step_policy::is_step_policy(payload) =>
                         {
                             let entry = held.clone();
                             Some(refuse!(GovEntry::from_verified_log_entry(
@@ -6023,7 +6019,7 @@ impl ChannelState {
                         &mut batch,
                         author,
                         entry_hash,
-                        &payload,
+                        payload,
                         now_ms,
                         &mut expired,
                     )?;
@@ -6490,7 +6486,7 @@ impl ChannelState {
         self.reset_private_pulls();
         // An older author may have served a skeleton before its authenticated release arrived.
         // Its newly available local key makes eligible bodies worth asking for again now.
-        self.drive.omitted.clear();
+        self.drive.clear_omissions();
         self.persist_drive(store)?;
         self.drive.told_unheld.remove(&skdm.body.author_id);
         let before = self.drive.news.len();
@@ -7450,7 +7446,6 @@ impl ChannelState {
     /// Whether this node may read `author`'s messages: `author` has consented to
     /// this identity on the log (ADR-007 per-sender consent). Reading also needs the
     /// sender key itself (the SKDM).
-    #[must_use]
     pub fn may_read(&self, store: &Store, author: &Digest32, me: &Digest32) -> Result<bool> {
         self.current_governance(store)?.can_read(me, author)
     }
@@ -8196,7 +8191,6 @@ impl ChannelState {
     }
 
     /// Whether `who` may name the room: its creator or an admin (ADR-028 R-1).
-    #[must_use]
     pub fn may_rename(&self, store: &Store, who: &Digest32, now: crate::time::Ms) -> Result<bool> {
         self.grants_policy(store, who, now.get())
     }
@@ -8311,7 +8305,6 @@ impl ChannelState {
     /// log: a member that joined after this node did, by its join, and a member that grants this
     /// node consent (ADR-007 G-9), by its latest grant. Nothing here knows the keyring or what was
     /// dismissed; [`crate::node::offers::offers`] decides over every room.
-    #[must_use]
     pub fn offer_bases(&self, store: &Store) -> Result<Vec<crate::node::api::OfferBasis>> {
         use crate::node::api::{OfferBasis, OfferWhy};
         let me = self.me();
@@ -8786,14 +8779,7 @@ impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
         // And every body owed here that this peer's feed reaches (V030-10).
         // An omission means only that this peer did not supply the body in that exchange.
         // Retry later: it may have fetched the body elsewhere without moving its feed head.
-        if room
-            .drive
-            .omitted
-            .get(&self.peer)
-            .is_some_and(|(at, _)| at.elapsed() >= std::time::Duration::from_secs(30))
-        {
-            room.drive.omitted.remove(&self.peer);
-        }
+        room.drive.expire_omissions();
         let owed = match room.owed_wants(self.store, remote, &wants) {
             Ok(owed) => owed,
             Err(error) => {
@@ -8805,12 +8791,7 @@ impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
         };
         for range in owed {
             for seq in range.from_seq..=range.to_seq {
-                if !room
-                    .drive
-                    .omitted
-                    .get(&self.peer)
-                    .is_some_and(|(_, m)| m.contains(&(range.author_id, seq)))
-                {
+                if !room.drive.peer_omitted(&self.peer, &(range.author_id, seq)) {
                     wants.push(crate::log::sync::WantRange {
                         author_id: range.author_id,
                         from_seq: seq,

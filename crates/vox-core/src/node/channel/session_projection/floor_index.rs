@@ -32,10 +32,11 @@ fn generation_key(author: &Digest32, generation: Generation) -> Key {
     key
 }
 fn generation(key: &Key) -> Generation {
-    (
-        u64::from_be_bytes(key[32..40].try_into().expect("epoch width")),
-        u64::from_be_bytes(key[40..48].try_into().expect("generation width")),
-    )
+    let mut epoch = [0; 8];
+    let mut generation = [0; 8];
+    epoch.copy_from_slice(&key[32..40]);
+    generation.copy_from_slice(&key[40..48]);
+    (u64::from_be_bytes(epoch), u64::from_be_bytes(generation))
 }
 fn pair(author: &Digest32, recipient: &Digest32) -> Digest32 {
     crate::hash::sha256_concat(&[b"vox/session-floor-pair/v1", author, recipient])

@@ -411,6 +411,11 @@ const T_ARRIVAL_HEAD_REQ: u64 = 8728;
 const T_ARRIVAL_HEAD: u64 = 8729;
 const T_ARRIVAL_PAGE_REQ: u64 = 8731;
 const T_ARRIVAL_PAGE: u64 = 8732;
+const T_OPERATION_PAGE_REQ: u64 = 8733;
+const T_OPERATION_PAGE: u64 = 8734;
+const T_UNREAD_SUMMARY_REQ: u64 = 8735;
+const T_UNREAD_SUMMARY: u64 = 8736;
+const T_MARK_READ_AT: u64 = 8737;
 const T_ROOM_PAGE_REQ: u64 = 5492;
 const T_ROOM_PAGE: u64 = 5493;
 
@@ -484,6 +489,21 @@ pub enum Request {
         /// The last scanned arrival; zero starts an empty room's future feed.
         after: crate::node::api::HistoryCursor,
     },
+    /// Bounded operation members from the sealed selected index, with no retained query state.
+    OperationPage {
+        /// Selected room and author; an operation id is scoped to its author.
+        channel_id: Digest32,
+        /// The operation's author.
+        author: Digest32,
+        /// Exact operation id, not its hashed index alone.
+        op: String,
+        /// Fixed saved-room instance and last included readable arrival.
+        through: crate::node::api::HistoryCursor,
+        /// Last examined canonical `(created_millis, hash)` key.
+        after: Option<(u64, Digest32)>,
+        /// Exact selected operation root returned by the first page.
+        revision: Option<u64>,
+    },
     /// One stateless bounded governance page on the room-page transport.
     GovernancePage {
         /// Room whose current governance is selected.
@@ -513,6 +533,20 @@ pub enum Request {
         channel_id: Digest32,
         /// The entries shown.
         entries: Vec<Digest32>,
+    },
+    /// Mark a bounded page only in the room incarnation from which it was read.
+    MarkReadAt {
+        /// The room.
+        channel_id: Digest32,
+        /// Captured saved-room incarnation.
+        instance: [u8; 16],
+        /// Entries shown; an empty page validates completion without adding marks.
+        entries: Vec<Digest32>,
+    },
+    /// Scalar facts under the existing bounded unread rule.
+    UnreadSummary {
+        /// The room.
+        channel_id: Digest32,
     },
     /// Append a message to a room.
     Post {
@@ -1085,12 +1119,46 @@ impl Request {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut e = Encoder::new();
         match self {
+            Request::UnreadSummary { channel_id } => {
+                e.array(2).uint(T_UNREAD_SUMMARY_REQ).bytes(channel_id);
+            }
+            Request::MarkReadAt {
+                channel_id,
+                instance,
+                entries,
+            } => {
+                e.array(4)
+                    .uint(T_MARK_READ_AT)
+                    .bytes(channel_id)
+                    .bytes(instance)
+                    .array(entries.len());
+                for entry in entries {
+                    e.bytes(entry);
+                }
+            }
             Request::ArrivalHead { channel_id } => {
                 e.array(2).uint(T_ARRIVAL_HEAD_REQ).bytes(channel_id);
             }
             Request::ArrivalPage { channel_id, after } => {
                 e.array(3).uint(T_ARRIVAL_PAGE_REQ).bytes(channel_id);
                 encode_history_cursor(&mut e, *after);
+            }
+            Request::OperationPage {
+                channel_id,
+                author,
+                op,
+                through,
+                after,
+                revision,
+            } => {
+                e.array(7)
+                    .uint(T_OPERATION_PAGE_REQ)
+                    .bytes(channel_id)
+                    .bytes(author)
+                    .text(op);
+                encode_history_cursor(&mut e, *through);
+                encode_order_cursor(&mut e, *after);
+                encode_optional_u64(&mut e, *revision);
             }
             Request::GovernancePage { channel_id, query } => {
                 e.array(3).uint(T_ROOM_PAGE_REQ).bytes(channel_id);
@@ -1650,6 +1718,32 @@ impl Request {
             .uint()
             .map_err(|_| Error::MalformedIpc("ipc request tag"))?;
         match (tag, n) {
+            (T_UNREAD_SUMMARY_REQ, 2) => {
+                let channel_id = digest(&mut d)?;
+                d.finish()?;
+                Ok(Request::UnreadSummary { channel_id })
+            }
+            (T_MARK_READ_AT, 4) => {
+                let channel_id = digest(&mut d)?;
+                let instance = d
+                    .bytes()?
+                    .try_into()
+                    .map_err(|_| Error::MalformedIpc("read mark instance"))?;
+                let n = d.array()?;
+                if n > crate::node::content::MAX_READ_HASHES {
+                    return Err(Error::MalformedIpc("ipc too many entries"));
+                }
+                let mut entries = Vec::with_capacity(n);
+                for _ in 0..n {
+                    entries.push(digest(&mut d)?);
+                }
+                d.finish()?;
+                Ok(Request::MarkReadAt {
+                    channel_id,
+                    instance,
+                    entries,
+                })
+            }
             (T_ARRIVAL_HEAD_REQ, 2) => {
                 let channel_id = digest(&mut d)?;
                 d.finish()?;
@@ -1660,6 +1754,23 @@ impl Request {
                 let after = history_cursor(&mut d)?;
                 d.finish()?;
                 Ok(Request::ArrivalPage { channel_id, after })
+            }
+            (T_OPERATION_PAGE_REQ, 7) => {
+                let channel_id = digest(&mut d)?;
+                let author = digest(&mut d)?;
+                let op = text(&mut d, "operation id")?;
+                let through = history_cursor(&mut d)?;
+                let after = order_cursor(&mut d)?;
+                let revision = optional_u64(&mut d)?;
+                d.finish()?;
+                Ok(Request::OperationPage {
+                    channel_id,
+                    author,
+                    op,
+                    through,
+                    after,
+                    revision,
+                })
             }
             (T_SUBSCRIBE, 1) => {
                 d.finish()
@@ -2454,7 +2565,23 @@ pub struct SharedService {
 /// how a `Lagged` report comes to be silently swallowed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
+    /// One bounded exact operation selection. Empty rows with `next` still require continuation.
+    OperationPage {
+        /// Readable matching rows in canonical `(created_millis, hash)` order.
+        rows: Vec<MessageRow>,
+        /// Last examined canonical key, absent only when this fixed-cap pass is complete.
+        next: Option<(u64, Digest32)>,
+        /// Exact immutable root of this selected operation.
+        revision: u64,
+        /// First known conflicting arrival, retained after its body expires and bounded by the requested horizon.
+        conflict_at: Option<u64>,
+    },
     /// The current saved room instance and its newest readable arrival.
+    /// Counts and first boundary without unread message bodies.
+    UnreadSummary {
+        /// Facts from one current room snapshot.
+        summary: crate::node::api::UnreadSummary,
+    },
     ArrivalHead {
         /// This cursor has no dependency on retaining the newest message body.
         head: crate::node::api::HistoryCursor,
@@ -2761,6 +2888,30 @@ impl Frame {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut e = Encoder::new();
         match self {
+            Frame::OperationPage {
+                rows,
+                next,
+                revision,
+                conflict_at,
+            } => {
+                e.array(5).uint(T_OPERATION_PAGE).array(rows.len());
+                for row in rows {
+                    encode_row(&mut e, row);
+                }
+                encode_order_cursor(&mut e, *next);
+                e.uint(*revision);
+                encode_optional_u64(&mut e, *conflict_at);
+            }
+            Frame::UnreadSummary { summary } => {
+                e.array(7)
+                    .uint(T_UNREAD_SUMMARY)
+                    .uint(summary.addressed)
+                    .uint(summary.urgent)
+                    .uint(summary.new)
+                    .uint(summary.coordination)
+                    .bytes(summary.first.as_ref().map_or(&[][..], |h| &h[..]))
+                    .uint(u64::from(summary.scan_limited));
+            }
             Frame::ArrivalHead { head } => {
                 e.array(2).uint(T_ARRIVAL_HEAD);
                 encode_history_cursor(&mut e, *head);
@@ -3620,9 +3771,50 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 revision: digest(d)?,
             });
         }
+        (T_UNREAD_SUMMARY, 7) => {
+            let summary = crate::node::api::UnreadSummary {
+                addressed: d.uint()?,
+                urgent: d.uint()?,
+                new: d.uint()?,
+                coordination: d.uint()?,
+                first: optional_digest(d)?,
+                scan_limited: match d.uint()? {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(Error::MalformedIpc("unread summary limit")),
+                },
+            };
+            let limit = crate::node::channel::UNREAD_LOOKED as u64;
+            if summary.addressed > limit
+                || summary.new > limit
+                || summary.coordination > limit
+                || summary.addressed + summary.new + summary.coordination > limit
+                || summary.urgent > summary.addressed
+            {
+                return Err(Error::MalformedIpc("unread summary counts"));
+            }
+            return Ok(Frame::UnreadSummary { summary });
+        }
         (T_ARRIVAL_HEAD, 2) => {
             return Ok(Frame::ArrivalHead {
                 head: history_cursor(d)?,
+            });
+        }
+        (T_OPERATION_PAGE, 5) => {
+            let Frame::Rows { rows } = decode_body(d, T_ROWS, 2)? else {
+                return Err(Error::MalformedIpc("operation page rows"));
+            };
+            if rows.len() > PAGE_ENTRIES {
+                return Err(Error::MalformedIpc("operation page row count"));
+            }
+            let next = order_cursor(d)?;
+            let revision = d.uint()?;
+            let conflict_at = optional_u64(d)?;
+            return Ok(Frame::OperationPage {
+                rows,
+                next,
+                revision,
+                conflict_at,
             });
         }
         (T_ARRIVAL_PAGE, 4) => {
@@ -4889,6 +5081,7 @@ fn read_lifecycle_cursor(d: &mut Decoder<'_>) -> Result<crate::node::sessions::L
 /// Existing SessionsPage wire bytes, produced from at most one logical page of
 /// compact references. Arbitrarily large metadata is decoded a bounded chunk at
 /// a time, with current room/drive checks before every continuation.
+#[allow(clippy::too_many_arguments)]
 async fn write_sessions(
     stream: &mut UnixStream,
     handle: &NodeHandle,
@@ -5712,6 +5905,7 @@ async fn serve_requests(
         if matches!(
             reply,
             Frame::Rows { .. }
+                | Frame::OperationPage { .. }
                 | Frame::ArrivalPage { .. }
                 | Frame::FilteredRows { .. }
                 | Frame::RoomPage { .. }
@@ -6197,6 +6391,72 @@ fn one_line(text: &str) -> String {
 /// and be able to ask something else.
 async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
     let frame = match request {
+        Request::OperationPage {
+            channel_id,
+            author,
+            op,
+            through,
+            after,
+            revision,
+        } => {
+            use crate::node::channel::history::{Query, Reply};
+            match handle
+                .room_history(
+                    channel_id,
+                    Query::OperationPage {
+                        author,
+                        op,
+                        through,
+                        after,
+                        revision,
+                    },
+                )
+                .await
+            {
+                Ok(Reply::OperationPage {
+                    rows,
+                    next,
+                    revision,
+                    conflict_at,
+                }) => Frame::OperationPage {
+                    rows,
+                    next,
+                    revision,
+                    conflict_at,
+                },
+                Ok(_) => Frame::Error {
+                    reason: "unexpected operation page reply".into(),
+                },
+                Err(reason) => Frame::Error { reason },
+            }
+        }
+        Request::UnreadSummary { channel_id } => {
+            use crate::node::channel::history::{Query, Reply};
+            match handle.room_history(channel_id, Query::UnreadSummary).await {
+                Ok(Reply::UnreadSummary(summary)) => Frame::UnreadSummary { summary },
+                Ok(_) => Frame::Error {
+                    reason: "unexpected unread summary reply".into(),
+                },
+                Err(reason) => Frame::Error { reason },
+            }
+        }
+        Request::MarkReadAt {
+            channel_id,
+            instance,
+            entries,
+        } => match handle
+            .apply(crate::node::api::NodeCommand::MarkRead {
+                channel_id,
+                entries,
+                expected_instance: Some(instance),
+            })
+            .await
+        {
+            crate::node::api::Outcome::Done => Frame::Ok,
+            other => Frame::Error {
+                reason: other.to_string(),
+            },
+        },
         Request::ArrivalHead { channel_id } => {
             match handle.history_reader().arrival_head(channel_id).await {
                 Ok(head) => Frame::ArrivalHead { head },
@@ -6542,6 +6802,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             .apply(crate::node::api::NodeCommand::MarkRead {
                 channel_id,
                 entries,
+                expected_instance: None,
             })
             .await
         {

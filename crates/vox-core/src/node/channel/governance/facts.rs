@@ -474,6 +474,8 @@ impl<'a> Read<'a> {
     pub(super) fn authority_generation(&self) -> u64 {
         self.header.authority_generation
     }
+    // This is the published display revision, not the internal directory write revision.
+    #[allow(clippy::misnamed_getters)]
     pub(super) fn revision(&self) -> u64 {
         self.header.display_revision
     }

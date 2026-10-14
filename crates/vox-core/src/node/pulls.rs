@@ -269,7 +269,6 @@ pub fn folder_prior(
 }
 
 /// Every pull this node has recorded.
-#[must_use]
 pub fn recorded(paths: &Paths) -> impl Iterator<Item = Pulled> + use<> {
     records(paths).map(|(_, p)| p)
 }
@@ -1727,7 +1726,7 @@ impl Pulls {
             let Some(file) = file else {
                 break;
             };
-            if !file.extension().is_some_and(|x| x == "json") {
+            if file.extension().is_none_or(|x| x != "json") {
                 continue;
             }
             if cursor.phase == 3 {

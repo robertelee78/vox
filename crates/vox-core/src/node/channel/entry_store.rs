@@ -216,7 +216,7 @@ impl Directory {
     }
     fn bytes(&self) -> Zeroizing<Vec<u8>> {
         let mut e = Encoder::new();
-        e.array(19).uint(7);
+        e.array(19).uint(8);
         self.active.write(&mut e);
         self.provisional.write(&mut e);
         e.uint(self.next_page)
@@ -292,9 +292,10 @@ impl Directory {
         let mut d = Decoder::new(bytes);
         let arity = d.array()?;
         let version = d.uint()?;
-        // This unpublished format includes durable receipts, pending local read marks and
-        // recovery membership. Reading older roots as empty would silently lose accepted work.
-        if (arity, version) != (19, 7) {
+        // This unpublished format includes durable receipts, pending local read marks,
+        // canonical operation members and retained conflict witnesses. Older partial roots
+        // cannot be treated as empty without silently losing accepted work.
+        if (arity, version) != (19, 8) {
             return Err(invalid("entry directory format"));
         }
         let active = Roots::read(&mut d)?;
@@ -528,6 +529,7 @@ enum Value {
     Rendered(RenderFact),
     Owed(render_facts::OwedFact),
     Retained(crate::node::retention::Tracked),
+    Operation(render_facts::OperationFact),
 }
 impl Value {
     fn locator(self) -> Result<Locator> {
@@ -548,6 +550,7 @@ impl Value {
             Self::Rendered(fact) => fact.write(e),
             Self::Owed(fact) => fact.write(e),
             Self::Retained(fact) => retention_facts::write_fact(fact, e),
+            Self::Operation(fact) => fact.write(e),
         }
     }
     fn read(d: &mut Decoder<'_>) -> Result<Self> {
@@ -567,7 +570,11 @@ impl Value {
             2 if d.uint()? == 1 => Ok(Self::Number(d.uint()?)),
             1 if d.uint()? == 2 => Ok(Self::Present),
             5 if d.uint()? == 3 => Ok(Self::Rendered(RenderFact::read(d)?)),
-            4 if d.uint()? == 4 => Ok(Self::Owed(render_facts::OwedFact::read(d)?)),
+            4 => match d.uint()? {
+                4 => Ok(Self::Owed(render_facts::OwedFact::read(d)?)),
+                6 => Ok(Self::Operation(render_facts::OperationFact::read(d)?)),
+                _ => Err(invalid("entry page value kind")),
+            },
             6 if d.uint()? == 5 => Ok(Self::Retained(retention_facts::read_fact(d)?)),
             _ => Err(invalid("entry page value kind")),
         }

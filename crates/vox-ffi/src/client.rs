@@ -491,6 +491,23 @@ pub struct PulledBy {
     pub names: Vec<String>,
 }
 
+/// Counts and the first boundary in the node's existing bounded unread range.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct RoomUnread {
+    /// Messages addressed to this node.
+    pub addressed: u64,
+    /// Urgent messages among addressed messages.
+    pub urgent: u64,
+    /// Room conversation messages.
+    pub new: u64,
+    /// Coordination messages.
+    pub coordination: u64,
+    /// Oldest unread message in the examined range, if any.
+    pub first: Option<String>,
+    /// Older rows exist outside the node's unread examination range.
+    pub scan_limited: bool,
+}
+
 /// **The three unread levels** (ADR-028 R-8): what one unread message is to this node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum UnreadLevel {
@@ -5238,6 +5255,24 @@ impl VoxClient {
     ///
     /// # Errors
     /// A malformed id, or the node's refusal (the room not open).
+    pub async fn unread_summary(&self, room: String) -> Result<RoomUnread, VoxError> {
+        let channel_id = digest(&room, "room id")?;
+        on_held!(self, |c| {
+            match ask(c, &Request::UnreadSummary { channel_id }).await? {
+                Frame::UnreadSummary { summary } => Ok(RoomUnread {
+                    addressed: summary.addressed,
+                    urgent: summary.urgent,
+                    new: summary.new,
+                    coordination: summary.coordination,
+                    first: summary.first.as_ref().map(b32_encode),
+                    scan_limited: summary.scan_limited,
+                }),
+                other => Err(unexpected(&other)),
+            }
+        })
+    }
+
+    /// The bounded unread rows, for callers that need their bodies.
     pub async fn unread(&self, room: String) -> Result<Vec<RoomMessage>, VoxError> {
         let channel_id = digest(&room, "room id")?;
         on_held!(self, |c| {
@@ -5343,8 +5378,9 @@ impl VoxClient {
                 for page in entries.chunks(vox_core::node::content::MAX_READ_HASHES) {
                     done(
                         c,
-                        &Request::MarkRead {
+                        &Request::MarkReadAt {
                             channel_id,
+                            instance: head.instance,
                             entries: page.to_vec(),
                         },
                     )
@@ -5359,6 +5395,17 @@ impl VoxClient {
                 let Some(next) = next else { break };
                 cursor = next;
             }
+            // Validate completion even when the captured room was empty, all rows were
+            // ours, or the final page contained no markable rows.
+            done(
+                c,
+                &Request::MarkReadAt {
+                    channel_id,
+                    instance: head.instance,
+                    entries: Vec::new(),
+                },
+            )
+            .await?;
             Ok(marked)
         })
     }

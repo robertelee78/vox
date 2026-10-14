@@ -24,19 +24,24 @@ const MAX_PENDING_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_PENDING_SESSIONS: usize = 256;
 const HEADER: u64 = 0;
 
-/// The sequence range committed by one atomic admission.
+/// Inclusive bounds of the durable sequences covered by one atomic admission.
+/// A repeated source event names its original sequence rather than allocating another.
+/// Both bounds are zero when the whole admission deliberately suppressed driver echoes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Committed {
-    /// First sequence in the batch.
+    /// Lowest durable sequence covered by the batch.
     pub first: u64,
-    /// Last sequence in the batch.
+    /// Highest durable sequence covered by the batch.
     pub last: u64,
+    /// This admission began a new source activity (or stored an unkeyed activity).
+    /// Continuing an already admitted split source does not repeat its control effects.
+    pub fresh: bool,
 }
 
 /// A failed admission distinguishes a transaction never submitted from an uncertain commit.
 #[derive(Debug)]
 pub enum AdmissionError {
-    /// Preparation failed; none of this batch was committed.
+    /// Preparation failed; this batch committed no new activity or source receipts.
     NotCommitted(Error),
     /// The commit returned an error; its durable outcome must not be guessed or retried.
     Unconfirmed(Error),
@@ -80,6 +85,53 @@ struct Session {
 struct Item {
     room: Digest32,
     body: String,
+}
+
+/// Adapter-only identity, removed before the activity becomes a Session record.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Source {
+    id: Digest32,
+    revision: Digest32,
+    part: u64,
+    parts: u64,
+    #[serde(default)]
+    suppressed: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SourceReceipt {
+    session: Digest32,
+    room: Digest32,
+    source: Digest32,
+    kind: String,
+    revision: Digest32,
+    parts: u64,
+    next: u64,
+    first: u64,
+    last: u64,
+    suppressed: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SourcePart {
+    revision: Digest32,
+    parts: u64,
+    digest: Digest32,
+    seq: u64,
+}
+
+fn source_scope(session: &Digest32, room: &Digest32, id: &Digest32, kind: &str) -> Digest32 {
+    let mut bytes = b"vox/session-ingress-source/v1".to_vec();
+    bytes.extend_from_slice(session);
+    bytes.extend_from_slice(room);
+    bytes.extend_from_slice(id);
+    bytes.extend_from_slice(kind.as_bytes());
+    sha256(&bytes)
+}
+
+fn source_error() -> Error {
+    Error::Profile("inconsistent Session activity source")
 }
 
 fn bad() -> Error {
@@ -179,7 +231,8 @@ fn session_in(batch: &Batch<'_>, key: &Sek, scope: &Digest32, name: &str) -> Res
     Ok(s)
 }
 
-/// Validate, number and commit an entire batch. No sequence or body is accepted on error.
+/// Validate, number and commit an entire batch. Preparation errors accept no new sequence
+/// or body; source receipts committed by earlier calls remain authoritative.
 pub fn admit(
     profile: &Profile,
     room: Digest32,
@@ -206,24 +259,177 @@ pub fn admit(
         return Err(Error::Profile("this room was removed; its Session cleanup is pending").into());
     }
     let mut session = session_in(&batch, &key, &scope, name)?;
-    if session.head == session.next {
-        if directory.active.contains(&scope) {
-            return Err(bad().into());
-        }
-        if directory.active.len() == MAX_PENDING_SESSIONS {
-            return Err(Error::SizeLimitExceeded("pending Session inboxes").into());
-        }
-        directory.active.push(scope);
-    } else if !directory.active.contains(&scope) {
+    if directory.active.contains(&scope) != (session.head < session.next) {
         return Err(bad().into());
     }
-    let first = session.next;
+    let mut first = u64::MAX;
+    let mut last = 0;
+    let before = session.next;
+    let mut fresh = false;
+    let mut receipts_changed = false;
     for body in bodies {
         let serde_json::Value::Object(mut object) =
             serde_json::from_str(&body).map_err(|_| bad())?
         else {
             return Err(Error::Profile("Session activity must be a JSON object").into());
         };
+        let source = object
+            .remove("_vox_source")
+            .map(|value| serde_json::from_value::<Source>(value).map_err(|_| source_error()))
+            .transpose()?;
+        let mut source_write = None;
+        if let Some(source) = source {
+            let kind = object
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                .filter(|kind| matches!(*kind, "user" | "tool" | "tool-done"))
+                .ok_or_else(source_error)?;
+            if (source.suppressed && kind != "user")
+                || source.part == 0
+                || source.parts == 0
+                || source.part > source.parts
+                || source.parts > MAX_BATCH_ITEMS as u64
+            {
+                return Err(source_error().into());
+            }
+            let coordinates = object.get("part").and_then(serde_json::Value::as_array);
+            if match coordinates {
+                Some(part) => {
+                    part.len() != 2
+                        || part[0].as_u64() != Some(source.part)
+                        || part[1].as_u64() != Some(source.parts)
+                }
+                None => source.part != 1 || source.parts != 1 || object.contains_key("part"),
+            } {
+                return Err(source_error().into());
+            }
+            let source_scope = source_scope(&scope, &room, &source.id, kind);
+            let saved = batch
+                .get_segment(&source_scope, SegmentKind::SessionIngress, HEADER)?
+                .map(|segment| decode::<SourceReceipt>(&key, &source_scope, HEADER, &segment))
+                .transpose()?;
+            let mut receipt = match saved {
+                Some(receipt) => {
+                    if receipt.session != scope
+                        || receipt.room != room
+                        || receipt.source != source.id
+                        || receipt.kind != kind
+                        || receipt.parts == 0
+                        || receipt.parts > MAX_BATCH_ITEMS as u64
+                        || receipt.next < 2
+                        || receipt.next > receipt.parts + 1
+                        || if receipt.suppressed {
+                            receipt.first != 0
+                                || receipt.last != 0
+                                || receipt.next != receipt.parts + 1
+                        } else {
+                            receipt.first == 0
+                                || receipt.first > receipt.last
+                                || receipt.last >= session.next
+                        }
+                    {
+                        return Err(bad().into());
+                    }
+                    // Like the adapter's old exact started/finished sets, the first version
+                    // of a source event wins. An updated tool input is not another start.
+                    if receipt.revision != source.revision {
+                        if receipt.next != receipt.parts + 1 {
+                            return Err(source_error().into());
+                        }
+                        if !receipt.suppressed {
+                            first = first.min(receipt.first);
+                            last = last.max(receipt.last);
+                        }
+                        continue;
+                    }
+                    if receipt.parts != source.parts {
+                        return Err(source_error().into());
+                    }
+                    if receipt.suppressed {
+                        continue;
+                    }
+                    receipt
+                }
+                None => {
+                    if source.part != 1 {
+                        return Err(source_error().into());
+                    }
+                    SourceReceipt {
+                        session: scope,
+                        room,
+                        source: source.id,
+                        kind: kind.to_owned(),
+                        revision: source.revision,
+                        parts: source.parts,
+                        next: 1,
+                        first: session.next,
+                        last: session.next,
+                        suppressed: false,
+                    }
+                }
+            };
+            // A driver echo is deliberately absent from shared history, but its exact
+            // identity still survives restart so a late duplicate cannot escape suppression.
+            if source.suppressed && receipt.next == 1 {
+                receipt.suppressed = true;
+                receipt.first = 0;
+                receipt.last = 0;
+                receipt.next = receipt.parts + 1;
+                put(&mut batch, &key, &source_scope, HEADER, &receipt)?;
+                receipts_changed = true;
+                fresh = true;
+                continue;
+            }
+            // Timestamp is observation time, not source identity. Everything else in this
+            // exact split part must agree when an adapter repeats the same source revision.
+            let mut canonical = object.clone();
+            canonical.remove("ts");
+            canonical.remove("seq");
+            canonical.remove("session");
+            let digest = sha256(serde_json::Value::Object(canonical).to_string().as_bytes());
+            if let Some(segment) =
+                batch.get_segment(&source_scope, SegmentKind::SessionIngress, source.part)?
+            {
+                let part: SourcePart = decode(&key, &source_scope, source.part, &segment)?;
+                if part.revision != source.revision
+                    || part.parts != source.parts
+                    || part.seq < receipt.first
+                    || part.seq > receipt.last
+                    || source.part >= receipt.next
+                {
+                    return Err(bad().into());
+                }
+                if part.digest != digest {
+                    return Err(source_error().into());
+                }
+                first = first.min(part.seq);
+                last = last.max(part.seq);
+                continue;
+            }
+            if source.part != receipt.next {
+                return Err(source_error().into());
+            }
+            receipt.next += 1;
+            receipt.last = session.next;
+            source_write = Some((
+                source_scope,
+                receipt,
+                source.part,
+                SourcePart {
+                    revision: source.revision,
+                    parts: source.parts,
+                    digest,
+                    seq: session.next,
+                },
+            ));
+        }
+        // A duplicate needs no scheduling slot or pending bytes, even when the inbox is full.
+        if session.head == session.next {
+            if directory.active.len() == MAX_PENDING_SESSIONS {
+                return Err(Error::SizeLimitExceeded("pending Session inboxes").into());
+            }
+            directory.active.push(scope);
+        }
         object.insert("seq".into(), session.next.into());
         object.insert("session".into(), name.into());
         let body = serde_json::Value::Object(object).to_string();
@@ -242,18 +448,33 @@ pub fn admit(
             return Err(Error::SizeLimitExceeded("pending Session activity").into());
         }
         batch.put_segment(&scope, SegmentKind::SessionIngress, session.next, &segment)?;
+        fresh |= source_write
+            .as_ref()
+            .is_none_or(|(_, _, part, _)| *part == 1);
+        if let Some((source_scope, receipt, part, part_receipt)) = source_write {
+            put(&mut batch, &key, &source_scope, part, &part_receipt)?;
+            put(&mut batch, &key, &source_scope, HEADER, &receipt)?;
+        }
+        first = first.min(session.next);
+        last = last.max(session.next);
         session.next = session
             .next
             .checked_add(1)
             .ok_or(Error::SizeLimitExceeded("Session sequence"))?;
     }
-    put(&mut batch, &key, &scope, HEADER, &session)?;
-    put(&mut batch, &key, &node, HEADER, &directory)?;
+    if first == u64::MAX {
+        first = 0;
+    }
+    let bodies_changed = session.next != before;
+    if !bodies_changed && !receipts_changed {
+        return Ok(Committed { first, last, fresh });
+    }
+    if bodies_changed {
+        put(&mut batch, &key, &scope, HEADER, &session)?;
+        put(&mut batch, &key, &node, HEADER, &directory)?;
+    }
     batch.commit().map_err(AdmissionError::Unconfirmed)?;
-    Ok(Committed {
-        first,
-        last: session.next - 1,
-    })
+    Ok(Committed { first, last, fresh })
 }
 
 /// One owned item, bounded by the admission limit. Its completion is never committed alone.

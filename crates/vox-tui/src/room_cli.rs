@@ -2108,21 +2108,17 @@ pub async fn sessions(paths: &Paths, room: &str, json: bool) -> Result<(), AppEr
     Ok(())
 }
 
-/// `vox room tail` — every row after a cursor, then every row as it lands, **with no
-/// gap across a lag or a restart** (ADR-021 §7).
+/// `vox room tail` — every row after a cursor, then every readable arrival (ADR-021 §7).
+/// Capture the saved arrival position before subscribing and immediately catch up after
+/// registration. Events only wake that one cursor; late rows, repeated wakes and retention
+/// need neither a second delivery route nor a lifetime set of already printed hashes.
 ///
-/// How the gap is closed: subscribe **first**, then read from the cursor, then emit
-/// the read rows followed by the live ones, dropping any entry already emitted. A row
-/// that lands between the subscription and the read arrives twice and is emitted once;
-/// a row cannot land in neither. On `Lagged` — the node dropped events for this
-/// subscriber — re-read from the last emitted entry rather than trusting the stream.
+/// Duplicates across a restart are permitted and gaps are not: the caller persists its last
+/// entry hash after processing and resumes with `--since`. A removed room instance refuses
+/// explicitly rather than applying an old arrival position to a new room.
 ///
-/// Duplicates across a *restart* are permitted and gaps are not: the caller persists
-/// its cursor after processing, and resumes from it.
-///
-/// With `--json`, rows are `vox.room.row/1`, and an arrival that turns an operation
-/// into a conflict re-emits every earlier row of that operation with `conflict`, so a
-/// consumer learns of the change from the stream alone.
+/// With `--json`, rows are `vox.room.row/1`; a newly conflicting operation also re-emits its
+/// earlier rows with `conflict`, so the consumer learns of the change from the stream alone.
 ///
 /// # Errors
 /// If the node cannot be reached, the room is unknown, or the cursor is not in it.
@@ -2132,23 +2128,56 @@ pub async fn tail(
     since: Option<&str>,
     json: bool,
 ) -> Result<(), AppError> {
-    let (mut lookup, channel_id, room_key) = open_room(paths, room).await?;
-    let cursor = match since {
-        None => None,
-        Some(s) => Some(parse_cursor(s)?),
-    };
+    use vox_core::node::api::NodeEvent;
 
-    // Subscribe BEFORE reading. Subscribing is terminal for a connection, so the
-    // stream gets a connection of its own and `lookup` keeps answering reads.
+    let (mut lookup, channel_id, room_key) = open_room(paths, room).await?;
+    let mut cursor = tail_head(&mut lookup, channel_id).await?;
+    let mut shown = TailRows::default();
+    if let Some(since) = since {
+        let hash = parse_cursor(since)?;
+        let row = match lookup
+            .request(&Request::Find {
+                channel_id,
+                entries: vec![hash],
+            })
+            .await
+            .map_err(|e| AppError::Usage(e.to_string()))?
+        {
+            Frame::Rows { mut rows } if rows.len() == 1 && rows[0].entry_hash == hash => {
+                rows.remove(0)
+            }
+            Frame::Rows { .. } => {
+                return Err(AppError::Usage("cursor not in this room's timeline".into()))
+            }
+            Frame::Error { reason } => return Err(AppError::Usage(reason)),
+            other => return Err(crate::client::unexpected(&other)),
+        };
+        if row.owed || row.arrival == 0 {
+            return Err(AppError::Usage(
+                "cursor is not a readable arrival in this room".into(),
+            ));
+        }
+        if tail_head(&mut lookup, channel_id).await?.instance != cursor.instance {
+            return Err(AppError::Usage(
+                "the saved room changed while locating the cursor; run the command again".into(),
+            ));
+        }
+        cursor.arrival = row.arrival;
+        shown.last = Some(hash);
+    }
+
+    // Both connections are held as the same node. The head predates registration, and the
+    // first page below closes that gap even when no further event ever arrives.
     let mut stream = attach(paths).await?;
+    if lookup.me().is_none() || stream.me() != lookup.me() {
+        return Err(AppError::Usage(
+            "the attached node changed while starting this tail".into(),
+        ));
+    }
     stream
         .subscribe()
         .await
         .map_err(|e| AppError::Usage(e.to_string()))?;
-    // **Test-only: a pause between the subscription and the read** (V030-31, #368), read from
-    // `VOX_TEST_TAIL_HOLD_MS` in a build with the `test-knobs` feature; no shipped build reads it
-    // (V210-105). Rows posted in it land between the two steps every time, which is the moment
-    // the order exists for.
     #[cfg(feature = "test-knobs")]
     if let Some(ms) = std::env::var("VOX_TEST_TAIL_HOLD_MS")
         .ok()
@@ -2158,138 +2187,135 @@ pub async fn tail(
         tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
     }
 
-    // Start at the live edge, or stream the requested backlog one bounded page at a time.
-    let mut read_to = cursor;
-    if cursor.is_none() {
-        read_to = match lookup
-            .request(&Request::Count {
-                channel_id,
-                since: None,
-            })
-            .await
-            .map_err(|e| AppError::Usage(e.to_string()))?
-        {
-            Frame::Count { last, .. } => last,
-            other => return Err(crate::client::unexpected(&other)),
-        };
-    }
-    let mut shown = TailRows::default();
     let mut out = std::io::stdout().lock();
-    if cursor.is_some() {
+    loop {
         loop {
-            let rows = coord::read_upto(&mut lookup, channel_id, read_to, 200)
-                .await?
-                .ok_or_else(|| AppError::Usage("cursor not in this room's timeline".into()))?;
-            let Some(next) = rows.last().map(|r| r.entry_hash) else {
-                break;
+            let (rows, instance, next) = match lookup
+                .request(&Request::ArrivalPage {
+                    channel_id,
+                    after: cursor,
+                })
+                .await
+                .map_err(|e| tail_stopped(room, shown.last, json, &e.to_string()))?
+            {
+                Frame::ArrivalPage {
+                    rows,
+                    instance,
+                    next,
+                } => (rows, instance, next),
+                Frame::Error { reason } => {
+                    return Err(tail_stopped(room, shown.last, json, &reason))
+                }
+                other => return Err(crate::client::unexpected(&other)),
             };
-            if Some(next) == read_to {
-                return Err(AppError::Usage("the tail's page did not advance".into()));
+            if instance != cursor.instance {
+                return Err(AppError::Usage("the saved room changed; this tail stopped rather than applying its old cursor to the replacement room".into()));
             }
-            read_to = Some(next);
+            let mut last = cursor.arrival;
+            for row in &rows {
+                if row.owed || row.arrival <= last {
+                    return Err(AppError::Usage(
+                        "the tail's arrival page did not advance consistently".into(),
+                    ));
+                }
+                last = row.arrival;
+            }
+            if next.is_some_and(|n| {
+                n.instance != instance || n.arrival <= cursor.arrival || n.arrival < last
+            }) {
+                return Err(AppError::Usage(
+                    "the tail's arrival continuation did not advance consistently".into(),
+                ));
+            }
             for row in rows {
+                let arrival = row.arrival;
                 shown
-                    .deliver(&mut lookup, channel_id, &room_key, row, &mut out, json)
-                    .await?;
+                    .deliver(
+                        &mut lookup,
+                        channel_id,
+                        &room_key,
+                        cursor.instance,
+                        row,
+                        &mut out,
+                        json,
+                    )
+                    .await
+                    .map_err(|e| tail_stopped(room, shown.last, json, &e.to_string()))?;
+                cursor.arrival = arrival;
+            }
+            if let Some(next) = next {
+                cursor = next;
+                tokio::task::yield_now().await;
+            } else {
+                break;
             }
         }
-    }
-
-    // **An event is a wake, never the data** (ADR-020 §6). Only this node's own posts
-    // arrive as `NewEntry`; an entry that arrives from another member by sync is
-    // announced as `Synced`, and one that becomes readable when a sender key arrives as
-    // `SenderKeyReceived` — neither carries the row. So on any of them, and on
-    // `Lagged`, the room is read from where this stream last read it, and whatever it has
-    // not emitted is emitted.
-    //
-    // **From where it last read, never the whole room** (V210-113): a whole re-read made
-    // every arriving message cost the room's history (one run: 122 re-reads of ~7.4 MB).
-    // It is complete because a node's timeline only grows at its end: an entry rendered
-    // late (its key arrived after it did) is appended when it is rendered, so it sits
-    // after every row any earlier read returned — though not necessarily after the last
-    // row *emitted*, which may be an own post that came as `NewEntry`; hence `read_to`.
-    // If retention removed the cursor, resume through the retained rows in bounded pages.
-    loop {
-        let reread = match stream.next().await {
-            Ok(Some(Frame::Event(vox_core::node::api::NodeEvent::NewEntry {
-                channel_id: c,
-                row,
-            }))) if c == channel_id => {
-                shown
-                    .deliver(&mut lookup, channel_id, &room_key, row, &mut out, json)
-                    .await?;
-                false
-            }
-            Ok(Some(Frame::Event(
-                vox_core::node::api::NodeEvent::Synced { channel_id: c, .. }
-                | vox_core::node::api::NodeEvent::SenderKeyReceived { channel_id: c, .. },
-            ))) => c == channel_id,
-            Ok(Some(Frame::Lagged { missed })) => {
-                eprintln!("vox: this stream fell behind by {missed} events; re-reading the room");
-                true
-            }
-            Ok(Some(_)) => false,
-            // **The node stopping is a failure, not the end of the room** (V210-83). It exited 0
-            // here, so a supervisor restarting a tail on failure never did, and a script read a
-            // stream that had silently stopped as one that had finished.
-            Ok(None) => {
-                return Err(AppError::Usage(match shown.last {
-                    Some(h) => format!(
-                        "the node stopped, so this tail stopped with it\n       start the node \
-                         again, then resume with `vox room tail {room} --since {}`",
-                        b32_encode(&h)
-                    ),
-                    None => format!(
-                        "the node stopped, so this tail stopped with it\n       start the node \
-                         again, then run `vox room tail {room}`"
-                    ),
-                }))
-            }
-            Err(e) => return Err(AppError::Usage(e.to_string())),
-        };
-        if reread {
-            loop {
-                let rows = match lookup
-                    .request(&Request::Read {
-                        channel_id,
-                        since: read_to,
-                        after: None,
-                        limit: 200,
-                    })
-                    .await
-                    .map_err(|e| AppError::Usage(e.to_string()))?
+        // The stream carries wakes only: never print its embedded NewEntry a second way.
+        loop {
+            match stream.next().await {
+                Ok(Some(Frame::Event(
+                    NodeEvent::NewEntry { channel_id: c, .. }
+                    | NodeEvent::Synced { channel_id: c, .. }
+                    | NodeEvent::SenderKeyReceived { channel_id: c, .. }
+                    | NodeEvent::ChannelOpened { channel_id: c },
+                ))) if c == channel_id => break,
+                Ok(Some(Frame::Event(NodeEvent::ChannelClosed { channel_id: c })))
+                    if c == channel_id =>
                 {
-                    Frame::Rows { rows } => rows,
-                    Frame::Error { .. } if read_to.is_some() => {
-                        read_to = None;
-                        continue;
-                    }
-                    other => return Err(crate::client::unexpected(&other)),
-                };
-                let Some(next) = rows.last().map(|r| r.entry_hash) else {
+                    return Err(tail_stopped(
+                        room,
+                        shown.last,
+                        json,
+                        "the room closed on this node",
+                    ));
+                }
+                Ok(Some(Frame::Event(NodeEvent::RoomRemoved { channel_id: c })))
+                    if c == channel_id =>
+                {
+                    return Err(AppError::Usage(
+                        "the room was removed from this node, so this tail stopped".into(),
+                    ));
+                }
+                Ok(Some(Frame::Lagged { missed })) => {
+                    eprintln!("vox: this stream fell behind by {missed} events; resuming its saved arrival cursor");
                     break;
-                };
-                if Some(next) == read_to {
-                    return Err(AppError::Usage("the tail's page did not advance".into()));
                 }
-                read_to = Some(next);
-                for row in rows {
-                    shown
-                        .deliver(&mut lookup, channel_id, &room_key, row, &mut out, json)
-                        .await?;
-                }
+                Ok(Some(_)) => {}
+                Ok(None) => return Err(tail_stopped(room, shown.last, json, "the node stopped")),
+                Err(e) => return Err(tail_stopped(room, shown.last, json, &e.to_string())),
             }
         }
     }
 }
 
-/// A tail retains its output's identities and operation context, never the room's prose history.
+async fn tail_head(
+    lookup: &mut IpcClient,
+    channel_id: Digest32,
+) -> Result<vox_core::node::api::HistoryCursor, AppError> {
+    match lookup
+        .request(&Request::ArrivalHead { channel_id })
+        .await
+        .map_err(|e| AppError::Usage(e.to_string()))?
+    {
+        Frame::ArrivalHead { head } => Ok(head),
+        Frame::Error { reason } => Err(AppError::Usage(reason)),
+        other => Err(crate::client::unexpected(&other)),
+    }
+}
+
+fn tail_stopped(room: &str, last: Option<Digest32>, json: bool, reason: &str) -> AppError {
+    let resume = match last {
+        Some(hash) => format!("vox room tail {room} --since {}", b32_encode(&hash)),
+        None => format!("vox room tail {room}"),
+    };
+    let mode = if json { " --json" } else { "" };
+    AppError::Usage(format!("{reason}, so this tail stopped\n       restore the node and room, then resume with `{resume}{mode}`"))
+}
+
+/// Only a resume hint survives delivery. Operation context is bounded and scoped to one
+/// arriving row, then dropped; unchanged event wakes never query that context again.
 #[derive(Default)]
 struct TailRows {
-    ops: vox_agentcomms::ops::OpIndex,
-    seen: std::collections::HashSet<Digest32>,
-    loaded: std::collections::HashSet<String>,
-    by_hash: std::collections::HashMap<Digest32, vox_core::node::api::MessageRow>,
     last: Option<Digest32>,
 }
 
@@ -2300,80 +2326,249 @@ impl TailRows {
         lookup: &mut IpcClient,
         channel_id: Digest32,
         room_key: &str,
+        instance: [u8; 16],
         row: vox_core::node::api::MessageRow,
         out: &mut std::io::StdoutLock<'_>,
         json: bool,
     ) -> Result<(), AppError> {
-        if row.owed || !self.seen.insert(row.entry_hash) {
-            return Ok(());
+        if row.owed {
+            return Err(AppError::Usage(
+                "the tail received an unreadable arrival".into(),
+            ));
         }
-        let parsed = Envelope::parse(&row.text).ok();
-        let mut newly_conflicted = false;
-        if let Some(envelope) = &parsed {
-            if let Some(op) = vox_agentcomms::ops::op_of(envelope) {
-                if self.loaded.insert(op.to_owned()) {
-                    // Only rows relevant to this operation are needed to label it or a conflict.
-                    for earlier in
-                        coord::structured(lookup, channel_id, &[], &[op.to_owned()]).await?
-                    {
-                        if let Ok(e) = Envelope::parse(&earlier.text) {
-                            if vox_agentcomms::ops::op_of(&e) == Some(op) {
-                                self.ops.insert(
-                                    earlier.entry_hash,
-                                    earlier.author,
-                                    earlier.created_millis,
-                                    &e,
-                                );
-                                self.by_hash.insert(earlier.entry_hash, earlier);
-                            }
-                        }
-                    }
-                }
-                newly_conflicted =
-                    self.ops
-                        .insert(row.entry_hash, row.author, row.created_millis, envelope);
-                self.by_hash.insert(row.entry_hash, row.clone());
+        if !json {
+            // Session lifecycle records remain absent from the plain conversation.
+            if !crate::agent_hook::is_session_record(&row) {
+                writeln!(out, "{}", plain_row(&row))?;
+                out.flush()?;
             }
-        }
-        emit_row(out, room_key, &row, &self.ops, json, None);
-        if newly_conflicted && json {
-            if let Some(e) = &parsed {
-                for earlier in self.ops.group_of(row.author, e) {
-                    if earlier == row.entry_hash {
-                        continue;
-                    }
-                    if let Some(earlier) = self.by_hash.get(&earlier) {
-                        emit_row(out, room_key, earlier, &self.ops, json, Some("conflict"));
-                    }
-                }
-            }
+        } else if let Some(envelope) = Envelope::parse(&row.text)
+            .ok()
+            .filter(|e| vox_agentcomms::ops::op_of(e).is_some())
+        {
+            let mut operation =
+                TailOperation::load(lookup, channel_id, room_key, instance, &row, &envelope)
+                    .await?;
+            operation.emit(room_key, &row, out)?;
+        } else {
+            writeln!(
+                out,
+                "{}",
+                row_json(room_key, &row, &vox_agentcomms::ops::OpIndex::new(), None)
+            )?;
+            out.flush()?;
         }
         self.last = Some(row.entry_hash);
         Ok(())
     }
 }
 
-fn emit_row(
-    out: &mut std::io::StdoutLock<'_>,
-    room_key: &str,
-    r: &vox_core::node::api::MessageRow,
-    ops: &vox_agentcomms::ops::OpIndex,
-    json: bool,
-    status: Option<&str>,
-) {
-    // A Session's opening and end are not the room's conversation (ADR-029 CL-2), as in `vox
-    // room read`: a rename re-posts the record, which printed here read as a second "opened".
-    // `--json` keeps every row for programs.
-    if !json && crate::agent_hook::is_session_record(r) {
-        return;
+/// One exact operation's completed disk staging. Only one bounded row page and scalar
+/// verdict are resident. The canonical group is read once, then replayed for conflict rows;
+/// no network request or normal revision failure can occur inside an output JSON line.
+struct TailOperation {
+    op: String,
+    group: std::fs::File,
+    prior: std::fs::File,
+    first: Option<Digest32>,
+    conflict: bool,
+    new_conflict: bool,
+}
+
+impl TailOperation {
+    async fn load(
+        lookup: &mut IpcClient,
+        room: Digest32,
+        room_key: &str,
+        instance: [u8; 16],
+        row: &vox_core::node::api::MessageRow,
+        envelope: &Envelope,
+    ) -> Result<Self, AppError> {
+        let through = tail_head(lookup, room).await?;
+        if through.instance != instance || through.arrival < row.arrival {
+            return Err(AppError::Usage("the saved room changed during tail operation lookup; retry from the last completed row".into()));
+        }
+        let mut result = Self {
+            op: vox_agentcomms::ops::op_of(envelope)
+                .unwrap_or_default()
+                .to_owned(),
+            group: tempfile::tempfile()?,
+            prior: tempfile::tempfile()?,
+            first: None,
+            conflict: false,
+            new_conflict: false,
+        };
+        write!(result.group, "[")?;
+        let mut revision = None;
+        let mut conflict_at = None;
+        let mut after = None;
+        let mut found = false;
+        let mut comma = false;
+        loop {
+            let (rows, next, current, conflict) = match lookup
+                .request(&Request::OperationPage {
+                    channel_id: room,
+                    author: row.author,
+                    op: result.op.clone(),
+                    through,
+                    after,
+                    revision,
+                })
+                .await
+                .map_err(|e| AppError::Usage(e.to_string()))?
+            {
+                Frame::OperationPage {
+                    rows,
+                    next,
+                    revision,
+                    conflict_at,
+                } => (rows, next, revision, conflict_at),
+                Frame::Error { reason } => return Err(AppError::Usage(reason)),
+                other => return Err(crate::client::unexpected(&other)),
+            };
+            if revision.is_some_and(|old| old != current)
+                || (revision.is_some() && conflict != conflict_at)
+                || conflict.is_some_and(|arrival| arrival > through.arrival)
+            {
+                return Err(AppError::Usage(
+                    "the selected operation changed; retry from the last completed row".into(),
+                ));
+            }
+            revision = Some(current);
+            conflict_at = conflict;
+            let mut last = after;
+            for member in rows {
+                let key = (member.created_millis, member.entry_hash);
+                if member.owed
+                    || member.author != row.author
+                    || member.arrival > through.arrival
+                    || last.is_some_and(|last| key <= last)
+                {
+                    return Err(AppError::Usage(
+                        "the operation page did not advance consistently".into(),
+                    ));
+                }
+                let env = Envelope::parse(&member.text)
+                    .map_err(|_| AppError::Usage("invalid operation row".into()))?;
+                if vox_agentcomms::ops::op_of(&env) != Some(result.op.as_str()) {
+                    return Err(AppError::Usage(
+                        "the operation page changed identity".into(),
+                    ));
+                }
+                last = Some(key);
+                result.first.get_or_insert(member.entry_hash);
+                found |= member.entry_hash == row.entry_hash;
+                if comma {
+                    write!(result.group, ",")?;
+                }
+                write!(result.group, "\"{}\"", b32_encode(&member.entry_hash))?;
+                comma = true;
+                if conflict == Some(row.arrival) && member.arrival < row.arrival {
+                    // Each staged prefix has one bounded message body, never the N-member group.
+                    writeln!(result.prior, "{}", tail_row_prefix(room_key, &member)?)?;
+                }
+            }
+            if next.is_some_and(|next| {
+                after.is_some_and(|after| next <= after) || last.is_some_and(|last| next < last)
+            }) {
+                return Err(AppError::Usage(
+                    "the operation continuation did not advance consistently".into(),
+                ));
+            }
+            match next {
+                Some(next) => after = Some(next),
+                None => break,
+            }
+        }
+        if !found {
+            return Err(AppError::Usage(
+                "the arriving operation is no longer readable; retry from the last completed row"
+                    .into(),
+            ));
+        }
+        write!(result.group, "]")?;
+        result.group.flush()?;
+        result.prior.flush()?;
+        result.conflict = conflict_at.is_some();
+        result.new_conflict = conflict_at == Some(row.arrival);
+        Ok(result)
     }
-    let line = if json {
-        row_json(room_key, r, ops, status)
-    } else {
-        plain_row(r)
-    };
-    let _ = writeln!(out, "{line}");
-    let _ = out.flush();
+
+    fn emit(
+        &mut self,
+        room_key: &str,
+        row: &vox_core::node::api::MessageRow,
+        out: &mut std::io::StdoutLock<'_>,
+    ) -> Result<(), AppError> {
+        use std::io::{BufRead as _, Seek as _};
+        if self.new_conflict {
+            self.prior.rewind()?;
+            let mut reader = std::io::BufReader::new(&mut self.prior);
+            let mut prefix = String::new();
+            while reader.read_line(&mut prefix)? != 0 {
+                // JSON escapes any newlines in the bounded message body. The final group
+                // array stays on disk and is never read into this String.
+                let prefix_without_newline = prefix.strip_suffix('\n').unwrap_or(&prefix);
+                emit_tail_operation(
+                    out,
+                    prefix_without_newline,
+                    &self.op,
+                    "conflict",
+                    &mut self.group,
+                )?;
+                prefix.clear();
+            }
+        }
+        let status = if self.conflict {
+            "conflict"
+        } else if self.first == Some(row.entry_hash) {
+            "ok"
+        } else {
+            "duplicate"
+        };
+        emit_tail_operation(
+            out,
+            &tail_row_prefix(room_key, row)?,
+            &self.op,
+            status,
+            &mut self.group,
+        )
+    }
+}
+
+fn tail_row_prefix(
+    room_key: &str,
+    row: &vox_core::node::api::MessageRow,
+) -> Result<String, AppError> {
+    let mut value = row_value(room_key, row, &vox_agentcomms::ops::OpIndex::new(), None);
+    value
+        .as_object_mut()
+        .ok_or_else(|| AppError::Usage("invalid tail row object".into()))?
+        .remove("op");
+    let mut prefix = value.to_string();
+    prefix.pop(); // row_value returns one JSON object; the caller supplies its final field.
+    Ok(prefix)
+}
+
+fn emit_tail_operation(
+    out: &mut std::io::StdoutLock<'_>,
+    prefix: &str,
+    op: &str,
+    status: &str,
+    group: &mut std::fs::File,
+) -> Result<(), AppError> {
+    use std::io::Seek as _;
+    group.rewind()?;
+    write!(
+        out,
+        "{prefix},\"op\":{{\"id\":{},\"status\":{},\"group\":",
+        serde_json::Value::String(op.into()),
+        serde_json::Value::String(status.into())
+    )?;
+    std::io::copy(group, out)?;
+    writeln!(out, "}}}}")?;
+    out.flush()?;
+    Ok(())
 }
 
 /// Parse a full entry hash, in the same base32 the first column prints.

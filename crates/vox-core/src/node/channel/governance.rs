@@ -271,6 +271,7 @@ pub(super) fn progress(store: &Store, sek: &Sek, room: &Digest32, now: u64) -> R
 /// Seal accepted input facts and replay obligations in the exact transaction
 /// publishing that source entry, including a body filled at an old receipt id.
 /// The caller alone commits or rolls back the Batch.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn accepted_into(
     batch: &mut crate::node::store::Batch<'_>,
     entries: &EntryIndex,
@@ -336,6 +337,7 @@ fn published_clock(found: Option<u64>, clock: Option<u64>, expected: u64) -> Res
 /// One actor turn of work. Source and causal work both progress before ordering,
 /// rather than draining all newly received rows while starving older obligations.
 /// No future complete-page vector or borrowed snapshot survives this function.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn advance(
     store: &Store,
     entries: &EntryIndex,
