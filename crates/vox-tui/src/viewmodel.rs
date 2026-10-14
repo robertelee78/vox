@@ -109,6 +109,34 @@ pub struct MessageView {
     pub image: Option<ImageView>,
     /// What it relates to, as its sender tagged it (#636): `task:#636`, `project:vox`.
     pub tags: Vec<String>,
+    /// Canonical General root from the readable envelope, independent of its immediate quote.
+    pub thread: Option<Digest32>,
+}
+
+/// The daemon's summary of every retained readable reply, not just a loaded room page.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThreadSummaryView {
+    /// Replies excluding the starting message.
+    pub replies: u64,
+    /// Latest reply send time, in epoch milliseconds.
+    pub last_reply: u64,
+    /// One bounded page of repliers, named locally.
+    pub authors: String,
+    /// More repliers exist beyond the names shown.
+    pub more_authors: bool,
+}
+
+/// One bounded page of an expanded thread, replaced when the person asks for the next page.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThreadView {
+    /// The starting message in General.
+    pub root: Digest32,
+    /// Replies in the daemon's thread order.
+    pub replies: std::sync::Arc<Vec<MessageView>>,
+    /// Whether this is the page from the beginning of the thread.
+    pub first_page: bool,
+    /// The person may request a following page; an empty answer marks the end.
+    pub more: bool,
 }
 
 /// **An image a message shares** (ADR-028 F-11, #502): drawn only once this node's copy is verified.
@@ -228,6 +256,10 @@ pub struct ChannelView {
     pub timeline: std::sync::Arc<Vec<MessageView>>,
     /// Messages before the oldest room page on screen; Up at the first loads another page.
     pub room_older: u64,
+    /// Authoritative summaries for the General messages loaded here.
+    pub threads: std::collections::BTreeMap<Digest32, ThreadSummaryView>,
+    /// At most one thread's bounded reply page.
+    pub expanded_thread: Option<ThreadView>,
     /// One notice per member this node holds back for equivocating here (V210-63, V210-66), by
     /// the name this operator gave them; drawn above the timeline, **each on its own line**.
     pub held_back: Vec<String>,
@@ -577,6 +609,20 @@ pub enum Command {
     OlderRoom {
         /// The room on screen.
         channel_id: Digest32,
+    },
+    /// Expand a General message's replies, or collapse the open thread.
+    ShowThread {
+        /// The room on screen.
+        channel_id: Digest32,
+        /// The General root; absent collapses it.
+        root: Option<Digest32>,
+    },
+    /// Replace the expanded reply page with its next bounded page.
+    NextThreadPage {
+        /// The room on screen.
+        channel_id: Digest32,
+        /// The open General root.
+        root: Digest32,
     },
     /// Create a room under its shared name (ADR-028 R-1) with an out-of-band passphrase.
     CreateChannel {
