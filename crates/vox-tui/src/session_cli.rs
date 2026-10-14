@@ -66,12 +66,6 @@ pub async fn show(
     use vox_core::node::ipc::Frame;
     let mut client = crate::room_cli::attach(paths).await?;
     let channel_id = crate::room_cli::room_of(&mut client, room).await?;
-    let sessions = match client.sessions(channel_id).await {
-        Ok(Frame::SessionsPage { sessions, .. }) => sessions,
-        Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
-        Ok(other) => return Err(crate::client::unexpected(&other)),
-        Err(e) => return Err(AppError::Usage(e.to_string())),
-    };
     let label_of = |s: &vox_core::node::sessions::SessionRow| {
         vox_agentcomms::envelope::session_label(
             &crate::ident::name_of(&s.node),
@@ -81,8 +75,20 @@ pub async fn show(
     };
     // The Session the room's Sessions name; else the daemon looks among its entries for the one
     // `session` names, whose opening has not arrived yet.
-    let named = vox_core::node::sessions::resolve(&sessions, session, true, label_of)
-        .map_or_else(|_| session.trim().to_owned(), |s| s.id.clone());
+    let selected = vox_core::node::sessions::selection::lookup(
+        &mut client,
+        channel_id,
+        None,
+        session,
+        true,
+        label_of,
+    )
+    .await
+    .map_err(AppError::Usage)?;
+    let named = selected
+        .as_ref()
+        .map_or_else(|| session.trim().to_owned(), |s| s.id.clone());
+    let sessions: Vec<_> = selected.into_iter().collect();
     let before = before
         .map(|b| vox_core::node::link::b32_decode(b.trim(), "entry"))
         .transpose()

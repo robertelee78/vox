@@ -1371,16 +1371,30 @@ fn private_wire_refused(member: &mut Member, holders: &[&Member], room: [u8; 32]
         .enable_all()
         .build()
         .expect("APPARATUS: lifecycle readback runtime");
-    let allowed = match rt.block_on(member.socket(&rt).sessions(room)) {
-        Ok(Frame::SessionsPage { sessions, .. }) => sessions
-            .into_iter()
-            .filter(|s| s.can_drive)
-            .flat_map(|s| std::iter::once(s.opening).chain(s.ended))
-            .collect::<std::collections::BTreeSet<_>>(),
-        other => {
-            panic!("PRODUCT: daemon did not report its lifecycle record identities: {other:?}")
+    let mut allowed = std::collections::BTreeSet::new();
+    let mut socket = member.socket(&rt);
+    let mut after = None;
+    loop {
+        match rt.block_on(socket.sessions_page(room, after)) {
+            Ok(Frame::SessionsPage { sessions, more, .. }) => {
+                let next = sessions.last().map(|s| s.opening);
+                allowed.extend(
+                    sessions
+                        .into_iter()
+                        .filter(|s| s.can_drive)
+                        .flat_map(|s| std::iter::once(s.opening).chain(s.ended)),
+                );
+                if !more {
+                    break;
+                }
+                after = next;
+            }
+            other => {
+                panic!("PRODUCT: daemon did not report its lifecycle record identities: {other:?}")
+            }
         }
-    };
+    }
+    drop(socket);
     drop(rt);
     drop(member._daemon.take());
     let paths = Paths::resolve(

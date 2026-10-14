@@ -413,7 +413,6 @@ pub(crate) async fn addressees(
     }
     let members = members_of(client, channel_id).await?;
     let member = |w: &str| crate::ident::resolve_member(w, &members, crate::ident::names());
-    let mut sessions: Option<Vec<vox_core::node::sessions::SessionRow>> = None;
     let mut to: Vec<String> = Vec::new();
     for w in words {
         let entry = match w
@@ -421,10 +420,8 @@ pub(crate) async fn addressees(
             .and_then(|(m, s)| Some((member(m).ok()?, s)))
         {
             Some((fp, typed)) => {
-                if sessions.is_none() {
-                    sessions = Some(sessions_of(client, channel_id).await?);
-                }
-                let session = session_of(sessions.as_deref().unwrap_or_default(), &fp, typed)
+                let session = session_of(client, channel_id, &fp, typed)
+                    .await
                     .map_err(|e| AppError::Usage(format!("refusing --to {w}: {e}")))?;
                 format!("{}/{session}", b32_encode(&fp))
             }
@@ -439,33 +436,21 @@ pub(crate) async fn addressees(
     Ok(to)
 }
 
-/// The room's Sessions, as its log says.
-async fn sessions_of(
+/// One current open Session of this exact node, selected with bounded metadata pages.
+async fn session_of(
     client: &mut IpcClient,
-    channel_id: Digest32,
-) -> Result<Vec<vox_core::node::sessions::SessionRow>, AppError> {
-    match client.sessions(channel_id).await {
-        Ok(Frame::SessionsPage { sessions, .. }) => Ok(sessions),
-        Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
-        Ok(other) => Err(crate::client::unexpected(&other)),
-        Err(e) => Err(AppError::Usage(e.to_string())),
-    }
-}
-
-/// The id of the one open Session of the node `fp` that `typed` names (ADR-029 TA-1, TA-5), as
-/// [`vox_core::node::sessions::addressable`] finds it, labelled as this node labels it.
-fn session_of(
-    rows: &[vox_core::node::sessions::SessionRow],
+    room: Digest32,
     fp: &Digest32,
     typed: &str,
 ) -> Result<String, String> {
-    vox_core::node::sessions::addressable(rows, fp, typed, |s| {
+    vox_core::node::sessions::selection::addressable(client, room, *fp, typed, |s| {
         vox_agentcomms::envelope::session_label(
             &crate::ident::name_of(&s.node),
             s.name.as_deref(),
             &s.id,
         )
     })
+    .await
 }
 
 /// What a structured post did, for its caller to say (`vox room post`, the TUI's composer).
@@ -890,17 +875,13 @@ pub async fn post_cmd(
                     )));
                 }
                 // One session addressed is one of the member's open Sessions here (TA-1, TA-5).
-                let mut sessions = None;
                 for t in &env.to {
                     let (Some(fp), (_, Some(id))) =
                         (node_of(t), vox_agentcomms::envelope::addressee(t))
                     else {
                         continue;
                     };
-                    if sessions.is_none() {
-                        sessions = Some(sessions_of(&mut client, cid).await?);
-                    }
-                    match session_of(sessions.as_deref().unwrap_or_default(), &fp, id) {
+                    match session_of(&mut client, cid, &fp, id).await {
                         Ok(found) if found == id => {}
                         Ok(_) => {
                             return Err(AppError::Usage(format!(
@@ -1976,7 +1957,9 @@ pub async fn sessions(paths: &Paths, room: &str, json: bool) -> Result<(), AppEr
     let mut client = attach(paths).await?;
     let channel_id = room_of(&mut client, room).await?;
     crate::ident::load_names(&mut client).await;
-    let rows = sessions_of(&mut client, channel_id).await?;
+    let stamp = vox_core::node::sessions::selection::revision(&mut client, channel_id)
+        .await
+        .map_err(AppError::Usage)?;
     let label = |s: &vox_core::node::sessions::SessionRow| {
         vox_agentcomms::envelope::session_label(
             &crate::ident::name_of(&s.node),
@@ -1984,40 +1967,59 @@ pub async fn sessions(paths: &Paths, room: &str, json: bool) -> Result<(), AppEr
             &s.id,
         )
     };
-    if json {
-        for s in &rows {
-            println!(
-                "{}",
-                serde_json::json!({
-                    "node": id(&s.node),
-                    "id": s.id,
-                    "name": s.name,
-                    "harness": s.harness,
-                    "label": label(s),
-                    "open": s.open,
-                    "opened_millis": s.opened_millis,
-                    "ended_millis": s.ended_millis,
-                    "can_drive": s.can_drive,
-                })
-            );
+    let mut any = false;
+    let mut ended_heading = false;
+    // Preserve the terminal's open-then-ended grouping with two bounded passes,
+    // rather than retaining every completed Session until the open list finishes.
+    for pass in 0..if json { 1 } else { 2 } {
+        let mut after = None;
+        loop {
+            let (rows, more) = match client.sessions_page(channel_id, after).await {
+                Ok(Frame::SessionsPage { sessions, more, .. }) => (sessions, more),
+                Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
+                Ok(other) => return Err(crate::client::unexpected(&other)),
+                Err(e) => return Err(AppError::Usage(e.to_string())),
+            };
+            if vox_core::node::sessions::selection::revision(&mut client, channel_id)
+                .await
+                .map_err(AppError::Usage)?
+                != stamp
+            {
+                return Err(AppError::Usage(
+                    "the room's Sessions changed while listing; run the command again".into(),
+                ));
+            }
+            let next = rows.last().map(|s| s.opening);
+            if more && (next.is_none() || next == after) {
+                return Err(AppError::Usage("the Session page did not advance".into()));
+            }
+            for s in rows {
+                any = true;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({"node":id(&s.node),"id":s.id,"name":s.name,"harness":s.harness,"label":label(&s),"open":s.open,"opened_millis":s.opened_millis,"ended_millis":s.ended_millis,"can_drive":s.can_drive})
+                    );
+                } else if pass == 0 && s.open {
+                    println!("open   {}", label(&s));
+                } else if pass == 1 && !s.open {
+                    if !ended_heading {
+                        println!("ended:");
+                        ended_heading = true;
+                    }
+                    println!("ended  {}", label(&s));
+                }
+            }
+            if !more {
+                break;
+            }
+            after = next;
         }
-        return Ok(());
     }
-    if rows.is_empty() {
+    if !json && !any {
         println!("(no Sessions in this room)");
-        return Ok(());
     }
-    for s in rows.iter().filter(|s| s.open) {
-        println!("open   {}", label(s));
-    }
-    // **An ended Session is set apart** (SE-5), kept as long as the room keeps messages.
-    let ended: Vec<_> = rows.iter().filter(|s| !s.open).collect();
-    if !ended.is_empty() {
-        println!("ended:");
-        for s in ended {
-            println!("ended  {}", label(s));
-        }
-    }
+
     Ok(())
 }
 

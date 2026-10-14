@@ -31,7 +31,7 @@ fn plus(index: &mut Write<'_, '_>, tree: T, key: [u8; 64], n: u64) -> Result<u64
     index.activity_set(tree, key, Some(value))?;
     Ok(value)
 }
-fn authored_reference(fact: &Fact, reference: &Digest32) -> Digest32 {
+pub(super) fn authored_reference(fact: &Fact, reference: &Digest32) -> Digest32 {
     sha256_concat(&[
         b"vox/session-activity/authored-ref/v1",
         &fact.author,

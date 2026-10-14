@@ -5013,6 +5013,24 @@ impl ChannelState {
             && stamp.expires_at.is_none_or(|at| self.now_hint < at)
     }
 
+    /// Compact display invalidation facts, without collecting rendered rows or owed bodies.
+    pub(crate) fn display_stamp(&self, store: &Store) -> Result<DisplayStamp> {
+        let rendered = self
+            .entries
+            .render_view(store, &self.sek, &self.channel_id)?;
+        Ok(DisplayStamp {
+            incarnation: self.gen.clone(),
+            rewrite: self.display_rewrite,
+            rendered_len: self.timeline.len(),
+            order_revision: self.dag.reorder_generation(),
+            body_revision: self.dag.body_generation(),
+            session_revision: self.legacy_sessions.display_revision(),
+            retention: (self.effective_retention(), self.effective_step_retention()),
+            expires_at: rendered.next_owed_expiry()?,
+            owed: rendered.owed_before(None)? != 0,
+        })
+    }
+
     /// Build only after the previous projection's stamp no longer matches. Borrow the
     /// ordinary rendered timeline, and hash each owed skeleton once while collecting both
     /// its placeholder and the next expiry boundary for subsequent constant-time reuse.
@@ -6464,12 +6482,6 @@ impl ChannelState {
 
     // ---- Sessions: the drive key (ADR-029 SC-2, SC-2a, SC-2b; #543) ----------------------------
 
-    /// How many Session entries this node holds here, key-changed entries among them.
-    #[must_use]
-    pub fn session_count(&self) -> usize {
-        self.drive.sessions.len()
-    }
-
     /// One page of the Session entries this node has opened or written here (ADR-034 FR-5): each
     /// node's entries only if this node holds its drive key (SC-2), or wrote them; a key-changed
     /// entry ([`crate::node::drive::KEY_CHANGED`]) is no Session's, and is left out. As
@@ -6485,23 +6497,6 @@ impl ChannelState {
         max_bytes: usize,
     ) -> std::result::Result<crate::node::drive::SessionPage, String> {
         self.drive.sessions.page(which, before, max_rows, max_bytes)
-    }
-
-    /// The private lifecycle records used to discover Sessions, separate from activity.
-    pub fn session_records(&self) -> Vec<SessionRow> {
-        self.drive.sessions.lifecycle().cloned().collect()
-    }
-
-    /// The files other members' Sessions sent out here that this node opened (ADR-029 DR-1.8).
-    #[must_use]
-    pub fn session_files(&self) -> Vec<SessionRow> {
-        let me = self.me();
-        self.drive
-            .sessions
-            .files_out()
-            .filter(|r| r.author != me)
-            .cloned()
-            .collect()
     }
 
     /// Whether this node holds any drive key of `author`'s here: whether it can read inside

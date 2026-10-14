@@ -437,10 +437,6 @@ pub struct ChannelDetail {
     pub epoch: u64,
     /// Members, in fingerprint order.
     pub members: Vec<Digest32>,
-    /// Temporary input for Session folding only, oldest first. Public reads, agreement,
-    /// wake delivery and file offers use bounded stored queries. This field is removed when
-    /// the dependent Session projection is composed.
-    pub timeline: Timeline,
     /// The newest readable local arrival; used to start bounded subscribers.
     pub last_arrival: Option<u64>,
     /// The saved instance that owns local arrival ids, preserved across reopen.
@@ -521,11 +517,6 @@ pub struct ChannelDetail {
     /// The nodes whose Sessions this node can read inside here (ADR-029 SC-2), sorted: itself, and
     /// each node whose drive key it holds. What a Session's `can_drive` is said from.
     pub drive_from: Vec<Digest32>,
-    /// The files other members' Sessions sent out here that this node can open (ADR-029
-    /// DR-1.8): what it pulls by itself, as a room share addressed to it.
-    pub session_files: Vec<crate::node::drive::SessionRow>,
-    /// Drive-sealed lifecycle records, kept separate from public chat and activity steps.
-    pub session_records: Vec<crate::node::drive::SessionRow>,
     /// Opaque Session input/publication/drive token; no retained metadata strings.
     pub session_revision: Digest32,
 }

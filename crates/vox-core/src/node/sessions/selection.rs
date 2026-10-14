@@ -4,7 +4,11 @@ use super::SessionRow;
 use crate::hash::Digest32;
 use crate::node::ipc::{Frame, IpcClient};
 
-async fn revision(client: &mut IpcClient, room: Digest32) -> Result<Digest32, String> {
+/// Current room Session token for a bounded multi-request selection.
+///
+/// # Errors
+/// The selected node or room is unavailable, or its snapshot cannot be read.
+pub async fn revision(client: &mut IpcClient, room: Digest32) -> Result<Digest32, String> {
     let reply = client
         .exchange(&crate::node::snapshot::request_body())
         .await
@@ -40,6 +44,53 @@ pub async fn resolve(
     ended_ok: bool,
     label: impl Fn(&SessionRow) -> String,
 ) -> Result<SessionRow, String> {
+    lookup(client, room, node, typed, ended_ok, label)
+        .await?
+        .ok_or_else(|| format!("no Session in this room is named {}", typed.trim()))
+}
+
+/// Resolve retained metadata, returning absence only after the full bounded scan.
+/// Read callers may then use the existing opening-not-received activity path.
+///
+/// # Errors
+/// Refused, changed, ambiguous or ineligible metadata; these are never absence.
+pub async fn lookup(
+    client: &mut IpcClient,
+    room: Digest32,
+    node: Option<Digest32>,
+    typed: &str,
+    ended_ok: bool,
+    label: impl Fn(&SessionRow) -> String,
+) -> Result<Option<SessionRow>, String> {
+    select(client, room, node, typed, ended_ok, label, false).await
+}
+
+/// Resolve the newest opening of each id for a message addressed to one node.
+///
+/// # Errors
+/// No current open Session matches, the identity is ambiguous, or a read failed.
+pub async fn addressable(
+    client: &mut IpcClient,
+    room: Digest32,
+    node: Digest32,
+    typed: &str,
+    label: impl Fn(&SessionRow) -> String,
+) -> Result<String, String> {
+    select(client, room, Some(node), typed, false, label, true)
+        .await?
+        .map(|s| s.id)
+        .ok_or_else(|| format!("no Session in this room is named {}", typed.trim()))
+}
+
+async fn select(
+    client: &mut IpcClient,
+    room: Digest32,
+    node: Option<Digest32>,
+    typed: &str,
+    ended_ok: bool,
+    label: impl Fn(&SessionRow) -> String,
+    latest: bool,
+) -> Result<Option<SessionRow>, String> {
     let typed = typed.trim();
     if typed.is_empty() {
         return Err(
@@ -82,12 +133,36 @@ pub async fn resolve(
             if node.is_some_and(|node| row.node != node) {
                 continue;
             }
-            if row.id == typed || (prefix && row.id.starts_with(typed)) {
+            let id_match = row.id == typed || (prefix && row.id.starts_with(typed));
+            let name_match = row.name.as_deref() == Some(typed);
+            if latest && (id_match || name_match) {
+                match client
+                    .session_lookup(room, row.node, row.id.clone())
+                    .await
+                    .map_err(|e| e.to_string())?
+                {
+                    Frame::SessionsPage {
+                        sessions,
+                        more: false,
+                        ..
+                    } if sessions.len() == 1 => {
+                        if sessions[0].opening != row.opening {
+                            continue;
+                        }
+                    }
+                    Frame::Error { reason } => return Err(reason),
+                    Frame::NodeDetached { node } => {
+                        return Err(format!("the connection to node {node} ended"))
+                    }
+                    _ => return Err("the node did not answer the latest Session opening".into()),
+                }
+            }
+            if id_match {
                 id_count = id_count.saturating_add(1);
                 if by_id.is_none() {
                     by_id = Some(row);
                 }
-            } else if row.name.as_deref() == Some(typed) {
+            } else if name_match {
                 name_count = name_count.saturating_add(1);
                 if by_name.is_none() {
                     by_name = Some(row);
@@ -104,10 +179,13 @@ pub async fn resolve(
     } else {
         (name_count, by_name)
     };
+    if revision(client, room).await? != stamp {
+        return Err("the room's Sessions changed while selecting; try again".into());
+    }
     match (count, selected) {
-        (0, _) => Err(format!("no Session in this room is named {typed}")),
+        (0, _) => Ok(None),
         (1, Some(row)) if !row.open && !ended_ok => Err(format!("{} has ended", label(&row))),
-        (1, Some(row)) => Ok(row),
+        (1, Some(row)) => Ok(Some(row)),
         (n, _) => Err(format!(
             "{typed} names {n} Sessions; give a more specific Session id and node"
         )),

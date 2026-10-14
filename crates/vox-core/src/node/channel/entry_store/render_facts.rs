@@ -1116,6 +1116,23 @@ impl RenderView<'_> {
         })
         .transpose()
     }
+    pub(crate) fn next_owed_expiry(&self) -> Result<Option<u64>> {
+        let item = self.source().first(
+            self.order.read.sek,
+            self.order.read.channel,
+            self.roots().owed_expiry,
+            &[0; 64],
+            0,
+        )?;
+        match item {
+            Some((key, Value::Owed(_))) => {
+                let (expires, _) = order_key(key)?;
+                Ok((expires != u64::MAX).then_some(expires))
+            }
+            None => Ok(None),
+            _ => Err(invalid("owed expiry value")),
+        }
+    }
     pub(crate) fn expired_owed(&self, now: u64) -> Result<Option<Digest32>> {
         let item = self.source().first(
             self.order.read.sek,

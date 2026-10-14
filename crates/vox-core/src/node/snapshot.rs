@@ -78,9 +78,6 @@ pub struct OpenRoomSnap {
     pub step_retention: u64,
     /// This node's explicit shorter Session-step lifetime, if it has one.
     pub local_step_retention: Option<u64>,
-    /// The room's Sessions, oldest opening first (ADR-029;
-    /// [`crate::node::sessions::fold`]).
-    pub sessions: Vec<crate::node::sessions::SessionRow>,
     /// Opaque Session change token, including private activity and actor lifetime.
     pub session_revision: Digest32,
 }
@@ -154,7 +151,6 @@ impl NodeSnapshot {
                         room_step_retention: d.room_step_retention,
                         step_retention: d.step_retention,
                         local_step_retention: d.local_step_retention,
-                        sessions: crate::node::sessions::fold(d),
                         session_revision: handle.session_display_token(d, policy_current),
                     })
                     .collect(),
@@ -194,7 +190,7 @@ impl NodeSnapshot {
         }
         e.array(self.open.len());
         for o in &self.open {
-            e.array(20)
+            e.array(19)
                 .bytes(&o.channel_id)
                 .text(o.name.as_deref().unwrap_or_default());
             digests(&mut e, &o.members);
@@ -241,7 +237,6 @@ impl NodeSnapshot {
                 digests(&mut e, who);
             }
             e.uint(o.retention);
-            crate::node::sessions::put_rows(&mut e, &o.sessions);
             e.uint(o.room_retention)
                 .uint(o.room_step_retention)
                 .uint(o.step_retention);
@@ -323,7 +318,7 @@ impl NodeSnapshot {
         let mut open = Vec::new();
         for _ in 0..d.array().map_err(bad("ipc snapshot open rooms"))? {
             let fields = d.array().map_err(bad("ipc snapshot open room"))?;
-            if fields != 20 {
+            if fields != 19 {
                 return Err(Error::MalformedIpc("ipc snapshot open room"));
             }
             let channel_id = digest(&mut d)?;
@@ -401,7 +396,6 @@ impl NodeSnapshot {
                 pulled_by.push((entry, read_digests(&mut d)?));
             }
             let retention = d.uint().map_err(bad("ipc snapshot retention"))?;
-            let sessions = crate::node::sessions::read_rows(&mut d)?;
             let room_retention = d.uint().map_err(bad("ipc snapshot room retention"))?;
             let room_step_retention = d.uint().map_err(bad("ipc snapshot room step retention"))?;
             let step_retention = d.uint().map_err(bad("ipc snapshot step retention"))?;
@@ -438,7 +432,6 @@ impl NodeSnapshot {
                 room_step_retention,
                 step_retention,
                 local_step_retention,
-                sessions,
             });
         }
         let mut trusted = Vec::new();

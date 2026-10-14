@@ -81,6 +81,13 @@ pub(crate) struct TextPage {
 #[derive(Clone)]
 pub(crate) enum Query {
     Waiting,
+    Pending {
+        after: Option<crate::node::sessions::PendingCursor>,
+    },
+    Summary {
+        opening: Digest32,
+        revision: Revision,
+    },
     Lifecycle {
         before: Option<crate::node::sessions::LifecycleCursor>,
         not_before: Option<u64>,
@@ -115,6 +122,11 @@ pub(crate) enum Query {
 
 pub(crate) enum Reply {
     Waiting(u64),
+    Pending {
+        targets: Vec<crate::node::sessions::PendingTarget>,
+        next: Option<crate::node::sessions::PendingCursor>,
+    },
+    Summary(crate::node::ipc::SessionSummary),
     Lifecycle {
         rows: Vec<(Row, crate::node::sessions::LifecycleCursor)>,
         older: bool,
@@ -215,11 +227,14 @@ fn next(read: &Read<'_>, authors: &[Digest32], after: u64) -> Result<Option<(u64
 impl ChannelState {
     /// One bounded maintenance step; incomplete work stays unpublished. A local
     /// storage failure follows the room's existing poison/refusal boundary.
-    pub(crate) fn advance_sessions(&mut self, store: &Store) -> Result<bool> {
+    pub(crate) fn advance_sessions(&mut self, store: &Store, now: u64) -> Result<bool> {
         if self.poisoned {
             return Err(self.save_failure());
         }
         let result = (|| {
+            if !self.advance_private_sessions(store, now)? {
+                return Ok(false);
+            }
             let metadata = super::build::advance(self, store)?;
             let activity = super::activity_fold::advance(self, store)?;
             let waiting = super::waiting::advance(self, store)?;
@@ -276,11 +291,18 @@ impl ChannelState {
         store: &Store,
         query: Query,
         max_bytes: usize,
+        now: u64,
     ) -> std::result::Result<Reply, String> {
         if self.poisoned {
             return Err(self.save_failure().to_string());
         }
+        if self.needs_session_upgrade() {
+            return Err(REFRESHING.into());
+        }
         let result = (|| -> Answer<Reply> {
+            if !self.private_expiry_ready(store, now)? {
+                return Err(Failure::Request(REFRESHING));
+            }
             let snapshot = store.snapshot()?;
             let read = Read::existing(&snapshot, &self.sek, &self.channel_id)?
                 .ok_or(Failure::Request(REFRESHING))?;
@@ -312,6 +334,143 @@ impl ChannelState {
                 Ok(())
             };
             match query {
+                Query::Summary {
+                    opening,
+                    revision: previous,
+                } => {
+                    check(&previous)?;
+                    if !read.header.activity.ready {
+                        return Err(Failure::Request(REFRESHING));
+                    }
+                    let descriptor_id = read
+                        .find(Tree::OpeningHash, &hash_key(&opening))?
+                        .ok_or(Failure::Request(CHANGED))?;
+                    let row = descriptor(&read, descriptor_id)?;
+                    if !authors.contains(&row.node) {
+                        return Err(Failure::Request(CHANGED));
+                    }
+                    let mut entries = 0u64;
+                    let mut newest: Option<(u64, Digest32)> = None;
+                    for author in &authors {
+                        let group = super::activity_index::group(&row.id, author);
+                        entries = entries
+                            .checked_add(
+                                read.find(Tree::ActivityCounts, &hash_key(&group))?
+                                    .unwrap_or(0),
+                            )
+                            .ok_or(Error::MalformedAtRest("Session entry count exhausted"))?;
+                        let mut bound = [255; 64];
+                        bound[..32].copy_from_slice(&group);
+                        if let Some((key, id)) = read.previous(Tree::ActivityRaw, Some(bound))? {
+                            if key[..32] == group && newest.is_none_or(|(old, _)| id > old) {
+                                let fact = super::activity_index::fact(&read, id)?;
+                                if fact.author != *author || fact.session != row.id {
+                                    return Err(
+                                        Error::MalformedAtRest("Session newest binding").into()
+                                    );
+                                }
+                                newest = Some((id, fact.hash));
+                            }
+                        }
+                    }
+                    let waiting = if row.ended.is_none() {
+                        read.activity_find(
+                            super::activity_state::ActivityTree::PendingCount,
+                            &hash_key(&super::activity_index::group(&row.id, &row.node)),
+                        )?
+                        .unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    Ok(Reply::Summary(crate::node::ipc::SessionSummary {
+                        entries,
+                        newest: newest.map(|(_, hash)| hash),
+                        waiting: u32::try_from(waiting).unwrap_or(u32::MAX),
+                    }))
+                }
+                Query::Pending { after } => {
+                    use super::activity_index::{arrival_key, fact};
+                    use super::activity_state::ActivityTree;
+                    if !read.header.activity.ready {
+                        return Err(Failure::Request(REFRESHING));
+                    }
+                    let stamp = self.sessions_revision(store)?;
+                    if after.is_some_and(|c| c.revision != stamp) {
+                        return Err(Failure::Request(CHANGED));
+                    }
+                    let mut cursor = after.map(|c| c.after);
+                    let mut targets = Vec::new();
+                    let mut complete = false;
+                    for _ in 0..256 {
+                        if targets.len() == 64 {
+                            break;
+                        }
+                        let Some((key, id)) =
+                            read.activity_next(ActivityTree::RoomPending, cursor.map(arrival_key))?
+                        else {
+                            complete = true;
+                            break;
+                        };
+                        if key != arrival_key(id) {
+                            return Err(
+                                Error::MalformedAtRest("Session pending cursor binding").into()
+                            );
+                        }
+                        cursor = Some(id);
+                        let f = fact(&read, id)?;
+                        if !authors.contains(&f.author) {
+                            continue;
+                        }
+                        let reference = f
+                            .reference
+                            .ok_or(Error::MalformedAtRest("Session pending request reference"))?;
+                        if read
+                            .activity_find(
+                                ActivityTree::Resolved,
+                                &hash_key(&super::activity_fold::authored_reference(
+                                    &f, &reference,
+                                )),
+                            )?
+                            .is_some()
+                        {
+                            continue;
+                        }
+                        let group = sha256_concat(&[
+                            b"vox/session-projection/id/v1",
+                            &f.author,
+                            f.session.as_bytes(),
+                        ]);
+                        let Some(row_id) = read.find(Tree::Groups, &hash_key(&group))? else {
+                            continue;
+                        };
+                        let row = descriptor(&read, row_id)?;
+                        if row.node != f.author || row.id != f.session {
+                            return Err(
+                                Error::MalformedAtRest("Session pending opening binding").into()
+                            );
+                        }
+                        if row.ended.is_some() {
+                            continue;
+                        }
+                        targets.push(crate::node::sessions::PendingTarget {
+                            node: f.author,
+                            id: f.session,
+                            opening: row.opening.position.hash,
+                            entry: f.hash,
+                        });
+                    }
+                    Ok(Reply::Pending {
+                        targets,
+                        next: if complete {
+                            None
+                        } else {
+                            cursor.map(|after| crate::node::sessions::PendingCursor {
+                                revision: stamp,
+                                after,
+                            })
+                        },
+                    })
+                }
                 Query::Waiting => {
                     let waiting = &read.header.activity.waiting;
                     if !read.header.activity.ready

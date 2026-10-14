@@ -10,7 +10,7 @@ use vox_agentcomms::envelope::{Envelope, SESSION, SESSION_END};
 
 use crate::hash::Digest32;
 use crate::node::actor::NodeHandle;
-use crate::node::api::{ChannelDetail, MessageRow, NodeCommand, Outcome};
+use crate::node::api::{NodeCommand, Outcome};
 
 /// One Session of a room, as its log says.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,6 +38,28 @@ pub struct SessionRow {
     pub can_drive: bool,
 }
 
+/// A continuation for pending requests in one unchanged room/authority revision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingCursor {
+    /// Opaque input/authority stamp; a changed room refuses continuation.
+    pub revision: Digest32,
+    /// Last examined saved private arrival, not an unbounded set of prior requests.
+    pub after: u64,
+}
+
+/// One addressable waiting request. Full metadata/details are read only on selection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingTarget {
+    /// Authenticated Session author.
+    pub node: Digest32,
+    /// Complete Session id, within the existing content format bound.
+    pub id: String,
+    /// Current open Session's opening.
+    pub opening: Digest32,
+    /// The approval/question origin to fetch with the existing exact activity path.
+    pub entry: Digest32,
+}
+
 /// A position in the chronological opening/end notices of one saved room.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LifecycleCursor {
@@ -56,246 +78,6 @@ pub struct LifecycleRow {
     pub session: SessionRow,
     /// This notice's exact position and kind.
     pub cursor: LifecycleCursor,
-}
-
-/// The room's currently visible Sessions, oldest opening first: this node's own and those of
-/// authors granting it drive (ADR-031 SA-1/SA-2). Retained records alone never grant discovery.
-/// Each `session` entry opens one; a later `session-end` from the same node and session ends it.
-/// A `session` from a session already
-/// open names it again and changes nothing else. A Session's name is the newest its node gave, on
-/// those records or on any message the session posted while open (ADR-029 SE-3, MD-1), so a
-/// renamed session's label changes with its next message.
-#[must_use]
-pub fn fold(detail: &ChannelDetail) -> Vec<SessionRow> {
-    // Keep the public timeline separate. Only Session folding merges private lifecycle
-    // records with legacy records and room messages that can rename a Session. Stable ordering
-    // preserves multipart order when records have the same millisecond timestamp.
-    let private: Vec<_> = detail
-        .session_records
-        .iter()
-        .map(|r| MessageRow {
-            entry_hash: r.entry_hash,
-            author: r.author,
-            created_millis: r.created_millis,
-            text: r.body.clone(),
-            arrival: 0,
-            late: false,
-            owed: false,
-        })
-        .collect();
-    let mut timeline: Vec<_> = detail
-        .timeline
-        .iter()
-        .filter(|r| is_record(&r.text) || r.text.contains("session_name"))
-        .chain(private.iter())
-        .collect();
-    // A refreshed ciphertext is the same logical lifecycle record. Keep its newest wire
-    // identity, so replaying an ended Session cannot manufacture another opening.
-    let mut seen = std::collections::HashSet::new();
-    timeline.reverse();
-    timeline.retain(|r| {
-        !is_record(&r.text) || seen.insert((r.author, r.created_millis, r.text.as_str()))
-    });
-    timeline.reverse();
-    timeline.sort_by_key(|r| r.created_millis);
-    let mut rows: Vec<SessionRow> = Vec::new();
-    // Per row: the position that last named it, and the one that ended it.
-    let mut spans: Vec<(u32, Option<u32>)> = Vec::new();
-    // Large metadata is retained Session records, split without changing the store
-    // encoding. Only a complete, hash-matching bundle supplies a Session's fields.
-    let mut parts: std::collections::HashMap<(Digest32, String), (u32, u64, String)> =
-        std::collections::HashMap::new();
-    let positions = 0..timeline.len();
-    let mut records = Vec::new();
-    for i in positions {
-        let Ok(mut i) = u32::try_from(i) else {
-            continue;
-        };
-        let Some(mut r) = timeline.get(i as usize).copied() else {
-            continue;
-        };
-        if r.owed {
-            continue;
-        }
-        let Ok(mut env) = Envelope::parse(&r.text) else {
-            continue;
-        };
-        if !matches!(env.kind.as_str(), SESSION | SESSION_END) {
-            continue;
-        }
-        if let Some(tag) = env.data["session_parts"].as_str() {
-            let Ok(value) = serde_json::from_str::<serde_json::Value>(&r.text) else {
-                continue;
-            };
-            let Some(part) = value["part"].as_array() else {
-                continue;
-            };
-            let (Some(number), Some(count)) = (
-                part.first().and_then(serde_json::Value::as_u64),
-                part.get(1).and_then(serde_json::Value::as_u64),
-            ) else {
-                continue;
-            };
-            if number == 0 || count == 0 || number > count {
-                continue;
-            }
-            let key = (r.author, tag.to_owned());
-            if number == 1 {
-                parts.insert(key.clone(), (i, 1, String::new()));
-            }
-            let Some((_, next, text)) = parts.get_mut(&key) else {
-                continue;
-            };
-            if *next != number {
-                parts.remove(&key);
-                continue;
-            }
-            text.push_str(&env.body);
-            *next = number.saturating_add(1);
-            if number != count {
-                continue;
-            }
-            let Some((first, _, text)) = parts.remove(&key) else {
-                continue;
-            };
-            if crate::node::link::b32_encode(&crate::hash::sha256(text.as_bytes())) != tag {
-                continue;
-            }
-            let Ok(joined) = Envelope::parse(&text) else {
-                continue;
-            };
-            if joined.kind != SESSION {
-                continue;
-            }
-            let Some(origin) = timeline.get(first as usize).copied() else {
-                continue;
-            };
-            i = first;
-            r = origin;
-            env = joined;
-        }
-        if env.from.trim().is_empty() {
-            continue;
-        }
-        records.push((i, r, env));
-    }
-    // Other openings or an end can arrive between a bundle's parts. Interpret complete
-    // metadata at its first record's position, not where its final part happened to land.
-    records.sort_unstable_by_key(|(position, _, _)| *position);
-    for (i, r, env) in records {
-        let at = rows
-            .iter()
-            .rposition(|s| s.node == r.author && s.id == env.from);
-        match (env.kind.as_str(), at) {
-            (SESSION, Some(k)) if rows[k].open => {
-                // A grant refresh is the same logical opening at its original time. Keep
-                // the latest sealed record identity for pagination and direct readback.
-                if rows[k].opened_millis == r.created_millis {
-                    rows[k].opening = r.entry_hash;
-                }
-                if env.at.session_name.is_some() {
-                    rows[k].name.clone_from(&env.at.session_name);
-                    spans[k].0 = i;
-                }
-            }
-            (SESSION, _) => {
-                spans.push((i, None));
-                rows.push(SessionRow {
-                    node: r.author,
-                    id: env.from.clone(),
-                    name: env.at.session_name.clone(),
-                    harness: env.data["session"]["harness"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_owned(),
-                    open: true,
-                    opened_millis: r.created_millis,
-                    ended_millis: None,
-                    opening: r.entry_hash,
-                    ended: None,
-                    // This node reads inside it when it holds the node's drive key, or is the node
-                    // (ADR-029 SC-2, #543).
-                    can_drive: detail.drive_from.contains(&r.author),
-                });
-            }
-            (SESSION_END, Some(k)) if rows[k].open => {
-                spans[k].1 = Some(i);
-                rows[k].open = false;
-                rows[k].ended_millis = Some(r.created_millis);
-                rows[k].ended = Some(r.entry_hash);
-            }
-            (SESSION_END, Some(k)) if rows[k].ended_millis == Some(r.created_millis) => {
-                rows[k].ended = Some(r.entry_hash);
-            }
-            _ => {}
-        }
-    }
-    renamed(&timeline, &mut rows, &spans);
-    // Current drive authority includes this node itself. Keep previously read data (SA-7),
-    // but do not expose a revoked author's retained Session metadata or addressing targets.
-    rows.retain(|row| row.can_drive);
-    rows
-}
-
-/// Each row's name from the newest message its session posted after the record that last named
-/// it, and before its end: one pass from the room's newest entry back, parsing only entries that
-/// carry a session name, by a node with a Session, until every row has its newest name.
-fn renamed(timeline: &[&MessageRow], rows: &mut [SessionRow], spans: &[(u32, Option<u32>)]) {
-    let Some(floor) = spans.iter().map(|s| s.0).min() else {
-        return;
-    };
-    let mut left: Vec<bool> = vec![true; rows.len()];
-    let mut pending = rows.len();
-    let newest = (0..timeline.len()).rev();
-    for (i, r) in newest.zip(timeline.iter().rev()) {
-        let Ok(i) = u32::try_from(i) else { continue };
-        if pending == 0 || i <= floor {
-            break;
-        }
-        // A row whose naming record is at or past this entry is settled already.
-        for (k, l) in left.iter_mut().enumerate() {
-            if *l && spans[k].0 >= i {
-                *l = false;
-                pending -= 1;
-            }
-        }
-        if pending == 0 {
-            break;
-        }
-        if r.owed || !r.text.contains("session_name") || !rows.iter().any(|s| s.node == r.author) {
-            continue;
-        }
-        let Ok(env) = Envelope::parse(&r.text) else {
-            continue;
-        };
-        let (Some(name), false) = (env.at.session_name, env.from.trim().is_empty()) else {
-            continue;
-        };
-        for (k, s) in rows.iter_mut().enumerate() {
-            let (named, end) = spans[k];
-            if left[k]
-                && s.node == r.author
-                && s.id == env.from
-                && i > named
-                && end.is_none_or(|e| i < e)
-            {
-                s.name = Some(name.clone());
-                left[k] = false;
-                pending -= 1;
-            }
-        }
-    }
-}
-
-/// The Sessions of the open room `room`, as `handle`'s node holds it; empty for a room not open.
-#[must_use]
-pub fn of_room(handle: &NodeHandle, room: &Digest32) -> Vec<SessionRow> {
-    let view = handle.view();
-    view.open_channels
-        .iter()
-        .find(|d| d.channel_id == *room)
-        .map(fold)
-        .unwrap_or_default()
 }
 
 /// Exact own/current-author lookup. Each retry advances one bounded storage page;

@@ -43,16 +43,13 @@ impl ChannelState {
             .get_segment(&self.channel_id, SegmentKind::PrivateSession, id)?
             .ok_or(Error::MalformedAtRest("Session file locator has no record"))?;
         let saved = self.read_private(id, &segment)?;
+        if self.private_expired(&saved, now) {
+            return Ok(None);
+        }
         let Some(row) = saved.row else {
             return Ok(None);
         };
-        let ttl = self.effective_step_retention();
-        if !authors.contains(&row.author)
-            || !crate::node::drive::is_file_out(&row)
-            || (ttl != 0
-                && saved.first_seen.min(row.created_millis)
-                    <= now.saturating_sub(ttl.saturating_mul(1000)))
-        {
+        if !authors.contains(&row.author) || !crate::node::drive::is_file_out(&row) {
             return Ok(None);
         }
         Ok(Some(row))
@@ -67,6 +64,17 @@ impl ChannelState {
     ) -> std::result::Result<FileReply, String> {
         if self.poisoned {
             return Err(self.save_failure().to_string());
+        }
+        if self.needs_session_upgrade() {
+            return Err("the room is refreshing saved Sessions; retry".into());
+        }
+        match self.private_expiry_ready(store, now) {
+            Ok(true) => {}
+            Ok(false) => return Err("the room is refreshing saved Sessions; retry".into()),
+            Err(error) => {
+                self.poison(&error);
+                return Err(error.to_string());
+            }
         }
         let answer = (|| -> Result<FileReply> {
             let instance = self.history_instance(store)?;

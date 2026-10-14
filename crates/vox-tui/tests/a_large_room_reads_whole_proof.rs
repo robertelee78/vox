@@ -422,9 +422,22 @@ fn a_large_sessions_list_and_a_hook_name_arrive_whole() {
         .expect("APPARATUS: passphrase");
     rt.block_on(client.attach(node.as_str().to_owned(), Some(pass)))
         .expect("PRODUCT: the app could not attach");
-    let listed = rt
-        .block_on(client.sessions(room.id.clone()))
-        .expect("PRODUCT: the app could not list the Sessions");
+    // Follow the public metadata continuation; the apparatus retains the rows only
+    // for the existing whole-history identity/order assertions below.
+    let listed = rt.block_on(async {
+        let mut listed = Vec::new();
+        let mut after = None;
+        loop {
+            let page = client
+                .sessions_page(room.id.clone(), after)
+                .await
+                .expect("PRODUCT: the app could not list the Sessions");
+            listed.extend(page.sessions);
+            let Some(next) = page.next else { break };
+            after = Some(next);
+        }
+        listed
+    });
     assert_eq!(
         listed.len(),
         2003,
@@ -632,7 +645,6 @@ fn delayed_app_reply(fault: AppReplyFault) {
             let _ = self.0.send(said);
         }
         fn on_sessions(&self, _: String) {}
-        fn on_session_entry(&self, _: String, _: String, _: String) {}
     }
     if background {
         assert_eq!(
@@ -659,7 +671,11 @@ fn delayed_app_reply(fault: AppReplyFault) {
         )
     } else {
         let answer = rt.block_on(async {
-            tokio::time::timeout(Duration::from_secs(65), client.sessions(room.id.clone())).await
+            tokio::time::timeout(
+                Duration::from_secs(65),
+                client.sessions_page(room.id.clone(), None),
+            )
+            .await
         });
         let answer =
             answer.expect("PRODUCT: the app's request still waits after its 60-second bound");
@@ -676,7 +692,7 @@ fn delayed_app_reply(fault: AppReplyFault) {
         "PRODUCT: the app's deadline said: {reason}"
     );
     release.store(true, Ordering::SeqCst);
-    let next = rt.block_on(client.sessions(room.id.clone()));
+    let next = rt.block_on(client.sessions_page(room.id.clone(), None));
     assert!(
         next.is_ok(),
         "PRODUCT: the app's next request could not reconnect: {next:?}"
@@ -1097,9 +1113,18 @@ fn a_room_past_one_frame_of_history_reads_whole() {
         .unwrap_or_else(|e| {
             panic!("PRODUCT (staging): the app's client did not attach alice's node: {e}")
         });
-    let listed = rt.block_on(client.sessions(room.id.clone()));
-    let listed = listed.unwrap_or_else(|e| {
-        panic!("PRODUCT: the app's `sessions` over {SESSION_ENTRIES} Session entries failed: {e}")
+    let listed = rt.block_on(async {
+        let mut listed = Vec::new();
+        let mut after = None;
+        loop {
+            let page = client.sessions_page(room.id.clone(), after).await.unwrap_or_else(|e| {
+                panic!("PRODUCT: the app's `sessions` over {SESSION_ENTRIES} Session entries failed: {e}")
+            });
+            listed.extend(page.sessions);
+            let Some(next) = page.next else { break };
+            after = Some(next);
+        }
+        listed
     });
     assert!(
         listed.iter().any(|s| s.session_id == SESSION),
@@ -1115,8 +1140,15 @@ fn a_room_past_one_frame_of_history_reads_whole() {
         "PRODUCT: a pending request before the newest page disappeared from the Session count"
     );
     let pending = rt
-        .block_on(client.session_requests(room.id.clone(), alice.b32(), SESSION.to_owned(), vec![]))
-        .expect("PRODUCT: the app could not find an older pending request");
+        .block_on(client.session_requests_page(
+            room.id.clone(),
+            alice.b32(),
+            SESSION.to_owned(),
+            None,
+            None,
+        ))
+        .expect("PRODUCT: the app could not find an older pending request")
+        .entries;
     assert!(
         pending.iter().any(|e| e
             .request
@@ -1196,13 +1228,15 @@ fn a_room_past_one_frame_of_history_reads_whole() {
         );
     });
     let resolved = rt
-        .block_on(client.session_requests(
+        .block_on(client.session_requests_page(
             room.id.clone(),
             alice.b32(),
             SESSION.to_owned(),
-            vec!["approval-before-pages".to_owned()],
+            Some("approval-before-pages".to_owned()),
+            None,
         ))
-        .expect("PRODUCT: the app could not refresh a loaded older request");
+        .expect("PRODUCT: the app could not refresh a loaded older request")
+        .entries;
     assert!(
         resolved.iter().any(|e| e
             .request
@@ -1211,8 +1245,15 @@ fn a_room_past_one_frame_of_history_reads_whole() {
         "PRODUCT: the app's loaded older request remained unresolved: {resolved:?}"
     );
     let pending = rt
-        .block_on(client.session_requests(room.id.clone(), alice.b32(), SESSION.to_owned(), vec![]))
-        .expect("PRODUCT: the app could not refresh pending requests");
+        .block_on(client.session_requests_page(
+            room.id.clone(),
+            alice.b32(),
+            SESSION.to_owned(),
+            None,
+            None,
+        ))
+        .expect("PRODUCT: the app could not refresh pending requests")
+        .entries;
     assert!(
         pending.is_empty(),
         "PRODUCT: the resolved older request still asks for an answer: {pending:?}"

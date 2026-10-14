@@ -395,6 +395,8 @@ const T_SESSIONS_PAGE: u64 = 5438;
 const T_SESSION_LOOKUP: u64 = 8721;
 const T_SESSIONS_WAITING_REQ: u64 = 8722;
 const T_SESSIONS_WAITING: u64 = 8723;
+const T_SESSIONS_PENDING_REQ: u64 = 8726;
+const T_SESSIONS_PENDING: u64 = 8727;
 const T_SESSION_LIFECYCLE_REQ: u64 = 8724;
 const T_SESSION_LIFECYCLE: u64 = 8725;
 const T_ROOM_PAGE_REQ: u64 = 5492;
@@ -653,6 +655,13 @@ pub enum Request {
     SessionsWaiting {
         /// The room.
         channel_id: Digest32,
+    },
+    /// One bounded page of pending targets across all currently open readable Sessions.
+    SessionsPending {
+        /// The room.
+        channel_id: Digest32,
+        /// Last examined arrival in the same saved/authority revision.
+        after: Option<crate::node::sessions::PendingCursor>,
     },
     /// The latest opening of this exact node/session, at most one row, or a refusal.
     /// Uses [`Frame::SessionsPage`]; `more` is always false.
@@ -1218,6 +1227,10 @@ impl Request {
             }
             Request::Sessions { channel_id } => {
                 e.array(2).uint(T_SESSIONS_REQ).bytes(channel_id);
+            }
+            Request::SessionsPending { channel_id, after } => {
+                e.array(3).uint(T_SESSIONS_PENDING_REQ).bytes(channel_id);
+                put_pending_cursor(&mut e, *after);
             }
             Request::SessionsWaiting { channel_id } => {
                 e.array(2).uint(T_SESSIONS_WAITING_REQ).bytes(channel_id);
@@ -1999,6 +2012,12 @@ impl Request {
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::SessionEntries { channel_id })
             }
+            (T_SESSIONS_PENDING_REQ, 3) => {
+                let channel_id = digest(&mut d)?;
+                let after = read_pending_cursor(&mut d)?;
+                d.finish()?;
+                Ok(Request::SessionsPending { channel_id, after })
+            }
             (T_SESSIONS_WAITING_REQ, 2) => {
                 let channel_id = digest(&mut d)?;
                 d.finish()?;
@@ -2503,6 +2522,13 @@ pub enum Frame {
         /// Exact current-room answerable request count, not only the displayed page.
         waiting: u64,
     },
+    /// At most 64 fixed-size pending targets; an empty page can still advance its scan cursor.
+    SessionsPendingPage {
+        /// Current open request origins, oldest retained arrival first.
+        targets: Vec<crate::node::sessions::PendingTarget>,
+        /// More saved inputs remain; absence means this revision was exhausted.
+        next: Option<crate::node::sessions::PendingCursor>,
+    },
     /// A bounded opening/end notice page, oldest first within this page.
     SessionLifecyclePage {
         /// Complete current labels and exact lifecycle positions.
@@ -2784,6 +2810,17 @@ impl Frame {
             }
             Frame::SessionsWaiting { waiting } => {
                 e.array(2).uint(T_SESSIONS_WAITING).uint(*waiting);
+            }
+            Frame::SessionsPendingPage { targets, next } => {
+                e.array(3).uint(T_SESSIONS_PENDING).array(targets.len());
+                for target in targets {
+                    e.array(4)
+                        .bytes(&target.node)
+                        .text(&target.id)
+                        .bytes(&target.opening)
+                        .bytes(&target.entry);
+                }
+                put_pending_cursor(&mut e, *next);
             }
             Frame::SessionLifecyclePage { rows, older } => {
                 e.array(4).uint(T_SESSION_LIFECYCLE);
@@ -3665,6 +3702,34 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 more,
             });
         }
+        (T_SESSIONS_PENDING, 3) => {
+            let count = d.array()?;
+            if count > 64 {
+                return Err(Error::MalformedIpc("Session pending page count"));
+            }
+            let mut targets = Vec::with_capacity(count);
+            for _ in 0..count {
+                if d.array()? != 4 {
+                    return Err(Error::MalformedIpc("Session pending target"));
+                }
+                let node = digest(d)?;
+                let id = d.text()?;
+                if id.is_empty() || id.len() > crate::node::content::MAX_SESSION_ID_LEN {
+                    return Err(Error::MalformedIpc("Session pending id"));
+                }
+                let id = id.to_owned();
+                let opening = digest(d)?;
+                let entry = digest(d)?;
+                targets.push(crate::node::sessions::PendingTarget {
+                    node,
+                    id,
+                    opening,
+                    entry,
+                });
+            }
+            let next = read_pending_cursor(d)?;
+            return Ok(Frame::SessionsPendingPage { targets, next });
+        }
         (T_SESSIONS_WAITING, 2) => {
             return Ok(Frame::SessionsWaiting { waiting: d.uint()? });
         }
@@ -4257,6 +4322,35 @@ fn text_header(bytes: u64) -> Vec<u8> {
     header
 }
 
+fn put_pending_cursor(e: &mut Encoder, cursor: Option<crate::node::sessions::PendingCursor>) {
+    e.array(usize::from(cursor.is_some()));
+    if let Some(c) = cursor {
+        e.array(2).bytes(&c.revision).uint(c.after);
+    }
+}
+fn read_pending_cursor(
+    d: &mut Decoder<'_>,
+) -> Result<Option<crate::node::sessions::PendingCursor>> {
+    match d.array()? {
+        0 => Ok(None),
+        1 => {
+            if d.array()? != 2 {
+                return Err(Error::MalformedIpc("Session pending cursor"));
+            }
+            let revision = digest(d)?;
+            let after = d.uint()?;
+            if after == 0 {
+                return Err(Error::MalformedIpc("Session pending arrival"));
+            }
+            Ok(Some(crate::node::sessions::PendingCursor {
+                revision,
+                after,
+            }))
+        }
+        _ => Err(Error::MalformedIpc("Session pending cursor option")),
+    }
+}
+
 fn put_lifecycle_cursor(e: &mut Encoder, cursor: &crate::node::sessions::LifecycleCursor) {
     e.array(3)
         .uint(cursor.at_millis)
@@ -4427,27 +4521,18 @@ async fn write_sessions(
             }
         }
         if !whole && cursors.is_none() {
-            // The summary currently uses the activity index; no metadata string is
-            // needed for its identity, count or permission decision.
-            summaries.push(
-                session_summary(
-                    handle,
-                    room,
-                    &crate::node::sessions::SessionRow {
-                        node: row.node,
-                        id: row.id.clone(),
-                        name: None,
-                        harness: String::new(),
-                        open: row.open,
-                        opened_millis: row.opened_millis,
-                        ended_millis: row.ended_millis,
-                        opening: row.opening,
-                        ended: row.ended,
-                        can_drive: true,
-                    },
-                )
-                .await,
-            );
+            let summary = tokio::select! {
+                answer=handle.session_projection(room,Query::Summary{opening:row.opening,revision:revision.clone()})=>answer,
+                ()=subscriber_gone(stream)=>return Ok(false),
+            };
+            match summary {
+                Ok(Reply::Summary(summary)) => summaries.push(summary),
+                Ok(_) => return Err(Error::MalformedIpc("unexpected Session summary answer")),
+                Err(reason) => {
+                    found_frame(stream, &Frame::Error { reason }.to_bytes(), writing).await?;
+                    return Ok(true);
+                }
+            }
         }
         let mut suffix = Encoder::new();
         suffix
@@ -5498,54 +5583,6 @@ fn session_page_bytes() -> usize {
     rows_budget().saturating_sub(SESSION_PAGE_ROWS * ROW_OVERHEAD)
 }
 
-/// What the daemon's index says of a room's Session `s` (ADR-034 FR-5): how many entries it holds
-/// of it, its newest, and its indexed pending requests when this node may drive it and it is
-/// open. Transcript length never changes the work.
-async fn session_summary(
-    handle: &NodeHandle,
-    channel_id: Digest32,
-    s: &crate::node::sessions::SessionRow,
-) -> SessionSummary {
-    let page = handle
-        .session_page(
-            channel_id,
-            crate::node::drive::SessionFilter::SessionRaw(s.id.clone()),
-            None,
-            1,
-            session_page_bytes(),
-        )
-        .await
-        .and_then(std::result::Result::ok);
-    let Some(page) = page else {
-        return SessionSummary::default();
-    };
-    let newest = page.rows.last().map(|r| r.entry_hash);
-    let entries = page.older + page.rows.len() as u64;
-    let waiting = if s.can_drive && s.open {
-        let pending = handle
-            .session_page(
-                channel_id,
-                crate::node::drive::SessionFilter::Pending(s.id.clone()),
-                None,
-                usize::MAX,
-                usize::MAX,
-            )
-            .await
-            .and_then(std::result::Result::ok)
-            .map(|p| p.rows)
-            .unwrap_or_default();
-        let mine = crate::node::session_view::of_session(pending, &s.id, &s.node);
-        u32::try_from(crate::node::session_view::waiting(&mine).len()).unwrap_or(u32::MAX)
-    } else {
-        0
-    };
-    SessionSummary {
-        entries,
-        newest,
-        waiting,
-    }
-}
-
 /// What the daemon's index says of one Session (ADR-034 FR-5), so a client lists Sessions and
 /// counts what waits in them without reading their entries.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -6133,6 +6170,14 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 reason: other.to_string(),
             },
         },
+        Request::SessionsPending{channel_id,after}=>{
+            use crate::node::channel::session_projection::{Query,Reply};
+            match handle.session_projection(channel_id,Query::Pending{after}).await {
+                Ok(Reply::Pending{targets,next})=>Frame::SessionsPendingPage{targets,next},
+                Ok(_)=>Frame::Error{reason:"unexpected Session pending answer".into()},
+                Err(reason)=>Frame::Error{reason},
+            }
+        }
         Request::SessionsWaiting{channel_id} => {
             use crate::node::channel::session_projection::{Query,Reply};
             match handle.session_projection(channel_id,Query::Waiting).await {
@@ -7294,6 +7339,21 @@ impl IpcClient {
         Ok(self.older_daemon(reply))
     }
 
+    /// Bounded targets for every pending request, independent of the metadata display page.
+    ///
+    /// # Errors
+    /// The node cannot be reached, the selection changed, or the reply is malformed.
+    pub async fn sessions_pending(
+        &mut self,
+        channel_id: Digest32,
+        after: Option<crate::node::sessions::PendingCursor>,
+    ) -> Result<Frame> {
+        let reply = self
+            .request(&Request::SessionsPending { channel_id, after })
+            .await?;
+        Ok(self.older_daemon(reply))
+    }
+
     /// Exact waiting count for all currently readable open Sessions in the room.
     ///
     /// # Errors
@@ -7344,47 +7404,6 @@ impl IpcClient {
             })
             .await?;
         Ok(self.older_daemon(reply))
-    }
-
-    /// A room's Sessions, however many pages that takes (ADR-034 FR-1) — as one
-    /// [`Frame::SessionsPage`] with no more to follow, or the first reply that was not a page (an
-    /// error). A daemon older than this client is said as [`IpcClient::older_daemon`] says it.
-    ///
-    /// # Errors
-    /// If the node cannot be reached or answers with a malformed frame.
-    pub async fn sessions(&mut self, channel_id: Digest32) -> Result<Frame> {
-        let (mut all, mut told) = (Vec::new(), Vec::new());
-        let mut after = None;
-        loop {
-            match self
-                .request(&Request::SessionsPage { channel_id, after })
-                .await?
-            {
-                Frame::SessionsPage {
-                    sessions,
-                    summaries,
-                    more,
-                } => {
-                    let last = sessions.last().map(|s| s.opening);
-                    all.extend(sessions);
-                    told.extend(summaries);
-                    match (more, last) {
-                        (false, _) => {
-                            return Ok(Frame::SessionsPage {
-                                sessions: all,
-                                summaries: told,
-                                more: false,
-                            })
-                        }
-                        (true, Some(last)) if after != Some(last) => after = Some(last),
-                        (true, _) => {
-                            return Err(Error::MalformedIpc("ipc sessions page did not advance"))
-                        }
-                    }
-                }
-                other => return Ok(self.older_daemon(other)),
-            }
-        }
     }
 
     /// `reply` as this client says it: a daemon that does not know a request this build makes is

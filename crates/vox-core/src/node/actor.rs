@@ -300,9 +300,7 @@ fn over_of(ch: &ChannelState) -> Option<String> {
     ch.has_left(&ch.me()).then(|| "left".to_owned())
 }
 
-/// A room's detail for the view, reusing the previous timeline and its indices whenever the
-/// display inputs still match, including owed rows (#862). Pure end appends extend the shared
-/// prefix (V210-120); fills, expiry, classification and ordering changes rebuild it.
+/// A room summary and opaque display tokens; history and Sessions are queried in pages.
 fn detail_of(
     ch: &ChannelState,
     store: &crate::node::store::Store,
@@ -314,39 +312,12 @@ fn detail_of(
         return Err(ch.save_failure());
     }
     let (frozen, refused_below_checkpoint) = ch.fork_watch();
-    // The remaining materialized projection is used only by Session folding until its
-    // dependent streaming projection is composed. Public readers use sealed history queries.
-    let (timeline, display_stamp, display_revision) = if let Some(p) =
-        prev.filter(|p| ch.display_is_current(&p.display_stamp))
+    let display_stamp = ch.display_stamp(store)?;
+    let display_revision = match prev
+        .filter(|p| p.display_stamp == display_stamp && ch.display_is_current(&p.display_stamp))
     {
-        (
-            p.timeline.clone(),
-            p.display_stamp.clone(),
-            p.display_revision,
-        )
-    } else {
-        let (rows, stamp) = ch.display_timeline(store)?;
-        let prefix = prev.filter(|p| {
-            let n = p.timeline.len();
-            !stamp.owed
-                && !p.display_stamp.owed
-                && ch.display_extends(&p.display_stamp)
-                && n <= rows.len()
-                && p.timeline.first().map(|r| r.entry_hash) == rows.first().map(|r| r.entry_hash)
-                && p.timeline.last().map(|r| r.entry_hash)
-                    == n.checked_sub(1).map(|i| rows[i].entry_hash)
-        });
-        let timeline = match prefix {
-            Some(p) => p
-                .timeline
-                .appended(rows[p.timeline.len()..].iter().map(row_of)),
-            None => rows.iter().map(row_of).collect(),
-        };
-        (
-            timeline,
-            stamp,
-            sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-        )
+        Some(p) => p.display_revision,
+        None => sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     };
     // Who trusts each member (ADR-028 K-7), once: this identity's own entry is `consenting`.
     let trusted_by = ch.trusted_by();
@@ -357,7 +328,6 @@ fn detail_of(
         notices: ch.notices(store)?,
         epoch: ch.epoch(),
         members: ch.members(),
-        timeline,
         last_arrival: ch.last_arrival(store)?,
         history_instance: ch.history_instance(store)?,
         display_stamp,
@@ -393,8 +363,6 @@ fn detail_of(
         held: ch.held_own(store)?,
         unread: ch.unread(store)?,
         drive_from: ch.drive_from(store)?,
-        session_files: ch.session_files(),
-        session_records: ch.session_records(),
         session_revision: ch.sessions_revision(store)?,
     })
 }
@@ -1545,6 +1513,8 @@ enum NetEvent {
         reply: oneshot::Sender<Outcome>,
         /// The room.
         channel_id: Digest32,
+        /// The exact open operation; close/lock invalidate it before publication.
+        opening: Arc<()>,
         /// The opened room, or why it would not open.
         opened: Box<crate::error::Result<ChannelState>>,
     },
@@ -4445,6 +4415,16 @@ struct PendingWithdrawal {
     routes: BTreeMap<Digest32, Vec<std::net::SocketAddr>>,
 }
 
+/// An opened room stays private until one bounded recovery/retention turn completes.
+/// Only its original caller is held; no transcript-sized task or waiter list is retained.
+struct RoomPreparation {
+    channel: tokio::sync::Mutex<ChannelState>,
+    reply: Option<oneshot::Sender<Outcome>>,
+    reopening: bool,
+    packages: Option<std::vec::IntoIter<crate::node::keypackage::KeyPackage>>,
+    recovery: Option<std::sync::Weak<tokio::sync::Mutex<ChannelState>>>,
+}
+
 /// The node actor's state (owned by its task).
 pub struct Node {
     paths: Paths,
@@ -4645,6 +4625,11 @@ pub struct Node {
     /// The reopening task, aborted at lock: it holds room keys, and a locked node holds none
     /// (ADR-015).
     reopen_task: Option<tokio::task::JoinHandle<()>>,
+    /// One unpublished state per room being prepared; round-robin bounded actor turns.
+    preparing_rooms: BTreeMap<Digest32, RoomPreparation>,
+    preparation_after: Option<Digest32>,
+    /// Exact off-actor unwraps; a close/lock cannot be undone by their late result.
+    opening_rooms: BTreeMap<Digest32, Arc<()>>,
     /// Unlock replies held until the reopening has finished (#208).
     unlock_waiters: Vec<oneshot::Sender<Outcome>>,
     /// Locks begun whose settling — the wait for work still holding a secret — has not reported
@@ -5238,6 +5223,9 @@ impl Node {
             joins_answered: BTreeMap::new(),
             reopening: std::collections::BTreeSet::new(),
             reopen_task: None,
+            preparing_rooms: BTreeMap::new(),
+            preparation_after: None,
+            opening_rooms: BTreeMap::new(),
             unlock_waiters: Vec::new(),
             locking: 0,
             unlock_after_lock: Vec::new(),
@@ -5623,6 +5611,10 @@ impl Node {
                     self.publish().await;
                     self.schedule().await;
                 }
+                () = tokio::task::yield_now(), if !self.preparing_rooms.is_empty() => {
+                    if self.apply_computer_keyring().await.is_err() { continue; }
+                    self.advance_room_preparation().await;
+                }
                 _ = ticker.tick() => {
                     if self.apply_computer_keyring().await.is_err() { continue; }
                     if let Some(net) = self.net.as_ref() {
@@ -5655,7 +5647,7 @@ impl Node {
                     self.deliver_owed_consents(None).await;
                     // Drive keys too (ADR-029 SC-2a, SC-2b): changed if a holder lost drive,
                     // and released to whoever is owed one.
-                    self.tend_drive_keys().await;
+                    let sessions_changed = self.tend_drive_keys().await;
                     self.tend_private_sessions().await;
                     let peers: Vec<_> = self.net.as_ref().map(|n| n.manager().peers()).unwrap_or_default();
                     for peer in peers { self.pull_presentation(peer); }
@@ -5670,7 +5662,7 @@ impl Node {
                     // connection died (D1a) and raises the periodic request (D7).
                     self.sync_tick().await;
                     let ran = self.schedule().await;
-                    if ran || tended || pruned || self.paths_moved() {
+                    if ran || tended || pruned || sessions_changed || self.paths_moved() {
                         self.publish().await;
                     }
                     // Retention on every tick: the index is ordered by age, so a pass that
@@ -7510,48 +7502,13 @@ impl Node {
                 channel_id,
                 channel,
             } => {
-                // Held only if it is still wanted: closed while it was opening, the identity
-                // locked meanwhile, or opened by hand in between — each drops it, and its keys
-                // zeroize with it.
-                let wanted = self.reopening.remove(&channel_id)
+                if self.reopening.contains(&channel_id)
                     && !self.channels.contains_key(&channel_id)
-                    && self.profile.as_ref().is_some_and(Profile::is_unlocked);
-                if wanted {
-                    // Everything `open_channel` does to a room it opens: a room reopened after an
-                    // unlock is the same room, and a restart is exactly when its members have to
-                    // be dialled from where they were last reached (`node::peer_book`).
-                    let mut channel = *channel;
-                    if let Err(e) = self.retention_before_publication(&mut channel).await {
-                        let _ = self.event_tx.send(NodeEvent::NodeNote {
-                            note: format!(
-                                "room {} did not reopen: {e}; it stays closed",
-                                crate::node::link::b32_encode(&channel_id)
-                            ),
-                        });
-                        return;
-                    }
-                    crate::node::status::SyncBook::note_set_aside(
-                        &self.sync_book,
-                        channel_id,
-                        channel.set_aside(),
-                    );
-                    self.channels
-                        .insert(channel_id, Arc::new(tokio::sync::Mutex::new(channel)));
-                    self.mark_decisions_on_open(&channel_id).await;
-                    self.resume_leave(&channel_id).await;
-                    self.act_on_removals_while_closed(&channel_id).await;
-                    self.adopt_channel_anchors(&channel_id).await;
-                    self.refresh_network_view().await;
-                    // Who may reach this room's services and apps: the app gate holds no room it
-                    // was not told about, and refused every dial here with "this node does not
-                    // hold that room" until a sync happened to refresh it (#227, family-LAN proof).
-                    self.refresh_reachers().await;
-                    self.publish_channel_locally(&channel_id).await;
-                    self.publish_channel_to_anchors(&channel_id, PublishCause::Opened)
-                        .await;
-                    self.install_key_packages(&channel_id).await;
-                    self.reach_members_of(&channel_id).await;
-                    let _ = self.event_tx.send(NodeEvent::ChannelOpened { channel_id });
+                    && self.profile.as_ref().is_some_and(Profile::is_unlocked)
+                {
+                    self.queue_room_preparation(*channel, None, true);
+                } else {
+                    self.reopening.remove(&channel_id);
                 }
             }
             NetEvent::ReopenGone { channel_id } => {
@@ -7559,6 +7516,7 @@ impl Node {
                 let _ = self.forget_open(&channel_id);
             }
             NetEvent::ReopenFailed { channel_id, why } => {
+                self.reopening.remove(&channel_id);
                 let _ = self.event_tx.send(NodeEvent::NodeNote {
                     note: format!(
                         "room {} did not reopen: {why}; it stays closed",
@@ -7579,11 +7537,12 @@ impl Node {
                     .await;
             }
             NetEvent::ReopenFinished => {
-                self.reopening.clear();
                 self.reopen_task = None;
-                for reply in std::mem::take(&mut self.unlock_waiters) {
-                    let _ = reply.send(Outcome::Done);
-                }
+                // Opening the store is finished; bounded private preparation may still
+                // be pending. Unlock must not report Ready before those rooms are held.
+                self.reopening
+                    .retain(|room| self.preparing_rooms.contains_key(room));
+                self.answer_prepared_unlocks();
             }
             NetEvent::HandshakesQueued {
                 waited,
@@ -7984,19 +7943,35 @@ impl Node {
             NetEvent::ChannelUnsealed {
                 reply,
                 channel_id,
+                opening,
                 opened,
             } => {
-                let outcome = match *opened {
-                    // Opened meanwhile by another command, or by the reopening: that one is held.
-                    _ if self.channels.contains_key(&channel_id) => Outcome::Done,
-                    // Locked meanwhile: a locked node holds no room key (ADR-015).
-                    _ if !self.profile.as_ref().is_some_and(Profile::is_unlocked) => {
-                        Outcome::Failed(Fault::NoIdentity)
+                if !self
+                    .opening_rooms
+                    .get(&channel_id)
+                    .is_some_and(|pending| Arc::ptr_eq(pending, &opening))
+                {
+                    if let Ok(mut room) = *opened {
+                        room.lock_now();
                     }
-                    Ok(ch) => self.finish_open_channel(ch).await,
-                    Err(e) => Outcome::Failed(fault_of(&e)),
+                    let _ = reply.send(Outcome::Failed(Fault::ChannelNotOpen));
+                    return;
+                }
+                self.opening_rooms.remove(&channel_id);
+                let outcome = match *opened {
+                    _ if self.channels.contains_key(&channel_id) => Some(Outcome::Done),
+                    _ if !self.profile.as_ref().is_some_and(Profile::is_unlocked) => {
+                        Some(Outcome::Failed(Fault::NoIdentity))
+                    }
+                    Ok(ch) => {
+                        self.queue_room_preparation(ch, Some(reply), false);
+                        return;
+                    }
+                    Err(e) => Some(Outcome::Failed(fault_of(&e))),
                 };
-                self.answer_when_published(channel_id, reply, outcome).await;
+                if let Some(outcome) = outcome {
+                    self.answer_when_published(channel_id, reply, outcome).await;
+                }
             }
             // Nothing to do but publish the view, which every event does once handled.
             NetEvent::BoardWithdrew => {}
@@ -8987,11 +8962,12 @@ impl Node {
                 let result = match (self.channels.get(&channel_id), self.profile.as_ref()) {
                     (Some(shared), Some(profile)) => {
                         let mut room = shared.lock().await;
-                        match room.advance_sessions(profile.store()) {
+                        match room.advance_sessions(profile.store(), self.now_ms().get()) {
                             Ok(_) => room.session_query(
                                 profile.store(),
                                 query,
                                 crate::node::ipc::rows_budget(),
+                                self.now_ms().get(),
                             ),
                             Err(error) => Err(error.to_string()),
                         }
@@ -15293,6 +15269,14 @@ impl Node {
         if self.headless.is_none() {
             self.decisions.lock();
         }
+        self.opening_rooms.clear();
+        for (_, mut prepared) in std::mem::take(&mut self.preparing_rooms) {
+            prepared.channel.get_mut().lock_now();
+            if let Some(reply) = prepared.reply {
+                let _ = reply.send(Outcome::Failed(Fault::Locked));
+            }
+        }
+        self.preparation_after = None;
         for (_, shared) in std::mem::take(&mut self.channels) {
             shared.lock().await.lock_now();
         }
@@ -15439,7 +15423,7 @@ impl Node {
         // The view first, as for every command: a caller told `Done` reads the view at once (the
         // trust keyring, the rooms) and must find the unlock in it.
         self.publish().await;
-        if outcome.is_done() && self.reopen_task.is_some() {
+        if outcome.is_done() && (self.reopen_task.is_some() || !self.reopening.is_empty()) {
             self.unlock_waiters.push(reply);
         } else {
             let _ = reply.send(outcome);
@@ -15844,6 +15828,12 @@ impl Node {
             let _ = reply.send(Outcome::Done);
             return;
         }
+        if self.opening_rooms.contains_key(&channel_id)
+            || self.preparing_rooms.contains_key(&channel_id)
+        {
+            let _ = reply.send(Outcome::Failed(Fault::ChannelNotOpen));
+            return;
+        }
         let now_ms = self.now_ms();
         let Some(profile) = self.profile.as_ref() else {
             let _ = reply.send(Outcome::Failed(Fault::NoIdentity));
@@ -15859,6 +15849,8 @@ impl Node {
         let me = crate::identity::composite::RootSigner::fingerprint(&*signer);
         let store = profile.store_handle();
         let tx = self.net_tx.clone();
+        let opening = Arc::new(());
+        self.opening_rooms.insert(channel_id, Arc::clone(&opening));
         tokio::spawn(async move {
             let opened = tokio::task::spawn_blocking(move || {
                 let wrap = store
@@ -15874,75 +15866,187 @@ impl Node {
                 .send(NetEvent::ChannelUnsealed {
                     reply,
                     channel_id,
+                    opening,
                     opened: Box::new(opened),
                 })
                 .await;
         });
     }
 
-    /// Hold a room opened off the actor: everything [`Self::begin_open_channel`] leaves.
-    fn finish_open_channel(&mut self, ch: ChannelState) -> Boxed<'_, Outcome> {
-        Box::pin(self.finish_open_channel_unboxed(ch))
+    fn queue_room_preparation(
+        &mut self,
+        channel: ChannelState,
+        reply: Option<oneshot::Sender<Outcome>>,
+        reopening: bool,
+    ) {
+        let id = channel.channel_id();
+        if let Some(pending) = self.preparing_rooms.get_mut(&id) {
+            pending.reopening |= reopening;
+            if pending.reply.is_none() {
+                pending.reply = reply;
+            } else if let Some(reply) = reply {
+                // Do not retain an unlimited waiter list for repeated open requests.
+                let _ = reply.send(Outcome::Failed(Fault::ChannelNotOpen));
+            }
+            return;
+        }
+        self.preparing_rooms.insert(
+            id,
+            RoomPreparation {
+                channel: tokio::sync::Mutex::new(channel),
+                reply,
+                reopening,
+                packages: None,
+                recovery: None,
+            },
+        );
     }
 
-    /// Apply this node's shorter limits after opening under the room policy, before a cached
-    /// row can be read or relayed. Failure follows the caller's ordinary open/recovery error path.
+    fn answer_prepared_unlocks(&mut self) {
+        if self.reopen_task.is_none() && self.reopening.is_empty() {
+            for reply in std::mem::take(&mut self.unlock_waiters) {
+                let _ = reply.send(Outcome::Done);
+            }
+        }
+    }
+
+    fn cancel_room_preparation(&mut self, id: &Digest32, fault: Fault) -> bool {
+        let opening = self.opening_rooms.remove(id).is_some();
+        let Some(mut prepared) = self.preparing_rooms.remove(id) else {
+            return opening;
+        };
+        prepared.channel.get_mut().lock_now();
+        if let Some(reply) = prepared.reply {
+            let _ = reply.send(Outcome::Failed(fault));
+        }
+        self.reopening.remove(id);
+        self.answer_prepared_unlocks();
+        true
+    }
+
+    /// One room, one bounded storage turn. The main select loop services commands,
+    /// lock/close and network work between turns; no room is published half recovered.
+    async fn advance_room_preparation(&mut self) {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let id = self
+            .preparation_after
+            .and_then(|after| {
+                self.preparing_rooms
+                    .range((Excluded(after), Unbounded))
+                    .next()
+                    .map(|(id, _)| *id)
+            })
+            .or_else(|| self.preparing_rooms.first_key_value().map(|(id, _)| *id));
+        let Some(id) = id else { return };
+        self.preparation_after = Some(id);
+        let Some(mut prepared) = self.preparing_rooms.remove(&id) else {
+            return;
+        };
+        let outcome =
+            if !self.profile.as_ref().is_some_and(Profile::is_unlocked) || self.locking != 0 {
+                Outcome::Failed(Fault::Locked)
+            } else if prepared.recovery.as_ref().is_some_and(|original| {
+                !self
+                    .channels
+                    .get(&id)
+                    .zip(original.upgrade())
+                    .is_some_and(|(a, b)| Arc::ptr_eq(a, &b))
+            }) {
+                Outcome::Failed(Fault::ChannelNotOpen)
+            } else if prepared.recovery.is_none() && self.channels.contains_key(&id) {
+                Outcome::Done
+            } else if prepared.reopening && !self.reopening.contains(&id) {
+                Outcome::Failed(Fault::ChannelNotOpen)
+            } else {
+                match self.retention_before_publication(&mut prepared).await {
+                    Ok(false) => {
+                        self.preparing_rooms.insert(id, prepared);
+                        return;
+                    }
+                    Ok(true) => {
+                        if prepared.recovery.is_some() {
+                            self.complete_store_recovery(id, Ok(prepared.channel.into_inner()))
+                                .await;
+                            Outcome::Done
+                        } else {
+                            self.publish_open_channel(prepared.channel.into_inner())
+                                .await
+                        }
+                    }
+                    Err(error) => {
+                        let fault = fault_of(&error);
+                        if prepared.recovery.is_some() {
+                            self.complete_store_recovery(id, Err(error)).await;
+                            self.publish().await;
+                            return;
+                        }
+                        let _ = self.event_tx.send(NodeEvent::NodeNote {
+                            note: format!(
+                                "room {} could not finish opening: {error}; it stays closed",
+                                crate::node::link::b32_encode(&id)
+                            ),
+                        });
+                        Outcome::Failed(fault)
+                    }
+                }
+            };
+        self.reopening.remove(&id);
+        if let Some(reply) = prepared.reply {
+            self.answer_when_published(id, reply, outcome).await;
+        } else {
+            // An Unlock waiter observes the held-room view before Ready.
+            self.publish().await;
+        }
+        self.answer_prepared_unlocks();
+    }
+
+    /// Apply current shorter limits and private recovery before publication. A false
+    /// result retains the original opened state for the next actor turn.
     async fn retention_before_publication(
         &mut self,
-        ch: &mut ChannelState,
-    ) -> crate::error::Result<()> {
-        // Resolve stored packages before deciding which pre-upgrade Session copies the node
-        // may keep. The room is not published or available to readers/sync yet. This uses the
-        // usual prekey-consumption path and trust check, never a new source of permission.
-        if ch.needs_session_upgrade() {
+        prepared: &mut RoomPreparation,
+    ) -> crate::error::Result<bool> {
+        let ch = prepared.channel.get_mut();
+        if prepared.packages.is_none() {
+            prepared.packages = Some(
+                if ch.needs_session_upgrade() {
+                    ch.take_inbound_packages()
+                } else {
+                    Vec::new()
+                }
+                .into_iter(),
+            );
+        }
+        if let Some(package) = prepared.packages.as_mut().and_then(Iterator::next) {
             let ctx = ch.join_context()?;
             let now = self.now_ms();
-            for package in ch.take_inbound_packages() {
-                let Ok(init) = package.initial_message() else {
-                    continue;
-                };
-                let Some(mut session) = self.respond_to_initial(&init, &ctx).await else {
-                    continue;
-                };
-                let Ok(skdm) = package.open(&mut session, now.get()) else {
-                    continue;
-                };
-                if !self.trust.is_trusted(&skdm.body.author_id) {
-                    ch.hold_package(package);
-                    continue;
+            if let Ok(init) = package.initial_message() {
+                if let Some(mut session) = self.respond_to_initial(&init, &ctx).await {
+                    if let Ok(skdm) = package.open(&mut session, now.get()) {
+                        if self.trust.is_trusted(&skdm.body.author_id) {
+                            let profile = self.profile.as_ref().ok_or(Error::AtRestLocked)?;
+                            let _ = ch.accept_skdm(profile.store(), &skdm, now);
+                        } else {
+                            ch.hold_package(package);
+                        }
+                    }
                 }
-                let profile = self.profile.as_ref().ok_or(Error::AtRestLocked)?;
-                // A malformed package is skipped just as during ordinary delivery. A failed
-                // durable write poisons the room, which finish_session_upgrade refuses below.
-                let _ = ch.accept_skdm(profile.store(), &skdm, now);
             }
+            return Ok(false);
         }
         let id = ch.channel_id();
         let retention = self.node_retention_for(&id);
-        let profile = self
-            .profile
-            .as_ref()
-            .ok_or(crate::error::Error::AtRestLocked)?;
+        let profile = self.profile.as_ref().ok_or(Error::AtRestLocked)?;
         ch.set_node_retention(profile.store(), retention)?;
         ch.set_node_step_retention(profile.store(), self.node_step_retention.for_room(&id))?;
-        ch.finish_session_upgrade(profile.store(), self.now_ms().get())?;
-        ch.refresh_session_records(profile, &self.drive_holders(), &[], self.now_ms().get())?;
-        ch.sweep_retention(profile.store(), self.now_ms())?;
-        Ok(())
-    }
-
-    /// [`Self::finish_open_channel`], unboxed: see [`Boxed`].
-    async fn finish_open_channel_unboxed(&mut self, mut ch: ChannelState) -> Outcome {
-        if let Err(e) = self.retention_before_publication(&mut ch).await {
-            let _ = self.event_tx.send(NodeEvent::NodeNote {
-                note: format!(
-                    "room {} could not apply retention before opening: {e}",
-                    crate::node::link::b32_encode(&ch.channel_id())
-                ),
-            });
-            return Outcome::Failed(fault_of(&e));
+        if !ch.finish_session_upgrade(profile.store(), self.now_ms().get())? {
+            return Ok(false);
         }
-        self.publish_open_channel(ch).await
+        if !ch.refresh_session_records(profile, &self.drive_holders(), &[], self.now_ms().get())? {
+            return Ok(false);
+        }
+        ch.sweep_retention(profile.store(), self.now_ms())?;
+        Ok(true)
     }
 
     /// Publish a room only after both shared and local retention have been applied durably.
@@ -15974,8 +16078,9 @@ impl Node {
         // that stayed in the set would come back by itself, which is not what closing it meant.
         // A room still reopening is closed too: it leaves `reopening`, so its state is dropped
         // when it arrives rather than held.
+        let preparing = self.cancel_room_preparation(channel_id, Fault::ChannelNotOpen);
         let reopening = self.reopening.remove(channel_id);
-        if self.channels.contains_key(channel_id) || reopening {
+        if self.channels.contains_key(channel_id) || reopening || preparing {
             if let Err(e) = self.forget_open(channel_id) {
                 return Outcome::Failed(fault_of(&e));
             }
@@ -16006,6 +16111,7 @@ impl Node {
                 });
                 Outcome::Done
             }
+            None if preparing || reopening => Outcome::Done,
             None => Outcome::Failed(Fault::ChannelNotOpen),
         }
     }
@@ -16444,6 +16550,7 @@ impl Node {
     /// and then the store is rewritten so none of the deleted bytes stay in the file. A room left
     /// (V210-164) or ended (the decider, 2026-10-03) goes this way.
     async fn purge_room(&mut self, channel_id: &Digest32) -> Outcome {
+        self.cancel_room_preparation(channel_id, Fault::UnknownChannel);
         // A leave still waiting for this room is overtaken: the room is joined again from scratch.
         let (overtaken, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.leave_waiters)
             .into_iter()
@@ -17884,12 +17991,24 @@ impl Node {
     }
 
     /// [`Self::tend_drive_keys_in`] in every open room.
-    async fn tend_drive_keys(&mut self) {
+    async fn tend_drive_keys(&mut self) -> bool {
         let holders = self.drive_holders();
         let channels: Vec<Digest32> = self.channels.keys().copied().collect();
+        let mut changed = false;
         for channel_id in channels {
+            let before = self.session_projection_revision(&channel_id).await;
             self.tend_drive_keys_in(&channel_id, &holders).await;
+            changed |= before != self.session_projection_revision(&channel_id).await;
         }
+        changed
+    }
+
+    async fn session_projection_revision(&self, channel_id: &Digest32) -> Option<Digest32> {
+        let (Some(profile), Some(shared)) = (self.profile.as_ref(), self.channels.get(channel_id))
+        else {
+            return None;
+        };
+        shared.lock().await.sessions_revision(profile.store()).ok()
     }
 
     /// This node's drive key in one room (ADR-029 SC-2a, SC-2b): **changed first** if a member it
@@ -17926,7 +18045,7 @@ impl Node {
                 return;
             }
             use crate::node::channel::session_projection::{Query, Reply};
-            if ch.advance_sessions(profile.store()).is_err() {
+            if ch.advance_sessions(profile.store(), now_millis).is_err() {
                 return;
             }
             let has_session = match ch.session_query(
@@ -17935,6 +18054,7 @@ impl Node {
                     node: profile.fingerprint(),
                 },
                 1,
+                now_millis,
             ) {
                 Ok(Reply::HasOpen(open)) => open,
                 // A rebuilding or failed projection does not assert absence or release keys.
@@ -17947,9 +18067,9 @@ impl Node {
                 return;
             };
             if !owed.is_empty()
-                && ch
+                && !ch
                     .refresh_session_records(profile, holders, &owed, now_millis)
-                    .is_err()
+                    .is_ok_and(|complete| complete)
             {
                 return;
             }

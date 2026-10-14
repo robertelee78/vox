@@ -28,4 +28,4 @@ mod waiting;
 pub(super) mod private_index;
 
 pub(crate) use files::{FileQuery, FileReply};
-pub(crate) use query::{FieldKind, Query, Reply, Revision, Row, TextPage};
+pub(crate) use query::{FieldKind, Query, Reply, Row};
