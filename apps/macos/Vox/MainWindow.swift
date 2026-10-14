@@ -65,7 +65,7 @@ struct MainWindow: View {
                 switch model.selection {
                 case let .room(id):
                     // One view per room: its draft, To:, urgent and attachment do not carry over.
-                    RoomView(model: model, room: id).id(id)
+                    RoomTimelineView(model: model, room: id).id(id)
                 case .keyring:
                     KeyringView(model: model)
                 case .decisions:
@@ -871,7 +871,7 @@ private enum TimelineEnd {
 }
 
 /// The room on screen: its timeline and a field to post, with its members beside it.
-private struct RoomView: View {
+private struct RoomTimelineView: View {
     /// The conversation's text size, for its spacing (L-1a): this view sets it on the timeline and
     /// the composer, so it reads it from Theme rather than from its own environment.
     private var scale: Double { Theme.scale }
@@ -1833,13 +1833,13 @@ private struct MessageRow: View {
                 // What it relates to, as its sender tagged it (#636): quiet, under it; each opens
                 // the room's thread of that tag.
                 HStack(spacing: Space.s8 * scale) {
-                    ForEach(message.tags, id: \.self) { tag in
-                        Button { model.showing = .tag(tag) } label: {
-                            Text(tag).caption().secondaryText()
+                    ForEach(message.tagSelectors, id: \.key) { tag in
+                        Button { model.showing = .tag(key: tag.key, label: tag.label) } label: {
+                            Text(tag.label).caption().secondaryText()
                         }
                         .buttonStyle(.plain)
-                        .help("Show the room's messages tagged \(tag)")
-                        .accessibilityIdentifier("tag-\(message.id)-\(tag)")
+                        .help("Show the room's messages tagged \(tag.label)")
+                        .accessibilityIdentifier("tag-\(message.id)-\(tag.label)")
                     }
                 }
             }
@@ -2025,8 +2025,8 @@ private struct RoomHeader: View {
                     Button("All messages") { model.showing = .general }
                         .disabled(tagShown == nil)
                     Divider()
-                    ForEach(model.roomTags, id: \.self) { tag in
-                        Button(tag) { model.showing = .tag(tag) }
+                    ForEach(model.roomTags, id: \.key) { tag in
+                        Button(tag.label) { model.showing = .tag(key: tag.key, label: tag.label) }
                     }
                 } label: {
                     Label(tagShown ?? "Tags", systemImage: "tag")
@@ -2044,7 +2044,7 @@ private struct RoomHeader: View {
 
     /// The tag whose thread is on screen, if one is.
     private var tagShown: String? {
-        if case .tag(let tag) = model.showing { return tag }
+        if case .tag(_, let label) = model.showing { return label }
         return nil
     }
 
