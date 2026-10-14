@@ -627,33 +627,35 @@ final class NodeModel: ObservableObject {
         }
     }
 
-    /// Each room's newest message read so far, by room: the next read starts after it.
-    private var lastRead: [String: String] = [:]
-
-    /// Read what `room` has after its newest message read so far, for its row's preview.
+    /// Find the latest preview through bounded indexed pages. Coordination-only pages
+    /// are skipped without collecting the intervening history in the window process.
     private func readLast(_ room: String) async {
+        let epoch = nodeObservationEpoch
         do {
-            let rows: [RoomMessage]
-            if let after = lastRead[room] {
-                do {
-                    rows = try await client.read(room: room, after: after, limit: 0)
-                } catch where Self.rejectedForwardMark(error) {
-                    // Retention can remove the last preview row. Retire its mark before the
-                    // bounded read, so a failed recovery never retries that expired mark.
-                    lastRead[room] = nil
-                    rows = try await client.roomRead(room: room).messages
+            var page = try await client.roomRead(room: room)
+            let instance = page.instance
+            while true {
+                guard epoch == nodeObservationEpoch, !Task.isCancelled,
+                      rooms.contains(where: { $0.id == room && $0.open }) else { return }
+                guard page.instance == instance else {
+                    throw VoxError.Failed(reason: "The saved room changed while reading its preview.")
                 }
-            } else {
-                rows = try await client.roomRead(room: room).messages
+                if let shown = page.messages.last(where: Preview.shows) {
+                    guard let i = rooms.firstIndex(where: { $0.id == room }),
+                          shown.createdMillis >= rooms[i].last?.millis ?? 0 else { return }
+                    let preview = Preview(shown, me: me)
+                    if rooms[i].last != preview { rooms[i].last = preview }
+                    return
+                }
+                guard let before = page.before else { return }
+                let older = try await client.roomReadOlder(room: room, before: before)
+                guard older.before != before else {
+                    throw VoxError.Failed(reason: "The room preview page did not advance.")
+                }
+                page = older
             }
-            guard let newest = rows.last else { return }
-            lastRead[room] = newest.id
-            guard let shown = rows.last(where: Preview.shows),
-                  let i = rooms.firstIndex(where: { $0.id == room }),
-                  shown.createdMillis >= rooms[i].last?.millis ?? 0 else { return }
-            let preview = Preview(shown, me: me)
-            if rooms[i].last != preview { rooms[i].last = preview }
         } catch {
+            guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
             reportBackground(error)
         }
     }
@@ -800,7 +802,6 @@ final class NodeModel: ObservableObject {
                 roomHasNewer = false
                 roomNeedsPage = false
                 rejectedRoomMark = nil
-                lastRead[id] = page.messages.last?.id
                 watchReads(id)
             }
         } catch {
@@ -816,13 +817,6 @@ final class NodeModel: ObservableObject {
         roomOlder = 0
         roomBefore = nil
         roomReloadNeeded = true
-    }
-
-    /// Only a refused forward history mark warrants reanchoring. A disconnect, permission
-    /// refusal or malformed reply must retain its own error instead of becoming an empty page.
-    private static func rejectedForwardMark(_ error: Error) -> Bool {
-        guard case let VoxError.Failed(reason) = error else { return false }
-        return reason == "page mark not in this room's timeline"
     }
 
     /// The timeline's previous page is fetched only at the person's scroll position or request.
