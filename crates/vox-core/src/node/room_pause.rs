@@ -141,6 +141,9 @@ async fn request(
         session: String::new(),
         action: Action::RoomPause {
             paused,
+            expected_instance: selected
+                .filter(|(actor, _)| *actor == peer)
+                .map(|(_, instance)| instance),
             after: after.clone(),
             expected,
         },

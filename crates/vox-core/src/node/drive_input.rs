@@ -149,6 +149,30 @@ pub(crate) async fn send_checked(
     }
     let (stream, _) = crate::node::appipc::open_on(stream, room, peer, vec![LABEL.to_owned()], false)
         .await.map_err(|e| Unsent::Unreachable(format!("the session's node could not be reached, or would not take drive input ({e}); nothing was sent")))?;
+    // The stream now retains the exact room gate it opened under. A replacement before
+    // that open is caught here; one after it empties that retained gate and resets the stream.
+    if let Some((actor, instance)) = selected {
+        let mut current = crate::node::ipc::IpcClient::open_at(at)
+            .await
+            .map_err(|error| Unsent::Unreachable(error.to_string()))?;
+        if current.me() != Some(actor) {
+            return Err(Unsent::Unreachable(
+                "the selected node changed; nothing was sent".into(),
+            ));
+        }
+        match current
+            .request(&crate::node::ipc::Request::ArrivalHead { channel_id: room })
+            .await
+        {
+            Ok(Frame::ArrivalHead { head }) if head.instance == instance => {}
+            Ok(Frame::Error { reason }) => return Err(Unsent::Unreachable(reason)),
+            _ => {
+                return Err(Unsent::Unreachable(
+                    "the selected room changed; nothing was sent".into(),
+                ))
+            }
+        }
+    }
     let (r, mut w) = stream.into_split();
     let mut line = serde_json::to_string(request)
         .map_err(|e| Unsent::Unreachable(format!("the request could not be written: {e}")))?;

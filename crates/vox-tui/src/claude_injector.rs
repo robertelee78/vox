@@ -74,6 +74,23 @@ pub enum Act {
 /// No pane proven, the pane gone or no longer the session's, tmux failing, text over
 /// [`MAX_TEXT_CHARS`] or that would not submit, a slash command with other characters.
 pub fn drive(reg: &crate::wake::Session, act: &Act) -> Result<(), String> {
+    drive_guarded(reg, act, None)
+}
+
+/// A room-pause interrupt must remain authorized after the blocking send mutex is acquired.
+/// Ordinary human drive has no pause guard and retains its existing behavior.
+pub(crate) fn drive_guarded(
+    reg: &crate::wake::Session,
+    act: &Act,
+    guard: Option<&crate::host::room_pause::InterruptGuard>,
+) -> Result<(), String> {
+    let permitted = || {
+        if guard.is_none_or(|guard| guard.allowed()) {
+            Ok(())
+        } else {
+            Err("room pause, authority or Session changed; the interrupt was not sent".to_owned())
+        }
+    };
     let Some(p) = reg.tmux.as_ref() else {
         // Case: a drive before any hook bound the session, or a session outside tmux.
         return Err(reg.tmux_why.clone().unwrap_or_else(|| {
@@ -86,9 +103,13 @@ pub fn drive(reg: &crate::wake::Session, act: &Act) -> Result<(), String> {
     let _one = SENDING
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    permitted()?;
     check(p)?;
     match act {
-        Act::Interrupt => key(p, "Escape"),
+        Act::Interrupt => {
+            permitted()?;
+            key(p, "Escape")
+        }
         Act::Stop => key(p, "C-c"),
         Act::Slash(cmd) => {
             let cmd = if cmd.starts_with('/') {

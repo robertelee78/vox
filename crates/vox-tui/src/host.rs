@@ -27,7 +27,7 @@ use std::collections::{BTreeMap, BTreeSet};
 mod anchor_discovery;
 mod computer;
 mod local_trust;
-mod room_pause;
+pub(crate) mod room_pause;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
@@ -1762,6 +1762,7 @@ impl Router {
             &req.action,
             Action::RoomPause {
                 paused: None,
+                expected_instance: None,
                 after: None,
                 expected: None
             }
@@ -1780,6 +1781,7 @@ impl Router {
         };
         if let Action::RoomPause {
             paused,
+            expected_instance,
             after,
             expected,
         } = &req.action
@@ -1794,6 +1796,7 @@ impl Router {
                     info,
                     generation,
                     *paused,
+                    *expected_instance,
                     after.as_deref(),
                     *expected,
                 )
@@ -2099,6 +2102,16 @@ impl Router {
         reg: &crate::wake::Session,
         action: &crate::drive::Action,
     ) -> Result<String, String> {
+        self.steer_guarded(node, reg, action, None).await
+    }
+
+    async fn steer_guarded(
+        &self,
+        node: &NodeName,
+        reg: &crate::wake::Session,
+        action: &crate::drive::Action,
+        guard: Option<room_pause::InterruptGuard>,
+    ) -> Result<String, String> {
         use crate::codex_mirror::Steer;
         use crate::drive::Action;
         let steer = match action {
@@ -2124,14 +2137,22 @@ impl Router {
                 }
                 self.inner
                     .codex
-                    .steer(std::path::Path::new(&reg.codex_home), &reg.session, steer)
+                    .steer_guarded(
+                        std::path::Path::new(&reg.codex_home),
+                        &reg.session,
+                        steer,
+                        guard,
+                    )
                     .await
             }
             "opencode" => {
                 if let Some(reservation) = &mut delivery {
                     reservation.attempting();
                 }
-                self.inner.opencode.steer(&reg.session, steer).await
+                self.inner
+                    .opencode
+                    .steer_guarded(&reg.session, steer, guard)
+                    .await
             }
             "claude" => {
                 use crate::claude_injector::Act;
@@ -2146,10 +2167,12 @@ impl Router {
                 if let Some(reservation) = &mut delivery {
                     reservation.attempting();
                 }
-                tokio::task::spawn_blocking(move || crate::claude_injector::drive(&reg, &act))
-                    .await
-                    .unwrap_or_else(|_| Err("the delivery to the terminal failed".into()))
-                    .map(|()| "delivered to its terminal".to_owned())
+                tokio::task::spawn_blocking(move || {
+                    crate::claude_injector::drive_guarded(&reg, &act, guard.as_ref())
+                })
+                .await
+                .unwrap_or_else(|_| Err("the delivery to the terminal failed".into()))
+                .map(|()| "delivered to its terminal".to_owned())
             }
             "codex" => Err(
                 "this Codex session registered no CODEX_HOME, so Vox cannot reach its app-server"

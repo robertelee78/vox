@@ -36,6 +36,9 @@ pub enum Action {
     RoomPause {
         /// Pause, resume, or read without changing it.
         paused: Option<bool>,
+        /// Captured receiver-local room instance for an own-node mutation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_instance: Option<[u8; 16]>,
         /// Continue interrupting live registrations strictly after this Session id.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         after: Option<String>,

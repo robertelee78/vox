@@ -17,6 +17,7 @@ impl Router {
         info: &vox_core::node::app::AppInfo,
         generation: u64,
         paused: Option<bool>,
+        expected_instance: Option<[u8; 16]>,
         after: Option<&str>,
         expected: Option<PauseSelection>,
     ) -> Answer {
@@ -50,6 +51,7 @@ impl Router {
                     info.channel_id,
                     info.peer,
                     if after.is_some() { None } else { paused },
+                    expected_instance,
                     expected,
                     publication_guard,
                 )
@@ -103,40 +105,40 @@ impl Router {
                 );
                 tasks.spawn(async move {
                     let id = registration.session.clone();
-                    let current = handle.view();
-                    let same = {
-                        let slots = lock(&router.inner.slots);
-                        matches!(slots.get(&node), Some(Slot::Attached(attached))
-                            if attached.generation == generation && Arc::ptr_eq(attached.handle.app(), handle.app()) && !*attached.detached.borrow())
+                    let guard = InterruptGuard {
+                        ended: tokio_util::sync::CancellationToken::new(),
+                        views: handle.watch(),
+                        current: Arc::new({
+                            let (router, node, handle, registration) = (router.clone(), node.clone(), handle.clone(), registration.clone());
+                            move || {
+                                let current = handle.view();
+                                let same = {
+                                    let slots = lock(&router.inner.slots);
+                                    matches!(slots.get(&node), Some(Slot::Attached(attached))
+                                        if attached.generation == generation && Arc::ptr_eq(attached.handle.app(), handle.app()) && !*attached.detached.borrow())
+                                };
+                                let own = current.identity.as_ref().map(|i| i.fingerprint) == Some(info.peer);
+                                same && !current.locked && !current.locking
+                                    && (own || current.drive.contains(&info.peer))
+                                    && current.open_channels.iter().any(|d| d.channel_id == info.channel_id
+                                        && d.history_instance == selection.instance && d.pause == selection.state && d.pause.paused
+                                        && d.members.contains(&info.peer))
+                                    && crate::wake::pause_registration(&paths, &registration.session).ok().flatten().is_some_and(|now| now.same(&registration)
+                                        && now.first_seen_ms == registration.first_seen_ms && now.tmux == registration.tmux
+                                        && now.codex_home == registration.codex_home && now.mirror == registration.mirror)
+                            }
+                        }),
                     };
-                    let own = current.identity.as_ref().map(|i| i.fingerprint) == Some(info.peer);
-                    let ready = same && !current.locked && !current.locking
-                        && (own || current.drive.contains(&info.peer))
-                        && current.open_channels.iter().any(|d| d.channel_id == info.channel_id
-                            && d.history_instance == selection.instance && d.pause == selection.state && d.pause.paused)
-                        && crate::wake::pause_registration(&paths, &id).ok().flatten().is_some_and(|now| now.same(&registration)
-                            && now.first_seen_ms == registration.first_seen_ms && now.tmux == registration.tmux
-                            && now.codex_home == registration.codex_home && now.mirror == registration.mirror);
-                    let outcome = if !ready {
+                    // Dropping the attempt retires queued controls and a spawn_blocking job
+                    // waiting on Claude's send mutex, even though those jobs outlive this future.
+                    let _attempt = InterruptAttempt(guard.ended.clone());
+                    let outcome = if !guard.allowed() {
                         Err("the room, pause, authority or Session changed; no interrupt was sent".into())
                     } else {
-                        let mut views = handle.watch();
-                        let changed = async {
-                            loop {
-                                let valid = {
-                                    let view = views.borrow();
-                                    let owns = view.identity.as_ref().map(|i| i.fingerprint) == Some(info.peer);
-                                    !view.locked && !view.locking && (owns || view.drive.contains(&info.peer))
-                                        && view.open_channels.iter().any(|d| d.channel_id == info.channel_id
-                                            && d.history_instance == selection.instance && d.pause == selection.state && d.pause.paused)
-                                };
-                                if !valid || views.changed().await.is_err() { return; }
-                            }
-                        };
                         tokio::select! {
                             biased;
-                            () = changed => Err("the room pause or authority changed while interrupting; delivery is unknown".into()),
-                            result = tokio::time::timeout(std::time::Duration::from_secs(15), router.steer(&node, &registration, &Action::Interrupt)) => match result {
+                            () = guard.cancelled() => Err("the room pause or authority changed while interrupting; delivery is unknown".into()),
+                            result = tokio::time::timeout(std::time::Duration::from_secs(15), router.steer_guarded(&node, &registration, &Action::Interrupt, Some(guard.clone()))) => match result {
                                 Ok(result) => result,
                                 Err(_) => Err("the interrupt was not acknowledged in time; its delivery is unknown".into()),
                             }
@@ -172,5 +174,37 @@ fn saved(report: PauseReport) -> Answer {
         .into(),
         code: None,
         pause: Some(report),
+    }
+}
+
+/// One pause's permission to interrupt, carried through existing adapter queues. It owns no
+/// output and is retired when the awaiting pause attempt completes, times out or is dropped.
+#[derive(Clone)]
+pub(crate) struct InterruptGuard {
+    current: Arc<dyn Fn() -> bool + Send + Sync>,
+    ended: tokio_util::sync::CancellationToken,
+    views: tokio::sync::watch::Receiver<vox_core::node::api::NodeView>,
+}
+impl InterruptGuard {
+    pub(crate) fn allowed(&self) -> bool {
+        !self.ended.is_cancelled() && (self.current)()
+    }
+    pub(crate) async fn cancelled(&self) {
+        let mut views = self.views.clone();
+        loop {
+            if !self.allowed() {
+                return;
+            }
+            tokio::select! {
+                () = self.ended.cancelled() => return,
+                changed = views.changed() => if changed.is_err() { return; },
+            }
+        }
+    }
+}
+struct InterruptAttempt(tokio_util::sync::CancellationToken);
+impl Drop for InterruptAttempt {
+    fn drop(&mut self) {
+        self.0.cancel();
     }
 }

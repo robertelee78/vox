@@ -4176,6 +4176,7 @@ impl NodeHandle {
         channel_id: Digest32,
         by: Digest32,
         paused: Option<bool>,
+        expected_instance: Option<[u8; 16]>,
         expected: Option<vox_agentcomms::drive::PauseSelection>,
         publication_guard: Option<std::fs::File>,
     ) -> Result<vox_agentcomms::drive::PauseSelection, Fault> {
@@ -4185,6 +4186,7 @@ impl NodeHandle {
                 channel_id,
                 by,
                 paused,
+                expected_instance,
                 expected,
                 publication_guard,
                 reply,
@@ -5861,6 +5863,7 @@ impl Node {
                 channel_id,
                 by,
                 paused,
+                expected_instance,
                 expected,
                 publication_guard,
                 reply,
@@ -5868,7 +5871,8 @@ impl Node {
                 let result = if paused.is_some() && publication_guard.is_none() {
                     Err(Fault::Internal)
                 } else {
-                    self.room_pause(&channel_id, by, paused, expected).await
+                    self.room_pause(&channel_id, by, paused, expected_instance, expected)
+                        .await
                 };
                 drop(publication_guard);
                 let _ = reply.send(result);
@@ -17441,7 +17445,10 @@ impl Node {
         if let Some(net) = self.net.as_ref() {
             self.sync_anchor_scopes(net);
         }
-        self.reachers.remove(channel_id);
+        if let Some(reachers) = self.reachers.remove(channel_id) {
+            crate::node::tunnel::publish_reachers(&reachers, std::collections::BTreeSet::new());
+        }
+        self.app.set_reachers(&self.reachers);
         crate::node::status::SyncBook::forget_room(&self.sync_book, channel_id);
         self.sched_rooms.remove(channel_id);
         self.discover_rooms.remove(channel_id);
@@ -18611,6 +18618,7 @@ impl Node {
         channel_id: &Digest32,
         by: Digest32,
         paused: Option<bool>,
+        expected_instance: Option<[u8; 16]>,
         expected: Option<vox_agentcomms::drive::PauseSelection>,
     ) -> Result<vox_agentcomms::drive::PauseSelection, Fault> {
         let profile = self
@@ -18645,7 +18653,9 @@ impl Node {
             instance,
             state: ch.room_pause(),
         };
-        if expected.is_some_and(|expected| expected != current) {
+        if expected_instance.is_some_and(|expected| expected != instance)
+            || expected.is_some_and(|expected| expected != current)
+        {
             return Err(Fault::ReadSelectionChanged);
         }
         if let Some(paused) = paused {

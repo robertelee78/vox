@@ -71,6 +71,7 @@ pub struct OpenCodeMirror {
 enum Cmd {
     Steer {
         steer: Steer,
+        guard: Option<crate::host::room_pause::InterruptGuard>,
         reply: oneshot::Sender<Result<String, String>>,
     },
 }
@@ -159,6 +160,15 @@ impl OpenCodeMirror {
     /// # Errors
     /// Why the control was refused, or why its outcome could not be confirmed.
     pub async fn steer(&self, session: &str, steer: Steer) -> Result<String, String> {
+        self.steer_guarded(session, steer, None).await
+    }
+
+    pub(crate) async fn steer_guarded(
+        &self,
+        session: &str,
+        steer: Steer,
+        guard: Option<crate::host::room_pause::InterruptGuard>,
+    ) -> Result<String, String> {
         let tx = self.conns().get(session).cloned().ok_or_else(|| {
             "Vox is not connected to this OpenCode session: it ended, or its OpenCode has not run \
              a turn since Vox started"
@@ -176,7 +186,11 @@ impl OpenCodeMirror {
         }
         let (reply, rx) = oneshot::channel();
         tx.commands
-            .try_send(Cmd::Steer { steer, reply })
+            .try_send(Cmd::Steer {
+                steer,
+                guard,
+                reply,
+            })
             .map_err(|error| match error {
                 mpsc::error::TrySendError::Full(_) => {
                     "OpenCode's control queue is full; nothing was sent".to_owned()
@@ -315,9 +329,20 @@ impl Follow {
                 _ = stop.notified() => break,
                 cmd = rx.recv() => match cmd {
                     None => break,
-                    Some(Cmd::Steer { steer, reply }) => {
+                    Some(Cmd::Steer { steer, guard, reply }) => {
+                        if guard.as_ref().is_some_and(|guard| !guard.allowed()) {
+                            let _ = reply.send(Err("room pause, authority or Session changed; the interrupt was not sent".into()));
+                            continue;
+                        }
                         if let Some(call) = self.steer_call(steer, reply) {
-                            if !Self::write(&mut write, &call).await {
+                            let written = if let Some(guard) = guard {
+                                tokio::select! {
+                                    biased;
+                                    () = guard.cancelled() => false,
+                                    written = Self::write(&mut write, &call) => written,
+                                }
+                            } else { Self::write(&mut write, &call).await };
+                            if !written {
                                 self.fail("a control write failed; its outcome is unknown, do not assume it is safe to repeat").await;
                                 break;
                             }

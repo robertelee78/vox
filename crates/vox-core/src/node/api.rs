@@ -782,6 +782,8 @@ pub enum NodeCommand {
         by: Digest32,
         /// Set pause/resume; `None` reads the saved state.
         paused: Option<bool>,
+        /// Captured local room instance; checked with the mutation under the room lock.
+        expected_instance: Option<[u8; 16]>,
         /// Existing receiver room incarnation/state when continuing an interrupt page.
         expected: Option<vox_agentcomms::drive::PauseSelection>,
         /// Already acquired outside the actor; kept through a queued mutation even if its
