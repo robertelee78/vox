@@ -10,7 +10,7 @@ use vox_agentcomms::envelope::{Envelope, SESSION, SESSION_END};
 
 use crate::hash::Digest32;
 use crate::node::actor::NodeHandle;
-use crate::node::api::{NodeCommand, Outcome};
+use crate::node::api::{Fault, NodeCommand, Outcome};
 
 /// One Session of a room, as its log says.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,8 +80,8 @@ pub struct LifecycleRow {
     pub cursor: LifecycleCursor,
 }
 
-/// Exact own/current-author lookup. Each retry advances one bounded storage page;
-/// neither the actor nor a waiting client retains all Session metadata.
+/// Exact own/current-author lookup. Pending policy and Session folds retry within the same
+/// deadline; neither the actor nor a waiting client retains all Session metadata.
 pub(crate) async fn lookup(
     handle: &NodeHandle,
     room: Digest32,
@@ -104,14 +104,28 @@ pub(crate) async fn lookup(
             Ok(Reply::Lookup(row)) => return Ok(row),
             Ok(_) => return Err("unexpected Session lookup answer".into()),
             Err(reason)
-                if reason == "the room is refreshing saved Sessions; retry"
-                    && tokio::time::Instant::now() < deadline =>
+                if opening_refreshing(&reason) && tokio::time::Instant::now() < deadline =>
             {
                 tokio::task::yield_now().await
             }
             Err(reason) => return Err(reason),
         }
     }
+}
+
+// Exact pending replies from governance, legacy classification, private controls and floors,
+// and the Session projection. Every other refusal, including unreadable facts, is permanent
+// for this attempt and must reach the caller. These are Error::Display strings where the
+// actor returns a storage-layer readiness error before reaching the Session query.
+fn opening_refreshing(reason: &str) -> bool {
+    matches!(
+        reason,
+        "the room is refreshing saved Sessions; retry"
+            | "node: room governance is refreshing; try again when it is ready"
+            | "node: legacy Session classification is refreshing"
+            | "stream refused: Session authorization facts are refreshing"
+            | "stream refused: Session control facts are refreshing"
+    )
 }
 
 /// What a session tells its node about itself, for its Session's records.
@@ -238,7 +252,8 @@ async fn post(
     text: String,
 ) -> Result<(), String> {
     // A room just joined is written to once its first sync with another member has ended
-    // (V210-164), usually within a second.
+    // (V210-164), and only once its current policy facts are ready. Both pending states use
+    // the existing bounded retry; no other failed append is repeated.
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         match handle
@@ -250,7 +265,7 @@ async fn post(
             .await
         {
             Outcome::Appended(_) => return Ok(()),
-            Outcome::Failed(crate::node::api::Fault::RoomNotSynced)
+            Outcome::Failed(Fault::RoomNotSynced | Fault::GovernanceRefreshing)
                 if tokio::time::Instant::now() < deadline =>
             {
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;

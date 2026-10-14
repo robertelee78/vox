@@ -20582,6 +20582,7 @@ pub fn fault_of(e: &Error) -> Fault {
     if ChannelState::governance_refreshing(e)
         || ChannelState::legacy_classification_refreshing(e)
         || ChannelState::authorization_refreshing(e)
+        || matches!(e, Error::StreamRefused("Session control facts are refreshing"))
     {
         return Fault::GovernanceRefreshing;
     }
