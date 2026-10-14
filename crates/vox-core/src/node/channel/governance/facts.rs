@@ -103,8 +103,8 @@ pub(super) enum Table {
     EffectKinds,
     Notices,
     NoticeByHash,
-    Contexts,
-    AuthorityCache,
+    // Slot 34 was unused. Preserve the remaining sealed root positions.
+    AuthorityCache = 35,
     IssuerRoles,
     ActiveAdmins,
     CurrentAuthority,
@@ -501,84 +501,10 @@ impl<'a> Read<'a> {
             .find(self.header.roots[Table::Hashes as usize], &hash_key(hash))
     }
 
-    /// One governance predecessor in the named author's feed, never a log scan.
-    pub(super) fn before(&self, author: &Digest32, seq: u64) -> Result<Option<(u64, u64)>> {
-        let Some((key, log)) = self.tree().last_before(
-            self.header.roots[Table::Positions as usize],
-            Some(position(author, seq)),
-        )?
-        else {
-            return Ok(None);
-        };
-        if key[..32] != author[..] {
-            return Ok(None);
-        }
-        if key[40..].iter().any(|byte| *byte != 0) {
-            return Err(invalid("governance position padding"));
-        }
-        let sequence = u64::from_be_bytes(
-            key[32..40]
-                .try_into()
-                .map_err(|_| invalid("governance position sequence"))?,
-        );
-        Ok(Some((sequence, log)))
-    }
-
-    pub(super) fn reached(&self, entry: &Digest32, author: &Digest32) -> Result<u64> {
-        if !self.causal_settled()?
-            || self
-                .tree()
-                .find(
-                    self.header.roots[Table::Complete as usize],
-                    &hash_key(entry),
-                )?
-                .is_none()
-        {
-            return Err(invalid("governance causal facts not settled"));
-        }
-        Ok(self
-            .tree()
-            .find(
-                self.header.roots[Table::Frontiers as usize],
-                &frontier(entry, author),
-            )?
-            .unwrap_or(0))
-    }
-
-    pub(super) fn frontier_after(
-        &self,
-        entry: &Digest32,
-        after: Option<Digest32>,
-    ) -> Result<Option<(Digest32, u64)>> {
-        let tree = self.tree();
-        let item = match after {
-            Some(author) => tree.first_after(
-                self.header.roots[Table::Frontiers as usize],
-                Some(frontier(entry, &author)),
-            )?,
-            None => tree.first_at_or_after(
-                self.header.roots[Table::Frontiers as usize],
-                hash_key(entry),
-            )?,
-        };
-        frontier_row(entry, item)
-    }
-
-    pub(super) fn causal_settled(&self) -> Result<bool> {
-        Ok(self.header.initialized
-            && self
-                .first(Table::PendingOrder, None)?
-                .is_none_or(|(key, _)| pending_log(&key) > self.header.barrier))
-    }
-
     pub(super) fn pending(&self) -> bool {
         self.header.roots[Table::Pending as usize] != 0
             || !self.header.initialized
             || !self.settled()
-    }
-
-    pub(super) fn through(&self) -> u64 {
-        self.header.through
     }
 
     pub(super) fn settled(&self) -> bool {
@@ -815,10 +741,6 @@ impl<'a, 'store> Write<'a, 'store> {
             return Err(invalid("governance source binding"));
         }
         Ok(entry)
-    }
-
-    pub(super) fn through(&self) -> u64 {
-        self.header.through
     }
 
     /// The cursor advances with its index/queue updates in this transaction.
@@ -1125,9 +1047,6 @@ impl<'a, 'store> Write<'a, 'store> {
     }
     pub(super) fn order_ready(&self) -> bool {
         self.header.order_ready
-    }
-    pub(super) fn evaluated(&self) -> u64 {
-        self.header.evaluated
     }
     pub(super) fn ordered_from(&self) -> u64 {
         self.header.ordered_from

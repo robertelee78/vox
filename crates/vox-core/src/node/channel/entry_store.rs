@@ -27,6 +27,8 @@ const DIRECTORY: u64 = 0;
 type Key = [u8; 64];
 
 mod dag_facts;
+mod missing_facts;
+mod receipt_facts;
 mod render_facts;
 mod retention_facts;
 pub(crate) mod session_tree;
@@ -81,11 +83,14 @@ pub(crate) struct Roots {
     referenced: u64,
     rendered: render_facts::Roots,
     retained: retention_facts::Roots,
+    read_receipts: u64,
+    read_pairs: u64,
+    missing_positions: u64,
 }
 
 impl Roots {
     fn write(self, e: &mut Encoder) {
-        e.array(8)
+        e.array(11)
             .uint(self.sequence)
             .uint(self.hash)
             .uint(self.clock)
@@ -94,29 +99,26 @@ impl Roots {
             .uint(self.referenced);
         self.rendered.write(e);
         self.retained.write(e);
+        e.uint(self.read_receipts)
+            .uint(self.read_pairs)
+            .uint(self.missing_positions);
     }
     fn read(d: &mut Decoder<'_>) -> Result<Self> {
-        let arity = d.array()?;
-        if !matches!(arity, 2 | 6 | 7 | 8) {
+        if d.array()? != 11 {
             return Err(invalid("entry roots arity"));
         }
         Ok(Self {
             sequence: d.uint()?,
             hash: d.uint()?,
-            clock: if arity >= 6 { d.uint()? } else { 0 },
-            order: if arity >= 6 { d.uint()? } else { 0 },
-            children: if arity >= 6 { d.uint()? } else { 0 },
-            referenced: if arity >= 6 { d.uint()? } else { 0 },
-            rendered: if arity >= 7 {
-                render_facts::Roots::read(d)?
-            } else {
-                render_facts::Roots::default()
-            },
-            retained: if arity >= 8 {
-                retention_facts::Roots::read(d)?
-            } else {
-                retention_facts::Roots::default()
-            },
+            clock: d.uint()?,
+            order: d.uint()?,
+            children: d.uint()?,
+            referenced: d.uint()?,
+            rendered: render_facts::Roots::read(d)?,
+            retained: retention_facts::Roots::read(d)?,
+            read_receipts: d.uint()?,
+            read_pairs: d.uint()?,
+            missing_positions: d.uint()?,
         })
     }
 }
@@ -209,7 +211,7 @@ impl Directory {
     }
     fn bytes(&self) -> Zeroizing<Vec<u8>> {
         let mut e = Encoder::new();
-        e.array(18).uint(5);
+        e.array(18).uint(6);
         self.active.write(&mut e);
         self.provisional.write(&mut e);
         e.uint(self.next_page)
@@ -284,10 +286,9 @@ impl Directory {
         let mut d = Decoder::new(bytes);
         let arity = d.array()?;
         let version = d.uint()?;
-        if !matches!(
-            (arity, version),
-            (8, 1) | (12, 2) | (15, 3) | (16, 4) | (18, 5)
-        ) {
+        // This unpublished format includes durable receipt and recovery membership roots.
+        // Reading older roots as empty would silently lose reads and owed bodies.
+        if (arity, version) != (18, 6) {
             return Err(invalid("entry directory format"));
         }
         let active = Roots::read(&mut d)?;
@@ -403,8 +404,14 @@ impl Directory {
                 active.order,
                 active.children,
                 active.referenced,
+                active.read_receipts,
+                active.read_pairs,
+                active.missing_positions,
                 provisional.sequence,
                 provisional.hash,
+                provisional.read_receipts,
+                provisional.read_pairs,
+                provisional.missing_positions,
             ]
             .iter()
             .any(|id| *id >= next_page)
@@ -433,6 +440,9 @@ impl Directory {
                 || p.work.order >= next_page
                 || p.work.children >= next_page
                 || p.work.referenced >= next_page
+                || p.work.read_receipts >= next_page
+                || p.work.read_pairs >= next_page
+                || p.work.missing_positions >= next_page
                 || !p.work.rendered.valid_for(next_page)
                 || !p.work.retained.valid_for(next_page)
                 || p.retired >= next_page
@@ -834,6 +844,9 @@ impl EntryIndex {
 }
 
 impl Read<'_> {
+    pub(crate) fn transaction(&self) -> Transaction<'_, '_> {
+        Transaction::Snapshot(&self.snapshot)
+    }
     fn source(&self) -> Source<'_> {
         Source::Cached(&self.snapshot, self.cache)
     }
@@ -1180,6 +1193,9 @@ impl<'s> Write<'_, 's> {
             return Err(invalid("not rebuilding entry index"));
         }
         self.directory.active = self.index(self.directory.active, entry, log)?;
+        if entry.payload.is_none() {
+            self.directory.active = self.missing_in_roots(self.directory.active, entry, true)?;
+        }
         Ok(())
     }
     pub(crate) fn finish_rebuild(&mut self) -> Result<()> {
@@ -1216,6 +1232,12 @@ impl<'s> Write<'_, 's> {
         self.batch
             .put_segment(self.channel, SegmentKind::LogDb, log, &sealed)?;
         self.directory.active = self.index(self.directory.active, entry, log)?;
+        // A refill settles recovery atomically with its durable wire. Rewriting a body as
+        // a skeleton for local retention deliberately does not create recovery work.
+        if entry.payload.is_some() {
+            self.set_missing(&entry.skeleton.author_id, entry.skeleton.seq, false)?;
+            self.set_owed(entry.entry_hash(), None)?;
+        }
         Ok(())
     }
     pub(crate) fn stage(&mut self, entry: &Entry) -> Result<u64> {
@@ -1463,6 +1485,11 @@ impl Write<'_, '_> {
                     .put_segment(self.channel, SegmentKind::Index, log, &seen)?;
             }
             p.work = self.index(p.work, &entry, log)?;
+            if entry.payload.is_none() {
+                // The membership stays unpublished with this authenticated suffix until the
+                // witness's effects and root switch commit together.
+                p.work = self.missing_in_roots(p.work, &entry, true)?;
+            }
             self.enqueue_fact(entry.entry_hash())?;
             p.after_log = log
                 .checked_add(1)

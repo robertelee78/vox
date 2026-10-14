@@ -37,6 +37,7 @@
 //! alone. M14 adds other authors' entries, SKDMs, consent and sync on top of the
 //! same layout.
 
+mod diagnostics;
 mod entry_store;
 mod governance;
 pub(crate) mod history;
@@ -46,10 +47,10 @@ mod private_session;
 pub(crate) mod session_floor;
 pub(crate) mod session_projection;
 
+pub use diagnostics::SetAside;
 pub use entry_store::OrderView;
 use entry_store::Transaction;
 pub use governance::{GovernanceNotices, GovernanceProgress, GovernanceShares, GovernanceTargets};
-use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use zeroize::Zeroizing;
@@ -736,7 +737,8 @@ impl std::fmt::Display for RoomEnd {
 pub(crate) struct DisplayStamp {
     incarnation: Arc<std::sync::atomic::AtomicU64>,
     rewrite: u64,
-    rendered_len: usize,
+    rendered_roots: [u64; 4],
+    rendered_count: u64,
     order_revision: u64,
     body_revision: u64,
     session_revision: u64,
@@ -749,7 +751,8 @@ impl PartialEq for DisplayStamp {
     fn eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.incarnation, &other.incarnation)
             && self.rewrite == other.rewrite
-            && self.rendered_len == other.rendered_len
+            && self.rendered_roots == other.rendered_roots
+            && self.rendered_count == other.rendered_count
             && self.order_revision == other.order_revision
             && self.body_revision == other.body_revision
             && self.session_revision == other.session_revision
@@ -797,7 +800,7 @@ pub struct Rendered {
     /// **Not received yet** (V030-10): a message whose signed envelope this node holds and whose
     /// body no peer has supplied yet, and which has not expired by this node's own reckoning. Its
     /// `text` is empty; it is asked for again on every sync, and replaced by the message when the
-    /// body arrives. Never stored: [`ChannelState::shown_timeline`] places one for each owed body.
+    /// body arrives. Selected history queries derive each placeholder from sealed owed facts.
     pub owed: bool,
 }
 
@@ -895,20 +898,11 @@ pub struct ChannelState {
     /// The next `LogDb` / `PlaintextCache` segment id.
     next_log_id: u64,
     /// Stored entries set aside when the room opened (V210-74): each as `author#seq: why`.
-    set_aside: Vec<String>,
+    set_aside: SetAside,
     /// A receiver chain advanced in memory since the chains were last written (V210-74): a decrypt
     /// uses its message key up even when what it opened does not render, so a pass that rendered
     /// nothing must write the chains too, or a restart could derive that key again.
     chains_advanced: bool,
-    /// The read records this node holds and can open (ADR-028 §6), by the record's entry hash:
-    /// `(reader, entries read)`. Never rows of the timeline (RR-4).
-    read_records: BTreeMap<Digest32, (Digest32, Vec<Digest32>)>,
-    /// [`Self::read_records`] turned round: for each entry read, each reader and how many of its
-    /// records name it. A count, so a record pruned by retention takes away only its own share.
-    reads: BTreeMap<Digest32, BTreeMap<Digest32, u32>>,
-    /// Read records decrypted into a batch not yet committed: applied by
-    /// [`Self::place_committed`] once it has, as rendered rows are.
-    pending_reads: Vec<(ReadRow, u64)>,
     /// Sealed exact-hash subtype evidence; never a permission or recovery eligibility decision.
     legacy_sessions: legacy_session::LegacySessions,
     /// Own-feed declaration cursor and the capable readers covered by that scan.
@@ -918,26 +912,20 @@ pub struct ChannelState {
     /// last sync with this node (ADR-028 R-6): the highest seq of the feed its frontier named.
     /// Persisted as [`SEG_HELD`].
     held: BTreeMap<Digest32, u64>,
-    /// **Bodies owed** (V030-10): `(author, seq)` of each entry held without its body that has not
-    /// expired by this node's own reckoning ([`ChannelState::body_expired`]). Asked of every peer
-    /// whose feed reaches it, on every sync, until one supplies it or it expires here. May hold
-    /// positions that have since expired or been filled; [`ChannelState::forget_settled_owed`]
-    /// drops those.
-    owed: BTreeSet<(Digest32, u64)>,
-    /// The last owed position [`ChannelState::owed_wants`] asked for: the next session asks from
-    /// after it, so bodies no peer holds never keep the rest from being asked for.
+    /// Last missing-body position examined by `owed_wants`, including ineligible positions.
+    /// The next session resumes after it and wraps, so unavailable bodies cannot starve others.
     owed_asked_to: Option<(Digest32, u64)>,
     /// The latest time this room was told (milliseconds): what "expired by now" is reckoned against
     /// where no clock is passed in (the view, the want-list).
     now_hint: u64,
-    /// Rendered rows in the room's one order ([`Dag::causal_order`]), never in the
-    /// order they arrived (PRD-001 R13).
-    timeline: Vec<Rendered>,
     projection_state: history::State,
-    /// The [`Dag::reorder_generation`] the timeline was last sorted at.
-    timeline_generation: u64,
-    /// Changes that cannot extend the previous rendered prefix. Pure end appends are
-    /// distinguished by timeline length; unchanged owed rows need no repeated scan.
+    /// Constant-size display watermarks; plaintext bodies live only in the sealed cache.
+    /// A late insertion or canonical move invalidates a notice scan, but an end append does not.
+    display_tail: Option<(u64, Digest32)>,
+    display_order_revision: u64,
+    /// Highest shown time in this open incarnation, to notice a backwards wall-clock step.
+    display_shown_at: u64,
+    /// Changes that cannot extend the previous rendered prefix.
     display_rewrite: u64,
     /// entry hash -> the `LogDb` page it is stored in, so a signature dropped under a
     /// checkpoint (ADR-023 decision 3) can be rewritten in place.
@@ -1012,7 +1000,7 @@ pub struct ChannelState {
     /// Retaining it is a deliberate, bounded decision (recorded in ADR-016): it is a
     /// **group** secret every member already holds, scoped to one channel and one
     /// epoch, and it sits beside the SEK it derives — an attacker who can read this
-    /// memory already has the SEK and the decrypted timeline, which are strictly
+    /// memory already has the SEK and can decrypt its saved history, which are strictly
     /// more valuable. It is wiped by [`ChannelState::lock_now`] with the SEK, never
     /// written to disk, and never crosses the client boundary (no view, event or
     /// `Debug` output carries it).
@@ -1025,8 +1013,6 @@ pub struct ChannelState {
     /// actor from the node's config; the room's own lives in the checked governance display.
     node_retention: u64,
     node_step_retention: u64,
-    /// Locally authenticated classification survives removal of the encrypted body.
-    step_bodies: std::collections::HashSet<Digest32>,
     /// When this node last pruned anything in the room (milliseconds), or opened it: what a closing
     /// checkpoint waits [`ChannelState::set_checkpoint_idle`] past (ADR-023 decision 3).
     last_pruned_at: u64,
@@ -1599,61 +1585,11 @@ fn parse_cache(bytes: &[u8]) -> Result<CacheRow> {
     }))
 }
 
-/// Add `row` to a room's read records and the index turned round from them.
-fn index_read(
-    records: &mut BTreeMap<Digest32, (Digest32, Vec<Digest32>)>,
-    reads: &mut BTreeMap<Digest32, BTreeMap<Digest32, u32>>,
-    row: ReadRow,
-) {
-    if records.contains_key(&row.entry_hash) {
-        return;
-    }
-    for h in &row.read {
-        *reads.entry(*h).or_default().entry(row.reader).or_default() += 1;
-    }
-    records.insert(row.entry_hash, (row.reader, row.read));
-}
-
-/// Sort rendered rows into the room's one order ([`Dag::order_key`]) and mark the late
-/// ones. A row the DAG does not hold cannot be in a timeline (every row is render-gated
-/// by it); it would sort last rather than panic.
-fn sort_timeline(dag: &Dag, entries: &impl EntryRead, timeline: &mut [Rendered]) -> Result<()> {
-    let mut failure = None;
-    timeline.sort_by_cached_key(|r| match dag.order_key(entries, &r.entry_hash) {
-        Ok(key) => key.unwrap_or((u64::MAX, r.entry_hash)),
-        Err(error) => {
-            failure.get_or_insert(error);
-            (u64::MAX, r.entry_hash)
-        }
-    });
-    if let Some(error) = failure {
-        return Err(error);
-    }
-    mark_late(timeline);
-    Ok(())
-}
-
-/// Mark each row placed above a row the reader had already been shown — shown at least
-/// [`LATE_AFTER_MS`] before this one arrived (see [`Rendered::late`]). One pass from the
-/// bottom, tracking the earliest time any row below was shown.
+/// The wall-clock stamp stored with a rendering for this open incarnation.
 fn shown_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-}
-
-fn mark_late(timeline: &mut [Rendered]) -> bool {
-    let mut earliest_below = u64::MAX;
-    let mut changed = false;
-    for r in timeline.iter_mut().rev() {
-        let late = earliest_below
-            .checked_add(LATE_AFTER_MS)
-            .is_some_and(|seen| r.shown_at_ms >= seen);
-        changed |= r.late != late;
-        r.late = late;
-        earliest_below = earliest_below.min(r.shown_at_ms);
-    }
-    changed
 }
 
 impl ChannelState {
@@ -1844,21 +1780,18 @@ impl ChannelState {
             presence: BTreeMap::new(),
             sender,
             next_log_id: 1,
-            set_aside: Vec::new(),
+            set_aside: SetAside::default(),
             chains_advanced: false,
-            read_records: BTreeMap::new(),
-            reads: BTreeMap::new(),
-            pending_reads: Vec::new(),
             legacy_sessions: legacy_session::LegacySessions::default(),
             legacy_announced: None,
             private_sessions: private_session::PrivateSessions::default(),
             held: BTreeMap::new(),
-            owed: BTreeSet::new(),
             owed_asked_to: None,
             now_hint: now_ms,
-            timeline: Vec::new(),
             projection_state: history::State::default(),
-            timeline_generation: 0,
+            display_tail: None,
+            display_order_revision: 0,
+            display_shown_at: 0,
             display_rewrite: 0,
             entries,
             inbound_packages: Vec::new(),
@@ -1875,7 +1808,6 @@ impl ChannelState {
             delivered: BTreeMap::new(),
             node_retention: 0,
             node_step_retention: 0,
-            step_bodies: std::collections::HashSet::new(),
             last_pruned_at: now_ms,
             checkpoint_idle: CHECKPOINT_IDLE_SECS,
             history: BTreeMap::new(),
@@ -1903,8 +1835,7 @@ impl ChannelState {
 
     /// Open a channel from the store: double-lock unwrap of the SEK, then rebuild
     /// the DAG from the log segments through the full acceptance predicate, load
-    /// the timeline from the plaintext cache (rows whose entry is not in the DAG
-    /// are dropped), and restore the sender chain.
+    /// sealed rendering index (without retaining plaintext bodies), and restore the sender chain.
     pub fn open(
         profile: &Profile,
         channel_id: &Digest32,
@@ -1990,17 +1921,14 @@ impl ChannelState {
 
         let mut next_log_id = 1u64;
         let mut presence = BTreeMap::new();
-        let mut step_bodies = std::collections::HashSet::new();
+        let mut retained_step_body = None;
         // Key-packages for this identity found on reload are offered again: installing one
         // twice is harmless (`accept_skdm` keeps the live chain), and one that arrived just
         // before a crash would otherwise never be installed.
         let mut inbound_packages = Vec::new();
         let mut packages_from = BTreeSet::new();
-        let mut set_aside = Vec::new();
+        let mut set_aside = SetAside::default();
         let mut unlinked = 0usize;
-        // Each entry held without its body, `(author, seq, claimed_ms)`: owed again unless it has
-        // expired here (V030-10).
-        let mut held_bare: Vec<(Digest32, u64, u64)> = Vec::new();
         store.visit_segments(channel_id, SegmentKind::LogDb, |id, seg| {
             next_log_id = id.saturating_add(1);
             let wire = open_segment(&sek, SegmentKind::LogDb, id, &seg)?;
@@ -2074,8 +2002,8 @@ impl ChannelState {
                     .payload
                     .as_deref()
                     .is_some_and(|p| is_step_body(channel_id, p));
-            if steps {
-                step_bodies.insert(entry.entry_hash());
+            if steps && entry.payload.is_some() {
+                retained_step_body.get_or_insert_with(|| entry.entry_hash());
             }
             if let Some(payload) = entry.payload.as_deref() {
                 if let Some(pkg) = Some(payload)
@@ -2087,13 +2015,6 @@ impl ChannelState {
                         packages_from.insert(entry.skeleton.author_id);
                     }
                 }
-            }
-            if entry.payload.is_none() {
-                held_bare.push((
-                    entry.skeleton.author_id,
-                    entry.skeleton.seq,
-                    entry.skeleton.claimed_ms,
-                ));
             }
             match dag.accept(&mut entry_read, entry, kind, &key, &admission) {
                 Ok(_) => {}
@@ -2245,47 +2166,15 @@ impl ChannelState {
             }
         }
 
-        // Timeline from the sealed plaintext cache, render-gated by the DAG — and by
-        // retention: a row whose body is gone is not shown, whatever the cache says.
-        //
-        // A cache row takes its id from the same counter as the log (a received message's row is
-        // the id after its entry's), so the counter resumes past the highest of **both** (V210-73).
-        // Resumed from the log alone, the first post after a restart took the id of the last
-        // received message's cache row, and its own cache row overwrote that one: the message
-        // was gone from the room at the next restart.
-        let mut timeline = Vec::new();
-        let (mut read_records, mut reads) = (BTreeMap::new(), BTreeMap::new());
-        store.visit_segments(channel_id, SegmentKind::PlaintextCache, |id, seg| {
+        // Cache and log ids share one allocator. Resume past both without retaining rows;
+        // prepare_rendered validates and indexes the sealed cache one row at a time below.
+        store.visit_segments(channel_id, SegmentKind::PlaintextCache, |id, segment| {
             next_log_id = next_log_id.max(id.saturating_add(1));
-            let row = open_segment(&sek, SegmentKind::PlaintextCache, id, &seg)?;
-            match parse_cache(&row)? {
-                CacheRow::Text(mut rendered) => {
-                    rendered.arrival = id;
-                    if entry_read
-                        .retention(&rendered.entry_hash)?
-                        .is_some_and(|t| t.cache_id == Some(id))
-                    {
-                        timeline.push(rendered);
-                    }
-                }
-                // A read record ages like a message (RR-2) and is never a row of the timeline.
-                CacheRow::Read(r) => {
-                    if entry_read
-                        .retention(&r.entry_hash)?
-                        .is_some_and(|t| t.cache_id == Some(id))
-                    {
-                        index_read(&mut read_records, &mut reads, r);
-                    }
-                }
-                // Private startup/migration indexes these one row at a time before
-                // publication; no resident transcript is reconstructed here.
-                CacheRow::Session(_) => {}
-            }
+            let row = open_segment(&sek, SegmentKind::PlaintextCache, id, &segment)?;
+            let _ = parse_cache(&row)?;
             Ok(())
         })?;
-        // The cache is in the order rows were rendered; the timeline is in the room's.
-        sort_timeline(&dag, &entry_read, &mut timeline)?;
-        let timeline_generation = dag.reorder_generation();
+        let display_order_revision = dag.reorder_generation();
 
         let sender_seg = store
             .get_segment(channel_id, SegmentKind::KeyMaterial, SEG_SENDER)?
@@ -2399,12 +2288,6 @@ impl ChannelState {
         governance::prepare(store, &sek, channel_id)?;
         // No destructive retention uses a partially rebuilt authority projection.
         let governance_display = governance::Display::genesis(&genesis);
-        let room_ttl = 0;
-        let owed = held_bare
-            .into_iter()
-            .filter(|(_, _, claimed)| !expired_at(*claimed, now_ms, room_ttl))
-            .map(|(author, seq, _)| (author, seq))
-            .collect();
         let mut room = Self {
             channel_id: *channel_id,
             genesis,
@@ -2424,19 +2307,16 @@ impl ChannelState {
             next_log_id,
             set_aside,
             chains_advanced: false,
-            read_records,
-            reads,
-            pending_reads: Vec::new(),
             legacy_sessions: legacy_session::LegacySessions::default(),
             legacy_announced: None,
             private_sessions: private_session::PrivateSessions::default(),
             held,
-            owed,
             owed_asked_to: None,
             now_hint: now_ms,
-            timeline,
             projection_state: history::State::default(),
-            timeline_generation,
+            display_tail: None,
+            display_order_revision,
+            display_shown_at: 0,
             display_rewrite: 0,
             entries,
             inbound_packages,
@@ -2451,7 +2331,6 @@ impl ChannelState {
             delivered,
             node_retention: 0,
             node_step_retention: 0,
-            step_bodies,
             last_pruned_at: now_ms,
             checkpoint_idle: CHECKPOINT_IDLE_SECS,
             history,
@@ -2474,6 +2353,11 @@ impl ChannelState {
                     .and_then(|r| r.cache_id)
                     == Some(id))
             })?;
+        room.display_tail = room
+            .entries
+            .render_view(store, &room.sek, &room.channel_id)?
+            .step(None, true, None, true)?
+            .map(|(key, _)| key);
         // Apply the new default while upgrading an existing room, before publishing any
         // cached Session rows or permitting a sync to send its old encrypted bodies.
         room.restore_legacy_sessions(store, now.0)?;
@@ -2481,13 +2365,8 @@ impl ChannelState {
         // author's signed generation announcements before exposing its Session permissions.
         room.index_session_floors(store)?;
         room.restore_private_sessions(store)?;
-        for hash in &room.step_bodies {
-            if room
-                .entry(store, hash)?
-                .is_some_and(|entry| entry.payload.is_some())
-            {
-                room.private_sessions.legacy_pending.insert(*hash);
-            }
+        if let Some(hash) = retained_step_body {
+            room.private_sessions.legacy_pending.insert(hash);
         }
         room.private_sessions.upgrading = !room.private_sessions.legacy_pending.is_empty();
         room.sweep_retention(store, now)?;
@@ -2667,21 +2546,18 @@ impl ChannelState {
             presence: BTreeMap::new(),
             sender,
             next_log_id: 1,
-            set_aside: Vec::new(),
+            set_aside: SetAside::default(),
             chains_advanced: false,
-            read_records: BTreeMap::new(),
-            reads: BTreeMap::new(),
-            pending_reads: Vec::new(),
             legacy_sessions: legacy_session::LegacySessions::default(),
             legacy_announced: None,
             private_sessions: private_session::PrivateSessions::default(),
             held: BTreeMap::new(),
-            owed: BTreeSet::new(),
             owed_asked_to: None,
             now_hint: now_ms,
-            timeline: Vec::new(),
             projection_state: history::State::default(),
-            timeline_generation: 0,
+            display_tail: None,
+            display_order_revision: 0,
+            display_shown_at: 0,
             display_rewrite: 0,
             entries,
             inbound_packages: Vec::new(),
@@ -2697,7 +2573,6 @@ impl ChannelState {
             delivered: BTreeMap::new(),
             node_retention: 0,
             node_step_retention: 0,
-            step_bodies: std::collections::HashSet::new(),
             last_pruned_at: now_ms,
             checkpoint_idle: CHECKPOINT_IDLE_SECS,
             history: BTreeMap::new(),
@@ -4825,14 +4700,46 @@ impl ChannelState {
 
     /// Floor controls carry durable authorization, like governance: neither message nor
     /// Session activity expiry may erase the evidence another reader needs after a restart.
-    fn entry_retention(&self, entry: &Entry) -> u64 {
+    fn entry_retention(&self, transaction: Transaction<'_, '_>, entry: &Entry) -> Result<u64> {
         if entry.payload.as_deref().is_some_and(retained_control) {
-            0
-        } else if self.step_bodies.contains(&entry.entry_hash()) {
+            return Ok(0);
+        }
+        let hash = entry.entry_hash();
+        let index = self
+            .entries
+            .view(transaction, &self.sek, &self.channel_id)?;
+        let steps = if let Some(tracked) = index.retention(&hash)? {
+            tracked.steps
+        } else if let Some(body) = entry.payload.as_deref() {
+            is_step_body(&self.channel_id, body)
+        } else {
+            // Retention removes its own row but keeps this sealed first-seen subtype fact
+            // beside the log. A never-received body may have no such fact; a disk error is
+            // still an error, never evidence that this was ordinary room content.
+            let log = index
+                .log_id(&hash)?
+                .ok_or(Error::MalformedAtRest("retention entry missing"))?;
+            let segment = match transaction {
+                Transaction::Snapshot(snapshot) => {
+                    snapshot.get_segment(&self.channel_id, SegmentKind::Index, log)?
+                }
+                Transaction::Batch(batch) => {
+                    batch.get_segment(&self.channel_id, SegmentKind::Index, log)?
+                }
+            };
+            match segment {
+                Some(segment) => {
+                    parse_first_seen(&open_segment(&self.sek, SegmentKind::Index, log, &segment)?)?
+                        .1
+                }
+                None => false,
+            }
+        };
+        Ok(if steps {
             self.effective_step_retention()
         } else {
             self.effective_retention()
-        }
+        })
     }
 
     /// `(this node's own retention, the room's)` when the node's own asks to keep messages longer
@@ -4861,35 +4768,19 @@ impl ChannelState {
             && expired_at(claimed_ms, now_ms, self.effective_retention())
     }
 
-    /// Drop from the owed bodies every one that has arrived, or has expired here since.
+    /// Examine at most 64 missing positions per turn, removing settled recovery work in
+    /// the same transaction as its placeholder. The cursor advances over retained positions too.
     fn forget_settled_owed(&mut self, store: &Store) -> Result<()> {
-        use std::ops::Bound::{Excluded, Unbounded};
         let result = (|| -> Result<()> {
-            let start = self
-                .projection_state
-                .cleanup_cursor
-                .map_or(Unbounded, Excluded);
-            let positions: Vec<_> = self
-                .owed
-                .range((start, Unbounded))
-                .take(64)
-                .copied()
-                .collect();
-            self.projection_state.cleanup_cursor = if positions.len() == 64 {
-                positions.last().copied()
-            } else {
-                None
-            };
-            if positions.is_empty() {
-                return Ok(());
-            }
             let mut batch = store.batch()?;
             let mut writer = self
                 .entries
                 .write(&mut batch, &self.sek, &self.channel_id)?;
+            let (positions, next) =
+                writer.missing_page(self.projection_state.cleanup_cursor, 64)?;
             let mut changed = false;
-            for position in positions {
-                let entry = writer.get(&position.0, position.1)?;
+            for (author, seq) in positions {
+                let entry = writer.get(&author, seq)?;
                 let keep = match entry.as_ref() {
                     Some(e) => {
                         e.payload.is_none()
@@ -4898,7 +4789,7 @@ impl ChannelState {
                                 && expired_at(
                                     e.skeleton.claimed_ms,
                                     self.now_hint,
-                                    self.entry_retention(e),
+                                    self.entry_retention(Transaction::Batch(writer.batch()), e)?,
                                 ))
                     }
                     None => false,
@@ -4907,8 +4798,7 @@ impl ChannelState {
                     if let Some(entry) = entry {
                         writer.set_owed(entry.entry_hash(), None)?;
                     }
-                    self.owed.remove(&position);
-                    changed = true;
+                    changed |= writer.set_missing(&author, seq, false)?;
                 }
             }
             if changed {
@@ -4917,6 +4807,7 @@ impl ChannelState {
                 self.entries.committed();
                 self.invalidate_display();
             }
+            self.projection_state.cleanup_cursor = next;
             Ok(())
         })();
         if let Err(ref error) = result {
@@ -4925,145 +4816,113 @@ impl ChannelState {
         result
     }
 
-    /// The positions to ask a peer for whose bodies are owed here (V030-10), as want ranges: each
-    /// that the peer's feed reaches (`remote`), below anything `wants` already asks of that author,
-    /// at most [`MAX_OWED_ASKED`] positions per session, taken in turn from after the last one
-    /// asked for.
+    /// Ask for at most MAX_OWED_ASKED bodies after examining at most 256 missing positions.
+    /// Advance past every examined position, including frozen, expired and unreachable ones;
+    /// wrap once to the start without revisiting positions from this same call.
     pub fn owed_wants(
         &mut self,
         store: &Store,
         remote: &[crate::log::sync::FeedFrontier],
         wants: &[crate::log::sync::WantRange],
     ) -> Result<Vec<crate::log::sync::WantRange>> {
-        use std::ops::Bound::{Excluded, Unbounded};
         self.forget_settled_owed(store)?;
+        let entries = self.entries.read(store, &self.sek, &self.channel_id)?;
         let mut out: Vec<crate::log::sync::WantRange> = Vec::new();
         let mut asked = 0usize;
-        let mut last = None;
-        let turn: Vec<(Digest32, u64)> = match self.owed_asked_to {
-            Some(p) => self
-                .owed
-                .range((Excluded(p), Unbounded))
-                .chain(self.owed.range(..=p))
-                .copied()
-                .collect(),
-            None => self.owed.iter().copied().collect(),
-        };
-        for (author, seq) in &turn {
-            if asked >= MAX_OWED_ASKED {
-                break;
+        let mut examined = 0usize;
+        let start = self.owed_asked_to;
+        let mut after = start;
+        let mut wrapped = false;
+        'scan: while examined < 256 && asked < MAX_OWED_ASKED {
+            let (positions, next) = entries.missing_page(after, 256 - examined)?;
+            for (author, seq) in positions {
+                if wrapped && start.is_some_and(|start| (author, seq) > start) {
+                    break 'scan;
+                }
+                examined += 1;
+                self.owed_asked_to = Some((author, seq));
+                // Not of a frozen author, nor beyond a refused feed suffix (ADR-025 D3).
+                if self.dag.is_frozen(&author)
+                    || self
+                        .dag
+                        .refused_from(&author)
+                        .is_some_and(|from| seq >= from)
+                    || !remote
+                        .iter()
+                        .any(|f| f.author_id == author && f.max_seq >= seq)
+                    || !wants
+                        .iter()
+                        .filter(|w| w.author_id == author)
+                        .all(|w| seq < w.from_seq)
+                {
+                    continue;
+                }
+                let entry = entries
+                    .get(&author, seq)?
+                    .ok_or(Error::MalformedAtRest("missing-body entry missing"))?;
+                // Cleanup has its own small budget. Recheck every requested position so a
+                // settled position beyond that cleanup page is never asked for again.
+                if entry.payload.is_some()
+                    || self.private_id(store, &entry.entry_hash())?.is_some()
+                    || (self.governance_display_current(self.now_hint)
+                        && expired_at(
+                            entry.skeleton.claimed_ms,
+                            self.now_hint,
+                            self.entry_retention(entries.transaction(), &entry)?,
+                        ))
+                {
+                    continue;
+                }
+                asked += 1;
+                match out.last_mut() {
+                    Some(w) if w.author_id == author && w.to_seq.checked_add(1) == Some(seq) => {
+                        w.to_seq = seq
+                    }
+                    _ => out.push(crate::log::sync::WantRange {
+                        author_id: author,
+                        from_seq: seq,
+                        to_seq: seq,
+                    }),
+                }
+                if asked == MAX_OWED_ASKED {
+                    break 'scan;
+                }
             }
-            // Not of a frozen author, nor from where an author's feed is closed here: as
-            // `wants_for_unfrozen` (ADR-025 D3, V210-74).
-            if self.dag.is_frozen(author)
-                || self
-                    .dag
-                    .refused_from(author)
-                    .is_some_and(|from| *seq >= from)
-            {
-                continue;
+            match next {
+                Some(next) => after = Some(next),
+                None if start.is_some() && !wrapped => {
+                    after = None;
+                    wrapped = true;
+                }
+                None => break,
             }
-            let reaches = remote
-                .iter()
-                .any(|f| f.author_id == *author && f.max_seq >= *seq);
-            let below = wants
-                .iter()
-                .filter(|w| w.author_id == *author)
-                .all(|w| *seq < w.from_seq);
-            if !reaches || !below {
-                continue;
-            }
-            asked += 1;
-            last = Some((*author, *seq));
-            match out.last_mut() {
-                Some(w) if w.author_id == *author && w.to_seq + 1 == *seq => w.to_seq = *seq,
-                _ => out.push(crate::log::sync::WantRange {
-                    author_id: *author,
-                    from_seq: *seq,
-                    to_seq: *seq,
-                }),
-            }
-        }
-        if last.is_some() {
-            self.owed_asked_to = last;
         }
         Ok(out)
-    }
-
-    /// The entries whose body is owed here and not expired: each is shown as **not received yet**
-    /// ([`ChannelState::shown_timeline`]).
-    fn owed_shown<'a>(
-        &'a self,
-        entries: &'a impl EntryRead,
-    ) -> impl Iterator<Item = Result<(Entry, Digest32, u64)>> + 'a {
-        self.owed.iter().filter_map(move |(author, seq)| {
-            let result = (|| -> Result<Option<(Entry, Digest32, u64)>> {
-                let Some(feed) = self.dag.feed(author) else {
-                    return Ok(None);
-                };
-                let Some(entry) = feed.get(entries, *seq)? else {
-                    return Ok(None);
-                };
-                if entry.payload.is_some() {
-                    return Ok(None);
-                }
-                let hash = entry.entry_hash();
-                let ttl = self.entry_retention(&entry);
-                Ok((!self.legacy_sessions.is_session(&hash)
-                    && !(self.governance_display_current(self.now_hint)
-                        && expired_at(entry.skeleton.claimed_ms, self.now_hint, ttl)))
-                .then_some((entry, hash, ttl)))
-            })();
-            match result {
-                Ok(Some(row)) => Some(Ok(row)),
-                Ok(None) => None,
-                Err(error) => Some(Err(error)),
-            }
-        })
-    }
-
-    /// Whether a public projection has a body still owed. A disk failure is not an empty room.
-    pub fn shows_owed(&self, store: &Store) -> Result<bool> {
-        let entries = self.entries.read(store, &self.sek, &self.channel_id)?;
-        let shown = self.owed_shown(&entries).next().transpose()?.is_some();
-        Ok(shown)
-    }
-
-    /// Public rows in room order, including authenticated owed-body placeholders.
-    pub fn shown_timeline(&self, store: &Store) -> Result<Vec<Rendered>> {
-        Ok(self.display_timeline(store)?.0.into_owned())
     }
 
     fn invalidate_display(&mut self) {
         self.display_rewrite = self.display_rewrite.wrapping_add(1);
     }
 
-    /// Check before walking any owed or rendered rows. Wall-clock progress only matters
-    /// when it crosses the first visible owed row's expiry, using the room's own clock.
-    pub(crate) fn display_is_current(&self, stamp: &DisplayStamp) -> bool {
-        self.display_extends(stamp) && stamp.rendered_len == self.timeline.len()
-    }
-
-    pub(crate) fn display_extends(&self, stamp: &DisplayStamp) -> bool {
-        Arc::ptr_eq(&self.gen, &stamp.incarnation)
-            && self.display_rewrite == stamp.rewrite
-            && self.dag.reorder_generation() == stamp.order_revision
-            && self.dag.body_generation() == stamp.body_revision
-            && self.legacy_sessions.display_revision() == stamp.session_revision
-            && (self.effective_retention(), self.effective_step_retention()) == stamp.retention
-            && stamp.rendered_len <= self.timeline.len()
-            && stamp.expires_at.is_none_or(|at| self.now_hint < at)
+    /// Compare the same sealed snapshot facts used to publish the candidate view. Expiry
+    /// remains a wall-clock fence even when no entry or cache root changed meanwhile.
+    pub(crate) fn display_is_current(&self, stamp: &DisplayStamp, current: &DisplayStamp) -> bool {
+        stamp == current && stamp.expires_at.is_none_or(|at| self.now_hint < at)
     }
 
     /// Compact display invalidation facts, without collecting rendered rows or owed bodies.
     pub(crate) fn display_stamp(&self, store: &Store) -> Result<DisplayStamp> {
+        if self.poisoned {
+            return Err(self.save_failure());
+        }
         let rendered = self
             .entries
             .render_view(store, &self.sek, &self.channel_id)?;
         Ok(DisplayStamp {
             incarnation: self.gen.clone(),
             rewrite: self.display_rewrite,
-            rendered_len: self.timeline.len(),
+            rendered_roots: rendered.display_roots(),
+            rendered_count: rendered.count()?,
             order_revision: self.dag.reorder_generation(),
             body_revision: self.dag.body_generation(),
             session_revision: self.legacy_sessions.display_revision(),
@@ -5071,64 +4930,6 @@ impl ChannelState {
             expires_at: rendered.next_owed_expiry()?,
             owed: rendered.owed_before(None)? != 0,
         })
-    }
-
-    /// Build only after the previous projection's stamp no longer matches. Borrow the
-    /// ordinary rendered timeline, and hash each owed skeleton once while collecting both
-    /// its placeholder and the next expiry boundary for subsequent constant-time reuse.
-    pub(crate) fn display_timeline(
-        &self,
-        store: &Store,
-    ) -> Result<(Cow<'_, [Rendered]>, DisplayStamp)> {
-        let mut expires_at = None;
-        let entries = self.entries.read(store, &self.sek, &self.channel_id)?;
-        let mut owed = Vec::new();
-        for item in self.owed_shown(&entries) {
-            let (e, hash, ttl) = item?;
-            if ttl != 0 {
-                if let Some(at) = e.skeleton.claimed_ms.checked_add(ttl.saturating_mul(1_000)) {
-                    expires_at = Some(expires_at.map_or(at, |old: u64| old.min(at)));
-                }
-            }
-            owed.push(Rendered {
-                entry_hash: hash,
-                author: e.skeleton.author_id,
-                created_millis: e.skeleton.claimed_ms,
-                text: String::new(),
-                arrival: 0,
-                shown_at_ms: 0,
-                late: false,
-                owed: true,
-            });
-        }
-        let stamp = DisplayStamp {
-            incarnation: self.gen.clone(),
-            rewrite: self.display_rewrite,
-            rendered_len: self.timeline.len(),
-            order_revision: self.dag.reorder_generation(),
-            body_revision: self.dag.body_generation(),
-            session_revision: self.legacy_sessions.display_revision(),
-            retention: (self.effective_retention(), self.effective_step_retention()),
-            expires_at,
-            owed: !owed.is_empty(),
-        };
-        if owed.is_empty() {
-            return Ok((Cow::Borrowed(&self.timeline), stamp));
-        }
-        let mut rows: Vec<Rendered> = self.timeline.iter().cloned().chain(owed).collect();
-        // Sorted only: the `late` marks are the timeline's, and an owed row was never shown.
-        let mut failure = None;
-        rows.sort_by_cached_key(|r| match self.dag.order_key(&entries, &r.entry_hash) {
-            Ok(key) => key.unwrap_or((u64::MAX, r.entry_hash)),
-            Err(error) => {
-                failure.get_or_insert(error);
-                (u64::MAX, r.entry_hash)
-            }
-        });
-        if let Some(error) = failure {
-            return Err(error);
-        }
-        Ok((Cow::Owned(rows), stamp))
     }
 
     /// Set the **room's** retention (PRD-001 R7): append an ADR-007 policy-update carrying
@@ -5409,7 +5210,7 @@ impl ChannelState {
         let entry = self
             .entry_at(transaction, entry_hash)?
             .ok_or(Error::MalformedAtRest("rendered entry missing"))?;
-        let ttl = self.entry_retention(&entry);
+        let ttl = self.entry_retention(transaction, &entry)?;
         if ttl == 0 {
             return Ok(false);
         }
@@ -5465,6 +5266,7 @@ impl ChannelState {
             return Ok(0);
         }
         let shed = self.effective_retention() != 0;
+        let mut display_changed = false;
         let persisted = (|| -> Result<()> {
             let mut batch = store.batch()?;
             for (hash, tracked) in &due {
@@ -5486,7 +5288,9 @@ impl ChannelState {
                         .entries
                         .write(&mut batch, &self.sek, &self.channel_id)?;
                     index.committing(self.next_log_id);
+                    display_changed |= index.has_rendered(hash)?;
                     index.remove_rendered(hash)?;
+                    index.remove_read_receipt(hash)?;
                     index.set_retention(*hash, None)?;
                     self.dag.prune_payload(&mut index, hash)?;
                     if shed {
@@ -5524,17 +5328,20 @@ impl ChannelState {
         }
         self.entries.committed();
         self.legacy_sessions.committed();
-        let gone: BTreeSet<Digest32> = due.iter().map(|(h, _)| *h).collect();
-        let before = self.timeline.len();
-        self.timeline.retain(|r| !gone.contains(&r.entry_hash));
-        if self.timeline.len() != before {
+        if display_changed {
             self.invalidate_display();
-        }
-        for h in &gone {
-            self.forget_read_record(h);
-        }
-        if mark_late(&mut self.timeline) {
-            self.invalidate_display();
+            let tail = self
+                .entries
+                .render_view(store, &self.sek, &self.channel_id)
+                .and_then(|view| view.step(None, true, None, true))
+                .map(|row| row.map(|(key, _)| key));
+            match tail {
+                Ok(tail) => self.display_tail = tail,
+                Err(error) => {
+                    self.poison(&error);
+                    return Err(error);
+                }
+            }
         }
         Ok(due.len())
     }
@@ -5594,9 +5401,7 @@ impl ChannelState {
             .as_deref()
             .is_some_and(|body| is_step_body(&self.channel_id, body));
         if steps {
-            if self.step_bodies.insert(entry_hash) {
-                self.invalidate_display();
-            }
+            self.invalidate_display();
             self.private_sessions.legacy_pending.insert(entry_hash);
         }
         let claimed_ms = steps.then_some(entry.skeleton.claimed_ms);
@@ -5687,7 +5492,7 @@ impl ChannelState {
 
     /// The stored entries set aside when this room opened (V210-74), each as `author#seq: why`.
     #[must_use]
-    pub fn set_aside(&self) -> &[String] {
+    pub fn set_aside(&self) -> &SetAside {
         &self.set_aside
     }
 
@@ -5883,11 +5688,6 @@ impl ChannelState {
                                 "verified suffix has no signed witness",
                             ));
                         }
-                        if !self.body_expired(entry.skeleton.claimed_ms, crate::time::Ms(now_ms))
-                            && self.owed.insert((*author, seq))
-                        {
-                            self.invalidate_display();
-                        }
                         seq = seq
                             .checked_add(1)
                             .ok_or(Error::MalformedAtRest("feed sequence exhausted"))?;
@@ -6044,7 +5844,7 @@ impl ChannelState {
                             &entry_hash,
                         )?
                         .ok_or(Error::MalformedAtRest("synced entry vanished"))?;
-                    let (seq, claimed) = (held.skeleton.seq, held.skeleton.claimed_ms);
+                    let seq = held.skeleton.seq;
                     // Written before the entry is classified, exactly as each entry was when it
                     // committed on its own: a refusal below still leaves its log row stored. A body
                     // that arrived for a held skeleton rewrites that skeleton's page.
@@ -6091,12 +5891,16 @@ impl ChannelState {
                     let Some(payload) = payload else {
                         // A skeleton: stored, never rendered. Its body is owed unless it has
                         // expired here (V030-10).
-                        if !self.body_expired(claimed, crate::time::Ms(now_ms))
-                            && self.owed.insert((author, seq))
-                        {
-                            self.invalidate_display();
-                        }
-                        let visibility = self.owed_visibility(&batch, &held)?;
+                        // Promotion already inserted the missing position atomically.
+                        let missing = self
+                            .entries
+                            .write(&mut batch, &self.sek, &self.channel_id)?
+                            .missing_contains(&author, seq)?;
+                        let visibility = if missing {
+                            self.owed_visibility(&batch, &held)?
+                        } else {
+                            None
+                        };
                         let mut writer =
                             self.entries
                                 .write(&mut batch, &self.sek, &self.channel_id)?;
@@ -6104,16 +5908,6 @@ impl ChannelState {
                         writer.seal()?;
                         return Ok(Ok(Vec::new()));
                     };
-                    {
-                        let mut writer =
-                            self.entries
-                                .write(&mut batch, &self.sek, &self.channel_id)?;
-                        writer.set_owed(entry_hash, None)?;
-                        writer.seal()?;
-                    }
-                    if self.owed.remove(&(author, seq)) {
-                        self.invalidate_display();
-                    }
                     let wire_kind = refuse!(classify_payload(&payload));
                     let gov = match wire_kind {
                         EntryKind::Governance | EntryKind::Content
@@ -6175,6 +5969,7 @@ impl ChannelState {
                     self.queue_legacy_sessions(&mut batch)?;
                 }
                 self.queue_private_generations(&mut batch)?;
+
                 batch.commit()
             })(),
         };
@@ -6197,7 +5992,7 @@ impl ChannelState {
         out.rendered += rendered_rows.len();
         self.place_committed(store, rendered_rows, &expired)?;
         // An entry that arrived may be a parent others named before it: rows move.
-        self.settle_timeline(store)?;
+        self.settle_display_order(store)?;
         // Reconciliation done; only now surface a session failure, with its coded
         // reason preserved (ADR-008 never downgrades a failure silently).
         Ok(out)
@@ -6875,6 +6670,7 @@ impl ChannelState {
             if self.chains_advanced {
                 self.queue_receivers(&mut batch)?;
             }
+
             batch.commit()
         })();
         if let Err(e) = result {
@@ -6946,11 +6742,7 @@ impl ChannelState {
             }
             bytes = bytes.saturating_add(cost);
             let already = writer.has_rendered(&hash)?
-                || self.read_records.contains_key(&hash)
-                || self
-                    .pending_reads
-                    .iter()
-                    .any(|(row, _)| row.entry_hash == hash)
+                || writer.read_receipt_cache(&hash)?.is_some()
                 || writer
                     .retention(&hash)?
                     .is_some_and(|r| r.cache_id.is_some())
@@ -7009,6 +6801,7 @@ impl ChannelState {
             if self.chains_advanced {
                 self.queue_receivers(&mut batch)?;
             }
+
             batch.commit()?;
             Ok(rows)
         })();
@@ -7053,7 +6846,6 @@ impl ChannelState {
             )?;
             if row.is_none()
                 && expired.is_empty()
-                && self.pending_reads.is_empty()
                 && self.drive.pending.is_empty()
                 && !self.chains_advanced
                 && !self.legacy_sessions.dirty()
@@ -7061,6 +6853,7 @@ impl ChannelState {
                 return Ok(None);
             }
             self.queue_receivers(&mut batch)?;
+
             batch.commit()?;
             Ok(row)
         })();
@@ -7193,9 +6986,13 @@ impl ChannelState {
                     id,
                     &cache_seg,
                 )?;
-                self.queue_retention_rendered(batch, &entry_hash, row.created_millis, Some(id))?;
+                {
+                    let mut index = self.entries.write(batch, &self.sek, &self.channel_id)?;
+                    index.put_read_receipt(&row, id)?;
+                    index.retention_rendered(&entry_hash, row.created_millis, Some(id))?;
+                    index.seal()?;
+                }
                 self.next_log_id = id.saturating_add(1);
-                self.pending_reads.push((row, id));
                 return Ok(None);
             }
             // A Session entry sealed under the sender key is not one: its node gave it to every
@@ -7261,26 +7058,54 @@ impl ChannelState {
         Ok(Some(rendered))
     }
 
-    /// What follows a committed render pass, in memory: each row is recorded for retention and
-    /// placed at its spot in the room's order ([`Self::place_rendered`]), and any expired late
-    /// arrival is pruned — in a transaction of its own, now that the pass's has committed.
+    /// The data commit has completed. Give its bounded rows one visibility time before
+    /// publishing their display facts, so time spent decrypting or committing this batch
+    /// cannot make its own rows look late relative to each other.
+    fn seal_render_visibility(&mut self, store: &Store, rows: &[Rendered]) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let shown = shown_now();
+        let result = (|| -> Result<()> {
+            let mut batch = store.batch()?;
+            let mut index = self
+                .entries
+                .write(&mut batch, &self.sek, &self.channel_id)?;
+            for row in rows {
+                index.remove_rendered(&row.entry_hash)?;
+            }
+            for row in rows {
+                index.put_rendered(row, shown)?;
+            }
+            index.seal()?;
+            batch.commit()?;
+            self.entries.committed();
+            Ok(())
+        })();
+        if let Err(ref error) = result {
+            self.poison(error);
+        }
+        result
+    }
+
+    /// After a committed render pass, retain only display watermarks.
+    /// Bodies/order/late facts are already sealed. Prune expired late arrivals in their own
+    /// transaction now that the rendering batch has committed.
     fn place_committed(
         &mut self,
         store: &Store,
         rows: Vec<Rendered>,
         expired: &[(Digest32, Tracked)],
     ) -> Result<()> {
+        self.seal_render_visibility(store, &rows)?;
         self.legacy_sessions.committed();
         for (row, _) in std::mem::take(&mut self.drive.pending) {
             if !crate::node::drive::is_key_changed(&row.session_id) {
                 self.drive.news.push(row.session_id.clone());
             }
         }
-        for (row, _) in std::mem::take(&mut self.pending_reads) {
-            index_read(&mut self.read_records, &mut self.reads, row);
-        }
         for rendered in rows {
-            self.place_rendered(store, rendered)?;
+            self.note_rendered(store, &rendered.entry_hash)?;
         }
         let settled = (|| -> Result<()> {
             if !expired.is_empty() {
@@ -7324,71 +7149,52 @@ impl ChannelState {
         batch.put_segment(&self.channel_id, SegmentKind::KeyMaterial, SEG_DRIVE, &seg)
     }
 
-    /// Insert a just-rendered row at its place in the room's order — which is above
-    /// rows already shown when it arrived late (ADR-023 decision 1) — and re-sort first
-    /// if a late parent has moved rows since the last sort.
-    ///
-    /// The row's shown time is read **now**, from the system clock, not from the caller. A sync
-    /// session hands its render the time the session *began*, and since v0.2.9 a session locks the
-    /// room per step, so one that stalls on a peer can span rows posted meanwhile: a post it
-    /// delivers late was stamped as shown before them, and was never marked late (measured on
-    /// the v0.3.0 integration). "When the reader could first see it" is this moment.
-    fn place_rendered(&mut self, store: &Store, mut rendered: Rendered) -> Result<()> {
-        rendered.shown_at_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
-        let position = (|| -> Result<usize> {
-            self.settle_timeline(store)?;
-            if self.poisoned {
-                return Err(self.save_failure());
+    /// Note only the committed row's sealed ordering and shown-time facts. No plaintext is
+    /// retained, and late flags are derived by RenderView from ranked suffix metadata.
+    fn note_rendered(&mut self, store: &Store, hash: &Digest32) -> Result<()> {
+        let result = (|| -> Result<()> {
+            self.settle_display_order(store)?;
+            let rendered = self
+                .entries
+                .render_view(store, &self.sek, &self.channel_id)?;
+            let key = rendered
+                .order()
+                .key(hash)?
+                .ok_or(Error::MalformedAtRest("rendered entry not published"))?;
+            let fact = rendered
+                .fact(hash)?
+                .ok_or(Error::MalformedAtRest("committed rendering missing"))?;
+            drop(rendered);
+            if self.display_tail.is_some_and(|tail| key <= tail)
+                || fact.shown < self.display_shown_at
+            {
+                self.invalidate_display();
             }
-            let entries = self.entries.read(store, &self.sek, &self.channel_id)?;
-            let key = self.dag.order_key(&entries, &rendered.entry_hash)?;
-            let mut failure = None;
-            let at = self.timeline.partition_point(|r| {
-                match self.dag.order_key(&entries, &r.entry_hash) {
-                    Ok(old) => old <= key,
-                    Err(error) => {
-                        failure.get_or_insert(error);
-                        false
-                    }
-                }
-            });
-            match failure {
-                Some(error) => Err(error),
-                None => Ok(at),
-            }
+            self.display_tail = Some(self.display_tail.map_or(key, |tail| tail.max(key)));
+            self.display_shown_at = self.display_shown_at.max(fact.shown);
+            Ok(())
         })();
-        let at = match position {
-            Ok(at) => at,
-            Err(error) => {
-                // The row is already durable. Keep its receipt for the local poster, but the
-                // poisoned room publishes no replacement view until recovery reopens it.
-                self.timeline.push(rendered);
-                self.poison(&error);
-                return Err(error);
-            }
-        };
-        let appended = at == self.timeline.len();
-        self.timeline.insert(at, rendered);
-        let remarked = mark_late(&mut self.timeline);
-        if !appended || remarked {
-            self.invalidate_display();
+        if let Err(ref error) = result {
+            self.poison(error);
         }
-        Ok(())
+        result
     }
 
-    fn settle_timeline(&mut self, store: &Store) -> Result<()> {
+    /// Canonical moves are already reflected in the sealed render tree. Refresh just the
+    /// tail watermark and invalidate any notice scan that depended on the old prefix.
+    fn settle_display_order(&mut self, store: &Store) -> Result<()> {
         let result = (|| -> Result<()> {
             if self.poisoned {
                 return Err(self.save_failure());
             }
             let generation = self.dag.reorder_generation();
-            if generation != self.timeline_generation {
-                let entries = self.entries.read(store, &self.sek, &self.channel_id)?;
-                sort_timeline(&self.dag, &entries, &mut self.timeline)?;
-                drop(entries);
-                self.timeline_generation = generation;
+            if generation != self.display_order_revision {
+                self.display_tail = self
+                    .entries
+                    .render_view(store, &self.sek, &self.channel_id)?
+                    .step(None, true, None, true)?
+                    .map(|(key, _)| key);
+                self.display_order_revision = generation;
                 self.invalidate_display();
             }
             Ok(())
@@ -7528,7 +7334,7 @@ impl ChannelState {
         self.gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.finish_entry_publication(store)?;
         // It may be a parent rows already shown named before it arrived.
-        self.settle_timeline(store)?;
+        self.settle_display_order(store)?;
         if kind == EntryKind::Checkpoint {
             return Ok(Accepted::Checkpoint);
         }
@@ -7748,6 +7554,9 @@ impl ChannelState {
             return Err(e);
         }
         self.entries.committed();
+        // The send is already durable. A display-finalization error poisons future reads,
+        // but must not tell the caller that this committed message was never sent.
+        let _ = self.seal_render_visibility(profile.store(), std::slice::from_ref(&rendered));
         let _ = self.finish_entry_publication(profile.store());
         self.next_log_id = id.saturating_add(1);
         self.gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -7758,42 +7567,25 @@ impl ChannelState {
             self.skipped.push_back((entry_hash, skipped));
         }
 
-        // Its `seen` names every head this node holds, so it sorts after all of them;
-        // placed through the same path as any row all the same.
-        // Persistence succeeded; a later ordering read failure reports storage health, not an unsent post.
-        let _ = self.place_rendered(profile.store(), rendered.clone());
+        // Persistence succeeded; a later sealed-index read failure reports storage health,
+        // not an unsent post. The returned receipt needs no retained plaintext copy.
+        let _ = self.note_rendered(profile.store(), &rendered.entry_hash);
         Ok(rendered)
     }
 
-    /// Take a read record pruned by retention out of the index (RR-2).
-    fn forget_read_record(&mut self, record: &Digest32) {
-        let Some((reader, read)) = self.read_records.remove(record) else {
-            return;
-        };
-        for h in read {
-            if let Some(readers) = self.reads.get_mut(&h) {
-                if let Some(n) = readers.get_mut(&reader) {
-                    *n = n.saturating_sub(1);
-                    if *n == 0 {
-                        readers.remove(&reader);
-                    }
-                }
-                if readers.is_empty() {
-                    self.reads.remove(&h);
-                }
+    /// Read one message's readers from the same snapshot as its rendered row. Each index
+    /// fetch is bounded; the returned identities are bounded by the admitted-author limit.
+    fn read_by(rendered: &entry_store::RenderView<'_>, entry: &Digest32) -> Result<Vec<Digest32>> {
+        let mut out = Vec::new();
+        let mut after = None;
+        loop {
+            let (readers, next) = rendered.readers_page(entry, after, 64)?;
+            out.extend(readers);
+            match next {
+                Some(next) => after = Some(next),
+                None => return Ok(out),
             }
         }
-    }
-
-    /// Who this node knows has read `entry`: the authors of the read records it holds and can
-    /// open that name it (ADR-028 RR-3). A member whose records this node cannot open is not here,
-    /// read or not.
-    #[must_use]
-    pub fn read_by(&self, entry: &Digest32) -> Vec<Digest32> {
-        self.reads
-            .get(entry)
-            .map(|r| r.keys().copied().collect())
-            .unwrap_or_default()
     }
 
     /// Record that `member`'s node said, in a sync, it holds this identity's feed here up to `seq`
@@ -7819,6 +7611,9 @@ impl ChannelState {
     /// "on N of M members' nodes"). Only a node's own word counts: an entry sent to it is not
     /// held until it says so.
     pub fn held_own(&self, store: &Store) -> Result<Vec<(Digest32, u64)>> {
+        if self.poisoned {
+            return Err(self.save_failure());
+        }
         let me = self.me();
         let others: Vec<_> = self.members().into_iter().filter(|m| *m != me).collect();
         let rendered = self
@@ -7856,6 +7651,9 @@ impl ChannelState {
     /// and named by no read record of this node's. A room this node never recorded anything read
     /// in counts from its first row. At most [`UNREAD_LOOKED`] rows from the newest are looked at.
     pub fn unread(&self, store: &Store) -> Result<Vec<Digest32>> {
+        if self.poisoned {
+            return Err(self.save_failure());
+        }
         let me = self.me();
         let mut out = Vec::new();
         let rendered = self
@@ -7867,7 +7665,7 @@ impl ChannelState {
                 break;
             };
             cursor = Some(key);
-            if self.read_by(&key.1).contains(&me) {
+            if rendered.was_read(&key.1, &me)? {
                 break;
             }
             let entry = rendered
@@ -7886,6 +7684,9 @@ impl ChannelState {
     /// anyone is known to have read, oldest first: what a client shows under each message it sent
     /// (ADR-028 R-6).
     pub fn read_by_own(&self, store: &Store) -> Result<Vec<(Digest32, Vec<Digest32>)>> {
+        if self.poisoned {
+            return Err(self.save_failure());
+        }
         let rendered = self
             .entries
             .render_view(store, &self.sek, &self.channel_id)?;
@@ -7897,7 +7698,7 @@ impl ChannelState {
                 break;
             };
             cursor = Some(key);
-            let readers = self.read_by(&key.1);
+            let readers = Self::read_by(&rendered, &key.1)?;
             if !readers.is_empty() {
                 out.push((key.1, readers));
             }
@@ -7921,17 +7722,17 @@ impl ChannelState {
         me: &Digest32,
         shown: &[Digest32],
     ) -> Result<Vec<Digest32>> {
+        if self.poisoned {
+            return Err(self.save_failure());
+        }
         let rendered = self
             .entries
             .render_view(store, &self.sek, &self.channel_id)?;
         let mut out = BTreeSet::new();
         for hash in shown {
-            if self.read_records.contains_key(hash)
+            if rendered.read_receipt_cache(hash)?.is_some()
                 || rendered.fact(hash)?.is_none()
-                || self
-                    .reads
-                    .get(hash)
-                    .is_some_and(|readers| readers.contains_key(me))
+                || rendered.was_read(hash, me)?
             {
                 continue;
             }
@@ -8046,6 +7847,13 @@ impl ChannelState {
                     cache_id: Some(id),
                 }),
             )?;
+            {
+                let mut index = self
+                    .entries
+                    .write(&mut batch, &self.sek, &self.channel_id)?;
+                index.put_read_receipt(&row, id)?;
+                index.seal()?;
+            }
             batch.commit()
         })();
         if let Err(e) = persisted {
@@ -8058,7 +7866,6 @@ impl ChannelState {
         self.gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.finish_entry_publication(profile.store())?;
 
-        index_read(&mut self.read_records, &mut self.reads, row);
         Ok(entry_hash)
     }
 
@@ -8201,12 +8008,6 @@ impl ChannelState {
     #[must_use]
     pub fn genesis(&self) -> &Genesis {
         &self.genesis
-    }
-
-    /// The render-gated timeline, oldest first.
-    #[must_use]
-    pub fn timeline(&self) -> &[Rendered] {
-        &self.timeline
     }
 
     /// The room's members, in fingerprint order: its admitted authors, less every one that has

@@ -36,27 +36,38 @@ pub(in crate::node::channel) fn remember_presence(
 /// A turn may publish current authority while later ordinary causal work remains.
 #[derive(Clone, Copy, Debug)]
 pub struct GovernanceProgress {
+    /// Current source and authority facts are ready for checked reads at this turn's time.
     pub ready: bool,
+    /// Another bounded maintenance turn is needed, possibly only for later ordinary entries.
     pub pending: bool,
+    /// This turn published a different display revision or restored readiness.
     pub changed: bool,
 }
 
 /// At most 64 inspected target slots; an empty result may still have a continuation.
 pub struct GovernanceTargets {
+    /// Matching current targets in fingerprint order.
     pub targets: Vec<Digest32>,
+    /// Last inspected target; continue strictly after it, even when `targets` is empty.
     pub next: Option<Digest32>,
 }
 
+/// Current shares selected from at most 64 inspected service slots.
 pub struct GovernanceShares {
+    /// Shared services whose hosts have not left the room.
     pub shares: Vec<Share>,
+    /// Last inspected host and service-name hash; none exhausts the listing.
     pub next: Option<(Digest32, Digest32)>,
 }
 
 /// Chronological notices from one newest-first disk page. Continue strictly before
 /// `before` with this same revision; do not replace a visible page on read failure.
 pub struct GovernanceNotices {
+    /// Selected notices in chronological order.
     pub notices: Vec<RoomNotice>,
+    /// Continue strictly before this canonical clock and entry hash; none exhausts the listing.
     pub before: Option<(u64, Digest32)>,
+    /// Governance revision to preserve for the next page.
     pub revision: u64,
 }
 
@@ -67,14 +78,19 @@ impl ChannelState {
         super::refreshing(error)
     }
 
+    /// Check one target against current authority at `now`, including the genesis creator.
+    /// Pending replay or authority expiry returns refreshing rather than an absence claim.
     pub fn is_admin(&self, store: &Store, target: &Digest32, now: crate::time::Ms) -> Result<bool> {
         self.checked_governance(store, now.get())?.is_admin(target)
     }
 
+    /// Current governance revision, requiring authority to be ready at the room's latest time.
     pub fn governance_revision(&self, store: &Store) -> Result<u64> {
         Ok(self.checked_governance(store, self.now_hint)?.revision())
     }
 
+    /// Resolve an exact service name or base32 service fingerprint from current source facts.
+    /// A departed host or a withdrawn share returns none; incomplete source replay is an error.
     pub fn shared_service(
         &self,
         store: &Store,
@@ -88,6 +104,8 @@ impl ChannelState {
         view.share_selector(host, name)
     }
 
+    /// Answer one exact lookup or page inspecting at most 64 slots.
+    /// Supplied revisions must match; authority-dependent selections also require a ready fold.
     pub fn governance_page(
         &self,
         store: &Store,
@@ -339,6 +357,8 @@ impl ChannelState {
             .is_granted())
     }
 
+    /// Select current consent targets, including identities outside the admitted roster.
+    /// Inspect at most `limit` clamped to 1..=64 slots strictly after `after`.
     pub fn consent_page(
         &self,
         store: &Store,
@@ -355,6 +375,8 @@ impl ChannelState {
         })
     }
 
+    /// Page through active admins under checked authority at `now`, excluding the creator.
+    /// Inspect at most `limit` clamped to 1..=64 slots strictly after `after`.
     pub fn admin_page(
         &self,
         store: &Store,
@@ -372,6 +394,8 @@ impl ChannelState {
         })
     }
 
+    /// Page through current shares, filtering withdrawn announcements and departed hosts.
+    /// Inspect at most `limit` clamped to 1..=64 slots; an empty page may still continue.
     pub fn share_page(
         &self,
         store: &Store,
@@ -389,6 +413,8 @@ impl ChannelState {
         })
     }
 
+    /// Select up to `limit` clamped to 1..=64 older notice slots, in chronological order.
+    /// Require current authority and, when supplied, the exact continuation revision.
     pub fn notice_page(
         &self,
         store: &Store,

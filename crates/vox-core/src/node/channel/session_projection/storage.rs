@@ -325,36 +325,18 @@ pub(super) struct Read<'a> {
     room: &'a Digest32,
     pub header: Header,
     working: bool,
-    activity_working: bool,
 }
 
 impl<'a> Read<'a> {
     pub fn waiting_find(&self, root: u64, key: &Key) -> Result<Option<u64>> {
         session_tree::Read::snapshot(self.snapshot, self.sek, self.room, KIND).find(root, key)
     }
-    pub fn activity_work(mut self) -> Result<Self> {
-        if self.header.activity.work.is_none() {
-            return Err(invalid("Session activity work absent"));
-        }
-        self.activity_working = true;
-        Ok(self)
-    }
-    fn activity_root(&self, tree: ActivityTree) -> Result<u64> {
-        if self.activity_working {
-            Ok(self
-                .header
-                .activity
-                .work
-                .as_ref()
-                .ok_or_else(|| invalid("Session activity work absent"))?
-                .roots[tree.index()])
-        } else {
-            Ok(self.header.activity.roots[tree.index()])
-        }
+    fn activity_root(&self, tree: ActivityTree) -> u64 {
+        self.header.activity.roots[tree.index()]
     }
     pub fn activity_find(&self, tree: ActivityTree, key: &Key) -> Result<Option<u64>> {
         session_tree::Read::snapshot(self.snapshot, self.sek, self.room, KIND)
-            .find(self.activity_root(tree)?, key)
+            .find(self.activity_root(tree), key)
     }
     pub fn activity_next(
         &self,
@@ -362,7 +344,7 @@ impl<'a> Read<'a> {
         after: Option<Key>,
     ) -> Result<Option<(Key, u64)>> {
         session_tree::Read::snapshot(self.snapshot, self.sek, self.room, KIND)
-            .first_after(self.activity_root(tree)?, after)
+            .first_after(self.activity_root(tree), after)
     }
     pub fn activity_previous(
         &self,
@@ -370,7 +352,7 @@ impl<'a> Read<'a> {
         before: Option<Key>,
     ) -> Result<Option<(Key, u64)>> {
         session_tree::Read::snapshot(self.snapshot, self.sek, self.room, KIND)
-            .last_before(self.activity_root(tree)?, before)
+            .last_before(self.activity_root(tree), before)
     }
     pub fn open(snapshot: &'a Snapshot, sek: &'a Sek, room: &'a Digest32) -> Result<Self> {
         Self::existing(snapshot, sek, room)?
@@ -396,7 +378,6 @@ impl<'a> Read<'a> {
             room,
             header,
             working: false,
-            activity_working: false,
         }))
     }
 

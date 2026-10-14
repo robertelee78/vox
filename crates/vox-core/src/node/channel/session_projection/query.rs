@@ -101,8 +101,8 @@ pub(crate) enum Query {
         revision: Option<Revision>,
         limit: usize,
     },
-    Count {
-        revision: Option<Revision>,
+    Validate {
+        revision: Revision,
     },
     Lookup {
         node: Digest32,
@@ -138,10 +138,7 @@ pub(crate) enum Reply {
         more: bool,
         revision: Revision,
     },
-    Count {
-        count: u64,
-        revision: Revision,
-    },
+    Valid,
     Lookup(Option<Row>),
     Text(TextPage),
 }
@@ -622,17 +619,9 @@ impl ChannelState {
                         revision,
                     })
                 }
-                Query::Count { revision: previous } => {
-                    if let Some(previous) = &previous {
-                        check(previous)?;
-                    }
-                    let mut count = 0u64;
-                    for author in &authors {
-                        count = count
-                            .checked_add(read.find(Tree::Counts, &hash_key(author))?.unwrap_or(0))
-                            .ok_or(Error::MalformedAtRest("Session count overflow"))?;
-                    }
-                    Ok(Reply::Count { count, revision })
+                Query::Validate { revision: previous } => {
+                    check(&previous)?;
+                    Ok(Reply::Valid)
                 }
                 Query::Exact { node, id } => {
                     if !authors.contains(&node) {

@@ -461,37 +461,6 @@ impl<'a> View<'a> {
         }
     }
 
-    pub(in crate::node::channel) fn presence(
-        &self,
-        author: &Digest32,
-    ) -> Result<Option<(u64, bool)>> {
-        let Some(log) = self.facts.get(Table::Presence, &hash_key(author))? else {
-            return Ok(None);
-        };
-        let entry = self.facts.entry(log)?;
-        let GovBody::Presence(body) = GovEntry::body_bound_to(&entry)? else {
-            return Err(invalid("governance presence kind"));
-        };
-        if entry.skeleton.author_id != *author || body.body.author_id != *author {
-            return Err(invalid("governance presence author"));
-        }
-        Ok(Some((entry.skeleton.seq, body.body.here)))
-    }
-
-    pub(in crate::node::channel) fn back(&self, author: &Digest32) -> Result<Option<(u64, u64)>> {
-        let Some(log) = self.facts.get(Table::Back, &hash_key(author))? else {
-            return Ok(None);
-        };
-        let entry = self.facts.entry(log)?;
-        let GovBody::Presence(body) = GovEntry::body_bound_to(&entry)? else {
-            return Err(invalid("governance admission kind"));
-        };
-        if entry.skeleton.author_id != *author || !body.body.here {
-            return Err(invalid("governance admission binding"));
-        }
-        Ok(Some((entry.skeleton.seq, entry.skeleton.claimed_ms)))
-    }
-
     pub(in crate::node::channel) fn grant_sequence(
         &self,
         author: &Digest32,

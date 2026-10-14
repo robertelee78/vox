@@ -11,10 +11,6 @@ use crate::node::api::{
 
 pub(crate) enum Query {
     Governance(crate::node::api::GovernanceQuery),
-    SharedService {
-        host: Digest32,
-        name: String,
-    },
     ArrivalHead,
     NoticeState,
     NoticeExact {
@@ -29,11 +25,6 @@ pub(crate) enum Query {
         limit: usize,
     },
     LocateUnread,
-    SessionCandidates {
-        after: Option<(u64, u64, Digest32)>,
-        revision: Option<SessionRevision>,
-        limit: usize,
-    },
     Arrival {
         after: Option<u64>,
         limit: usize,
@@ -81,17 +72,11 @@ pub(crate) enum Query {
 
 pub(crate) enum Reply {
     Governance(crate::node::api::GovernancePage),
-    SharedService(Option<Share>),
     ArrivalHead(HistoryCursor),
     NoticeState(NoticeState),
     NoticeExact(Option<NoticeRow>),
     NoticePage(NoticePage),
     CursorPage(MessagePage),
-    SessionCandidates {
-        rows: Vec<MessageRow>,
-        next: Option<(u64, u64, Digest32)>,
-        revision: SessionRevision,
-    },
     ThreadSummary {
         count: u64,
         last: u64,
@@ -158,46 +143,31 @@ impl Selection {
 pub(crate) struct Revision {
     incarnation: Arc<std::sync::atomic::AtomicU64>,
     facts: [u64; 8],
+    rendered_roots: [u64; 4],
 }
 
 impl Revision {
-    fn of(ch: &ChannelState) -> Self {
-        Self {
+    fn of(ch: &ChannelState, rendered: &entry_store::RenderView<'_>) -> Result<Self> {
+        Ok(Self {
             incarnation: ch.gen.clone(),
             facts: [
                 ch.gen.load(std::sync::atomic::Ordering::Relaxed),
                 ch.display_rewrite,
-                ch.timeline.len() as u64,
+                rendered.count()?,
                 ch.dag.reorder_generation(),
                 ch.dag.body_generation(),
                 ch.legacy_sessions.display_revision(),
                 ch.effective_retention(),
                 ch.effective_step_retention(),
             ],
-        }
+            rendered_roots: rendered.display_roots(),
+        })
     }
-    fn current(&self, ch: &ChannelState) -> bool {
-        let now = Self::of(ch);
-        Arc::ptr_eq(&self.incarnation, &now.incarnation) && self.facts == now.facts
-    }
-}
-
-/// Only a Session/name candidate insertion, removal or canonical move invalidates
-/// this fold. Unrelated chat must not keep a multi-page Session rebuild restarting.
-#[derive(Clone)]
-pub(crate) struct SessionRevision {
-    incarnation: Arc<std::sync::atomic::AtomicU64>,
-    root: u64,
-}
-impl SessionRevision {
-    fn of(ch: &ChannelState, rendered: &entry_store::RenderView<'_>) -> Self {
-        Self {
-            incarnation: ch.gen.clone(),
-            root: rendered.session_revision(),
-        }
-    }
-    fn current(&self, ch: &ChannelState, rendered: &entry_store::RenderView<'_>) -> bool {
-        Arc::ptr_eq(&self.incarnation, &ch.gen) && self.root == rendered.session_revision()
+    fn current(&self, ch: &ChannelState, rendered: &entry_store::RenderView<'_>) -> Result<bool> {
+        let now = Self::of(ch, rendered)?;
+        Ok(Arc::ptr_eq(&self.incarnation, &now.incarnation)
+            && self.facts == now.facts
+            && self.rendered_roots == now.rendered_roots)
     }
 }
 
@@ -239,14 +209,14 @@ impl View<'_> {
         };
         if entry.payload.is_some()
             || !self
-                .ch
-                .owed
-                .contains(&(entry.skeleton.author_id, entry.skeleton.seq))
+                .rendered
+                .missing_contains(&entry.skeleton.author_id, entry.skeleton.seq)?
             || self.ch.legacy_sessions.is_session(hash)
             || expired_at(
                 entry.skeleton.claimed_ms,
                 self.ch.now_hint,
-                self.ch.entry_retention(&entry),
+                self.ch
+                    .entry_retention(self.rendered.transaction(), &entry)?,
             )
         {
             return Ok(None);
@@ -446,7 +416,9 @@ impl View<'_> {
             .order()
             .entry(&row.entry_hash)?
             .ok_or(Error::MalformedAtRest("notice entry missing"))?;
-        let ttl = self.ch.entry_retention(&entry);
+        let ttl = self
+            .ch
+            .entry_retention(self.rendered.transaction(), &entry)?;
         let expires = if ttl == 0 {
             None
         } else {
@@ -491,53 +463,6 @@ impl View<'_> {
             Query::Governance(query) => Ok(Reply::Governance(
                 self.ch.governance_page(self.store, query)?,
             )),
-            Query::SharedService { host, name } => Ok(Reply::SharedService(
-                self.ch.shared_service(self.store, &host, &name)?,
-            )),
-            Query::SessionCandidates {
-                after,
-                revision,
-                limit,
-            } => {
-                if revision
-                    .as_ref()
-                    .is_some_and(|r| !r.current(self.ch, &self.rendered))
-                {
-                    return Err(Failure::Request(CHANGED));
-                }
-                let revision =
-                    revision.unwrap_or_else(|| SessionRevision::of(self.ch, &self.rendered));
-                let mut cursor = after;
-                let mut rows = Vec::new();
-                let mut used = 0usize;
-                while rows.len() < limit.min(crate::node::ipc::PAGE_ENTRIES) {
-                    let Some((key, _)) = self.rendered.session_candidate(cursor)? else {
-                        return Ok(Reply::SessionCandidates {
-                            rows,
-                            next: None,
-                            revision,
-                        });
-                    };
-                    let row = self
-                        .row(&key.2)?
-                        .ok_or(Error::MalformedAtRest("session candidate missing"))?;
-                    let cost = row
-                        .text
-                        .len()
-                        .saturating_add(crate::node::ipc::ROW_OVERHEAD);
-                    if !rows.is_empty() && used.saturating_add(cost) > bytes {
-                        break;
-                    }
-                    used = used.saturating_add(cost);
-                    rows.push(row);
-                    cursor = Some(key);
-                }
-                Ok(Reply::SessionCandidates {
-                    rows,
-                    next: cursor,
-                    revision,
-                })
-            }
             Query::ArrivalHead => Ok(Reply::ArrivalHead(self.head()?)),
             Query::NoticeState => Ok(Reply::NoticeState(self.notice_state()?)),
             Query::NoticeExact { entry } => Ok(Reply::NoticeExact(
@@ -783,7 +708,7 @@ impl View<'_> {
                 }
                 Ok(Reply::Located {
                     entries: found.into_iter().map(|(_, h)| h).collect(),
-                    revision: Revision::of(self.ch),
+                    revision: Revision::of(self.ch, &self.rendered)?,
                 })
             }
             Query::Locate { entries } => {
@@ -803,11 +728,11 @@ impl View<'_> {
                 }
                 Ok(Reply::Located {
                     entries: found.into_iter().map(|(_, h)| h).collect(),
-                    revision: Revision::of(self.ch),
+                    revision: Revision::of(self.ch, &self.rendered)?,
                 })
             }
             Query::Exact { entry, revision } => {
-                if !revision.current(self.ch) {
+                if !revision.current(self.ch, &self.rendered)? {
                     return Err(Failure::Request(CHANGED));
                 }
                 Ok(Reply::Exact(
@@ -849,15 +774,6 @@ impl ChannelState {
                     return self
                         .governance_page(store, query)
                         .map(Reply::Governance)
-                        .map_err(|e| match e {
-                            Error::Profile(why) => Failure::Request(why),
-                            e => Failure::Storage(e),
-                        })
-                }
-                Query::SharedService { host, name } => {
-                    return self
-                        .shared_service(store, &host, &name)
-                        .map(Reply::SharedService)
                         .map_err(|e| match e {
                             Error::Profile(why) => Failure::Request(why),
                             e => Failure::Storage(e),
@@ -928,6 +844,7 @@ impl State {
     }
 }
 impl ChannelState {
+    /// Caller has established missing membership in the current Batch.
     pub(super) fn owed_visibility(
         &self,
         batch: &crate::node::store::Batch<'_>,
@@ -937,14 +854,11 @@ impl ChannelState {
         if entry.payload.is_some()
             || self.private_contains_in(batch, &hash)?
             || self.legacy_sessions.is_session(&hash)
-            || !self
-                .owed
-                .contains(&(entry.skeleton.author_id, entry.skeleton.seq))
         {
             return Ok(None);
         }
         let created = entry.skeleton.claimed_ms;
-        let ttl = self.entry_retention(entry);
+        let ttl = self.entry_retention(Transaction::Batch(batch), entry)?;
         if expired_at(created, self.now_hint, ttl) {
             return Ok(None);
         }
@@ -976,24 +890,31 @@ impl ChannelState {
                 .write(&mut batch, &self.sek, &self.channel_id)?;
             let mut changed = false;
             if self.projection_state.pending {
-                use std::ops::Bound::{Excluded, Unbounded};
-                let start = self.projection_state.cursor.map_or(Unbounded, Excluded);
-                let end = self
-                    .projection_state
-                    .through
-                    .map_or(Unbounded, std::ops::Bound::Included);
-                let positions: Vec<_> = self.owed.range((start, end)).take(64).copied().collect();
-                for (author, seq) in &positions {
+                let (positions, next) = writer.missing_page(self.projection_state.cursor, 64)?;
+                let mut through = false;
+                for (author, seq) in positions {
+                    if self
+                        .projection_state
+                        .through
+                        .is_some_and(|end| (author, seq) > end)
+                    {
+                        through = true;
+                        break;
+                    }
+                    self.projection_state.cursor = Some((author, seq));
                     let entry = writer
-                        .get(author, *seq)?
+                        .get(&author, seq)?
                         .ok_or(Error::MalformedAtRest("owed entry missing"))?;
                     let visibility = self.owed_visibility(writer.batch(), &entry)?;
                     writer.set_owed(entry.entry_hash(), visibility)?;
+                    changed = true;
                 }
-                self.projection_state.cursor =
-                    positions.last().copied().or(self.projection_state.cursor);
-                self.projection_state.pending = positions.len() == 64;
-                changed = true;
+                self.projection_state.pending = !through
+                    && next.is_some()
+                    && self
+                        .projection_state
+                        .through
+                        .is_none_or(|end| self.projection_state.cursor < Some(end));
             }
             for _ in 0..64 {
                 let Some(hash) = writer.first_expired_owed(self.now_hint)? else {

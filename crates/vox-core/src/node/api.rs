@@ -425,27 +425,131 @@ pub struct HistoryPage {
 }
 
 /// A bounded governance selection carried by the existing room-page transport.
+/// Continue a listing with its returned cursor and revision; a stale revision requires
+/// reloading the selection. Authority queries refuse while their projection is refreshing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GovernanceQuery {
-    Admin { target: Digest32 },
-    NoticesAfter { entry: Option<Digest32>, after: Option<(u64, Digest32)>, revision: Option<u64> },
-    Service { host: Digest32, selector: String },
-    Notices { before: Option<(u64, Digest32)>, revision: Option<u64> },
-    Shares { after: Option<(Digest32, Digest32)>, revision: Option<u64> },
-    Admins { after: Option<Digest32>, revision: Option<u64> },
-    Consent { author: Option<Digest32>, after: Option<Digest32>, revision: Option<u64> },
+    /// Check one identity against current authority, including the genesis creator.
+    Admin {
+        /// Identity whose admin authority is requested.
+        target: Digest32,
+    },
+    /// Page forward through notices between one visible message and the next.
+    NoticesAfter {
+        /// Visible message anchoring the range; none selects notices before the first message.
+        entry: Option<Digest32>,
+        /// Continue strictly after this canonical clock and entry hash within the range.
+        after: Option<(u64, Digest32)>,
+        /// Revision returned by the preceding page, or none for the first page.
+        revision: Option<u64>,
+    },
+    /// Resolve one current service without scanning the room's shares.
+    Service {
+        /// Identity publishing the service.
+        host: Digest32,
+        /// Exact service name or base32 service fingerprint.
+        selector: String,
+    },
+    /// Page backward through notices, returning each page in chronological order.
+    Notices {
+        /// Continue strictly before this canonical clock and entry hash; none selects newest.
+        before: Option<(u64, Digest32)>,
+        /// Revision returned by the preceding page, or none for the first page.
+        revision: Option<u64>,
+    },
+    /// Page through current services whose hosts have not left the room.
+    Shares {
+        /// Continue strictly after this host and service-name hash; none starts the listing.
+        after: Option<(Digest32, Digest32)>,
+        /// Revision returned by the preceding page, or none for the first page.
+        revision: Option<u64>,
+    },
+    /// Page through current admins other than the separately returned genesis creator.
+    Admins {
+        /// Continue strictly after this identity; none starts the listing.
+        after: Option<Digest32>,
+        /// Revision returned by the preceding page, or none for the first page.
+        revision: Option<u64>,
+    },
+    /// Page through an author's current consent targets, including targets outside the roster.
+    Consent {
+        /// Consent author, or none for this node's identity.
+        author: Option<Digest32>,
+        /// Continue strictly after this target; none starts the listing.
+        after: Option<Digest32>,
+        /// Revision returned by the preceding page, or none for the first page.
+        revision: Option<u64>,
+    },
 }
 
 /// At most 64 inspected slots. Empty rows with a continuation are not exhaustion.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GovernancePage {
-    Admin { target: Digest32, admin: bool, revision: u64 },
-    Service { share: Option<crate::node::channel::Share>, revision: u64 },
-    NoticesAfter { rows: Vec<crate::node::channel::RoomNotice>, next: Option<(u64, Digest32)>, revision: u64 },
-    Notices { rows: Vec<crate::node::channel::RoomNotice>, before: Option<(u64, Digest32)>, revision: u64 },
-    Shares { rows: Vec<crate::node::channel::Share>, next: Option<(Digest32, Digest32)>, revision: u64 },
-    Admins { creator: Digest32, members: Vec<Digest32>, next: Option<Digest32>, revision: u64 },
-    Consent { author: Digest32, targets: Vec<Digest32>, next: Option<Digest32>, revision: u64 },
+    /// Current authority for one identity.
+    Admin {
+        /// Identity that was checked.
+        target: Digest32,
+        /// Whether that identity currently has admin authority.
+        admin: bool,
+        /// Governance revision used for this answer.
+        revision: u64,
+    },
+    /// One exact service lookup.
+    Service {
+        /// Current share, or none when absent, withdrawn, or published by a departed host.
+        share: Option<crate::node::channel::Share>,
+        /// Governance revision used for this answer.
+        revision: u64,
+    },
+    /// A chronological page within the requested visible-message range.
+    NoticesAfter {
+        /// Notices selected from this bounded page.
+        rows: Vec<crate::node::channel::RoomNotice>,
+        /// Continue strictly after this clock and hash; none exhausts the selected range.
+        next: Option<(u64, Digest32)>,
+        /// Revision to supply when continuing this selection.
+        revision: u64,
+    },
+    /// A page selected backward through notices and returned in chronological order.
+    Notices {
+        /// Notices selected from this bounded page.
+        rows: Vec<crate::node::channel::RoomNotice>,
+        /// Continue strictly before this clock and hash; none exhausts older notices.
+        before: Option<(u64, Digest32)>,
+        /// Revision to supply when continuing this selection.
+        revision: u64,
+    },
+    /// Current shares from one page, after filtering withdrawn shares and departed hosts.
+    Shares {
+        /// Current service announcements selected from this page.
+        rows: Vec<crate::node::channel::Share>,
+        /// Last inspected host and service-name hash; none exhausts the listing.
+        next: Option<(Digest32, Digest32)>,
+        /// Revision to supply when continuing this selection.
+        revision: u64,
+    },
+    /// Current admin authority, with the creator separate from the paged identities.
+    Admins {
+        /// Genesis creator, whose authority is immutable.
+        creator: Digest32,
+        /// Active admin identities in fingerprint order, excluding the creator.
+        members: Vec<Digest32>,
+        /// Continue strictly after this identity; none exhausts the listing.
+        next: Option<Digest32>,
+        /// Revision to supply when continuing this selection.
+        revision: u64,
+    },
+    /// One page of an author's current consent targets.
+    Consent {
+        /// Identity whose consent statements were selected.
+        author: Digest32,
+        /// Targets still covered by consent, including targets outside the roster.
+        targets: Vec<Digest32>,
+        /// Last inspected target; none exhausts the listing.
+        next: Option<Digest32>,
+        /// Revision to supply when continuing this selection.
+        revision: u64,
+    },
 }
 
 /// An open channel's full state for display.

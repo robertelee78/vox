@@ -469,7 +469,9 @@ const T_OFFERS: u64 = 4952;
 pub enum Request {
     /// One stateless bounded governance page on the room-page transport.
     GovernancePage {
+        /// Room whose current governance is selected.
         channel_id: Digest32,
+        /// Exact lookup or page selection, including any continuation and revision.
         query: crate::node::api::GovernanceQuery,
     },
 
@@ -2419,6 +2421,7 @@ pub struct SharedService {
 pub enum Frame {
     /// A bounded governance result with explicit continuation and revision.
     GovernancePage {
+        /// Selected result; an empty listing with a continuation is not exhausted.
         page: crate::node::api::GovernancePage,
     },
 
@@ -4903,11 +4906,11 @@ async fn write_sessions(
             }
         }
         let checked = tokio::select! {
-            result = handle.session_projection(room, Query::Count { revision: Some(revision.clone()) }) => result,
+            result = handle.session_projection(room, Query::Validate { revision: revision.clone() }) => result,
             () = subscriber_gone(stream) => return Ok(false),
         };
         match checked {
-            Ok(Reply::Count { .. }) => {}
+            Ok(Reply::Valid) => {}
             Ok(_) => return Err(Error::MalformedIpc("unexpected Session revision answer")),
             Err(reason) => {
                 found_frame(stream, &Frame::Error { reason }.to_bytes(), writing).await?;
@@ -6074,20 +6077,38 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
     let frame = match request {
         Request::GovernancePage { channel_id, query } => {
             use crate::node::channel::history::{Query, Reply};
-            match handle.room_history(channel_id, Query::Governance(query)).await {
+            match handle
+                .room_history(channel_id, Query::Governance(query))
+                .await
+            {
                 Ok(Reply::Governance(page)) => Frame::GovernancePage { page },
-                Ok(_) => Frame::Error { reason: "unexpected governance page reply".into() },
+                Ok(_) => Frame::Error {
+                    reason: "unexpected governance page reply".into(),
+                },
                 Err(reason) => Frame::Error { reason },
             }
         }
-        Request::RoomPage { channel_id, before, limit } => {
+        Request::RoomPage {
+            channel_id,
+            before,
+            limit,
+        } => {
             use crate::node::channel::history::{Query, Reply};
-            let limit = if limit == 0 { SESSION_PAGE_ROWS } else {
-                usize::try_from(limit).unwrap_or(usize::MAX).min(SESSION_PAGE_ROWS)
+            let limit = if limit == 0 {
+                SESSION_PAGE_ROWS
+            } else {
+                usize::try_from(limit)
+                    .unwrap_or(usize::MAX)
+                    .min(SESSION_PAGE_ROWS)
             };
-            match handle.room_history(channel_id, Query::Older { before, limit }).await {
+            match handle
+                .room_history(channel_id, Query::Older { before, limit })
+                .await
+            {
                 Ok(Reply::Older { rows, older }) => Frame::RoomPage { rows, older },
-                Ok(_) => Frame::Error { reason: "unexpected room history answer".into() },
+                Ok(_) => Frame::Error {
+                    reason: "unexpected room history answer".into(),
+                },
                 Err(reason) => Frame::Error { reason },
             }
         }
@@ -6144,39 +6165,80 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         Request::LinkPreview { anchors } => {
             let view = handle.view();
             let Some(identity) = view.identity.filter(|_| !view.locked && !view.locking) else {
-                return Frame::Error { reason: "the creating node is not ready".into() };
+                return Frame::Error {
+                    reason: "the creating node is not ready".into(),
+                };
             };
-            let endpoints = view.listening.iter()
+            let endpoints = view
+                .listening
+                .iter()
                 .map(|a| crate::nat::multiaddr::Multiaddr::parse(a))
                 .collect::<Result<Vec<_>>>()
                 .and_then(crate::nat::multiaddr::EndpointList::new);
             let endpoints = match endpoints {
                 Ok(endpoints) => Some(endpoints),
-                Err(e) => return Frame::Error { reason: format!("the node's link addresses could not be read: {e}") },
+                Err(e) => {
+                    return Frame::Error {
+                        reason: format!("the node's link addresses could not be read: {e}"),
+                    }
+                }
             };
-            let (routes, omitted) = crate::node::link::preview_routes(&anchors, identity.fingerprint, endpoints);
-            Frame::LinkPreview { node: identity.fingerprint, routes, omitted }
+            let (routes, omitted) =
+                crate::node::link::preview_routes(&anchors, identity.fingerprint, endpoints);
+            Frame::LinkPreview {
+                node: identity.fingerprint,
+                routes,
+                omitted,
+            }
         }
         Request::RoomAnchors { channel_id } => {
             let view = handle.view();
-            if !view.open_channels.iter().any(|room| room.channel_id == channel_id) {
-                return Frame::Error { reason: "room not open".into() };
+            if !view
+                .open_channels
+                .iter()
+                .any(|room| room.channel_id == channel_id)
+            {
+                return Frame::Error {
+                    reason: "room not open".into(),
+                };
             }
             if let Some(error) = view.anchor_inventory_error {
-                return Frame::Error { reason: format!("room anchors could not be read: {error}") };
+                return Frame::Error {
+                    reason: format!("room anchors could not be read: {error}"),
+                };
             }
-            match view.room_anchors.iter().find(|room| room.room == channel_id) {
-                Some(room) if !room.stale => Frame::RoomAnchors { anchors: room.anchors.clone() },
-                Some(_) => Frame::Error { reason: "room anchors have not refreshed yet; try again".into() },
-                None => Frame::Error { reason: "room anchors are not available yet; try again".into() },
+            match view
+                .room_anchors
+                .iter()
+                .find(|room| room.room == channel_id)
+            {
+                Some(room) if !room.stale => Frame::RoomAnchors {
+                    anchors: room.anchors.clone(),
+                },
+                Some(_) => Frame::Error {
+                    reason: "room anchors have not refreshed yet; try again".into(),
+                },
+                None => Frame::Error {
+                    reason: "room anchors are not available yet; try again".into(),
+                },
             }
         }
-        Request::ChangeRoomAnchors { channel_id, add, remove } => match handle
-            .apply(crate::node::api::NodeCommand::ChangeRoomAnchors { channel_id, add, remove })
+        Request::ChangeRoomAnchors {
+            channel_id,
+            add,
+            remove,
+        } => match handle
+            .apply(crate::node::api::NodeCommand::ChangeRoomAnchors {
+                channel_id,
+                add,
+                remove,
+            })
             .await
         {
             crate::node::api::Outcome::Done => Frame::Ok,
-            other => Frame::Error { reason: other.to_string() },
+            other => Frame::Error {
+                reason: other.to_string(),
+            },
         },
         // Not gated on the passphrase (ADR-028 K-11): the room's governance says who may.
         Request::RenameRoom { channel_id, name } => match handle
@@ -6189,13 +6251,23 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             },
         },
         // Not gated on the passphrase (ADR-028 K-11): the node's governance says who may.
-        Request::SetStepRetention { channel_id, seconds } => match handle
-            .apply(crate::node::api::NodeCommand::SetStepRetention { channel_id, seconds })
+        Request::SetStepRetention {
+            channel_id,
+            seconds,
+        } => match handle
+            .apply(crate::node::api::NodeCommand::SetStepRetention {
+                channel_id,
+                seconds,
+            })
             .await
         {
             crate::node::api::Outcome::Done => Frame::Ok,
-            crate::node::api::Outcome::OwnRetention { own, room } => Frame::OwnRetention { own, room },
-            other => Frame::Error { reason: other.to_string() },
+            crate::node::api::Outcome::OwnRetention { own, room } => {
+                Frame::OwnRetention { own, room }
+            }
+            other => Frame::Error {
+                reason: other.to_string(),
+            },
         },
         Request::SetRetention { channel_id, ttl } => match handle
             .apply(crate::node::api::NodeCommand::SetRetention { channel_id, ttl })
@@ -6260,12 +6332,19 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         // **A read, so no passphrase** (V210-162, V210-165): the names this node gave its
         // members are how every surface on this account names an author, the agent drain
         // included, and the OS account is the boundary. Only a change to the keyring is gated.
-        Request::Presentation { target } => {
-            Frame::Presented { entries: handle.view().presented.into_iter().filter(|(fp, _)| *fp == target).collect() }
-        }
-        Request::Presentations { after } => {
-            Frame::Presented { entries: page(handle.view().presented, after, |(fp, name)| (*fp, name.len())) }
-        }
+        Request::Presentation { target } => Frame::Presented {
+            entries: handle
+                .view()
+                .presented
+                .into_iter()
+                .filter(|(fp, _)| *fp == target)
+                .collect(),
+        },
+        Request::Presentations { after } => Frame::Presented {
+            entries: page(handle.view().presented, after, |(fp, name)| {
+                (*fp, name.len())
+            }),
+        },
         Request::TrustList { after, .. } => {
             let view = handle.view();
             let rows = view
@@ -6402,77 +6481,218 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 }
             }
         }
-        Request::Read { channel_id, since, after, limit } => {
+        Request::Read {
+            channel_id,
+            since,
+            after,
+            limit,
+        } => {
             use crate::node::channel::history::{Query, Reply};
-            let limit = if limit == 0 { PAGE_ENTRIES } else {
-                usize::try_from(limit).unwrap_or(usize::MAX).min(PAGE_ENTRIES)
+            let limit = if limit == 0 {
+                PAGE_ENTRIES
+            } else {
+                usize::try_from(limit)
+                    .unwrap_or(usize::MAX)
+                    .min(PAGE_ENTRIES)
             };
-            match handle.room_history(channel_id, Query::Read { since, after, limit }).await {
+            match handle
+                .room_history(
+                    channel_id,
+                    Query::Read {
+                        since,
+                        after,
+                        limit,
+                    },
+                )
+                .await
+            {
                 Ok(Reply::Rows(rows)) => Frame::Rows { rows },
-                Ok(_) => Frame::Error { reason: "unexpected room history answer".into() },
+                Ok(_) => Frame::Error {
+                    reason: "unexpected room history answer".into(),
+                },
                 Err(reason) => Frame::Error { reason },
             }
         }
-        Request::Order {channel_id,after,revision} => {
-            use crate::node::channel::history::{Query,Reply};
-            match handle.room_history(channel_id,Query::Order {after,revision,limit:PAGE_ENTRIES}).await {
-                Ok(Reply::Order {entries,next,revision}) => Frame::Order {entries,next,revision},
-                Ok(_) => Frame::Error {reason:"unexpected room order answer".into()},
-                Err(reason) => Frame::Error {reason},
+        Request::Order {
+            channel_id,
+            after,
+            revision,
+        } => {
+            use crate::node::channel::history::{Query, Reply};
+            match handle
+                .room_history(
+                    channel_id,
+                    Query::Order {
+                        after,
+                        revision,
+                        limit: PAGE_ENTRIES,
+                    },
+                )
+                .await
+            {
+                Ok(Reply::Order {
+                    entries,
+                    next,
+                    revision,
+                }) => Frame::Order {
+                    entries,
+                    next,
+                    revision,
+                },
+                Ok(_) => Frame::Error {
+                    reason: "unexpected room order answer".into(),
+                },
+                Err(reason) => Frame::Error { reason },
             }
         }
         // V210-120: only the rows asked for, found through the room's index of structured posts,
         // so a client after a room's coordination posts no longer reads every row of the room.
-        Request::Structured {channel_id,types,ops,since} => {
-            use crate::node::channel::{history::{Query,Reply,Selection,Filter}};
-            let filters=types.into_iter().map(Filter::Type).chain(ops.into_iter().map(Filter::Op)).collect();
-            match handle.room_history(channel_id,Query::Filtered {selection:Selection::Any(filters),since,resume:None,limit:PAGE_ENTRIES}).await {
-                Ok(Reply::Page {rows,..})=>Frame::Rows {rows},
-                Ok(_)=>Frame::Error {reason:"unexpected history answer".into()},Err(reason)=>Frame::Error {reason},
+        Request::Structured {
+            channel_id,
+            types,
+            ops,
+            since,
+        } => {
+            use crate::node::channel::history::{Filter, Query, Reply, Selection};
+            let filters = types
+                .into_iter()
+                .map(Filter::Type)
+                .chain(ops.into_iter().map(Filter::Op))
+                .collect();
+            match handle
+                .room_history(
+                    channel_id,
+                    Query::Filtered {
+                        selection: Selection::Any(filters),
+                        since,
+                        resume: None,
+                        limit: PAGE_ENTRIES,
+                    },
+                )
+                .await
+            {
+                Ok(Reply::Page { rows, .. }) => Frame::Rows { rows },
+                Ok(_) => Frame::Error {
+                    reason: "unexpected history answer".into(),
+                },
+                Err(reason) => Frame::Error { reason },
             }
         }
-        Request::Thread {channel_id,root,since} => {
-            use crate::node::channel::{history::{Query,Reply,Selection,Filter}};
-            match handle.room_history(channel_id,Query::Filtered {selection:Selection::Any(vec![Filter::Thread(root)]),since,resume:None,limit:PAGE_ENTRIES}).await {
-                Ok(Reply::Page {rows,..})=>Frame::Rows {rows},
-                Ok(_)=>Frame::Error {reason:"unexpected history answer".into()},Err(reason)=>Frame::Error {reason},
+        Request::Thread {
+            channel_id,
+            root,
+            since,
+        } => {
+            use crate::node::channel::history::{Filter, Query, Reply, Selection};
+            match handle
+                .room_history(
+                    channel_id,
+                    Query::Filtered {
+                        selection: Selection::Any(vec![Filter::Thread(root)]),
+                        since,
+                        resume: None,
+                        limit: PAGE_ENTRIES,
+                    },
+                )
+                .await
+            {
+                Ok(Reply::Page { rows, .. }) => Frame::Rows { rows },
+                Ok(_) => Frame::Error {
+                    reason: "unexpected history answer".into(),
+                },
+                Err(reason) => Frame::Error { reason },
             }
         }
         Request::RoomDisplayRevision { channel_id } => {
             match handle.room_display_revision(&channel_id) {
                 Some(revision) => Frame::RoomDisplayRevision { revision },
-                None => Frame::Error { reason: "room not open".into() },
+                None => Frame::Error {
+                    reason: "room not open".into(),
+                },
             }
         }
-        Request::ThreadSummary {channel_id,root,after_author} => {
-            use crate::node::channel::history::{Query,Reply};
-            match handle.room_history(channel_id,Query::ThreadSummary {root,after_author}).await {
-                Ok(Reply::ThreadSummary {count,last,authors,next})=>Frame::ThreadSummary {reply_count:count,last_reply_millis:last,authors,next_author:next},
-                Ok(_)=>Frame::Error {reason:"unexpected history answer".into()},Err(reason)=>Frame::Error {reason},
+        Request::ThreadSummary {
+            channel_id,
+            root,
+            after_author,
+        } => {
+            use crate::node::channel::history::{Query, Reply};
+            match handle
+                .room_history(channel_id, Query::ThreadSummary { root, after_author })
+                .await
+            {
+                Ok(Reply::ThreadSummary {
+                    count,
+                    last,
+                    authors,
+                    next,
+                }) => Frame::ThreadSummary {
+                    reply_count: count,
+                    last_reply_millis: last,
+                    authors,
+                    next_author: next,
+                },
+                Ok(_) => Frame::Error {
+                    reason: "unexpected history answer".into(),
+                },
+                Err(reason) => Frame::Error { reason },
             }
         }
-        Request::Tagged {channel_id,tags,from,since,resume} => {
-            use crate::node::channel::{history::{Query,Reply,Selection,Filter}};
-            let filters=tags.into_iter().map(Filter::Tag).chain(from.map(Filter::Author)).collect();
-            match handle.room_history(channel_id,Query::Filtered {selection:Selection::All(filters),since,resume,limit:PAGE_ENTRIES}).await {
-                Ok(Reply::Page {rows,next})=>Frame::FilteredRows {rows,next},
-                Ok(_)=>Frame::Error {reason:"unexpected history answer".into()},Err(reason)=>Frame::Error {reason},
+        Request::Tagged {
+            channel_id,
+            tags,
+            from,
+            since,
+            resume,
+        } => {
+            use crate::node::channel::history::{Filter, Query, Reply, Selection};
+            let filters = tags
+                .into_iter()
+                .map(Filter::Tag)
+                .chain(from.map(Filter::Author))
+                .collect();
+            match handle
+                .room_history(
+                    channel_id,
+                    Query::Filtered {
+                        selection: Selection::All(filters),
+                        since,
+                        resume,
+                        limit: PAGE_ENTRIES,
+                    },
+                )
+                .await
+            {
+                Ok(Reply::Page { rows, next }) => Frame::FilteredRows { rows, next },
+                Ok(_) => Frame::Error {
+                    reason: "unexpected history answer".into(),
+                },
+                Err(reason) => Frame::Error { reason },
             }
         }
         Request::Count { channel_id, since } => {
             use crate::node::channel::history::{Query, Reply};
-            match handle.room_history(channel_id, Query::Count { since }).await {
+            match handle
+                .room_history(channel_id, Query::Count { since })
+                .await
+            {
                 Ok(Reply::Count { n, last }) => Frame::Count { n, last },
-                Ok(_) => Frame::Error { reason: "unexpected room history answer".into() },
+                Ok(_) => Frame::Error {
+                    reason: "unexpected room history answer".into(),
+                },
                 Err(reason) => Frame::Error { reason },
             }
         }
         // Searched from the newest row back: what a client looks up (a reply's parent) is
         // usually recent.
         // The rows the view says are unread here, as the timeline holds them (ADR-028 R-8).
-        Request::Unread {..} => Frame::Error {reason:"Unread requires a reply stream".into()},
+        Request::Unread { .. } => Frame::Error {
+            reason: "Unread requires a reply stream".into(),
+        },
         // The server streams exact Find rows without materializing all requested bodies.
-        Request::Find { .. } => Frame::Error { reason: "Find requires a reply stream".into() },
+        Request::Find { .. } => Frame::Error {
+            reason: "Find requires a reply stream".into(),
+        },
         // Open or not by the node's own count, not by whether the view has caught up with an
         // open (V210-149): the one-shot form asks the same question the same way.
         Request::Share {
@@ -6558,7 +6778,10 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             Ok(states) => Frame::PullStates { states },
             Err(reason) => Frame::Error { reason },
         },
-        Request::PullStatesFor { channel_id, entries } => match handle.pulls().states_for(&channel_id, &entries).await {
+        Request::PullStatesFor {
+            channel_id,
+            entries,
+        } => match handle.pulls().states_for(&channel_id, &entries).await {
             Ok(states) => Frame::PullStates { states },
             Err(reason) => Frame::Error { reason },
         },
@@ -6592,35 +6815,63 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 reason: other.to_string(),
             },
         },
-        Request::SessionsPending{channel_id,after}=>{
-            use crate::node::channel::session_projection::{Query,Reply};
-            match handle.session_projection(channel_id,Query::Pending{after}).await {
-                Ok(Reply::Pending{targets,next})=>Frame::SessionsPendingPage{targets,next},
-                Ok(_)=>Frame::Error{reason:"unexpected Session pending answer".into()},
-                Err(reason)=>Frame::Error{reason},
+        Request::SessionsPending { channel_id, after } => {
+            use crate::node::channel::session_projection::{Query, Reply};
+            match handle
+                .session_projection(channel_id, Query::Pending { after })
+                .await
+            {
+                Ok(Reply::Pending { targets, next }) => {
+                    Frame::SessionsPendingPage { targets, next }
+                }
+                Ok(_) => Frame::Error {
+                    reason: "unexpected Session pending answer".into(),
+                },
+                Err(reason) => Frame::Error { reason },
             }
         }
-        Request::SessionsWaiting{channel_id} => {
-            use crate::node::channel::session_projection::{Query,Reply};
-            match handle.session_projection(channel_id,Query::Waiting).await {
-                Ok(Reply::Waiting(waiting))=>Frame::SessionsWaiting{waiting},
-                Ok(_)=>Frame::Error{reason:"unexpected Session waiting answer".into()},
-                Err(reason)=>Frame::Error{reason},
+        Request::SessionsWaiting { channel_id } => {
+            use crate::node::channel::session_projection::{Query, Reply};
+            match handle.session_projection(channel_id, Query::Waiting).await {
+                Ok(Reply::Waiting(waiting)) => Frame::SessionsWaiting { waiting },
+                Ok(_) => Frame::Error {
+                    reason: "unexpected Session waiting answer".into(),
+                },
+                Err(reason) => Frame::Error { reason },
             }
         }
-        Request::Sessions { .. } | Request::SessionsPage { .. } | Request::SessionLookup { .. } | Request::SessionLifecycle { .. } => Frame::Error {
+        Request::Sessions { .. }
+        | Request::SessionsPage { .. }
+        | Request::SessionLookup { .. }
+        | Request::SessionLifecycle { .. } => Frame::Error {
             reason: "Sessions require a reply stream".into(),
         },
-        Request::Services { channel_id, after, revision } => match handle.open_detail(channel_id).await {
+        Request::Services {
+            channel_id,
+            after,
+            revision,
+        } => match handle.open_detail(channel_id).await {
             Some(detail) => match handle.shared_page(channel_id, after, revision).await {
                 Ok((shared, next, revision)) => Frame::Services {
-                    room: crate::node::resolver::room_shown_here(detail.name.as_deref(), &channel_id, handle.view().channels.iter().map(|c| c.name.as_deref())),
-                    services: detail.services.iter().map(|(tag, local)| (tag.clone(), local.to_string())).collect(),
-                    shared, next, revision,
+                    room: crate::node::resolver::room_shown_here(
+                        detail.name.as_deref(),
+                        &channel_id,
+                        handle.view().channels.iter().map(|c| c.name.as_deref()),
+                    ),
+                    services: detail
+                        .services
+                        .iter()
+                        .map(|(tag, local)| (tag.clone(), local.to_string()))
+                        .collect(),
+                    shared,
+                    next,
+                    revision,
                 },
                 Err(reason) => Frame::Error { reason },
             },
-            None => Frame::Error { reason: "room not open".into() },
+            None => Frame::Error {
+                reason: "room not open".into(),
+            },
         },
         Request::Agree {
             channel_id,
@@ -6793,13 +7044,23 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 },
             }
         }
-        Request::CheckRoomPassphrase { channel_id, mut passphrase } => {
-            match handle.apply(crate::node::api::NodeCommand::CheckRoomPassphrase {
-                channel_id,
-                passphrase: crate::node::api::Secret::new(std::mem::take(&mut *passphrase).into_bytes()),
-            }).await {
+        Request::CheckRoomPassphrase {
+            channel_id,
+            mut passphrase,
+        } => {
+            match handle
+                .apply(crate::node::api::NodeCommand::CheckRoomPassphrase {
+                    channel_id,
+                    passphrase: crate::node::api::Secret::new(
+                        std::mem::take(&mut *passphrase).into_bytes(),
+                    ),
+                })
+                .await
+            {
                 crate::node::api::Outcome::Done => Frame::Ok,
-                other => Frame::Error { reason: other.to_string() },
+                other => Frame::Error {
+                    reason: other.to_string(),
+                },
             }
         }
         Request::Join {
@@ -6934,9 +7195,20 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         }
         Request::Admins { channel_id } => {
             use crate::node::channel::history::{Query, Reply};
-            match handle.room_history(channel_id, Query::Governance(crate::node::api::GovernanceQuery::Admins { after: None, revision: None })).await {
+            match handle
+                .room_history(
+                    channel_id,
+                    Query::Governance(crate::node::api::GovernanceQuery::Admins {
+                        after: None,
+                        revision: None,
+                    }),
+                )
+                .await
+            {
                 Ok(Reply::Governance(page)) => Frame::GovernancePage { page },
-                Ok(_) => Frame::Error { reason: "unexpected admin page reply".into() },
+                Ok(_) => Frame::Error {
+                    reason: "unexpected admin page reply".into(),
+                },
                 Err(reason) => Frame::Error { reason },
             }
         }

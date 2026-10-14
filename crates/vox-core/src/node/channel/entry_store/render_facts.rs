@@ -711,11 +711,25 @@ impl RenderView<'_> {
     pub(crate) fn has_backfill(&self) -> bool {
         self.roots().backfill != 0
     }
+    pub(crate) fn transaction(&self) -> Transaction<'_, '_> {
+        self.order.read.transaction()
+    }
     pub(crate) fn order(&self) -> &OrderView<'_> {
         &self.order
     }
     pub(crate) fn revision(&self) -> u64 {
         self.order.revision()
+    }
+    /// Only facts that can change a rendered row or an owed placeholder. Ordinary
+    /// directory seals, receipt writes and recovery cursors do not change this token.
+    pub(crate) fn display_roots(&self) -> [u64; 4] {
+        let roots = self.roots();
+        [
+            roots.hash,
+            roots.display,
+            roots.owed_display,
+            self.order.read.directory.render_epoch,
+        ]
     }
     pub(crate) fn fact(&self, hash: &Digest32) -> Result<Option<RenderFact>> {
         self.source().render_fact(
@@ -962,11 +976,19 @@ impl EntryIndex {
                     break;
                 }
                 bytes = bytes.saturating_add(opened.len());
-                if let super::super::CacheRow::Text(mut row) = super::super::parse_cache(&opened)? {
-                    row.arrival = id;
-                    if retained(writer.batch, &row.entry_hash, id)? {
-                        writer.put_rendered(&row, 0)?;
+                match super::super::parse_cache(&opened)? {
+                    super::super::CacheRow::Text(mut row) => {
+                        row.arrival = id;
+                        if retained(writer.batch, &row.entry_hash, id)? {
+                            writer.put_rendered(&row, 0)?;
+                        }
                     }
+                    super::super::CacheRow::Read(row) => {
+                        if retained(writer.batch, &row.entry_hash, id)? {
+                            writer.put_read_receipt(&row, id)?;
+                        }
+                    }
+                    super::super::CacheRow::Session(_) => {}
                 }
                 writer.directory.render_cursor = Some(id);
             }

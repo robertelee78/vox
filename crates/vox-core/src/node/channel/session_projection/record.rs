@@ -3,7 +3,7 @@
 
 use crate::cbor::{Decoder, Encoder};
 use crate::error::{Error, Result};
-use crate::hash::{sha256_concat, Digest32};
+use crate::hash::Digest32;
 
 pub(super) type Key = [u8; 64];
 
@@ -205,14 +205,6 @@ pub(super) struct Descriptor {
 }
 
 impl Descriptor {
-    pub fn group(&self) -> Digest32 {
-        sha256_concat(&[
-            b"vox/session-projection/id/v1",
-            &self.node,
-            self.id.as_bytes(),
-        ])
-    }
-
     pub fn put(&self, e: &mut Encoder) {
         e.array(9).uint(1).bytes(&self.node).text(&self.id);
         self.opening.put(e);
