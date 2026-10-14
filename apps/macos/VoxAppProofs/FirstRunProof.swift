@@ -4352,8 +4352,8 @@ final class FirstRunProof: XCTestCase {
                 && panel.frame.contains(bodyFrame)
                 && panel.frame.contains(CGPoint(x: frame.midX, y: frame.midY)) && inView(ui, row)
         }
-        let panelUntil = Date().addingTimeInterval(20)
-        while Date() < panelUntil {
+        let taggedMiddleRealizationUntil = Date().addingTimeInterval(20)
+        while Date() < taggedMiddleRealizationUntil {
             if let row = locate(ui, middleKey), visibleMiddle(row) { break }
             panel.scroll(byDeltaX: 0, deltaY: -100)
             Thread.sleep(forTimeInterval: 0.25)
