@@ -27,7 +27,7 @@ use vox_core::node::link::{b32_decode, b32_encode, B32_DIGEST_LEN};
 use vox_core::node::paths::Paths;
 
 use crate::app::AppError;
-use crate::tunnel_cli::resolve_prefix;
+use crate::tunnel_cli::{resolve_fingerprint, resolve_prefix};
 
 /// Connect to the daemon as this node, which must be attached already (ADR-026 L-2: a one-shot
 /// verb never attaches).
@@ -5110,7 +5110,10 @@ pub async fn anchors(
         } => (chosen_anchors(paths, anchors, *find_anchor).await?, None),
         crate::cli::RoomAnchorChange::Remove { fingerprint } => (
             vox_core::nat::bootstrap::BootstrapSet::new(),
-            Some(b32_decode(fingerprint, "anchor fingerprint")?),
+            Some(vox_core::node::link::fingerprint_input(
+                fingerprint,
+                "anchor fingerprint",
+            )?),
         ),
     };
     let mut client = attach(paths).await?;
@@ -5624,7 +5627,7 @@ pub async fn trust_rename(paths: &Paths, fingerprint: &str, name: &str) -> Resul
         Err(e) => return Err(AppError::Usage(e.to_string())),
     };
     let ids: Vec<Digest32> = entries.iter().map(|(id, _)| *id).collect();
-    let target = resolve_prefix(fingerprint, &ids).map_err(|_| {
+    let target = resolve_fingerprint(fingerprint, &ids).map_err(|_| {
         AppError::Usage(format!(
             "no trusted identity matches {fingerprint:?}, so there is nothing to rename — \
              `vox trust add` it first"
@@ -5670,7 +5673,7 @@ pub async fn trust_capability(
         Err(e) => return Err(AppError::Usage(e.to_string())),
     };
     let ids: Vec<Digest32> = entries.iter().map(|(id, _, _)| *id).collect();
-    let target = resolve_prefix(fingerprint, &ids).map_err(|_| {
+    let target = resolve_fingerprint(fingerprint, &ids).map_err(|_| {
         AppError::Usage(format!(
             "no trusted identity matches {fingerprint:?}, so it has nothing to change — \
              `vox trust add` it first"
@@ -5865,7 +5868,7 @@ pub async fn trust_dismiss(paths: &Paths, fingerprint: &str) -> Result<(), AppEr
     let mut client = attach(paths).await?;
     let offers = offers_of(&mut client).await?;
     let ids: Vec<Digest32> = offers.iter().map(|o| o.member).collect();
-    let member = resolve_prefix(fingerprint, &ids).map_err(|_| {
+    let member = resolve_fingerprint(fingerprint, &ids).map_err(|_| {
         AppError::Usage(format!(
             "no offer matches {fingerprint:?}; `vox trust offers` lists them"
         ))
@@ -6124,7 +6127,7 @@ pub async fn admin(
         Ok(other) => return Err(crate::client::unexpected(&other)),
         Err(e) => return Err(AppError::Usage(e.to_string())),
     };
-    let member = resolve_prefix(member, &members)?;
+    let member = resolve_fingerprint(member, &members)?;
     match client
         .request(&Request::SetAdmin {
             channel_id,
