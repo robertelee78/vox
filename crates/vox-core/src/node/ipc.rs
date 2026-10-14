@@ -726,6 +726,8 @@ pub enum Request {
         name: String,
         /// The room's passphrase.
         passphrase: zeroize::Zeroizing<String>,
+        /// The anchors explicitly kept for this room before creation.
+        anchors: crate::nat::bootstrap::BootstrapSet,
     },
     /// Mint an invite link for a room.
     ///
@@ -1318,8 +1320,16 @@ impl Request {
                     .bytes(channel_id)
                     .text(passphrase);
             }
-            Request::Create { name, passphrase } => {
-                e.array(3).uint(T_CREATE).text(name).text(passphrase);
+            Request::Create {
+                name,
+                passphrase,
+                anchors,
+            } => {
+                e.array(4)
+                    .uint(T_CREATE)
+                    .text(name)
+                    .text(passphrase)
+                    .bytes(&anchors.to_bytes());
             }
             Request::RoomAnchors { channel_id } => {
                 e.array(2).uint(T_ROOM_ANCHORS_READ).bytes(channel_id);
@@ -2063,12 +2073,17 @@ impl Request {
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Join { link, passphrase })
             }
-            (T_CREATE, 3) => {
+            (T_CREATE, 4) => {
                 let name = text(&mut d, "ipc create name")?;
                 let passphrase = secret_text(&mut d, "ipc create passphrase")?;
+                let anchors = crate::nat::bootstrap::BootstrapSet::from_bytes(d.bytes()?)?;
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
-                Ok(Request::Create { name, passphrase })
+                Ok(Request::Create {
+                    name,
+                    passphrase,
+                    anchors,
+                })
             }
             (T_INVITE, 2) => {
                 let channel_id = digest(&mut d)?;
@@ -6153,9 +6168,11 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         Request::Create {
             name,
             mut passphrase,
+            anchors,
         } => match handle
             .apply(crate::node::api::NodeCommand::CreateChannel {
                 name,
+                anchors,
                 passphrase: crate::node::api::Secret::new(
                     std::mem::take(&mut *passphrase).into_bytes(),
                 ),

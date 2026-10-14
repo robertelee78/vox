@@ -1532,6 +1532,8 @@ enum NetEvent {
         room_name: String,
         /// The passphrase, kept by the room's state.
         passphrase: Secret,
+        /// The chosen set, signed before the new room is published.
+        anchors: BootstrapSet,
         /// The genesis made before the seal.
         genesis: Box<crate::governance::genesis::Genesis>,
         /// When the room was begun.
@@ -5399,9 +5401,10 @@ impl Node {
                     if let NodeCommand::CreateChannel {
                         name: room_name,
                         passphrase,
+                        anchors,
                     } = command
                     {
-                        self.begin_create_channel(room_name, passphrase, None, reply)
+                        self.begin_create_channel(room_name, passphrase, anchors, None, reply)
                             .await;
                         self.note_if_stalled(name, started);
                         self.publish().await;
@@ -5431,6 +5434,7 @@ impl Node {
                         self.begin_create_channel(
                             room_name,
                             passphrase,
+                            BootstrapSet::new(),
                             Some((tag, endpoint)),
                             reply,
                         )
@@ -5681,9 +5685,6 @@ impl Node {
                     Err(_) => Outcome::Failed(Fault::WrongPassphrase),
                 },
             },
-            NodeCommand::CreateChannel { name, passphrase } => {
-                self.create_channel(&name, &passphrase).await
-            }
             NodeCommand::ChangeRoomAnchors {
                 channel_id,
                 add,
@@ -5864,7 +5865,9 @@ impl Node {
                 out
             }
             // Answered through `begin_create_channel`, which the run loop calls instead of this.
-            NodeCommand::Serve { .. } => Outcome::Failed(Fault::Internal),
+            NodeCommand::CreateChannel { .. } | NodeCommand::Serve { .. } => {
+                Outcome::Failed(Fault::Internal)
+            }
             NodeCommand::Up { channel_id, bind } => self.bring_up(&channel_id, bind).await,
             NodeCommand::AddService {
                 channel_id,
@@ -7885,6 +7888,7 @@ impl Node {
                 reply,
                 room_name,
                 passphrase,
+                anchors,
                 genesis,
                 now,
                 sealed,
@@ -7906,6 +7910,7 @@ impl Node {
                             sek,
                             &wrap,
                             now,
+                            &anchors,
                         ) {
                             Ok(ch) => match service {
                                 None => self.finish_create_channel(ch).await,
@@ -15315,30 +15320,6 @@ impl Node {
         }
     }
 
-    fn create_channel<'a>(
-        &'a mut self,
-        room_name: &'a str,
-        passphrase: &'a Secret,
-    ) -> Boxed<'a, Outcome> {
-        Box::pin(self.create_channel_unboxed(room_name, passphrase))
-    }
-
-    /// [`Self::create_channel`], unboxed: see [`Boxed`].
-    async fn create_channel_unboxed(&mut self, room_name: &str, passphrase: &Secret) -> Outcome {
-        if self.room_named(room_name).is_some() {
-            return Outcome::Failed(Fault::RoomNameTaken);
-        }
-        let now_ms = self.now_ms();
-        let Some(profile) = self.profile.as_ref() else {
-            return Outcome::Failed(Fault::NoIdentity);
-        };
-        match ChannelState::create_with_profile(profile, room_name, passphrase, now_ms, self.argon2)
-        {
-            Ok(ch) => self.finish_create_channel(ch).await,
-            Err(e) => Outcome::Failed(fault_of(&e)),
-        }
-    }
-
     /// Everything after a room exists: hold it, give it anchors, publish it, say so.
     fn finish_create_channel(&mut self, ch: ChannelState) -> Boxed<'_, Outcome> {
         Box::pin(self.finish_create_channel_unboxed(ch))
@@ -15420,6 +15401,7 @@ impl Node {
         &mut self,
         room_name: String,
         passphrase: Secret,
+        anchors: BootstrapSet,
         service: Option<(String, SocketAddr)>,
         reply: oneshot::Sender<Outcome>,
     ) {
@@ -15487,6 +15469,7 @@ impl Node {
                     reply,
                     room_name,
                     passphrase,
+                    anchors,
                     genesis: Box::new(genesis),
                     now: now_ms,
                     sealed,

@@ -836,6 +836,8 @@ pub enum NodeCommand {
         name: String,
         /// The channel passphrase (the second lock factor).
         passphrase: Secret,
+        /// Explicitly chosen room anchors; never inherited from machine settings.
+        anchors: crate::nat::bootstrap::BootstrapSet,
     },
     /// Open a channel: double-lock unwrap of its SEK.
     OpenChannel {
