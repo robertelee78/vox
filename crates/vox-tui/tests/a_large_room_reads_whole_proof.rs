@@ -638,13 +638,20 @@ fn delayed_app_reply(fault: AppReplyFault) {
         .expect("PRODUCT: the app could not attach its node");
     let (ended, from_listener) = std::sync::mpsc::channel();
     struct Listener(std::sync::mpsc::Sender<String>);
+    #[async_trait::async_trait]
     impl vox_ffi::ClientListener for Listener {
-        fn on_message(&self, _: String, _: vox_ffi::RoomMessage) {}
-        fn on_notice(&self, _: String) {}
-        fn on_ended(&self, said: String) {
+        async fn on_message(&self, _: String, _: Vec<u8>, _: vox_ffi::RoomMessage) -> bool {
+            true
+        }
+        async fn on_notice(&self, _: String) -> bool {
+            true
+        }
+        async fn on_ended(&self, said: String) {
             let _ = self.0.send(said);
         }
-        fn on_sessions(&self, _: String) {}
+        async fn on_sessions(&self, _: String) -> bool {
+            true
+        }
     }
     if background {
         assert_eq!(
