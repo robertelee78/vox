@@ -80,9 +80,9 @@ struct OfferCard: View {
             .task(id: offer.presentedName) { if alias.isEmpty { alias = offer.presentedName } }
             .task(id: offer.fingerprint) {
                 trustPrepared = false
-                await model.refreshIndividualTrustEligibility(offer.fingerprint)
+                await model.refreshIndividualTrustEligibility(offer.fingerprint, invalidate: true)
                 guard !Task.isCancelled else { return }
-                trustPrepared = model.canManageIndividualTrust(offer.fingerprint)
+                trustPrepared = true // Current authoritative fact, not this completion latch, grants the form.
             }
         }
         if !offer.presentedName.isEmpty { Text("Name it presents: \(offer.presentedName)").accessibilityIdentifier("offer-presented-name") }

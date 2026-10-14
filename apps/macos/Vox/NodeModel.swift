@@ -362,11 +362,14 @@ final class NodeModel: ObservableObject {
     }
 
     /// Selected-node authority, never inferred from a name, address or cached body.
-    func refreshIndividualTrustEligibility(_ fingerprint: String) async {
+    func refreshIndividualTrustEligibility(_ fingerprint: String, invalidate: Bool = false) async {
         let request = UUID(), generation = roomReadGeneration, epoch = nodeObservationEpoch
         let room = roomOnScreen
         individualTrustReads[fingerprint] = request
-        individualTrustFacts[fingerprint] = IndividualTrustFact(allowed: nil, reason: "Checking whether individual trust can be changed…")
+        // Entry checks retire stale authority; background refresh keeps a current form stable.
+        if invalidate {
+            individualTrustFacts[fingerprint] = IndividualTrustFact(allowed: nil, reason: "Checking whether individual trust can be changed…")
+        }
         do {
             let fact = try await client.individualTrustEligibility(fingerprint: fingerprint)
             guard individualTrustReads[fingerprint] == request, generation == roomReadGeneration,
