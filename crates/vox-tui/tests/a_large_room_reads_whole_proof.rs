@@ -2037,6 +2037,7 @@ fn many_vox(
 }
 
 // Product-facing app pages: the proof may retain the returned rows to assert completeness.
+#[cfg(feature = "optional-proofs")]
 async fn collection_services(app: &vox_ffi::VoxClient, room: &str) -> Vec<vox_ffi::SharedService> {
     let mut rows = Vec::new();
     let mut after = None;
