@@ -636,7 +636,7 @@ final class NodeModel: ObservableObject {
             let instance = page.instance
             while true {
                 guard epoch == nodeObservationEpoch, !Task.isCancelled,
-                      rooms.contains(where: { $0.id == room && $0.open }) else { return }
+                      rooms.contains(where: { $0.id == room }) else { return }
                 guard page.instance == instance else {
                     throw VoxError.Failed(reason: "The saved room changed while reading its preview.")
                 }
@@ -1042,8 +1042,10 @@ final class NodeModel: ObservableObject {
 
     /// The rooms, the keyring, the nodes on this Mac and the peers, read again.
     func refresh() async {
+        let epoch = nodeObservationEpoch
         do {
             let fresh = try await client.rooms()
+            guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
             let now = fresh.map { r in
                 var room = Room(id: r.id, name: name(of: r), open: r.open)
                 if let held = rooms.first(where: { $0.id == r.id }) {
@@ -1060,12 +1062,19 @@ final class NodeModel: ObservableObject {
                 return room
             }
             if now != rooms { rooms = now }
-            for room in now { await readLast(room.id) }
+            for room in now {
+                await readLast(room.id)
+                guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
+            }
             await readWaiting()
+            guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
             await readFacts()
+            guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
             let back = await readTrustsBack()
+            guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
             if back != trustsBack { trustsBack = back }
         } catch {
+            guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
             reportBackground(error)
         }
     }
