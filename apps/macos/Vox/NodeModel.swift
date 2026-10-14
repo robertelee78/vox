@@ -914,7 +914,6 @@ final class NodeModel: ObservableObject {
 
                 try await client.subscribe(listener: Listener(model: self))
                 guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
-                lastRead.removeAll()
                 await refresh()
                 guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
                 await reconcileUnread()
