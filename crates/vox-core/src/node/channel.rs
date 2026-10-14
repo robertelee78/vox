@@ -38,6 +38,7 @@
 //! same layout.
 
 mod entry_store;
+pub(crate) mod history;
 mod legacy_session;
 mod legacy_session_sender;
 mod private_session;

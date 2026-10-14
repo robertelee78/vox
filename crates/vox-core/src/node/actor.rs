@@ -643,6 +643,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::Status(_) => "reporting status",
         NetEvent::Names(_) => "resolving a .vox name",
         NetEvent::SessionPage { .. } => "reading a page of a room's Session entries",
+        NetEvent::RoomHistory { .. } => "reading a page of a room's history",
         NetEvent::MemberDialer(_) => "lending the proxy its dialer",
         NetEvent::ComputerPolicy(_) => "applying computer trust",
         NetEvent::LocalTrustBlacklist(_) => "reading local trust removal decisions",
@@ -1041,6 +1042,11 @@ enum NetEvent {
         /// Where the answer goes.
         reply:
             oneshot::Sender<Option<std::result::Result<crate::node::drive::SessionPage, String>>>,
+    },
+    RoomHistory {
+        channel_id: Digest32,
+        query: crate::node::channel::history::Query,
+        reply: oneshot::Sender<std::result::Result<crate::node::channel::history::Reply, String>>,
     },
     /// The daemon's proxy (ADR-028 S-5) wants this node's way of reaching a member, to carry a
     /// name that resolved to one of this node's rooms.
@@ -4079,6 +4085,35 @@ impl NodeHandle {
             .await
             .ok()?;
         rx.await.ok()?
+    }
+
+    /// One bounded selected-room query. No snapshot or room lock crosses this reply.
+    pub(crate) async fn room_history(
+        &self,
+        channel_id: Digest32,
+        query: crate::node::channel::history::Query,
+    ) -> std::result::Result<crate::node::channel::history::Reply, String> {
+        let (reply, rx) = oneshot::channel();
+        self.net_tx
+            .send(NetEvent::RoomHistory {
+                channel_id,
+                query,
+                reply,
+            })
+            .await
+            .map_err(|_| "the node has stopped".to_owned())?;
+        rx.await.map_err(|_| "the node has stopped".to_owned())?
+    }
+
+    /// Borrow metadata directly: cloning NodeView also clones every room's complete order.
+    pub(crate) fn inspect_view<T>(&self, read: impl FnOnce(&NodeView, bool) -> T) -> T {
+        let policy_current = self.computer.as_ref().is_none_or(|c| {
+            c.policy_current(
+                self.computer_revision
+                    .load(std::sync::atomic::Ordering::Acquire),
+            )
+        });
+        read(&self.view_rx.borrow(), policy_current)
     }
 
     /// Resolve a `.vox` name against this node's rooms and keyring (PRD-001 R20): the
@@ -8906,6 +8941,21 @@ impl Node {
                     None => None,
                 };
                 let _ = reply.send(page);
+            }
+            NetEvent::RoomHistory {
+                channel_id,
+                query,
+                reply,
+            } => {
+                let result = match (self.channels.get(&channel_id), self.profile.as_ref()) {
+                    (Some(shared), Some(profile)) => shared.lock().await.history_query(
+                        profile.store(),
+                        query,
+                        crate::node::ipc::rows_budget(),
+                    ),
+                    _ => Err("room not open".into()),
+                };
+                let _ = reply.send(result);
             }
             NetEvent::Names(reply) => {
                 let _ = reply.send(self.resolver_snapshot().await);
