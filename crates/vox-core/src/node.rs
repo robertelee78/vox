@@ -40,6 +40,7 @@ pub mod daemonipc;
 pub mod decisions;
 pub mod drive;
 pub mod drive_input;
+pub mod room_pause;
 pub mod folder;
 pub mod headless;
 pub mod ipc;

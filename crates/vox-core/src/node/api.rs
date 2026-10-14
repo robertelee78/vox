@@ -555,6 +555,11 @@ pub enum GovernancePage {
 /// An open channel's full state for display.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelDetail {
+    /// This node's durable room pause. It never gates direct operator input.
+    pub pause: vox_agentcomms::drive::PauseState,
+    /// Ordinary reply wakes at/below this saved readable-arrival boundary are held for a turn.
+    /// Updated on resume; it is receiver-local and not a remote Session metadata cursor.
+    pub pause_resume_after: u64,
     /// The channelID.
     pub channel_id: Digest32,
     /// The room's shared name (ADR-028 R-1); `None` for a room no admin has named.
@@ -768,6 +773,23 @@ pub struct AnchoredChannel {
 /// A command from a client to the node.
 #[derive(Debug)]
 pub enum NodeCommand {
+    /// Read or change the local room pause. Only the authenticated drive receiver constructs
+    /// a change; the actor rechecks current authority before sealing it.
+    RoomPause {
+        /// Exact room.
+        channel_id: Digest32,
+        /// Authenticated app-stream sender, or this node for its own socket.
+        by: Digest32,
+        /// Set pause/resume; `None` reads the saved state.
+        paused: Option<bool>,
+        /// Existing receiver room incarnation/state when continuing an interrupt page.
+        expected: Option<vox_agentcomms::drive::PauseSelection>,
+        /// Already acquired outside the actor; kept through a queued mutation even if its
+        /// caller is cancelled. The actor never waits for this hook-publication fence.
+        publication_guard: Option<std::fs::File>,
+        /// Answer only after durable state and its current view have been updated.
+        reply: tokio::sync::oneshot::Sender<Result<vox_agentcomms::drive::PauseSelection, Fault>>,
+    },
     /// Create the profile's identity (fails if one exists).
     CreateIdentity {
         /// The identity passphrase.

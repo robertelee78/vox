@@ -31,6 +31,18 @@ pub struct Request {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "lowercase")]
 pub enum Action {
+    /// Set or read this receiver's durable room pause (ADR-033 PA-1–PA-6).
+    /// The request's Session id must be empty. `None` reads current state.
+    RoomPause {
+        /// Pause, resume, or read without changing it.
+        paused: Option<bool>,
+        /// Continue interrupting live registrations strictly after this Session id.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after: Option<String>,
+        /// The receiver's saved room and state from the previous page.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected: Option<PauseSelection>,
+    },
     /// Typed as the operator's input (DR-1.2).
     Text {
         /// What is typed.
@@ -87,6 +99,7 @@ impl Action {
     #[must_use]
     pub fn name(&self) -> &'static str {
         match self {
+            Action::RoomPause { .. } => "roompause",
             Action::Text { .. } => "text",
             Action::Interrupt => "interrupt",
             Action::Stop => "stop",
@@ -110,10 +123,18 @@ pub struct Answer {
     /// only by its own name, which the driver may not; the driver names it as it knows it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
+    /// Current durable state and one bounded interrupt page for a room-pause request.
+    /// `ok` means this state is saved; interruption failures do not undo admission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause: Option<PauseReport>,
 }
 
 /// The session's node does not trust the driver with drive (DR-2).
 pub const NO_DRIVE: &str = "no-drive";
+
+/// The receiver could not confirm its saved room pause state (for example a storage failure).
+/// This is distinct from a refusal which is known not to have changed it.
+pub const PAUSE_UNKNOWN: &str = "pause-state-unknown";
 
 /// What a driver reads for [`NO_DRIVE`], `node` being its own name for the session's node: its
 /// alias for it, or its short fingerprint.
@@ -142,3 +163,50 @@ pub fn slash(text: &str) -> (String, String) {
         None => (t.to_owned(), String::new()),
     }
 }
+
+/// One receiver's current room state, not a history of pause operations.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PauseState {
+    /// Whether room news and autonomous wakes are held.
+    pub paused: bool,
+    /// Authenticated driver of the last change; zero only before the first change.
+    pub by: [u8; 32],
+    /// Receiver's time of the last change; zero before the first change.
+    pub at_millis: u64,
+}
+
+/// Existing saved-room incarnation plus the exact state being continued.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PauseSelection {
+    /// Receiver-local saved room instance (not the driver's arrival instance).
+    pub instance: [u8; 16],
+    /// Pause state which this interruption pass belongs to.
+    pub state: PauseState,
+}
+
+/// Delivery of Esc to one currently registered Session, separate from saved pause admission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PauseInterrupt {
+    /// Exact harness Session id.
+    pub session: String,
+    /// Whether the harness acknowledged the interrupt.
+    pub delivered: bool,
+    /// Delivery result or explicit refusal/unknown outcome.
+    pub said: String,
+}
+
+/// One fixed-size page of a room pause. Callers transparently continue `next` in the same action.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PauseReport {
+    /// Saved current room state and incarnation.
+    pub selection: PauseSelection,
+    /// At most [`PAUSE_PAGE`] live Session interruption results.
+    pub interrupts: Vec<PauseInterrupt>,
+    /// Last examined live Session id; `None` completes this operation.
+    pub next: Option<String>,
+    /// Registration discovery failed after state admission; no all-interrupted claim is made.
+    pub interrupt_error: Option<String>,
+}
+
+/// Live registrations interrupted per request; memory never grows with saved Session history.
+pub const PAUSE_PAGE: usize = 16;

@@ -775,6 +775,121 @@ pub fn registered(paths: &Paths) -> Vec<Session> {
         .collect()
 }
 
+/// One bounded page of current registrations in `room`, ordered by complete Session id.
+/// Files are inspected one at a time; no saved Session transcript or activity is read.
+/// A malformed registration is reported, never counted as successfully interrupted.
+pub(crate) fn registered_page(
+    paths: &Paths,
+    room: &str,
+    after: Option<&str>,
+    limit: usize,
+) -> Result<(Vec<Session>, Option<String>), String> {
+    let entries = match std::fs::read_dir(paths.session_dir()) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), None)),
+        Err(e) => return Err(format!("cannot read live Session registrations: {e}")),
+    };
+    let mut page: Vec<Session> = Vec::with_capacity(limit + 1);
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
+        if entry.path().extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(session) = pause_registration_file(&entry.path())? else {
+            continue;
+        };
+        if !session.interactive
+            || session.room.as_deref() != Some(room)
+            || after.is_some_and(|after| session.session.as_str() <= after)
+        {
+            continue;
+        }
+        if session.session.len() > vox_core::node::content::MAX_SESSION_ID_LEN {
+            return Err(
+                "a registration has an invalid Session id; interruption is incomplete".into(),
+            );
+        }
+        let index = page.partition_point(|old| old.session < session.session);
+        if index <= limit {
+            page.insert(index, session);
+            page.truncate(limit + 1);
+        }
+    }
+    let more = page.len() > limit;
+    page.truncate(limit);
+    let next = if more {
+        page.last().map(|s| s.session.clone())
+    } else {
+        None
+    };
+    Ok((page, next))
+}
+
+/// Only the live routing fields needed to interrupt. Large current titles and transcript
+/// metadata are skipped by the streaming JSON decoder rather than copied into every page.
+#[derive(serde::Deserialize)]
+struct PauseRegistration {
+    session: String,
+    harness: String,
+    #[serde(default)]
+    endpoint: String,
+    #[serde(default)]
+    token: String,
+    #[serde(default)]
+    room: Option<String>,
+    #[serde(default)]
+    first_seen_ms: u64,
+    #[serde(default = "interactive_by_default")]
+    interactive: bool,
+    #[serde(default)]
+    tmux: Option<TmuxPane>,
+    #[serde(default)]
+    tmux_why: Option<String>,
+    #[serde(default)]
+    codex_home: String,
+    #[serde(default)]
+    mirror: String,
+}
+fn pause_registration_file(path: &std::path::Path) -> Result<Option<Session>, String> {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("cannot read live Session registration: {e}")),
+    };
+    let reg: PauseRegistration =
+        serde_json::from_reader(std::io::BufReader::new(file)).map_err(|e| {
+            format!(
+                "cannot read live Session registration {}: {e}",
+                path.display()
+            )
+        })?;
+    Ok(Some(Session {
+        session: reg.session,
+        harness: reg.harness,
+        endpoint: reg.endpoint,
+        token: reg.token,
+        room: reg.room,
+        first_seen_ms: reg.first_seen_ms,
+        interactive: reg.interactive,
+        tmux: reg.tmux,
+        tmux_why: reg.tmux_why,
+        codex_home: reg.codex_home,
+        mirror: reg.mirror,
+        state: String::new(),
+        state_ms: 0,
+        last_drained_ms: 0,
+        start: None,
+        name: None,
+        transcript: String::new(),
+        tmux_claim: None,
+    }))
+}
+
+/// Revalidate a selected live routing record without loading its current title/transcript.
+pub(crate) fn pause_registration(paths: &Paths, session: &str) -> Result<Option<Session>, String> {
+    pause_registration_file(&paths.session_file(session))
+}
+
 /// Drop `session`'s registration, **if it is still the one that failed**.
 ///
 /// A registration is rewritten every turn, but nothing ever removed one: a session that

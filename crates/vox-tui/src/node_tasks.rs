@@ -100,7 +100,15 @@ async fn watch_for_interrupts(node: NodeHandle, paths: Paths) {
     say_retention_above_room(&node.view(), &mut said_above, &paths);
     // Counted at once, not at the first tick.
     if !deaf {
-        tend(&paths, &history, &node.view(), &answered, &mut tending).await;
+        tend(
+            &node,
+            &paths,
+            &history,
+            &node.view(),
+            &answered,
+            &mut tending,
+        )
+        .await;
     }
     loop {
         let sweep = tokio::select! {
@@ -153,6 +161,11 @@ async fn watch_for_interrupts(node: NodeHandle, paths: Paths) {
             swept.retain(|room, _| view.channels.iter().any(|c| c.channel_id == *room));
             opening.retain(|room| view.channels.iter().any(|c| c.channel_id == *room));
             for d in &view.open_channels {
+                // Do not consume the wake cursor while paused: urgent held news is judged
+                // after resume, and registration cursors still name all undrained news.
+                if d.pause.paused {
+                    continue;
+                }
                 if opening.contains(&d.channel_id) {
                     match history.arrival_head(d.channel_id).await {
                         Ok(last) => {
@@ -174,11 +187,34 @@ async fn watch_for_interrupts(node: NodeHandle, paths: Paths) {
                     }
                 };
                 for row in page.rows {
+                    if room_held(&node.view(), &d.channel_id) {
+                        break;
+                    }
                     if may_wake(&row.text) {
-                        if let Err(e) = judge(&paths, &history, &view, &d.channel_id, &row).await {
+                        if let Err(e) =
+                            judge(&node, &paths, &history, &view, &d.channel_id, &row).await
+                        {
                             eprintln!("vox daemon: could not judge room notice; will retry: {e}");
                             break;
                         }
+                    }
+                    // A completed history read is not permission to consume its cursor
+                    // across a newly admitted pause. No daemon await occurs in this fence.
+                    let _publication = match crate::room_pause::publication_lock(
+                        &paths,
+                        d.channel_id,
+                        false,
+                    )
+                    .await
+                    {
+                        Ok(guard) => guard,
+                        Err(error) => {
+                            eprintln!("vox daemon: room notice cursor held: {error}");
+                            break;
+                        }
+                    };
+                    if room_held(&node.view(), &d.channel_id) {
+                        break;
                     }
                     if crate::ping::is_ping(&row.text) {
                         crate::ping::answer(&node, &paths, &view, d.channel_id, &row);
@@ -195,7 +231,7 @@ async fn watch_for_interrupts(node: NodeHandle, paths: Paths) {
                     );
                 }
             }
-            tend(&paths, &history, &view, &answered, &mut tending).await;
+            tend(&node, &paths, &history, &view, &answered, &mut tending).await;
             answered.clear();
         }
     }
@@ -267,6 +303,7 @@ fn may_answer(text: &str) -> bool {
 /// `view` is the node's view as the entry is judged: the room's log, for the hop budget and the
 /// reply chain.
 async fn judge(
+    node: &NodeHandle,
     paths: &vox_core::node::paths::Paths,
     history: &vox_core::node::actor::HistoryReader,
     view: &vox_core::node::api::NodeView,
@@ -298,6 +335,10 @@ async fn judge(
         return Ok(());
     };
     let me_fp = vox_core::node::link::b32_encode(&me);
+    let _publication = crate::room_pause::publication_lock(paths, *channel_id, false).await?;
+    if room_held(&node.view(), channel_id) {
+        return Err("room news is paused; the wake cursor stays put".into());
+    }
     for session in crate::wake::registered(paths) {
         if session.room.as_deref() != Some(room.as_str()) {
             continue;
@@ -440,6 +481,7 @@ struct NoticeFold {
     urgent: NoticeCount,
     replies: NoticeCount,
     newest_reply: Option<vox_core::hash::Digest32>,
+    resume_after: u64,
 }
 enum FoldProgress {
     Pending,
@@ -453,6 +495,7 @@ impl NoticeFold {
         registration: &crate::wake::Session,
         cursor: Option<vox_core::hash::Digest32>,
         ahead: crate::agent_hook::SavedHashes,
+        resume_after: u64,
     ) -> Result<Self, String> {
         let state = history.notice_state(room).await?;
         let after = match cursor {
@@ -478,6 +521,7 @@ impl NoticeFold {
             urgent: NoticeCount::default(),
             replies: NoticeCount::default(),
             newest_reply: None,
+            resume_after,
         })
     }
     fn valid(&self, state: &vox_core::node::api::NoticeState) -> bool {
@@ -530,7 +574,8 @@ impl NoticeFold {
                                     .is_some_and(|m| context.spoke(&m, &self.registration.session));
                             if urgent {
                                 self.urgent.add(row.author)?;
-                            } else if context.hops > 0
+                            } else if row.arrival > self.resume_after
+                                && context.hops > 0
                                 && !crate::wake::NOT_REPLIES.contains(&envelope.kind.as_str())
                                 && me.is_some_and(|m| {
                                     context.answers(&m, &self.registration.session)
@@ -574,6 +619,7 @@ impl NoticeFold {
 /// before sending**, from that room and its cursor, so a message its drain already read is never
 /// announced. [`crate::wake::tend`] has the rules; notices carry counts and senders, never a message.
 async fn tend(
+    node: &NodeHandle,
     paths: &vox_core::node::paths::Paths,
     history: &vox_core::node::actor::HistoryReader,
     view: &vox_core::node::api::NodeView,
@@ -618,6 +664,10 @@ async fn tend(
         else {
             continue;
         };
+        if room_held(&node.view(), &d.channel_id) {
+            t.folds.remove(&session.session);
+            continue;
+        }
         let mut n = crate::wake::notices_in(paths, &session.session, Some(room));
         if !(t.starting_sessions.contains(&session.session)
             || t.folds.contains_key(&session.session)
@@ -643,12 +693,24 @@ async fn tend(
                 .unwrap_or_default()
         );
         if t.folds.get(&session.session).is_some_and(|fold| {
-            !fold.registration.same(&session) || fold.cursor != cursor || fold.ahead != ahead
+            !fold.registration.same(&session)
+                || fold.cursor != cursor
+                || fold.ahead != ahead
+                || fold.resume_after != d.pause_resume_after
         }) {
             t.folds.remove(&session.session);
         }
         if !t.folds.contains_key(&session.session) {
-            match NoticeFold::start(history, d.channel_id, &session, cursor, ahead.clone()).await {
+            match NoticeFold::start(
+                history,
+                d.channel_id,
+                &session,
+                cursor,
+                ahead.clone(),
+                d.pause_resume_after,
+            )
+            .await
+            {
                 Ok(fold) => {
                     t.folds.insert(session.session.clone(), fold);
                 }
@@ -673,9 +735,14 @@ async fn tend(
             }
             Ok(FoldProgress::Complete) => {}
         }
-        let Some(fold) = t.folds.remove(&session.session) else {
-            continue;
-        };
+        let _publication =
+            match crate::room_pause::publication_lock(paths, d.channel_id, false).await {
+                Ok(guard) => guard,
+                Err(error) => {
+                    eprintln!("vox daemon: room notice accounting held: {error}");
+                    continue;
+                }
+            };
         // No cursor, room move or endpoint change that happened during an actor wait may
         // make an old count update a new binding's notices.
         if !crate::wake::registration(paths, &session.session).is_some_and(|now| session.same(&now))
@@ -684,6 +751,18 @@ async fn tend(
         {
             continue;
         }
+        if node
+            .view()
+            .open_channels
+            .iter()
+            .find(|now| now.channel_id == d.channel_id)
+            .is_none_or(|now| now.pause.paused || now.pause_resume_after != d.pause_resume_after)
+        {
+            continue;
+        }
+        let Some(fold) = t.folds.remove(&session.session) else {
+            continue;
+        };
         let starting = t.starting_sessions.remove(&session.session);
         let urgent = fold.urgent;
         let replies = fold.replies;
@@ -762,7 +841,15 @@ async fn tend(
                 };
                 let text = crate::agent_hook::render_wake(&[owed]);
                 let hold = u64::try_from(settings.wake_hold.as_millis()).unwrap_or(u64::MAX);
-                deliver(paths.clone(), session, text, (before, n, hold));
+                deliver(
+                    node.clone(),
+                    d.channel_id,
+                    d.pause,
+                    paths.clone(),
+                    session,
+                    text,
+                    (before, n, hold),
+                );
             }
         }
     }
@@ -791,6 +878,9 @@ struct Tending {
 /// **A notice that does not arrive stays owed** (`undo`: the record before and after it was sent,
 /// and the hold): it is tried again once the hold passes or the session's cursor moves.
 fn deliver(
+    node: NodeHandle,
+    room: vox_core::hash::Digest32,
+    expected_pause: vox_agentcomms::drive::PauseState,
     paths: vox_core::node::paths::Paths,
     session: crate::wake::Session,
     text: String,
@@ -800,8 +890,32 @@ fn deliver(
         let failed = |paths: &vox_core::node::paths::Paths| {
             crate::wake::undelivered(paths, &session.session, &undo.0, &undo.1, undo.2);
         };
-        let woke = crate::wake::wake(&paths, &session, &text);
-        match tokio::time::timeout(WAKE_DEADLINE, woke).await {
+        // A pause which arrives after the scheduled count cancels an in-flight wake.
+        // Cancelled/uncertain notice delivery remains owed; it never consumes room news.
+        let mut view = node.watch();
+        let held = async {
+            loop {
+                if room_held(&view.borrow(), &room)
+                    || view
+                        .borrow()
+                        .open_channels
+                        .iter()
+                        .find(|d| d.channel_id == room)
+                        .is_none_or(|d| d.pause != expected_pause)
+                {
+                    return;
+                }
+                if view.changed().await.is_err() {
+                    return;
+                }
+            }
+        };
+        let result = tokio::select! {
+            biased;
+            () = held => { failed(&paths); return; },
+            result = tokio::time::timeout(WAKE_DEADLINE, crate::wake::wake(&paths, &session, &text)) => result,
+        };
+        match result {
             Ok(Ok(())) => eprintln!("vox daemon: woke session {}", session.session),
             Ok(Err(crate::wake::WakeError::Moved)) => {}
             // A session that has ended is forgotten, so its name's later messages are
@@ -839,4 +953,15 @@ fn deliver(
             }
         }
     });
+}
+
+/// Missing/closed/locked rooms hold autonomous delivery too; only explicit human drive bypasses.
+fn room_held(view: &vox_core::node::api::NodeView, room: &vox_core::hash::Digest32) -> bool {
+    view.locked
+        || view.locking
+        || view
+            .open_channels
+            .iter()
+            .find(|d| &d.channel_id == room)
+            .is_none_or(|d| d.pause.paused)
 }

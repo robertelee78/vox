@@ -52,6 +52,7 @@ pub mod ping;
 pub mod platform;
 pub mod room_ask;
 pub mod room_cli;
+pub mod room_pause;
 pub mod room_map;
 pub mod session_cli;
 pub mod session_drive_ui;

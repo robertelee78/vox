@@ -250,6 +250,15 @@ pub enum Mode {
     CommandPalette(String),
     /// A masked onboarding/attach prompt is open (modal).
     Prompt(Prompt),
+    /// Current-node outcomes of one completed room action; a selected result is rendered.
+    PauseReport {
+        /// One bounded result per selected current node.
+        nodes: Vec<String>,
+        /// Result currently visible.
+        selected: usize,
+        /// Vertical scroll within that one result.
+        scroll: u16,
+    },
 }
 
 impl Mode {
@@ -567,6 +576,39 @@ impl UiState {
         match self.mode {
             Mode::CommandPalette(_) => return self.on_palette_key(key, vm),
             Mode::Prompt(_) => return self.on_prompt_key(key),
+            Mode::PauseReport {
+                ref nodes,
+                ref mut selected,
+                ref mut scroll,
+            } => {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Enter => self.mode = Mode::Normal,
+                    KeyCode::Left => {
+                        *selected = selected.saturating_sub(1);
+                        *scroll = 0;
+                    }
+                    KeyCode::Right => {
+                        *selected = selected
+                            .saturating_add(1)
+                            .min(nodes.len().saturating_sub(1));
+                        *scroll = 0;
+                    }
+                    KeyCode::Up => *scroll = scroll.saturating_sub(1),
+                    KeyCode::Down => *scroll = scroll.saturating_add(1),
+                    KeyCode::PageUp => *scroll = scroll.saturating_sub(10),
+                    KeyCode::PageDown => *scroll = scroll.saturating_add(10),
+                    KeyCode::Home => {
+                        *selected = 0;
+                        *scroll = 0;
+                    }
+                    KeyCode::End => {
+                        *selected = nodes.len().saturating_sub(1);
+                        *scroll = 0;
+                    }
+                    _ => {}
+                }
+                return Action::Redraw;
+            }
             Mode::Normal => {}
         }
         // The composer, when focused, owns printable keys, Backspace and Enter.
@@ -1972,6 +2014,13 @@ pub fn parse_command(line: &str, ui: &UiState, vm: &ViewModel) -> Option<Parsed>
     }
     // Channel-scoped verbs require an active channel.
     let channel = ui.active_channel_id(vm)?;
+    if matches!(verb, "pause" | "resume") {
+        return Some(Parsed::Core(Command::RoomPause {
+            channel_id: channel,
+            nodes: rest.split_whitespace().map(str::to_owned).collect(),
+            paused: verb == "pause",
+        }));
+    }
     // Interrupting or stopping is driving the Session on screen (DR-1.3); without drive it is
     // refused (CL-3), and outside a Session there is nothing to send it to.
     if let (Showing::Session(..), "interrupt" | "stop" | "approve" | "reject" | "answer") =

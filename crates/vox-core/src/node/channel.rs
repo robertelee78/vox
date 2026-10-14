@@ -247,6 +247,9 @@ const SEG_DRIVE: u64 = 16;
 /// member learn of a newcomer that is offline, and never of one that left.
 const SEG_BOARD_KEPT: u64 = 17;
 
+/// One current local room pause; sealed independently of Session activity and retention.
+const SEG_ROOM_PAUSE: u64 = 18;
+
 /// Encoding version of [`SEG_BOARD_KEPT`]: `[1, [notice wire..], [withdraw wire..]]`.
 const BOARD_KEPT_VERSION: u64 = 1;
 
@@ -1014,6 +1017,8 @@ pub struct ChannelState {
     /// The room's admission notices and members' withdraws this node keeps (#520), persisted in
     /// `SEG_BOARD_KEPT`. See [`ChannelState::keep_notice`] and [`ChannelState::keep_withdraw`].
     board_kept: BoardKept,
+    room_pause: vox_agentcomms::drive::PauseState,
+    pause_resume_after: u64,
     /// The channel passphrase, retained **in memory only** for as long as the
     /// channel is open (M14.7c).
     ///
@@ -1839,6 +1844,8 @@ impl ChannelState {
             known_members: BTreeSet::new(),
             drive: DriveState::default(),
             board_kept: BoardKept::default(),
+            room_pause: vox_agentcomms::drive::PauseState::default(),
+            pause_resume_after: 0,
             skipped: std::collections::VecDeque::new(),
             poisoned: false,
             save_error: None,
@@ -2301,6 +2308,32 @@ impl ChannelState {
             }
             None => DriveState::default(),
         };
+        let (room_pause, pause_resume_after) =
+            match store.get_segment(channel_id, SegmentKind::KeyMaterial, SEG_ROOM_PAUSE)? {
+                Some(seg) => {
+                    let bytes = open_segment(&sek, SegmentKind::KeyMaterial, SEG_ROOM_PAUSE, &seg)?;
+                    let mut d = crate::cbor::Decoder::new(&bytes);
+                    if d.array()? != 5 || d.uint()? != 1 {
+                        return Err(Error::MalformedAtRest("room pause format"));
+                    }
+                    let state = vox_agentcomms::drive::PauseState {
+                        paused: match d.uint()? {
+                            0 => false,
+                            1 => true,
+                            _ => return Err(Error::MalformedAtRest("room pause value")),
+                        },
+                        by: d
+                            .bytes()?
+                            .try_into()
+                            .map_err(|_| Error::MalformedAtRest("room pause driver"))?,
+                        at_millis: d.uint()?,
+                    };
+                    let resume_after = d.uint()?;
+                    d.finish()?;
+                    (state, resume_after)
+                }
+                None => (vox_agentcomms::drive::PauseState::default(), 0),
+            };
         let board_kept =
             match store.get_segment(channel_id, SegmentKind::KeyMaterial, SEG_BOARD_KEPT)? {
                 Some(seg) => {
@@ -2365,6 +2398,8 @@ impl ChannelState {
             known_members,
             drive,
             board_kept,
+            room_pause,
+            pause_resume_after,
             skipped: std::collections::VecDeque::new(),
             poisoned: false,
             save_error: None,
@@ -2606,6 +2641,8 @@ impl ChannelState {
             known_members: BTreeSet::new(),
             drive: DriveState::default(),
             board_kept: BoardKept::default(),
+            room_pause: vox_agentcomms::drive::PauseState::default(),
+            pause_resume_after: 0,
             skipped: std::collections::VecDeque::new(),
             poisoned: false,
             save_error: None,
@@ -2829,6 +2866,68 @@ impl ChannelState {
         crate::nat::notice::AdmissionNotice::from_wire(wire)
             .ok()
             .map(|n| n.key)
+    }
+
+    /// Current durable local pause. Session metadata publishers may copy this scalar state;
+    /// no activity history or registration scan is needed to recover it after a restart.
+    #[must_use]
+    pub fn room_pause(&self) -> vox_agentcomms::drive::PauseState {
+        self.room_pause
+    }
+
+    /// Ordinary replies already readable at the last resume wait for the next human turn.
+    /// Addressed urgent news remains eligible for the existing wake policy.
+    #[must_use]
+    pub fn pause_resume_after(&self) -> u64 {
+        self.pause_resume_after
+    }
+
+    /// Save a receiver-authorized change before exposing it to wake/news consumers.
+    pub(crate) fn set_room_pause(
+        &mut self,
+        store: &Store,
+        paused: bool,
+        by: Digest32,
+        now: u64,
+    ) -> Result<()> {
+        if self.is_poisoned() {
+            return Err(self.save_failure());
+        }
+        if self.room_pause.paused == paused {
+            return Ok(());
+        }
+        let resume_after = if paused {
+            self.pause_resume_after
+        } else {
+            self.last_arrival(store)?.unwrap_or(0)
+        };
+        let state = vox_agentcomms::drive::PauseState {
+            paused,
+            by,
+            at_millis: now.max(self.room_pause.at_millis.saturating_add(1)),
+        };
+        let mut e = crate::cbor::Encoder::new();
+        e.array(5)
+            .uint(1)
+            .uint(u64::from(state.paused))
+            .bytes(&state.by)
+            .uint(state.at_millis)
+            .uint(resume_after);
+        let segment = seal_segment(
+            &self.sek,
+            SegmentKind::KeyMaterial,
+            SEG_ROOM_PAUSE,
+            &e.finish(),
+        )?;
+        store.put_segment(
+            &self.channel_id,
+            SegmentKind::KeyMaterial,
+            SEG_ROOM_PAUSE,
+            &segment,
+        )?;
+        self.room_pause = state;
+        self.pause_resume_after = resume_after;
+        Ok(())
     }
 
     fn save_board_kept(&mut self, store: &Store) -> Result<()> {

@@ -2280,40 +2280,51 @@ impl RoomDrain {
     }
 }
 
-/// The offers for this node (ADR-028 K-15, K-19) this session has not been shown, or has been
-/// shown saying something else: `(fingerprint, what is said of it)`. Recorded as shown here, so
-/// a quiet turn costs nothing; none when the node does not answer for them.
-async fn new_offers(paths: &Paths, client: &mut IpcClient, session: &str) -> Vec<(String, String)> {
+/// Prepare the current offers without acknowledging them. A pause admitted while the hook
+/// reads must leave these notices available for the next turn.
+#[derive(Default)]
+struct NewOffers {
+    fresh: Vec<(String, String)>,
+    shown: Option<String>,
+}
+impl NewOffers {
+    fn commit(&self, paths: &Paths, session: &str) {
+        let Some(body) = &self.shown else {
+            return;
+        };
+        let file = offers_shown_file(paths, session);
+        if let Err(error) = vox_core::node::paths::create_private_dir(
+            &paths.cursor_dir().join("offers"),
+        )
+        .and_then(|()| vox_core::node::paths::write_private_file_unique(&file, body.as_bytes()))
+        {
+            // The notice was emitted. A failed acknowledgement repeats it next turn.
+            eprintln!("vox agent hook: could not record the offers shown: {error}");
+        }
+    }
+}
+
+async fn new_offers(paths: &Paths, client: &mut IpcClient, session: &str) -> NewOffers {
     let Ok(offers) = crate::room_cli::offers_of(client).await else {
-        return Vec::new();
+        return NewOffers::default();
     };
-    let file = offers_shown_file(paths, session);
-    let shown = std::fs::read_to_string(&file).unwrap_or_default();
+    let shown = std::fs::read_to_string(offers_shown_file(paths, session)).unwrap_or_default();
     let now: Vec<(String, String)> = offers
         .iter()
-        .map(|o| (b32_encode(&o.member), o.said.clone()))
+        .map(|offer| (b32_encode(&offer.member), offer.said.clone()))
         .collect();
     let line = |(fp, said): &(String, String)| format!("{fp}\t{said}");
     let fresh: Vec<(String, String)> = now
         .iter()
-        .filter(|o| !shown.lines().any(|l| l == line(o)))
+        .filter(|offer| !shown.lines().any(|old| old == line(offer)))
         .cloned()
         .collect();
-    if !fresh.is_empty() {
-        let body: String = now.iter().map(|o| format!("{}\n", line(o))).collect();
-        if let Err(e) =
-            std::fs::create_dir_all(file.parent().unwrap_or(paths.cursor_dir().as_path()))
-                .map_err(|e| e.to_string())
-                .and_then(|()| {
-                    vox_core::node::paths::write_private_file_unique(&file, body.as_bytes())
-                        .map_err(|e| e.to_string())
-                })
-        {
-            // Shown anyway; failing to record it only means it is shown again next turn.
-            eprintln!("vox agent hook: could not record the offers shown: {e}");
-        }
-    }
-    fresh
+    let shown = (!fresh.is_empty()).then(|| {
+        now.iter()
+            .map(|offer| format!("{}\n", line(offer)))
+            .collect()
+    });
+    NewOffers { fresh, shown }
 }
 
 /// Where a session records the offers it was shown: under the cursors, a file per session.
@@ -2401,6 +2412,15 @@ async fn drain(
         None => Vec::new(),
     };
 
+    // A pause holds the complete room feed, including joining/coordination/file notices.
+    // No hook cursor advances while it is held. The person's prompt itself still reaches
+    // the harness: this only supplies (or withholds) Vox's extra context.
+    let selected_room = rooms.first().map(|r| r.0);
+    if let (Some(room), Some(me)) = (selected_room, me) {
+        if pause_holds(paths, room, me).await? {
+            return Ok(());
+        }
+    }
     let mut drains = Vec::new();
     let mut joined = Vec::new();
     // **One room that cannot be read does not silence the others** (V210-163): it is named,
@@ -2438,9 +2458,14 @@ async fn drain(
     if news.is_empty()
         && unread.is_empty()
         && note.is_none()
-        && offered.is_empty()
+        && offered.fresh.is_empty()
         && joined.is_empty()
     {
+        let NewsPublication::Ready(_publication) =
+            news_publication(paths, selected_room, me).await?
+        else {
+            return Ok(());
+        };
         // Nothing new: emit nothing at all rather than "no new messages". An
         // agent's context is not the place for a heartbeat, and a quiet room
         // should cost zero tokens per turn.
@@ -2458,7 +2483,7 @@ async fn drain(
     vox.push_str(ROOM_AND_ISSUE);
     let mut context: String = joined.iter().map(|(_, said)| said.as_str()).collect();
     context.push_str(&unread.concat());
-    context.push_str(&offers_said(paths, &offered));
+    context.push_str(&offers_said(paths, &offered.fresh));
     // **The notices sit under a framing line** (V210-123): they quote session and resource
     // names that room members chose, so, like the messages, they say first whose words
     // those are.
@@ -2553,7 +2578,15 @@ async fn drain(
         shown_in[i] = shown;
     }
     context.push_str(&render_skipped(&skipped));
+    // All history/offer IPC and rendering precede this fence. Only a final point query,
+    // stdout publication and synchronous acknowledgements are inside it.
+    let NewsPublication::Ready(publication) = news_publication(paths, selected_room, me).await?
+    else {
+        return Ok(());
+    };
     emit(format, raw_input, &input.event, &vox, &context);
+    std::io::Write::flush(&mut std::io::stdout())?;
+    offered.commit(paths, &input.session_id);
 
     for (file, _) in joined {
         let saved = vox_core::node::paths::create_private_dir(&paths.cursor_dir().join("joined"))
@@ -2562,11 +2595,57 @@ async fn drain(
             eprintln!("vox agent hook: could not record the joining notice: {e}");
         }
     }
+    for (d, shown) in drains.iter().zip(&shown_in) {
+        d.commit(paths, &input.session_id, *shown);
+    }
+    drop(publication);
     for (d, shown) in drains.iter().zip(shown_in) {
-        d.commit(paths, &input.session_id, shown);
         mark_read(&mut client, d, shown).await;
     }
     Ok(())
+}
+
+enum NewsPublication {
+    Held,
+    Ready(Option<std::fs::File>),
+}
+
+async fn news_publication(
+    paths: &Paths,
+    room: Option<Digest32>,
+    me: Option<Digest32>,
+) -> Result<NewsPublication, AppError> {
+    let (Some(room), Some(me)) = (room, me) else {
+        return Ok(NewsPublication::Ready(None));
+    };
+    let guard = crate::room_pause::publication_lock(paths, room, false)
+        .await
+        .map_err(AppError::Usage)?;
+    let held = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        pause_holds(paths, room, me),
+    )
+    .await
+    .map_err(|_| {
+        AppError::Usage("room pause state did not answer; news and its cursor are held".into())
+    })??;
+    if held {
+        Ok(NewsPublication::Held)
+    } else {
+        Ok(NewsPublication::Ready(Some(guard)))
+    }
+}
+
+async fn pause_holds(paths: &Paths, room: Digest32, me: Digest32) -> Result<bool, AppError> {
+    let at = crate::client::one_shot(paths)?;
+    vox_core::node::room_pause::status(&at, room, me)
+        .await
+        .map(|state| state.paused)
+        .map_err(|e| {
+            AppError::Usage(format!(
+                "room pause state could not be read; news and its cursor are held: {e}"
+            ))
+        })
 }
 
 /// Tell the node which of `d`'s news were drained into this turn, so it posts a read record for

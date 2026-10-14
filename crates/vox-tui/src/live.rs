@@ -3600,6 +3600,26 @@ impl CoreHandle for DaemonCore {
                 ),
                 other => other,
             },
+            Command::RoomPause {
+                channel_id,
+                nodes,
+                paused,
+            } => {
+                let paths = match self.account.node_paths(&self.node) {
+                    Ok(paths) => paths,
+                    Err(e) => return CommandStatus::Said(e.to_string()),
+                };
+                let result = until_stopped(
+                    &self.rt,
+                    &self.stop,
+                    crate::room_pause::summarize(&paths, channel_id, &nodes, paused),
+                );
+                CommandStatus::RoomPauseReport(match result {
+                    Some(Ok(said)) => said,
+                    Some(Err(e)) => vec![e.to_string()],
+                    None => vec!["room operation stopped; already acknowledged pauses remain saved; an outstanding target's outcome is unknown".into()],
+                })
+            }
             Command::Drive {
                 channel_id,
                 session: (node, id),
