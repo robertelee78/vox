@@ -2527,6 +2527,27 @@ final class NodeModel: ObservableObject {
             .map { ($0.fingerprint, $0.presentedName) }))
     }
 
+    /// General and the independent thread window are the only consumers of these file maps.
+    /// Session files carry their verified local path in their bounded activity entries.
+    private var displayedFileIDs: Set<String> {
+        Set((messages + threadReplies + [threadRootMessage].compactMap { $0 })
+            .filter { $0.file != nil }.map(\.id))
+    }
+
+    private func displayedFileFacts(_ room: String, ids: Set<String>) async throws
+        -> (copies: [PulledFile], states: [OfferPull]) {
+        let ordered = ids.sorted()
+        var copies: [PulledFile] = []
+        var states: [OfferPull] = []
+        for offset in stride(from: 0, to: ordered.count, by: 64) {
+            try Task.checkCancellation()
+            let batch = Array(ordered[offset..<min(offset + 64, ordered.count)])
+            copies += try await client.pulledFor(room: room, entries: batch)
+            states += try await client.pullStatesFor(room: room, entries: batch)
+        }
+        return (copies, states)
+    }
+
     /// The room on screen, read again every few seconds while it is there, each part published
     /// only when it changed: who has read this node's messages (read records arrive with the
     /// room's syncs and draw nothing of their own), the pulled copies, the services
@@ -2542,8 +2563,8 @@ final class NodeModel: ObservableObject {
                 let reads = try? await self.client.readBy(room: room)
                 let where_ = try? await self.client.whereabouts(room: room)
                 let pulls = try? await self.client.pulledBy(room: room)
-                let copies = try? await self.client.pulled(room: room)
-                let states = try? await self.client.pullStates(room: room)
+                let fileIDs = self.displayedFileIDs
+                let fileFacts = try? await self.displayedFileFacts(room, ids: fileIDs)
                 let rows = try? await self.memberRows(room)
                 let kept = try? await self.client.retention(room: room)
                 let keptSecs = try? await self.client.retentionSecs(room: room)
@@ -2573,12 +2594,15 @@ final class NodeModel: ObservableObject {
                     let now = Dictionary(pulls.map { ($0.id, $0.names) }) { $1 }
                     if now != self.pulledBy { self.pulledBy = now }
                 }
-                if let copies {
-                    let now = Dictionary(copies.map { ($0.entry, $0.path) }) { $1 }
+                let visibleFiles = self.displayedFileIDs
+                if let copies = fileFacts?.copies {
+                    let now = Dictionary(copies.filter { visibleFiles.contains($0.entry) }
+                        .map { ($0.entry, $0.path) }) { $1 }
                     if now != self.pulled { self.pulled = now }
                 }
-                if let states {
-                    let now = Dictionary(states.map { ($0.entry, $0.state) }) { $1 }
+                if let states = fileFacts?.states {
+                    let now = Dictionary(states.filter { visibleFiles.contains($0.entry) }
+                        .map { ($0.entry, $0.state) }) { $1 }
                     if now != self.pulling { self.pulling = now }
                 }
                 if let rows {
