@@ -972,6 +972,8 @@ final class AppModel: ObservableObject {
 /// capital and ended with a full stop (P6).
 func sentence(_ error: Error) -> String {
     switch error {
+    case let VoxError.Unreachable(reason): return asSentence(reason)
+    case let VoxError.ReadInterrupted(reason): return asSentence(reason)
     case let VoxError.Failed(reason): return asSentence(reason)
     case let VoxError.Detached(reason): return asSentence(reason)
     case let VoxError.Unknown(reason): return asSentence(reason)

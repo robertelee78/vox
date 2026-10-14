@@ -53,6 +53,20 @@ pub use computer::{
 /// Anything that went wrong, with the core's reason.
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum VoxError {
+    /// The connection to the daemon could not be established. A later healthy daemon and
+    /// held-node read may retire this background fault without hiding an operation refusal.
+    #[error("{reason}")]
+    Unreachable {
+        /// The existing daemon connection sentence, unchanged for a person.
+        reason: String,
+    },
+    /// The daemon connection ended before its answer. The request outcome is unknown;
+    /// only a background read may retire this observation after later healthy reads.
+    #[error("{reason}")]
+    ReadInterrupted {
+        /// The existing interruption sentence, unchanged for a person.
+        reason: String,
+    },
     /// The operation failed.
     #[error("{reason}")]
     Failed {
