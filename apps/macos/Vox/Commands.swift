@@ -163,6 +163,8 @@ struct VoxCommands: Commands {
         CommandGroup(replacing: .newItem) { items("File") }
         CommandMenu("Room") { items("Room") }
         CommandMenu("Node") {
+            Button("Choose Node…") { Task { await app.askAppNodeChoice() } }
+                .disabled(!app.canChooseAppNode)
             Button("Unlock…") { Task { await app.attachAgain() } }
                 .disabled(app.selectedNodeStatus != "Locked")
             Button("Forget") { Task { await app.detachNode() } }
