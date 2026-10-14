@@ -889,13 +889,15 @@ final class NodeModel: ObservableObject {
 
     func refreshMachineState() async { await readFacts() }
 
-    private func readFacts() async {
+    private var observationNeedsRestart = false
+
+    private func readFacts(restartObservation: Bool = true) async {
         let epoch = nodeObservationEpoch
         // Reachability first: failed reads must not leave stale node/peer states visible.
         do {
             let fresh = try await client.nodes()
             guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
-            let recovering = !daemonReachable
+            let recovering = !daemonReachable || observationNeedsRestart
             machineStateKnown = true
             daemonFailure = nil
             if fresh != nodes { nodes = fresh }
@@ -921,7 +923,7 @@ final class NodeModel: ObservableObject {
             if fresh.first(where: { $0.name == node })?.state == "attached" {
                 ended = nil
             }
-            if recovering {
+            if recovering && restartObservation {
                 // A live connection does not establish that the selected room's snapshot
                 // or its watcher survived the interruption. Preserve its visible content
                 // until an authoritative page and roster replace it together.
@@ -936,6 +938,7 @@ final class NodeModel: ObservableObject {
 
                 try await client.subscribe(listener: Listener(model: self))
                 guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
+                observationNeedsRestart = false
                 await refresh()
                 guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
                 await reconcileUnread()
@@ -1833,16 +1836,16 @@ final class NodeModel: ObservableObject {
     /// Create from a snapshot of explicitly kept, already numeric endpoints. Search and DNS
     /// never hold this mutation, and closing/changing the sheet retires its UI publication.
     func createRoom(_ name: String, passphrase secret: Secret, anchors: [RoomAnchorEndpoint],
-                    context: String) async -> Bool {
+                    context: String, currentOwner: @MainActor () -> Bool) async -> Bool {
         let operation = "create-room", attempt = begin("create-room")
         defer { end(attempt) }
-        guard context == anchorChoiceContext, sheet == .newRoom, ended == nil else { secret.wipe(); return false }
+        guard currentOwner(), context == anchorChoiceContext, sheet == .newRoom, ended == nil else { secret.wipe(); return false }
         let editor = sheetInstance, origin = selection
         // The mutation opens a room, so its ChannelOpened event may restart observation and
         // retire the old read epoch. That does not retire the person's creation intent.
         // Keep the exact sheet and navigation fences; reads still use their own fresh epochs.
         func current(_ expected: Selection?) -> Bool {
-            !Task.isCancelled && sheet == .newRoom && sheetInstance == editor && selection == expected
+            currentOwner() && !Task.isCancelled && sheet == .newRoom && sheetInstance == editor && selection == expected
         }
         do {
             let passphrase = try secret.passphrase()
@@ -2859,6 +2862,7 @@ final class NodeModel: ObservableObject {
     }
 
     fileprivate func stopped(_ text: String) async {
+        observationNeedsRestart = true
         waitingLedger = nil
         nodeObservationEpoch = UUID()
         roomReadGeneration = UUID()
@@ -2873,7 +2877,10 @@ final class NodeModel: ObservableObject {
         daemonReachable = text.localizedCaseInsensitiveContains("detached")
             || text.localizedCaseInsensitiveContains("Locked")
         if !daemonReachable { daemonFailure = text }
-        await readFacts()
+        // Resubscribing aborts the old Rust observer, which is awaiting this callback.
+        // Read readiness here; the existing follow loop (or an independent user action)
+        // performs the pending restart and authoritative refresh outside that callback.
+        await readFacts(restartObservation: false)
     }
 
     /// Recoverable history is reloaded from the node after leaving a view or losing its
