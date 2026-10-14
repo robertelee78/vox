@@ -2445,10 +2445,8 @@ final class NodeModel: ObservableObject {
                 guard !Task.isCancelled, self.roomReadGeneration == generation,
                       self.selection == .room(room), self.ended == nil else { return }
                 await self.refreshSessionMetadata()
-                let listed = self.sessions
                 guard !Task.isCancelled, self.roomReadGeneration == generation,
                       self.selection == .room(room), self.ended == nil else { return }
-                if listed != self.sessions { self.sessions = listed }
                 if let reads {
                     let now = Dictionary(uniqueKeysWithValues: reads.map { ($0.id, $0.names) })
                     if now != self.readBy { self.readBy = now }
