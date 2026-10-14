@@ -292,6 +292,8 @@ private struct RoomForm: View {
     @State private var noPassphrase = true
     /// A create or join under way: Return and the button may both ask.
     @State private var submitting = false
+    @State private var submission = UUID()
+    @StateObject private var anchors = RoomAnchorChoices()
 
     var body: some View {
         VStack(alignment: .leading, spacing: Space.s12) {
@@ -319,6 +321,7 @@ private struct RoomForm: View {
                 Text("No passphrase: anyone with the link can join.")
                     .accessibilityIdentifier("room-form-no-passphrase")
             }
+            if !joining { RoomAnchorSearch(model: model, choices: anchors).disabled(submitting) }
             if submitting {
                 ProgressView(joining ? "Joining the room…" : "Creating the room…")
                     .accessibilityIdentifier("room-form-progress")
@@ -334,6 +337,7 @@ private struct RoomForm: View {
         }
         .padding(Space.s24)
         .frame(width: Theme.scaled(440))
+        .onDisappear { submission = UUID(); anchors.retire() }
         .onAppear {
             model.clearOutcome(of: operation)
             // A link the system opened the app with fills the field; nothing is joined until the
@@ -355,9 +359,14 @@ private struct RoomForm: View {
         // The secure control keeps the person's input through the result (ADR-034 PR-3).
         let secret = field.copyAllowingEmpty()
         let (l, n) = (link, name)
+        let kept = anchors.kept, context = model.anchorChoiceContext
+        let request = UUID(), actor = model.me
+        submission = request
         Task {
             let ok = joining ? await model.joinRoom(l, passphrase: secret)
-                : await model.createRoom(n, passphrase: secret)
+                : await model.createRoom(n, passphrase: secret, anchors: kept, context: context)
+            guard !Task.isCancelled, submission == request, model.me == actor,
+                  model.sheet == (joining ? .joinRoom : .newRoom) else { return }
             submitting = false
             if ok {
                 field.clear()
