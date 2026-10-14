@@ -562,8 +562,9 @@ pub struct CreateRoomArgs {
     #[command(flatten)]
     pub profile: NodeArgs,
     /// An anchor for this room only: fingerprint@address or host:port. Repeat for more.
-    #[arg(long = "anchor", value_name = "ANCHOR")]
-    pub anchors: Vec<String>,
+    /// The machine's --anchor/VOX_ANCHORS settings are not imported into this room.
+    #[arg(long = "room-anchor", value_name = "ANCHOR")]
+    pub room_anchors: Vec<String>,
     /// Search the local network for anchors to keep in this room; finding none still creates it.
     #[arg(long)]
     pub find_anchor: bool,
@@ -2852,7 +2853,7 @@ pub fn run() -> ExitCode {
                                 a.passphrase_file.as_deref(),
                                 a.idle_end.as_deref(),
                                 a.bind.as_deref(),
-                                &a.anchors,
+                                &a.room_anchors,
                                 a.find_anchor,
                             )
                             .await
