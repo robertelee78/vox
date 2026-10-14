@@ -1384,7 +1384,7 @@ impl Held {
                     VoxError::Unreachable { reason } => VoxError::Unreachable {
                         reason: contextual(reason),
                     },
-                    VoxError::Interrupted { reason } => VoxError::Interrupted {
+                    VoxError::ReadInterrupted { reason } => VoxError::ReadInterrupted {
                         reason: contextual(reason),
                     },
                     VoxError::Unknown { reason } => VoxError::Unknown {
@@ -1433,9 +1433,30 @@ fn said(socket: &std::path::Path, e: Error) -> VoxError {
     if unreachable {
         VoxError::Unreachable { reason }
     } else if interrupted {
-        VoxError::Interrupted { reason }
+        VoxError::Unknown { reason }
     } else if uncertain {
         VoxError::Unknown { reason }
+    } else {
+        VoxError::Failed { reason }
+    }
+}
+
+/// A transport failure of an authoritative read, replaceable by a later healthy read.
+/// Mutation exchanges and malformed or refused replies never use this boundary.
+fn read_interrupted(e: Error, words: impl FnOnce(Error) -> String) -> VoxError {
+    use vox_core::error::IpcHandshake;
+    let interrupted = matches!(
+        &e,
+        Error::Ipc(
+            IpcHandshake::Unreachable { .. }
+                | IpcHandshake::HungUp { .. }
+                | IpcHandshake::Cut
+                | IpcHandshake::RequestTimedOut { .. }
+        )
+    );
+    let reason = words(e);
+    if interrupted {
+        VoxError::ReadInterrupted { reason }
     } else {
         VoxError::Failed { reason }
     }
@@ -1996,6 +2017,8 @@ impl VoxClient {
     }
 
     async fn daemon(&self, req: DaemonRequest) -> Result<DaemonFrame, VoxError> {
+        // Only Nodes is classified here as an authoritative read; other requests may mutate.
+        let read_only = matches!(&req, DaemonRequest::Nodes);
         let socket = self.socket.clone();
         self.on_rt(async move {
             let mut d = DaemonClient::open(&socket)
@@ -2004,6 +2027,9 @@ impl VoxClient {
             match d.request(req).await {
                 Ok(DaemonFrame::Refused(r)) => Err(failed(r.to_string())),
                 Ok(f) => Ok(f),
+                Err(e) if read_only => Err(read_interrupted(e, |e| {
+                    vox_core::node::daemonipc::unreached(&socket, None, e)
+                })),
                 Err(e) => Err(said(&socket, e)),
             }
         })
@@ -2074,10 +2100,9 @@ impl VoxClient {
         let body = vox_core::node::snapshot::request_body();
         let (reply, names) = on_held!(self, |c| {
             let names = names(c).await?;
-            let reply = c
-                .exchange(&body)
-                .await
-                .map_err(|e| failed(format!("the vox daemon stopped answering: {e}")))?;
+            let reply = c.exchange(&body).await.map_err(|e| {
+                read_interrupted(e, |e| format!("the vox daemon stopped answering: {e}"))
+            })?;
             Ok((reply, names))
         })?;
         let Ok(Some(snap)) = vox_core::node::snapshot::NodeSnapshot::from_bytes(&reply) else {
@@ -4454,10 +4479,9 @@ impl VoxClient {
     /// No node attached, or the daemon's refusal.
     pub async fn view(&self) -> Result<NodeView, VoxError> {
         let body = vox_core::node::snapshot::request_body();
-        let reply = on_held!(self, |c| c
-            .exchange(&body)
-            .await
-            .map_err(|e| failed(format!("the vox daemon stopped answering: {e}"))))?;
+        let reply = on_held!(self, |c| c.exchange(&body).await.map_err(|e| {
+            read_interrupted(e, |e| format!("the vox daemon stopped answering: {e}"))
+        }))?;
         match vox_core::node::snapshot::NodeSnapshot::from_bytes(&reply) {
             Ok(Some(s)) => Ok(NodeView {
                 me: s.me.map(|m| b32_encode(&m)).unwrap_or_default(),

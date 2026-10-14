@@ -63,7 +63,7 @@ pub enum VoxError {
     /// The daemon connection ended before its answer. The request outcome is unknown;
     /// only a background read may retire this observation after later healthy reads.
     #[error("{reason}")]
-    Interrupted {
+    ReadInterrupted {
         /// The existing interruption sentence, unchanged for a person.
         reason: String,
     },
