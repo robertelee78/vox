@@ -1520,7 +1520,7 @@ private struct RoomTimelineView: View {
                     .help("Return sends; ⇧Return starts a new line; @name addresses; ! marks urgent")
                     .accessibilityLabel("Message \(model.roomName(room)), as \(model.node)")
                     .textFieldStyle(.plain)
-                    .frame(minWidth: 80 * scale, maxWidth: .infinity)
+                    .frame(minWidth: 80 * scale, maxWidth: .infinity, minHeight: Space.s24 * scale)
                     .layoutPriority(1)
                     .onSubmit { send(urgent: urgent) }
                     .accessibilityIdentifier("compose")
