@@ -2517,6 +2517,39 @@ impl VoxClient {
         })
     }
 
+    /// Fetch the one readable root of an open thread without paging through General history.
+    /// A missing, expired or unreadable root is `None`; the caller must discard its cached root.
+    ///
+    /// # Errors
+    /// A malformed id, a closed room, or the selected node's refusal.
+    pub async fn thread_root(
+        &self,
+        room: String,
+        root: String,
+    ) -> Result<Option<RoomMessage>, VoxError> {
+        let channel_id = digest(&room, "room id")?;
+        let root = digest(&root, "thread root")?;
+        on_held!(self, |c| {
+            let names = names(c).await?;
+            let me = c.me().map(|f| b32_encode(&f));
+            match ask(
+                c,
+                &Request::Find {
+                    channel_id,
+                    entries: vec![root],
+                },
+            )
+            .await?
+            {
+                Frame::Rows { rows } => Ok(rows
+                    .iter()
+                    .find(|r| r.entry_hash == root && !r.owed)
+                    .map(|r| rendered(r, &names, me.as_deref()))),
+                other => Err(unexpected(&other)),
+            }
+        })
+    }
+
     /// One bounded page of readable thread replies in arrival order, matching `thread_summary`.
     /// Opaque owed rows have no readable thread metadata and are not included. Empty `since`
     /// starts the thread; the next request follows the last returned id. An empty page finishes
