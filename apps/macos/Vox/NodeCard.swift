@@ -35,7 +35,7 @@ struct NodeActions: ViewModifier {
                 Button("Copy Name and Fingerprint") { copyWords("\(presented) <\(fingerprint)>") }
             }
             if !trust.inKeyring && model.canManageIndividualTrust(fingerprint) {
-                Button("Trust…") { model.openCard(fingerprint, name: name, act: .trust) }
+                Button("Trust…") { Task { await model.openTrustCard(fingerprint, name: name) } }
             }
             if let room = model.roomOnScreen, let offer = model.memberOffer(fingerprint, in: room),
                model.canManageIndividualTrust(fingerprint) {
@@ -67,7 +67,7 @@ struct MemberTrustActions: View {
                     Text("New member").eyebrow().secondaryText()
                         .accessibilityIdentifier("member-new-" + fingerprint)
                     HStack {
-                        Button("Trust") { model.openCard(fingerprint, name: name, act: .trust) }
+                        Button("Trust") { Task { await model.openTrustCard(fingerprint, name: name) } }
                             .accessibilityIdentifier("member-trust-" + fingerprint)
                         Button("Dismiss") { Task { await model.dismiss(offer) } }
                             .accessibilityIdentifier("member-dismiss-" + fingerprint)
@@ -146,7 +146,9 @@ struct NodeCard: View {
                 }
                 HStack {
                     if !trust.inKeyring && model.canManageIndividualTrust(node.fingerprint) {
-                        Button("Trust…") { act = .trust }
+                        Button("Trust…") {
+                            Task { if await model.prepareCardTrust(node.fingerprint) { act = .trust } }
+                        }
                             .accessibilityIdentifier("card-trust-open")
                     }
                     if let room = model.roomOnScreen, let offer = model.memberOffer(node.fingerprint, in: room),

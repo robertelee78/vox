@@ -366,6 +366,7 @@ final class NodeModel: ObservableObject {
         let request = UUID(), generation = roomReadGeneration, epoch = nodeObservationEpoch
         let room = roomOnScreen
         individualTrustReads[fingerprint] = request
+        individualTrustFacts[fingerprint] = IndividualTrustFact(allowed: nil, reason: "Checking whether individual trust can be changed…")
         do {
             let fact = try await client.individualTrustEligibility(fingerprint: fingerprint)
             guard individualTrustReads[fingerprint] == request, generation == roomReadGeneration,
@@ -381,9 +382,10 @@ final class NodeModel: ObservableObject {
     private func checkIndividualTrust(_ fingerprint: String, operation: String) async -> Bool {
         let generation = roomReadGeneration, epoch = nodeObservationEpoch, request = UUID()
         individualTrustReads[fingerprint] = request
+        individualTrustFacts[fingerprint] = IndividualTrustFact(allowed: nil, reason: "Checking whether individual trust can be changed…")
         do {
             let fact = try await client.individualTrustEligibility(fingerprint: fingerprint)
-            guard individualTrustReads[fingerprint] == request, generation == roomReadGeneration, epoch == nodeObservationEpoch, ended == nil else { return false }
+            guard individualTrustReads[fingerprint] == request, generation == roomReadGeneration, epoch == nodeObservationEpoch, ended == nil, !Task.isCancelled else { return false }
             individualTrustFacts[fingerprint] = IndividualTrustFact(allowed: fact.canManageIndividualTrust, reason: fact.reason)
             guard fact.canManageIndividualTrust else {
                 let refused = Outcome(operation: operation, kind: .refused, words: fact.reason)
@@ -393,14 +395,15 @@ final class NodeModel: ObservableObject {
             }
             return true
         } catch {
-            guard individualTrustReads[fingerprint] == request, generation == roomReadGeneration, epoch == nodeObservationEpoch, ended == nil else { return false }
+            guard individualTrustReads[fingerprint] == request, generation == roomReadGeneration, epoch == nodeObservationEpoch, ended == nil, !Task.isCancelled else { return false }
             individualTrustFacts[fingerprint] = IndividualTrustFact(allowed: nil, reason: sentence(error))
             report(error, operation: operation)
             return false
         }
     }
 
-    @Published var card: NodeCardFor?
+    private var individualTrustIntent = UUID()
+    @Published var card: NodeCardFor? { didSet { individualTrustIntent = UUID() } }
     /// The keyring row selected, by fingerprint: what Keyring > Compare, Rename and Remove act on.
     @Published var keyringSelected: String?
     /// What a Keyring menu action asks the keyring view to open; each ask counts one up.
@@ -1010,7 +1013,30 @@ final class NodeModel: ObservableObject {
     }
 
     /// Open `fingerprint`'s card (D4), named `name` as the room names it.
+    func openTrustCard(_ fingerprint: String, name: String) async {
+        let intent = UUID()
+        individualTrustIntent = intent
+        guard await checkIndividualTrust(fingerprint, operation: "trust"),
+              individualTrustIntent == intent, !Task.isCancelled else { return }
+        keyringDid = nil
+        keyringFailed = nil
+        card = NodeCardFor(fingerprint: fingerprint, name: name, act: .trust)
+    }
+
+    func prepareCardTrust(_ fingerprint: String) async -> Bool {
+        let intent = individualTrustIntent
+        guard card?.fingerprint == fingerprint,
+              await checkIndividualTrust(fingerprint, operation: "trust"),
+              individualTrustIntent == intent, card?.fingerprint == fingerprint,
+              !Task.isCancelled else { return false }
+        return true
+    }
+
     func openCard(_ fingerprint: String, name: String, act: NodeCardFor.Act? = nil) {
+        if act == .trust {
+            Task { await openTrustCard(fingerprint, name: name) }
+            return
+        }
         keyringDid = nil
         keyringFailed = nil
         card = NodeCardFor(fingerprint: fingerprint, name: name, act: act)
@@ -1290,7 +1316,7 @@ final class NodeModel: ObservableObject {
         let generation = roomReadGeneration, epoch = nodeObservationEpoch
         guard await trust(offer.fingerprint, as: alias, drive: drive) else { return false }
         let waiting = try? await client.pendingOffers()
-        guard generation == roomReadGeneration, epoch == nodeObservationEpoch, ended == nil else { return false }
+        guard generation == roomReadGeneration, epoch == nodeObservationEpoch, ended == nil, !Task.isCancelled else { return false }
         if let waiting { offers = waiting }
         return true
     }
@@ -1306,11 +1332,11 @@ final class NodeModel: ObservableObject {
         do {
             try await client.dismissOffer(fingerprint: offer.fingerprint)
             let waiting = try? await client.pendingOffers()
-            guard generation == roomReadGeneration, epoch == nodeObservationEpoch, ended == nil else { return }
+            guard generation == roomReadGeneration, epoch == nodeObservationEpoch, ended == nil, !Task.isCancelled else { return }
             if let waiting { offers = waiting }
             if selection == .offer(offer.fingerprint) { selection = nil }
         } catch {
-            guard generation == roomReadGeneration, epoch == nodeObservationEpoch, ended == nil else { return }
+            guard generation == roomReadGeneration, epoch == nodeObservationEpoch, ended == nil, !Task.isCancelled else { return }
             report(error, operation: operation)
         }
     }
