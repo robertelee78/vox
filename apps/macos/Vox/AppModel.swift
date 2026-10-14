@@ -317,13 +317,20 @@ final class AppModel: ObservableObject {
                 await connection.close(); return
             }
             // Only an authenticated, still-selected request changes the daemon's personal role.
-            _ = try await connection.selectPersonalNode(node: name)
+            let selected = try await connection.selectPersonalNode(node: name)
             committed = true
             guard ownsNodeRequest(original, generation), self.node === old else {
                 await connection.close()
                 // A superseding lifecycle request must consult the daemon's saved selection;
                 // it must not write an obsolete app choice after this authoritative commit.
                 if self.client === original, self.node === old { await reach() }
+                return
+            }
+            guard selected.selectedNode == expected, selected.selectedName == name else {
+                await connection.close()
+                appNodeChooser = false
+                appNodeChoiceSaid = "The daemon selected a different node. Reconnecting to its saved selection."
+                await reach()
                 return
             }
             self.client = connection
@@ -337,7 +344,21 @@ final class AppModel: ObservableObject {
             } catch {
                 // The daemon already committed the role. Report the local mirror failure
                 // without pretending the old node still acts in this window.
-                appNodeChoiceSaid = sentence(error)
+                let mirrorFailure = sentence(error)
+                do {
+                    let fresh = try await connection.nodes()
+                    guard ownsNodeRequest(connection, generation), self.node?.me == expected else {
+                        await original.close(); return
+                    }
+                    appNodeChoices = fresh
+                    appNodeChoiceSaid = mirrorFailure
+                } catch {
+                    guard ownsNodeRequest(connection, generation), self.node?.me == expected else {
+                        await original.close(); return
+                    }
+                    appNodeChoices = []
+                    appNodeChoiceSaid = mirrorFailure + " " + sentence(error)
+                }
                 appNodeChooser = true
             }
             await original.close()
