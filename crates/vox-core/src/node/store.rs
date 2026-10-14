@@ -77,6 +77,7 @@ const fn kind_code(kind: SegmentKind) -> u8 {
         SegmentKind::EntryIndex => 11,
         SegmentKind::ProvisionalLog => 12,
         SegmentKind::SessionIndex => 14,
+        SegmentKind::GovernanceIndex => 15,
     }
 }
 
@@ -710,6 +711,32 @@ pub(crate) struct Snapshot {
 }
 
 impl Snapshot {
+    /// Read only the next segment key. A readiness check never copies the sealed body.
+    pub(crate) fn segment_id_after(
+        &self,
+        channel: &Digest32,
+        kind: SegmentKind,
+        after: Option<u64>,
+    ) -> Result<Option<u64>> {
+        use std::ops::Bound::{Excluded, Included};
+        let table = self
+            .txn
+            .open_table(SEGMENTS)
+            .map_err(storage("open segments"))?;
+        let low = match after {
+            Some(id) => Excluded((*channel, kind_code(kind), id)),
+            None => Included((*channel, kind_code(kind), 0)),
+        };
+        let mut rows = table
+            .range((low, Included((*channel, kind_code(kind), u64::MAX))))
+            .map_err(storage("range segments"))?;
+        Ok(rows
+            .next()
+            .transpose()
+            .map_err(storage("iterate segments"))?
+            .map(|(key, _)| key.value().2))
+    }
+
     pub(crate) fn get_segment(
         &self,
         channel: &Digest32,
@@ -764,6 +791,54 @@ pub struct Batch<'a> {
 }
 
 impl Batch<'_> {
+    /// Read the last segment key without opening its sealed body.
+    pub(crate) fn last_segment_id(
+        &self,
+        channel: &Digest32,
+        kind: SegmentKind,
+    ) -> Result<Option<u64>> {
+        let table = self
+            .txn
+            .open_table(SEGMENTS)
+            .map_err(storage("open segments"))?;
+        let mut rows = table
+            .range((*channel, kind_code(kind), 0)..=(*channel, kind_code(kind), u64::MAX))
+            .map_err(storage("range segments"))?;
+        let found = rows
+            .next_back()
+            .transpose()
+            .map_err(storage("iterate segments"))?
+            .map(|(key, _)| key.value().2);
+        Ok(found)
+    }
+
+    /// Read only the next segment key. A readiness check never copies the sealed body.
+    pub(crate) fn segment_id_after(
+        &self,
+        channel: &Digest32,
+        kind: SegmentKind,
+        after: Option<u64>,
+    ) -> Result<Option<u64>> {
+        use std::ops::Bound::{Excluded, Included};
+        let table = self
+            .txn
+            .open_table(SEGMENTS)
+            .map_err(storage("open segments"))?;
+        let low = match after {
+            Some(id) => Excluded((*channel, kind_code(kind), id)),
+            None => Included((*channel, kind_code(kind), 0)),
+        };
+        let mut rows = table
+            .range((low, Included((*channel, kind_code(kind), u64::MAX))))
+            .map_err(storage("range segments"))?;
+        let found = rows
+            .next()
+            .transpose()
+            .map_err(storage("iterate segments"))?
+            .map(|(key, _)| key.value().2);
+        Ok(found)
+    }
+
     /// Read this transaction's writes as well as its original rows. Reading through Store
     /// here would miss a split/root update made earlier in this same batch.
     pub(crate) fn get_segment(

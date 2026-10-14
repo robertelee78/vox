@@ -385,77 +385,111 @@ pub use vox_core::node::service_reach::{
 /// S-1, S-3), who shared it, the commands to reach it and what those need; then what this node
 /// itself offers there and where. With `json`, the same as one JSON object, every address in it
 /// canonical.
-pub fn print_services(
-    room: &str,
-    channel_id: &Digest32,
-    services: &[(String, String)],
-    shared: &[vox_core::node::ipc::SharedService],
-    proxy: &Result<SocketAddr, String>,
+pub struct ServiceListPrinter {
+    channel_id: Digest32,
+    proxy: Result<SocketAddr, String>,
     json: bool,
-) {
-    if json {
-        let rows: Vec<serde_json::Value> = shared
-            .iter()
-            .map(|s| {
-                serde_json::json!({
-                    "address": s.canonical,
-                    "readable": s.address,
-                    "by": s.by,
-                    "kind": s.kind,
-                    "udp": s.udp,
-                    "commands": service_commands(s)
-                        .into_iter()
-                        .map(|(what, command)| serde_json::json!({"what": what, "command": command}))
-                        .collect::<Vec<_>>(),
-                    "needs": service_needs(s, Some(proxy))
-                        .into_iter()
-                        .map(|(need, holds, otherwise)| {
-                            serde_json::json!({"need": need, "holds": holds, "otherwise": otherwise})
-                        })
-                        .collect::<Vec<_>>(),
-                })
-            })
-            .collect();
-        let offered: Vec<serde_json::Value> = services
-            .iter()
-            .map(|(tag, local)| serde_json::json!({"tag": tag, "local": local}))
-            .collect();
-        let out = serde_json::json!({
-            "room": room,
-            "room_id": b32_encode(channel_id),
-            "shared": rows,
-            "offered": offered,
-            "ssh_config": proxy.as_ref().ok().map(|at| vox_core::node::up::ssh_config_hint(*at)),
-        });
-        println!("{out}");
-        return;
+    started: bool,
+    any: bool,
+    ssh: bool,
+    room: String,
+}
+impl ServiceListPrinter {
+    pub fn new(channel_id: Digest32, proxy: Result<SocketAddr, String>, json: bool) -> Self {
+        Self {
+            channel_id,
+            proxy,
+            json,
+            started: false,
+            any: false,
+            ssh: false,
+            room: String::new(),
+        }
     }
-    if shared.is_empty() {
-        println!("vox: nothing is shared in {room} ({})", short(channel_id));
-    } else {
-        println!("vox: shared in {room} ({})", short(channel_id));
-        // Its kind, as its sharer's node detected it (ADR-028 S-2); a datagram service that
-        // is not plain `udp` says so too. The readable address is for reading; the canonical
-        // one beneath it is what to copy, and works on any member's machine (ADR-028 S-1, S-3).
-        for s in shared {
-            let udp = if s.udp && s.kind != "udp" { "/udp" } else { "" };
-            println!("  {}  by {}  {}{udp}", s.address, s.by, s.kind);
-            println!("    {}", s.canonical);
-            for (what, command) in service_commands(s) {
-                println!("      {what:<8}{command}");
-            }
-            // What reaching it needs, each fact ✓ or missing with its fix (the App Study's
-            // readiness ticks, in the words the TUI and the app use).
-            for (need, holds, otherwise) in service_needs(s, Some(proxy)) {
-                println!("      {}", service_tick(&need, holds, &otherwise));
+    pub fn page(
+        &mut self,
+        room: &str,
+        services: &[(String, String)],
+        shared: &[vox_core::node::ipc::SharedService],
+    ) {
+        if !self.started {
+            self.started = true;
+            self.room = room.to_owned();
+            if self.json {
+                let offered: Vec<_> = services
+                    .iter()
+                    .map(|(tag, local)| serde_json::json!({"tag":tag,"local":local}))
+                    .collect();
+                print!(
+                    "{{\"room\":{},\"room_id\":{},\"offered\":{},\"ssh_config\":{},\"shared\":[",
+                    serde_json::json!(room),
+                    serde_json::json!(b32_encode(&self.channel_id)),
+                    serde_json::json!(offered),
+                    serde_json::json!(self
+                        .proxy
+                        .as_ref()
+                        .ok()
+                        .map(|at| vox_core::node::up::ssh_config_hint(*at)))
+                );
+            } else {
+                println!(
+                    "vox: services offered in {room} ({})",
+                    short(&self.channel_id)
+                );
+                if services.is_empty() {
+                    println!("  none");
+                }
+                for (tag, address) in services {
+                    println!("  {tag}  →  {address}");
+                }
             }
         }
-        // `ssh <address>` needs ssh pointed at the proxy, once (what `vox up` prints).
-        if shared.iter().any(|s| s.kind == "ssh") {
-            match proxy {
+        for s in shared {
+            if self.json {
+                if self.any {
+                    print!(",");
+                }
+                let row = serde_json::json!({
+                    "address":s.canonical,"readable":s.address,"by":s.by,"kind":s.kind,"udp":s.udp,
+                    "commands":service_commands(s).into_iter().map(|(what,command)|serde_json::json!({"what":what,"command":command})).collect::<Vec<_>>(),
+                    "needs":service_needs(s,Some(&self.proxy)).into_iter().map(|(need,holds,otherwise)|serde_json::json!({"need":need,"holds":holds,"otherwise":otherwise})).collect::<Vec<_>>(),
+                });
+                print!("{row}");
+            } else {
+                if !self.any {
+                    println!("vox: shared in {} ({})", self.room, short(&self.channel_id));
+                }
+                let udp = if s.udp && s.kind != "udp" { "/udp" } else { "" };
+                println!("  {}  by {}  {}{udp}", s.address, s.by, s.kind);
+                println!("    {}", s.canonical);
+                for (what, command) in service_commands(s) {
+                    println!("      {what:<8}{command}");
+                }
+                for (need, holds, otherwise) in service_needs(s, Some(&self.proxy)) {
+                    println!("      {}", service_tick(&need, holds, &otherwise));
+                }
+            }
+            self.any = true;
+            self.ssh |= s.kind == "ssh";
+        }
+    }
+    pub fn finish(self) {
+        if self.json {
+            println!("]}}");
+            return;
+        }
+        if !self.any {
+            println!(
+                "vox: nothing is shared in {} ({})",
+                self.room,
+                short(&self.channel_id)
+            );
+        }
+        if self.ssh {
+            match self.proxy {
                 Ok(at) => {
                     println!("  for ssh by address, add this to ~/.ssh/config once:");
-                    for line in vox_core::node::up::ssh_config_hint(*at).lines() {
+                    for line in vox_core::node::up::ssh_config_hint(at).lines() {
                         println!("    {line}");
                     }
                 }
@@ -464,14 +498,6 @@ pub fn print_services(
                 }
             }
         }
-    }
-    if services.is_empty() {
-        println!("vox: no services offered in {}", short(channel_id));
-        return;
-    }
-    println!("vox: services offered in {room} ({})", short(channel_id));
-    for (tag, addr) in services {
-        println!("  {tag}  →  {addr}");
     }
 }
 
@@ -1318,23 +1344,34 @@ pub async fn serve(
     // The canonical address (ADR-028 S-1): what any member can use as printed, on any machine.
     let me = held.me.unwrap_or_default();
     // What each was detected to be (ADR-028 S-2), as the room's log says it.
-    let shared = match held.client.request(&Request::Services { channel_id }).await {
-        Ok(Frame::Services { shared, .. }) => shared,
-        _ => Vec::new(),
-    };
     for (port, label) in &services {
         let endpoint = at.unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], *port)));
         let name = vox_core::node::channel::service_name(label);
         let udp = vox_core::tunnel::udp::is_udp(label);
         let address = vox_core::node::resolver::canonical_address(&channel_id, &me, name);
-        let said = shared
-            .iter()
-            .find(|s| s.by == "you" && s.canonical == address)
-            .map(|s| {
-                let proto = if udp && s.kind != "udp" { "/udp" } else { "" };
-                format!(" ({}{proto})", s.kind)
+        let said = match held
+            .client
+            .request(&Request::GovernancePage {
+                channel_id,
+                query: vox_core::node::api::GovernanceQuery::Service {
+                    host: me,
+                    selector: name.to_owned(),
+                },
             })
-            .unwrap_or_default();
+            .await
+        {
+            Ok(Frame::GovernancePage {
+                page: vox_core::node::api::GovernancePage::Service { share: Some(s), .. },
+            }) => {
+                let proto = if udp && s.kind.as_str() != "udp" {
+                    "/udp"
+                } else {
+                    ""
+                };
+                format!(" ({}{proto})", s.kind.as_str())
+            }
+            _ => String::new(),
+        };
         // Its name for reading, and the canonical address to copy (ADR-028 S-1).
         println!("sharing {endpoint} as {name} — {address}{said}");
     }

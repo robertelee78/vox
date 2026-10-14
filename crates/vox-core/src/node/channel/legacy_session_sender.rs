@@ -89,9 +89,14 @@ impl ChannelState {
         }
         let previous = self.legacy_announced_through(profile.store())?;
         let mut readers = BTreeMap::new();
-        for peer in self.consented() {
+        // A peer advertises private support through its admitted feed. Unknown
+        // consent targets cannot have advertised it and are kept on disk by the
+        // governance index; this audience needs only the bounded admitted roster.
+        let peers: Vec<_> = self.authors.keys().copied().collect();
+        for peer in peers {
             if peer == me
                 || self.has_left(&peer)
+                || !self.has_consented(profile.store(), &peer)?
                 || !self.supports_private(profile.store(), &peer)?
             {
                 continue;
@@ -209,6 +214,7 @@ impl ChannelState {
             let mut batch = profile.store().batch()?;
             let posted = if let Some((entry, hash, id, log, sender, seen)) = prepared {
                 self.publish_entry_into(&mut batch, &entry)?;
+                self.observe_governance_into(profile.store(), &mut batch, &entry, id)?;
                 batch.put_segment(&self.channel_id, SegmentKind::LogDb, id, &log)?;
                 batch.put_segment(&self.channel_id, SegmentKind::Index, id, &seen)?;
                 batch.put_segment(

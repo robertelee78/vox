@@ -152,6 +152,13 @@ pub struct DaemonCore {
     /// The daemon's event task.
     daemon_events: tokio::task::JoinHandle<()>,
     snapshot: NodeSnapshot,
+    /// Only the selected room's currently requested governance pages.
+    governance: Option<SelectedGovernance>,
+    shown_entries: Vec<Digest32>,
+    service_window: Vec<(Digest32, Digest32, String)>,
+    service_window_next: usize,
+    service_window_rows: Vec<(Digest32, vox_core::node::channel::Share)>,
+
     presented: Vec<(Digest32, String)>,
     /// Storage failures by room id; a recovery replaces the failure with a notice.
     room_save_errors: BTreeMap<Digest32, String>,
@@ -270,6 +277,36 @@ struct RoomUnread {
     cursor: Option<Digest32>,
     /// Rows the events announced and not yet read and counted.
     pending: usize,
+}
+
+/// One selected governance page per kind, with revision-bound continuations.
+struct SelectedGovernance {
+    room: Digest32,
+    revision: u64,
+    notices: Vec<vox_core::node::channel::RoomNotice>,
+    notices_cursor: Option<(u64, Digest32)>,
+    notices_next: Option<(u64, Digest32)>,
+    notices_want: bool,
+    shares: Vec<vox_core::node::channel::Share>,
+    shares_cursor: Option<(Digest32, Digest32)>,
+    shares_next: Option<(Digest32, Digest32)>,
+    shares_want: bool,
+}
+impl SelectedGovernance {
+    fn new(room: Digest32, revision: u64) -> Self {
+        Self {
+            room,
+            revision,
+            notices: Vec::new(),
+            notices_cursor: None,
+            notices_next: None,
+            notices_want: true,
+            shares: Vec::new(),
+            shares_cursor: None,
+            shares_next: None,
+            shares_want: true,
+        }
+    }
 }
 
 /// One displayed room page in canonical room order. Older navigation replaces it; End
@@ -558,6 +595,11 @@ impl DaemonCore {
             rx,
             daemon_events,
             snapshot: NodeSnapshot::default(),
+            governance: None,
+            shown_entries: Vec::new(),
+            service_window: Vec::new(),
+            service_window_next: 0,
+            service_window_rows: Vec::new(),
             presented: Vec::new(),
             room_save_errors: BTreeMap::new(),
             recovered_rooms: BTreeSet::new(),
@@ -2380,6 +2422,135 @@ impl DaemonCore {
         }
     }
 
+    fn read_governance(&mut self) {
+        use vox_core::node::api::{GovernancePage as Page, GovernanceQuery as Query};
+        let Some(room) = self.active else {
+            self.governance = None;
+            self.service_window.clear();
+            self.service_window_rows.clear();
+            return;
+        };
+        let Some(revision) = self
+            .snapshot
+            .open
+            .iter()
+            .find(|r| r.channel_id == room)
+            .map(|r| r.governance_revision)
+        else {
+            return;
+        };
+        if self
+            .governance
+            .as_ref()
+            .is_none_or(|g| g.room != room || g.revision != revision)
+        {
+            self.governance = Some(SelectedGovernance::new(room, revision));
+            self.service_window.clear();
+            self.service_window_rows.clear();
+            self.service_window_next = 0;
+        }
+        let Some(conn) = self.conn.as_mut() else {
+            return;
+        };
+        let g = self.governance.as_mut().expect("selected room");
+        for notices in [true, false] {
+            let wanted = if notices {
+                g.notices_want
+            } else {
+                g.shares_want
+            };
+            if !wanted {
+                continue;
+            }
+            let query = if notices {
+                Query::Notices {
+                    before: g.notices_cursor,
+                    revision: Some(g.revision),
+                }
+            } else {
+                Query::Shares {
+                    after: g.shares_cursor,
+                    revision: Some(g.revision),
+                }
+            };
+            match until_stopped(
+                &self.rt,
+                &self.stop,
+                conn.client.request(&Request::GovernancePage {
+                    channel_id: room,
+                    query,
+                }),
+            ) {
+                Some(Ok(Frame::GovernancePage {
+                    page: Page::Notices { rows, before, .. },
+                })) => {
+                    g.notices = rows;
+                    g.notices_next = before;
+                    g.notices_want = false;
+                }
+                Some(Ok(Frame::GovernancePage {
+                    page: Page::Shares { rows, next, .. },
+                })) => {
+                    g.shares = rows;
+                    g.shares_next = next;
+                    g.shares_want = false;
+                }
+                Some(Ok(Frame::Error { reason })) => {
+                    self.notice = Some(reason);
+                    return;
+                }
+                Some(Err(e)) => {
+                    self.notice = Some(e.to_string());
+                    return;
+                }
+                _ => return,
+            }
+        }
+        let selected: BTreeSet<_> = self
+            .timeline
+            .iter()
+            .flat_map(|t| t.rows.iter())
+            .chain(self.thread.iter().flat_map(|t| t.rows.iter()))
+            .filter(|r| self.shown_entries.contains(&r.entry_hash))
+            .flat_map(|r| vox_core::node::resolver::canonical_services(&r.text))
+            .collect();
+        let selected: Vec<_> = selected.into_iter().collect();
+        if selected != self.service_window {
+            self.service_window = selected;
+            self.service_window_next = 0;
+            self.service_window_rows.clear();
+        }
+        for _ in 0..64 {
+            let Some((channel_id, host, selector)) =
+                self.service_window.get(self.service_window_next).cloned()
+            else {
+                break;
+            };
+            match until_stopped(
+                &self.rt,
+                &self.stop,
+                conn.client.request(&Request::GovernancePage {
+                    channel_id,
+                    query: Query::Service { host, selector },
+                }),
+            ) {
+                Some(Ok(Frame::GovernancePage {
+                    page: Page::Service { share, .. },
+                })) => {
+                    if let Some(share) = share {
+                        self.service_window_rows.push((channel_id, share));
+                    }
+                    self.service_window_next += 1;
+                }
+                Some(Ok(Frame::Error { reason })) => {
+                    self.notice = Some(reason);
+                    break;
+                }
+                _ => break,
+            }
+        }
+    }
+
     fn project(&mut self) -> ViewModel {
         let snap = self.snapshot.clone();
         let me = snap.me;
@@ -2451,7 +2622,15 @@ impl DaemonCore {
         channels.sort_by_key(|c| c.group);
         let machine_nodes = self.machine_nodes.clone();
         // This node's names, for every address the views write readable (ADR-028 S-1a).
-        let names = vox_core::node::resolver::VoxResolver::of_snapshot(&snap);
+        let mut names = vox_core::node::resolver::VoxResolver::of_snapshot(&snap);
+        if let Some(g) = &self.governance {
+            for share in &g.shares {
+                names.add_share(g.room, share.host, &share.name, share.udp);
+            }
+        }
+        for (room, share) in &self.service_window_rows {
+            names.add_share(*room, share.host, &share.name, share.udp);
+        }
         let mut thread_replies = std::sync::Arc::default();
         let timeline = self.active.and_then(|cid| {
             let room = snap.open.iter().find(|d| d.channel_id == cid)?;
@@ -2476,9 +2655,20 @@ impl DaemonCore {
                         names_here(),
                     ),
                     retention: vox_core::node::retention::describe(d.retention),
-                    notices: d
-                        .notices
-                        .iter()
+                    notices_more: self
+                        .governance
+                        .as_ref()
+                        .is_some_and(|g| g.room == d.channel_id && g.notices_next.is_some()),
+                    shared_more: self
+                        .governance
+                        .as_ref()
+                        .is_some_and(|g| g.room == d.channel_id && g.shares_next.is_some()),
+                    notices: self
+                        .governance
+                        .as_ref()
+                        .filter(|g| g.room == d.channel_id)
+                        .into_iter()
+                        .flat_map(|g| g.notices.iter())
                         .map(|n| NoticeView {
                             timestamp: n.created_millis,
                             after: n.after,
@@ -2539,7 +2729,7 @@ impl DaemonCore {
                                 // only to a member its keyring trusts (V210-148), and takes a
                                 // member's key only if it trusts it.
                                 trust: {
-                                    let reads_you = d.consented.binary_search(m).is_ok();
+                                    let reads_you = d.member_consent.binary_search(m).is_ok();
                                     let trusts_you = d.consenting.binary_search(m).is_ok();
                                     if is_me {
                                         Trust::You
@@ -2605,8 +2795,11 @@ impl DaemonCore {
                     // What is shared here, in this operator's own words (V030-25): the same
                     // addresses `vox service list` prints.
                     shared: {
-                        d.shares
-                            .iter()
+                        self.governance
+                            .as_ref()
+                            .filter(|g| g.room == d.channel_id)
+                            .into_iter()
+                            .flat_map(|g| g.shares.iter())
                             .map(|s| {
                                 let who = if me == Some(s.host) {
                                     "you".to_owned()
@@ -3075,6 +3268,7 @@ impl CoreHandle for DaemonCore {
         self.read_timeline();
         self.read_threads();
         self.read_sessions_page();
+        self.read_governance();
         self.read_session();
         self.count_waiting();
         self.count_unread();
@@ -3092,6 +3286,7 @@ impl CoreHandle for DaemonCore {
         self.checked
             .retain(|entry| self.image_visible.contains(entry));
         self.check_pulls();
+        self.shown_entries = entries.to_vec();
         let Some(cid) = self.active else {
             return;
         };
@@ -3435,6 +3630,24 @@ impl CoreHandle for DaemonCore {
                     .filter(|t| t.channel_id == channel_id)
                 {
                     t.want_latest = true;
+                }
+                CommandStatus::Done
+            }
+            Command::GovernancePage {
+                channel_id,
+                notices,
+                first,
+            } => {
+                if let Some(g) = self.governance.as_mut().filter(|g| g.room == channel_id) {
+                    if notices {
+                        if first || g.notices_next.is_some() {
+                            g.notices_cursor = if first { None } else { g.notices_next };
+                            g.notices_want = true;
+                        }
+                    } else if first || g.shares_next.is_some() {
+                        g.shares_cursor = if first { None } else { g.shares_next };
+                        g.shares_want = true;
+                    }
                 }
                 CommandStatus::Done
             }

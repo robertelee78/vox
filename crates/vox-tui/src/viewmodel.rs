@@ -254,6 +254,10 @@ pub struct ChannelView {
     /// What a person is told happened to the room, in its order, each with who did it, by
     /// this node's name for them: `ann renamed the room to family` (ADR-028 E-5).
     pub notices: Vec<NoticeView>,
+    /// The selected notice page has an older continuation.
+    pub notices_more: bool,
+    /// The selected service page has a continuation, including empty filtered pages.
+    pub shared_more: bool,
     /// The retention this node applies here, as a person reads it ("1 week", "forever"): what the
     /// room's header always shows (ADR-028 R-7).
     pub retention: String,
@@ -664,6 +668,11 @@ pub enum Command {
         channel_id: Digest32,
     },
     /// Load the room page before its oldest shown message.
+    GovernancePage {
+        channel_id: Digest32,
+        notices: bool,
+        first: bool,
+    },
     OlderRoom {
         /// The room on screen.
         channel_id: Digest32,

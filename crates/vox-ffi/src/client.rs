@@ -693,6 +693,41 @@ pub struct RoomServices {
     pub shared: Vec<SharedService>,
     /// The services this node offers there.
     pub offered: Vec<OfferedService>,
+    /// Continue after this inspected slot; empty pages can still continue.
+    pub next: Option<ServiceCursor>,
+    /// Carry this revision into the continuation.
+    pub revision: u64,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ServiceCursor {
+    pub host: String,
+    pub name_hash: String,
+}
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct NoticeCursor {
+    pub clock: u64,
+    pub entry: String,
+}
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct RoomAdmins {
+    pub creator: String,
+    pub members: Vec<String>,
+    pub next: Option<String>,
+    pub revision: u64,
+}
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct RoomNotices {
+    pub rows: Vec<RoomNoticeRow>,
+    pub before: Option<NoticeCursor>,
+    pub revision: u64,
+}
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct RoomConsentPage {
+    pub author: String,
+    pub targets: Vec<String>,
+    pub next: Option<String>,
+    pub revision: u64,
 }
 
 /// A service a member shares in a room.
@@ -2992,15 +3027,60 @@ impl VoxClient {
     ///
     /// # Errors
     /// A malformed id, or the node's refusal (the room not open).
-    pub async fn admins(&self, room: String) -> Result<Vec<String>, VoxError> {
+    pub async fn is_admin(&self, room: String, member: String) -> Result<bool, VoxError> {
+        use vox_core::node::api::{GovernancePage, GovernanceQuery};
         let channel_id = digest(&room, "room id")?;
-        on_held!(
-            self,
-            |c| match ask(c, &Request::Admins { channel_id }).await? {
-                Frame::Members { members } => Ok(members.iter().map(b32_encode).collect()),
-                other => Err(unexpected(&other)),
+        let target = digest(&member, "member fingerprint")?;
+        on_held!(self, |c| match ask(
+            c,
+            &Request::GovernancePage {
+                channel_id,
+                query: GovernanceQuery::Admin { target }
             }
         )
+        .await?
+        {
+            Frame::GovernancePage {
+                page: GovernancePage::Admin { admin, .. },
+            } => Ok(admin),
+            other => Err(unexpected(&other)),
+        })
+    }
+
+    pub async fn admins_page(
+        &self,
+        room: String,
+        after: Option<String>,
+        revision: Option<u64>,
+    ) -> Result<RoomAdmins, VoxError> {
+        use vox_core::node::api::{GovernancePage, GovernanceQuery};
+        let channel_id = digest(&room, "room id")?;
+        let after = after.map(|v| digest(&v, "admin cursor")).transpose()?;
+        on_held!(self, |c| match ask(
+            c,
+            &Request::GovernancePage {
+                channel_id,
+                query: GovernanceQuery::Admins { after, revision }
+            }
+        )
+        .await?
+        {
+            Frame::GovernancePage {
+                page:
+                    GovernancePage::Admins {
+                        creator,
+                        members,
+                        next,
+                        revision,
+                    },
+            } => Ok(RoomAdmins {
+                creator: b32_encode(&creator),
+                members: members.iter().map(b32_encode).collect(),
+                next: next.as_ref().map(b32_encode),
+                revision
+            }),
+            other => Err(unexpected(&other)),
+        })
     }
 
     /// Make `member` an admin of `room`, or (`admin` false) take it back; its creator only.
@@ -3344,8 +3424,21 @@ impl VoxClient {
     ///
     /// # Errors
     /// A malformed id, or the node's refusal.
-    pub async fn services(&self, room: String) -> Result<RoomServices, VoxError> {
+    pub async fn services_page(
+        &self,
+        room: String,
+        after: Option<ServiceCursor>,
+        revision: Option<u64>,
+    ) -> Result<RoomServices, VoxError> {
         let channel_id = digest(&room, "room id")?;
+        let after = after
+            .map(|v| {
+                Ok::<_, VoxError>((
+                    digest(&v.host, "service cursor host")?,
+                    digest(&v.name_hash, "service cursor name")?,
+                ))
+            })
+            .transpose()?;
         // Whether the `.vox` proxy runs, for the needs of ssh by address and of a URL, asked as
         // `vox service list` asks it.
         let held = Arc::clone(&self.held);
@@ -3365,51 +3458,64 @@ impl VoxClient {
                     }))
             })
             .await?;
-        on_held!(
-            self,
-            |c| match ask(c, &Request::Services { channel_id }).await? {
-                Frame::Services {
-                    room,
-                    services,
-                    shared,
-                } => Ok(RoomServices {
-                    room: shown_name(&room),
-                    shared: shared
-                        .into_iter()
-                        .map(|s| {
-                            use vox_core::node::service_reach::{commands, needs};
-                            SharedService {
-                                commands: commands(&s)
-                                    .into_iter()
-                                    .map(|(what, command)| ServiceCommand {
-                                        what: what.to_owned(),
-                                        command,
-                                    })
-                                    .collect(),
-                                needs: needs(&s, Some(&proxy))
-                                    .into_iter()
-                                    .map(|(need, holds, otherwise)| ServiceNeed {
-                                        need: shown_name(&need),
-                                        holds,
-                                        otherwise: shown_name(&otherwise),
-                                    })
-                                    .collect(),
-                                address: shown_name(&s.address),
-                                canonical: s.canonical,
-                                by: shown_name(&s.by),
-                                udp: s.udp,
-                                kind: shown_name(&s.kind),
-                            }
-                        })
-                        .collect(),
-                    offered: services
-                        .into_iter()
-                        .map(|(tag, local)| OfferedService { tag, local })
-                        .collect(),
-                }),
-                other => Err(unexpected(&other)),
+        on_held!(self, |c| match ask(
+            c,
+            &Request::Services {
+                channel_id,
+                after,
+                revision
             }
         )
+        .await?
+        {
+            Frame::Services {
+                room,
+                services,
+                shared,
+                next,
+                revision,
+            } => Ok(RoomServices {
+                next: next.map(|(host, name_hash)| ServiceCursor {
+                    host: b32_encode(&host),
+                    name_hash: b32_encode(&name_hash)
+                }),
+                revision,
+                room: shown_name(&room),
+                shared: shared
+                    .into_iter()
+                    .map(|s| {
+                        use vox_core::node::service_reach::{commands, needs};
+                        SharedService {
+                            commands: commands(&s)
+                                .into_iter()
+                                .map(|(what, command)| ServiceCommand {
+                                    what: what.to_owned(),
+                                    command,
+                                })
+                                .collect(),
+                            needs: needs(&s, Some(&proxy))
+                                .into_iter()
+                                .map(|(need, holds, otherwise)| ServiceNeed {
+                                    need: shown_name(&need),
+                                    holds,
+                                    otherwise: shown_name(&otherwise),
+                                })
+                                .collect(),
+                            address: shown_name(&s.address),
+                            canonical: s.canonical,
+                            by: shown_name(&s.by),
+                            udp: s.udp,
+                            kind: shown_name(&s.kind),
+                        }
+                    })
+                    .collect(),
+                offered: services
+                    .into_iter()
+                    .map(|(tag, local)| OfferedService { tag, local })
+                    .collect(),
+            }),
+            other => Err(unexpected(&other)),
+        })
     }
 
     /// Offer the local endpoint `local` (`ip:port`) in `room` as the service `tag`, kept across
@@ -4240,12 +4346,12 @@ impl VoxClient {
     ///
     /// # Errors
     /// A malformed id, or the node's refusal.
-    pub async fn consents(&self, room: String) -> Result<RoomConsents, VoxError> {
+    pub async fn member_consents(&self, room: String) -> Result<RoomConsents, VoxError> {
         let channel_id = digest(&room, "room id")?;
         on_held!(
             self,
-            |c| match ask(c, &Request::Consents { channel_id }).await? {
-                Frame::Consents { outbound, inbound } => Ok(RoomConsents {
+            |c| match ask(c, &Request::MemberConsents { channel_id }).await? {
+                Frame::MemberConsents { outbound, inbound } => Ok(RoomConsents {
                     outbound: outbound.iter().map(b32_encode).collect(),
                     inbound: inbound.iter().map(b32_encode).collect(),
                 }),
@@ -4470,23 +4576,97 @@ impl VoxClient {
     ///
     /// # Errors
     /// A malformed id, the room not open, or the daemon's refusal.
-    pub async fn notices(&self, room: String) -> Result<Vec<RoomNoticeRow>, VoxError> {
-        let (open, names) = self.open_snap(&room).await?;
-        let Some(open) = open else {
-            return Err(failed("the room is not open on this node"));
-        };
-        Ok(open
-            .notices
-            .into_iter()
-            .map(|n| RoomNoticeRow {
-                id: b32_encode(&n.entry_hash),
-                author: b32_encode(&n.author),
-                author_name: names.get(&n.author).cloned().unwrap_or_default(),
-                created_millis: n.created_millis,
-                what: n.what,
-                after: n.after.map(|a| b32_encode(&a)).unwrap_or_default(),
-            })
-            .collect())
+    pub async fn notices_page(
+        &self,
+        room: String,
+        before: Option<NoticeCursor>,
+        revision: Option<u64>,
+    ) -> Result<RoomNotices, VoxError> {
+        use vox_core::node::api::{GovernancePage, GovernanceQuery};
+        let channel_id = digest(&room, "room id")?;
+        let before = before
+            .map(|v| Ok::<_, VoxError>((v.clock, digest(&v.entry, "notice cursor")?)))
+            .transpose()?;
+        let (_, names) = self.open_snap(&room).await?;
+        on_held!(self, |c| match ask(
+            c,
+            &Request::GovernancePage {
+                channel_id,
+                query: GovernanceQuery::Notices { before, revision }
+            }
+        )
+        .await?
+        {
+            Frame::GovernancePage {
+                page:
+                    GovernancePage::Notices {
+                        rows,
+                        before,
+                        revision,
+                    },
+            } => Ok(RoomNotices {
+                rows: rows
+                    .into_iter()
+                    .map(|n| RoomNoticeRow {
+                        id: b32_encode(&n.entry_hash),
+                        author: b32_encode(&n.author),
+                        author_name: names.get(&n.author).cloned().unwrap_or_default(),
+                        created_millis: n.created_millis,
+                        what: n.what,
+                        after: n.after.as_ref().map(b32_encode).unwrap_or_default()
+                    })
+                    .collect(),
+                before: before.map(|(clock, entry)| NoticeCursor {
+                    clock,
+                    entry: b32_encode(&entry)
+                }),
+                revision,
+            }),
+            other => Err(unexpected(&other)),
+        })
+    }
+
+    /// Complete consent history through bounded pages, including targets outside the roster.
+    pub async fn consents_page(
+        &self,
+        room: String,
+        author: Option<String>,
+        after: Option<String>,
+        revision: Option<u64>,
+    ) -> Result<RoomConsentPage, VoxError> {
+        use vox_core::node::api::{GovernancePage, GovernanceQuery};
+        let channel_id = digest(&room, "room id")?;
+        let author = author.map(|v| digest(&v, "consent author")).transpose()?;
+        let after = after.map(|v| digest(&v, "consent cursor")).transpose()?;
+        on_held!(self, |c| match ask(
+            c,
+            &Request::GovernancePage {
+                channel_id,
+                query: GovernanceQuery::Consent {
+                    author,
+                    after,
+                    revision
+                }
+            }
+        )
+        .await?
+        {
+            Frame::GovernancePage {
+                page:
+                    GovernancePage::Consent {
+                        author,
+                        targets,
+                        next,
+                        revision,
+                    },
+            } => Ok(RoomConsentPage {
+                author: b32_encode(&author),
+                targets: targets.iter().map(b32_encode).collect(),
+                next: next.as_ref().map(b32_encode),
+                revision
+            }),
+            other => Err(unexpected(&other)),
+        })
     }
 
     /// How long `room` keeps messages here, as a person reads it ("1 week", "forever"), as the

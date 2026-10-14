@@ -886,7 +886,10 @@ impl UiState {
                 self.focus = self.focus.next();
                 // The Shared pane is there only when something is shared.
                 if self.focus == Focus::Shared
-                    && vm.active.as_ref().is_none_or(|c| c.shared.is_empty())
+                    && vm
+                        .active
+                        .as_ref()
+                        .is_none_or(|c| c.shared.is_empty() && !c.shared_more)
                 {
                     self.focus = self.focus.next();
                 }
@@ -898,6 +901,29 @@ impl UiState {
                     self.focus = self.focus.next();
                 }
                 Action::Redraw
+            }
+            KeyCode::Char(key @ ('n' | 'r'))
+                if self.screen == Screen::Channel && self.focus == Focus::Shared =>
+            {
+                self.selected_share = 0;
+                vm.active.as_ref().map_or(Action::Redraw, |c| {
+                    Action::Dispatch(Command::GovernancePage {
+                        channel_id: c.channel_id,
+                        notices: false,
+                        first: key == 'r',
+                    })
+                })
+            }
+            KeyCode::Char(key @ ('N' | 'R'))
+                if self.screen == Screen::Channel && self.focus == Focus::Timeline =>
+            {
+                vm.active.as_ref().map_or(Action::Redraw, |c| {
+                    Action::Dispatch(Command::GovernancePage {
+                        channel_id: c.channel_id,
+                        notices: true,
+                        first: key == 'R',
+                    })
+                })
             }
             KeyCode::Char('y') if self.screen == Screen::Channel && self.focus == Focus::Shared => {
                 match vm

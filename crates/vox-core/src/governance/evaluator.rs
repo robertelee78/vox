@@ -319,7 +319,7 @@ impl Evaluator {
                 continue; // author key unknown: cannot verify, cannot trust
             };
             if known.is_some_and(|k| k.contains(&e.entry_hash))
-                || Self::verify_body(&e.body, &key).is_ok()
+                || e.body.verify(&key).is_ok()
             {
                 verified.push(e);
             }
@@ -362,25 +362,6 @@ impl Evaluator {
             room_anchors,
             verified: verified_hashes,
         })
-    }
-
-    /// Verify one governance body's signature under `author_key` (the body's
-    /// issuer/author root). Genesis verifies its own self-signature.
-    fn verify_body(body: &GovBody, author_key: &CompositePublicKey) -> Result<()> {
-        match body {
-            GovBody::Genesis(g) => g.verify(),
-            GovBody::AdminCert(c) => c.verify(author_key),
-            GovBody::AdminRevocation(r) => r.verify(author_key),
-            GovBody::ConsentGrant(g) => g.verify(author_key),
-            GovBody::ConsentRevocation(r) => r.verify(author_key),
-            GovBody::PolicyUpdate(p) => p.verify(author_key),
-            GovBody::StepPolicyUpdate(p) => p.verify(author_key),
-            GovBody::Lifecycle(l) => l.verify(author_key),
-            GovBody::Presence(p) => p.verify(author_key),
-            GovBody::ServiceShare(s) => s.verify(author_key),
-            GovBody::RoomName(n) => n.verify(author_key),
-            GovBody::RoomAnchors(a) => a.verify(author_key),
-        }
     }
 
     // ---- Queries (pure lookups over resolved state) ----

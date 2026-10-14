@@ -87,6 +87,8 @@ pub enum SegmentKind {
     ProvisionalLog,
     /// Sealed Session locators, projection descriptors and metadata part coordinates.
     SessionIndex,
+    /// Sealed governance locators, causal facts and checked evaluation work.
+    GovernanceIndex,
 }
 
 impl SegmentKind {
@@ -104,6 +106,7 @@ impl SegmentKind {
             SegmentKind::EntryIndex => b"vox/seg/entry-index/v1",
             SegmentKind::ProvisionalLog => b"vox/seg/provisional-log/v1",
             SegmentKind::SessionIndex => b"vox/seg/session-index/v1",
+            SegmentKind::GovernanceIndex => b"vox/seg/governance-index/v1",
         }
     }
 }

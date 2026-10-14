@@ -424,6 +424,30 @@ pub struct HistoryPage {
     pub older: u64,
 }
 
+/// A bounded governance selection carried by the existing room-page transport.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GovernanceQuery {
+    Admin { target: Digest32 },
+    NoticesAfter { entry: Option<Digest32>, after: Option<(u64, Digest32)>, revision: Option<u64> },
+    Service { host: Digest32, selector: String },
+    Notices { before: Option<(u64, Digest32)>, revision: Option<u64> },
+    Shares { after: Option<(Digest32, Digest32)>, revision: Option<u64> },
+    Admins { after: Option<Digest32>, revision: Option<u64> },
+    Consent { author: Option<Digest32>, after: Option<Digest32>, revision: Option<u64> },
+}
+
+/// At most 64 inspected slots. Empty rows with a continuation are not exhaustion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GovernancePage {
+    Admin { target: Digest32, admin: bool, revision: u64 },
+    Service { share: Option<crate::node::channel::Share>, revision: u64 },
+    NoticesAfter { rows: Vec<crate::node::channel::RoomNotice>, next: Option<(u64, Digest32)>, revision: u64 },
+    Notices { rows: Vec<crate::node::channel::RoomNotice>, before: Option<(u64, Digest32)>, revision: u64 },
+    Shares { rows: Vec<crate::node::channel::Share>, next: Option<(Digest32, Digest32)>, revision: u64 },
+    Admins { creator: Digest32, members: Vec<Digest32>, next: Option<Digest32>, revision: u64 },
+    Consent { author: Digest32, targets: Vec<Digest32>, next: Option<Digest32>, revision: u64 },
+}
+
 /// An open channel's full state for display.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelDetail {
@@ -431,8 +455,6 @@ pub struct ChannelDetail {
     pub channel_id: Digest32,
     /// The room's shared name (ADR-028 R-1); `None` for a room no admin has named.
     pub name: Option<String>,
-    /// What a person is told happened to the room, in its order (ADR-028 E-5).
-    pub notices: Vec<crate::node::channel::RoomNotice>,
     /// The current epoch.
     pub epoch: u64,
     /// Members, in fingerprint order.
@@ -449,8 +471,6 @@ pub struct ChannelDetail {
     /// The services this node offers in this channel: `(service_tag, local address)`
     /// in tag order (ADR-013 Bind config — host configuration, not authorization).
     pub services: Vec<(String, std::net::SocketAddr)>,
-    /// The services shared in this channel by every member, as its log says (V030-25).
-    pub shares: Vec<crate::node::channel::Share>,
     /// Whether this node has completed the room's first sync since joining it (V210-164): until
     /// then its log may not yet hold what the room's members have written, shares included.
     pub synced: bool,
@@ -459,13 +479,13 @@ pub struct ChannelDetail {
     pub equivocations: Vec<(Digest32, u64)>,
     /// The room's genesis creator, its root admin (ADR-007).
     pub creator: Digest32,
-    /// Who this identity consents to reading it here (ADR-007), in fingerprint order. Read off
-    /// the log, so a revocation takes one out; what a client shows as consent (V210-82).
-    pub consented: Vec<Digest32>,
-    /// The room's admins, its creator first (V030-08): who may end it.
-    pub admins: Vec<Digest32>,
+    /// Current members this identity consents to, for roster indicators only.
+    /// Arbitrary consent targets are read through GovernanceQuery::Consent.
+    pub member_consent: Vec<Digest32>,
+    /// Revision of the checked governance projection used by this display.
+    pub governance_revision: u64,
     /// The other members that consent to this identity reading them here, in fingerprint order:
-    /// the inbound half of `consented`, off the log the same way (V030-17).
+    /// the inbound half of `member_consent`, off the log the same way (V030-17).
     pub consenting: Vec<Digest32>,
     /// Who trusts each member here (ADR-028 K-7): `(member, the other members that consent to it
     /// reading them)`, in fingerprint order, a member no one trusts left out. `consenting` is this
@@ -1039,6 +1059,10 @@ pub enum Fault {
     ProfileBusy,
     /// Local pairwise delivery capacity is occupied; no new key was sealed or grant recorded.
     DeliveryBusy,
+    /// Stored governance is being brought current; no permission decision may use its old view.
+    GovernanceRefreshing,
+    /// One admin removal is already being applied over bounded actor turns.
+    AdminChangePending,
     /// Making an identity, its file (`vault.cbor`) could not be written. Not [`Fault::Storage`],
     /// which named the store when the store was fine (V210-77).
     IdentityFileUnwritable,
@@ -1261,6 +1285,12 @@ impl Fault {
             Fault::DeliveryBusy => {
                 "this node's key-delivery capacity is busy; the key waits locally\n       existing deliveries are retried; no new grant was recorded by this attempt"
             }
+            Fault::GovernanceRefreshing => {
+                "this room's permissions are still being read from local storage\n       try again once the room is ready"
+            }
+            Fault::AdminChangePending => {
+                "an admin change is already being applied on this node\n       wait for its answer before making another admin change"
+            }
             Fault::RetentionFileUnwritable => {
                 "your retention for this room could not be saved: the node's retention file (`retention`, in its configuration directory) could not be written\n       check free disk space, and that the configuration directory is writable; then run it again"
             }
@@ -1476,6 +1506,8 @@ fault_names!(
     Storage,
     ProfileBusy,
     DeliveryBusy,
+    GovernanceRefreshing,
+    AdminChangePending,
     IdentityFileUnwritable,
     RetentionFileUnwritable,
     SealedUnreadable,

@@ -801,7 +801,7 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
         .constraints([Constraint::Length(tall), Constraint::Min(3)])
         .split(cols[1]);
     render_sessions(frame, column[0], channel, &rows, ui);
-    let side = if channel.shared.is_empty() {
+    let side = if channel.shared.is_empty() && !channel.shared_more {
         vec![column[1]]
     } else {
         Layout::default()
@@ -825,7 +825,14 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
     if let Some(area) = side.get(1) {
         let items: Vec<ListItem> = shared_lines.into_iter().map(ListItem::new).collect();
         frame.render_widget(
-            List::new(items).block(pane_block("Shared", shared_focus)),
+            List::new(items).block(pane_block(
+                if channel.shared_more {
+                    "Shared · n: next · r: first"
+                } else {
+                    "Shared · r: first"
+                },
+                shared_focus,
+            )),
             *area,
         );
     }
@@ -1267,7 +1274,14 @@ fn render_timeline<'a>(
     let title = if scroll > 0 {
         format!("Timeline{showing} · {RETENTION} {retention} (scrolled — End: newest)")
     } else {
-        format!("Timeline{showing} · {RETENTION} {retention}")
+        format!(
+            "Timeline{showing} · {RETENTION} {retention}{}",
+            if channel.notices_more {
+                " · N: older notices · R: latest"
+            } else {
+                " · R: latest notices"
+            }
+        )
     };
     let p = Paragraph::new(shown).block(pane_block(&title, focus));
     frame.render_widget(p, area);

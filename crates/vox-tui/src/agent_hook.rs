@@ -227,8 +227,8 @@ async fn joined_notice(
     if !client.me().is_some_and(|me| members.contains(&me)) {
         return Ok(None);
     }
-    let (outbound, inbound) = match client.request(&Request::Consents { channel_id }).await? {
-        Frame::Consents { outbound, inbound } => (outbound, inbound),
+    let (outbound, inbound) = match client.request(&Request::MemberConsents { channel_id }).await? {
+        Frame::MemberConsents { outbound, inbound } => (outbound, inbound),
         Frame::Error { reason } => return Err(AppError::Usage(reason)),
         other => return Err(crate::client::unexpected(&other)),
     };

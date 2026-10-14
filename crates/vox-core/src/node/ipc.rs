@@ -237,7 +237,7 @@ const T_ERROR: u64 = 4;
 const T_ROWS: u64 = 5;
 const T_FILTERED_ROWS: u64 = 87201;
 const T_MEMBERS: u64 = 6;
-/// [`Frame::Consents`] (V030-17).
+/// [`Frame::MemberConsents`] (V030-17).
 const T_CONSENTS: u64 = 3271;
 const T_ROOMS: u64 = 7;
 
@@ -258,7 +258,7 @@ const T_SUBSCRIBE: u64 = 1;
 const T_POST: u64 = 2;
 const T_READ: u64 = 3;
 const T_ROSTER: u64 = 4;
-/// [`Request::Consents`] (V030-17).
+/// [`Request::MemberConsents`] (V030-17).
 const T_CONSENTS_REQ: u64 = 3270;
 const T_ROOMS_REQ: u64 = 5;
 // Protocol 3 — the service verbs an agent needs for file exchange (ADR-020 §11).
@@ -458,6 +458,12 @@ const T_OFFERS: u64 = 4952;
 /// is accident prevention on top of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
+    /// One stateless bounded governance page on the room-page transport.
+    GovernancePage {
+        channel_id: Digest32,
+        query: crate::node::api::GovernanceQuery,
+    },
+
     /// A room's newest bounded history page, or the page before an entry (ADR-034 FR-4/5).
     RoomPage {
         /// The room.
@@ -527,7 +533,7 @@ pub enum Request {
     },
     /// Who this identity consents to reading it in a room, and who consents to it: both
     /// directions of trust, off the room's log (V030-17).
-    Consents {
+    MemberConsents {
         /// The room.
         channel_id: Digest32,
     },
@@ -555,6 +561,10 @@ pub enum Request {
     Services {
         /// The room.
         channel_id: Digest32,
+        /// Continue strictly after the last inspected service slot.
+        after: Option<(Digest32, Digest32)>,
+        /// The revision returned by the first page.
+        revision: Option<u64>,
     },
     /// Share a file or a folder (ADR-028 F-1, F-2): the daemon hashes it, serves it and posts
     /// `envelope` as its announcement, answered with [`Frame::Shares`] holding the one share once
@@ -1020,12 +1030,19 @@ pub enum Request {
 /// The most entries one [`Request::Find`] may name.
 pub const MAX_FIND: usize = 64;
 
+#[path = "ipc_governance.rs"]
+mod governance_page;
+
 impl Request {
     /// Canonical CBOR body (unframed).
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut e = Encoder::new();
         match self {
+            Request::GovernancePage { channel_id, query } => {
+                e.array(3).uint(T_ROOM_PAGE_REQ).bytes(channel_id);
+                governance_page::put_query(&mut e, query);
+            }
             Request::RoomPage {
                 channel_id,
                 before,
@@ -1186,7 +1203,7 @@ impl Request {
             Request::KeyWaits { channel_id } => {
                 e.array(2).uint(T_KEY_WAITS_REQ).bytes(channel_id);
             }
-            Request::Consents { channel_id } => {
+            Request::MemberConsents { channel_id } => {
                 e.array(2).uint(T_CONSENTS_REQ).bytes(channel_id);
             }
             Request::Order {
@@ -1198,8 +1215,14 @@ impl Request {
                 encode_order_cursor(&mut e, *after);
                 encode_optional_u64(&mut e, *revision);
             }
-            Request::Services { channel_id } => {
-                e.array(2).uint(T_SERVICES_REQ).bytes(channel_id);
+            Request::Services {
+                channel_id,
+                after,
+                revision,
+            } => {
+                e.array(4).uint(T_SERVICES_REQ).bytes(channel_id);
+                governance_page::put_pair(&mut e, *after);
+                encode_optional_u64(&mut e, *revision);
             }
             Request::Share {
                 channel_id,
@@ -1603,6 +1626,12 @@ impl Request {
                     limit,
                 })
             }
+            (T_ROOM_PAGE_REQ, 3) => {
+                let channel_id = digest(&mut d)?;
+                let query = governance_page::query(&mut d)?;
+                d.finish()?;
+                Ok(Request::GovernancePage { channel_id, query })
+            }
             (T_ROOM_PAGE_REQ, 4) => {
                 let channel_id = digest(&mut d)?;
                 let before = optional_digest(&mut d)?;
@@ -1633,7 +1662,7 @@ impl Request {
                 let channel_id = digest(&mut d)?;
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
-                Ok(Request::Consents { channel_id })
+                Ok(Request::MemberConsents { channel_id })
             }
             (T_ORDER, 4) => {
                 let channel_id = digest(&mut d)?;
@@ -1647,11 +1676,17 @@ impl Request {
                     revision,
                 })
             }
-            (T_SERVICES_REQ, 2) => {
+            (T_SERVICES_REQ, 4) => {
                 let channel_id = digest(&mut d)?;
+                let after = governance_page::pair(&mut d)?;
+                let revision = optional_u64(&mut d)?;
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
-                Ok(Request::Services { channel_id })
+                Ok(Request::Services {
+                    channel_id,
+                    after,
+                    revision,
+                })
             }
             // The unpaged form (no `after`), as any release before #189 sends it: read as the first
             // page. Refused, a worker on an older release died at its first room lookup with
@@ -2313,6 +2348,11 @@ pub struct SharedService {
 /// how a `Lagged` report comes to be silently swallowed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
+    /// A bounded governance result with explicit continuation and revision.
+    GovernancePage {
+        page: crate::node::api::GovernancePage,
+    },
+
     /// One bounded history page, oldest row first, and the number of older rows (FR-4).
     RoomPage {
         /// The selected messages.
@@ -2429,8 +2469,8 @@ pub enum Frame {
         /// The room's retention, seconds.
         room: u64,
     },
-    /// What a [`Request::Consents`] asked for, each in fingerprint order.
-    Consents {
+    /// What a [`Request::MemberConsents`] asked for, each in fingerprint order.
+    MemberConsents {
         /// The members this identity consents to reading it.
         outbound: Vec<Digest32>,
         /// The members that consent to this identity reading them.
@@ -2478,6 +2518,10 @@ pub enum Frame {
         services: Vec<(String, String)>,
         /// What every member shares in the room (V030-25), with both forms of each address.
         shared: Vec<SharedService>,
+        /// More inspected slots remain, even when this page has no active shares.
+        next: Option<(Digest32, Digest32)>,
+        /// Keep this revision for the continuation.
+        revision: u64,
     },
     /// File shares, as a [`Request::Share`], [`Request::ShareStop`] or [`Request::ShareList`]
     /// asked for.
@@ -2575,6 +2619,10 @@ impl Frame {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut e = Encoder::new();
         match self {
+            Frame::GovernancePage { page } => {
+                e.array(2).uint(T_ROOM_PAGE);
+                governance_page::put_page(&mut e, page);
+            }
             Frame::RoomPage { rows, older } => {
                 e.array(3)
                     .uint(T_ROOM_PAGE)
@@ -2670,7 +2718,7 @@ impl Frame {
                     e.array(2).bytes(m).text(why);
                 }
             }
-            Frame::Consents { outbound, inbound } => {
+            Frame::MemberConsents { outbound, inbound } => {
                 e.array(3).uint(T_CONSENTS).array(outbound.len());
                 for m in outbound {
                     e.bytes(m);
@@ -2726,8 +2774,10 @@ impl Frame {
                 room,
                 services,
                 shared,
+                next,
+                revision,
             } => {
-                e.array(4).uint(T_SERVICES).text(room).array(services.len());
+                e.array(6).uint(T_SERVICES).text(room).array(services.len());
                 for (tag, local) in services {
                     e.array(2).text(tag).text(local);
                 }
@@ -2742,6 +2792,8 @@ impl Frame {
                         .uint(u64::from(s.trusts_you))
                         .uint(u64::from(s.online));
                 }
+                governance_page::put_pair(&mut e, *next);
+                e.uint(*revision);
             }
             Frame::Shares { shares } => {
                 e.array(2).uint(T_SHARES).array(shares.len());
@@ -3359,6 +3411,11 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 revision: digest(d)?,
             });
         }
+        (T_ROOM_PAGE, 2) => {
+            return Ok(Frame::GovernancePage {
+                page: governance_page::page(d)?,
+            })
+        }
         (T_ROOM_PAGE, 3) => {
             let body = d
                 .bytes()
@@ -3478,7 +3535,7 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             };
             let outbound = set("ipc trust grants outbound")?;
             let inbound = set("ipc trust grants inbound")?;
-            return Ok(Frame::Consents { outbound, inbound });
+            return Ok(Frame::MemberConsents { outbound, inbound });
         }
         (T_BOUND, 2) => {
             return Ok(Frame::Bound {
@@ -3522,7 +3579,7 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             }
             return Ok(Frame::Rooms { rooms });
         }
-        (T_SERVICES, 4) => {
+        (T_SERVICES, 6) => {
             let room = text(d, "ipc services room")?;
             let count = d
                 .array()
@@ -3540,7 +3597,10 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             let count = d
                 .array()
                 .map_err(|_| Error::MalformedIpc("ipc shared array"))?;
-            let mut shared = Vec::with_capacity(count.min(1024));
+            if count > 64 {
+                return Err(Error::MalformedIpc("ipc shared page bound"));
+            }
+            let mut shared = Vec::with_capacity(count);
             for _ in 0..count {
                 if d.array()
                     .map_err(|_| Error::MalformedIpc("ipc shared row"))?
@@ -3578,6 +3638,8 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 room,
                 services,
                 shared,
+                next: governance_page::pair(d)?,
+                revision: d.uint()?,
             });
         }
         (T_SHARES, 2) => {
@@ -5382,10 +5444,11 @@ async fn serve_requests(
             Frame::Rows { .. }
                 | Frame::FilteredRows { .. }
                 | Frame::RoomPage { .. }
+                | Frame::GovernancePage { .. }
                 | Frame::Order { .. }
                 | Frame::Members { .. }
                 | Frame::KeyWaits { .. }
-                | Frame::Consents { .. }
+                | Frame::MemberConsents { .. }
                 | Frame::Trusted { .. }
                 | Frame::Presented { .. }
                 | Frame::Rooms { .. }
@@ -5863,6 +5926,14 @@ fn one_line(text: &str) -> String {
 /// and be able to ask something else.
 async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
     let frame = match request {
+        Request::GovernancePage { channel_id, query } => {
+            use crate::node::channel::history::{Query, Reply};
+            match handle.room_history(channel_id, Query::Governance(query)).await {
+                Ok(Reply::Governance(page)) => Frame::GovernancePage { page },
+                Ok(_) => Frame::Error { reason: "unexpected governance page reply".into() },
+                Err(reason) => Frame::Error { reason },
+            }
+        }
         Request::RoomPage { channel_id, before, limit } => {
             use crate::node::channel::history::{Query, Reply};
             let limit = if limit == 0 { SESSION_PAGE_ROWS } else {
@@ -6360,23 +6431,16 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         Request::Sessions { .. } | Request::SessionsPage { .. } | Request::SessionLookup { .. } | Request::SessionLifecycle { .. } => Frame::Error {
             reason: "Sessions require a reply stream".into(),
         },
-        Request::Services { channel_id } => match handle.open_detail(channel_id).await {
-            Some(detail) => Frame::Services {
-                room: crate::node::resolver::room_shown_here(
-                    detail.name.as_deref(),
-                    &channel_id,
-                    handle.view().channels.iter().map(|c| c.name.as_deref()),
-                ),
-                services: detail
-                    .services
-                    .iter()
-                    .map(|(tag, local)| (tag.clone(), local.to_string()))
-                    .collect(),
-                shared: handle.shared_in(channel_id).await.unwrap_or_default(),
+        Request::Services { channel_id, after, revision } => match handle.open_detail(channel_id).await {
+            Some(detail) => match handle.shared_page(channel_id, after, revision).await {
+                Ok((shared, next, revision)) => Frame::Services {
+                    room: crate::node::resolver::room_shown_here(detail.name.as_deref(), &channel_id, handle.view().channels.iter().map(|c| c.name.as_deref())),
+                    services: detail.services.iter().map(|(tag, local)| (tag.clone(), local.to_string())).collect(),
+                    shared, next, revision,
+                },
+                Err(reason) => Frame::Error { reason },
             },
-            None => Frame::Error {
-                reason: "room not open".into(),
-            },
+            None => Frame::Error { reason: "room not open".into() },
         },
         Request::Agree {
             channel_id,
@@ -6433,15 +6497,15 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             }
         }
         // Bounded like the roster: two sets of at most a room's members.
-        Request::Consents { channel_id } => {
+        Request::MemberConsents { channel_id } => {
             let view = handle.view();
             match view
                 .open_channels
                 .iter()
                 .find(|d| d.channel_id == channel_id)
             {
-                Some(detail) => Frame::Consents {
-                    outbound: detail.consented.clone(),
+                Some(detail) => Frame::MemberConsents {
+                    outbound: detail.member_consent.clone(),
                     inbound: detail.consenting.clone(),
                 },
                 None => Frame::Error {
@@ -6687,18 +6751,11 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             .await
         }
         Request::Admins { channel_id } => {
-            let view = handle.view();
-            match view
-                .open_channels
-                .iter()
-                .find(|d| d.channel_id == channel_id)
-            {
-                Some(detail) => Frame::Members {
-                    members: detail.admins.clone(),
-                },
-                None => Frame::Error {
-                    reason: "room not open".into(),
-                },
+            use crate::node::channel::history::{Query, Reply};
+            match handle.room_history(channel_id, Query::Governance(crate::node::api::GovernanceQuery::Admins { after: None, revision: None })).await {
+                Ok(Reply::Governance(page)) => Frame::GovernancePage { page },
+                Ok(_) => Frame::Error { reason: "unexpected admin page reply".into() },
+                Err(reason) => Frame::Error { reason },
             }
         }
         Request::IdleEnd {

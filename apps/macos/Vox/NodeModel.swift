@@ -236,6 +236,11 @@ final class NodeModel: ObservableObject {
     @Published private(set) var sessionNote: String?
     /// What was done to the room on screen (its retention set, its name changed), oldest first.
     @Published private(set) var notices: [RoomNoticeRow] = []
+    @Published private(set) var noticesBefore: NoticeCursor?
+    @Published private(set) var governancePageError: String?
+    private var noticesCursor: NoticeCursor?
+    private var noticesRevision: UInt64?
+    private var governanceRead = UUID()
     /// Where this node's verified copy of each share it pulled in the room on screen is, by the
     /// share's message id (ADR-028 F-3, F-4): what its card opens with Quick Look.
     @Published private(set) var pulled: [String: String] = [:]
@@ -308,6 +313,9 @@ final class NodeModel: ObservableObject {
 
     /// The services members share in the room on screen, as cards above its timeline.
     @Published private(set) var roomServices: [SharedService] = []
+    @Published private(set) var roomServicesNext: ServiceCursor?
+    private var roomServicesCursor: ServiceCursor?
+    private var roomServicesRevision: UInt64?
     /// What the last keyring change did, or why it failed, in the daemon's words (E-5, M-7).
     @Published private(set) var keyringDid: String?
     @Published private(set) var keyringFailed: String?
@@ -706,7 +714,7 @@ final class NodeModel: ObservableObject {
     private func readTrustsBack() async -> Set<String> {
         var back: Set<String> = []
         for room in rooms where room.open {
-            if let consents = try? await client.consents(room: room.id) {
+            if let consents = try? await client.memberConsents(room: room.id) {
                 back.formUnion(consents.inbound)
             }
         }
@@ -840,6 +848,14 @@ final class NodeModel: ObservableObject {
         stepRetentionError = nil
         stepRetentionRead = UUID()
         notices = []
+        noticesBefore = nil
+        noticesCursor = nil
+        noticesRevision = nil
+        roomServicesNext = nil
+        roomServicesCursor = nil
+        roomServicesRevision = nil
+        governancePageError = nil
+        governanceRead = UUID()
         sessions = []
         sessionPages.clear()
         selectedEarlierRequest = nil
@@ -885,11 +901,11 @@ final class NodeModel: ObservableObject {
             let read = page.messages
             guard generation == roomReadGeneration, self.selection == .room(id), ended == nil else { return }
             let unreadIDs = Set(unread.map(\.id))
-            let services = (try? await client.services(room: id).shared) ?? []
+            let services = try await client.servicesPage(room: id, after: nil, revision: nil)
             let rows = try await memberRows(id)
             let kept = (try? await client.retention(room: id)) ?? ""
             let keptSecs = try? await client.retentionSecs(room: id)
-            let done = (try? await client.notices(room: id)) ?? []
+            let done = try await client.noticesPage(room: id, before: nil, revision: nil)
             let listed = (try? await client.sessions(room: id)) ?? []
             guard generation == roomReadGeneration, self.selection == .room(id), ended == nil else { return }
             guard messageRevision == roomMessageRevision else { return }
@@ -901,13 +917,17 @@ final class NodeModel: ObservableObject {
             unreadCount = unread.count
             messages = read
             roomNeedsPage = false
-            roomServices = services
+            roomServices = services.shared
+            roomServicesNext = services.next
+            roomServicesRevision = services.revision
             members = rows.rows
             trustsMe = rows.trustsMe
             for (fingerprint, name) in rows.presented { rememberPresentation(fingerprint, name) }
             retention = kept
             retentionSecs = keptSecs
-            notices = done
+            notices = done.rows
+            noticesBefore = done.before
+            noticesRevision = done.revision
             sessions = listed
             await loadStepRetention()
             guard generation == roomReadGeneration, self.selection == .room(id), ended == nil else { return }
@@ -1527,15 +1547,16 @@ final class NodeModel: ObservableObject {
         stepRetentionLoading = true
         defer { if stepRetentionRead == token { stepRetentionLoading = false } }
         do {
+            let identity = me
             let (value, admins) = try await AppRequest.run("Reading Session step retention") { [client] in
                 let value = try await client.stepRetention(room: id)
-                let admins = try await client.admins(room: id)
-                return (value, admins)
+                let admin = try await client.isAdmin(room: id, member: identity)
+                return (value, admin)
             }
             guard !Task.isCancelled, roomReadGeneration == generation, ended == nil,
                   roomOnScreen == id, stepRetentionRead == token else { return }
             stepRetention = value
-            stepRetentionAdmin = admins.contains(me)
+            stepRetentionAdmin = admins
             stepRetentionError = nil
         } catch {
             guard !Task.isCancelled, roomReadGeneration == generation, ended == nil,
@@ -1598,14 +1619,11 @@ final class NodeModel: ObservableObject {
         }
     }
 
-    /// The room on screen's admins, creator first.
-    func admins() async -> [String] {
-        guard let id = roomOnScreen else { return [] }
-        do { return try await client.admins(room: id) }
-        catch {
-            report(error, operation: "admins")
-            return []
-        }
+    /// One active admin page, with its creator separately identified.
+    func adminsPage(after: String? = nil, revision: UInt64? = nil) async -> RoomAdmins? {
+        guard let id = roomOnScreen else { return nil }
+        do { return try await client.adminsPage(room: id, after: after, revision: revision) }
+        catch { report(error, operation: "admins"); return nil }
     }
 
     /// Make a member an admin of the room on screen, or take it back.
@@ -1656,8 +1674,37 @@ final class NodeModel: ObservableObject {
     }
 
     /// A room's services, as the daemon lists them.
-    func services(of room: String) async throws -> RoomServices {
-        try await client.services(room: room)
+    func services(of room: String, after: ServiceCursor? = nil, revision: UInt64? = nil) async throws -> RoomServices {
+        try await client.servicesPage(room: room, after: after, revision: revision)
+    }
+
+    /// Replace selected governance pages. A stale cursor keeps the last good view visible.
+    func readGovernancePages(first: Bool = false, nextServices: Bool = false, olderNotices: Bool = false) async {
+        guard let room = roomOnScreen else { return }
+        let generation = roomReadGeneration
+        let token = UUID()
+        governanceRead = token
+        let serviceCursor = first ? nil : (nextServices ? roomServicesNext : roomServicesCursor)
+        let noticeCursor = first ? nil : (olderNotices ? noticesBefore : noticesCursor)
+        do {
+            let services = try await client.servicesPage(room: room, after: serviceCursor,
+                revision: serviceCursor == nil ? nil : roomServicesRevision)
+            let done = try await client.noticesPage(room: room, before: noticeCursor,
+                revision: noticeCursor == nil ? nil : noticesRevision)
+            guard governanceRead == token, roomReadGeneration == generation, roomOnScreen == room, !Task.isCancelled else { return }
+            roomServices = services.shared
+            roomServicesCursor = serviceCursor
+            roomServicesNext = services.next
+            roomServicesRevision = services.revision
+            notices = done.rows
+            noticesCursor = noticeCursor
+            noticesBefore = done.before
+            noticesRevision = done.revision
+            governancePageError = nil
+        } catch {
+            guard governanceRead == token, roomReadGeneration == generation, roomOnScreen == room else { return }
+            governancePageError = sentence(error)
+        }
     }
 
     /// A room's members.
@@ -1833,7 +1880,7 @@ final class NodeModel: ObservableObject {
     /// The members of `room` other than this node, with the trust each has here.
     private func memberRows(_ room: String) async throws -> (rows: [MemberRow], trustsMe: Set<String>, presented: [String: String]) {
         let roster = try await client.roster(room: room)
-        let consents = try await client.consents(room: room)
+        let consents = try await client.memberConsents(room: room)
         let keyring = Dictionary(trusted.map { ($0.fingerprint, $0.drive) }) { $1 }
         let back = Set(consents.inbound)
         // Their trust in this node, whether or not this node trusts them (D4): both directions.
@@ -1871,11 +1918,10 @@ final class NodeModel: ObservableObject {
                 let pulls = try? await self.client.pulledBy(room: room)
                 let copies = try? await self.client.pulled(room: room)
                 let states = try? await self.client.pullStates(room: room)
-                let services = try? await self.client.services(room: room).shared
                 let rows = try? await self.memberRows(room)
                 let kept = try? await self.client.retention(room: room)
                 let keptSecs = try? await self.client.retentionSecs(room: room)
-                let done = try? await self.client.notices(room: room)
+                await self.readGovernancePages()
                 guard !Task.isCancelled, self.roomReadGeneration == generation,
                       self.selection == .room(room), self.ended == nil else { return }
                 if let kept, kept != self.retention { self.retention = kept }
@@ -1883,7 +1929,6 @@ final class NodeModel: ObservableObject {
                 await self.loadStepRetention()
                 guard !Task.isCancelled, self.roomReadGeneration == generation,
                       self.selection == .room(room), self.ended == nil else { return }
-                if let done, done != self.notices { self.notices = done }
                 let listed = try? await self.client.sessions(room: room)
                 guard !Task.isCancelled, self.roomReadGeneration == generation,
                       self.selection == .room(room), self.ended == nil else { return }
@@ -1908,7 +1953,6 @@ final class NodeModel: ObservableObject {
                     let now = Dictionary(states.map { ($0.entry, $0.state) }) { $1 }
                     if now != self.pulling { self.pulling = now }
                 }
-                if let services, services != self.roomServices { self.roomServices = services }
                 if let rows {
                     if rows.trustsMe != self.trustsMe { self.trustsMe = rows.trustsMe }
                     for (fingerprint, name) in rows.presented { self.rememberPresentation(fingerprint, name) }
@@ -2281,9 +2325,10 @@ extension NodeModel {
     func menuBarFacts() async -> MenuBarFacts {
         var facts = MenuBarFacts()
         for room in rooms where room.open {
-            if let listed = try? await client.services(room: room.id) {
+            if let listed = try? await client.servicesPage(room: room.id, after: nil, revision: nil) {
                 facts.services += listed.shared.filter { $0.by != "you" }
                     .map { .init(address: $0.address, canonical: $0.canonical, by: $0.by) }
+                if listed.next != nil { facts.moreServiceRooms.append(.init(room: room.id, name: room.name)) }
             }
             if let mine = try? await client.shares(room: room.id) {
                 facts.shares += mine.map {

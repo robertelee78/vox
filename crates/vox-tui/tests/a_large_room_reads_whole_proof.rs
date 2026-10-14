@@ -1628,17 +1628,14 @@ fn every_large_collection_reaches_the_cli_and_app() {
         }
         let deadline = Instant::now() + Duration::from_secs(120);
         loop {
-            let listed = app_bob
-                .services(room.id.clone())
-                .await
-                .expect("PRODUCT: app service collection failed");
-            if listed.shared.len() >= tags.len() {
+            let listed = collection_services(&app_bob, &room.id).await;
+            if listed.len() >= tags.len() {
                 break;
             }
             assert!(
                 Instant::now() < deadline,
                 "PRODUCT: only{} of1000 services reached the app",
-                listed.shared.len()
+                listed.len()
             );
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
@@ -1652,7 +1649,7 @@ fn every_large_collection_reaches_the_cli_and_app() {
             assert_eq!(
                 shared
                     .iter()
-                    .filter(|s| s["address"]
+                    .filter(|s| s["readable"]
                         .as_str()
                         .is_some_and(|a| a.starts_with(&format!("{tag}."))))
                     .count(),
@@ -1660,16 +1657,12 @@ fn every_large_collection_reaches_the_cli_and_app() {
                 "PRODUCT: CLI lost or repeated service {tag}"
             );
         }
-        let shared = app_bob
-            .services(room.id.clone())
-            .await
-            .expect("PRODUCT: app services failed")
-            .shared;
+        let shared = collection_services(&app_bob, &room.id).await;
         for tag in &tags {
             assert_eq!(
                 shared
                     .iter()
-                    .filter(|s| s.canonical.starts_with(&format!("{tag}.")))
+                    .filter(|s| s.address.starts_with(&format!("{tag}.")))
                     .count(),
                 1,
                 "PRODUCT: app lost or repeated service {tag}"
@@ -2040,5 +2033,24 @@ fn many_vox(
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         argv: format!("vox {} --node {node}", args.join(" ")),
+    }
+}
+
+// Product-facing app pages: the proof may retain the returned rows to assert completeness.
+async fn collection_services(app: &vox_ffi::VoxClient, room: &str) -> Vec<vox_ffi::SharedService> {
+    let mut rows = Vec::new();
+    let mut after = None;
+    let mut revision = None;
+    loop {
+        let page = app
+            .services_page(room.to_owned(), after, revision)
+            .await
+            .expect("PRODUCT: app service page failed");
+        rows.extend(page.shared);
+        revision = Some(page.revision);
+        match page.next {
+            Some(next) => after = Some(next),
+            None => return rows,
+        }
     }
 }
