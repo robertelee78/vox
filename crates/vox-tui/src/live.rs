@@ -156,6 +156,8 @@ pub struct DaemonCore {
     /// The daemon's event task.
     daemon_events: tokio::task::JoinHandle<()>,
     snapshot: NodeSnapshot,
+    footer_room: Option<Digest32>,
+    footer_own: Own,
     /// Only the selected room's currently requested governance pages.
     governance: Option<SelectedGovernance>,
     shown_entries: Vec<Digest32>,
@@ -469,6 +471,8 @@ struct Own {
     pulled_by: Vec<(Digest32, Vec<Digest32>)>,
     /// How many other members the room has.
     others: u64,
+    read_more: BTreeSet<Digest32>,
+    pulled_more: BTreeSet<Digest32>,
 }
 
 struct Projected {
@@ -597,6 +601,8 @@ impl DaemonCore {
             rx,
             daemon_events,
             snapshot: NodeSnapshot::default(),
+            footer_room: None,
+            footer_own: Own::default(),
             governance: None,
             shown_entries: Vec::new(),
             service_window: Vec::new(),
@@ -965,6 +971,8 @@ impl DaemonCore {
         self.thread_summaries.clear();
         self.thread_roots.clear();
         self.snapshot = NodeSnapshot::default();
+        self.footer_room = None;
+        self.footer_own = Own::default();
         self.session_listing = None;
         self.selected_session = None;
         self.session_rows.clear();
@@ -1354,6 +1362,7 @@ impl DaemonCore {
                     }
                     self.note_joins(&before);
                     self.check_pulls();
+                    self.refresh_footers();
                 }
                 Ok(None) => match Frame::from_bytes(&reply) {
                     Ok(Frame::NodeDetached { .. }) => self.detached(),
@@ -1366,6 +1375,97 @@ impl DaemonCore {
                 self.ended
                     .get_or_insert(format!("the vox daemon stopped answering: {e}"));
             }
+        }
+    }
+
+    fn refresh_footers(&mut self) {
+        let Some(room) = self.active else {
+            self.footer_room = None;
+            self.footer_own = Own::default();
+            return;
+        };
+        let entries: Vec<_> = self
+            .timeline
+            .iter()
+            .flat_map(|t| t.rows.iter())
+            .chain(self.thread.iter().flat_map(|t| t.rows.iter()))
+            .filter(|row| self.snapshot.me == Some(row.author))
+            .map(|row| row.entry_hash)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let Some(conn) = self.conn.as_mut() else {
+            return;
+        };
+        let answer = until_stopped(&self.rt, &self.stop, async {
+            let instance = match conn
+                .client
+                .request(&Request::ArrivalHead { channel_id: room })
+                .await
+                .map_err(|e| e.to_string())?
+            {
+                Frame::ArrivalHead { head } => head.instance,
+                Frame::Error { reason } => return Err(reason),
+                _ => return Err("unexpected footer room identity".to_owned()),
+            };
+            let mut own = Own::default();
+            for chunk in entries.chunks(128) {
+                let selected = chunk
+                    .iter()
+                    .map(|entry| vox_core::node::api::FooterSelection {
+                        entry: *entry,
+                        read_after: None,
+                        pulled_after: None,
+                    })
+                    .collect();
+                match conn
+                    .client
+                    .request(&Request::Footers {
+                        channel_id: room,
+                        instance,
+                        entries: selected,
+                        limit: 8,
+                    })
+                    .await
+                    .map_err(|e| e.to_string())?
+                {
+                    Frame::Footers {
+                        instance: actual,
+                        rows,
+                    } if actual == instance => {
+                        for row in rows {
+                            if !row.present {
+                                continue;
+                            }
+                            if row.read_after.is_some() {
+                                own.read_more.insert(row.entry);
+                            }
+                            if row.pulled_after.is_some() {
+                                own.pulled_more.insert(row.entry);
+                            }
+                            own.read_by.push((row.entry, row.read_by));
+                            own.pulled_by.push((row.entry, row.pulled_by));
+                            own.held.push((row.entry, row.held));
+                            own.others = row.others;
+                        }
+                    }
+                    Frame::Error { reason } => return Err(reason),
+                    _ => return Err("unexpected message footers".to_owned()),
+                }
+            }
+            Ok(own)
+        });
+        match answer {
+            Some(Ok(own)) => {
+                self.footer_room = Some(room);
+                self.footer_own = own;
+            }
+            Some(Err(reason)) => {
+                self.footer_room = None;
+                self.footer_own = Own::default();
+                self.notice = Some(reason);
+            }
+            None => {}
         }
     }
 
@@ -2254,6 +2354,9 @@ impl DaemonCore {
                 .map(|fp| crate::ident::member_name(&shown_names, fp))
                 .collect();
             names.sort();
+            if own.read_more.contains(&r.entry_hash) {
+                names.push("more readers — vox room read --json shows all".into());
+            }
             names.join(", ")
         };
         // Who pulled a share it sent, whole, from its daemon's own record (ADR-028 F-7).
@@ -2269,6 +2372,9 @@ impl DaemonCore {
                 .map(|fp| crate::ident::member_name(&shown_names, fp))
                 .collect();
             names.sort();
+            if own.pulled_more.contains(&r.entry_hash) {
+                names.push("more recipients — vox room read --json shows all".into());
+            }
             names.join(", ")
         };
         // Where a message it sent is, while no member is known to have read it (ADR-028 R-6):
@@ -2616,12 +2722,11 @@ impl DaemonCore {
         }
         let mut thread_replies = std::sync::Arc::default();
         let timeline = self.active.and_then(|cid| {
-            let room = snap.open.iter().find(|d| d.channel_id == cid)?;
-            let own = Own {
-                read_by: room.read_by.clone(),
-                held: room.held.clone(),
-                pulled_by: room.pulled_by.clone(),
-                others: room.members.iter().filter(|m| me != Some(**m)).count() as u64,
+            snap.open.iter().find(|d| d.channel_id == cid)?;
+            let own = if self.footer_room == Some(cid) {
+                self.footer_own.clone()
+            } else {
+                Own::default()
             };
             thread_replies = self.project_timeline(me, &snap.trusted, &own, &names, true);
             Some(self.project_timeline(me, &snap.trusted, &own, &names, false))

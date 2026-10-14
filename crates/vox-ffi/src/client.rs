@@ -32,6 +32,34 @@ use zeroize::Zeroizing;
 
 use crate::{digest, failed, input_fingerprint, VoxError};
 
+/// One bounded footer page for an exact displayed message. Continuations mean more people;
+/// clients replace a viewed recipient page instead of accumulating every historical recipient.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct MessageFooter {
+    /// Selected message identity.
+    pub id: String,
+    /// False when this is no longer a readable own message.
+    pub present: bool,
+    /// Names in this reader page.
+    pub read_by: Vec<String>,
+    /// Continue readers after this opaque fingerprint.
+    pub read_after: Option<String>,
+    /// Current delivery wording for the exact message.
+    pub whereabouts: String,
+    /// Names in this completed-fetch page.
+    pub pulled_by: Vec<String>,
+    /// Continue completed-fetch disk records at this stable offset.
+    pub pulled_after: Option<u64>,
+}
+/// Exact footer response on the caller's saved room.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct MessageFooters {
+    /// The validated saved-room identity.
+    pub instance: Vec<u8>,
+    /// One row per requested id, including explicit absence.
+    pub rows: Vec<MessageFooter>,
+}
+
 /// A passphrase, held by Rust in a buffer that is wiped when it is dropped or [`Passphrase::wipe`]d.
 ///
 /// Swift makes one from the bytes it has (a secure field's, or the Keychain's `Data`) and passes the
@@ -2384,6 +2412,106 @@ impl VoxClient {
             names,
             snap.me,
         ))
+    }
+
+    async fn footers_read(
+        &self,
+        room: String,
+        node: String,
+        instance: Vec<u8>,
+        entries: Vec<vox_core::node::api::FooterSelection>,
+        limit: usize,
+    ) -> Result<MessageFooters, VoxError> {
+        if entries.len() > 128 {
+            return Err(failed(
+                "A footer selection may contain at most 128 messages.",
+            ));
+        }
+        let channel_id = digest(&room, "room id")?;
+        let actor = input_fingerprint(&node)?;
+        let instance: [u8; 16] = instance
+            .try_into()
+            .map_err(|_| failed("The saved room identity must contain exactly 16 bytes."))?;
+        on_held!(self, |c| {
+            if c.me() != Some(actor) {
+                return Err(failed(
+                    "The acting node changed before reading message footers.",
+                ));
+            }
+            let names = names(c).await?;
+            let rows = match ask(
+                c,
+                &Request::Footers {
+                    channel_id,
+                    instance,
+                    entries: entries.clone(),
+                    limit,
+                },
+            )
+            .await?
+            {
+                Frame::Footers {
+                    instance: actual,
+                    rows,
+                } if actual == instance => rows,
+                other => return Err(unexpected(&other)),
+            };
+            if rows.len() != entries.len()
+                || rows
+                    .iter()
+                    .zip(&entries)
+                    .any(|(row, selection)| row.entry != selection.entry)
+            {
+                return Err(failed("The footer response changed the selected messages."));
+            }
+            let mut bytes = rows.len() * 192;
+            let mut named = |members: Vec<Digest32>| -> Result<Vec<String>, VoxError> {
+                let mut out = Vec::with_capacity(members.len());
+                for member in members {
+                    let name = names
+                        .get(&member)
+                        .cloned()
+                        .unwrap_or_else(|| b32_encode(&member));
+                    if name.len() > 1024 {
+                        return Err(failed("A member name exceeds the message-footer limit."));
+                    }
+                    bytes = bytes.saturating_add(name.len());
+                    if bytes > 128 * 1024 {
+                        return Err(failed(
+                            "Message footer names exceed 128 KiB. Select fewer messages.",
+                        ));
+                    }
+                    out.push(name);
+                }
+                out.sort();
+                Ok(out)
+            };
+            let mut rendered = Vec::with_capacity(rows.len());
+            for row in rows {
+                rendered.push(MessageFooter {
+                    id: b32_encode(&row.entry),
+                    present: row.present,
+                    read_by: named(row.read_by)?,
+                    read_after: row.read_after.as_ref().map(b32_encode),
+                    whereabouts: if row.present {
+                        vox_text::read::whereabouts(row.held, row.others)
+                    } else {
+                        String::new()
+                    },
+                    pulled_by: named(row.pulled_by)?,
+                    pulled_after: row.pulled_after,
+                });
+            }
+            if c.me() != Some(actor) {
+                return Err(failed(
+                    "The acting node changed while reading message footers.",
+                ));
+            }
+            Ok(MessageFooters {
+                instance: instance.to_vec(),
+                rows: rendered,
+            })
+        })
     }
 
     /// One of the node's marks on its own entries in `room`, from one snapshot: each entry's id
@@ -5502,6 +5630,56 @@ impl VoxClient {
         .await
     }
 
+    /// Read bounded first recipient pages for exactly the displayed ids. At most 128 ids,
+    /// eight readers and eight completed-fetch records per card, and 128 KiB of names.
+    pub async fn message_footers(
+        &self,
+        room: String,
+        node: String,
+        instance: Vec<u8>,
+        entries: Vec<String>,
+    ) -> Result<MessageFooters, VoxError> {
+        if entries.len() > 128 {
+            return Err(failed(
+                "A footer selection may contain at most 128 messages.",
+            ));
+        }
+        let selections = entries
+            .iter()
+            .map(|entry| {
+                Ok(vox_core::node::api::FooterSelection {
+                    entry: digest(entry, "message id")?,
+                    read_after: None,
+                    pulled_after: None,
+                })
+            })
+            .collect::<Result<Vec<_>, VoxError>>()?;
+        self.footers_read(room, node, instance, selections, 8).await
+    }
+
+    /// Read the next bounded recipient page for one displayed card. The caller keeps only
+    /// the viewed page and indicates More whenever either continuation is present.
+    pub async fn message_footer_page(
+        &self,
+        room: String,
+        node: String,
+        instance: Vec<u8>,
+        entry: String,
+        read_after: Option<String>,
+        pulled_after: Option<u64>,
+    ) -> Result<MessageFooters, VoxError> {
+        let selection = vox_core::node::api::FooterSelection {
+            entry: digest(&entry, "message id")?,
+            read_after: read_after
+                .as_ref()
+                .map(|id| digest(id, "reader cursor"))
+                .transpose()?,
+            pulled_after,
+        };
+        self.footers_read(room, node, instance, vec![selection], 64)
+            .await
+    }
+
     /// Who has read this node's own recent messages in `room` (ADR-028 R-6), from the read
     /// records the node can open, as `vox room read --json` says it: a member whose records it
     /// cannot open is in none.
@@ -5714,12 +5892,41 @@ impl VoxClient {
     /// # Errors
     /// A malformed id, or the daemon's refusal.
     pub async fn pulled_by(&self, room: String) -> Result<Vec<PulledBy>, VoxError> {
-        Ok(self
-            .own_marks(room, |o| o.pulled_by)
-            .await?
+        let (open, _, me) = self.open_snap_me(&room).await?;
+        let Some(open) = open else {
+            return Ok(Vec::new());
+        };
+        let actor = me.ok_or_else(not_attached)?;
+        let channel_id = digest(&room, "room id")?;
+        let instance = on_held!(self, |c| {
+            match ask(c, &Request::ArrivalHead { channel_id }).await? {
+                Frame::ArrivalHead { head } => Ok(head.instance),
+                other => Err(unexpected(&other)),
+            }
+        })?;
+        let result = self
+            .message_footers(
+                room,
+                b32_encode(&actor),
+                instance.to_vec(),
+                open.held.iter().map(|(id, _)| b32_encode(id)).collect(),
+            )
+            .await?;
+        result
+            .rows
             .into_iter()
-            .map(|(id, names)| PulledBy { id, names })
-            .collect())
+            .map(|row| {
+                if row.pulled_after.is_some() {
+                    return Err(failed(
+                        "More completed recipients are available through message_footer_page.",
+                    ));
+                }
+                Ok(PulledBy {
+                    id: row.id,
+                    names: row.pulled_by,
+                })
+            })
+            .collect()
     }
 
     /// What this node's person has not read in `room`, oldest first (ADR-028 R-8): the messages

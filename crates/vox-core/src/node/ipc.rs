@@ -419,6 +419,8 @@ const T_MARK_READ_AT: u64 = 8737;
 const T_SESSIONS_OPEN_REQ: u64 = 8738;
 const T_THREAD_PAGE_REQ: u64 = 8739;
 const T_THREAD_PAGE: u64 = 8740;
+const T_FOOTERS_REQ: u64 = 8741;
+const T_FOOTERS: u64 = 8742;
 const T_ROOM_PAGE_REQ: u64 = 5492;
 const T_ROOM_PAGE: u64 = 5493;
 
@@ -486,6 +488,17 @@ const T_OFFERS: u64 = 4952;
 /// is accident prevention on top of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
+    /// Recipient pages for an exact displayed selection on the saved room instance.
+    Footers {
+        /// Selected room.
+        channel_id: Digest32,
+        /// Expected saved-room identity.
+        instance: [u8; 16],
+        /// At most 128 exact messages; continuation applies per card.
+        entries: Vec<crate::node::api::FooterSelection>,
+        /// At most 8 per recipient kind for a batch, or 64 for one card.
+        limit: usize,
+    },
     /// The selected room's saved instance and newest readable arrival, without loading bodies.
     ArrivalHead {
         /// The room on this held node.
@@ -1166,6 +1179,25 @@ impl Request {
                     e.bytes(entry);
                 }
             }
+            Request::Footers {
+                channel_id,
+                instance,
+                entries,
+                limit,
+            } => {
+                e.array(5)
+                    .uint(T_FOOTERS_REQ)
+                    .bytes(channel_id)
+                    .bytes(instance)
+                    .uint(*limit as u64)
+                    .array(entries.len());
+                for selection in entries {
+                    e.array(3)
+                        .bytes(&selection.entry)
+                        .bytes(selection.read_after.as_ref().map_or(&[][..], |v| &v[..]));
+                    encode_optional_u64(&mut e, selection.pulled_after);
+                }
+            }
             Request::ArrivalHead { channel_id } => {
                 e.array(2).uint(T_ARRIVAL_HEAD_REQ).bytes(channel_id);
             }
@@ -1806,6 +1838,37 @@ impl Request {
                     channel_id,
                     instance,
                     entries,
+                })
+            }
+            (T_FOOTERS_REQ, 5) => {
+                let channel_id = digest(&mut d)?;
+                let instance = d
+                    .bytes()?
+                    .try_into()
+                    .map_err(|_| Error::MalformedIpc("footer instance"))?;
+                let limit =
+                    usize::try_from(d.uint()?).map_err(|_| Error::MalformedIpc("footer limit"))?;
+                let n = d.array()?;
+                if n > 128 || limit == 0 || limit > if n == 1 { 64 } else { 8 } {
+                    return Err(Error::MalformedIpc("footer bounds"));
+                }
+                let mut entries = Vec::with_capacity(n);
+                for _ in 0..n {
+                    if d.array()? != 3 {
+                        return Err(Error::MalformedIpc("footer selection"));
+                    }
+                    entries.push(crate::node::api::FooterSelection {
+                        entry: digest(&mut d)?,
+                        read_after: optional_digest(&mut d)?,
+                        pulled_after: optional_u64(&mut d)?,
+                    });
+                }
+                d.finish()?;
+                Ok(Request::Footers {
+                    channel_id,
+                    instance,
+                    entries,
+                    limit,
                 })
             }
             (T_ARRIVAL_HEAD_REQ, 2) => {
@@ -2673,6 +2736,13 @@ pub struct SharedService {
 /// how a `Lagged` report comes to be silently swallowed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
+    /// Bounded exact message footers, with independent per-card recipient continuations.
+    Footers {
+        /// Saved-room instance used by the query.
+        instance: [u8; 16],
+        /// At most 128 cards; at most 8 identities/kind/card, or 64 for a single card.
+        rows: Vec<crate::node::api::MessageFooter>,
+    },
     /// One bounded exact operation selection. Empty rows with `next` still require continuation.
     OperationPage {
         /// Readable matching rows in canonical `(created_millis, hash)` order.
@@ -3030,6 +3100,26 @@ impl Frame {
                     .uint(summary.coordination)
                     .bytes(summary.first.as_ref().map_or(&[][..], |h| &h[..]))
                     .uint(u64::from(summary.scan_limited));
+            }
+            Frame::Footers { instance, rows } => {
+                e.array(3).uint(T_FOOTERS).bytes(instance).array(rows.len());
+                for row in rows {
+                    e.array(8)
+                        .bytes(&row.entry)
+                        .uint(u64::from(row.present))
+                        .uint(row.held)
+                        .uint(row.others);
+                    e.array(row.read_by.len());
+                    for member in &row.read_by {
+                        e.bytes(member);
+                    }
+                    e.bytes(row.read_after.as_ref().map_or(&[][..], |v| &v[..]));
+                    e.array(row.pulled_by.len());
+                    for member in &row.pulled_by {
+                        e.bytes(member);
+                    }
+                    encode_optional_u64(&mut e, row.pulled_after);
+                }
             }
             Frame::ArrivalHead { head } => {
                 e.array(2).uint(T_ARRIVAL_HEAD);
@@ -3938,6 +4028,60 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 return Err(Error::MalformedIpc("unread summary counts"));
             }
             return Ok(Frame::UnreadSummary { summary });
+        }
+        (T_FOOTERS, 3) => {
+            let instance = d
+                .bytes()?
+                .try_into()
+                .map_err(|_| Error::MalformedIpc("footer instance"))?;
+            let n = d.array()?;
+            if n > 128 {
+                return Err(Error::MalformedIpc("footer count"));
+            }
+            let max = if n == 1 { 64 } else { 8 };
+            let mut rows = Vec::with_capacity(n);
+            for _ in 0..n {
+                if d.array()? != 8 {
+                    return Err(Error::MalformedIpc("footer row"));
+                }
+                let entry = digest(d)?;
+                let present = match d.uint()? {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(Error::MalformedIpc("footer presence")),
+                };
+                let held = d.uint()?;
+                let others = d.uint()?;
+                let count = d.array()?;
+                if count > max {
+                    return Err(Error::MalformedIpc("footer readers"));
+                }
+                let mut read_by = Vec::with_capacity(count);
+                for _ in 0..count {
+                    read_by.push(digest(d)?);
+                }
+                let read_after = optional_digest(d)?;
+                let count = d.array()?;
+                if count > max {
+                    return Err(Error::MalformedIpc("footer pullers"));
+                }
+                let mut pulled_by = Vec::with_capacity(count);
+                for _ in 0..count {
+                    pulled_by.push(digest(d)?);
+                }
+                let pulled_after = optional_u64(d)?;
+                rows.push(crate::node::api::MessageFooter {
+                    entry,
+                    present,
+                    read_by,
+                    read_after,
+                    held,
+                    others,
+                    pulled_by,
+                    pulled_after,
+                });
+            }
+            return Ok(Frame::Footers { instance, rows });
         }
         (T_ARRIVAL_HEAD, 2) => {
             return Ok(Frame::ArrivalHead {
@@ -6696,6 +6840,63 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 reason: other.to_string(),
             },
         },
+        Request::Footers {
+            channel_id,
+            instance,
+            entries,
+            limit,
+        } => {
+            use crate::node::channel::history::{Query, Reply};
+            let answer = async {
+                let (mut rows, tags) = match handle
+                    .room_history(
+                        channel_id,
+                        Query::Footers {
+                            instance,
+                            entries: entries.clone(),
+                            limit,
+                        },
+                    )
+                    .await?
+                {
+                    Reply::Footers { rows, tags } => (rows, tags),
+                    _ => return Err("unexpected footer reply".to_owned()),
+                };
+                let shares = std::sync::Arc::clone(handle.shares());
+                rows = tokio::task::spawn_blocking(move || -> std::result::Result<_, String> {
+                    for ((row, tag), selection) in rows.iter_mut().zip(tags).zip(entries) {
+                        if let Some(tag) = tag {
+                            (row.pulled_by, row.pulled_after) = shares.pulled_page(
+                                channel_id,
+                                row.entry,
+                                &tag,
+                                selection.pulled_after,
+                                limit,
+                            )?;
+                        }
+                    }
+                    Ok(rows)
+                })
+                .await
+                .map_err(|error| error.to_string())??;
+                if handle
+                    .history_reader()
+                    .arrival_head(channel_id)
+                    .await?
+                    .instance
+                    != instance
+                {
+                    return Err("the saved room changed; open its current page again".into());
+                }
+                let reply = Frame::Footers { instance, rows };
+                if reply.to_bytes().len() > 128 * 1024 {
+                    return Err("message footer page exceeds 128 KiB; select fewer messages".into());
+                }
+                Ok(reply)
+            }
+            .await;
+            answer.unwrap_or_else(|reason| Frame::Error { reason })
+        }
         Request::ArrivalHead { channel_id } => {
             match handle.history_reader().arrival_head(channel_id).await {
                 Ok(head) => Frame::ArrivalHead { head },

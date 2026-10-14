@@ -10,6 +10,11 @@ use crate::node::api::{
 };
 
 pub(crate) enum Query {
+    Footers {
+        instance: [u8; 16],
+        entries: Vec<crate::node::api::FooterSelection>,
+        limit: usize,
+    },
     Governance(crate::node::api::GovernanceQuery),
     DisplayRevision,
     ArrivalHead,
@@ -85,6 +90,10 @@ pub(crate) enum Query {
 }
 
 pub(crate) enum Reply {
+    Footers {
+        rows: Vec<crate::node::api::MessageFooter>,
+        tags: Vec<Option<String>>,
+    },
     Governance(crate::node::api::GovernancePage),
     DisplayRevision(Digest32),
     ArrivalHead(HistoryCursor),
@@ -514,6 +523,88 @@ impl View<'_> {
                 self.ch.governance_page(self.store, query)?,
             )),
             Query::ArrivalHead => Ok(Reply::ArrivalHead(self.head()?)),
+            Query::Footers {
+                instance,
+                entries,
+                limit,
+            } => {
+                if instance != self.rendered.history_instance() {
+                    return Err(Failure::Request(
+                        "the saved room changed; open its current page again",
+                    ));
+                }
+                if entries.len() > 128
+                    || limit == 0
+                    || limit > if entries.len() == 1 { 64 } else { 8 }
+                {
+                    return Err(Failure::Request(
+                        "displayed footers exceed one bounded page",
+                    ));
+                }
+                let me = self.ch.me();
+                let others: Vec<_> = self
+                    .ch
+                    .members()
+                    .into_iter()
+                    .filter(|member| *member != me)
+                    .collect();
+                let mut rows = Vec::new();
+                let mut tags = Vec::new();
+                for selection in entries {
+                    let mut footer = crate::node::api::MessageFooter {
+                        entry: selection.entry,
+                        present: false,
+                        read_by: Vec::new(),
+                        read_after: None,
+                        held: 0,
+                        others: others.len() as u64,
+                        pulled_by: Vec::new(),
+                        pulled_after: None,
+                    };
+                    let mut tag = None;
+                    if let Some(row) = self
+                        .row(&selection.entry)?
+                        .filter(|row| !row.owed && row.author == me)
+                    {
+                        let entry = self
+                            .rendered
+                            .order()
+                            .entry(&selection.entry)?
+                            .ok_or(Error::MalformedAtRest("footer entry missing"))?;
+                        footer.present = true;
+                        (footer.read_by, footer.read_after) = self.rendered.readers_page(
+                            &selection.entry,
+                            selection.read_after,
+                            limit,
+                        )?;
+                        footer.held = others
+                            .iter()
+                            .filter(|member| {
+                                self.ch
+                                    .held
+                                    .get(*member)
+                                    .is_some_and(|head| *head >= entry.skeleton.seq)
+                            })
+                            .count() as u64;
+                        if let Ok(envelope) = serde_json::from_str::<serde_json::Value>(&row.text) {
+                            if envelope.get("type").and_then(serde_json::Value::as_str)
+                                == Some(crate::node::shares::FILE)
+                            {
+                                tag = envelope
+                                    .get("data")
+                                    .and_then(|data| data.get("tag"))
+                                    .and_then(serde_json::Value::as_str)
+                                    .filter(|tag| tag.len() <= 512)
+                                    .map(str::to_owned);
+                            }
+                        }
+                    }
+                    rows.push(footer);
+                    tags.push(tag);
+                }
+                Ok(Reply::Footers { rows, tags })
+            }
+
             Query::OperationPage {
                 author,
                 op,

@@ -62,9 +62,6 @@ pub struct OpenRoomSnap {
     /// Who trusts each member (ADR-028 K-7): `(member, the members that consent to it reading
     /// them)`.
     pub trusted_by: Vec<(Digest32, Vec<Digest32>)>,
-    /// Who has pulled each of this node's shares here whole: `(entry, members)` (ADR-028 F-7;
-    /// [`crate::node::shares::Shares::pulled_by`]).
-    pub pulled_by: Vec<(Digest32, Vec<Digest32>)>,
     /// The retention this node applies here, seconds, `0` forever
     /// ([`crate::node::api::ChannelDetail::retention`]): what the room's header always shows
     /// (ADR-028 R-7).
@@ -143,7 +140,6 @@ impl NodeSnapshot {
                         read_by: d.read_by.clone(),
                         held: d.held.clone(),
                         trusted_by: d.trusted_by.clone(),
-                        pulled_by: handle.shares().pulled_by(&d.channel_id),
                         retention: d.retention,
                         room_retention: d.room_retention,
                         room_step_retention: d.room_step_retention,
@@ -188,7 +184,7 @@ impl NodeSnapshot {
         }
         e.array(self.open.len());
         for o in &self.open {
-            e.array(18)
+            e.array(17)
                 .bytes(&o.channel_id)
                 .text(o.name.as_deref().unwrap_or_default());
             digests(&mut e, &o.members);
@@ -212,11 +208,6 @@ impl NodeSnapshot {
             for (member, by) in &o.trusted_by {
                 e.array(2).bytes(member);
                 digests(&mut e, by);
-            }
-            e.array(o.pulled_by.len());
-            for (entry, who) in &o.pulled_by {
-                e.array(2).bytes(entry);
-                digests(&mut e, who);
             }
             e.uint(o.retention);
             e.uint(o.room_retention)
@@ -300,7 +291,7 @@ impl NodeSnapshot {
         let mut open = Vec::new();
         for _ in 0..d.array().map_err(bad("ipc snapshot open rooms"))? {
             let fields = d.array().map_err(bad("ipc snapshot open room"))?;
-            if fields != 18 {
+            if fields != 17 {
                 return Err(Error::MalformedIpc("ipc snapshot open room"));
             }
             let channel_id = digest(&mut d)?;
@@ -335,12 +326,6 @@ impl NodeSnapshot {
                 let member = digest(&mut d)?;
                 trusted_by.push((member, read_digests(&mut d)?));
             }
-            let mut pulled_by = Vec::new();
-            for _ in 0..d.array().map_err(bad("ipc snapshot pulled by"))? {
-                want(&mut d, 2, "ipc snapshot pulled by entry")?;
-                let entry = digest(&mut d)?;
-                pulled_by.push((entry, read_digests(&mut d)?));
-            }
             let retention = d.uint().map_err(bad("ipc snapshot retention"))?;
             let room_retention = d.uint().map_err(bad("ipc snapshot room retention"))?;
             let room_step_retention = d.uint().map_err(bad("ipc snapshot room step retention"))?;
@@ -371,7 +356,6 @@ impl NodeSnapshot {
                 read_by,
                 held,
                 trusted_by,
-                pulled_by,
                 retention,
                 room_retention,
                 room_step_retention,

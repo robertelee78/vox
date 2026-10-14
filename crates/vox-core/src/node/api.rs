@@ -2385,3 +2385,35 @@ pub struct UnreadSummary {
     /// Older rows exist beyond the existing unread examination limit.
     pub scan_limited: bool,
 }
+
+/// Exact displayed-message footer selection. Recipient pages never imply a complete list
+/// while their continuation is present.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FooterSelection {
+    /// Exact retained message.
+    pub entry: Digest32,
+    /// Continue signed/local readers strictly after this identity.
+    pub read_after: Option<Digest32>,
+    /// Continue completed fetches at this stable disk byte position.
+    pub pulled_after: Option<u64>,
+}
+/// One bounded recipient page for one own message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageFooter {
+    /// Selected entry, including when it is no longer visible.
+    pub entry: Digest32,
+    /// Still a readable own rendered message in this saved room.
+    pub present: bool,
+    /// Reader identities in this page.
+    pub read_by: Vec<Digest32>,
+    /// More readers remain when present.
+    pub read_after: Option<Digest32>,
+    /// Other members whose current highwater covers this message.
+    pub held: u64,
+    /// Current other-member count.
+    pub others: u64,
+    /// Completed fetch identities in this page.
+    pub pulled_by: Vec<Digest32>,
+    /// More receipt records remain when present; an empty page can still continue.
+    pub pulled_after: Option<u64>,
+}

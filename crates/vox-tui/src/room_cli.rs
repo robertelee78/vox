@@ -1311,32 +1311,161 @@ async fn names_in(client: &mut IpcClient) -> vox_core::node::resolver::VoxResolv
     }
 }
 
-/// Who has read this node's own recent messages in `room`, and who has pulled its shares there
-/// whole (ADR-028 R-6, F-7), by entry, from one snapshot of the node. Empty when it does not say.
-async fn own_in(
+async fn footer_instance(
     client: &mut IpcClient,
-    room: &Digest32,
-) -> (
-    std::collections::BTreeMap<Digest32, Vec<Digest32>>,
-    std::collections::BTreeMap<Digest32, Vec<Digest32>>,
-) {
-    let body = vox_core::node::snapshot::request_body();
-    let Ok(reply) = client.exchange(&body).await else {
-        return Default::default();
-    };
-    let Ok(Some(snap)) = vox_core::node::snapshot::NodeSnapshot::from_bytes(&reply) else {
-        return Default::default();
-    };
-    snap.open
-        .into_iter()
-        .find(|o| o.channel_id == *room)
-        .map(|o| {
-            (
-                o.read_by.into_iter().collect(),
-                o.pulled_by.into_iter().collect(),
-            )
+    channel_id: Digest32,
+) -> Result<[u8; 16], AppError> {
+    match client.request(&Request::ArrivalHead { channel_id }).await? {
+        Frame::ArrivalHead { head } => Ok(head.instance),
+        Frame::Error { reason } => Err(AppError::Usage(reason)),
+        other => Err(crate::client::unexpected(&other)),
+    }
+}
+async fn footer_page(
+    client: &mut IpcClient,
+    channel_id: Digest32,
+    instance: [u8; 16],
+    entry: Digest32,
+    read_after: Option<Digest32>,
+    pulled_after: Option<u64>,
+) -> Result<vox_core::node::api::MessageFooter, AppError> {
+    match client
+        .request(&Request::Footers {
+            channel_id,
+            instance,
+            limit: 64,
+            entries: vec![vox_core::node::api::FooterSelection {
+                entry,
+                read_after,
+                pulled_after,
+            }],
         })
-        .unwrap_or_default()
+        .await?
+    {
+        Frame::Footers {
+            instance: actual,
+            mut rows,
+        } if actual == instance && rows.len() == 1 && rows[0].entry == entry => Ok(rows.remove(0)),
+        Frame::Error { reason } => Err(AppError::Usage(reason)),
+        other => Err(crate::client::unexpected(&other)),
+    }
+}
+/// First footer pages for one displayed chunk. Remote authors cannot have own-message
+/// footers and incur neither footer IPC nor temporary files.
+async fn footer_first(
+    client: &mut IpcClient,
+    channel_id: Digest32,
+    instance: [u8; 16],
+    shown: impl Iterator<Item = (Digest32, Digest32)>,
+) -> Result<std::collections::BTreeMap<Digest32, vox_core::node::api::MessageFooter>, AppError> {
+    let me = client.me();
+    let entries: Vec<_> = shown
+        .filter(|(_, author)| Some(*author) == me)
+        .map(|(entry, _)| vox_core::node::api::FooterSelection {
+            entry,
+            read_after: None,
+            pulled_after: None,
+        })
+        .collect();
+    if entries.is_empty() {
+        return Ok(Default::default());
+    }
+    match client
+        .request(&Request::Footers {
+            channel_id,
+            instance,
+            entries: entries.clone(),
+            limit: 8,
+        })
+        .await?
+    {
+        Frame::Footers {
+            instance: actual,
+            rows,
+        } if actual == instance
+            && rows.len() == entries.len()
+            && rows
+                .iter()
+                .zip(&entries)
+                .all(|(row, selected)| row.entry == selected.entry) =>
+        {
+            Ok(rows.into_iter().map(|row| (row.entry, row)).collect())
+        }
+        Frame::Error { reason } => Err(AppError::Usage(reason)),
+        other => Err(crate::client::unexpected(&other)),
+    }
+}
+fn footer_fields(row: &mut serde_json::Value, page: &vox_core::node::api::MessageFooter) {
+    for (key, members) in [("read_by", &page.read_by), ("pulled_by", &page.pulled_by)] {
+        if !members.is_empty() {
+            let mut names: Vec<_> = members.iter().map(crate::ident::name_of).collect();
+            names.sort();
+            row[key] = names.into();
+        }
+    }
+}
+
+/// Stream complete recipient arrays into anonymous per-row files before exposing a JSON line.
+/// Neither the CLI nor the daemon retains a share's lifetime recipient set in RAM.
+async fn footer_spools(
+    client: &mut IpcClient,
+    room: Digest32,
+    instance: [u8; 16],
+    first: vox_core::node::api::MessageFooter,
+) -> Result<(std::fs::File, std::fs::File), AppError> {
+    use std::io::{Seek, SeekFrom, Write};
+    let mut readers = tempfile::tempfile()?;
+    let mut pullers = tempfile::tempfile()?;
+    readers.write_all(b"[")?;
+    pullers.write_all(b"[")?;
+    let (mut read_after, mut pulled_after) = (None, None);
+    let (mut reads_done, mut pulls_done) = (false, false);
+    let (mut first_read, mut first_pull) = (true, true);
+    let entry = first.entry;
+    let mut page = first;
+    loop {
+        if !reads_done {
+            for member in page.read_by {
+                if !first_read {
+                    readers.write_all(b",")?;
+                }
+                first_read = false;
+                serde_json::to_writer(&mut readers, &crate::ident::name_of(&member))
+                    .map_err(|e| AppError::Usage(e.to_string()))?;
+            }
+            if page.read_after.is_some() && page.read_after == read_after {
+                return Err(AppError::Usage("reader cursor did not advance".into()));
+            }
+            read_after = page.read_after;
+            reads_done = read_after.is_none();
+        }
+        if !pulls_done {
+            for member in page.pulled_by {
+                if !first_pull {
+                    pullers.write_all(b",")?;
+                }
+                first_pull = false;
+                serde_json::to_writer(&mut pullers, &crate::ident::name_of(&member))
+                    .map_err(|e| AppError::Usage(e.to_string()))?;
+            }
+            if page.pulled_after.is_some() && page.pulled_after == pulled_after {
+                return Err(AppError::Usage(
+                    "completed-pull cursor did not advance".into(),
+                ));
+            }
+            pulled_after = page.pulled_after;
+            pulls_done = pulled_after.is_none();
+        }
+        if reads_done && pulls_done {
+            break;
+        }
+        page = footer_page(client, room, instance, entry, read_after, pulled_after).await?;
+    }
+    readers.write_all(b"]")?;
+    pullers.write_all(b"]")?;
+    readers.seek(SeekFrom::Start(0))?;
+    pullers.seek(SeekFrom::Start(0))?;
+    Ok((readers, pullers))
 }
 
 /// What was done to `room` (its retention set, its name changed), in the room's order, each with
@@ -1716,6 +1845,7 @@ pub async fn read(
     tagged: &Tagged,
 ) -> Result<(), AppError> {
     let (mut client, channel_id, room_key) = open_room(paths, room).await?;
+    let footer_instance = footer_instance(&mut client, channel_id).await?;
     let since = match since {
         None => None,
         Some(s) => Some(parse_cursor(s)?),
@@ -1745,7 +1875,6 @@ pub async fn read(
             )));
         };
         let held_back = equivocations_in(paths, &channel_id).await;
-        let (_, pulled_by) = own_in(&mut client, &channel_id).await;
         let mut out = std::io::stdout().lock();
         // **A member held back for equivocating is said first** (V210-63), named as the rows
         // below name it. `vox status --json` carries the same, in full, for agents.
@@ -1762,39 +1891,73 @@ pub async fn read(
         // room's conversation (ADR-029 CL-2): `vox room sessions` lists Sessions; `--json` keeps
         // every row for programs.
         let names = names_in(&mut client).await;
-        for r in rows
+        let mut selected = rows
             .iter()
             .filter(|r| r.late || !only_late)
             .filter(|r| !crate::agent_hook::is_session_record(r))
-            .take(take)
-        {
-            let text = plain_row(r);
-            let mut selected_names = names.clone();
-            for (room, host, selector) in vox_core::node::resolver::canonical_services(&text) {
-                match client
-                    .request(&Request::GovernancePage {
-                        channel_id: room,
-                        query: vox_core::node::api::GovernanceQuery::Service { host, selector },
-                    })
-                    .await?
-                {
-                    Frame::GovernancePage {
-                        page:
-                            vox_core::node::api::GovernancePage::Service {
-                                share: Some(share), ..
-                            },
-                    } => selected_names.add_share(room, share.host, &share.name, share.udp),
-                    Frame::GovernancePage {
-                        page: vox_core::node::api::GovernancePage::Service { share: None, .. },
-                    } => {}
-                    Frame::Error { reason } => return Err(AppError::Usage(reason)),
-                    other => return Err(crate::client::unexpected(&other)),
-                }
+            .take(take);
+        loop {
+            let chunk: Vec<_> = selected.by_ref().take(128).collect();
+            if chunk.is_empty() {
+                break;
             }
-            let _ = writeln!(out, "{}", selected_names.readable_in(&text));
-            // Under a share this node sent, who has pulled it whole (ADR-028 F-7).
-            if let Some(line) = pulled_by.get(&r.entry_hash).and_then(|w| pulled_by_line(w)) {
-                let _ = writeln!(out, "  {line}");
+            let mut footers = footer_first(
+                &mut client,
+                channel_id,
+                footer_instance,
+                chunk.iter().map(|row| (row.entry_hash, row.author)),
+            )
+            .await?;
+            for r in chunk {
+                let text = plain_row(r);
+                let mut selected_names = names.clone();
+                for (room, host, selector) in vox_core::node::resolver::canonical_services(&text) {
+                    match client
+                        .request(&Request::GovernancePage {
+                            channel_id: room,
+                            query: vox_core::node::api::GovernanceQuery::Service { host, selector },
+                        })
+                        .await?
+                    {
+                        Frame::GovernancePage {
+                            page:
+                                vox_core::node::api::GovernancePage::Service {
+                                    share: Some(share), ..
+                                },
+                        } => selected_names.add_share(room, share.host, &share.name, share.udp),
+                        Frame::GovernancePage {
+                            page: vox_core::node::api::GovernancePage::Service { share: None, .. },
+                        } => {}
+                        Frame::Error { reason } => return Err(AppError::Usage(reason)),
+                        other => return Err(crate::client::unexpected(&other)),
+                    }
+                }
+                let _ = writeln!(out, "{}", selected_names.readable_in(&text));
+                // Under a share this node sent, who has pulled it whole (ADR-028 F-7).
+                if let Some(mut page) = footers.remove(&r.entry_hash) {
+                    loop {
+                        if let Some(line) = pulled_by_line(&page.pulled_by) {
+                            let _ = writeln!(out, "  {line}");
+                        }
+                        let Some(after) = page.pulled_after else {
+                            break;
+                        };
+                        page = footer_page(
+                            &mut client,
+                            channel_id,
+                            footer_instance,
+                            r.entry_hash,
+                            None,
+                            Some(after),
+                        )
+                        .await?;
+                        if page.pulled_after == Some(after) {
+                            return Err(AppError::Usage(
+                                "completed-pull cursor did not advance".into(),
+                            ));
+                        }
+                    }
+                }
             }
         }
         return Ok(());
@@ -1839,7 +2002,6 @@ pub async fn read(
     ids.dedup();
     let group = coord::structured(&mut client, channel_id, &[], &ids).await?;
     let ops = coord::index_of(&coord::posted_of(&group));
-    let (read_by, pulled_by) = own_in(&mut client, &channel_id).await;
     // Asked for (`--notices`), what was done to the room, each right after the row it follows in
     // the room's order (a notice before every row only when reading from the start; one after a
     // row not read here is not this page's).
@@ -1856,31 +2018,55 @@ pub async fn read(
         )
         .await?;
     }
-    for r in &shown {
-        let mut row = row_value(&room_key, r, &ops, None);
-        // Under a share this node sent, who has pulled it whole (ADR-028 F-7).
-        if let Some(who) = pulled_by.get(&r.entry_hash) {
-            let mut names: Vec<String> = who.iter().map(crate::ident::name_of).collect();
-            names.sort();
-            row["pulled_by"] = names.into();
-        }
-        // Under a message this node sent, who has read it, by this node's names (ADR-028 R-6).
-        if let Some(who) = read_by.get(&r.entry_hash) {
-            let mut names: Vec<String> = who.iter().map(crate::ident::name_of).collect();
-            names.sort();
-            row["read_by"] = names.into();
-        }
-        let _ = writeln!(out, "{row}");
-        if with_notices && !r.owed {
-            write_notices_after(
-                &mut client,
-                channel_id,
-                &room_key,
-                Some(r.entry_hash),
-                &mut notice_revision,
-                &mut out,
-            )
-            .await?;
+    for chunk in shown.chunks(128) {
+        let mut footers = footer_first(
+            &mut client,
+            channel_id,
+            footer_instance,
+            chunk.iter().map(|row| (row.entry_hash, row.author)),
+        )
+        .await?;
+        for r in chunk {
+            let mut row = row_value(&room_key, r, &ops, None);
+            let first = footers.remove(&r.entry_hash);
+            if let Some(page) = first.filter(|page| page.present) {
+                if page.read_after.is_none() && page.pulled_after.is_none() {
+                    footer_fields(&mut row, &page);
+                    writeln!(out, "{row}")?;
+                } else {
+                    let (mut readers, mut pullers) =
+                        footer_spools(&mut client, channel_id, footer_instance, page).await?;
+                    // Complete arrays are disk-spooled first; no IPC call can split this output line.
+                    if let Some(object) = row.as_object_mut() {
+                        object.remove("read_by");
+                        object.remove("pulled_by");
+                    }
+                    let text = row.to_string();
+                    write!(out, "{}", text.strip_suffix('}').unwrap_or(&text))?;
+                    if readers.metadata()?.len() > 2 {
+                        write!(out, ",\"read_by\":")?;
+                        std::io::copy(&mut readers, &mut out)?;
+                    }
+                    if pullers.metadata()?.len() > 2 {
+                        write!(out, ",\"pulled_by\":")?;
+                        std::io::copy(&mut pullers, &mut out)?;
+                    }
+                    writeln!(out, "}}")?;
+                }
+            } else {
+                writeln!(out, "{row}")?;
+            }
+            if with_notices && !r.owed {
+                write_notices_after(
+                    &mut client,
+                    channel_id,
+                    &room_key,
+                    Some(r.entry_hash),
+                    &mut notice_revision,
+                    &mut out,
+                )
+                .await?;
+            }
         }
     }
     Ok(())
