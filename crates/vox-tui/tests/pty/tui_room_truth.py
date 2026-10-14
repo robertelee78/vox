@@ -1377,9 +1377,9 @@ try:
     def tabs():
         screen = tui.display()
         for at, line in enumerate(screen[:-1]):
-            start = line.find("┌")
-            if start >= 0 and " · Tabs" in line[start:]:
-                return screen[at + 1][start + 1:line.find("┐", start)].strip()
+            border = re.search(r"┌[^┌┐]* · Tabs[^┌┐]*┐", line)
+            if border:
+                return screen[at + 1][border.start() + 1:border.end() - 1].strip()
         return ""
     open_tab = ("alice · " + labels[OPEN_ID]["name"]
                 if labels[OPEN_ID].get("name") else open_label)
