@@ -82,8 +82,8 @@ extension VoxAction {
             VoxAction("Room", "Retention…", enabled: inRoom) { node?.sheet = .retention },
             VoxAction("Room", "Admins…", enabled: inRoom) { node?.sheet = .admins },
             VoxAction("Room", "Reply in Thread", "r",
-                      enabled: inRoom && node?.messages.contains { $0.id == node?.selectedMessage } == true) {
-                node?.replyTo = node?.messages.first { $0.id == node?.selectedMessage }
+                      enabled: inRoom && node?.selectedChatMessage != nil) {
+                node?.replyTo = node?.selectedChatMessage
             },
             // The room's composer only: never while a Session is shown (D2).
             VoxAction("Room", "Send Urgent", .return, enabled: inRoom && !inSession) {

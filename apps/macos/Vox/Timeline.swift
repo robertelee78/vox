@@ -71,7 +71,7 @@ extension NodeModel {
         let placed = notices.filter { $0.after.isEmpty || shown.contains($0.after) }
         var items = placed.filter { $0.after.isEmpty }.map(item)
         for m in messages {
-            items.append(.message(m))
+            if m.thread.isEmpty { items.append(.message(m)) }
             items += placed.filter { $0.after == m.id }.map(item)
         }
         for n in notices where !n.after.isEmpty && !shown.contains(n.after) {
@@ -197,7 +197,7 @@ extension NodeModel {
     func quote(of m: RoomMessage) -> (id: String, words: String?)? {
         let re = m.re.trimmingCharacters(in: .whitespaces).lowercased()
         guard !re.isEmpty else { return nil }
-        guard let held = byID[re], !held.owed else { return (re, nil) }
+        guard let held = byID[re] ?? threadMessage(re), !held.owed else { return (re, nil) }
         let said = held.file.map { $0.note.isEmpty ? $0.name : $0.note } ?? held.text
         let first = said.split(separator: "\n", omittingEmptySubsequences: false).first.map(String.init) ?? ""
         let more = first.count > 80 || said.contains("\n") ? "…" : ""
