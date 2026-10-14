@@ -2629,12 +2629,12 @@ final class NodeModel: ObservableObject {
                     if now != self.pulledBy { self.pulledBy = now }
                 }
                 let visibleFiles = self.displayedFileIDs
-                if let copies = fileFacts?.copies {
+                if visibleFiles == fileIDs, let copies = fileFacts?.copies {
                     let now = Dictionary(copies.filter { visibleFiles.contains($0.entry) }
                         .map { ($0.entry, $0.path) }) { $1 }
                     if now != self.pulled { self.pulled = now }
                 }
-                if let states = fileFacts?.states {
+                if visibleFiles == fileIDs, let states = fileFacts?.states {
                     let now = Dictionary(states.filter { visibleFiles.contains($0.entry) }
                         .map { ($0.entry, $0.state) }) { $1 }
                     if now != self.pulling { self.pulling = now }
