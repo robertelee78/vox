@@ -298,33 +298,7 @@ pub(crate) async fn post(
         }
         _ => body,
     };
-    // Pasted envelopes are a supported posting verb too. Keep their metadata, while adding
-    // the same starting tags as the flag-built reply; no tag is resolved outside this room.
-    let body = if let Ok(mut env) = Envelope::parse(&body) {
-        if env.re.is_some() || env.thread.is_some() {
-            let root = match (&env.thread, &env.re) {
-                (Some(root), _) => Some(root.clone()),
-                (None, Some(re)) => {
-                    let chain = coord::reply_chain(&mut client, channel_id, re).await?;
-                    vox_agentcomms::envelope::reply_thread_by(re, |h| {
-                        let hash = b32_decode(h.trim(), "re").ok()?;
-                        chain
-                            .iter()
-                            .find(|r| r.entry_hash == hash)
-                            .map(|r| r.text.clone())
-                    })
-                    .or_else(|| Some(re.clone()))
-                }
-                _ => None,
-            };
-            env.tags = reply_tags(&mut client, channel_id, root.as_deref(), &env.tags).await?;
-            env.to_text()
-        } else {
-            body
-        }
-    } else {
-        body
-    };
+    let body = prepare_reply(&mut client, channel_id, &body).await?;
     match client
         .request(&Request::Post {
             channel_id,
@@ -493,6 +467,63 @@ impl PostReport {
                     .map(|r| format!("to {}: {}", r.name, r.says)),
             )
             .collect()
+    }
+}
+
+/// Prepare a pasted envelope before it is signed, in both the CLI and the TUI. Prose is
+/// unchanged; a reply must name a readable parent and carry that parent's canonical thread.
+pub(crate) async fn prepare_reply(
+    client: &mut IpcClient,
+    cid: Digest32,
+    body: &str,
+) -> Result<String, AppError> {
+    let Ok(mut env) = Envelope::parse(body) else {
+        return Ok(body.to_owned());
+    };
+    if env.re.is_none() && env.thread.is_none() {
+        return Ok(body.to_owned());
+    }
+    let known = match env.re.as_deref() {
+        Some(re) => {
+            let chain = coord::reply_chain(client, cid, re).await?;
+            vox_agentcomms::envelope::reply_thread_by(re, |h| {
+                let hash = b32_decode(h.trim(), "re").ok()?;
+                chain
+                    .iter()
+                    .find(|r| r.entry_hash == hash)
+                    .map(|r| r.text.clone())
+            })
+        }
+        None => None,
+    };
+    env.thread = reply_thread(env.re.as_deref(), known, env.thread.as_deref())?;
+    env.tags = reply_tags(client, cid, env.thread.as_deref(), &env.tags).await?;
+    Ok(env.to_text())
+}
+
+/// Resolve a new reply's thread, after a structured operation has had the chance to reuse its
+/// recorded root. An explicit thread alone is caller intent; it cannot make an unreadable `re`
+/// into a known General message or override the readable parent's canonical root.
+pub(crate) fn reply_thread(
+    re: Option<&str>,
+    known: Option<String>,
+    explicit: Option<&str>,
+) -> Result<Option<String>, AppError> {
+    if let Some(re) = re {
+        if known.is_none() {
+            return Err(AppError::Usage(format!(
+                "cannot reply to {re}: this node cannot read that message; nothing was posted"
+            )));
+        }
+    }
+    match (known, explicit) {
+        (Some(root), Some(explicit)) if !root.eq_ignore_ascii_case(explicit.trim()) => {
+            Err(AppError::Usage(format!(
+                "thread {explicit} contradicts the message being replied to: its thread is {root}"
+            )))
+        }
+        (Some(root), _) => Ok(Some(root)),
+        (None, explicit) => Ok(explicit.map(str::to_owned)),
     }
 }
 
@@ -669,16 +700,7 @@ pub(crate) async fn post_structured(
     let thread = if let Some(original) = retry {
         original.envelope.thread.clone()
     } else {
-        match (known_thread, &opts.thread) {
-            (Some(root), Some(explicit)) if !root.eq_ignore_ascii_case(explicit.trim()) => {
-                return Err(AppError::Usage(format!(
-                    "--thread {explicit} contradicts the message being replied to: its thread is {root}"
-                )));
-            }
-            (Some(root), _) => Some(root),
-            (None, Some(explicit)) => Some(explicit.clone()),
-            (None, None) => re.clone(),
-        }
+        reply_thread(re.as_deref(), known_thread, opts.thread.as_deref())?
     };
     let tags = if thread.is_some() {
         let inherited: Vec<String> = match retry {
@@ -1452,8 +1474,9 @@ pub(crate) fn shown_tags(tags: &[String]) -> String {
 /// woke `session`; and that parent's budget less one.
 ///
 /// # Errors
-/// An urgent post from a session woken by several unanswered messages names none of them, or a
-/// parent cannot be read.
+/// An urgent post from a session woken by several unanswered messages names none of them, or
+/// the node cannot answer. An unavailable parent leaves the root unknown: callers must use
+/// `reply_thread` before a new post, after checking for an existing operation retry.
 pub(crate) async fn answers(
     client: &mut IpcClient,
     cid: Digest32,
@@ -1521,7 +1544,7 @@ pub(crate) async fn answers(
 }
 
 /// Inherit only the canonical starting message's tags, even when a reply answers another reply.
-/// A missing root cannot supply tags; the existing missing-parent behavior is unchanged.
+/// A missing root cannot supply tags. This does not infer a root from an unavailable parent.
 pub(crate) async fn reply_tags(
     client: &mut IpcClient,
     cid: Digest32,

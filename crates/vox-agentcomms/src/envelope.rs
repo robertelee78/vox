@@ -620,8 +620,9 @@ pub fn reply_hops_by(re: &str, parent: impl FnMut(&str) -> Option<String>) -> u3
 
 /// The thread a reply belongs to (ADR-033 TH-1, TH-3): the parent's thread, or the parent
 /// itself when it is a General message, including plain text. `None` means the parent is
-/// unavailable; callers keep their existing missing-parent behavior. This is resolved before
-/// assigning an operation's identity, so retrying a reply cannot change its meaning.
+/// unavailable: `parent` must supply only readable content, never an owed placeholder. A new
+/// reply must not guess that an unavailable parent is a General root. An existing operation
+/// keeps its recorded root when retried, even if its parent is no longer readable.
 #[must_use]
 pub fn reply_thread_by(re: &str, mut parent: impl FnMut(&str) -> Option<String>) -> Option<String> {
     let text = parent(re)?;
