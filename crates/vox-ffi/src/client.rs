@@ -1112,6 +1112,8 @@ pub struct FfiSessionEntry {
     pub id: String,
     /// When its node sent it, milliseconds since the Unix epoch.
     pub at_ms: u64,
+    /// The activity kind: tool steps fold; replies, questions and approvals stay visible.
+    pub kind: String,
     /// The one line, exactly as `vox room session` prints it.
     pub line: String,
     /// Its full input and output, for Details, as `vox room session --details` prints them under
@@ -1131,6 +1133,7 @@ fn session_entry(
     FfiSessionEntry {
         id: b32_encode(&l.id),
         at_ms: l.at_millis,
+        kind: l.kind.clone(),
         line: l.text.clone(),
         details: details_text(l),
         file: l.file.as_ref().map(|f| FfiSessionFile {
