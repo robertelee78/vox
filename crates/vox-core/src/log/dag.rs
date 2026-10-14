@@ -68,7 +68,7 @@ use crate::error::{Error, Result};
 use crate::hash::Digest32;
 use crate::identity::composite::CompositePublicKey;
 use crate::log::checkpoint::Checkpoint;
-use crate::log::entry::{Entry, EntryKind, MAX_SEEN};
+use crate::log::entry::{Entry, EntryKind, EntryRead, EntryWrite, MAX_SEEN};
 
 /// How far an entry's claimed time may run ahead of the latest entry it names (or of the room's
 /// genesis, if it names none) before it is capped: ten minutes.
@@ -85,7 +85,7 @@ use crate::log::entry::{Entry, EntryKind, MAX_SEEN};
 /// minutes), capping moves it only among entries it did not see, which is all the claimed time
 /// is ever used for. A larger bound would be a larger lever for a dishonest one.
 pub const MAX_LEAD_MS: u64 = 10 * 60 * 1_000;
-use crate::log::feed::Feed;
+use crate::log::feed::{Feed, FeedError};
 
 /// The set of identities admitted to a `(channelID, epoch)` — the membership
 /// input to the acceptance predicate (ADR-008 §"Abuse resistance"). M5 models
@@ -169,6 +169,8 @@ pub enum Rejected {
     Feed(Error),
     /// A duplicate of an already-stored entry (same hash) — idempotently ignored.
     Duplicate,
+    /// A local encrypted index/log read or write failed. Never a peer authenticator failure.
+    Local(Error),
     /// A position at or below its author's checkpoint that this node does not hold as
     /// this entry (ADR-023 decision 3). Refused, never classified as a fork: below the line
     /// the body is expired, so it could never be shown, and a fork proof would need the
@@ -182,8 +184,6 @@ pub enum Rejected {
 pub struct Dag {
     /// author -> feed.
     feeds: HashMap<Digest32, Feed>,
-    /// entry hash -> (author, seq), for content-addressed lookup and Negentropy.
-    by_hash: HashMap<Digest32, (Digest32, u64)>,
     /// Authors frozen by an attributable fork proof; their later entries are
     /// refused (ADR-008 — members revoke/rotate to exclude the equivocator).
     frozen: HashMap<Digest32, ForkProof>,
@@ -255,13 +255,15 @@ impl Dag {
     /// The number of entries stored across all authors.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.by_hash.len()
+        self.feeds
+            .values()
+            .fold(0usize, |n, feed| n.saturating_add(feed.len()))
     }
 
     /// Whether the DAG holds no entries.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.by_hash.is_empty()
+        self.feeds.values().all(Feed::is_empty)
     }
 
     /// The feed for `author`, if any.
@@ -366,27 +368,52 @@ impl Dag {
     }
 
     /// Look up a stored entry by its 32-byte hash (the Negentropy key).
-    #[must_use]
-    pub fn get_by_hash(&self, hash: &Digest32) -> Option<&Entry> {
-        let (author, seq) = self.by_hash.get(hash)?;
-        self.feeds.get(author).and_then(|f| f.get(*seq))
+    pub fn get_by_hash(&self, entries: &impl EntryRead, hash: &Digest32) -> Result<Option<Entry>> {
+        let Some((author, seq)) = entries.locate(hash)? else {
+            return Ok(None);
+        };
+        let Some(feed) = self.feeds.get(&author) else {
+            return Ok(None);
+        };
+        let entry = feed.get(entries, seq)?;
+        if entry.as_ref().is_some_and(|e| e.entry_hash() != *hash) {
+            return Err(Error::MalformedAtRest("DAG locator hash differs"));
+        }
+        Ok(entry)
+    }
+
+    fn position(
+        &self,
+        entries: &impl EntryRead,
+        hash: &Digest32,
+    ) -> Result<Option<(Digest32, u64)>> {
+        Ok(entries.locate(hash)?.filter(|(author, seq)| {
+            self.feeds
+                .get(author)
+                .is_some_and(|f| *seq != 0 && *seq <= f.max_seq())
+        }))
     }
 
     /// Drop the payload body of the stored entry `hash`, keeping its signed skeleton
     /// (ADR-010 retention). A peer that asks for it afterwards is served the skeleton.
     /// Returns whether a body was dropped.
-    pub fn prune_payload(&mut self, hash: &Digest32) -> bool {
-        let Some((author, seq)) = self.by_hash.get(hash).copied() else {
-            return false;
+    pub fn prune_payload(
+        &mut self,
+        entries: &mut impl EntryWrite,
+        hash: &Digest32,
+    ) -> Result<bool> {
+        let Some((author, seq)) = self.position(entries, hash)? else {
+            return Ok(false);
         };
         let dropped = self
             .feeds
             .get_mut(&author)
-            .is_some_and(|f| f.prune_payload(seq));
+            .ok_or(Error::MalformedAtRest("DAG feed missing"))?
+            .prune_payload(entries, seq)?;
         if dropped {
             self.body_generation = self.body_generation.wrapping_add(1);
         }
-        dropped
+        Ok(dropped)
     }
 
     /// **A body that arrives for a skeleton held without one is put back** (V030-10). A skeleton
@@ -394,30 +421,31 @@ impl Dag {
     /// send; the body stays owed, and when any peer serves it — the payload the skeleton commits
     /// to, by hash and length — it is the entry's again. A checkpoint that arrives this way is
     /// read as one arriving whole would be. Returns whether a body was put back.
-    pub fn fill_body(&mut self, entry: &Entry) -> bool {
+    pub fn fill_body(&mut self, entries: &mut impl EntryWrite, entry: &Entry) -> Result<bool> {
         let Some(payload) = entry.payload.as_ref() else {
-            return false;
+            return Ok(false);
         };
         if entry.verify_payload_binding().is_err() {
-            return false;
+            return Ok(false);
         }
         let hash = entry.entry_hash();
-        let Some((author, seq)) = self.by_hash.get(&hash).copied() else {
-            return false;
+        let Some((author, seq)) = self.position(entries, &hash)? else {
+            return Ok(false);
         };
-        let Some(feed) = self.feeds.get_mut(&author) else {
-            return false;
-        };
-        if !feed.restore_payload(seq, payload.clone()) {
-            return false;
+        let feed = self
+            .feeds
+            .get_mut(&author)
+            .ok_or(Error::MalformedAtRest("DAG feed missing"))?;
+        if !feed.restore_payload(entries, seq, payload.clone())? {
+            return Ok(false);
         }
-        let signed = feed.get(seq).is_some_and(Entry::is_signed);
+        let signed = feed.get(entries, seq)?.is_some_and(|e| e.is_signed());
         if let Some(cp) = Checkpoint::from_payload(payload)
             .ok()
             .flatten()
             .filter(|_| signed)
         {
-            let names = feed.get(cp.seq).map(Entry::entry_hash) == Some(cp.entry_hash);
+            let names = feed.get(entries, cp.seq)?.map(|e| e.entry_hash()) == Some(cp.entry_hash);
             if cp.seq < seq && names {
                 let held = self.checkpoints.entry(author).or_insert((0, cp.entry_hash));
                 if cp.seq > held.0 {
@@ -427,7 +455,7 @@ impl Dag {
         }
         self.filled.push(hash);
         self.body_generation = self.body_generation.wrapping_add(1);
-        true
+        Ok(true)
     }
 
     /// Revision of existing entries' body presence, independent of durable sync credit.
@@ -441,9 +469,8 @@ impl Dag {
     }
 
     /// Whether an entry with this hash is stored.
-    #[must_use]
-    pub fn contains(&self, hash: &Digest32) -> bool {
-        self.by_hash.contains_key(hash)
+    pub fn contains(&self, entries: &impl EntryRead, hash: &Digest32) -> Result<bool> {
+        Ok(self.position(entries, hash)?.is_some())
     }
 
     /// Accept an entry into the DAG, enforcing the full ADR-008 predicate.
@@ -474,6 +501,7 @@ impl Dag {
     /// seam where a future per-kind rule would go.
     pub fn accept(
         &mut self,
+        entries: &mut impl EntryWrite,
         entry: Entry,
         kind: EntryKind,
         author_root: &CompositePublicKey,
@@ -492,7 +520,7 @@ impl Dag {
         }
 
         // Idempotent duplicate.
-        if self.by_hash.contains_key(&hash) {
+        if self.contains(entries, &hash).map_err(Rejected::Local)? {
             return Err(Rejected::Duplicate);
         }
 
@@ -531,7 +559,7 @@ impl Dag {
 
         // Equivocation: a *different* entry already occupies (author, seq)?
         if let Some(feed) = self.feeds.get(&author) {
-            if let Some(existing) = feed.get(seq) {
+            if let Some(existing) = feed.get(entries, seq).map_err(Rejected::Local)? {
                 // An unsigned entry proves nothing: it can conflict, never incriminate.
                 if !signed {
                     return Err(Rejected::Verification(Error::MalformedBundle(
@@ -559,8 +587,11 @@ impl Dag {
             _ => None,
         };
         if let Some(cp) = checkpoint {
-            let named = self.feeds.get(&author).and_then(|f| f.get(cp.seq));
-            if cp.seq >= seq || named.map(Entry::entry_hash) != Some(cp.entry_hash) {
+            let named = match self.feeds.get(&author) {
+                Some(feed) => feed.get(entries, cp.seq).map_err(Rejected::Local)?,
+                None => None,
+            };
+            if cp.seq >= seq || named.map(|e| e.entry_hash()) != Some(cp.entry_hash) {
                 return Err(Rejected::Verification(Error::MalformedBundle(
                     "checkpoint names a position its own feed does not hold",
                 )));
@@ -572,9 +603,11 @@ impl Dag {
         self.feeds
             .entry(author)
             .or_default()
-            .append(entry)
-            .map_err(Rejected::Feed)?;
-        self.by_hash.insert(hash, (author, seq));
+            .append(entries, &entry)
+            .map_err(|e| match e {
+                FeedError::Invalid(e) => Rejected::Feed(e),
+                FeedError::Local(e) => Rejected::Local(e),
+            })?;
         if signed {
             // Chains every unsigned entry below it to a signature.
             self.unverified_from.remove(&author);
@@ -587,7 +620,7 @@ impl Dag {
                 *held = (cp.seq, cp.entry_hash);
             }
         }
-        self.place(hash);
+        self.place(entries, hash).map_err(Rejected::Local)?;
         Ok(hash)
     }
 
@@ -595,40 +628,51 @@ impl Dag {
     /// 3): what a sync session or a reload leaves provisional at its end. They are not
     /// authentic, and keeping them would block the real entries at those positions.
     /// Returns how many were removed.
-    pub fn discard_unverified(&mut self) -> usize {
+    pub fn discard_unverified(&mut self, entries: &mut impl EntryWrite) -> Result<usize> {
         let mut removed = 0usize;
         for (author, from) in std::mem::take(&mut self.unverified_from) {
             let Some(feed) = self.feeds.get_mut(&author) else {
                 continue;
             };
-            for entry in feed.truncate_from(from) {
+            removed += feed.truncate_from(entries, from, |entry| {
                 let h = entry.entry_hash();
-                self.by_hash.remove(&h);
                 if let Some(c) = self.clock.remove(&h) {
                     self.ordered.remove(&(c, h));
                 }
-                removed += 1;
-            }
+            })?;
         }
         if removed > 0 {
             self.reorder_generation = self.reorder_generation.wrapping_add(1);
         }
-        removed
+        Ok(removed)
     }
 
     /// Drop the signature of `hash` if its author's checkpoint covers it and its body is gone
     /// — for an entry pruned after the checkpoint arrived. Returns whether one was dropped.
-    pub fn drop_signature_if_checkpointed(&mut self, hash: &Digest32) -> bool {
-        let Some((author, seq)) = self.by_hash.get(hash).copied() else {
-            return false;
+    pub fn drop_signature_if_checkpointed(
+        &mut self,
+        entries: &mut impl EntryWrite,
+        hash: &Digest32,
+    ) -> Result<bool> {
+        let Some((author, seq)) = self.position(entries, hash)? else {
+            return Ok(false);
         };
-        if self.checkpoints.get(&author).is_none_or(|(b, _)| seq > *b) {
-            return false;
+        if self
+            .checkpoints
+            .get(&author)
+            .is_none_or(|(below, _)| seq > *below)
+        {
+            return Ok(false);
         }
-        let Some(feed) = self.feeds.get_mut(&author) else {
-            return false;
-        };
-        feed.get(seq).is_some_and(|e| e.payload.is_none()) && feed.drop_signature(seq)
+        let feed = self
+            .feeds
+            .get_mut(&author)
+            .ok_or(Error::MalformedAtRest("DAG feed missing"))?;
+        if feed.get(entries, seq)?.is_some_and(|e| e.payload.is_none()) {
+            feed.drop_signature(entries, seq)
+        } else {
+            Ok(false)
+        }
     }
 
     /// The highest seq of `author`'s feed that is authentic: its head, less any run of
@@ -654,8 +698,8 @@ impl Dag {
     /// and content keeps it until it expires here.
     ///
     /// Walks only what no earlier call covered, so it costs nothing between checkpoints.
-    pub fn drop_checkpointed_signatures(&mut self) -> Vec<Digest32> {
-        let mut dropped = Vec::new();
+    pub fn drop_checkpointed_signatures(&mut self, entries: &mut impl EntryWrite) -> Result<usize> {
+        let mut dropped = 0usize;
         for (author, (below, _)) in &self.checkpoints {
             let Some(feed) = self.feeds.get_mut(author) else {
                 continue;
@@ -664,38 +708,38 @@ impl Dag {
             if from > *below {
                 continue;
             }
-            self.swept_to.insert(*author, *below);
             for seq in from..=*below {
-                let eligible = feed
-                    .get(seq)
-                    .is_some_and(|e| e.is_signed() && e.payload.is_none());
-                if eligible && feed.drop_signature(seq) {
-                    if let Some(e) = feed.get(seq) {
-                        dropped.push(e.entry_hash());
+                if let Some(entry) = feed.get(entries, seq)? {
+                    if entry.is_signed()
+                        && entry.payload.is_none()
+                        && feed.drop_signature(entries, seq)?
+                    {
+                        dropped += 1;
                     }
                 }
+                self.swept_to.insert(*author, seq);
             }
         }
-        dropped
+        Ok(dropped)
     }
 
     /// Give a just-stored entry its clock, record its `seen` edges, and lift every
     /// stored entry that was waiting for it (module docs, "The one order").
-    fn place(&mut self, hash: Digest32) {
-        let Some(entry) = self.get_by_hash(&hash) else {
-            return;
+    fn place(&mut self, entries: &impl EntryRead, hash: Digest32) -> Result<()> {
+        let Some(entry) = self.get_by_hash(entries, &hash)? else {
+            return Err(Error::MalformedAtRest("new DAG entry missing"));
         };
         let author = entry.skeleton.author_id;
         let seq = entry.skeleton.seq;
         let seen = entry.skeleton.seen.clone();
         for parent in &seen {
-            if let Some((other, other_seq)) = self.by_hash.get(parent).copied() {
+            if let Some((other, other_seq)) = self.position(entries, parent)? {
                 let r = self.referenced.entry((author, other)).or_insert(0);
                 *r = (*r).max(other_seq);
             }
             self.seen_by.entry(*parent).or_default().push(hash);
         }
-        let clock = self.clock_of(&hash);
+        let clock = self.clock_of(entries, &hash)?;
         self.clock.insert(hash, clock);
         self.ordered.insert((clock, hash));
 
@@ -703,7 +747,7 @@ impl Dag {
         // it held, and whatever moves takes its descendants along.
         let waiting = self.seen_by.get(&hash).cloned().unwrap_or_default();
         for child in &waiting {
-            if let Some((child_author, _)) = self.by_hash.get(child).copied() {
+            if let Some((child_author, _)) = self.position(entries, child)? {
                 let r = self.referenced.entry((child_author, author)).or_insert(0);
                 *r = (*r).max(seq);
             }
@@ -713,7 +757,7 @@ impl Dag {
             let Some(old) = self.clock.get(&h).copied() else {
                 continue;
             };
-            let new = self.clock_of(&h);
+            let new = self.clock_of(entries, &h)?;
             if new <= old {
                 continue;
             }
@@ -721,8 +765,14 @@ impl Dag {
             self.ordered.insert((new, h));
             self.clock.insert(h, new);
             self.reorder_generation = self.reorder_generation.wrapping_add(1);
-            if let Some((a, s)) = self.by_hash.get(&h).copied() {
-                if let Some(succ) = self.feeds.get(&a).and_then(|f| f.get(s + 1)) {
+            if let Some((a, s)) = self.position(entries, &h)? {
+                if let Some(succ) = self
+                    .feeds
+                    .get(&a)
+                    .map(|f| f.get(entries, s + 1))
+                    .transpose()?
+                    .flatten()
+                {
                     work.push(succ.entry_hash());
                 }
             }
@@ -730,6 +780,7 @@ impl Dag {
                 work.extend(children.iter().copied());
             }
         }
+        Ok(())
     }
 
     /// An entry's clock from its parents' clocks as currently held (module docs, "The one
@@ -738,9 +789,9 @@ impl Dag {
     ///
     /// Monotone in the parents' clocks, so recomputing a child when a parent rises only ever
     /// raises it, and the fixpoint is the same whatever order entries arrived in.
-    fn clock_of(&self, hash: &Digest32) -> u64 {
-        let Some(entry) = self.get_by_hash(hash) else {
-            return 0;
+    fn clock_of(&self, entries: &impl EntryRead, hash: &Digest32) -> Result<u64> {
+        let Some(entry) = self.get_by_hash(entries, hash)? else {
+            return Ok(0);
         };
         let sk = &entry.skeleton;
         let parents = sk.seen.iter().chain((sk.seq > 1).then_some(&sk.prev_hash));
@@ -750,10 +801,10 @@ impl Dag {
             Some(a) => sk.claimed_ms.min(a.saturating_add(MAX_LEAD_MS)),
             None => sk.claimed_ms,
         };
-        match latest_parent {
+        Ok(match latest_parent {
             Some(p) => claimed.max(p.saturating_add(1)),
             None => claimed,
-        }
+        })
     }
 
     /// What an entry `author` writes now should list in `seen`: the head of every
@@ -781,7 +832,7 @@ impl Dag {
                 if head == 0 || head <= named {
                     return None;
                 }
-                let h = feed.get(head)?.entry_hash();
+                let h = feed.head_hash();
                 Some((self.clock.get(&h).copied().unwrap_or(0), h))
             })
             .collect();
@@ -814,17 +865,21 @@ impl Dag {
     /// that saw another claim follows it. `false` means concurrent **or** not yet
     /// known to be ordered — `a` may be an ancestor through an entry this node has not
     /// received. Neither entry held is `false`.
-    #[must_use]
-    pub fn happened_before(&self, a: &Digest32, b: &Digest32) -> bool {
+    pub fn happened_before(
+        &self,
+        entries: &impl EntryRead,
+        a: &Digest32,
+        b: &Digest32,
+    ) -> Result<bool> {
         let (Some(ca), Some(cb)) = (self.clock.get(a).copied(), self.clock.get(b).copied()) else {
-            return false;
+            return Ok(false);
         };
         // An ancestor's clock is strictly below its descendant's.
         if ca >= cb {
-            return false;
+            return Ok(false);
         }
-        let Some((a_author, a_seq)) = self.by_hash.get(a).copied() else {
-            return false;
+        let Some((a_author, a_seq)) = self.position(entries, a)? else {
+            return Ok(false);
         };
         let mut visited: HashSet<Digest32> = HashSet::new();
         let mut stack = vec![*b];
@@ -832,16 +887,16 @@ impl Dag {
             if !visited.insert(h) {
                 continue;
             }
-            let Some(entry) = self.get_by_hash(&h) else {
+            let Some(entry) = self.get_by_hash(entries, &h)? else {
                 continue;
             };
             let sk = &entry.skeleton;
             // Reaching `a`'s feed at or past `a` means `a` precedes it on that chain.
             if h != *b && sk.author_id == a_author && sk.seq >= a_seq {
-                return true;
+                return Ok(true);
             }
             if h == *b && sk.author_id == a_author {
-                return sk.seq > a_seq;
+                return Ok(sk.seq > a_seq);
             }
             let parents = sk
                 .seen
@@ -852,14 +907,14 @@ impl Dag {
                 // Anything at or below `a`'s clock cannot have `a` as an ancestor
                 // (unless it is `a`, which the feed check above catches).
                 if p == *a {
-                    return true;
+                    return Ok(true);
                 }
                 if self.clock.get(&p).is_some_and(|c| *c > ca) {
                     stack.push(p);
                 }
             }
         }
-        false
+        Ok(false)
     }
 
     /// Build the fork proof for a `(author, seq)` conflict (ADR-008 §"Fork /
@@ -902,26 +957,35 @@ impl Dag {
     /// **and** `decrypt` succeeds (the holder has keys). A `None` means "store it,
     /// replicate it, but do not render" — exactly the data-side of per-sender
     /// consent. The real decryptor is M4/M6; M5 only owns this seam.
-    pub fn render<F>(&self, hash: &Digest32, decrypt: F) -> Option<Vec<u8>>
+    pub fn render<F>(
+        &self,
+        entries: &impl EntryRead,
+        hash: &Digest32,
+        decrypt: F,
+    ) -> Result<Option<Vec<u8>>>
     where
         F: FnOnce(&Entry, &[u8]) -> Option<Vec<u8>>,
     {
-        let entry = self.get_by_hash(hash)?;
-        let payload = entry.payload.as_deref()?;
-        decrypt(entry, payload)
+        let Some(entry) = self.get_by_hash(entries, hash)? else {
+            return Ok(None);
+        };
+        let Some(payload) = entry.payload.as_deref() else {
+            return Ok(None);
+        };
+        Ok(decrypt(&entry, payload))
     }
 
     /// Verify the entire DAG: every feed's chain + signatures, given a resolver
     /// from author fingerprint to that author's composite root key. Used after a
     /// bulk import / sync to confirm convergence integrity.
-    pub fn verify_all<F>(&self, mut author_key: F) -> Result<()>
+    pub fn verify_all<F>(&self, entries: &impl EntryRead, mut author_key: F) -> Result<()>
     where
         F: FnMut(&Digest32) -> Option<CompositePublicKey>,
     {
         for (author, feed) in &self.feeds {
             let key = author_key(author).ok_or(Error::MalformedBundle("dag missing author key"))?;
-            feed.verify()?;
-            feed.verify_all_signatures(&key)?;
+            feed.verify(entries)?;
+            feed.verify_all_signatures(entries, &key)?;
         }
         Ok(())
     }

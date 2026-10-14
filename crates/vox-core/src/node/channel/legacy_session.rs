@@ -173,12 +173,17 @@ impl LegacySessions {
 
 impl ChannelState {
     /// A verified target, not a claimed time/sequence range or an unverified bare hash.
-    fn legacy_target(&self, hash: &Digest32, author: &Digest32) -> Option<&Entry> {
-        self.dag.get_by_hash(hash).filter(|entry| {
+    fn legacy_target(
+        &self,
+        transaction: Transaction<'_, '_>,
+        hash: &Digest32,
+        author: &Digest32,
+    ) -> Result<Option<Entry>> {
+        Ok(self.entry_at(transaction, hash)?.filter(|entry| {
             entry.skeleton.channel_id == self.channel_id
                 && entry.skeleton.author_id == *author
                 && entry.skeleton.seq <= self.dag.verified_head(author)
-        })
+        }))
     }
 
     /// Inspect an authenticated available body before Session floors discard it. A copied
@@ -210,11 +215,12 @@ impl ChannelState {
 
     pub(super) fn remember_legacy_kind(
         &mut self,
+        transaction: Transaction<'_, '_>,
         hash: Digest32,
         author: Digest32,
         session: bool,
     ) -> Result<()> {
-        let Some(log_id) = self.log_ids.get(&hash).copied() else {
+        let Some(log_id) = self.log_id_at(transaction, &hash)? else {
             self.legacy_sessions
                 .observed
                 .insert(hash, (author, session));
@@ -232,7 +238,13 @@ impl ChannelState {
     }
 
     /// Called before receive filtering, while a late contradictory body is still available.
-    pub(super) fn inspect_legacy_bodies(&mut self, staged: &[Vec<u8>]) -> Result<()> {
+    pub(super) fn inspect_legacy_bodies(
+        &mut self,
+        store: &Store,
+        staged: &[Vec<u8>],
+    ) -> Result<()> {
+        let snapshot = store.snapshot()?;
+        let transaction = Transaction::Snapshot(&snapshot);
         for wire in staged {
             let Ok(incoming) = Entry::from_wire(wire) else {
                 continue;
@@ -240,12 +252,12 @@ impl ChannelState {
             let hash = incoming.entry_hash();
             let author = incoming.skeleton.author_id;
             let kind = self
-                .legacy_target(&hash, &author)
-                .and_then(|entry| self.available_legacy_kind(entry));
+                .legacy_target(transaction, &hash, &author)?
+                .and_then(|entry| self.available_legacy_kind(&entry));
             if let Some(session) = kind {
                 // A new entry has no log id yet. Absorption repeats the inspection once it
                 // allocates its page; a refilled skeleton already has its durable log id.
-                self.remember_legacy_kind(hash, author, session)?;
+                self.remember_legacy_kind(transaction, hash, author, session)?;
             }
         }
         Ok(())
@@ -253,6 +265,7 @@ impl ChannelState {
 
     pub(super) fn accept_legacy_index(
         &mut self,
+        transaction: Transaction<'_, '_>,
         declaration: Digest32,
         outer_author: Digest32,
         index: LegacySessionIndex,
@@ -261,15 +274,14 @@ impl ChannelState {
         if index.channel_id != self.channel_id || index.author != outer_author {
             return Ok(());
         }
-        let Some(entry) = self.legacy_target(&declaration, &outer_author) else {
+        let Some(entry) = self.legacy_target(transaction, &declaration, &outer_author)? else {
             return Ok(());
         };
         if entry.payload.is_none() {
             return Ok(());
         }
-        let log_id = *self
-            .log_ids
-            .get(&declaration)
+        let log_id = self
+            .log_id_at(transaction, &declaration)?
             .ok_or(Error::MalformedAtRest(
                 "Session declaration has no log page",
             ))?;
@@ -286,12 +298,29 @@ impl ChannelState {
                 steps: index.steps,
             },
         );
-        self.reconcile_legacy_sessions(now_ms)
+        self.reconcile_legacy_sessions_at(transaction, now_ms)
     }
 
     /// Resolve only authenticated skeletons. Missing references age with their declaration;
     /// resolving a target moves its evidence into that target's own sealed page.
-    pub(super) fn reconcile_legacy_sessions(&mut self, now_ms: u64) -> Result<()> {
+    pub(super) fn reconcile_legacy_sessions(&mut self, store: &Store, now_ms: u64) -> Result<()> {
+        let snapshot = store.snapshot()?;
+        self.reconcile_legacy_sessions_at(Transaction::Snapshot(&snapshot), now_ms)
+    }
+
+    pub(super) fn reconcile_legacy_sessions_in(
+        &mut self,
+        batch: &crate::node::store::Batch<'_>,
+        now_ms: u64,
+    ) -> Result<()> {
+        self.reconcile_legacy_sessions_at(Transaction::Batch(batch), now_ms)
+    }
+
+    fn reconcile_legacy_sessions_at(
+        &mut self,
+        transaction: Transaction<'_, '_>,
+        now_ms: u64,
+    ) -> Result<()> {
         let pending: Vec<_> = self
             .legacy_sessions
             .pages
@@ -315,7 +344,9 @@ impl ChannelState {
             // This sealed page already authenticates the declaration. Its verified skeleton
             // remains sufficient after body pruning: a remote backdated timestamp must not
             // shorten the pending references' local first-seen lifetime.
-            if self.legacy_target(&declaration, &author).is_none()
+            if self
+                .legacy_target(transaction, &declaration, &author)?
+                .is_none()
                 || (ttl != 0 && first_seen <= now_ms.saturating_sub(ttl.saturating_mul(1_000)))
             {
                 self.legacy_sessions.remove(id);
@@ -323,7 +354,7 @@ impl ChannelState {
             }
             let mut remaining = Vec::new();
             for hash in steps {
-                let Some(entry) = self.dag.get_by_hash(&hash) else {
+                let Some(entry) = self.entry_at(transaction, &hash)? else {
                     remaining.push(hash);
                     continue;
                 };
@@ -337,12 +368,12 @@ impl ChannelState {
                     continue;
                 }
                 let session = self
-                    .available_legacy_kind(entry)
+                    .available_legacy_kind(&entry)
                     .or_else(|| self.legacy_sessions.targets.get(&hash).copied())
                     // A bare verified skeleton proves its signer/room/hash, not its subtype:
                     // the same author's authenticated exact-hash declaration supplies that.
                     .unwrap_or(true);
-                self.remember_legacy_kind(hash, author, session)?;
+                self.remember_legacy_kind(transaction, hash, author, session)?;
             }
             if remaining.is_empty() {
                 self.legacy_sessions.remove(id);
@@ -362,6 +393,8 @@ impl ChannelState {
     }
 
     pub(super) fn restore_legacy_sessions(&mut self, store: &Store, now_ms: u64) -> Result<()> {
+        let snapshot = store.snapshot()?;
+        let transaction = Transaction::Snapshot(&snapshot);
         for (id, segment) in store.segments(&self.channel_id, SegmentKind::SessionClassification)? {
             let bytes = open_segment(&self.sek, SegmentKind::SessionClassification, id, &segment)?;
             let page = Page::read(&bytes)?;
@@ -373,8 +406,8 @@ impl ChannelState {
                 } => (*declaration, *author, true),
                 Page::Target { hash, author, .. } => (*hash, *author, false),
             };
-            if let Some(log_id) = self.log_ids.get(&hash) {
-                if page_id(*log_id, pending)? != id {
+            if let Some(log_id) = self.log_id_at(transaction, &hash)? {
+                if page_id(log_id, pending)? != id {
                     return Err(Error::MalformedAtRest(
                         "Session classification page binding",
                     ));
@@ -383,7 +416,7 @@ impl ChannelState {
                 self.legacy_sessions.dirty.insert(id);
                 continue;
             }
-            if self.legacy_target(&hash, &author).is_none() {
+            if self.legacy_target(transaction, &hash, &author)?.is_none() {
                 return Err(Error::MalformedAtRest(
                     "Session classification target binding",
                 ));
@@ -410,13 +443,13 @@ impl ChannelState {
             .collect();
         for (hash, author) in known {
             if let Some(session) = self
-                .legacy_target(&hash, &author)
-                .and_then(|entry| self.available_legacy_kind(entry))
+                .legacy_target(transaction, &hash, &author)?
+                .and_then(|entry| self.available_legacy_kind(&entry))
             {
-                self.remember_legacy_kind(hash, author, session)?;
+                self.remember_legacy_kind(transaction, hash, author, session)?;
             }
         }
-        self.reconcile_legacy_sessions(now_ms)?;
+        self.reconcile_legacy_sessions_at(transaction, now_ms)?;
         if self.legacy_sessions.dirty() {
             let mut batch = store.batch()?;
             self.queue_legacy_sessions(&mut batch)?;

@@ -87,25 +87,31 @@ impl ChannelState {
         }
     }
 
-    pub(super) fn index_session_floors(&mut self) {
+    pub(super) fn index_session_floors(&mut self, store: &Store) -> Result<()> {
         if self.drive.floors_indexed {
-            return;
+            return Ok(());
         }
-        let mut entries = Vec::new();
-        for author in self.dag.authors() {
-            if let Some(feed) = self.dag.feed(&author) {
-                entries.extend(
-                    feed.iter()
-                        .filter(|e| e.skeleton.seq <= self.dag.verified_head(&author))
-                        .filter(|e| e.payload.as_deref().is_some_and(is_session_floor))
-                        .cloned(),
-                );
+        let indexed = (|| -> Result<()> {
+            for author in self.dag.authors() {
+                let head = self.dag.verified_head(&author);
+                for seq in 1..=head {
+                    let entry = self
+                        .entries
+                        .read(store, &self.sek, &self.channel_id)?
+                        .get(&author, seq)?
+                        .ok_or(Error::MalformedAtRest("Session floor feed entry missing"))?;
+                    if entry.payload.as_deref().is_some_and(is_session_floor) {
+                        self.learn_session_floor(&entry);
+                    }
+                }
             }
+            self.drive.floors_indexed = true;
+            Ok(())
+        })();
+        if let Err(ref error) = indexed {
+            self.poison(error);
         }
-        for entry in entries {
-            self.learn_session_floor(&entry);
-        }
-        self.drive.floors_indexed = true;
+        indexed
     }
 
     /// Publish the boundary before releasing the matching key or writing a Session step.
@@ -115,7 +121,7 @@ impl ChannelState {
         holders: &BTreeSet<Digest32>,
         now: u64,
     ) -> Result<()> {
-        self.index_session_floors();
+        self.index_session_floors(profile.store())?;
         let me = self.me();
         let members = self.drive_members();
         let Some(generation) = self.drive.chain.as_ref().map(SenderChain::chain_id) else {
@@ -158,20 +164,33 @@ impl ChannelState {
             {
                 continue;
             }
-            let first_seq = self
-                .dag
-                .feed(&me)
-                .and_then(|feed| {
-                    feed.iter().find_map(|e| {
-                        let m = GroupMessage::from_wire(e.payload.as_deref()?).ok()?;
-                        (m.header.channel_id == drive_channel(&self.channel_id)
+            let head = self.dag.feed(&me).map_or(0, |feed| feed.max_seq());
+            let mut first_seq = head
+                .checked_add(2)
+                .ok_or(Error::MalformedAtRest("feed sequence exhausted"))?;
+            let entries = self
+                .entries
+                .read(profile.store(), &self.sek, &self.channel_id)?;
+            for seq in 1..=head {
+                let entry = entries
+                    .get(&me, seq)?
+                    .ok_or(Error::MalformedAtRest("Session floor feed entry missing"))?;
+                if entry
+                    .payload
+                    .as_deref()
+                    .and_then(|p| GroupMessage::from_wire(p).ok())
+                    .is_some_and(|m| {
+                        m.header.channel_id == drive_channel(&self.channel_id)
                             && m.header.epoch == self.epoch
                             && m.header.chain_id == generation
-                            && m.header.iteration >= iteration)
-                            .then_some(e.skeleton.seq)
+                            && m.header.iteration >= iteration
                     })
-                })
-                .unwrap_or_else(|| self.next_skeleton(&me, &[], now).seq.saturating_add(1));
+                {
+                    first_seq = seq;
+                    break;
+                }
+            }
+            drop(entries);
             let floor = Floor {
                 room: self.channel_id,
                 author: me,
@@ -239,43 +258,68 @@ impl ChannelState {
     /// Keep signed skeletons while withholding bodies older than the recipient's authorization.
     pub(super) fn session_entries_for(
         &mut self,
+        store: &Store,
         peer: &Digest32,
         wants: &[crate::log::sync::WantRange],
-    ) -> Vec<Vec<u8>> {
-        self.index_session_floors();
-        crate::log::sync::entries_for_wants(&self.dag, wants)
+    ) -> Result<Vec<Vec<u8>>> {
+        self.index_session_floors(store)?;
+        let entries = self.entries.read(store, &self.sek, &self.channel_id)?;
+        crate::log::sync::entries_for_wants(&self.dag, &entries, wants)?
             .into_iter()
             .map(|wire| {
-                let Ok(mut entry) = Entry::from_wire(&wire) else {
-                    return wire;
-                };
+                let mut entry = Entry::from_wire(&wire)?;
                 if !self.session_body_allowed(&entry, peer) {
                     entry.payload = None;
                 }
-                entry.to_wire()
+                Ok(entry.to_wire())
             })
             .collect()
     }
 
-    /// Run only after the DAG verified the incoming entries, and before any body reaches disk.
-    pub(super) fn filter_received_session_bodies(&mut self, peer: Digest32, staged: &[Vec<u8>]) {
-        self.index_session_floors();
-        let verified = staged
-            .iter()
-            .filter_map(|wire| Entry::from_wire(wire).ok())
-            .filter_map(|e| self.dag.get_by_hash(&e.entry_hash()).cloned())
-            .filter(|e| e.skeleton.seq <= self.dag.verified_head(&e.skeleton.author_id))
-            .collect::<Vec<_>>();
-        for entry in &verified {
-            self.learn_session_floor(entry);
-            self.observe_legacy_drive_generation(entry);
+    /// After verification, inspect all newly authenticated floors before deciding any body.
+    /// Both passes fetch one entry at a time; large legal bodies never form a history-sized Vec.
+    pub(super) fn filter_received_session_bodies(
+        &mut self,
+        store: &Store,
+        peer: Digest32,
+        staged: &[Vec<u8>],
+    ) -> Result<()> {
+        self.index_session_floors(store)?;
+        for wire in staged {
+            let Ok(incoming) = Entry::from_wire(wire) else {
+                continue;
+            };
+            let Some(entry) = self.entry(store, &incoming.entry_hash())? else {
+                continue;
+            };
+            if entry.skeleton.seq > self.dag.verified_head(&entry.skeleton.author_id) {
+                continue;
+            }
+            self.learn_session_floor(&entry);
+            self.observe_legacy_drive_generation(&entry);
         }
         let me = self.me();
-        for entry in verified {
+        for wire in staged {
+            let Ok(incoming) = Entry::from_wire(wire) else {
+                continue;
+            };
+            let Some(entry) = self.entry(store, &incoming.entry_hash())? else {
+                continue;
+            };
+            if entry.skeleton.seq > self.dag.verified_head(&entry.skeleton.author_id) {
+                continue;
+            }
             let missing = entry.payload.is_none() || !self.session_body_allowed(&entry, &me);
             let position = (entry.skeleton.author_id, entry.skeleton.seq);
             if missing {
-                self.dag.prune_payload(&entry.entry_hash());
+                let mut batch = store.batch()?;
+                let mut index = self
+                    .entries
+                    .write(&mut batch, &self.sek, &self.channel_id)?;
+                self.dag.prune_payload(&mut index, &entry.entry_hash())?;
+                index.seal()?;
+                batch.commit()?;
+                self.entries.committed();
                 self.drive
                     .omitted
                     .entry(peer)
@@ -286,5 +330,6 @@ impl ChannelState {
                 omitted.1.remove(&position);
             }
         }
+        Ok(())
     }
 }
