@@ -10,6 +10,7 @@ use crate::node::store::{Batch, Snapshot};
 use zeroize::Zeroizing;
 
 use super::super::entry_store::session_tree;
+use super::activity_state::{ActivityState, ActivityTree};
 use super::record::Key;
 
 const KIND: SegmentKind = SegmentKind::SessionIndex;
@@ -99,6 +100,7 @@ pub(super) struct Header {
     pub activity_generation: u64,
     pub published: Option<(u64, u64)>,
     pub building: Option<Building>,
+    pub activity: ActivityState,
 }
 
 /// Fixed-size progress, never a list of sources, fields, or pages. Work roots stay
@@ -139,6 +141,7 @@ impl Default for Header {
             activity_generation: 0,
             published: None,
             building: None,
+            activity: ActivityState::default(),
         }
     }
 }
@@ -146,7 +149,7 @@ impl Default for Header {
 impl Header {
     fn bytes(&self) -> Zeroizing<Vec<u8>> {
         let mut e = Encoder::new();
-        e.array(11)
+        e.array(12)
             .uint(1)
             .uint(self.next)
             .uint(self.revision)
@@ -182,12 +185,13 @@ impl Header {
             }
             e.uint(work.cleanup as u64);
         }
+        self.activity.put(&mut e);
         Zeroizing::new(e.finish())
     }
 
     fn read(bytes: &[u8]) -> Result<Self> {
         let mut d = Decoder::new(bytes);
-        if d.array()? != 11 || d.uint()? != 1 {
+        if d.array()? != 12 || d.uint()? != 1 {
             return Err(invalid("Session index header version"));
         }
         let next = d.uint()?;
@@ -286,6 +290,7 @@ impl Header {
             }
             _ => return Err(invalid("Session build state option")),
         };
+        let activity = ActivityState::read(&mut d, next)?;
         d.finish()?;
         Ok(Self {
             roots,
@@ -298,6 +303,7 @@ impl Header {
             activity_generation,
             published,
             building,
+            activity,
         })
     }
 }
@@ -308,9 +314,53 @@ pub(super) struct Read<'a> {
     room: &'a Digest32,
     pub header: Header,
     working: bool,
+    activity_working: bool,
 }
 
 impl<'a> Read<'a> {
+    pub fn waiting_find(&self, root: u64, key: &Key) -> Result<Option<u64>> {
+        session_tree::Read::snapshot(self.snapshot, self.sek, self.room, KIND).find(root, key)
+    }
+    pub fn activity_work(mut self) -> Result<Self> {
+        if self.header.activity.work.is_none() {
+            return Err(invalid("Session activity work absent"));
+        }
+        self.activity_working = true;
+        Ok(self)
+    }
+    fn activity_root(&self, tree: ActivityTree) -> Result<u64> {
+        if self.activity_working {
+            Ok(self
+                .header
+                .activity
+                .work
+                .as_ref()
+                .ok_or_else(|| invalid("Session activity work absent"))?
+                .roots[tree.index()])
+        } else {
+            Ok(self.header.activity.roots[tree.index()])
+        }
+    }
+    pub fn activity_find(&self, tree: ActivityTree, key: &Key) -> Result<Option<u64>> {
+        session_tree::Read::snapshot(self.snapshot, self.sek, self.room, KIND)
+            .find(self.activity_root(tree)?, key)
+    }
+    pub fn activity_next(
+        &self,
+        tree: ActivityTree,
+        after: Option<Key>,
+    ) -> Result<Option<(Key, u64)>> {
+        session_tree::Read::snapshot(self.snapshot, self.sek, self.room, KIND)
+            .first_after(self.activity_root(tree)?, after)
+    }
+    pub fn activity_previous(
+        &self,
+        tree: ActivityTree,
+        before: Option<Key>,
+    ) -> Result<Option<(Key, u64)>> {
+        session_tree::Read::snapshot(self.snapshot, self.sek, self.room, KIND)
+            .last_before(self.activity_root(tree)?, before)
+    }
     pub fn open(snapshot: &'a Snapshot, sek: &'a Sek, room: &'a Digest32) -> Result<Self> {
         Self::existing(snapshot, sek, room)?
             .ok_or_else(|| invalid("Session projection is not prepared"))
@@ -335,6 +385,7 @@ impl<'a> Read<'a> {
             room,
             header,
             working: false,
+            activity_working: false,
         }))
     }
 
@@ -365,7 +416,7 @@ impl<'a> Read<'a> {
         Ok(self)
     }
 
-    fn root(&self, tree: Tree) -> Result<u64> {
+    pub(super) fn root(&self, tree: Tree) -> Result<u64> {
         if self.working {
             Ok(self
                 .header
@@ -404,6 +455,7 @@ pub(super) struct Write<'a, 's> {
     room: &'a Digest32,
     pub header: Header,
     working: bool,
+    activity_working: bool,
 }
 
 pub(super) fn find_in(
@@ -424,6 +476,115 @@ pub(super) fn find_in(
 }
 
 impl<'a, 's> Write<'a, 's> {
+    pub fn activity_is_working(&self) -> bool {
+        self.activity_working
+    }
+    pub fn waiting_find(&self, root: u64, key: &Key) -> Result<Option<u64>> {
+        session_tree::Read::batch(self.batch, self.sek, self.room, KIND).find(root, key)
+    }
+    pub fn waiting_next(&self, root: u64, after: Option<Key>) -> Result<Option<(Key, u64)>> {
+        session_tree::Read::batch(self.batch, self.sek, self.room, KIND).first_after(root, after)
+    }
+    pub fn waiting_set(&mut self, root: u64, key: Key, value: Option<u64>) -> Result<u64> {
+        let mut pages =
+            session_tree::Write::new(self.batch, self.sek, self.room, KIND, self.header.next)?;
+        let root = pages.set(root, key, value)?;
+        self.header.next = pages.next_page();
+        Ok(root)
+    }
+    pub fn activity_work(mut self) -> Result<Self> {
+        if self.header.activity.work.is_none() {
+            return Err(invalid("Session activity work absent"));
+        }
+        self.activity_working = true;
+        Ok(self)
+    }
+    fn activity_root(&self, tree: ActivityTree) -> Result<u64> {
+        if self.activity_working {
+            Ok(self
+                .header
+                .activity
+                .work
+                .as_ref()
+                .ok_or_else(|| invalid("Session activity work absent"))?
+                .roots[tree.index()])
+        } else {
+            Ok(self.header.activity.roots[tree.index()])
+        }
+    }
+    pub fn activity_find(&self, tree: ActivityTree, key: &Key) -> Result<Option<u64>> {
+        session_tree::Read::batch(self.batch, self.sek, self.room, KIND)
+            .find(self.activity_root(tree)?, key)
+    }
+    pub fn activity_next(
+        &self,
+        tree: ActivityTree,
+        after: Option<Key>,
+    ) -> Result<Option<(Key, u64)>> {
+        session_tree::Read::batch(self.batch, self.sek, self.room, KIND)
+            .first_after(self.activity_root(tree)?, after)
+    }
+    pub fn activity_set(&mut self, tree: ActivityTree, key: Key, value: Option<u64>) -> Result<()> {
+        let old = self.activity_root(tree)?;
+        let mut pages =
+            session_tree::Write::new(self.batch, self.sek, self.room, KIND, self.header.next)?;
+        let root = pages.set(old, key, value)?;
+        self.header.next = pages.next_page();
+        if self.activity_working {
+            self.header
+                .activity
+                .work
+                .as_mut()
+                .ok_or_else(|| invalid("Session activity work absent"))?
+                .roots[tree.index()] = root;
+        } else {
+            self.header.activity.roots[tree.index()] = root;
+        }
+        Ok(())
+    }
+    pub fn publish_activity(&mut self) -> Result<()> {
+        let work = self
+            .header
+            .activity
+            .work
+            .as_mut()
+            .ok_or_else(|| invalid("Session activity work absent"))?;
+        std::mem::swap(&mut self.header.activity.roots, &mut work.roots);
+        self.header.activity.applied = work.boundary;
+        self.header.activity.ready = true;
+        work.phase = 5;
+        work.cursor = None;
+        work.cleanup = 0;
+        Ok(())
+    }
+    pub fn cleanup_activity(&mut self, limit: usize) -> Result<()> {
+        self.activity_working = true;
+        for _ in 0..limit {
+            let at = self
+                .header
+                .activity
+                .work
+                .as_ref()
+                .ok_or_else(|| invalid("Session activity work absent"))?
+                .cleanup;
+            let Some(tree) = super::activity_state::ALL.get(at).copied() else {
+                self.header.activity.work = None;
+                self.activity_working = false;
+                break;
+            };
+            if let Some((key, _)) = self.activity_next(tree, None)? {
+                self.activity_set(tree, key, None)?;
+            } else {
+                self.header
+                    .activity
+                    .work
+                    .as_mut()
+                    .ok_or_else(|| invalid("Session activity work absent"))?
+                    .cleanup += 1;
+            }
+        }
+        Ok(())
+    }
     pub fn open(batch: &'a mut Batch<'s>, sek: &'a Sek, room: &'a Digest32) -> Result<Self> {
         let header = match batch.get_segment(room, KIND, HEADER)? {
             Some(sealed) => {
@@ -440,6 +601,7 @@ impl<'a, 's> Write<'a, 's> {
             room,
             header,
             working: false,
+            activity_working: false,
         })
     }
 
@@ -460,7 +622,7 @@ impl<'a, 's> Write<'a, 's> {
         Ok(self)
     }
 
-    fn root(&self, tree: Tree) -> Result<u64> {
+    pub(super) fn root(&self, tree: Tree) -> Result<u64> {
         if self.working {
             Ok(self
                 .header

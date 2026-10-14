@@ -12,7 +12,9 @@
 //!   is a refusal, never an empty Session list. Restart preserves the published version and
 //!   resumes bounded work without accepting an unauthenticated or partially parsed field.
 
+mod activity_fold;
 mod activity_index;
+mod activity_state;
 mod build;
 mod files;
 mod metadata;
@@ -21,6 +23,7 @@ mod record;
 mod source;
 mod storage;
 mod text;
+mod waiting;
 
 pub(super) mod private_index;
 

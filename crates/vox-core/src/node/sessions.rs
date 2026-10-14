@@ -3,6 +3,9 @@
 //! retained state, with original times, without receiving earlier activity. Legacy room records
 //! remain readable in copies already held (SA-5).
 
+/// Bounded identity/name selection shared by terminal and TUI callers.
+pub mod selection;
+
 use vox_agentcomms::envelope::{Envelope, SESSION, SESSION_END};
 
 use crate::hash::Digest32;
