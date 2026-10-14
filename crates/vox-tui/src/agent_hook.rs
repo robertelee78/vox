@@ -577,7 +577,7 @@ struct Parents {
     /// held, so its absence is not claimed.
     looked_up: bool,
     /// The copies this node pulled in the room, by announcement (ADR-028 F-6).
-    pulled: Vec<vox_core::node::pulls::Pulled>,
+    pulled: std::collections::BTreeMap<Digest32, std::path::PathBuf>,
     /// Where this node puts what it pulls from the room (F-4).
     files: std::path::PathBuf,
 }
@@ -615,17 +615,15 @@ fn share_line(
     parents: &Parents,
 ) -> Option<String> {
     let name = pulled_share(r, me)?;
-    Some(
-        match parents.pulled.iter().find(|p| p.entry == r.entry_hash) {
-            Some(p) => format!("{PULLED_TO}{}\n", p.path.display()),
-            None => format!(
-                "  \u{21b3} not pulled yet: it lands in {}/ once its SHA-256 is verified, and a \
+    Some(match parents.pulled.get(&r.entry_hash) {
+        Some(path) => format!("{PULLED_TO}{}\n", path.display()),
+        None => format!(
+            "  \u{21b3} not pulled yet: it lands in {}/ once its SHA-256 is verified, and a \
                  later turn says where; `vox room get` pulls {} now\n",
-                parents.files.display(),
-                vox_core::node::pulls::safe_file_name(&name)
-            ),
-        },
-    )
+            parents.files.display(),
+            vox_core::node::pulls::safe_file_name(&name)
+        ),
+    })
 }
 
 /// The one-line preview of the message `r` replies to, or `None` when it names none (V030-19).
@@ -1985,7 +1983,7 @@ impl RoomDrain {
         let mut pulling = self.pulling.clone();
         for r in &self.fresh[..shown] {
             if pulled_share(r, me.as_ref()).is_some()
-                && !self.parents.pulled.iter().any(|p| p.entry == r.entry_hash)
+                && !self.parents.pulled.contains_key(&r.entry_hash)
             {
                 pulling.insert(b32_encode(&r.entry_hash));
             }
@@ -2594,9 +2592,12 @@ async fn read_room(
     let mut parent_rows = targets;
     parent_rows.extend(root_rows);
     parent_rows.extend(rows.iter().cloned());
-    let pulled: Vec<vox_core::node::pulls::Pulled> = vox_core::node::pulls::recorded(paths)
-        .into_iter()
+    let pulled = parent_rows
+        .iter()
+        .filter(|row| pulled_share(row, me.as_ref()).is_some())
+        .filter_map(|row| vox_core::node::pulls::recorded_entry(paths, &row.entry_hash))
         .filter(|p| p.room == channel_id)
+        .map(|p| (p.entry, p.path))
         .collect();
     // **Where a share shown before it landed has landed since** (F-6), said once; one whose copy
     // is not there yet waits for a later turn.
@@ -2614,8 +2615,12 @@ async fn read_room(
     })
     .unwrap_or_default();
     let mut landed = Vec::new();
-    pulling.retain(
-        |entry| match pulled.iter().find(|p| b32_encode(&p.entry) == *entry) {
+    pulling.retain(|entry| {
+        match b32_decode(entry, "pull entry")
+            .ok()
+            .and_then(|entry| vox_core::node::pulls::recorded_entry(paths, &entry))
+            .filter(|p| p.room == channel_id)
+        {
             Some(p) => {
                 landed.push(format!(
                     "[{}] the file offered there is pulled: {}",
@@ -2625,8 +2630,8 @@ async fn read_room(
                 false
             }
             None => true,
-        },
-    );
+        }
+    });
     let parents = Parents {
         rows: parent_rows,
         looked_up,

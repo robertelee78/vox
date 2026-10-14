@@ -22,11 +22,11 @@
 //! under the retention this node applies to the room, the daemon deletes the copy and its record.
 //! A copy the person put elsewhere (`--dir`, `--out`) is theirs and is never recorded.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
@@ -219,9 +219,8 @@ impl Pulled {
 }
 
 /// Where a folder `name` shared by `author` in `room` is pulled to under `base`: where an earlier
-/// pull of it went, so pulling it again fetches only what changed (ADR-028 F-8); else `name`, or
-/// the first of `name (1)`, `name (2)` … not already there. With what that earlier pull left in
-/// place, `(path, sha256)`.
+/// pull of it went (ADR-028 F-8); else `name`, or the first of `name (1)`, `name (2)` … not
+/// already there. Historical receipts are visited one at a time.
 #[must_use]
 pub fn folder_dir(
     paths: &Paths,
@@ -229,40 +228,97 @@ pub fn folder_dir(
     room: &Digest32,
     author: &Digest32,
     name: &str,
-) -> (PathBuf, BTreeMap<String, String>) {
+) -> PathBuf {
     let name = safe_file_name(name);
-    let earlier: Vec<Pulled> = recorded(paths)
-        .into_iter()
-        .chain(records_in(&pending_dir(paths)).into_iter().map(|(_, p)| p))
-        .filter(|p| {
+    let earlier = recorded(paths)
+        .chain(records_in(&pending_dir(paths)).map(|(_, p)| p))
+        .find(|p| {
             p.room == *room
                 && p.path.parent() == Some(base)
                 && p.folder.as_ref() == Some(&(*author, name.clone()))
-        })
-        .collect();
-    if let Some(first) = earlier.first() {
-        let mut prior = BTreeMap::new();
-        for p in earlier.iter().filter(|p| p.path == first.path) {
-            prior.extend(p.files.iter().cloned());
-        }
-        return (first.path.clone(), prior);
+        });
+    if let Some(first) = earlier {
+        return first.path;
     }
-    let free = (0..1000)
+    (0..1000)
         .map(|n| base.join(numbered(&name, n)))
         .find(|d| std::fs::symlink_metadata(d).is_err())
-        .unwrap_or_else(|| base.join(&name));
-    (free, BTreeMap::new())
+        .unwrap_or_else(|| base.join(&name))
+}
+
+/// What earlier pulls put at the paths in this verified folder listing. The listing already
+/// has the folder protocol's file/path bounds; older versions cannot grow this map beyond it.
+#[must_use]
+pub fn folder_prior(
+    paths: &Paths,
+    dir: &Path,
+    list: &[crate::node::folder::Listed],
+) -> BTreeMap<String, String> {
+    let wanted: BTreeSet<&str> = list.iter().map(|f| f.path.as_str()).collect();
+    let mut prior = BTreeMap::new();
+    for p in recorded(paths).chain(records_in(&pending_dir(paths)).map(|(_, p)| p)) {
+        if p.path == dir && p.folder.is_some() {
+            for (path, hash) in p.files {
+                if wanted.contains(path.as_str()) {
+                    prior.insert(path, hash);
+                }
+            }
+        }
+    }
+    prior
 }
 
 /// Every pull this node has recorded.
 #[must_use]
-pub fn recorded(paths: &Paths) -> Vec<Pulled> {
-    records(paths).into_iter().map(|(_, p)| p).collect()
+pub fn recorded(paths: &Paths) -> impl Iterator<Item = Pulled> + use<> {
+    records(paths).map(|(_, p)| p)
 }
 
 /// Every pull this node has recorded, with the file that records it.
-fn records(paths: &Paths) -> Vec<(PathBuf, Pulled)> {
-    records_in(&paths.pulls_dir())
+fn records(paths: &Paths) -> impl Iterator<Item = (PathBuf, Pulled)> + use<> {
+    records_in(&paths.pulls_dir()).chain(
+        std::fs::read_dir(paths.pulls_dir().join("records"))
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .flat_map(|entry| records_in(&entry.path())),
+    )
+}
+
+fn entry_receipts(paths: &Paths, entry: &Digest32) -> PathBuf {
+    paths.pulls_dir().join("records").join(b32_encode(entry))
+}
+
+/// Keep the existing receipt until its exact replacement directory entry is durable. If a
+/// previous attempt stopped after linking it, only that same file may complete the move.
+fn move_legacy_receipt(paths: &Paths, file: &Path, entry: &Digest32) -> Result<(), String> {
+    let group = entry_receipts(paths, entry);
+    let to = group.join(file.file_name().ok_or("receipt has no name")?);
+    crate::node::paths::create_private_dir(&group).map_err(|e| e.to_string())?;
+    crate::node::paths::sync_dir(&group).map_err(|e| e.to_string())?;
+    if let Some(parent) = group.parent() {
+        crate::node::paths::sync_dir(parent).map_err(|e| e.to_string())?;
+    }
+    if let Err(error) = std::fs::hard_link(file, &to) {
+        #[cfg(unix)]
+        let same = {
+            use std::os::unix::fs::MetadataExt as _;
+            std::fs::metadata(file)
+                .ok()
+                .zip(std::fs::metadata(&to).ok())
+                .is_some_and(|(a, b)| a.dev() == b.dev() && a.ino() == b.ino())
+        };
+        #[cfg(not(unix))]
+        let same = false;
+        if error.kind() != std::io::ErrorKind::AlreadyExists || !same {
+            return Err(error.to_string());
+        }
+    }
+    crate::node::paths::sync_dir(&to).map_err(|e| e.to_string())?;
+    std::fs::remove_file(file).map_err(|e| e.to_string())?;
+    crate::node::paths::sync_dir(file).map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_file(receipt_index(paths, entry));
+    Ok(())
 }
 
 /// Where a folder pull under way is recorded until it completes: so one cut short is resumed in
@@ -300,18 +356,102 @@ pub fn finish(paths: &Paths, pulled: &Pulled) -> Result<(), String> {
 }
 
 /// Every record in `dir`, with the file that holds it.
-fn records_in(dir: &Path) -> Vec<(PathBuf, Pulled)> {
-    let Ok(dir) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    dir.filter_map(Result::ok)
+fn records_in(dir: &Path) -> impl Iterator<Item = (PathBuf, Pulled)> + use<> {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|x| x == "json"))
         .filter_map(|p| {
-            let v = serde_json::from_slice::<serde_json::Value>(&std::fs::read(&p).ok()?).ok()?;
-            Some((p, Pulled::from_json(&v)?))
+            let record = read_record(&p)?;
+            Some((p, record))
         })
-        .collect()
+}
+
+fn read_record(path: &Path) -> Option<Pulled> {
+    read_record_checked(path).ok().flatten()
+}
+
+fn read_record_checked(path: &Path) -> Result<Option<Pulled>, String> {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    let value = serde_json::from_reader::<_, serde_json::Value>(file)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    Pulled::from_json(&value)
+        .map(Some)
+        .ok_or_else(|| format!("{}: invalid pull receipt", path.display()))
+}
+
+fn receipt_index(paths: &Paths, entry: &Digest32) -> PathBuf {
+    paths
+        .pulls_dir()
+        .join("by-entry")
+        .join(format!("{}.json", b32_encode(entry)))
+}
+
+/// A derived exact-entry pointer. Failure to save it cannot turn a completed, durable pull
+/// into a failure: the authoritative receipt remains readable by the streaming fallback.
+fn index_record(paths: &Paths, file: &Path, entry: &Digest32) {
+    let Some(name) = file.file_name() else {
+        return;
+    };
+    let path = receipt_index(paths, entry);
+    if let Some(dir) = path.parent() {
+        if crate::node::paths::create_private_dir(dir).is_ok() {
+            let _ = crate::node::paths::write_private_file_unique(
+                &path,
+                name.to_string_lossy().as_bytes(),
+            );
+        }
+    }
+}
+
+/// One completed offer, without loading other offers' bodies or folder manifests. The
+/// streaming fallback upgrades the derived pointer for receipts written by an earlier build.
+#[must_use]
+pub fn recorded_entry(paths: &Paths, entry: &Digest32) -> Option<Pulled> {
+    if let Some((_, pulled)) =
+        records_in(&entry_receipts(paths, entry)).find(|(_, pulled)| pulled.entry == *entry)
+    {
+        return Some(pulled);
+    }
+    let prefix = format!("{}.", b32_encode(entry));
+    if let Ok(name) = std::fs::read_to_string(receipt_index(paths, entry)) {
+        let name = Path::new(&name);
+        if name.components().count() == 1
+            && name
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with(&prefix))
+        {
+            if let Some(p) = read_record(&paths.pulls_dir().join(name)) {
+                if p.entry == *entry {
+                    return Some(p);
+                }
+            }
+        }
+    }
+    // Filter names BEFORE opening records: an absent pointer never opens all historical
+    // folder manifests just to find a single entry.
+    for file in std::fs::read_dir(paths.pulls_dir())
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        if !file.file_name().to_string_lossy().starts_with(&prefix) {
+            continue;
+        }
+        if let Some(p) = read_record(&file.path()) {
+            if p.entry == *entry {
+                index_record(paths, &file.path(), entry);
+                return Some(p);
+            }
+        }
+    }
+    None
 }
 
 /// Record that `pulled` was put in the node's files directory, so it is deleted when its message
@@ -322,19 +462,25 @@ fn records_in(dir: &Path) -> Vec<(PathBuf, Pulled)> {
 pub fn record(paths: &Paths, pulled: &Pulled) -> Result<(), String> {
     let mut nonce = [0u8; 8];
     getrandom::fill(&mut nonce).map_err(|e| format!("no randomness for the record: {e}"))?;
-    let dir = paths.pulls_dir();
+    // The authoritative receipts themselves are addressed by entry. A not-yet-pulled offer
+    // therefore costs an exact directory lookup, not a walk over every completed transfer.
+    // The flat earlier layout remains readable and is moved incrementally by the sweeper.
+    let dir = entry_receipts(paths, &pulled.entry);
+    let file = dir.join(format!(
+        "{}.{}.json",
+        b32_encode(&pulled.entry),
+        hex(&nonce)
+    ));
     crate::node::paths::create_private_dir(&dir)
         .and_then(|()| {
-            crate::node::paths::write_private_file(
-                &dir.join(format!(
-                    "{}.{}.json",
-                    b32_encode(&pulled.entry),
-                    hex(&nonce)
-                )),
-                pulled.to_json().to_string().as_bytes(),
-            )
+            crate::node::paths::sync_dir(&dir)?;
+            if let Some(parent) = dir.parent() {
+                crate::node::paths::sync_dir(parent)?;
+            }
+            crate::node::paths::write_private_file(&file, pulled.to_json().to_string().as_bytes())
         })
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// The directory a room's pulled files land in.
@@ -381,19 +527,58 @@ pub fn numbered(name: &str, n: usize) -> String {
     }
 }
 
-/// What is known about one announcement this node may pull.
-enum State {
-    /// Pulling now.
-    Running(Offer),
-    /// Failed; tried again once this instant has passed, after waiting `wait`.
+/// A retry/refusal belongs beside the saved pull records, not in a growing resident map.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedState {
+    room: Digest32,
+    created_ms: u64,
+    state: SavedKind,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+enum SavedKind {
     Waiting {
-        until: Instant,
-        wait: Duration,
-        room: Digest32,
+        until_ms: u64,
+        wait_ms: u64,
         why: String,
     },
-    /// Asked for and failed (`get`): said until it is asked for again, or pulled by itself.
-    Failed { room: Digest32, why: String },
+    Failed {
+        why: String,
+    },
+    Short,
+}
+
+fn state_path(paths: &Paths, entry: &Digest32) -> PathBuf {
+    paths
+        .pulls_dir()
+        .join("states")
+        .join(format!("{}.json", b32_encode(entry)))
+}
+
+fn saved_state(paths: &Paths, entry: &Digest32) -> Result<Option<SavedState>, String> {
+    let path = state_path(paths, entry);
+    let file = match std::fs::File::open(&path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("reading {}: {e}", path.display())),
+    };
+    serde_json::from_reader(file)
+        .map(Some)
+        .map_err(|e| format!("reading {}: {e}", path.display()))
+}
+
+fn save_state(paths: &Paths, offer: &Offer, state: SavedKind) -> Result<(), String> {
+    let path = state_path(paths, &offer.entry);
+    let dir = path.parent().ok_or("pull state has no directory")?;
+    let bytes = serde_json::to_vec(&SavedState {
+        room: offer.room,
+        created_ms: offer.created_ms,
+        state,
+    })
+    .map_err(|e| e.to_string())?;
+    crate::node::paths::create_private_dir(dir)
+        .and_then(|()| crate::node::paths::write_private_file_unique(&path, &bytes))
+        .map_err(|e| e.to_string())
 }
 
 /// Where one offer's pull stands on this node, for a client to say (ADR-028 F-3; D5).
@@ -422,6 +607,141 @@ pub enum PullState {
 struct ScanCursor {
     last_room: Option<Digest32>,
     pages: BTreeMap<Digest32, Option<crate::node::api::HistoryCursor>>,
+    session_pages: BTreeMap<Digest32, Option<crate::node::api::HistoryCursor>>,
+}
+
+/// A retained directory cursor costs no per-receipt memory. Even invalid/non-record files
+/// consume a sweep slot, so a directory full of them cannot make one daemon turn unbounded.
+#[derive(Default)]
+struct ExpireCursor {
+    entries: Option<std::fs::ReadDir>,
+    group_entries: Option<std::fs::ReadDir>,
+    phase: usize,
+    folder: Option<FolderExpiry>,
+    failure: Option<String>,
+}
+
+/// At most one expired folder waits while its other receipts are checked in bounded turns.
+/// Keeping an iterator, rather than completing that scan inside one sweep slot, avoids an
+/// entire-history walk for each folder on one daemon turn.
+struct FolderExpiry {
+    receipt: PathBuf,
+    pulled: Pulled,
+    other: Box<dyn Iterator<Item = Result<PathBuf, String>> + Send>,
+    revision: [Option<std::time::SystemTime>; 3],
+}
+
+fn receipt_paths(paths: &Paths) -> impl Iterator<Item = Result<PathBuf, String>> + use<> {
+    let paths = paths.clone();
+    let mut cursor = ExpireCursor::default();
+    let mut done = false;
+    std::iter::from_fn(move || {
+        if done {
+            return None;
+        }
+        let file = cursor.next(&paths);
+        if let Some(why) = cursor.failure.take() {
+            done = true;
+            return Some(Err(why));
+        }
+        let file = file?;
+        if cursor.phase == 3 {
+            done = true;
+            return None;
+        }
+        Some(Ok(file))
+    })
+}
+
+fn receipt_revision(paths: &Paths) -> Result<[Option<std::time::SystemTime>; 3], String> {
+    let modified = |dir: PathBuf| match std::fs::metadata(&dir) {
+        Ok(meta) => meta
+            .modified()
+            .map(Some)
+            .map_err(|e| format!("{}: {e}", dir.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("{}: {e}", dir.display())),
+    };
+    Ok([
+        modified(paths.pulls_dir())?,
+        modified(paths.pulls_dir().join("records"))?,
+        modified(pending_dir(paths))?,
+    ])
+}
+
+fn forget_receipt(paths: &Paths, receipt: &Path, entry: &Digest32) {
+    if std::fs::remove_file(receipt).is_ok() {
+        let index = receipt_index(paths, entry);
+        if std::fs::read_to_string(&index)
+            .is_ok_and(|name| Some(std::ffi::OsStr::new(&name)) == receipt.file_name())
+        {
+            let _ = std::fs::remove_file(index);
+        }
+        let group = entry_receipts(paths, entry);
+        if receipt.parent() == Some(group.as_path()) {
+            let _ = std::fs::remove_dir(group);
+        }
+    }
+}
+
+impl ExpireCursor {
+    fn open_dir(&mut self, path: &Path) -> Option<std::fs::ReadDir> {
+        match std::fs::read_dir(path) {
+            Ok(entries) => Some(entries),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                self.failure = Some(format!("{}: {e}", path.display()));
+                None
+            }
+        }
+    }
+
+    fn entry_path(&mut self, entry: std::io::Result<std::fs::DirEntry>) -> PathBuf {
+        match entry {
+            Ok(entry) => entry.path(),
+            Err(e) => {
+                self.failure = Some(e.to_string());
+                PathBuf::new()
+            }
+        }
+    }
+
+    fn next(&mut self, paths: &Paths) -> Option<PathBuf> {
+        for _ in 0..4 {
+            if self.phase == 1 {
+                if let Some(entries) = &mut self.group_entries {
+                    if let Some(entry) = entries.next() {
+                        return Some(self.entry_path(entry));
+                    }
+                    self.group_entries = None;
+                    return Some(PathBuf::new());
+                }
+            }
+            if self.entries.is_none() {
+                let dir = match self.phase {
+                    0 => paths.pulls_dir(),
+                    1 => paths.pulls_dir().join("records"),
+                    2 => pending_dir(paths),
+                    _ => paths.pulls_dir().join("states"),
+                };
+                self.entries = self.open_dir(&dir);
+            }
+            if let Some(entry) = self.entries.as_mut().and_then(Iterator::next) {
+                if self.phase == 1 {
+                    let path = self.entry_path(entry);
+                    self.group_entries = self.open_dir(&path);
+                    return Some(PathBuf::new());
+                }
+                return Some(self.entry_path(entry));
+            }
+            self.entries = None;
+            self.phase = (self.phase + 1) % 4;
+            if self.phase == 0 {
+                return None;
+            }
+        }
+        None
+    }
 }
 
 /// The pulls of one node.
@@ -431,12 +751,11 @@ pub(crate) struct Pulls {
     view: watch::Receiver<NodeView>,
     history: crate::node::actor::HistoryReader,
     cursor: Mutex<ScanCursor>,
+    expiry: std::sync::Mutex<ExpireCursor>,
     events: tokio::sync::broadcast::Sender<crate::node::api::NodeEvent>,
-    /// Entries held back for want of room on the disk, already said once.
-    short: Mutex<HashSet<Digest32>>,
-    /// Entries decided for good: pulled, or never this node's to pull.
-    settled: Mutex<HashSet<Digest32>>,
-    pending: Mutex<BTreeMap<Digest32, State>>,
+    /// The transfer future owns its offer. Cancellation drops that ownership, so an
+    /// interrupted client cannot leave a running slot stuck forever. At most AT_ONCE keys.
+    running: Mutex<BTreeMap<Digest32, std::sync::Weak<Offer>>>,
 }
 
 impl std::fmt::Debug for Pulls {
@@ -715,13 +1034,12 @@ impl Pulls {
         let pulls = Arc::new(Self {
             history,
             cursor: Mutex::new(ScanCursor::default()),
+            expiry: std::sync::Mutex::new(ExpireCursor::default()),
             events,
-            short: Mutex::new(HashSet::new()),
-            settled: Mutex::new(recorded(&paths).into_iter().map(|p| p.entry).collect()),
             paths,
             cmd,
             view,
-            pending: Mutex::new(BTreeMap::new()),
+            running: Mutex::new(BTreeMap::new()),
         });
         let held = Arc::clone(&pulls);
         tokio::spawn(async move {
@@ -732,36 +1050,130 @@ impl Pulls {
                     () = tokio::time::sleep(SCAN) => {}
                 }
                 Arc::clone(&pulls).scan().await;
-                pulls.expire();
+                let expiring = Arc::clone(&pulls);
+                // Folder checks can read/hash files. They must not occupy a Tokio worker or
+                // borrow the current node view while doing disk I/O.
+                let _ = tokio::task::spawn_blocking(move || expiring.expire()).await;
                 tokio::time::sleep(SCAN).await;
             }
         });
         held
     }
 
-    /// Where each pull of `room` stands that is not done: pulling, waiting to try again, or
-    /// asked for and failed (D5). A pulled one is in [`recorded`].
-    pub(crate) async fn states(&self, room: &Digest32) -> Vec<(Digest32, PullState)> {
-        let pending = self.pending.lock().await;
-        pending
+    /// The bounded previous listing contract. Larger retained sets require exact-entry
+    /// queries; never allocate all saved failures just to discover that the reply is too big.
+    pub(crate) async fn states(
+        &self,
+        room: &Digest32,
+    ) -> Result<Vec<(Digest32, PullState)>, String> {
+        let active: Vec<Digest32> = self
+            .running
+            .lock()
+            .await
             .iter()
-            .filter_map(|(entry, s)| match s {
-                State::Running(o) if o.room == *room => Some((
-                    *entry,
-                    PullState::Pulling {
-                        bytes: std::fs::metadata(self.part_of(o)).map_or(0, |m| m.len()),
-                        of: o.size,
-                    },
-                )),
-                State::Waiting { room: r, why, .. } if r == room => {
-                    Some((*entry, PullState::Waiting { why: why.clone() }))
+            .filter(|(_, o)| o.upgrade().is_some_and(|o| o.room == *room))
+            .map(|(e, _)| *e)
+            .collect();
+        let mut entries = active;
+        for file in std::fs::read_dir(self.paths.pulls_dir().join("states"))
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let name = file.file_name();
+            let Some(id) = name.to_str().and_then(|n| n.strip_suffix(".json")) else {
+                continue;
+            };
+            let Ok(entry) = b32_decode(id, "pull entry") else {
+                continue;
+            };
+            if entries.contains(&entry) {
+                continue;
+            }
+            if saved_state(&self.paths, &entry)?
+                .is_some_and(|s| s.room == *room && !matches!(s.state, SavedKind::Short))
+            {
+                if entries.len() == 64 {
+                    return Err("this room has more pull states than one reply holds; read the states of the displayed entries".into());
                 }
-                State::Failed { room: r, why } if r == room => {
-                    Some((*entry, PullState::Failed { why: why.clone() }))
+                entries.push(entry);
+            }
+        }
+        self.states_for(room, &entries).await
+    }
+
+    /// Only the requested visible entries, never the node's complete saved transfer history.
+    pub(crate) async fn states_for(
+        &self,
+        room: &Digest32,
+        entries: &[Digest32],
+    ) -> Result<Vec<(Digest32, PullState)>, String> {
+        if entries.len() > 64 {
+            return Err("at most 64 pull states may be read at once".into());
+        }
+        let running = self.running.lock().await;
+        let mut out = Vec::new();
+        let mut bytes = 0usize;
+        for entry in entries {
+            let state = if let Some(o) = running
+                .get(entry)
+                .and_then(std::sync::Weak::upgrade)
+                .filter(|o| o.room == *room)
+            {
+                Some(PullState::Pulling {
+                    bytes: std::fs::metadata(self.part_of(&o)).map_or(0, |m| m.len()),
+                    of: o.size,
+                })
+            } else {
+                match saved_state(&self.paths, entry)?
+                    .filter(|s| s.room == *room)
+                    .map(|s| s.state)
+                {
+                    Some(SavedKind::Waiting { why, .. }) => Some(PullState::Waiting { why }),
+                    Some(SavedKind::Failed { why }) => Some(PullState::Failed { why }),
+                    Some(SavedKind::Short) | None => None,
                 }
-                _ => None,
-            })
-            .collect()
+            };
+            if let Some(state) = state {
+                bytes += 64
+                    + match &state {
+                        PullState::Waiting { why } | PullState::Failed { why } => why.len(),
+                        PullState::Pulling { .. } => 0,
+                    };
+                if bytes > 512 * 1024 && !out.is_empty() {
+                    return Err(
+                        "these pull states exceed one reply's byte budget; read fewer entries"
+                            .into(),
+                    );
+                }
+                out.push((*entry, state));
+            }
+        }
+        Ok(out)
+    }
+
+    fn note_short(&self, offer: &Offer) -> bool {
+        if matches!(
+            saved_state(&self.paths, &offer.entry),
+            Ok(Some(SavedState {
+                state: SavedKind::Short,
+                ..
+            }))
+        ) {
+            return false;
+        }
+        if let Err(why) = save_state(&self.paths, offer, SavedKind::Short) {
+            self.say_state_error(why);
+        }
+        true
+    }
+
+    fn say_state_error(&self, why: String) {
+        let _ = self.events.send(crate::node::api::NodeEvent::NodeNote {
+            note: format!(
+                "could not save/read a pull's retry state; it will be checked again: {why}"
+            ),
+        });
     }
 
     /// **Pull one offer now, as `vox room get` does** (ADR-028 F-3; D5): whoever it is addressed
@@ -774,53 +1186,60 @@ impl Pulls {
     /// The offer cannot be found or pulled, said in plain words.
     pub(crate) async fn get(&self, room: Digest32, entry: Digest32) -> Result<PathBuf, String> {
         let landed = |paths: &Paths| {
-            recorded(paths)
-                .into_iter()
-                .find(|p| p.room == room && p.entry == entry && p.path.exists())
+            recorded_entry(paths, &entry)
+                .filter(|p| p.room == room && p.path.exists())
+                .or_else(|| {
+                    let prefix = format!("{}.", b32_encode(&entry));
+                    std::fs::read_dir(entry_receipts(paths, &entry))
+                        .into_iter()
+                        .flatten()
+                        .chain(std::fs::read_dir(paths.pulls_dir()).into_iter().flatten())
+                        .flatten()
+                        .filter(|f| f.file_name().to_string_lossy().starts_with(&prefix))
+                        .filter_map(|f| read_record(&f.path()))
+                        .find(|p| p.room == room && p.entry == entry && p.path.exists())
+                })
                 .map(|p| p.path)
         };
-        let offer = self.offer_of(&room, &entry).await?;
+        let offer = Arc::new(self.offer_of(&room, &entry).await?);
         loop {
             if let Some(path) = landed(&self.paths) {
                 return Ok(path);
             }
-            let mut pending = self.pending.lock().await;
-            if matches!(pending.get(&entry), Some(State::Running(_))) {
-                drop(pending);
+            let mut running = self.running.lock().await;
+            running.retain(|_, offer| offer.strong_count() > 0);
+            if running.contains_key(&entry) || running.len() >= AT_ONCE {
+                drop(running);
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 continue;
             }
             let dir = room_dir(&self.paths, &room);
             let _ = crate::node::paths::create_private_dir(&dir);
             if let Some(why) = short_of_space(&dir, offer.size) {
-                pending.insert(
-                    entry,
-                    State::Failed {
-                        room,
-                        why: why.clone(),
-                    },
-                );
+                if let Err(e) =
+                    save_state(&self.paths, &offer, SavedKind::Failed { why: why.clone() })
+                {
+                    self.say_state_error(e);
+                }
                 return Err(why);
             }
-            pending.insert(entry, State::Running(offer.clone()));
+            running.insert(entry, Arc::downgrade(&offer));
             break;
         }
         let done = self.pull(&offer).await;
-        let mut pending = self.pending.lock().await;
+        let mut running = self.running.lock().await;
+        running.remove(&entry);
         match done {
             Ok(()) => {
-                pending.remove(&entry);
-                self.settled.lock().await.insert(entry);
+                let _ = std::fs::remove_file(state_path(&self.paths, &entry));
                 landed(&self.paths).ok_or_else(|| "it was pulled, but its record is gone".into())
             }
             Err(why) => {
-                pending.insert(
-                    entry,
-                    State::Failed {
-                        room,
-                        why: why.clone(),
-                    },
-                );
+                if let Err(e) =
+                    save_state(&self.paths, &offer, SavedKind::Failed { why: why.clone() })
+                {
+                    self.say_state_error(e);
+                }
                 Err(why)
             }
         }
@@ -834,6 +1253,11 @@ impl Pulls {
             .await?
             .into_iter()
             .next();
+        let session = if row.is_none() {
+            self.history.session_file(*room, *entry).await?
+        } else {
+            None
+        };
         let now = now_ms();
         let view = self.view.borrow();
         let me = view.identity.as_ref().map(|i| i.fingerprint);
@@ -847,7 +1271,7 @@ impl Pulls {
                 return Err("that message has not arrived yet".into());
             }
             (r.author, r.created_millis, offer_fields(&r.text, None))
-        } else if let Some(r) = d.session_files.iter().find(|r| r.entry_hash == *entry) {
+        } else if let Some(r) = session.as_ref() {
             (r.author, r.created_millis, offer_in_session(&r.body))
         } else {
             return Err("no message in this room has that id".into());
@@ -899,7 +1323,7 @@ impl Pulls {
         let now = now_ms();
         // One room and one bounded offer page per turn. A completed cycle starts again,
         // so granting trust later still discovers an older offer.
-        let (room, after) = {
+        let (room, after, session_after) = {
             let mut cursor = self.cursor.lock().await;
             let view = self.view.borrow();
             if view.locked || view.identity.is_none() {
@@ -907,6 +1331,9 @@ impl Pulls {
             }
             cursor
                 .pages
+                .retain(|room, _| view.open_channels.iter().any(|d| d.channel_id == *room));
+            cursor
+                .session_pages
                 .retain(|room, _| view.open_channels.iter().any(|d| d.channel_id == *room));
             // Rotate after one page, even on a read failure. An unending offer stream in
             // one room cannot prevent another open room's file from being considered.
@@ -921,11 +1348,15 @@ impl Pulls {
                 return;
             };
             cursor.last_room = Some(room);
-            (room, cursor.pages.get(&room).copied().flatten())
+            (
+                room,
+                cursor.pages.get(&room).copied().flatten(),
+                cursor.session_pages.get(&room).copied().flatten(),
+            )
         };
         let page = match self
             .history
-            .typed_page(room, vec![crate::node::shares::FILE.to_owned()], after, 64)
+            .typed_page(room, vec![crate::node::shares::FILE.to_owned()], after, 32)
             .await
         {
             Ok(page) => page,
@@ -936,10 +1367,21 @@ impl Pulls {
                 return;
             }
         };
-        let mut found: Vec<Offer> = Vec::new();
-        let mut never: Vec<Digest32> = Vec::new();
+        let session_page = match self
+            .history
+            .session_files_page(room, session_after, 32)
+            .await
         {
-            let settled = self.settled.lock().await;
+            Ok(page) => Some(page),
+            Err(e) => {
+                let _ = self.events.send(crate::node::api::NodeEvent::NodeNote {
+                    note: format!("could not read Session file offers; will retry: {e}"),
+                });
+                None
+            }
+        };
+        let mut found: Vec<Offer> = Vec::new();
+        {
             let view = self.view.borrow();
             let Some(me) = view.identity.as_ref().map(|i| i.fingerprint) else {
                 return;
@@ -950,7 +1392,7 @@ impl Pulls {
             let me_b32 = b32_encode(&me);
             if let Some(d) = view.open_channels.iter().find(|d| d.channel_id == room) {
                 for r in &page.rows {
-                    if r.owed || settled.contains(&r.entry_hash) || r.author == me {
+                    if r.owed || r.author == me {
                         continue;
                     }
                     let Some((name, size, sha256, tag, http, files)) = offer_in(&r.text, &me_b32)
@@ -981,20 +1423,15 @@ impl Pulls {
                 }
                 // **A file a Session sent out** (ADR-029 DR-1.8): this node opened its entry, so
                 // its node trusts it with drive; it is pulled as a share addressed to it is.
-                for r in &d.session_files {
-                    if settled.contains(&r.entry_hash) {
-                        continue;
-                    }
+                for r in session_page.as_ref().into_iter().flat_map(|p| &p.rows) {
                     let Some((name, size, sha256, tag, http, files)) = offer_in_session(&r.body)
                     else {
-                        never.push(r.entry_hash);
                         continue;
                     };
                     let created = r.created_millis.min(now);
                     if d.retention > 0
                         && now >= created.saturating_add(d.retention.saturating_mul(1_000))
                     {
-                        never.push(r.entry_hash);
                         continue;
                     }
                     if !view.trusted.iter().any(|(fp, _)| *fp == r.author) {
@@ -1016,23 +1453,28 @@ impl Pulls {
             }
         }
         self.cursor.lock().await.pages.insert(room, page.next);
-        self.settled.lock().await.extend(never);
-        let mut pending = self.pending.lock().await;
-        let mut running = pending
-            .values()
-            .filter(|s| matches!(s, State::Running(_)))
-            .count();
-        let at = Instant::now();
+        if let Some(page) = session_page {
+            self.cursor
+                .lock()
+                .await
+                .session_pages
+                .insert(room, page.next);
+        }
+        let mut running = self.running.lock().await;
+        running.retain(|_, offer| offer.strong_count() > 0);
         for offer in found {
-            if running >= AT_ONCE {
+            if running.len() >= AT_ONCE {
                 break;
+            }
+            if recorded_entry(&self.paths, &offer.entry).is_some() {
+                continue;
             }
             // **Not dialled while it would fill the disk**, and said once; looked at again on the
             // next scan rather than retried on a timer.
             let dir = room_dir(&self.paths, &offer.room);
             let _ = crate::node::paths::create_private_dir(&dir);
             if let Some(why) = short_of_space(&dir, offer.size) {
-                if self.short.lock().await.insert(offer.entry) {
+                if self.note_short(&offer) {
                     let who = self
                         .view
                         .borrow()
@@ -1054,34 +1496,50 @@ impl Pulls {
                 }
                 continue;
             }
-            let wait = match pending.get(&offer.entry) {
-                Some(State::Running(_)) => continue,
-                Some(State::Waiting { until, .. }) if *until > at => continue,
-                Some(State::Waiting { wait, .. }) => *wait,
-                Some(State::Failed { .. }) | None => RETRY_MIN / 2,
+            if running.contains_key(&offer.entry) {
+                continue;
+            }
+            let wait_ms = match saved_state(&self.paths, &offer.entry) {
+                Ok(Some(SavedState {
+                    state: SavedKind::Waiting { until_ms, .. },
+                    ..
+                })) if until_ms > now => continue,
+                Ok(Some(SavedState {
+                    state: SavedKind::Waiting { wait_ms, .. },
+                    ..
+                })) => wait_ms,
+                Ok(_) => RETRY_MIN.as_millis() as u64 / 2,
+                Err(why) => {
+                    self.say_state_error(why);
+                    continue;
+                }
             };
-            pending.insert(offer.entry, State::Running(offer.clone()));
-            running += 1;
+            let offer = Arc::new(offer);
+            running.insert(offer.entry, Arc::downgrade(&offer));
             let pulls = Arc::clone(&self);
             tokio::spawn(async move {
                 let done = pulls.pull(&offer).await;
-                let mut pending = pulls.pending.lock().await;
+                let mut running = pulls.running.lock().await;
+                running.remove(&offer.entry);
                 match done {
                     Ok(()) => {
-                        pending.remove(&offer.entry);
-                        pulls.settled.lock().await.insert(offer.entry);
+                        let _ = std::fs::remove_file(state_path(&pulls.paths, &offer.entry));
                     }
                     Err(why) => {
-                        let wait = (wait * 2).clamp(RETRY_MIN, RETRY_MAX);
-                        pending.insert(
-                            offer.entry,
-                            State::Waiting {
-                                until: Instant::now() + wait,
-                                wait,
-                                room: offer.room,
+                        let wait_ms = wait_ms
+                            .saturating_mul(2)
+                            .clamp(RETRY_MIN.as_millis() as u64, RETRY_MAX.as_millis() as u64);
+                        if let Err(e) = save_state(
+                            &pulls.paths,
+                            &offer,
+                            SavedKind::Waiting {
+                                until_ms: now_ms().saturating_add(wait_ms),
+                                wait_ms,
                                 why,
                             },
-                        );
+                        ) {
+                            pulls.say_state_error(e);
+                        }
                     }
                 }
             });
@@ -1135,7 +1593,7 @@ impl Pulls {
     /// what is not already there as listed. A pull cut short is not recorded, so it is tried again,
     /// and that try keeps every file the first one finished.
     async fn pull_folder(&self, offer: &Offer, base: &Path, count: u64) -> Result<(), String> {
-        let (dir, prior) = folder_dir(&self.paths, base, &offer.room, &offer.author, &offer.name);
+        let dir = folder_dir(&self.paths, base, &offer.room, &offer.author, &offer.name);
         crate::node::paths::create_private_dir(&dir).map_err(|e| e.to_string())?;
         let bound = match self
             .apply(NodeCommand::Forward {
@@ -1159,6 +1617,7 @@ impl Pulls {
         };
         let pulled = match crate::node::folder::fetch_list(bound, &offer.sha256, count).await {
             Ok(list) => {
+                let prior = folder_prior(&self.paths, &dir, &list);
                 pull.files = list
                     .iter()
                     .map(|f| (f.path.clone(), f.sha256.clone()))
@@ -1180,62 +1639,149 @@ impl Pulls {
         finish(&self.paths, &pull)
     }
 
-    /// Delete every pulled copy whose message has expired here, and its record (ADR-028 F-5).
-    /// A room this node does not hold open is left until it does: its retention is not known.
+    /// Visit a bounded portion of the saved receipts. A closed room is left alone until its
+    /// retention is known again. Receipts and the folder-reference check are streamed, never
+    /// collected into a second copy of all the node's retained history.
     fn expire(&self) {
         let now = now_ms();
-        // Read before the view is borrowed: a borrow held holds up the node's next view. A folder
-        // pull cut short is one too: its files go with its message.
-        let mut all = records(&self.paths);
-        all.extend(records_in(&pending_dir(&self.paths)));
-        if all.is_empty() {
-            return;
-        }
-        let due: Vec<(PathBuf, Pulled)> = {
+        let retention: Option<BTreeMap<Digest32, u64>> = {
             let view = self.view.borrow();
-            if view.locked {
-                return;
+            (!view.locked).then(|| {
+                view.open_channels
+                    .iter()
+                    .map(|d| (d.channel_id, d.retention))
+                    .collect()
+            })
+        };
+        let Some(retention) = retention else {
+            if let Ok(mut cursor) = self.expiry.lock() {
+                *cursor = ExpireCursor::default();
             }
-            all.iter()
-                .filter(|(_, p)| {
-                    view.open_channels.iter().any(|d| {
-                        d.channel_id == p.room
-                            && d.retention > 0
-                            && now
-                                >= p.created_ms
-                                    .saturating_add(d.retention.saturating_mul(1_000))
-                    })
-                })
-                .cloned()
-                .collect()
+            return;
+        };
+        let due = |p: &Pulled| {
+            retention.get(&p.room).is_some_and(|ttl| {
+                *ttl > 0 && now >= p.created_ms.saturating_add(ttl.saturating_mul(1_000))
+            })
+        };
+        let Ok(mut cursor) = self.expiry.lock() else {
+            return;
         };
         let files = self.paths.files_dir();
-        let due_files: HashSet<PathBuf> = due.iter().map(|(f, _)| f.clone()).collect();
-        for (file, p) in due {
-            // Only what lies in the node's files directory is the node's to delete.
+        for _ in 0..64 {
+            if let Some(mut folder) = cursor.folder.take() {
+                // Retention may have changed while this bounded scan was suspended.
+                if !due(&folder.pulled) {
+                    continue;
+                }
+                match folder.other.next() {
+                    Some(Err(why)) => {
+                        self.say_state_error(why);
+                    }
+                    Some(Ok(file)) => {
+                        let still_held = if file != folder.receipt
+                            && file.extension().is_some_and(|x| x == "json")
+                        {
+                            match read_record_checked(&file) {
+                                Ok(other) => other.is_some_and(|other| {
+                                    other.path == folder.pulled.path && !due(&other)
+                                }),
+                                Err(why) => {
+                                    self.say_state_error(why);
+                                    continue;
+                                }
+                            }
+                        } else {
+                            false
+                        };
+                        if still_held {
+                            forget_receipt(&self.paths, &folder.receipt, &folder.pulled.entry);
+                        } else {
+                            cursor.folder = Some(folder);
+                        }
+                    }
+                    None => {
+                        match receipt_revision(&self.paths) {
+                            Ok(revision) if revision != folder.revision => {
+                                folder.revision = revision;
+                                folder.other = Box::new(receipt_paths(&self.paths));
+                                cursor.folder = Some(folder);
+                                continue;
+                            }
+                            Err(why) => {
+                                self.say_state_error(why);
+                                continue;
+                            }
+                            Ok(_) => {}
+                        }
+                        remove_folder_copy(&folder.pulled.path, &folder.pulled.files);
+                        forget_receipt(&self.paths, &folder.receipt, &folder.pulled.entry);
+                    }
+                }
+                continue;
+            }
+            let file = cursor.next(&self.paths);
+            if let Some(why) = cursor.failure.take() {
+                self.say_state_error(why);
+            }
+            let Some(file) = file else {
+                break;
+            };
+            if !file.extension().is_some_and(|x| x == "json") {
+                continue;
+            }
+            if cursor.phase == 3 {
+                let saved = std::fs::File::open(&file)
+                    .ok()
+                    .and_then(|f| serde_json::from_reader::<_, SavedState>(f).ok());
+                if saved.is_some_and(|s| {
+                    retention.get(&s.room).is_some_and(|ttl| {
+                        *ttl > 0 && now >= s.created_ms.saturating_add(ttl.saturating_mul(1_000))
+                    })
+                }) {
+                    let _ = std::fs::remove_file(file);
+                }
+                continue;
+            }
+            let Some(p) = read_record(&file) else {
+                continue;
+            };
+            if !due(&p) {
+                if cursor.phase == 0 {
+                    if let Err(why) = move_legacy_receipt(&self.paths, &file, &p.entry) {
+                        self.say_state_error(why);
+                    }
+                }
+                continue;
+            }
             let ours = p.path.starts_with(&files)
                 && !p
                     .path
                     .components()
                     .any(|c| c == std::path::Component::ParentDir);
             if ours && p.folder.is_some() {
-                // **A folder copy goes with the last message that put it there**: a newer pull of
-                // the same folder, whose message has not expired, keeps it.
-                let still_held = all
-                    .iter()
-                    .any(|(f, o)| !due_files.contains(f) && o.path == p.path);
-                if !still_held {
-                    remove_folder_copy(&p.path, &p.files);
-                }
+                let revision = match receipt_revision(&self.paths) {
+                    Ok(revision) => revision,
+                    Err(why) => {
+                        self.say_state_error(why);
+                        continue;
+                    }
+                };
+                cursor.folder = Some(FolderExpiry {
+                    receipt: file,
+                    pulled: p,
+                    other: Box::new(receipt_paths(&self.paths)),
+                    revision,
+                });
+                continue;
             } else if ours {
                 match std::fs::remove_file(&p.path) {
                     Ok(()) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    // Tried again on the next look.
                     Err(_) => continue,
                 }
             }
-            let _ = std::fs::remove_file(file);
+            forget_receipt(&self.paths, &file, &p.entry);
         }
     }
 }
