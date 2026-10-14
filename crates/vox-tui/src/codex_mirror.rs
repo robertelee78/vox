@@ -306,7 +306,7 @@ impl Conn {
                     }
                 }
                 let Some(w) = ws.as_mut() else {
-                    self.apply_offline(cmd);
+                    self.apply_offline(cmd).await;
                     continue;
                 };
                 self.command(w, cmd).await;
@@ -359,7 +359,7 @@ impl Conn {
 
     /// A command while the app-server cannot be reached: watching is remembered for the next
     /// connection; an end is applied.
-    fn apply_offline(&mut self, cmd: Cmd) {
+    async fn apply_offline(&mut self, cmd: Cmd) {
         match cmd {
             Cmd::Watch { node, session } => {
                 // Said once in the Session: what it shows comes from the session's hooks alone,
@@ -380,7 +380,9 @@ impl Conn {
                              from now on join the app-server Vox keeps running."
                         ),
                     );
-                    self.sink.activity(&node, &session, split(e, "text"), None);
+                    self.sink
+                        .activity(&node, &session, split(e, "text"), None)
+                        .await;
                 }
                 self.watch(node, session);
             }
@@ -651,7 +653,7 @@ impl Conn {
                 }
             }
             // A request from Codex: an approval or a question.
-            (Some(m), Some(id)) => self.request(&m, id.clone(), v["params"].clone()),
+            (Some(m), Some(id)) => self.request(&m, id.clone(), v["params"].clone()).await,
             (Some(m), None) => self.notification(ws, &m, &v["params"]).await,
             (None, None) => {}
         }
@@ -713,16 +715,16 @@ impl Conn {
             "turn/completed" => {
                 t.turn = None;
                 let e = envelope(&thread, "turn-end", None);
-                self.sink.activity(&node, &thread, split(e, ""), None);
+                self.sink.activity(&node, &thread, split(e, ""), None).await;
             }
             "item/started" => {
                 if let Some(e) = tool_start(&thread, &p["item"]) {
                     t.started.insert(item_id(&p["item"]));
-                    self.sink.activity(&node, &thread, e, None);
+                    self.sink.activity(&node, &thread, e, None).await;
                 }
             }
-            "item/completed" => self.item_completed(&node, &thread, &p["item"]),
-            "serverRequest/resolved" => self.resolved_request(&node, &thread, p),
+            "item/completed" => self.item_completed(&node, &thread, &p["item"]).await,
+            "serverRequest/resolved" => self.resolved_request(&node, &thread, p).await,
             _ => {}
         }
         let unsubscribed = self.threads.get(&thread).is_some_and(|t| !t.subscribed);
@@ -731,7 +733,7 @@ impl Conn {
         }
     }
 
-    fn item_completed(&mut self, node: &NodeName, thread: &str, item: &Value) {
+    async fn item_completed(&mut self, node: &NodeName, thread: &str, item: &Value) {
         let id = item_id(item);
         let kind = item.get("type").and_then(Value::as_str).unwrap_or_default();
         match kind {
@@ -740,7 +742,9 @@ impl Conn {
                 if !text.trim().is_empty() {
                     let mut e = envelope(thread, "reply", None);
                     e.insert("text".into(), json!(text));
-                    self.sink.activity(node, thread, split(e, "text"), None);
+                    self.sink
+                        .activity(node, thread, split(e, "text"), None)
+                        .await;
                 }
             }
             // The prompt comes from the hook (see the module's notes); reasoning and plans are
@@ -754,11 +758,12 @@ impl Conn {
                 // the start is posted first, so the call is not lost.
                 if !t.started.remove(&id) {
                     if let Some(e) = tool_start(thread, item) {
-                        self.sink.activity(node, thread, e, None);
+                        self.sink.activity(node, thread, e, None).await;
                     }
                 }
                 self.sink
-                    .activity(node, thread, tool_done(thread, item), None);
+                    .activity(node, thread, tool_done(thread, item), None)
+                    .await;
                 // An approval of this call settles with the call: Codex's item says what took
                 // effect.
                 if self
@@ -771,7 +776,7 @@ impl Conn {
                         _ => "allowed",
                     };
                     self.asks.remove(&id);
-                    self.sink.resolved(node, thread, &id, outcome, None);
+                    self.sink.resolved(node, thread, &id, outcome, None).await;
                 }
             }
         }
@@ -779,7 +784,7 @@ impl Conn {
 
     /// Codex asks: post it and hold it for the first answer from a member with drive. The
     /// terminal shows it too and may answer first (DR-3); `serverRequest/resolved` says so.
-    fn request(&mut self, method: &str, rpc: Value, params: Value) {
+    async fn request(&mut self, method: &str, rpc: Value, params: Value) {
         let Some(thread) = Self::thread_of(&params).map(str::to_owned) else {
             return;
         };
@@ -802,7 +807,7 @@ impl Conn {
         } else {
             approval_entry(&thread, &r, method, &params)
         };
-        let Some(rx) = self.sink.request(&node, &thread, entry) else {
+        let Some(rx) = self.sink.request(&node, &thread, entry).await else {
             return;
         };
         self.asks.insert(
@@ -839,7 +844,7 @@ impl Conn {
         let _ = send(ws, &json!({"jsonrpc": "2.0", "id": rpc, "result": result})).await;
     }
 
-    fn resolved_request(&mut self, node: &NodeName, thread: &str, p: &Value) {
+    async fn resolved_request(&mut self, node: &NodeName, thread: &str, p: &Value) {
         let rpc = p.get("requestId").cloned().unwrap_or(Value::Null);
         let Some((r, a)) = self.asks.iter_mut().find(|(_, a)| a.rpc == rpc) else {
             return;
@@ -851,7 +856,9 @@ impl Conn {
                 Given::Approve { .. } => None,
             });
             self.asks.remove(&r);
-            self.sink.resolved(node, thread, &r, "answered", answers);
+            self.sink
+                .resolved(node, thread, &r, "answered", answers)
+                .await;
         } else if a.method == "item/permissions/requestApproval" {
             // No item follows a permissions grant: what Vox answered is all there is to say,
             // and when Vox did not answer, the terminal did.
@@ -860,7 +867,7 @@ impl Conn {
                 _ => "allowed",
             };
             self.asks.remove(&r);
-            self.sink.resolved(node, thread, &r, outcome, None);
+            self.sink.resolved(node, thread, &r, outcome, None).await;
         } else {
             a.resolved = true; // its item's completion says allowed or denied
         }

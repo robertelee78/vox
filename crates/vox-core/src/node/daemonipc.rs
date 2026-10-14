@@ -62,6 +62,7 @@ const T_ANCHOR_FAILED: u64 = 4015;
 const T_ANCHOR_RESOLVED: u64 = 4016;
 /// 4020–4029: the Session activity sink (ADR-029 §2, §3).
 const T_SESSION_ANSWER: u64 = 4020;
+const T_SESSION_ACTIVITY: u64 = 4021;
 
 // Client → daemon: the opening frame.
 const T_USE: u64 = 4100;
@@ -384,8 +385,8 @@ pub enum DaemonRequest {
     Stop,
     /// A harness session's activity for its Session (ADR-029 SC-1): `bodies` are entries in the
     /// shared activity format, already split to fit, in the harness's order. Answered
-    /// [`DaemonFrame::Ok`] once they are queued, never after they are sent: a hook must not wait
-    /// on the network inside a model's turn.
+    /// [`DaemonFrame::SessionActivity`] distinguishes committed local acceptance from a
+    /// volatile hold or refusal. A hook never waits for network delivery inside a turn.
     SessionActivity {
         /// The session's node.
         node: NodeName,
@@ -473,6 +474,34 @@ pub enum DaemonEvent {
         /// Why.
         cause: DetachCause,
     },
+}
+
+/// What happened to one batch of mirrored Session activity. Only Committed survives restart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionAdmission {
+    /// Every item is committed to the encrypted inbox, with this sequence range.
+    Committed {
+        /// First sequence committed in this batch.
+        first: u64,
+        /// Last sequence committed in this batch.
+        last: u64,
+    },
+    /// Retained only in the bounded volatile tail; no restart guarantee.
+    Held(String),
+    /// Not retained. The producer must not claim acceptance or silently replay it.
+    Refused(String),
+    /// The receipt disappeared; do not claim either acceptance or rejection, or replay it.
+    Unconfirmed(String),
+    /// This activity has no applicable Session or was an intentionally suppressed copy.
+    Skipped,
+}
+
+impl SessionAdmission {
+    /// The sink owns the activity (possibly only in memory), or it deliberately did not apply.
+    #[must_use]
+    pub fn taken(&self) -> bool {
+        !matches!(self, Self::Refused(_) | Self::Unconfirmed(_))
+    }
 }
 
 /// Why the daemon would not do what a `Use` or a [`DaemonRequest`] asked. Each says what to do; none
@@ -819,6 +848,8 @@ pub enum DaemonFrame {
     /// The answer to a [`DaemonRequest::SessionAsk`]: what the hook gives its harness, or
     /// nothing when the harness settled the request without Vox.
     SessionAnswer(Option<String>),
+    /// Local durable/volatile admission of one activity batch.
+    SessionActivity(SessionAdmission),
     /// What a [`DaemonRequest::RoomAsks`] asked for: one per directory, oldest session first.
     RoomAsks(Vec<RoomAsk>),
     /// What a [`DaemonRequest::RoomBind`] or [`DaemonRequest::RoomDecline`] did: whether it was
@@ -1447,7 +1478,27 @@ impl Opening {
             (T_REQ_SESSION_ACTIVITY, 5) => {
                 let node = name(&mut d, "ipc session activity node")?;
                 let session = text(&mut d, "ipc session activity session")?;
-                let bodies = texts(&mut d, "ipc session activity bodies")?;
+                if session.is_empty() || session.len() > crate::node::content::MAX_SESSION_ID_LEN {
+                    return Err(Error::MalformedIpc("ipc session activity session"));
+                }
+                let count = d
+                    .array()
+                    .map_err(malformed("ipc session activity bodies"))?;
+                if count > crate::node::session_ingress::MAX_BATCH_ITEMS {
+                    return Err(Error::SizeLimitExceeded("Session activity batch"));
+                }
+                let mut bodies = Vec::with_capacity(count);
+                let mut bytes = 0usize;
+                for _ in 0..count {
+                    let body = d.text().map_err(malformed("ipc session activity body"))?;
+                    bytes = bytes
+                        .checked_add(body.len())
+                        .ok_or(Error::SizeLimitExceeded("Session activity batch"))?;
+                    if bytes > crate::node::session_ingress::MAX_BATCH_BYTES {
+                        return Err(Error::SizeLimitExceeded("Session activity batch"));
+                    }
+                    bodies.push(body.to_owned());
+                }
                 let call = match d.array().map_err(malformed("ipc session activity call"))? {
                     0 => None,
                     1 => Some(call(&mut d)?),
@@ -1517,6 +1568,27 @@ impl DaemonFrame {
             DaemonFrame::ComputerFailed(why) => {
                 e.array(2).uint(T_COMPUTER_FAILED).text(why);
             }
+            DaemonFrame::SessionActivity(outcome) => match outcome {
+                SessionAdmission::Committed { first, last } => {
+                    e.array(4)
+                        .uint(T_SESSION_ACTIVITY)
+                        .uint(0)
+                        .uint(*first)
+                        .uint(*last);
+                }
+                SessionAdmission::Held(why) => {
+                    e.array(3).uint(T_SESSION_ACTIVITY).uint(1).text(why);
+                }
+                SessionAdmission::Refused(why) => {
+                    e.array(3).uint(T_SESSION_ACTIVITY).uint(2).text(why);
+                }
+                SessionAdmission::Skipped => {
+                    e.array(2).uint(T_SESSION_ACTIVITY).uint(3);
+                }
+                SessionAdmission::Unconfirmed(why) => {
+                    e.array(3).uint(T_SESSION_ACTIVITY).uint(4).text(why);
+                }
+            },
             DaemonFrame::Ok => {
                 e.array(1).uint(T_DAEMON_OK);
             }
@@ -1732,6 +1804,27 @@ impl DaemonFrame {
             (T_COMPUTER_STATUS, 2) => DaemonFrame::ComputerStatus(text(&mut d, "computer status")?),
             (T_COMPUTER_FAILED, 2) => {
                 DaemonFrame::ComputerFailed(text(&mut d, "computer refusal")?)
+            }
+            (T_SESSION_ACTIVITY, n @ (2..=4)) => {
+                let kind = d.uint().map_err(malformed("ipc Session admission"))?;
+                let outcome = match (kind, n) {
+                    (0, 4) => {
+                        let first = d.uint().map_err(malformed("ipc Session first sequence"))?;
+                        let last = d.uint().map_err(malformed("ipc Session last sequence"))?;
+                        if first == 0 || last < first {
+                            return Err(Error::MalformedIpc("ipc Session sequence range"));
+                        }
+                        SessionAdmission::Committed { first, last }
+                    }
+                    (1, 3) => SessionAdmission::Held(text(&mut d, "ipc Session held")?),
+                    (2, 3) => SessionAdmission::Refused(text(&mut d, "ipc Session refused")?),
+                    (3, 2) => SessionAdmission::Skipped,
+                    (4, 3) => {
+                        SessionAdmission::Unconfirmed(text(&mut d, "ipc Session unconfirmed")?)
+                    }
+                    _ => return Err(Error::MalformedIpc("ipc Session admission kind")),
+                };
+                DaemonFrame::SessionActivity(outcome)
             }
             (T_DAEMON_OK, 1) => DaemonFrame::Ok,
             (T_SESSION_REGISTERED, 5) => {

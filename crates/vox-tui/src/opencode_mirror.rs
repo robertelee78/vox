@@ -235,7 +235,7 @@ impl Follow {
                         Ok(_) if line.len() > MAX_LINE => {}
                         Ok(_) => {
                             if let Ok(v) = serde_json::from_str::<Value>(line.trim_end()) {
-                                self.line(&v);
+                                self.line(&v).await;
                             }
                         }
                     }
@@ -362,7 +362,7 @@ impl Follow {
         Some(self.call(m, reply, String::new()))
     }
 
-    fn line(&mut self, v: &Value) {
+    async fn line(&mut self, v: &Value) {
         match v.get("type").and_then(Value::as_str) {
             Some("result") => {
                 let Some((reply, done)) = v
@@ -383,7 +383,7 @@ impl Follow {
                     ))
                 });
             }
-            Some("event") => self.event(&v["event"]),
+            Some("event") => self.event(&v["event"]).await,
             _ => {}
         }
     }
@@ -407,15 +407,17 @@ impl Follow {
         m
     }
 
-    fn post(&mut self, bodies: Vec<String>) {
+    async fn post(&mut self, bodies: Vec<String>) {
         if !bodies.is_empty() {
             self.ended = false;
-            self.sink.activity(&self.node, &self.session, bodies, None);
+            self.sink
+                .activity(&self.node, &self.session, bodies, None)
+                .await;
         }
     }
 
     /// Post the assistant's text not yet posted, as one reply per session it came from.
-    fn flush_replies(&mut self) {
+    async fn flush_replies(&mut self) {
         let texts = std::mem::take(&mut self.texts);
         let mut by: Vec<(String, String)> = Vec::new();
         for (sid, _, t) in texts {
@@ -433,11 +435,11 @@ impl Follow {
         for (sid, text) in by {
             let mut e = self.envelope(&sid, "reply", None);
             e.insert("text".into(), json!(text));
-            self.post(split(e, "text"));
+            self.post(split(e, "text")).await;
         }
     }
 
-    fn event(&mut self, ev: &Value) {
+    async fn event(&mut self, ev: &Value) {
         let p = &ev["properties"];
         let sid = p
             .get("sessionID")
@@ -469,7 +471,7 @@ impl Follow {
                 }
             }
             "message.part.updated" => {
-                self.part(&sid, &p["part"]);
+                self.part(&sid, &p["part"]).await;
             }
             // **A rename is the Session's name at once** (ADR-029 MD-1): OpenCode's title, set by
             // `/rename`, by Vox's own rename, or made by OpenCode itself, arrives only here.
@@ -485,17 +487,18 @@ impl Follow {
                 }
             }
             "session.idle" if sid == self.session => {
-                self.flush_replies();
+                self.flush_replies().await;
                 if !self.ended {
-                    self.post(split(self.envelope(&sid, "turn-end", None), ""));
+                    self.post(split(self.envelope(&sid, "turn-end", None), ""))
+                        .await;
                     self.ended = true;
                 }
             }
             "permission.asked" => {
-                self.permission(&sid, p);
+                self.permission(&sid, p).await;
             }
             "question.asked" => {
-                self.question(&sid, p);
+                self.question(&sid, p).await;
             }
             "permission.replied" => {
                 let Some(r) = p.get("requestID").and_then(Value::as_str) else {
@@ -507,7 +510,8 @@ impl Follow {
                         _ => "allowed",
                     };
                     self.sink
-                        .resolved(&self.node, &self.session, r, outcome, None);
+                        .resolved(&self.node, &self.session, r, outcome, None)
+                        .await;
                 }
             }
             t @ ("question.replied" | "question.rejected") => {
@@ -517,7 +521,8 @@ impl Follow {
                 if let Some(ask) = self.asks.remove(r) {
                     if t == "question.rejected" {
                         self.sink
-                            .resolved(&self.node, &self.session, r, "cancelled", None);
+                            .resolved(&self.node, &self.session, r, "cancelled", None)
+                            .await;
                     } else {
                         // What OpenCode took, in the shape the member gave it when it is the
                         // member's answer, so the sink can say who answered (DR-4).
@@ -529,7 +534,8 @@ impl Follow {
                             _ => took,
                         };
                         self.sink
-                            .resolved(&self.node, &self.session, r, "answered", answers);
+                            .resolved(&self.node, &self.session, r, "answered", answers)
+                            .await;
                     }
                 }
             }
@@ -537,7 +543,7 @@ impl Follow {
         }
     }
 
-    fn part(&mut self, sid: &str, part: &Value) {
+    async fn part(&mut self, sid: &str, part: &Value) {
         let pid = part.get("id").and_then(Value::as_str).unwrap_or_default();
         let mid = part
             .get("messageID")
@@ -559,7 +565,7 @@ impl Follow {
                         }
                         let mut e = self.envelope(sid, "user", None);
                         e.insert("text".into(), json!(text));
-                        self.post(split(e, "text"));
+                        self.post(split(e, "text")).await;
                     }
                     _ => match self.texts.iter_mut().find(|(_, id, _)| id == pid) {
                         Some(slot) => slot.2 = text.to_owned(),
@@ -569,12 +575,12 @@ impl Follow {
                     },
                 }
             }
-            "tool" => self.tool(sid, part),
+            "tool" => self.tool(sid, part).await,
             _ => {}
         }
     }
 
-    fn tool(&mut self, sid: &str, part: &Value) {
+    async fn tool(&mut self, sid: &str, part: &Value) {
         let call = part
             .get("callID")
             .or_else(|| part.get("id"))
@@ -592,22 +598,20 @@ impl Follow {
             .and_then(Value::as_str)
             .unwrap_or_default();
         let input = state.get("input").cloned().unwrap_or(json!({}));
-        let start = |me: &mut Self| {
-            if me.started.insert(call.clone()) {
-                // What the assistant said before this call is posted before it.
-                me.flush_replies();
-                let text = input_text(&tool, &input);
-                let mut e = me.envelope(sid, "tool", Some(&call));
-                e.insert("tool".into(), json!(tool));
-                e.insert("summary".into(), json!(one_line(&text)));
-                e.insert("input".into(), json!(text));
-                me.post(split(e, "input"));
-            }
-        };
+        if matches!(status, "running" | "completed" | "error") && self.started.insert(call.clone())
+        {
+            // Admit earlier reply text before this call, without spawning an unbounded waiter.
+            self.flush_replies().await;
+            let text = input_text(&tool, &input);
+            let mut e = self.envelope(sid, "tool", Some(&call));
+            e.insert("tool".into(), json!(tool));
+            e.insert("summary".into(), json!(one_line(&text)));
+            e.insert("input".into(), json!(text));
+            self.post(split(e, "input")).await;
+        }
         match status {
-            "running" => start(self),
+            "running" => {}
             "completed" | "error" if self.finished.insert(call.clone()) => {
-                start(self);
                 let ok = status == "completed";
                 let output = if ok {
                     state
@@ -636,13 +640,13 @@ impl Follow {
                 e.insert("ok".into(), json!(ok));
                 e.insert("summary".into(), json!(one_line(&summary)));
                 e.insert("output".into(), json!(output));
-                self.post(split(e, "output"));
+                self.post(split(e, "output")).await;
             }
             _ => {}
         }
     }
 
-    fn permission(&mut self, sid: &str, p: &Value) {
+    async fn permission(&mut self, sid: &str, p: &Value) {
         let Some(id) = p.get("id").and_then(Value::as_str).map(str::to_owned) else {
             return;
         };
@@ -675,10 +679,11 @@ impl Follow {
             })),
         );
         e.insert("input".into(), json!(input));
-        self.ask(id, "approval", Vec::new(), Value::Object(e).to_string());
+        self.ask(id, "approval", Vec::new(), Value::Object(e).to_string())
+            .await;
     }
 
-    fn question(&mut self, sid: &str, p: &Value) {
+    async fn question(&mut self, sid: &str, p: &Value) {
         let Some(id) = p.get("id").and_then(Value::as_str).map(str::to_owned) else {
             return;
         };
@@ -700,11 +705,12 @@ impl Follow {
             .collect();
         let mut e = self.envelope(sid, "question", Some(&id));
         e.insert("questions".into(), json!(shown));
-        self.ask(id, "question", questions, Value::Object(e).to_string());
+        self.ask(id, "question", questions, Value::Object(e).to_string())
+            .await;
     }
 
-    fn ask(&mut self, id: String, of: &'static str, questions: Vec<Value>, entry: String) {
-        let Some(rx) = self.sink.request(&self.node, &self.session, entry) else {
+    async fn ask(&mut self, id: String, of: &'static str, questions: Vec<Value>, entry: String) {
+        let Some(rx) = self.sink.request(&self.node, &self.session, entry).await else {
             return;
         };
         self.asks.insert(

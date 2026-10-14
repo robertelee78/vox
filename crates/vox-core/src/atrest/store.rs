@@ -85,6 +85,8 @@ pub enum SegmentKind {
     EntryIndex,
     /// Unpublished wire entries, including unsigned checkpoint suffixes.
     ProvisionalLog,
+    /// Node-identity-sealed activity accepted before its room can append it.
+    SessionIngress,
 }
 
 impl SegmentKind {
@@ -101,6 +103,7 @@ impl SegmentKind {
             SegmentKind::PrivateSession => b"vox/seg/private-session/v1",
             SegmentKind::EntryIndex => b"vox/seg/entry-index/v1",
             SegmentKind::ProvisionalLog => b"vox/seg/provisional-log/v1",
+            SegmentKind::SessionIngress => b"vox/seg/session-ingress/v1",
         }
     }
 }
