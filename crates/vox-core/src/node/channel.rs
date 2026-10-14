@@ -3380,10 +3380,15 @@ impl ChannelState {
         prepared
     }
 
-    fn publish_entry_into(&mut self, batch: &mut crate::node::store::Batch<'_>) -> Result<()> {
+    fn publish_entry_into(
+        &mut self,
+        batch: &mut crate::node::store::Batch<'_>,
+        entry: &Entry,
+    ) -> Result<()> {
         let mut index = self.entries.write(batch, &self.sek, &self.channel_id)?;
         index.publish_promotion()?;
-        index.seal()
+        index.seal()?;
+        session_projection::private_index::observe_public(batch, &self.sek, &self.channel_id, entry)
     }
 
     fn finish_entry_publication(&mut self, store: &Store) -> Result<()> {
@@ -3506,7 +3511,7 @@ impl ChannelState {
                 now_millis,
             )?;
             let mut batch = profile.store().batch()?;
-            self.publish_entry_into(&mut batch)?;
+            self.publish_entry_into(&mut batch, &entry)?;
             batch.commit()
         })();
         if let Err(e) = persisted {
@@ -5330,7 +5335,7 @@ impl ChannelState {
         let persisted = (|| -> Result<()> {
             self.prepare_entry(profile.store(), &entry, kind, &signer.public_key(), now_ms)?;
             let mut batch = profile.store().batch()?;
-            self.publish_entry_into(&mut batch)?;
+            self.publish_entry_into(&mut batch, &entry)?;
             batch.commit()
         })();
         if let Err(e) = persisted {
@@ -5420,6 +5425,19 @@ impl ChannelState {
         let persisted = (|| -> Result<()> {
             let mut batch = store.batch()?;
             for (hash, tracked) in &due {
+                let entry = self
+                    .dag
+                    .get_by_hash(
+                        &self.entries.in_batch(&batch, &self.sek, &self.channel_id)?,
+                        hash,
+                    )?
+                    .ok_or(Error::MalformedAtRest("pruned control entry missing"))?;
+                session_projection::private_index::observe_public(
+                    &mut batch,
+                    &self.sek,
+                    &self.channel_id,
+                    &entry,
+                )?;
                 {
                     let mut index = self
                         .entries
@@ -5609,7 +5627,7 @@ impl ChannelState {
         let written = (|| -> Result<()> {
             self.prepare_entry(profile.store(), &entry, kind, &key, now_ms)?;
             let mut batch = profile.store().batch()?;
-            self.publish_entry_into(&mut batch)?;
+            self.publish_entry_into(&mut batch, &entry)?;
             batch.put_segment(&self.channel_id, SegmentKind::LogDb, id, &log_seg)?;
             for (row, seg) in rows {
                 batch.put_segment(&self.channel_id, SegmentKind::KeyMaterial, *row, seg)?;
@@ -6172,6 +6190,12 @@ impl ChannelState {
                         index.remove_staged(&author, seq)?;
                         index.seal()?;
                     }
+                    session_projection::private_index::observe_public(
+                        &mut batch,
+                        &self.sek,
+                        &self.channel_id,
+                        &held,
+                    )?;
                     if promotion.is_none() {
                         logged += 1;
                     }
@@ -6327,6 +6351,7 @@ impl ChannelState {
             return Err(e);
         }
         self.entries.committed();
+        self.private_controls_committed(store)?;
         self.chains_advanced = false;
         // Only now, after the commit: `SessionRoom::apply` reports `stored` from the generation,
         // and ADR-025 credits the peer from it, so it must count exactly the rows now durable —
@@ -6516,28 +6541,13 @@ impl ChannelState {
     /// session that brought it, when the node opens it): before that, nothing here can tell the key
     /// changed, and the session's node is the authority on whom it lets drive (DR-2).
     pub fn drive_from(&self, store: &Store) -> Result<Vec<Digest32>> {
-        let ns = drive_channel(&self.channel_id);
-        let entries = self.entries.read(store, &self.sek, &self.channel_id)?;
+        if !self.private_controls_ready(store)? {
+            return Err(Error::StreamRefused("Session control facts are refreshing"));
+        }
         let held: BTreeSet<Digest32> = self.drive.receivers.keys().map(|(a, _)| *a).collect();
         let mut from = BTreeSet::new();
         for author in held {
-            let mut legacy = None;
-            if let Some(feed) = self.dag.feed(&author) {
-                for seq in (1..=feed.max_seq()).rev() {
-                    let Some(entry) = feed.get(&entries, seq)? else {
-                        continue;
-                    };
-                    if let Some(msg) = entry
-                        .payload
-                        .as_deref()
-                        .and_then(|p| GroupMessage::from_wire(p).ok())
-                        .filter(|m| m.header.channel_id == ns)
-                    {
-                        legacy = Some(msg.header.chain_id);
-                        break;
-                    }
-                }
-            }
+            let legacy = self.legacy_drive_generation(store, &author)?;
             let announced = self
                 .drive
                 .floors
@@ -6545,11 +6555,7 @@ impl ChannelState {
                 .filter(|(a, _, epoch, _)| *a == author && *epoch <= self.epoch)
                 .map(|(_, _, _, generation)| *generation)
                 .max();
-            let newest = legacy
-                .into_iter()
-                .chain(announced)
-                .chain(self.legacy_drive_generation(&author))
-                .max();
+            let newest = legacy.into_iter().chain(announced).max();
             if newest.is_none_or(|g| self.drive.receivers.contains_key(&(author, g)))
                 || self.packages_from.contains(&author)
             {
@@ -7745,7 +7751,7 @@ impl ChannelState {
         let persisted = (|| -> Result<()> {
             self.prepare_entry(store, &entry, kind, &key, now_ms)?;
             let mut batch = store.batch()?;
-            self.publish_entry_into(&mut batch)?;
+            self.publish_entry_into(&mut batch, &entry)?;
             if kind == EntryKind::Content && gov.is_none() && entry.payload.is_some() {
                 self.track_body_into(&mut batch, entry_hash, id, now_ms)?;
             }
@@ -7945,7 +7951,7 @@ impl ChannelState {
                 now_millis,
             )?;
             let mut batch = profile.store().batch()?;
-            self.publish_entry_into(&mut batch)?;
+            self.publish_entry_into(&mut batch, &entry)?;
             batch.put_segment(&self.channel_id, SegmentKind::LogDb, id, &log_seg)?;
             batch.put_segment(
                 &self.channel_id,
@@ -8257,7 +8263,7 @@ impl ChannelState {
                 now_millis,
             )?;
             let mut batch = profile.store().batch()?;
-            self.publish_entry_into(&mut batch)?;
+            self.publish_entry_into(&mut batch, &entry)?;
             batch.put_segment(&self.channel_id, SegmentKind::LogDb, id, &log_seg)?;
             batch.put_segment(
                 &self.channel_id,

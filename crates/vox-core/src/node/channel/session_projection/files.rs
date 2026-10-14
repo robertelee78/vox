@@ -68,7 +68,13 @@ impl ChannelState {
         if self.needs_session_upgrade() {
             return Err("the room is refreshing saved Sessions; retry".into());
         }
-        match self.private_expiry_ready(store, now) {
+        match self.private_controls_ready(store).and_then(|ready| {
+            if ready {
+                self.private_expiry_ready(store, now)
+            } else {
+                Ok(false)
+            }
+        }) {
             Ok(true) => {}
             Ok(false) => return Err("the room is refreshing saved Sessions; retry".into()),
             Err(error) => {

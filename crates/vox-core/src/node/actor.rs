@@ -367,6 +367,17 @@ fn detail_of(
     })
 }
 
+/// A pending bounded Session fold is not an I/O failure. Keep the last good
+/// display while exact Session queries refuse; real local failures still poison.
+fn detail_failed(ch: &mut ChannelState, error: &Error) {
+    if !matches!(
+        error,
+        Error::StreamRefused("Session control facts are refreshing")
+    ) {
+        ch.poison(error);
+    }
+}
+
 /// A room's lock if it can be had by `deadline`. A free lock is taken even once the deadline has
 /// passed: only a held one is given up.
 async fn by<T>(
@@ -16164,7 +16175,7 @@ impl Node {
                         self.fresh_details
                             .insert(channel_id, (summary_of(&ch), detail));
                     }
-                    Err(error) => ch.poison(&error),
+                    Err(error) => detail_failed(&mut ch, &error),
                 }
             }
             written
@@ -16458,7 +16469,7 @@ impl Node {
                     self.fresh_details
                         .insert(*channel_id, (summary_of(&ch), detail));
                 }
-                Err(error) => ch.poison(&error),
+                Err(error) => detail_failed(&mut ch, &error),
             }
         }
         self.note_local_append(channel_id);
@@ -16504,7 +16515,7 @@ impl Node {
                     self.fresh_details
                         .insert(*channel_id, (summary_of(&ch), detail));
                 }
-                Err(error) => ch.poison(&error),
+                Err(error) => detail_failed(&mut ch, &error),
             }
         }
         self.note_local_append(channel_id);
@@ -16538,7 +16549,7 @@ impl Node {
                     self.fresh_details
                         .insert(*channel_id, (summary_of(&ch), detail));
                 }
-                Err(error) => ch.poison(&error),
+                Err(error) => detail_failed(&mut ch, &error),
             }
         }
         self.note_local_append(channel_id);
@@ -17998,17 +18009,23 @@ impl Node {
         for channel_id in channels {
             let before = self.session_projection_revision(&channel_id).await;
             self.tend_drive_keys_in(&channel_id, &holders).await;
-            changed |= before != self.session_projection_revision(&channel_id).await;
+            let after = self.session_projection_revision(&channel_id).await;
+            // A failed read also schedules publication, where its actual error is
+            // reported/poisoned; it must not silently look like an unchanged token.
+            changed |= before.is_err() || after.is_err() || before.ok() != after.ok();
         }
         changed
     }
 
-    async fn session_projection_revision(&self, channel_id: &Digest32) -> Option<Digest32> {
+    async fn session_projection_revision(
+        &self,
+        channel_id: &Digest32,
+    ) -> crate::error::Result<Digest32> {
         let (Some(profile), Some(shared)) = (self.profile.as_ref(), self.channels.get(channel_id))
         else {
-            return None;
+            return Err(Error::AtRestLocked);
         };
-        shared.lock().await.sessions_revision(profile.store()).ok()
+        shared.lock().await.sessions_revision(profile.store())
     }
 
     /// This node's drive key in one room (ADR-029 SC-2a, SC-2b): **changed first** if a member it
@@ -18030,6 +18047,11 @@ impl Node {
                 return;
             };
             let mut ch = shared.lock().await;
+            // Recovery/control catch-up must run before an announcement can refuse
+            // for pending facts, or the same refusal would starve its own repair.
+            if ch.advance_sessions(profile.store(), now_millis).is_err() {
+                return;
+            }
             // Ordinary-key declarations name only this node's authenticated legacy hashes.
             // They let read-only peers identify withheld steps without granting drive.
             if ch.announce_legacy_sessions(profile, now_millis).is_err() {
@@ -18045,9 +18067,6 @@ impl Node {
                 return;
             }
             use crate::node::channel::session_projection::{Query, Reply};
-            if ch.advance_sessions(profile.store(), now_millis).is_err() {
-                return;
-            }
             let has_session = match ch.session_query(
                 profile.store(),
                 Query::HasOpen {
@@ -18172,7 +18191,7 @@ impl Node {
                 self.fresh_details
                     .insert(*channel_id, (summary_of(&ch), detail));
             }
-            Err(error) => ch.poison(&error),
+            Err(error) => detail_failed(&mut ch, &error),
         }
         drop(ch);
         let channel_id = *channel_id;
@@ -18462,9 +18481,9 @@ impl Node {
                     open_channels.push(detail);
                 }
                 Err(error) => {
-                    // Preserve the last successful view; storage health names the failure and
-                    // the existing recovery path reopens this poisoned room before more work.
-                    ch.poison(&error);
+                    // Preserve the last successful view during bounded Session catch-up.
+                    // Actual I/O failure still poisons and follows existing recovery.
+                    detail_failed(&mut ch, &error);
                     if let Some(detail) = self
                         .fresh_details
                         .get(id)

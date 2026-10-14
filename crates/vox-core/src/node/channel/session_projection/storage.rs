@@ -50,9 +50,10 @@ pub(super) enum Tree {
     RefreshRecords,
     PrivateAge,
     PrivateStepAge,
+    Controls,
 }
 
-const TREES: usize = 29;
+const TREES: usize = 30;
 
 impl Tree {
     fn index(self) -> usize {
@@ -86,6 +87,7 @@ impl Tree {
             Self::RefreshRecords => 26,
             Self::PrivateAge => 27,
             Self::PrivateStepAge => 28,
+            Self::Controls => 29,
         }
     }
 }
@@ -202,11 +204,14 @@ impl Header {
         }
         let next = d.uint()?;
         let revision = d.uint()?;
-        if next == 0 || d.array()? != TREES {
+        let stored_trees = d.array()?;
+        // These are append-only derived roots within the current development format. Keep
+        // every original locator; startup streams the absent private/control facts.
+        if next == 0 || !matches!(stored_trees, 26 | 29 | TREES) {
             return Err(invalid("Session index header roots"));
         }
         let mut roots = [0; TREES];
-        for root in &mut roots {
+        for root in &mut roots[..stored_trees] {
             *root = d.uint()?;
             if *root >= next {
                 return Err(invalid("Session index root exceeds allocator"));
@@ -270,11 +275,11 @@ impl Header {
                             .map_err(|_| invalid("Session build cursor"))?,
                     ),
                 };
-                if d.array()? != TREES {
+                if d.array()? != stored_trees {
                     return Err(invalid("Session build roots"));
                 }
                 let mut roots = [0; TREES];
-                for root in &mut roots {
+                for root in &mut roots[..stored_trees] {
                     *root = d.uint()?;
                     if *root >= next {
                         return Err(invalid("Session work root exceeds allocator"));
@@ -763,6 +768,7 @@ impl<'a, 's> Write<'a, 's> {
             Tree::RefreshRecords,
             Tree::PrivateAge,
             Tree::PrivateStepAge,
+            Tree::Controls,
         ];
         self.working = true;
         for _ in 0..limit {

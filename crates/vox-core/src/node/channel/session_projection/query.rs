@@ -300,7 +300,7 @@ impl ChannelState {
             return Err(REFRESHING.into());
         }
         let result = (|| -> Answer<Reply> {
-            if !self.private_expiry_ready(store, now)? {
+            if !self.private_controls_ready(store)? || !self.private_expiry_ready(store, now)? {
                 return Err(Failure::Request(REFRESHING));
             }
             let snapshot = store.snapshot()?;
