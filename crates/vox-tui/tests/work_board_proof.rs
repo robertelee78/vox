@@ -437,12 +437,16 @@ fn member_work_roundtrip(alice: &Worker, bob: &Worker, room: &str) {
             "--to-session",
             "bob",
             "--ttl",
-            "60",
+            "600",
             "--json",
         ],
     );
     handoff.expect_ok("hand member-panel work to bob's exact Session");
-    let handoff_id = handoff.json()["entry_hash"]
+    let handoff_json = handoff.json();
+    let deadline = handoff_json["state"]["deadline_millis"]
+        .as_u64()
+        .expect("PRODUCT: handoff omitted its public deadline");
+    let handoff_id = handoff_json["entry_hash"]
         .as_str()
         .expect("PRODUCT: handoff has no hash")
         .to_owned();
@@ -458,21 +462,26 @@ fn member_work_roundtrip(alice: &Worker, bob: &Worker, room: &str) {
             re: None,
         },
     );
+    handoff_live(deadline);
     let pending = bob.vox(Some("bob"), &["room", "board", room, "--json"]);
+    handoff_live(deadline);
     pending.expect_ok("read the pending handoff");
     assert!(pending.json()["work"].as_array().is_some_and(|rows| rows.iter().any(|r|
         r["type"] == "handoff" && r["entry_hash"] == handoff_id && r["member"] == bob.b32()
             && r["session"] == "bob" && r["author"] == alice.b32() && r["from"] == "alice"
             && r["resource"] == WORK)),
         "PRODUCT: pending handoff omitted the exact recipient or authenticated sender/Session: {pending:?}");
+    handoff_live(deadline);
     let accepted = bob.vox(
         Some("bob"),
         &[
             "room", "claim", room, "--work", WORK, "--task", "#769", "--json",
         ],
     );
+    handoff_live(deadline);
     accepted.expect_ok("bob accepts the exact handoff by claiming");
     let accepted_board = bob.vox(Some("bob"), &["room", "board", room, "--json"]);
+    handoff_live(deadline);
     accepted_board.expect_ok("read the accepted handoff");
     let accepted_json = accepted_board.json();
     let accepted_work = accepted_json["work"]
@@ -490,6 +499,14 @@ fn member_work_roundtrip(alice: &Worker, bob: &Worker, room: &str) {
             .as_array()
             .is_some_and(|rs| !rs.iter().any(|r| r["type"] == "claim" && r["work"] == WORK)),
         "PRODUCT: a fresh board retained the released claim: {fresh:?}"
+    );
+}
+
+fn handoff_live(deadline: u64) {
+    let observed = now_ms();
+    assert!(
+        observed < deadline,
+        "APPARATUS: handoff lease expired before its non-TTL assertion; public deadline={deadline}, observed={observed}"
     );
 }
 
