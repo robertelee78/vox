@@ -314,13 +314,13 @@ fn detail_of(
         return Err(ch.save_failure());
     }
     let (frozen, refused_below_checkpoint) = ch.fork_watch();
-    let (timeline, structured, row_index, display_stamp, display_revision) = if let Some(p) =
+    // The remaining materialized projection is used only by Session folding until its
+    // dependent streaming projection is composed. Public readers use sealed history queries.
+    let (timeline, display_stamp, display_revision) = if let Some(p) =
         prev.filter(|p| ch.display_is_current(&p.display_stamp))
     {
         (
             p.timeline.clone(),
-            p.structured.clone(),
-            p.row_index.clone(),
             p.display_stamp.clone(),
             p.display_revision,
         )
@@ -336,43 +336,14 @@ fn detail_of(
                 && p.timeline.last().map(|r| r.entry_hash)
                     == n.checked_sub(1).map(|i| rows[i].entry_hash)
         });
-        // All three projections use the same prefix decision. First/last hashes alone
-        // cannot establish that a middle row's text, position or late flag is unchanged.
-        let (timeline, structured, base, from) = match prefix {
-            Some(p) => {
-                let from = p.timeline.len();
-                (
-                    p.timeline.appended(rows[from..].iter().map(row_of)),
-                    p.structured
-                        .appended(from, rows[from..].iter().map(|r| &r.text)),
-                    p.row_index.clone(),
-                    from,
-                )
-            }
-            None => (
-                rows.iter().map(row_of).collect(),
-                crate::node::api::StructuredIndex::default()
-                    .appended(0, rows.iter().map(|r| &r.text)),
-                crate::node::api::OpRuns::default(),
-                0,
-            ),
+        let timeline = match prefix {
+            Some(p) => p
+                .timeline
+                .appended(rows[p.timeline.len()..].iter().map(row_of)),
+            None => rows.iter().map(row_of).collect(),
         };
-        let row_index = base.appended(
-            rows[from..]
-                .iter()
-                .enumerate()
-                .filter_map(|(i, r)| {
-                    Some((
-                        u64::from_be_bytes(r.entry_hash[..8].try_into().ok()?),
-                        u32::try_from(from + i).ok()?,
-                    ))
-                })
-                .collect(),
-        );
         (
             timeline,
-            structured,
-            row_index,
             stamp,
             sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         )
@@ -390,9 +361,6 @@ fn detail_of(
         last_arrival: ch.last_arrival(store)?,
         display_stamp,
         display_revision,
-        row_index,
-        order: ch.order_keys(store)?,
-        structured,
         services: ch
             .services()
             .iter()

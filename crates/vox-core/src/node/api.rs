@@ -246,140 +246,6 @@ impl<T: Clone + std::fmt::Debug> std::fmt::Debug for Chunks<T> {
     }
 }
 
-/// Where a room's **structured posts** sit in its timeline (V210-120): by `type`, and by
-/// operation id.
-///
-/// A structured post is a body that parses as a JSON object with a string `type`; it may carry an
-/// operation id, a string at `data.op`. Nothing here knows what any `type` or id means: a client
-/// names the types and ids it wants ([`crate::node::ipc::Request::Structured`]) and is served those
-/// rows. A client that needed a room's claims, or the posts under one operation id, read every row
-/// of the room for them, every time, so its work grew with the room's history. Filled as rows are
-/// added, never rebuilt, and shared like the timeline.
-#[derive(Clone, Default, PartialEq, Eq)]
-pub struct StructuredIndex {
-    /// Positions in the timeline, oldest first, of the posts of each `type`.
-    pub by_type: std::collections::BTreeMap<String, Chunks<u32>>,
-    /// The posts carrying an operation id, by a hash of the id.
-    pub by_op: OpRuns,
-    /// Positions in the timeline, oldest first, of the messages carrying each tag (#636). Built
-    /// from rendered rows, so only from messages this node can read: a tag is part of its
-    /// message, and a node that cannot open the message holds no tag of it.
-    pub by_tag: std::collections::BTreeMap<String, Chunks<u32>>,
-    /// Reply positions by the General message they name (ADR-033 TH-4). Readable rows only.
-    pub by_thread: std::collections::BTreeMap<Digest32, Chunks<u32>>,
-}
-
-impl std::fmt::Debug for StructuredIndex {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("StructuredIndex")
-            .field(
-                "by_type",
-                &self
-                    .by_type
-                    .iter()
-                    .map(|(t, c)| (t, c.len()))
-                    .collect::<Vec<_>>(),
-            )
-            .field("by_op", &self.by_op.len())
-            .field("by_tag", &self.by_tag.len())
-            .field("by_thread", &self.by_thread.len())
-            .finish()
-    }
-}
-
-/// `(hash of an operation id, position)` pairs in sorted runs, each run sorted by hash.
-///
-/// A new post's pair becomes a run of one, and the newest two runs merge while the older is no
-/// longer than the newer, as a binary counter carries: so there are about log2(n) runs, an append
-/// does amortized O(log n) work, a lookup is a binary search in each run, and a clone copies one
-/// pointer per run. (The ids are many, one or a few per post, so a map of them would be copied
-/// whole on every append the view is shared across.)
-#[derive(Clone, Default, PartialEq, Eq)]
-pub struct OpRuns {
-    runs: Vec<std::sync::Arc<[(u64, u32)]>>,
-    len: usize,
-}
-
-impl OpRuns {
-    /// How many pairs.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    /// Whether there are none.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    /// These runs with `pairs` added.
-    #[must_use]
-    pub fn appended(&self, mut pairs: Vec<(u64, u32)>) -> Self {
-        if pairs.is_empty() {
-            return self.clone();
-        }
-        pairs.sort_unstable();
-        let mut next = self.clone();
-        next.len += pairs.len();
-        next.runs.push(pairs.into());
-        while let [.., older, newer] = next.runs.as_slice() {
-            if older.len() > newer.len() {
-                break;
-            }
-            let mut merged: Vec<(u64, u32)> = Vec::with_capacity(older.len() + newer.len());
-            let (mut i, mut j) = (0, 0);
-            while i < older.len() && j < newer.len() {
-                if older[i] <= newer[j] {
-                    merged.push(older[i]);
-                    i += 1;
-                } else {
-                    merged.push(newer[j]);
-                    j += 1;
-                }
-            }
-            merged.extend_from_slice(&older[i..]);
-            merged.extend_from_slice(&newer[j..]);
-            next.runs.pop();
-            next.runs.pop();
-            next.runs.push(merged.into());
-        }
-        next
-    }
-
-    /// The positions of the posts whose id hashes to `hash`, in no order. A hash can collide, so
-    /// a caller checks the id itself.
-    #[must_use]
-    pub fn find(&self, hash: u64) -> Vec<u32> {
-        let mut out = Vec::new();
-        for run in &self.runs {
-            let from = run.partition_point(|(h, _)| *h < hash);
-            out.extend(
-                run[from..]
-                    .iter()
-                    .take_while(|(h, _)| *h == hash)
-                    .map(|(_, p)| *p),
-            );
-        }
-        out
-    }
-}
-
-impl std::fmt::Debug for OpRuns {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "OpRuns({} in {} runs)", self.len, self.runs.len())
-    }
-}
-
-/// The hash an operation id is indexed by: FNV-1a, 64 bits. Not a security boundary: a collision
-/// only serves a client a row it then discards.
-#[must_use]
-pub fn op_hash(op: &str) -> u64 {
-    op.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| {
-        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
-    })
-}
-
 /// A structured post's `type` and operation id, or `None` for any other body.
 #[must_use]
 pub fn structured_kind(text: &str) -> Option<(String, Option<String>)> {
@@ -421,91 +287,6 @@ pub fn message_tags(text: &str) -> Vec<String> {
     tags.sort();
     tags.dedup();
     tags
-}
-
-impl StructuredIndex {
-    /// This index with the bodies of the rows at `start..` of a timeline added.
-    #[must_use]
-    pub fn appended<'a>(&self, start: usize, texts: impl IntoIterator<Item = &'a String>) -> Self {
-        let mut by_type: std::collections::BTreeMap<String, Vec<u32>> =
-            std::collections::BTreeMap::new();
-        let mut by_tag: std::collections::BTreeMap<String, Vec<u32>> =
-            std::collections::BTreeMap::new();
-        let mut by_thread: std::collections::BTreeMap<Digest32, Vec<u32>> =
-            std::collections::BTreeMap::new();
-        let mut ops = Vec::new();
-        for (i, text) in texts.into_iter().enumerate() {
-            let at = u32::try_from(start + i).unwrap_or(u32::MAX);
-            if let Some(root) = vox_agentcomms::envelope::Envelope::parse(text)
-                .ok()
-                .and_then(|e| e.thread)
-                .and_then(|h| crate::node::link::b32_decode(h.trim(), "thread").ok())
-            {
-                by_thread.entry(root).or_default().push(at);
-            }
-            for tag in message_tags(text) {
-                by_tag.entry(tag).or_default().push(at);
-            }
-            let Some((kind, op)) = structured_kind(text) else {
-                continue;
-            };
-            by_type.entry(kind).or_default().push(at);
-            if let Some(op) = op {
-                ops.push((op_hash(&op), at));
-            }
-        }
-        let mut next = self.clone();
-        for (kind, at) in by_type {
-            let entry = next.by_type.entry(kind).or_default();
-            *entry = entry.appended(at);
-        }
-        for (tag, at) in by_tag {
-            let entry = next.by_tag.entry(tag).or_default();
-            *entry = entry.appended(at);
-        }
-        for (root, at) in by_thread {
-            let entry = next.by_thread.entry(root).or_default();
-            *entry = entry.appended(at);
-        }
-        next.by_op = next.by_op.appended(ops);
-        next
-    }
-
-    /// The positions of the messages carrying every tag in `tags`, oldest first (#636): read from
-    /// the index, never from the room's history. No tags, no positions.
-    #[must_use]
-    pub fn tagged(&self, tags: &[String]) -> Vec<u32> {
-        let mut lists = tags.iter().map(|t| self.by_tag.get(t));
-        let Some(Some(first)) = lists.next() else {
-            return Vec::new();
-        };
-        let mut out: Vec<u32> = first.iter().copied().collect();
-        for list in lists {
-            let Some(list) = list else {
-                return Vec::new();
-            };
-            let set: std::collections::BTreeSet<u32> = list.iter().copied().collect();
-            out.retain(|p| set.contains(p));
-        }
-        out
-    }
-
-    /// The positions of the posts of any type in `types`, and of those whose operation id hashes
-    /// like one in `ops`, oldest first, each once.
-    #[must_use]
-    pub fn positions(&self, types: &[String], ops: &[String]) -> Vec<u32> {
-        let mut out: Vec<u32> = types
-            .iter()
-            .filter_map(|t| self.by_type.get(t))
-            .flat_map(|c| c.iter().copied())
-            .collect();
-        for op in ops {
-            out.extend(self.by_op.find(op_hash(op)));
-        }
-        out.sort_unstable();
-        out.dedup();
-        out
-    }
 }
 
 /// Why a member is offered to this node's keyring (ADR-028 K-15, K-17).
@@ -588,9 +369,9 @@ pub struct ChannelDetail {
     pub epoch: u64,
     /// Members, in fingerprint order.
     pub members: Vec<Digest32>,
-    /// The render-gated timeline, oldest first. Shared, not copied: every clone of the view — each
-    /// IPC read page takes one — used to copy every room's whole timeline (V210-71); and a new
-    /// message adds its row without rebuilding the rest (V210-120).
+    /// Temporary input for Session folding only, oldest first. Public reads, agreement,
+    /// wake delivery and file offers use bounded stored queries. This field is removed when
+    /// the dependent Session projection is composed.
     pub timeline: Timeline,
     /// The newest readable local arrival; used to start bounded subscribers.
     pub last_arrival: Option<u64>,
@@ -599,15 +380,6 @@ pub struct ChannelDetail {
     /// Node-local change token for the published timeline, unchanged on projection reuse.
     /// Scoped to this node actor; clients discard it when their node connection changes.
     pub display_revision: u64,
-    /// Entry-hash prefixes to timeline positions. Collisions are checked against the row's full
-    /// hash. Shared sorted runs let history pages locate their cursor without scanning history.
-    pub row_index: OpRuns,
-    /// Every entry this node holds for the channel, readable or not, in the room's one
-    /// order (PRD-001 R13), each with the clock that placed it (ms). `timeline` is this
-    /// sequence restricted to rendered rows.
-    pub order: Vec<(Digest32, u64)>,
-    /// Where its structured posts sit in `timeline`, by `type` (V210-120).
-    pub structured: StructuredIndex,
     /// The services this node offers in this channel: `(service_tag, local address)`
     /// in tag order (ADR-013 Bind config — host configuration, not authorization).
     pub services: Vec<(String, std::net::SocketAddr)>,

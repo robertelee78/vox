@@ -878,7 +878,7 @@ pub enum Request {
     /// A room's **structured posts** (V210-120): every row whose body is a JSON object with a
     /// `type` in `types`, or whose operation id is in `ops`, oldest first, answered as
     /// [`Frame::Rows`] and paged like [`Request::Read`]. The node knows no `type`'s meaning; see
-    /// [`crate::node::api::StructuredIndex`]. A row matched by an id's hash alone may carry
+    /// [`crate::node::api::structured_kind`]. A row matched by an id's hash alone may carry
     /// another id: the client checks.
     Structured {
         /// The room.
@@ -891,8 +891,8 @@ pub enum Request {
         since: Option<Digest32>,
     },
     /// A room's messages carrying every tag in `tags` (#636), and only `from`'s when it is
-    /// named, in arrival order, answered as [`Frame::Rows`] and paged like [`Request::Read`].
-    /// Found through the room's index ([`crate::node::api::StructuredIndex::tagged`]), which
+    /// named, in arrival order, answered as [`Frame::FilteredRows`]. Its explicit scan cursor
+    /// advances even through a page with no matching row. Found through the room's index ([`crate::node::api::message_tags`]), which
     /// holds only the tags of messages this node can read. A node from before tags answers
     /// that it does not know the request.
     Tagged {
@@ -2232,6 +2232,7 @@ pub enum Frame {
         /// Resume strictly after this local arrival id, or finish when absent.
         next: Option<u64>,
     },
+    /// Rendered message rows, streamed within the existing bounded reply framing.
     Rows {
         /// The rendered entries.
         rows: Vec<MessageRow>,
