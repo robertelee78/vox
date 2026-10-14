@@ -337,14 +337,70 @@ pub struct Offer {
     pub trusted_by: Vec<Digest32>,
 }
 
+/// A local arrival cursor bound to the saved room instance. Deleting and rejoining
+/// a room resets this instance; an ordinary close/reopen preserves it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistoryCursor {
+    /// Opaque local store identity, never a room or trust identity.
+    pub instance: [u8; 16],
+    /// Strictly continue after this local arrival id.
+    pub arrival: u64,
+}
+
 /// One bounded arrival-ordered history result. An explicit scan continuation may
 /// accompany an empty filtered page; only its absence marks the end of this scan.
 #[derive(Debug, Clone)]
 pub struct MessagePage {
     /// Owned readable rows in this page.
     pub rows: Vec<MessageRow>,
-    /// Continue strictly after this arrival id, even when there were no matching rows.
-    pub next: Option<u64>,
+    /// The saved room instance used by this page.
+    pub instance: [u8; 16],
+    /// Continue strictly after this cursor, even when there were no matching rows.
+    pub next: Option<HistoryCursor>,
+}
+
+/// Freshness of a bounded notice count. Ordinary append-only arrivals do not change it.
+#[derive(Debug, Clone)]
+pub struct NoticeRevision {
+    pub(crate) incarnation: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) facts: [u64; 4],
+}
+impl PartialEq for NoticeRevision {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.incarnation, &other.incarnation) && self.facts == other.facts
+    }
+}
+impl Eq for NoticeRevision {}
+
+/// A notice scan's bounded freshness and arrival boundary from one actor read.
+#[derive(Debug, Clone)]
+pub struct NoticeState {
+    /// Current saved room and newest readable arrival (zero for an empty room).
+    pub head: HistoryCursor,
+    /// Prefix/retention changes that require recounting.
+    pub revision: NoticeRevision,
+    /// The node's current wall clock, used for local retention deadlines.
+    pub now_ms: u64,
+}
+
+/// One readable notice or reply parent, with its exact local retention deadline.
+#[derive(Debug, Clone)]
+pub struct NoticeRow {
+    /// Owned authenticated row.
+    pub row: MessageRow,
+    /// A count using this row must be refreshed at this deadline; None means no expiry.
+    pub expires: Option<u64>,
+}
+
+/// One bounded page of notice candidates, plus its exact freshness boundary.
+#[derive(Debug, Clone)]
+pub struct NoticePage {
+    /// Readable, unexpired candidates only.
+    pub rows: Vec<NoticeRow>,
+    /// Continue after this cursor, including across an empty filtered page.
+    pub next: Option<HistoryCursor>,
+    /// State observed in the same short snapshot as the rows.
+    pub state: NoticeState,
 }
 
 /// One bounded display page and the exact number of earlier visible rows.
@@ -375,6 +431,8 @@ pub struct ChannelDetail {
     pub timeline: Timeline,
     /// The newest readable local arrival; used to start bounded subscribers.
     pub last_arrival: Option<u64>,
+    /// The saved instance that owns local arrival ids, preserved across reopen.
+    pub history_instance: [u8; 16],
     /// Local reuse stamp for the already-built display; never serialized or sent to peers.
     pub(crate) display_stamp: crate::node::channel::DisplayStamp,
     /// Node-local change token for the published timeline, unchanged on projection reuse.

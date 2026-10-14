@@ -418,13 +418,19 @@ pub enum PullState {
     },
 }
 
+#[derive(Default)]
+struct ScanCursor {
+    last_room: Option<Digest32>,
+    pages: BTreeMap<Digest32, Option<crate::node::api::HistoryCursor>>,
+}
+
 /// The pulls of one node.
 pub(crate) struct Pulls {
     paths: Paths,
     cmd: mpsc::WeakSender<(NodeCommand, oneshot::Sender<Outcome>)>,
     view: watch::Receiver<NodeView>,
     history: crate::node::actor::HistoryReader,
-    cursor: Mutex<(Option<Digest32>, Option<u64>)>,
+    cursor: Mutex<ScanCursor>,
     events: tokio::sync::broadcast::Sender<crate::node::api::NodeEvent>,
     /// Entries held back for want of room on the disk, already said once.
     short: Mutex<HashSet<Digest32>>,
@@ -708,7 +714,7 @@ impl Pulls {
     ) -> Arc<Self> {
         let pulls = Arc::new(Self {
             history,
-            cursor: Mutex::new((None, None)),
+            cursor: Mutex::new(ScanCursor::default()),
             events,
             short: Mutex::new(HashSet::new()),
             settled: Mutex::new(recorded(&paths).into_iter().map(|p| p.entry).collect()),
@@ -894,35 +900,28 @@ impl Pulls {
         // One room and one bounded offer page per turn. A completed cycle starts again,
         // so granting trust later still discovers an older offer.
         let (room, after) = {
-            let cursor = self.cursor.lock().await;
+            let mut cursor = self.cursor.lock().await;
             let view = self.view.borrow();
             if view.locked || view.identity.is_none() {
                 return;
             }
-            let chosen = match cursor.0 {
-                Some(room)
-                    if cursor.1.is_some()
-                        && view.open_channels.iter().any(|d| d.channel_id == room) =>
-                {
-                    Some(room)
-                }
-                prior => view
-                    .open_channels
-                    .iter()
-                    .filter(|d| prior.is_none_or(|p| d.channel_id > p))
-                    .map(|d| d.channel_id)
-                    .min()
-                    .or_else(|| view.open_channels.iter().map(|d| d.channel_id).min()),
+            cursor
+                .pages
+                .retain(|room, _| view.open_channels.iter().any(|d| d.channel_id == *room));
+            // Rotate after one page, even on a read failure. An unending offer stream in
+            // one room cannot prevent another open room's file from being considered.
+            let chosen = view
+                .open_channels
+                .iter()
+                .filter(|d| cursor.last_room.is_none_or(|last| d.channel_id > last))
+                .map(|d| d.channel_id)
+                .min()
+                .or_else(|| view.open_channels.iter().map(|d| d.channel_id).min());
+            let Some(room) = chosen else {
+                return;
             };
-            let Some(room) = chosen else { return };
-            (
-                room,
-                if cursor.0 == Some(room) {
-                    cursor.1
-                } else {
-                    None
-                },
-            )
+            cursor.last_room = Some(room);
+            (room, cursor.pages.get(&room).copied().flatten())
         };
         let page = match self
             .history
@@ -1016,7 +1015,7 @@ impl Pulls {
                 }
             }
         }
-        *self.cursor.lock().await = (Some(room), page.next);
+        self.cursor.lock().await.pages.insert(room, page.next);
         self.settled.lock().await.extend(never);
         let mut pending = self.pending.lock().await;
         let mut running = pending

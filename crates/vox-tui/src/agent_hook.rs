@@ -1187,8 +1187,8 @@ fn room_heading(room_label: &str, room_name: &str) -> String {
     }
 }
 
-/// What a session is owed in one room, for its wake (V030-15, V030-20): one sender's name per
-/// message, as this node's keyring names it.
+/// What a session is owed in one room, for its wake (V030-15, V030-20): exact message
+/// counts and a bounded sender sample, named from this node's keyring.
 pub(crate) struct Owed {
     /// The start of the room's id, as commands take it.
     pub room_label: String,
@@ -1201,6 +1201,9 @@ pub(crate) struct Owed {
     pub urgent: Vec<String>,
     /// The senders of the replies to this session's posts.
     pub replies: Vec<String>,
+    /// Further senders exist beyond the displayed sample; their exact number is not claimed.
+    pub urgent_more: bool,
+    pub replies_more: bool,
 }
 
 /// What a wake puts in front of a session (ADR-020 §6; V030-15, V030-20): **a count and the
@@ -1219,12 +1222,15 @@ pub(crate) struct Owed {
 /// message written to its messaging socket as one "from another Claude session … a teammate's
 /// request" (2.1.287, measured), and OpenCode as the person's own prompt.
 pub(crate) fn render_wake(owed: &[Owed]) -> String {
-    let from = |names: &[String]| {
+    let from = |names: &[String], more: bool| {
         let mut seen: Vec<String> = Vec::new();
         for n in names.iter().map(|n| one_line(n)) {
             if !seen.contains(&n) {
                 seen.push(n);
             }
+        }
+        if more {
+            seen.push("additional senders omitted".to_owned());
         }
         seen.join(", ")
     };
@@ -1237,7 +1243,7 @@ pub(crate) fn render_wake(owed: &[Owed]) -> String {
                     "{} urgent message{} addressed to you from {}",
                     o.urgent_count,
                     if o.urgent_count == 1 { "" } else { "s" },
-                    from(&o.urgent)
+                    from(&o.urgent, o.urgent_more)
                 ));
             }
             if o.reply_count != 0 {
@@ -1245,7 +1251,7 @@ pub(crate) fn render_wake(owed: &[Owed]) -> String {
                     "{} repl{} to your messages from {}",
                     o.reply_count,
                     if o.reply_count == 1 { "y" } else { "ies" },
-                    from(&o.replies)
+                    from(&o.replies, o.replies_more)
                 ));
             }
             format!(

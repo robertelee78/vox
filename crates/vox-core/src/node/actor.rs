@@ -359,6 +359,7 @@ fn detail_of(
         members: ch.members(),
         timeline,
         last_arrival: ch.last_arrival(store)?,
+        history_instance: ch.history_instance(store)?,
         display_stamp,
         display_revision,
         services: ch
@@ -8923,6 +8924,7 @@ impl Node {
                         profile.store(),
                         query,
                         crate::node::ipc::rows_budget(),
+                        (self.clock)(),
                     ),
                     _ => Err("room not open".into()),
                 };
@@ -18964,12 +18966,38 @@ impl HistoryReader {
             .ok_or_else(|| "the node has stopped".to_owned())?;
         query_history(&tx, room, query).await
     }
-    /// The newest readable arrival, without loading a message body.
-    pub async fn latest_arrival(&self, room: Digest32) -> std::result::Result<Option<u64>, String> {
+    /// The saved room instance and newest readable arrival, without loading a body.
+    pub async fn arrival_head(
+        &self,
+        room: Digest32,
+    ) -> std::result::Result<crate::node::api::HistoryCursor, String> {
         use crate::node::channel::history::{Query, Reply};
-        match self.query(room, Query::LatestArrival).await? {
-            Reply::LatestArrival(last) => Ok(last),
-            _ => Err("unexpected latest-arrival answer".into()),
+        match self.query(room, Query::ArrivalHead).await? {
+            Reply::ArrivalHead(head) => Ok(head),
+            _ => Err("unexpected arrival-head answer".into()),
+        }
+    }
+    /// Freshness for a notice count, without retaining a snapshot across client work.
+    pub async fn notice_state(
+        &self,
+        room: Digest32,
+    ) -> std::result::Result<crate::node::api::NoticeState, String> {
+        use crate::node::channel::history::{Query, Reply};
+        match self.query(room, Query::NoticeState).await? {
+            Reply::NoticeState(state) => Ok(state),
+            _ => Err("unexpected notice-state answer".into()),
+        }
+    }
+    /// One readable, unexpired notice parent and its local expiry deadline.
+    pub async fn notice_exact(
+        &self,
+        room: Digest32,
+        entry: Digest32,
+    ) -> std::result::Result<Option<crate::node::api::NoticeRow>, String> {
+        use crate::node::channel::history::{Query, Reply};
+        match self.query(room, Query::NoticeExact { entry }).await? {
+            Reply::NoticeExact(row) => Ok(row),
+            _ => Err("unexpected notice-row answer".into()),
         }
     }
     /// One display-ordered page, newest when `before` is absent.
@@ -18994,73 +19022,66 @@ impl HistoryReader {
             _ => Err("unexpected older history answer".into()),
         }
     }
-    /// Read one arrival page; errors distinguish a failed local read from an empty result.
+    /// Read one arrival page, resetting a cursor from a deleted/rejoined saved room.
     pub async fn arrival_page(
         &self,
         room: Digest32,
-        after: Option<u64>,
+        after: Option<crate::node::api::HistoryCursor>,
         limit: usize,
     ) -> std::result::Result<crate::node::api::MessagePage, String> {
-        use crate::node::channel::history::{Query, Reply};
-        match self
-            .query(
-                room,
-                Query::Arrival {
-                    after,
-                    limit: limit.clamp(1, crate::node::ipc::PAGE_ENTRIES),
-                },
-            )
-            .await?
-        {
-            Reply::Page { rows, next } => Ok(crate::node::api::MessagePage { rows, next }),
-            _ => Err("unexpected history page answer".into()),
-        }
+        self.cursor_page(room, after, None, limit).await
     }
     /// Read one page of these structured types, selected by the sealed room index.
     pub async fn typed_page(
         &self,
         room: Digest32,
         types: Vec<String>,
-        after: Option<u64>,
+        after: Option<crate::node::api::HistoryCursor>,
         limit: usize,
     ) -> std::result::Result<crate::node::api::MessagePage, String> {
-        use crate::node::channel::history::{Filter, Query, Reply, Selection};
+        use crate::node::channel::history::{Filter, Selection};
+        self.cursor_page(
+            room,
+            after,
+            Some(Selection::Any(
+                types.into_iter().map(Filter::Type).collect(),
+            )),
+            limit,
+        )
+        .await
+    }
+    async fn cursor_page(
+        &self,
+        room: Digest32,
+        after: Option<crate::node::api::HistoryCursor>,
+        selection: Option<crate::node::channel::history::Selection>,
+        limit: usize,
+    ) -> std::result::Result<crate::node::api::MessagePage, String> {
+        use crate::node::channel::history::{Query, Reply};
         match self
             .query(
                 room,
-                Query::Filtered {
-                    selection: Selection::Any(types.into_iter().map(Filter::Type).collect()),
-                    since: None,
-                    resume: after,
+                Query::CursorPage {
+                    after,
+                    selection,
                     limit: limit.clamp(1, crate::node::ipc::PAGE_ENTRIES),
                 },
             )
             .await?
         {
-            Reply::Page { rows, next } => Ok(crate::node::api::MessagePage { rows, next }),
+            Reply::CursorPage(page) => Ok(page),
             _ => Err("unexpected history page answer".into()),
         }
     }
-    /// A bounded page of possible wake/reply notices; ordinary chat is not scanned.
+    /// A bounded page of unexpired wake/reply candidates and its freshness token.
     pub async fn notice_page(
         &self,
         room: Digest32,
-        after: Option<u64>,
-    ) -> std::result::Result<crate::node::api::MessagePage, String> {
-        use crate::node::channel::history::{Filter, Query, Reply, Selection};
-        match self
-            .query(
-                room,
-                Query::Filtered {
-                    selection: Selection::Any(vec![Filter::NoticeCandidates]),
-                    since: None,
-                    resume: after,
-                    limit: crate::node::ipc::PAGE_ENTRIES,
-                },
-            )
-            .await?
-        {
-            Reply::Page { rows, next } => Ok(crate::node::api::MessagePage { rows, next }),
+        after: Option<crate::node::api::HistoryCursor>,
+    ) -> std::result::Result<crate::node::api::NoticePage, String> {
+        use crate::node::channel::history::{Query, Reply};
+        match self.query(room, Query::NoticePage { after }).await? {
+            Reply::NoticePage(page) => Ok(page),
             _ => Err("unexpected notice page answer".into()),
         }
     }

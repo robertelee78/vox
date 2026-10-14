@@ -71,9 +71,9 @@ async fn watch_for_interrupts(node: NodeHandle, paths: Paths) {
     let mut swept = std::collections::HashMap::new();
     let mut opening = std::collections::HashSet::new();
     for d in &node.view().open_channels {
-        match history.latest_arrival(d.channel_id).await {
+        match history.arrival_head(d.channel_id).await {
             Ok(last) => {
-                swept.insert(d.channel_id, last.unwrap_or(0));
+                swept.insert(d.channel_id, last);
             }
             Err(e) => {
                 eprintln!("vox daemon: could not establish the room's wake cursor: {e}");
@@ -150,11 +150,13 @@ async fn watch_for_interrupts(node: NodeHandle, paths: Paths) {
         }
         if sweep && !deaf {
             let view = node.view();
+            swept.retain(|room, _| view.channels.iter().any(|c| c.channel_id == *room));
+            opening.retain(|room| view.channels.iter().any(|c| c.channel_id == *room));
             for d in &view.open_channels {
                 if opening.contains(&d.channel_id) {
-                    match history.latest_arrival(d.channel_id).await {
+                    match history.arrival_head(d.channel_id).await {
                         Ok(last) => {
-                            swept.insert(d.channel_id, last.unwrap_or(0));
+                            swept.insert(d.channel_id, last);
                             opening.remove(&d.channel_id);
                         }
                         Err(e) => {
@@ -163,8 +165,8 @@ async fn watch_for_interrupts(node: NodeHandle, paths: Paths) {
                     }
                     continue;
                 }
-                let cursor = swept.get(&d.channel_id).copied().unwrap_or(0);
-                let page = match history.arrival_page(d.channel_id, Some(cursor), 64).await {
+                let cursor = swept.get(&d.channel_id).copied();
+                let page = match history.arrival_page(d.channel_id, cursor, 64).await {
                     Ok(page) => page,
                     Err(e) => {
                         eprintln!("vox daemon: could not read room notices; will retry: {e}");
@@ -184,7 +186,13 @@ async fn watch_for_interrupts(node: NodeHandle, paths: Paths) {
                     if may_answer(&row.text) {
                         answered.insert(d.channel_id);
                     }
-                    swept.insert(d.channel_id, row.arrival);
+                    swept.insert(
+                        d.channel_id,
+                        vox_core::node::api::HistoryCursor {
+                            instance: page.instance,
+                            arrival: row.arrival,
+                        },
+                    );
                 }
             }
             tend(&paths, &history, &view, &answered, &mut tending).await;
@@ -333,6 +341,7 @@ async fn judge(
 /// Only the facts needed from at most DEFAULT_HOPS + 1 parents survive a lookup.
 /// Parent text is released before the next actor request; a read error never means absent.
 struct ReplyContext {
+    expires: Option<u64>,
     hops: u32,
     speakers: Vec<(vox_core::hash::Digest32, vox_core::hash::Digest32)>,
     asked: Option<(vox_core::hash::Digest32, vox_core::hash::Digest32)>,
@@ -352,6 +361,7 @@ async fn reply_context(
     envelope: &vox_agentcomms::envelope::Envelope,
 ) -> Result<ReplyContext, String> {
     let mut context = ReplyContext {
+        expires: None,
         hops: envelope.hops,
         speakers: Vec::new(),
         asked: None,
@@ -364,15 +374,11 @@ async fn reply_context(
         else {
             break;
         };
-        let Some(row) = history
-            .exact(room, vec![hash])
-            .await?
-            .into_iter()
-            .next()
-            .filter(|r| !r.owed)
-        else {
+        let Some(parent) = history.notice_exact(room, hash).await? else {
             break;
         };
+        context.expires = sooner(context.expires, parent.expires);
+        let row = parent.row;
         if depth > vox_agentcomms::envelope::DEFAULT_HOPS {
             context.hops = 0;
             break;
@@ -391,15 +397,30 @@ async fn reply_context(
     Ok(context)
 }
 
+fn sooner(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, None) => a,
+        (None, b) => b,
+    }
+}
+
+// Counts stay exact; the announce-only sender display is an explicit bounded sample.
+const NOTICE_SENDERS: usize = 8;
 #[derive(Default)]
 struct NoticeCount {
     n: usize,
     authors: std::collections::BTreeSet<vox_core::hash::Digest32>,
+    more_authors: bool,
 }
 impl NoticeCount {
     fn add(&mut self, author: vox_core::hash::Digest32) -> Result<(), String> {
         self.n = self.n.checked_add(1).ok_or("notice count overflow")?;
-        self.authors.insert(author);
+        if self.authors.len() < NOTICE_SENDERS {
+            self.authors.insert(author);
+        } else if !self.authors.contains(&author) {
+            self.more_authors = true;
+        }
         Ok(())
     }
 }
@@ -407,11 +428,18 @@ struct NoticeFold {
     registration: crate::wake::Session,
     cursor: Option<vox_core::hash::Digest32>,
     ahead: std::collections::BTreeSet<vox_core::hash::Digest32>,
-    next: Option<u64>,
+    next: vox_core::node::api::HistoryCursor,
     through: u64,
+    revision: vox_core::node::api::NoticeRevision,
+    expires: Option<u64>,
     urgent: NoticeCount,
     replies: NoticeCount,
     newest_reply: Option<vox_core::hash::Digest32>,
+}
+enum FoldProgress {
+    Pending,
+    Complete,
+    Restart,
 }
 impl NoticeFold {
     async fn start(
@@ -421,71 +449,112 @@ impl NoticeFold {
         cursor: Option<vox_core::hash::Digest32>,
         ahead: std::collections::BTreeSet<vox_core::hash::Digest32>,
     ) -> Result<Self, String> {
-        let next = match cursor {
+        let state = history.notice_state(room).await?;
+        let after = match cursor {
             Some(hash) => history
                 .exact(room, vec![hash])
                 .await?
                 .first()
                 .filter(|r| !r.owed)
-                .map(|r| r.arrival),
-            None => None,
+                .map_or(0, |r| r.arrival),
+            None => 0,
         };
         Ok(Self {
             registration: registration.clone(),
             cursor,
             ahead,
-            next,
-            through: history.latest_arrival(room).await?.unwrap_or(0),
+            next: vox_core::node::api::HistoryCursor {
+                instance: state.head.instance,
+                arrival: after,
+            },
+            through: state.head.arrival,
+            revision: state.revision,
+            expires: None,
             urgent: NoticeCount::default(),
             replies: NoticeCount::default(),
             newest_reply: None,
         })
+    }
+    fn valid(&self, state: &vox_core::node::api::NoticeState) -> bool {
+        self.next.instance == state.head.instance
+            && self.revision == state.revision
+            && self.expires.is_none_or(|at| state.now_ms < at)
     }
     async fn advance(
         &mut self,
         history: &vox_core::node::actor::HistoryReader,
         room: vox_core::hash::Digest32,
         me: Option<vox_core::hash::Digest32>,
-    ) -> Result<bool, String> {
-        if self.next.unwrap_or(0) >= self.through {
-            return Ok(true);
+    ) -> Result<FoldProgress, String> {
+        let state = history.notice_state(room).await?;
+        if !self.valid(&state) {
+            return Ok(FoldProgress::Restart);
         }
-        let page = history.notice_page(room, self.next).await?;
-        let me_fp = me.as_ref().map(vox_core::node::link::b32_encode);
-        for row in page.rows {
-            if row.arrival > self.through {
-                return Ok(true);
+        self.through = self.through.max(state.head.arrival);
+        if self.next.arrival < self.through {
+            let page = history.notice_page(room, Some(self.next)).await?;
+            if !self.valid(&page.state) {
+                return Ok(FoldProgress::Restart);
             }
-            if !self.ahead.contains(&row.entry_hash) {
-                if let Ok(envelope) = vox_agentcomms::envelope::Envelope::parse(&row.text) {
-                    let own = me == Some(row.author)
-                        && !envelope.from.is_empty()
-                        && envelope.from == self.registration.session;
-                    if !own {
-                        let context = reply_context(history, room, &envelope).await?;
-                        let urgent = context.hops > 0
-                            && me_fp.as_deref().is_some_and(|fp| {
-                                crate::wake::wakes(&envelope, fp, &self.registration.session)
-                            })
-                            && !me.is_some_and(|m| context.spoke(&m, &self.registration.session));
-                        if urgent {
-                            self.urgent.add(row.author)?;
-                        } else if context.hops > 0
-                            && !crate::wake::NOT_REPLIES.contains(&envelope.kind.as_str())
-                            && me.is_some_and(|m| context.answers(&m, &self.registration.session))
-                        {
-                            self.replies.add(row.author)?;
-                            self.newest_reply = Some(row.entry_hash);
+            let me_fp = me.as_ref().map(vox_core::node::link::b32_encode);
+            let mut finished = page.next.is_none();
+            for item in page.rows {
+                let row = item.row;
+                if row.arrival > self.through {
+                    finished = true;
+                    break;
+                }
+                self.expires = sooner(self.expires, item.expires);
+                if !self.ahead.contains(&row.entry_hash) {
+                    if let Ok(envelope) = vox_agentcomms::envelope::Envelope::parse(&row.text) {
+                        let own = me == Some(row.author)
+                            && !envelope.from.is_empty()
+                            && envelope.from == self.registration.session;
+                        if !own {
+                            let context = reply_context(history, room, &envelope).await?;
+                            self.expires = sooner(self.expires, context.expires);
+                            let urgent = context.hops > 0
+                                && me_fp.as_deref().is_some_and(|fp| {
+                                    crate::wake::wakes(&envelope, fp, &self.registration.session)
+                                })
+                                && !me
+                                    .is_some_and(|m| context.spoke(&m, &self.registration.session));
+                            if urgent {
+                                self.urgent.add(row.author)?;
+                            } else if context.hops > 0
+                                && !crate::wake::NOT_REPLIES.contains(&envelope.kind.as_str())
+                                && me.is_some_and(|m| {
+                                    context.answers(&m, &self.registration.session)
+                                })
+                            {
+                                self.replies.add(row.author)?;
+                                self.newest_reply = Some(row.entry_hash);
+                            }
                         }
                     }
                 }
+                self.next.arrival = row.arrival;
             }
-            self.next = Some(row.arrival);
+            if let Some(next) = page.next {
+                self.next.arrival = next.arrival.min(self.through);
+            }
+            if finished {
+                self.next.arrival = self.through;
+            }
         }
-        if let Some(next) = page.next {
-            self.next = Some(next);
+        // This is the final actor wait before notices are read and changed. Catch up new
+        // arrivals without discarding the counted prefix; a changed prefix/expired input
+        // restarts the count and leaves the current obligation untouched.
+        let current = history.notice_state(room).await?;
+        if !self.valid(&current) {
+            return Ok(FoldProgress::Restart);
         }
-        Ok(page.next.is_none() || self.next.unwrap_or(0) >= self.through)
+        self.through = self.through.max(current.head.arrival);
+        Ok(if self.next.arrival < self.through {
+            FoldProgress::Pending
+        } else {
+            FoldProgress::Complete
+        })
     }
 }
 
@@ -576,12 +645,16 @@ async fn tend(
             continue;
         };
         match fold.advance(history, d.channel_id, me).await {
-            Ok(false) => continue,
+            Ok(FoldProgress::Pending) => continue,
+            Ok(FoldProgress::Restart) => {
+                t.folds.remove(&session.session);
+                continue;
+            }
             Err(e) => {
                 eprintln!("vox daemon: could not count room notices; will retry: {e}");
                 continue;
             }
-            Ok(true) => {}
+            Ok(FoldProgress::Complete) => {}
         }
         let Some(fold) = t.folds.remove(&session.session) else {
             continue;
@@ -667,6 +740,8 @@ async fn tend(
                     reply_count: replies.n,
                     urgent: urgent.authors.iter().map(name).collect(),
                     replies: replies.authors.iter().map(name).collect(),
+                    urgent_more: urgent.more_authors,
+                    replies_more: replies.more_authors,
                 };
                 let text = crate::agent_hook::render_wake(&[owed]);
                 let hold = u64::try_from(settings.wake_hold.as_millis()).unwrap_or(u64::MAX);

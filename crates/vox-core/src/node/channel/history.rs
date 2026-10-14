@@ -5,10 +5,24 @@
 
 pub(crate) use super::entry_store::Filter;
 use super::*;
-use crate::node::api::MessageRow;
+use crate::node::api::{
+    HistoryCursor, MessagePage, MessageRow, NoticePage, NoticeRevision, NoticeRow, NoticeState,
+};
 
 pub(crate) enum Query {
-    LatestArrival,
+    ArrivalHead,
+    NoticeState,
+    NoticeExact {
+        entry: Digest32,
+    },
+    NoticePage {
+        after: Option<HistoryCursor>,
+    },
+    CursorPage {
+        after: Option<HistoryCursor>,
+        selection: Option<Selection>,
+        limit: usize,
+    },
     LocateUnread,
     SessionCandidates {
         after: Option<(u64, u64, Digest32)>,
@@ -61,7 +75,11 @@ pub(crate) enum Query {
 }
 
 pub(crate) enum Reply {
-    LatestArrival(Option<u64>),
+    ArrivalHead(HistoryCursor),
+    NoticeState(NoticeState),
+    NoticeExact(Option<NoticeRow>),
+    NoticePage(NoticePage),
+    CursorPage(MessagePage),
     SessionCandidates {
         rows: Vec<MessageRow>,
         next: Option<(u64, u64, Digest32)>,
@@ -388,6 +406,79 @@ impl View<'_> {
         Ok(Reply::Page { rows, next: cursor })
     }
 
+    fn head(&self) -> Result<HistoryCursor> {
+        Ok(HistoryCursor {
+            instance: self.rendered.history_instance(),
+            arrival: self
+                .rendered
+                .step(None, false, None, true)?
+                .map_or(0, |(_, fact)| fact.cache),
+        })
+    }
+    fn notice_state(&self) -> Result<NoticeState> {
+        Ok(NoticeState {
+            head: self.head()?,
+            revision: NoticeRevision {
+                incarnation: self.ch.gen.clone(),
+                facts: [
+                    self.ch.display_rewrite,
+                    self.ch.effective_retention(),
+                    self.ch.effective_step_retention(),
+                    self.ch.legacy_sessions.display_revision(),
+                ],
+            },
+            now_ms: self.ch.now_hint,
+        })
+    }
+    fn notice_row(&self, row: MessageRow) -> Result<Option<NoticeRow>> {
+        if row.owed {
+            return Ok(None);
+        }
+        let entry = self
+            .rendered
+            .order()
+            .entry(&row.entry_hash)?
+            .ok_or(Error::MalformedAtRest("notice entry missing"))?;
+        let ttl = self.ch.entry_retention(&entry);
+        let expires = if ttl == 0 {
+            None
+        } else {
+            let tracked = self
+                .ch
+                .retention
+                .get(&row.entry_hash)
+                .ok_or(Error::MalformedAtRest("notice retention missing"))?;
+            Some(tracked.base().saturating_add(ttl.saturating_mul(1_000)))
+        };
+        Ok(expires
+            .is_none_or(|at| self.ch.now_hint < at)
+            .then_some(NoticeRow { row, expires }))
+    }
+    fn cursor_page(
+        &self,
+        after: Option<HistoryCursor>,
+        selection: Option<Selection>,
+        limit: usize,
+        bytes: usize,
+    ) -> Answer<MessagePage> {
+        let instance = self.rendered.history_instance();
+        let after = after.filter(|c| c.instance == instance).map(|c| c.arrival);
+        let answer = match selection {
+            Some(selection) => self.filtered(selection, None, after, limit, bytes)?,
+            None => self.answer(Query::Arrival { after, limit }, bytes)?,
+        };
+        let Reply::Page { rows, next } = answer else {
+            return Err(Failure::Storage(Error::MalformedAtRest(
+                "unexpected arrival page",
+            )));
+        };
+        Ok(MessagePage {
+            rows,
+            instance,
+            next: next.map(|arrival| HistoryCursor { instance, arrival }),
+        })
+    }
+
     fn answer(&self, query: Query, bytes: usize) -> Answer<Reply> {
         let cursor_error = "cursor not in this room's timeline";
         match query {
@@ -435,11 +526,40 @@ impl View<'_> {
                     revision,
                 })
             }
-            Query::LatestArrival => Ok(Reply::LatestArrival(
-                self.rendered
-                    .step(None, false, None, true)?
-                    .map(|(_, fact)| fact.cache),
+            Query::ArrivalHead => Ok(Reply::ArrivalHead(self.head()?)),
+            Query::NoticeState => Ok(Reply::NoticeState(self.notice_state()?)),
+            Query::NoticeExact { entry } => Ok(Reply::NoticeExact(
+                self.row(&entry)?
+                    .map(|row| self.notice_row(row))
+                    .transpose()?
+                    .flatten(),
             )),
+            Query::CursorPage {
+                after,
+                selection,
+                limit,
+            } => Ok(Reply::CursorPage(
+                self.cursor_page(after, selection, limit, bytes)?,
+            )),
+            Query::NoticePage { after } => {
+                let page = self.cursor_page(
+                    after,
+                    Some(Selection::Any(vec![Filter::NoticeCandidates])),
+                    crate::node::ipc::PAGE_ENTRIES,
+                    bytes,
+                )?;
+                let mut rows = Vec::with_capacity(page.rows.len());
+                for row in page.rows {
+                    if let Some(row) = self.notice_row(row)? {
+                        rows.push(row);
+                    }
+                }
+                Ok(Reply::NoticePage(NoticePage {
+                    rows,
+                    next: page.next,
+                    state: self.notice_state()?,
+                }))
+            }
             Query::Arrival { after, limit } => {
                 let mut cursor = after;
                 let mut rows = Vec::new();
@@ -687,6 +807,12 @@ impl View<'_> {
 }
 
 impl ChannelState {
+    pub(crate) fn history_instance(&self, store: &Store) -> Result<[u8; 16]> {
+        Ok(self
+            .entries
+            .render_view(store, &self.sek, &self.channel_id)?
+            .history_instance())
+    }
     pub(crate) fn last_arrival(&self, store: &Store) -> Result<Option<u64>> {
         self.entries
             .render_view(store, &self.sek, &self.channel_id)?
@@ -699,7 +825,9 @@ impl ChannelState {
         store: &Store,
         query: Query,
         max_bytes: usize,
+        now_ms: u64,
     ) -> std::result::Result<Reply, String> {
+        self.now_hint = self.now_hint.max(now_ms);
         if self.poisoned {
             return Err(self.save_failure().to_string());
         }

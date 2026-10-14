@@ -822,6 +822,10 @@ impl RenderView<'_> {
         .transpose()
     }
     /// The immutable root changes only when the public Session/name input changes.
+    pub(crate) fn history_instance(&self) -> [u8; 16] {
+        self.order.read.directory.history_instance
+    }
+
     pub(crate) fn session_revision(&self) -> u64 {
         self.roots().session_candidates
     }

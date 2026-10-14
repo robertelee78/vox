@@ -507,12 +507,20 @@ impl VoxNode {
         let mut events = self.node.subscribe();
         let node = self.node.clone();
         let history = node.history_reader();
-        let mut delivered: std::collections::HashMap<Digest32, u64> = node
-            .view()
-            .open_channels
-            .iter()
-            .map(|room| (room.channel_id, room.last_arrival.unwrap_or(0)))
-            .collect();
+        let mut delivered: std::collections::HashMap<Digest32, vox_core::node::api::HistoryCursor> =
+            node.view()
+                .open_channels
+                .iter()
+                .map(|room| {
+                    (
+                        room.channel_id,
+                        vox_core::node::api::HistoryCursor {
+                            instance: room.history_instance,
+                            arrival: room.last_arrival.unwrap_or(0),
+                        },
+                    )
+                })
+                .collect();
         let mut view = node.watch();
         self.rt.spawn(async move {
             let mut retry = tokio::time::interval(std::time::Duration::from_secs(2));
@@ -531,14 +539,18 @@ impl VoxNode {
                     }
                 } else { tokio::task::yield_now().await; }
                 more = false;
-                let rooms: Vec<_> = view.borrow_and_update().open_channels.iter().map(|r|r.channel_id).collect();
+                let rooms: Vec<_> = {
+                    let current = view.borrow_and_update();
+                    delivered.retain(|room,_| current.channels.iter().any(|c|c.channel_id == *room));
+                    current.open_channels.iter().map(|r|r.channel_id).collect()
+                };
                 for room in rooms {
-                    let after = delivered.get(&room).copied().unwrap_or(0);
-                    match history.arrival_page(room,Some(after),64).await {
+                    let after = delivered.get(&room).copied();
+                    match history.arrival_page(room,after,64).await {
                         Ok(page) => {
                             for row in page.rows {
                                 listener.on_message(b32_encode(&room),message(&row));
-                                delivered.insert(room,row.arrival);
+                                delivered.insert(room,vox_core::node::api::HistoryCursor {instance:page.instance, arrival:row.arrival});
                             }
                             more |= page.next.is_some();
                         }

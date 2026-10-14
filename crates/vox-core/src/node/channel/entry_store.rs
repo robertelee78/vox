@@ -160,6 +160,7 @@ struct Directory {
     render_epoch: u64,
     render_ready: bool,
     render_cursor: Option<u64>,
+    history_instance: [u8; 16],
 }
 
 impl Default for Directory {
@@ -179,14 +180,24 @@ impl Default for Directory {
             render_epoch: 0,
             render_ready: false,
             render_cursor: None,
+            history_instance: [0; 16],
         }
     }
 }
 
 impl Directory {
+    fn ensure_instance(&mut self) -> Result<()> {
+        if self.history_instance == [0; 16] {
+            getrandom::fill(&mut self.history_instance).map_err(|_| Error::Rng)?;
+            if self.history_instance == [0; 16] {
+                return Err(Error::Rng);
+            }
+        }
+        Ok(())
+    }
     fn bytes(&self) -> Zeroizing<Vec<u8>> {
         let mut e = Encoder::new();
-        e.array(15).uint(3);
+        e.array(16).uint(4);
         self.active.write(&mut e);
         self.provisional.write(&mut e);
         e.uint(self.next_page)
@@ -242,6 +253,7 @@ impl Directory {
                 e.array(0);
             }
         }
+        e.bytes(&self.history_instance);
         Zeroizing::new(e.finish())
     }
     fn parse(bytes: &[u8]) -> Result<Self> {
@@ -251,7 +263,7 @@ impl Directory {
         let mut d = Decoder::new(bytes);
         let arity = d.array()?;
         let version = d.uint()?;
-        if !matches!((arity, version), (8, 1) | (12, 2) | (15, 3)) {
+        if !matches!((arity, version), (8, 1) | (12, 2) | (15, 3) | (16, 4)) {
             return Err(invalid("entry directory format"));
         }
         let active = Roots::read(&mut d)?;
@@ -329,6 +341,18 @@ impl Directory {
         } else {
             None
         };
+        let history_instance = if version >= 4 {
+            let id: [u8; 16] = d
+                .bytes()?
+                .try_into()
+                .map_err(|_| invalid("history instance"))?;
+            if id == [0; 16] {
+                return Err(invalid("empty history instance"));
+            }
+            id
+        } else {
+            [0; 16]
+        };
         d.finish()?;
         if next_page == 0
             || next_provisional == 0
@@ -389,6 +413,7 @@ impl Directory {
             render_epoch,
             render_ready,
             render_cursor,
+            history_instance,
         })
     }
 }
@@ -944,11 +969,12 @@ impl EntryIndex {
         sek: &'a Sek,
         channel: &'a Digest32,
     ) -> Result<Write<'a, 's>> {
-        let directory =
+        let mut directory =
             match Source::Batch(batch).open(sek, channel, SegmentKind::EntryIndex, DIRECTORY)? {
                 Some(bytes) => Directory::parse(&bytes)?,
                 None => Directory::default(),
             };
+        directory.ensure_instance()?;
         Ok(Write {
             kind: SegmentKind::EntryIndex,
             batch,
@@ -963,7 +989,12 @@ impl EntryIndex {
     }
 }
 
-impl Write<'_, '_> {
+impl<'s> Write<'_, 's> {
+    /// Read related sealed state in the same transaction as an entry update.
+    pub(crate) fn batch(&self) -> &Batch<'s> {
+        self.batch
+    }
+
     fn allocate(&mut self) -> Result<u64> {
         let id = self.directory.next_page;
         self.directory.next_page = id
@@ -1545,6 +1576,12 @@ impl EntryIndex {
             .is_none_or(|d| d.phase == Phase::Rebuilding);
         drop(snapshot);
         if rebuilding {
+            let mut fresh = Directory {
+                origin: Some(origin),
+                history_instance: directory.as_ref().map_or([0; 16], |d| d.history_instance),
+                ..Directory::default()
+            };
+            fresh.ensure_instance()?;
             // A crashed rebuild is restarted after discarding only its derived pages. Keep a
             // durable Rebuilding directory throughout, never an apparently complete empty index.
             loop {
@@ -1559,10 +1596,6 @@ impl EntryIndex {
                     batch.delete_segment(channel, SegmentKind::EntryIndex, id)?;
                     removed += 1;
                 }
-                let fresh = Directory {
-                    origin: Some(origin),
-                    ..Directory::default()
-                };
                 let sealed = seal_segment(sek, SegmentKind::EntryIndex, DIRECTORY, &fresh.bytes())?;
                 batch.put_segment(channel, SegmentKind::EntryIndex, DIRECTORY, &sealed)?;
                 batch.commit()?;
