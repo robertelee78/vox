@@ -5289,20 +5289,13 @@ impl VoxClient {
         let socket = self.socket.clone();
         // The cursors and the stream are set up before this returns, so nothing posted after it
         // is missed.
-        let (stream, cursors, seen, owner) = self
+        let (stream, cursors, seen, owner, reanchor) = self
             .on_rt({
                 let held = Arc::clone(&held);
                 async move {
                     let mut slot = held.lock().await;
                     let h = slot.as_mut().ok_or_else(not_attached)?;
                     h.mend().await?;
-                    let mut stream = IpcClient::open_at(&h.at)
-                        .await
-                        .map_err(|e| said(&socket, e))?;
-                    stream
-                        .subscribe()
-                        .await
-                        .map_err(|e| failed(format!("cannot follow the node's events: {e}")))?;
                     let mut cursors = HashMap::new();
                     let seen = session_revisions(&mut h.client).await?;
                     for (id, _, open, _) in room_ids(&mut h.client).await? {
@@ -5320,12 +5313,31 @@ impl VoxClient {
                         node: h.node.clone(),
                         fingerprint: h.client.me(),
                     };
-                    Ok((stream, cursors, seen, owner))
+                    // Capture heads before registering: follow immediately reads the gap,
+                    // then queued events only wake reads after those same saved cursors.
+                    let mut stream = IpcClient::open_at(&h.at)
+                        .await
+                        .map_err(|e| said(&socket, e))?;
+                    if h.at.using.node != owner.node || stream.me() != owner.fingerprint {
+                        return Err(failed("the app's node identity changed"));
+                    }
+                    stream
+                        .subscribe()
+                        .await
+                        .map_err(|e| failed(format!("cannot follow the node's events: {e}")))?;
+                    // A room opened before registration has no queued Opened event. Its
+                    // snapshot must be reanchored too, rather than silently baselined late.
+                    let reanchor = room_ids(&mut h.client)
+                        .await?
+                        .into_iter()
+                        .any(|(id, _, open, _)| open && !cursors.contains_key(&id));
+                    Ok((stream, cursors, seen, owner, reanchor))
                 }
             })
             .await?;
-        self.rt
-            .spawn(follow(stream, cursors, seen, held, owner, listener));
+        self.rt.spawn(follow(
+            stream, cursors, seen, held, owner, reanchor, listener,
+        ));
         Ok(())
     }
 }
@@ -5438,8 +5450,35 @@ async fn follow(
     mut seen: HashMap<Digest32, Digest32>,
     held: Slot,
     owner: FollowOwner,
+    reanchor: bool,
     listener: Arc<dyn ClientListener>,
 ) {
+    if reanchor {
+        listener.on_ended(
+            "a room opened while observation started; refreshing its history and restarting observation"
+                .into(),
+        );
+        return;
+    }
+    // An arrival between the saved heads and subscription registration has no queued event.
+    // Catch it once without waiting for another message; event-driven reads use these same
+    // cursors, so a row also represented by a queued event is not delivered twice.
+    let initial_rooms: Vec<_> = cursors.keys().copied().collect();
+    for (&room, cursor) in &mut cursors {
+        loop {
+            match follow_page(&held, &owner, room, cursor, listener.as_ref()).await {
+                Ok(true) => tokio::task::yield_now().await,
+                Ok(false) => break,
+                Err(why) => {
+                    listener.on_ended(why);
+                    return;
+                }
+            }
+        }
+    }
+    if !sessions_told(&initial_rooms, &mut seen, &held, &owner, listener.as_ref()).await {
+        return;
+    }
     loop {
         let event = stream.next().await;
         {
@@ -5477,15 +5516,20 @@ async fn follow(
                     .collect()
             }
             Ok(Some(Frame::Event(ev @ NodeEvent::ChannelOpened { channel_id }))) => {
+                let Some(previous) = cursors.get(&channel_id) else {
+                    // The event has no opening arrival baseline. A current head could skip
+                    // later queued arrivals; explicit recovery reloads the selected snapshot
+                    // before following this room, without replaying all its old messages.
+                    listener.on_ended(
+                        "a room opened; refreshing its history and restarting observation".into(),
+                    );
+                    return;
+                };
                 match follow_head(&held, &owner, channel_id).await {
                     Ok(head) => {
-                        if let Some(previous) = cursors.get(&channel_id) {
-                            if previous.instance != head.instance {
-                                listener.on_ended("the saved room changed; refreshing its history and restarting observation".into());
-                                return;
-                            }
-                        } else {
-                            cursors.insert(channel_id, head);
+                        if previous.instance != head.instance {
+                            listener.on_ended("the saved room changed; refreshing its history and restarting observation".into());
+                            return;
                         }
                     }
                     Err(why) => {
@@ -5520,8 +5564,8 @@ async fn follow(
             }
             Ok(Some(Frame::Lagged { .. })) => {
                 // A lost open/close event must not leave another room's cursor attached to the
-                // wrong incarnation. Existing rooms keep their exact arrival cursor; new rooms
-                // start at their current head and the app reloads their visible history normally.
+                // wrong incarnation. Existing rooms keep their exact arrival cursor; an unknown
+                // room needs explicit snapshot recovery rather than a silently advanced head.
                 let open = {
                     let mut slot = held.lock().await;
                     let Some(h) = slot.as_mut().filter(|h| owner.holds(h)) else {
@@ -5550,18 +5594,11 @@ async fn follow(
                 };
                 cursors.retain(|room, _| open.contains(room));
                 seen.retain(|room, _| open.contains(room));
-                for &room in &open {
-                    if !cursors.contains_key(&room) {
-                        match follow_head(&held, &owner, room).await {
-                            Ok(head) => {
-                                cursors.insert(room, head);
-                            }
-                            Err(why) => {
-                                listener.on_ended(why);
-                                return;
-                            }
-                        }
-                    }
+                if open.iter().any(|room| !cursors.contains_key(room)) {
+                    listener.on_ended(
+                        "a room opened while events were missed; refreshing its history and restarting observation".into(),
+                    );
+                    return;
                 }
                 listener.on_notice(
                     "room observation caught up after missed events; refreshing the visible rooms"
