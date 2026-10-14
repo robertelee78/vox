@@ -46,7 +46,9 @@ extension NodeModel {
         let alias = session.nodeAlias.isEmpty
             ? (session.nodeFingerprint == me ? node : String(session.nodeFingerprint.prefix(12)))
             : session.nodeAlias
-        let several = openSessions.filter { $0.nodeFingerprint == session.nodeFingerprint }.count > 1
+        // A partial page cannot establish that this is the node's only open Session.
+        let several = sessionsOpenPaged || sessionsOpenNext != nil
+            || openSessions.filter { $0.nodeFingerprint == session.nodeFingerprint }.count > 1
         guard includeName || several else { return alias }
         let name = session.name.flatMap { $0.isEmpty ? nil : $0 } ?? session.sessionId
         return "\(alias) · \(name)"

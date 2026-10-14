@@ -945,7 +945,8 @@ private struct RoomTimelineView: View {
             VStack(spacing: 0) {
                 // The interactive tab row belongs to the content, outside title-bar dragging.
                 RoomTabs(model: model, room: room)
-                    .navigationTitle("")
+                    // Keep the OS window/Window menu named; interactive tabs stay in content.
+                    .navigationTitle(model.roomName(room))
                     .navigationSubtitle("")
                 Divider()
                 if !model.roomServices.isEmpty || model.roomServicesNext != nil {

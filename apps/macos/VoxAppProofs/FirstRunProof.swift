@@ -5455,8 +5455,8 @@ final class FirstRunProof: XCTestCase {
         for quiet in ["aaa", "bbb"] where shown(el(ui, Key.id("room-\(quiet)"))).contains("needs you") {
             XCTFail("PRODUCT: \(quiet) has nothing for alice, so its row must not say it needs her; it says \"\(shown(el(ui, Key.id("room-\(quiet)"))))\"")
         }
-        let roomRows = ui.windows.firstMatch.descendants(matching: .any)
-            .matching(NSPredicate(format: "identifier BEGINSWITH 'room-' AND NOT (identifier BEGINSWITH 'room-preview-' OR identifier BEGINSWITH 'room-badge-' OR identifier BEGINSWITH 'room-time-' OR identifier BEGINSWITH 'room-header' OR identifier BEGINSWITH 'room-form')"))
+        let roomRows = el(ui, Key.id("sidebar-rooms")).descendants(matching: .any)
+            .matching(NSPredicate(format: "identifier BEGINSWITH 'room-' AND NOT (identifier BEGINSWITH 'room-preview-' OR identifier BEGINSWITH 'room-badge-' OR identifier BEGINSWITH 'room-time-')"))
             .allElementsBoundByIndex.filter { $0.frame.width > 0 }.sorted { $0.frame.minY < $1.frame.minY }
         XCTAssertEqual(roomRows.first?.identifier, "room-mission",
                        "PRODUCT: the room with the newest message, mission, must be listed first (v0.4.3); the rows are \(roomRows.map(\.identifier))")
