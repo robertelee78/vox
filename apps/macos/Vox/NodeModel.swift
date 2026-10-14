@@ -218,6 +218,7 @@ final class NodeModel: ObservableObject {
             timelineFollowingNewest = true
             selectedEarlierRequest = nil
             sessionNote = nil
+            sessionReloadNeeded = false
             sessionLoading = showingSession
             // What was selected was in the other view's rows: Focus Timeline and ↑/↓ start
             // afresh in this one (P14), as on opening another room.
@@ -281,6 +282,7 @@ final class NodeModel: ObservableObject {
     var readingOlderTimeline: Bool { showingSession ? sessionReadingOlder : roomReadingOlder }
     /// What the node says of the Session on screen besides its entries: "opening not received yet".
     @Published private(set) var sessionNote: String?
+    @Published private(set) var sessionReloadNeeded = false
     /// What was done to the room on screen (its retention set, its name changed), oldest first.
     @Published private(set) var notices: [RoomNoticeRow] = []
     @Published private(set) var noticesBefore: NoticeCursor?
@@ -2586,6 +2588,7 @@ final class NodeModel: ObservableObject {
         selectedSessionMetadata = nil
         selectedSessionMetadataKnown = false
         sessionNote = nil
+        sessionReloadNeeded = false
         sessionLoading = false
         readBy = [:]
         whereabouts = [:]
@@ -2775,6 +2778,7 @@ extension NodeModel {
 
     /// The Session on screen's entries, to a member with drive; nothing to one without (SC-3).
     func readSession() async {
+        guard !sessionReloadNeeded else { return }
         if showingSession && selectedSessionMetadataKnown && selectedSessionMetadata == nil { return }
         guard let room = roomOnScreen, let s = shownSession, s.canDrive else {
             sessionPages.clear()
@@ -2836,9 +2840,13 @@ extension NodeModel {
 
     /// End on an older Session window reloads the actual newest page from disk.
     func readNewestTimeline() async {
-        guard showingSession else { return }
+        guard let room = roomOnScreen, showingSession else { return }
+        let destination = showing, epoch = nodeObservationEpoch
+        sessionReloadNeeded = false
         timelineFollowingNewest = true
         sessionWindowRevision = UUID()
+        await readSelectedSessionMetadata()
+        guard roomOnScreen == room, showing == destination, epoch == nodeObservationEpoch else { return }
         await readSession()
     }
 
@@ -2873,6 +2881,10 @@ extension NodeModel {
             sessionWindowRevision = UUID()
             selectedEarlierRequest = nil
             sessionNote = sentence(error)
+            if case let VoxError.Failed(reason) = error,
+               reason == "stream refused: cursor not among these Session entries" {
+                sessionReloadNeeded = true
+            }
             reportBackground(error)
         }
     }

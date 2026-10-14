@@ -1001,6 +1001,12 @@ private struct RoomView: View {
                                 let items = model.timelineItems
                                 let days = TimelineTime.dividers(items)
                                 LazyVStack(alignment: .leading, spacing: Space.s12 * scale) {
+                                    if model.showingSession && model.sessionReloadNeeded {
+                                        Button("Reload newest activity") {
+                                            Task { await model.readNewestTimeline() }
+                                        }
+                                        .accessibilityIdentifier("session-reload-newest")
+                                    }
                                     ForEach(items) { item in
                                         // A new day starts above the first line that falls on it.
                                         if let day = days[item.id] {
