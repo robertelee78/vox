@@ -427,6 +427,8 @@ const T_ROOM_VIEW_FIND: u64 = 8744;
 const T_POST_AT: u64 = 8745;
 const T_WORK_BOARD_REQ: u64 = 8746;
 const T_WORK_BOARD: u64 = 8747;
+// One current private opening for a membership caption; never an activity-history scan.
+const T_SESSION_JOIN: u64 = 8748;
 const T_ROOM_PAGE_REQ: u64 = 5492;
 const T_ROOM_PAGE: u64 = 5493;
 
@@ -814,6 +816,15 @@ pub enum Request {
         channel_id: Digest32,
         /// Exclusive opening from the previous page.
         after: Option<Digest32>,
+    },
+    /// One deterministic current opening for a member's existing join caption.
+    /// Uses SessionsPage with at most one row, bounded by the page byte budget.
+    /// No drive authority and no open Session both return an empty page.
+    SessionJoin {
+        /// The selected room.
+        channel_id: Digest32,
+        /// The authenticated member whose current opening is selected.
+        node: Digest32,
     },
     /// Exact number of answerable requests across every currently readable open Session.
     SessionsWaiting {
@@ -1576,6 +1587,12 @@ impl Request {
             Request::SessionsOpenPage { channel_id, after } => {
                 e.array(3).uint(T_SESSIONS_OPEN_REQ).bytes(channel_id);
                 e.bytes(after.as_ref().map_or(&[][..], |hash| &hash[..]));
+            }
+            Request::SessionJoin { channel_id, node } => {
+                e.array(3)
+                    .uint(T_SESSION_JOIN)
+                    .bytes(channel_id)
+                    .bytes(node);
             }
             Request::SessionsPending { channel_id, after } => {
                 e.array(3).uint(T_SESSIONS_PENDING_REQ).bytes(channel_id);
@@ -2591,6 +2608,12 @@ impl Request {
                 let channel_id = digest(&mut d)?;
                 d.finish()?;
                 Ok(Request::SessionsWaiting { channel_id })
+            }
+            (T_SESSION_JOIN, 3) => {
+                let channel_id = digest(&mut d)?;
+                let node = digest(&mut d)?;
+                d.finish()?;
+                Ok(Request::SessionJoin { channel_id, node })
             }
             (T_SESSION_LOOKUP, 4) => {
                 let channel_id = digest(&mut d)?;
@@ -5657,7 +5680,7 @@ async fn write_sessions(
     after: Option<Digest32>,
     whole: bool,
     open_only: bool,
-    exact: Option<(Digest32, String)>,
+    exact: Option<(Digest32, Option<String>)>,
     lifecycle: Option<(Option<crate::node::sessions::LifecycleCursor>, Option<u64>)>,
     writing: &std::sync::atomic::AtomicBool,
 ) -> Result<bool> {
@@ -5670,7 +5693,8 @@ async fn write_sessions(
         }
     } else {
         match exact {
-            Some((node, id)) => Query::Exact { node, id },
+            Some((node, Some(id))) => Query::Exact { node, id },
+            Some((node, None)) => Query::Join { node },
             None => Query::Page {
                 open_only,
                 after,
@@ -5737,11 +5761,12 @@ async fn write_sessions(
     let mut summaries = Vec::with_capacity(rows.len());
     for (at, row) in rows.iter().enumerate() {
         let mut prefix = Encoder::new();
-        prefix.array(10).bytes(&row.node).text(&row.id);
+        prefix.array(11).bytes(&row.node).text(&row.id);
         reply_part(stream, &prefix.finish(), &mut offset, true, writing).await?;
         for (which, field) in [
             (FieldKind::Name, row.name),
             (FieldKind::Harness, row.harness),
+            (FieldKind::Cwd, row.cwd),
         ] {
             reply_part(
                 stream,
@@ -6434,9 +6459,12 @@ async fn serve_requests(
                 None,
                 false,
                 false,
-                Some((*node, id.clone())),
+                Some((*node, Some(id.clone()))),
                 None,
             )),
+            Request::SessionJoin { channel_id, node } => {
+                Some((*channel_id, None, false, true, Some((*node, None)), None))
+            }
             Request::SessionLifecycle {
                 channel_id,
                 before,
@@ -8022,6 +8050,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         | Request::SessionsPage { .. }
         | Request::SessionsOpenPage { .. }
         | Request::SessionLookup { .. }
+        | Request::SessionJoin { .. }
         | Request::SessionLifecycle { .. } => Frame::Error {
             reason: "Sessions require a reply stream".into(),
         },
