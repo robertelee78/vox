@@ -305,10 +305,11 @@ fn over_of(ch: &ChannelState) -> Option<String> {
 /// prefix (V210-120); fills, expiry, classification and ordering changes rebuild it.
 fn detail_of(
     ch: &ChannelState,
+    store: &crate::node::store::Store,
     prev: Option<&ChannelDetail>,
     now: crate::time::Ms,
     sequence: &std::sync::atomic::AtomicU64,
-) -> ChannelDetail {
+) -> crate::error::Result<ChannelDetail> {
     let (frozen, refused_below_checkpoint) = ch.fork_watch();
     let (timeline, structured, row_index, display_stamp, display_revision) = if let Some(p) =
         prev.filter(|p| ch.display_is_current(&p.display_stamp))
@@ -321,7 +322,7 @@ fn detail_of(
             p.display_revision,
         )
     } else {
-        let (rows, stamp) = ch.display_timeline();
+        let (rows, stamp) = ch.display_timeline(store)?;
         let prefix = prev.filter(|p| {
             let n = p.timeline.len();
             !stamp.owed
@@ -376,7 +377,7 @@ fn detail_of(
     // Who trusts each member (ADR-028 K-7), once: this identity's own entry is `consenting`.
     let trusted_by = ch.trusted_by();
     let consenting = trusted_by.get(&ch.me()).cloned().unwrap_or_default();
-    ChannelDetail {
+    Ok(ChannelDetail {
         channel_id: ch.channel_id(),
         name: ch.name().map(str::to_owned),
         notices: ch.notices(),
@@ -416,12 +417,12 @@ fn detail_of(
         frozen,
         refused_below_checkpoint,
         read_by: ch.read_by_own(),
-        held: ch.held_own(),
+        held: ch.held_own(store)?,
         unread: ch.unread(),
-        drive_from: ch.drive_from(),
+        drive_from: ch.drive_from(store)?,
         session_files: ch.session_files(),
         session_records: ch.session_records(),
-    }
+    })
 }
 
 /// A room's lock if it can be had by `deadline`. A free lock is taken even once the deadline has
@@ -1531,6 +1532,8 @@ enum NetEvent {
         room_name: String,
         /// The passphrase, kept by the room's state.
         passphrase: Secret,
+        /// The chosen set, signed before the new room is published.
+        anchors: BootstrapSet,
         /// The genesis made before the seal.
         genesis: Box<crate::governance::genesis::Genesis>,
         /// When the room was begun.
@@ -5398,9 +5401,10 @@ impl Node {
                     if let NodeCommand::CreateChannel {
                         name: room_name,
                         passphrase,
+                        anchors,
                     } = command
                     {
-                        self.begin_create_channel(room_name, passphrase, None, reply)
+                        self.begin_create_channel(room_name, passphrase, anchors, None, reply)
                             .await;
                         self.note_if_stalled(name, started);
                         self.publish().await;
@@ -5430,6 +5434,7 @@ impl Node {
                         self.begin_create_channel(
                             room_name,
                             passphrase,
+                            BootstrapSet::new(),
                             Some((tag, endpoint)),
                             reply,
                         )
@@ -5680,9 +5685,6 @@ impl Node {
                     Err(_) => Outcome::Failed(Fault::WrongPassphrase),
                 },
             },
-            NodeCommand::CreateChannel { name, passphrase } => {
-                self.create_channel(&name, &passphrase).await
-            }
             NodeCommand::ChangeRoomAnchors {
                 channel_id,
                 add,
@@ -5863,7 +5865,9 @@ impl Node {
                 out
             }
             // Answered through `begin_create_channel`, which the run loop calls instead of this.
-            NodeCommand::Serve { .. } => Outcome::Failed(Fault::Internal),
+            NodeCommand::CreateChannel { .. } | NodeCommand::Serve { .. } => {
+                Outcome::Failed(Fault::Internal)
+            }
             NodeCommand::Up { channel_id, bind } => self.bring_up(&channel_id, bind).await,
             NodeCommand::AddService {
                 channel_id,
@@ -7884,6 +7888,7 @@ impl Node {
                 reply,
                 room_name,
                 passphrase,
+                anchors,
                 genesis,
                 now,
                 sealed,
@@ -7905,6 +7910,7 @@ impl Node {
                             sek,
                             &wrap,
                             now,
+                            &anchors,
                         ) {
                             Ok(ch) => match service {
                                 None => self.finish_create_channel(ch).await,
@@ -8719,7 +8725,14 @@ impl Node {
                     return;
                 };
                 let holders = self.drive_holders();
-                let page = shared.lock().await.private_page(&ask, &peer, &holders);
+                let Some(profile) = self.profile.as_ref() else {
+                    crate::transport::streams::refuse(&mut send, &mut recv);
+                    return;
+                };
+                let page = shared
+                    .lock()
+                    .await
+                    .private_page(profile.store(), &ask, &peer, &holders);
                 match page {
                     Ok(page) => {
                         tokio::spawn(async move {
@@ -10765,8 +10778,21 @@ impl Node {
             }
         };
         let mut channel = channel;
-        channel.set_node_retention(self.node_retention_for(&parsed.channel_id));
-        channel.set_node_step_retention(self.node_step_retention.for_room(&parsed.channel_id));
+        let retention = self.node_retention_for(&parsed.channel_id);
+        let Some(profile) = self.profile.as_ref() else {
+            return Outcome::Failed(Fault::NoIdentity);
+        };
+        if let Err(error) = channel
+            .set_node_retention(profile.store(), retention)
+            .and_then(|()| {
+                channel.set_node_step_retention(
+                    profile.store(),
+                    self.node_step_retention.for_room(&parsed.channel_id),
+                )
+            })
+        {
+            return Outcome::Failed(fault_of(&error));
+        }
         // A room joined again is published again (V030-14): its withdraw is kept no longer.
         self.withdrawn.remove(&parsed.channel_id);
         self.remember_or_say(&channel);
@@ -15294,30 +15320,6 @@ impl Node {
         }
     }
 
-    fn create_channel<'a>(
-        &'a mut self,
-        room_name: &'a str,
-        passphrase: &'a Secret,
-    ) -> Boxed<'a, Outcome> {
-        Box::pin(self.create_channel_unboxed(room_name, passphrase))
-    }
-
-    /// [`Self::create_channel`], unboxed: see [`Boxed`].
-    async fn create_channel_unboxed(&mut self, room_name: &str, passphrase: &Secret) -> Outcome {
-        if self.room_named(room_name).is_some() {
-            return Outcome::Failed(Fault::RoomNameTaken);
-        }
-        let now_ms = self.now_ms();
-        let Some(profile) = self.profile.as_ref() else {
-            return Outcome::Failed(Fault::NoIdentity);
-        };
-        match ChannelState::create_with_profile(profile, room_name, passphrase, now_ms, self.argon2)
-        {
-            Ok(ch) => self.finish_create_channel(ch).await,
-            Err(e) => Outcome::Failed(fault_of(&e)),
-        }
-    }
-
     /// Everything after a room exists: hold it, give it anchors, publish it, say so.
     fn finish_create_channel(&mut self, ch: ChannelState) -> Boxed<'_, Outcome> {
         Box::pin(self.finish_create_channel_unboxed(ch))
@@ -15328,8 +15330,18 @@ impl Node {
         // The node's own retention before the room is visible to anything that can start a
         // session on it (the retention fix, e2a74b9): every creation path comes through here.
         let id = ch.channel_id();
-        ch.set_node_retention(self.node_retention_for(&id));
-        ch.set_node_step_retention(self.node_step_retention.for_room(&id));
+        let retention = self.node_retention_for(&id);
+        let Some(profile) = self.profile.as_ref() else {
+            return Outcome::Failed(Fault::NoIdentity);
+        };
+        if let Err(error) = ch
+            .set_node_retention(profile.store(), retention)
+            .and_then(|()| {
+                ch.set_node_step_retention(profile.store(), self.node_step_retention.for_room(&id))
+            })
+        {
+            return Outcome::Failed(fault_of(&error));
+        }
         self.remember_or_say(&ch);
         self.channels
             .insert(id, Arc::new(tokio::sync::Mutex::new(ch)));
@@ -15389,6 +15401,7 @@ impl Node {
         &mut self,
         room_name: String,
         passphrase: Secret,
+        anchors: BootstrapSet,
         service: Option<(String, SocketAddr)>,
         reply: oneshot::Sender<Outcome>,
     ) {
@@ -15456,6 +15469,7 @@ impl Node {
                     reply,
                     room_name,
                     passphrase,
+                    anchors,
                     genesis: Box::new(genesis),
                     now: now_ms,
                     sealed,
@@ -15506,8 +15520,21 @@ impl Node {
             // published, so forgetting it here is the whole of the rollback.
             return Outcome::Failed(fault_of(&e));
         }
-        channel.set_node_retention(self.node_retention_for(&id));
-        channel.set_node_step_retention(self.node_step_retention.for_room(&id));
+        let retention = self.node_retention_for(&id);
+        let Some(profile) = self.profile.as_ref() else {
+            return Outcome::Failed(Fault::NoIdentity);
+        };
+        if let Err(error) = channel
+            .set_node_retention(profile.store(), retention)
+            .and_then(|()| {
+                channel.set_node_step_retention(
+                    profile.store(),
+                    self.node_step_retention.for_room(&id),
+                )
+            })
+        {
+            return Outcome::Failed(fault_of(&error));
+        }
         self.remember_or_say(&channel);
         self.channels
             .insert(id, Arc::new(tokio::sync::Mutex::new(channel)));
@@ -15743,12 +15770,13 @@ impl Node {
             }
         }
         let id = ch.channel_id();
-        ch.set_node_retention(self.node_retention_for(&id));
-        ch.set_node_step_retention(self.node_step_retention.for_room(&id));
+        let retention = self.node_retention_for(&id);
         let profile = self
             .profile
             .as_ref()
             .ok_or(crate::error::Error::AtRestLocked)?;
+        ch.set_node_retention(profile.store(), retention)?;
+        ch.set_node_step_retention(profile.store(), self.node_step_retention.for_room(&id))?;
         ch.finish_session_upgrade(profile.store(), self.now_ms().get())?;
         ch.refresh_session_records(profile, &self.drive_holders(), &[], self.now_ms().get())?;
         ch.sweep_retention(profile.store(), self.now_ms())?;
@@ -15871,13 +15899,19 @@ impl Node {
                 )
             });
             if written.is_ok() {
-                self.fresh_details.insert(
-                    channel_id,
-                    (
-                        summary_of(&ch),
-                        detail_of(&ch, None, self.now_ms(), &self.display_sequence),
-                    ),
-                );
+                match detail_of(
+                    &ch,
+                    profile.store(),
+                    None,
+                    self.now_ms(),
+                    &self.display_sequence,
+                ) {
+                    Ok(detail) => {
+                        self.fresh_details
+                            .insert(channel_id, (summary_of(&ch), detail));
+                    }
+                    Err(error) => ch.poison(&error),
+                }
             }
             written
         };
@@ -16153,13 +16187,19 @@ impl Node {
                 }
                 return Outcome::Failed(fault_of(&e));
             }
-            self.fresh_details.insert(
-                *channel_id,
-                (
-                    summary_of(&ch),
-                    detail_of(&ch, None, self.now_ms(), &self.display_sequence),
-                ),
-            );
+            match detail_of(
+                &ch,
+                profile.store(),
+                None,
+                self.now_ms(),
+                &self.display_sequence,
+            ) {
+                Ok(detail) => {
+                    self.fresh_details
+                        .insert(*channel_id, (summary_of(&ch), detail));
+                }
+                Err(error) => ch.poison(&error),
+            }
         }
         self.note_local_append(channel_id);
         self.withdraw_from_boards(channel_id, crate::nat::withdraw::WithdrawScope::Room)
@@ -16193,13 +16233,19 @@ impl Node {
             if let Err(e) = done {
                 return Outcome::Failed(fault_of(&e));
             }
-            self.fresh_details.insert(
-                *channel_id,
-                (
-                    summary_of(&ch),
-                    detail_of(&ch, None, self.now_ms(), &self.display_sequence),
-                ),
-            );
+            match detail_of(
+                &ch,
+                profile.store(),
+                None,
+                self.now_ms(),
+                &self.display_sequence,
+            ) {
+                Ok(detail) => {
+                    self.fresh_details
+                        .insert(*channel_id, (summary_of(&ch), detail));
+                }
+                Err(error) => ch.poison(&error),
+            }
         }
         self.note_local_append(channel_id);
         // The boards learn who may take the room off them (V030-14).
@@ -16221,13 +16267,19 @@ impl Node {
             if let Err(e) = ch.choose_idle_end(profile, idle_secs, now_ms) {
                 return Outcome::Failed(fault_of(&e));
             }
-            self.fresh_details.insert(
-                *channel_id,
-                (
-                    summary_of(&ch),
-                    detail_of(&ch, None, self.now_ms(), &self.display_sequence),
-                ),
-            );
+            match detail_of(
+                &ch,
+                profile.store(),
+                None,
+                self.now_ms(),
+                &self.display_sequence,
+            ) {
+                Ok(detail) => {
+                    self.fresh_details
+                        .insert(*channel_id, (summary_of(&ch), detail));
+                }
+                Err(error) => ch.poison(&error),
+            }
         }
         self.note_local_append(channel_id);
         Outcome::Done
@@ -17366,8 +17418,16 @@ impl Node {
                 continue;
             };
             if self.retention_dirty.remove(cid) {
-                ch.set_node_retention(self.node_retention.for_room(cid));
-                ch.set_node_step_retention(self.node_step_retention.for_room(cid));
+                if let Err(error) = ch
+                    .set_node_retention(&store, self.node_retention.for_room(cid))
+                    .and_then(|()| {
+                        ch.set_node_step_retention(&store, self.node_step_retention.for_room(cid))
+                    })
+                {
+                    ch.poison(&error);
+                    self.retention_dirty.insert(*cid);
+                    continue;
+                }
                 applied = true;
             }
             // **A node may keep less than its room, never more** (V030-32). A file value above the
@@ -17382,7 +17442,13 @@ impl Node {
                     room,
                 });
             }
-            let here = ch.sweep_retention(&store, now_ms).unwrap_or(0);
+            let here = match ch.sweep_retention(&store, now_ms) {
+                Ok(count) => count,
+                Err(error) => {
+                    ch.poison(&error);
+                    continue;
+                }
+            };
             pruned += here;
             // Asked every tick, not only after a prune: a room opened with an expired backlog
             // (after a restart) or one idle with a backlog under the batch size is checkpointed
@@ -17570,8 +17636,19 @@ impl Node {
         let Some(slot) = crate::node::ports::Slots::take(&self.slots, peer, Box::new(|| {})) else {
             return;
         };
-        let Some(ask) = shared.lock().await.start_private_pull(peer) else {
+        let Some(profile) = self.profile.as_ref() else {
             return;
+        };
+        let ask = {
+            let mut ch = shared.lock().await;
+            match ch.start_private_pull(profile.store(), peer) {
+                Ok(Some(ask)) => ask,
+                Ok(None) => return,
+                Err(error) => {
+                    ch.poison(&error);
+                    return;
+                }
+            }
         };
         let tx = self.net_tx.clone();
         tokio::spawn(async move {
@@ -17742,7 +17819,14 @@ impl Node {
                 return;
             };
             let mut ch = shared.lock().await;
-            ch.key_change_unsaid()
+            let unsaid = match ch.key_change_unsaid(profile.store()) {
+                Ok(unsaid) => unsaid,
+                Err(error) => {
+                    ch.poison(&error);
+                    return;
+                }
+            };
+            unsaid
                 && ch
                     .owed_drive(profile, holders, now_ms)
                     .is_ok_and(|owed| owed.is_empty())
@@ -17791,6 +17875,7 @@ impl Node {
             let published = self.view_tx.borrow();
             detail_of(
                 &ch,
+                profile.store(),
                 published
                     .open_channels
                     .iter()
@@ -17799,8 +17884,13 @@ impl Node {
                 &self.display_sequence,
             )
         };
-        self.fresh_details
-            .insert(*channel_id, (summary_of(&ch), detail));
+        match detail {
+            Ok(detail) => {
+                self.fresh_details
+                    .insert(*channel_id, (summary_of(&ch), detail));
+            }
+            Err(error) => ch.poison(&error),
+        }
         drop(ch);
         let channel_id = *channel_id;
         let _ = self.event_tx.send(NodeEvent::NewEntry {
@@ -18019,7 +18109,7 @@ impl Node {
         let mut open_channels = Vec::with_capacity(self.channels.len());
         let mut mlock_active = true;
         for (id, shared) in &self.channels {
-            let Some(ch) = by(deadline, shared).await else {
+            let Some(mut ch) = by(deadline, shared).await else {
                 // The summary and detail taken under this room's lock by this node's own latest write,
                 // if any, are newer than the ones last published (see `fresh_details`): a person reads
                 // their own post (read-your-writes), and the room's entry count agrees with it.
@@ -18037,7 +18127,6 @@ impl Node {
                 mlock_active &= prev.mlock_active;
                 continue;
             };
-            read.insert(*id);
             let mut anchors = BootstrapSet::new();
             for anchor in ch.anchors().nodes() {
                 if !ch.is_known_member(&anchor.id) {
@@ -18067,16 +18156,42 @@ impl Node {
             );
             summaries.insert(*id, summary_of(&ch));
             mlock_active &= ch.mlock_active();
-            open_channels.push(detail_of(
-                &ch,
-                self.fresh_details
-                    .get(id)
-                    .map(|(_, detail)| detail)
-                    .filter(|detail| ch.display_is_current(&detail.display_stamp))
-                    .or_else(|| prev.open_channels.iter().find(|d| d.channel_id == *id)),
-                self.now_ms(),
-                &self.display_sequence,
-            ));
+            let detail = self
+                .profile
+                .as_ref()
+                .ok_or(Error::AtRestLocked)
+                .and_then(|profile| {
+                    detail_of(
+                        &ch,
+                        profile.store(),
+                        self.fresh_details
+                            .get(id)
+                            .map(|(_, detail)| detail)
+                            .filter(|detail| ch.display_is_current(&detail.display_stamp))
+                            .or_else(|| prev.open_channels.iter().find(|d| d.channel_id == *id)),
+                        self.now_ms(),
+                        &self.display_sequence,
+                    )
+                });
+            match detail {
+                Ok(detail) => {
+                    read.insert(*id);
+                    open_channels.push(detail);
+                }
+                Err(error) => {
+                    // Preserve the last successful view; storage health names the failure and
+                    // the existing recovery path reopens this poisoned room before more work.
+                    ch.poison(&error);
+                    if let Some(detail) = self
+                        .fresh_details
+                        .get(id)
+                        .map(|(_, detail)| detail)
+                        .or_else(|| prev.open_channels.iter().find(|d| d.channel_id == *id))
+                    {
+                        open_channels.push(detail.clone());
+                    }
+                }
+            }
         }
         let mut channels = Vec::with_capacity(known.len());
         for id in &known {

@@ -2876,6 +2876,7 @@ impl CoreHandle for DaemonCore {
             }
             Command::CreateChannel { name, passphrase } => self.send(Request::Create {
                 name,
+                anchors: vox_core::nat::bootstrap::BootstrapSet::new(),
                 passphrase: Zeroizing::new(secret(&passphrase)),
             }),
             Command::RenameRoom { channel_id, name } => {

@@ -4811,6 +4811,8 @@ pub async fn create(
     passphrase_file: Option<&std::path::Path>,
     idle_end: Option<&str>,
     bind: Option<&std::path::Path>,
+    anchor_inputs: &[String],
+    find_anchor: bool,
 ) -> Result<(), AppError> {
     // Every member sees the room under this name, and it is the room part of every service
     // address in it: one DNS label (ADR-028 R-1, R-2). Said before a passphrase is asked for.
@@ -4864,6 +4866,7 @@ pub async fn create(
             short(&id)
         )));
     }
+    let anchors = chosen_anchors(paths, anchor_inputs, find_anchor).await?;
     let passphrase = room_passphrase(passphrase_file, "a passphrase for the new room", true)?;
     let kept = zeroize::Zeroizing::new(if bind.is_some() {
         passphrase.clone()
@@ -4882,6 +4885,7 @@ pub async fn create(
         .request(&Request::Create {
             name: name.clone(),
             passphrase: zeroize::Zeroizing::new(passphrase),
+            anchors,
         })
         .await
     {
@@ -4949,6 +4953,78 @@ pub async fn create(
     }
 }
 
+/// Resolve only inputs the person supplied, and search only on their explicit request.
+async fn chosen_anchors(
+    paths: &Paths,
+    inputs: &[String],
+    find: bool,
+) -> Result<vox_core::nat::bootstrap::BootstrapSet, AppError> {
+    use vox_core::nat::bootstrap::{BootstrapSet, MAX_BOOTSTRAP_NODES};
+    use vox_core::node::daemonipc::{DaemonClient, DaemonFrame, DaemonRequest};
+    if inputs.len() > MAX_BOOTSTRAP_NODES {
+        return Err(AppError::Usage(
+            "at most 64 room anchors can be supplied".into(),
+        ));
+    }
+    let mut set = BootstrapSet::new();
+    // Creating without an anchor never waits on discovery or anchor reachability.
+    if inputs.is_empty() && !find {
+        return Ok(set);
+    }
+    let mut daemon = DaemonClient::open(&paths.account().socket()).await?;
+    for input in inputs {
+        let spec = match daemon
+            .request(DaemonRequest::AnchorResolve {
+                input: input.clone(),
+            })
+            .await?
+        {
+            DaemonFrame::AnchorResolved(spec) => spec,
+            DaemonFrame::AnchorFailed(why) => return Err(AppError::Usage(why)),
+            DaemonFrame::Refused(why) => return Err(AppError::Usage(why.to_string())),
+            _ => {
+                return Err(AppError::Usage(
+                    "the daemon did not resolve the anchor".into(),
+                ))
+            }
+        };
+        set = tokio::task::spawn_blocking(move || {
+            vox_core::node::link::merge_anchor_spec(&mut set, &spec)?;
+            Ok::<_, vox_core::error::Error>(set)
+        })
+        .await
+        .map_err(|e| AppError::Usage(e.to_string()))??;
+    }
+    if find {
+        match daemon.request(DaemonRequest::AnchorSearch).await? {
+            DaemonFrame::AnchorsFound(found) => {
+                if found.is_empty() {
+                    println!("vox: no anchor answered the local network search.");
+                }
+                for anchor in found.nodes() {
+                    set.add(anchor.clone())?;
+                }
+            }
+            DaemonFrame::AnchorFailed(why) => {
+                // An optional search failing must not strand ordinary local room creation.
+                eprintln!("vox: {why}; continuing with the anchors already supplied.");
+            }
+            DaemonFrame::Refused(why) => return Err(AppError::Usage(why.to_string())),
+            _ => {
+                return Err(AppError::Usage(
+                    "the daemon did not answer the anchor search".into(),
+                ))
+            }
+        }
+    }
+    for anchor in set.nodes() {
+        for address in anchor.endpoints.addrs() {
+            println!("vox: room anchor {} at {address}", short(&anchor.id));
+        }
+    }
+    Ok(set)
+}
+
 /// Change a room's anchors through its ordinary governance writer.
 ///
 /// # Errors
@@ -4958,24 +5034,16 @@ pub async fn anchors(
     room: &str,
     change: &crate::cli::RoomAnchorChange,
 ) -> Result<(), AppError> {
-    let change = change.clone();
-    let (add, remove) = tokio::task::spawn_blocking(move || {
-        let mut add = vox_core::nat::bootstrap::BootstrapSet::new();
-        let remove = match change {
-            crate::cli::RoomAnchorChange::Add { anchors } => {
-                for spec in anchors {
-                    vox_core::node::link::merge_anchor_spec(&mut add, &spec)?;
-                }
-                None
-            }
-            crate::cli::RoomAnchorChange::Remove { fingerprint } => Some(
-                vox_core::node::link::b32_decode(&fingerprint, "anchor fingerprint")?,
-            ),
-        };
-        Ok::<_, vox_core::error::Error>((add, remove))
-    })
-    .await
-    .map_err(|error| AppError::Usage(error.to_string()))??;
+    let (add, remove) = match change {
+        crate::cli::RoomAnchorChange::Add {
+            anchors,
+            find_anchor,
+        } => (chosen_anchors(paths, anchors, *find_anchor).await?, None),
+        crate::cli::RoomAnchorChange::Remove { fingerprint } => (
+            vox_core::nat::bootstrap::BootstrapSet::new(),
+            Some(b32_decode(fingerprint, "anchor fingerprint")?),
+        ),
+    };
     let mut client = attach(paths).await?;
     let channel_id = room_of(&mut client, room).await?;
     match client

@@ -183,6 +183,8 @@ pub struct GovEntry {
     pub author_id: Digest32,
     /// The per-author sequence number (within-author causal order).
     pub seq: u64,
+    /// The authenticated log skeleton timestamp; retained with its governance coordinates.
+    pub claimed_ms: u64,
     /// The cross-author governance entry hashes this entry causally happens-after
     /// (see module docs). Empty for an entry concurrent with all other authors'.
     pub causal_predecessors: BTreeSet<Digest32>,
@@ -233,6 +235,7 @@ impl GovEntry {
             entry_hash: entry.entry_hash(),
             author_id: entry.skeleton.author_id,
             seq: entry.skeleton.seq,
+            claimed_ms: entry.skeleton.claimed_ms,
             causal_predecessors,
         })
     }

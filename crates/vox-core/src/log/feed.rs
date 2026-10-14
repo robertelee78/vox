@@ -28,12 +28,10 @@
 //!   at each step, so a peer can prove a head's ancestry without the whole feed
 //!   (partial replication).
 
-use std::collections::BTreeMap;
-
 use crate::error::{Error, Result};
 use crate::hash::{Digest32, DIGEST_LEN};
 use crate::identity::composite::CompositePublicKey;
-use crate::log::entry::{Entry, ZERO_HASH};
+use crate::log::entry::{Entry, EntryRead, EntryWrite, ZERO_HASH};
 
 /// Maximum per-author sequence number Vox supports.
 ///
@@ -108,258 +106,247 @@ pub fn lipmaa(n: u64) -> u64 {
 #[derive(Debug, Default, Clone)]
 pub struct Feed {
     author_id: Option<Digest32>,
-    /// seq -> entry. A `BTreeMap` keeps entries seq-ordered for iteration and
-    /// makes the contiguity check a simple range walk.
-    entries: BTreeMap<u64, Entry>,
+    head: u64,
+    head_hash: Digest32,
+    first_claimed_ms: u64,
+    ended: bool,
+}
+
+/// Structural rejection and local storage failure are different: the latter never becomes an
+/// authenticator refusal and must poison/report the local room instead.
+#[derive(Debug)]
+pub enum FeedError {
+    /// A peer entry violates the feed structure.
+    Invalid(Error),
+    /// The local entry store could not be read or written.
+    Local(Error),
 }
 
 impl Feed {
-    /// An empty feed (no author bound yet).
+    /// An empty feed, with no accepted author or head.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            author_id: None,
-            entries: BTreeMap::new(),
-        }
+        Self::default()
     }
-
-    /// The author this feed is bound to, once it holds at least one entry.
+    /// The accepted author, once this feed has held an entry.
     #[must_use]
     pub fn author_id(&self) -> Option<Digest32> {
         self.author_id
     }
-
-    /// The highest seq present (the head), or 0 if empty.
+    /// The last accepted sequence, including an unverified provisional tail.
     #[must_use]
     pub fn max_seq(&self) -> u64 {
-        self.entries.keys().next_back().copied().unwrap_or(0)
+        self.head
     }
-
-    /// The lowest seq present, or `None` if empty: where this node's copy of the feed starts.
+    /// The first accepted position, or none for an empty feed.
     #[must_use]
     pub fn min_seq(&self) -> Option<u64> {
-        self.entries.keys().next().copied()
+        (self.head != 0).then_some(1)
     }
-
-    /// The number of entries held.
+    /// The number of accepted positions, saturating on narrower platforms.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.entries.len()
+        usize::try_from(self.head).unwrap_or(usize::MAX)
     }
-
-    /// Whether the feed holds no entries.
+    /// Whether this feed has no accepted positions.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.head == 0
     }
-
-    /// The entry at `seq`, if present.
-    #[must_use]
-    pub fn get(&self, seq: u64) -> Option<&Entry> {
-        self.entries.get(&seq)
-    }
-
-    /// The hash of the head entry (the entry at `max_seq`), or the all-zero hash
-    /// if empty. This is the `head_hash` gossiped in `HAVE` and used in
-    /// fork-head comparison ([`crate::log::sync`]).
+    /// The hash at the accepted head, or the all-zero genesis predecessor.
     #[must_use]
     pub fn head_hash(&self) -> Digest32 {
-        self.entries
-            .values()
-            .next_back()
-            .map(Entry::entry_hash)
-            .unwrap_or(ZERO_HASH)
+        self.head_hash
+    }
+    /// The first accepted entry’s signed clock claim, used for membership context.
+    pub fn first_claimed_ms(&self) -> Option<u64> {
+        (self.head != 0).then_some(self.first_claimed_ms)
     }
 
-    /// Iterate entries in ascending seq order.
-    pub fn iter(&self) -> impl Iterator<Item = &Entry> {
-        self.entries.values()
-    }
-
-    /// The entries this feed **holds** with `from <= seq <= to`, in ascending seq
-    /// order. The cost is bounded by what is stored, never by the numbers asked
-    /// for: a peer's `WANT (author, 1, u64::MAX)` walks this feed's entries, not
-    /// eighteen quintillion lookups (PRD-001 R4). An inverted range is empty.
-    pub fn range(&self, from: u64, to: u64) -> impl Iterator<Item = &Entry> {
-        (from <= to)
-            .then(|| self.entries.range(from..=to).map(|(_, e)| e))
-            .into_iter()
-            .flatten()
-    }
-
-    /// Drop the payload body of the entry at `seq`, keeping its signed skeleton
-    /// (authenticated pruning, ADR-008/ADR-010). The feed's hash chain is over the
-    /// skeletons, so it stays verifiable. Returns whether a body was dropped.
-    pub fn prune_payload(&mut self, seq: u64) -> bool {
-        self.entries.get_mut(&seq).is_some_and(Entry::prune_payload)
-    }
-
-    /// Give the entry at `seq`, held without its body, the body `payload` (V030-10). The caller has
-    /// checked that it is the one the skeleton commits to. Returns whether a body was put back.
-    pub fn restore_payload(&mut self, seq: u64, payload: Vec<u8>) -> bool {
-        match self.entries.get_mut(&seq) {
-            Some(e) if e.payload.is_none() => {
-                e.payload = Some(payload);
-                true
-            }
-            _ => false,
+    /// Read one accepted position as an owned entry; an unreadable held row is an error.
+    pub fn get(&self, entries: &impl EntryRead, seq: u64) -> Result<Option<Entry>> {
+        if seq == 0 || seq > self.head {
+            return Ok(None);
         }
+        let author = self
+            .author_id
+            .ok_or(Error::MalformedAtRest("nonempty feed has no author"))?;
+        entries
+            .get(&author, seq)?
+            .map(Some)
+            .ok_or(Error::MalformedAtRest("held feed entry missing"))
     }
-
-    /// Drop the signature of the entry at `seq`, keeping its skeleton (ADR-023 decision 3).
-    /// Returns whether a signature was dropped. The caller holds the author's checkpoint.
-    pub fn drop_signature(&mut self, seq: u64) -> bool {
-        self.entries
-            .get_mut(&seq)
-            .is_some_and(Entry::drop_signature)
+    /// Stream accepted entries in order without retaining a complete feed copy.
+    pub fn iter<'a>(
+        &'a self,
+        entries: &'a impl EntryRead,
+    ) -> impl Iterator<Item = Result<Entry>> + 'a {
+        self.range(entries, 1, self.head)
     }
-
-    /// Remove every entry at `seq` and above, returning them. Used only to take back
-    /// skeletons that arrived without a signature and were never chained to a signed one.
-    pub fn truncate_from(&mut self, seq: u64) -> Vec<Entry> {
-        let tail = self.entries.split_off(&seq);
-        tail.into_values().collect()
+    /// Stream only held positions within the inclusive requested range.
+    pub fn range<'a>(
+        &'a self,
+        entries: &'a impl EntryRead,
+        from: u64,
+        to: u64,
+    ) -> impl Iterator<Item = Result<Entry>> + 'a {
+        // Feeds are contiguous. Clip peer-supplied bounds before walking: a WANT ending at
+        // u64::MAX visits only positions actually held, never every requested integer.
+        (from.max(1)..=to.min(self.head)).map(move |seq| {
+            self.get(entries, seq)?
+                .ok_or(Error::MalformedAtRest("held feed entry missing"))
+        })
     }
-
-    /// Append `entry` as the next contiguous entry, validating it links correctly.
-    ///
-    /// Enforces, in order: single author; `seq == max_seq + 1` (contiguous,
-    /// monotonic); the previous entry was not an end-of-feed; `prev_hash` equals
-    /// the seq−1 entry's hash (or all-zero at seq 1); `lipmaa_backlink` equals the
-    /// `lipmaa(seq)` entry's hash (or all-zero at seq 1). Returns
-    /// [`Error::MalformedJoin`]-free, log-specific errors on any violation.
-    ///
-    /// The caller is responsible for the *authenticator* (call [`Entry::verify`]
-    /// before append, or use [`Feed::append_verified`]); this method enforces the
-    /// structural feed invariants the signature does not cover.
-    pub fn append(&mut self, entry: Entry) -> Result<()> {
-        self.validate_next(&entry)?;
+    /// Validate author, sequence, end marker and both backlinks before writing.
+    pub fn validate_next(
+        &self,
+        entries: &impl EntryRead,
+        entry: &Entry,
+    ) -> std::result::Result<(), FeedError> {
+        let bad = |why| FeedError::Invalid(Error::MalformedBundle(why));
         let seq = entry.skeleton.seq;
-        if self.author_id.is_none() {
-            self.author_id = Some(entry.skeleton.author_id);
-        }
-        self.entries.insert(seq, entry);
-        Ok(())
-    }
-
-    /// Validate that `entry` would be a legal next append — single author,
-    /// contiguous monotonic `seq`, no append past end-of-feed, and correct
-    /// `prev_hash`/`lipmaa_backlink` — **without** mutating the feed, so a caller
-    /// can gate side effects on it before the insert and a later rejection never
-    /// leaves partial state.
-    pub fn validate_next(&self, entry: &Entry) -> Result<()> {
-        let seq = entry.skeleton.seq;
-
-        // Bound the sequence so the lipmaa power-of-three arithmetic stays
-        // overflow-free (ADR-008; see [`MAX_SEQ`]).
         if seq > MAX_SEQ {
-            return Err(Error::SizeLimitExceeded("feed seq exceeds MAX_SEQ"));
+            return Err(FeedError::Invalid(Error::SizeLimitExceeded(
+                "feed seq exceeds MAX_SEQ",
+            )));
         }
-
-        // Single-writer: every entry shares the feed's author.
-        match self.author_id {
-            None => {}
-            Some(a) if a == entry.skeleton.author_id => {}
-            Some(_) => return Err(Error::MalformedBundle("feed author mismatch")),
+        if self
+            .author_id
+            .is_some_and(|a| a != entry.skeleton.author_id)
+        {
+            return Err(bad("feed author mismatch"));
         }
-
-        // Contiguous, monotonic from 1.
-        let expected = self.max_seq() + 1;
-        if seq != expected {
-            return Err(Error::MalformedBundle("feed seq not contiguous"));
+        if self.head.checked_add(1) != Some(seq) {
+            return Err(bad("feed seq not contiguous"));
         }
-
-        // No append past an end-of-feed marker.
-        if let Some(prev) = self.entries.get(&self.max_seq()) {
-            if prev.skeleton.end_of_feed {
-                return Err(Error::MalformedBundle("feed already ended"));
-            }
+        if self.ended {
+            return Err(bad("feed already ended"));
         }
-
-        // prev_hash chaining.
-        let expect_prev = if seq == 1 {
+        if entry.skeleton.prev_hash != self.head_hash {
+            return Err(bad("feed prev_hash mismatch"));
+        }
+        let backlink = if seq == 1 {
             ZERO_HASH
         } else {
-            self.hash_at(seq - 1)?
+            self.get(entries, lipmaa(seq))
+                .map_err(FeedError::Local)?
+                .ok_or_else(|| bad("feed backlink target missing"))?
+                .entry_hash()
         };
-        if entry.skeleton.prev_hash != expect_prev {
-            return Err(Error::MalformedBundle("feed prev_hash mismatch"));
+        if entry.skeleton.lipmaa_backlink != backlink {
+            return Err(bad("feed lipmaa_backlink mismatch"));
         }
-
-        // lipmaa skip-link chaining.
-        let expect_lipmaa = if seq == 1 {
-            ZERO_HASH
-        } else {
-            self.hash_at(lipmaa(seq))?
-        };
-        if entry.skeleton.lipmaa_backlink != expect_lipmaa {
-            return Err(Error::MalformedBundle("feed lipmaa_backlink mismatch"));
-        }
-
         Ok(())
     }
-
-    /// Verify the authenticator of `entry` under `author_root`, then append it
-    /// with the structural checks of [`Feed::append`]. The single, ordered seam
-    /// for accepting a new own-or-replicated entry once authorship is known.
-    pub fn append_verified(
+    /// Write one validated entry through the transaction context, then advance metadata.
+    pub fn append(
         &mut self,
-        entry: Entry,
+        entries: &mut impl EntryWrite,
+        entry: &Entry,
+    ) -> std::result::Result<(), FeedError> {
+        self.validate_next(entries, entry)?;
+        entries.put(entry).map_err(FeedError::Local)?;
+        if self.head == 0 {
+            self.first_claimed_ms = entry.skeleton.claimed_ms;
+        }
+        self.author_id = Some(entry.skeleton.author_id);
+        self.head = entry.skeleton.seq;
+        self.head_hash = entry.entry_hash();
+        self.ended = entry.skeleton.end_of_feed;
+        Ok(())
+    }
+    /// Drop one retained body while keeping its authenticated skeleton.
+    pub fn prune_payload(&mut self, entries: &mut impl EntryWrite, seq: u64) -> Result<bool> {
+        let Some(mut entry) = self.get(entries, seq)? else {
+            return Ok(false);
+        };
+        if !entry.prune_payload() {
+            return Ok(false);
+        }
+        entries.put(&entry)?;
+        Ok(true)
+    }
+    /// Restore a body already authenticated by the caller against its held skeleton.
+    pub fn restore_payload(
+        &mut self,
+        entries: &mut impl EntryWrite,
+        seq: u64,
+        payload: Vec<u8>,
+    ) -> Result<bool> {
+        let Some(mut entry) = self.get(entries, seq)? else {
+            return Ok(false);
+        };
+        if entry.payload.is_some() {
+            return Ok(false);
+        }
+        entry.payload = Some(payload);
+        entries.put(&entry)?;
+        Ok(true)
+    }
+    /// Remove a signature covered by a later authenticated checkpoint.
+    pub fn drop_signature(&mut self, entries: &mut impl EntryWrite, seq: u64) -> Result<bool> {
+        let Some(mut entry) = self.get(entries, seq)? else {
+            return Ok(false);
+        };
+        if !entry.drop_signature() {
+            return Ok(false);
+        }
+        entries.put(&entry)?;
+        Ok(true)
+    }
+    /// Remove a provisional tail backwards, reporting each removed entry to the caller.
+    pub fn truncate_from(
+        &mut self,
+        entries: &mut impl EntryWrite,
+        from: u64,
+        mut removed: impl FnMut(Entry),
+    ) -> Result<usize> {
+        if from == 0 || from > self.head {
+            return Ok(0);
+        }
+        let author = self
+            .author_id
+            .ok_or(Error::MalformedAtRest("nonempty feed has no author"))?;
+        let mut count = 0;
+        for seq in (from..=self.head).rev() {
+            let entry = self
+                .get(entries, seq)?
+                .ok_or(Error::MalformedAtRest("unpublished feed entry missing"))?;
+            entries.remove(&author, seq)?;
+            self.head = seq - 1;
+            self.head_hash = entry.skeleton.prev_hash;
+            self.ended = false;
+            removed(entry);
+            count += 1;
+        }
+        Ok(count)
+    }
+    /// Recheck contiguous and skip linkage using owned, fallible reads.
+    pub fn verify(&self, entries: &impl EntryRead) -> Result<()> {
+        let mut expected = Self::new();
+        for entry in self.iter(entries) {
+            let entry = entry?;
+            expected
+                .validate_next(entries, &entry)
+                .map_err(|e| match e {
+                    FeedError::Invalid(e) | FeedError::Local(e) => e,
+                })?;
+            expected.author_id = self.author_id;
+            expected.head = entry.skeleton.seq;
+            expected.head_hash = entry.entry_hash();
+            expected.ended = entry.skeleton.end_of_feed;
+        }
+        Ok(())
+    }
+    /// Verify retained signatures and refuse an unsigned tail without a successor.
+    pub fn verify_all_signatures(
+        &self,
+        entries: &impl EntryRead,
         author_root: &CompositePublicKey,
     ) -> Result<()> {
-        entry.verify(author_root)?;
-        self.append(entry)
-    }
-
-    /// Full structural + chain verification of the whole feed: every entry's
-    /// `prev_hash` and `lipmaa_backlink`, monotonic contiguous seq, single
-    /// author, and end-of-feed discipline. Does NOT check authenticators (call
-    /// [`Feed::verify_all_signatures`] for that, given the author key).
-    pub fn verify(&self) -> Result<()> {
-        let mut expected_seq = 1u64;
-        let mut ended = false;
-        for (&seq, entry) in &self.entries {
-            if ended {
-                return Err(Error::MalformedBundle("feed entry after end-of-feed"));
-            }
-            if seq != expected_seq {
-                return Err(Error::MalformedBundle("feed seq not contiguous"));
-            }
-            if Some(entry.skeleton.author_id) != self.author_id {
-                return Err(Error::MalformedBundle("feed author mismatch"));
-            }
-            let expect_prev = if seq == 1 {
-                ZERO_HASH
-            } else {
-                self.hash_at(seq - 1)?
-            };
-            if entry.skeleton.prev_hash != expect_prev {
-                return Err(Error::MalformedBundle("feed prev_hash mismatch"));
-            }
-            let expect_lipmaa = if seq == 1 {
-                ZERO_HASH
-            } else {
-                self.hash_at(lipmaa(seq))?
-            };
-            if entry.skeleton.lipmaa_backlink != expect_lipmaa {
-                return Err(Error::MalformedBundle("feed lipmaa_backlink mismatch"));
-            }
-            ended = entry.skeleton.end_of_feed;
-            expected_seq += 1;
-        }
-        Ok(())
-    }
-
-    /// Verify every entry's composite authenticator under `author_root`. Combined
-    /// with [`Feed::verify`], this is a complete cryptographic feed check.
-    ///
-    /// An entry whose signature was dropped under a checkpoint (ADR-023 decision 3) is
-    /// authentic through the chain instead, which holds only if a **signed** entry sits above
-    /// it: [`Feed::verify`] checks the links, and this checks that the top of every unsigned
-    /// run is followed by a signature.
-    pub fn verify_all_signatures(&self, author_root: &CompositePublicKey) -> Result<()> {
         let mut unchained = false;
-        for entry in self.entries.values() {
+        for entry in self.iter(entries) {
+            let entry = entry?;
             if entry.is_signed() {
                 entry.verify(author_root)?;
                 unchained = false;
@@ -374,30 +361,25 @@ impl Feed {
         }
         Ok(())
     }
-
-    /// Build a lipmaa skip-link certificate: the chain of entries from the head
-    /// (`max_seq`) back to `target_seq`, following at each step the *larger* valid
-    /// backlink (lipmaa if its target ≥ `target_seq`, else prev). The result is a
-    /// logarithmic-length list (head-first) that [`verify_lipmaa_certificate`] can
-    /// check end-to-end without the whole feed — the partial-replication path
-    /// (ADR-008 §"lipmaa skip-links give logarithmic-length verification certs").
-    pub fn lipmaa_certificate(&self, target_seq: u64) -> Result<Vec<Entry>> {
-        let head = self.max_seq();
-        if target_seq == 0 || target_seq > head {
+    /// Read the logarithmic backlink certificate from the head to the requested position.
+    pub fn lipmaa_certificate(
+        &self,
+        entries: &impl EntryRead,
+        target_seq: u64,
+    ) -> Result<Vec<Entry>> {
+        if target_seq == 0 || target_seq > self.head {
             return Err(Error::MalformedBundle("lipmaa cert target out of range"));
         }
         let mut chain = Vec::new();
-        let mut cur = head;
+        let mut cur = self.head;
         loop {
             let entry = self
-                .entries
-                .get(&cur)
-                .ok_or(Error::MalformedBundle("lipmaa cert missing entry"))?;
-            chain.push(entry.clone());
+                .get(entries, cur)?
+                .ok_or(Error::MalformedAtRest("lipmaa cert missing entry"))?;
+            chain.push(entry);
             if cur == target_seq {
                 break;
             }
-            // Prefer the longer jump that does not overshoot the target.
             let lip = lipmaa(cur);
             cur = if cur >= 2 && lip >= target_seq && lip < cur {
                 lip
@@ -406,13 +388,6 @@ impl Feed {
             };
         }
         Ok(chain)
-    }
-
-    fn hash_at(&self, seq: u64) -> Result<Digest32> {
-        self.entries
-            .get(&seq)
-            .map(Entry::entry_hash)
-            .ok_or(Error::MalformedBundle("feed backlink target missing"))
     }
 }
 
