@@ -13,14 +13,14 @@
 //! Every failure is the daemon's own sentence (M-7): a refusal's words, a node's reason, or what
 //! went wrong reaching the daemon, said for a person.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use tokio::runtime::{Handle, Runtime};
 use vox_core::error::Error;
 use vox_core::hash::Digest32;
-use vox_core::node::api::{MessageRow, NodeEvent};
+use vox_core::node::api::{HistoryCursor, MessageRow, NodeEvent};
 use vox_core::node::daemonipc::{
     AttachMode, DaemonClient, DaemonFrame, DaemonRequest, KeepSource, NodeName, NodeState, UseNode,
 };
@@ -491,6 +491,23 @@ pub struct PulledBy {
     pub names: Vec<String>,
 }
 
+/// Counts and the first boundary in the node's existing bounded unread range.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct RoomUnread {
+    /// Messages addressed to this node.
+    pub addressed: u64,
+    /// Urgent messages among addressed messages.
+    pub urgent: u64,
+    /// Room conversation messages.
+    pub new: u64,
+    /// Coordination messages.
+    pub coordination: u64,
+    /// Oldest unread message in the examined range, if any.
+    pub first: Option<String>,
+    /// Older rows exist outside the node's unread examination range.
+    pub scan_limited: bool,
+}
+
 /// **The three unread levels** (ADR-028 R-8): what one unread message is to this node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum UnreadLevel {
@@ -748,6 +765,41 @@ pub struct RoomServices {
     pub shared: Vec<SharedService>,
     /// The services this node offers there.
     pub offered: Vec<OfferedService>,
+    /// Continue after this inspected slot; empty pages can still continue.
+    pub next: Option<ServiceCursor>,
+    /// Carry this revision into the continuation.
+    pub revision: u64,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ServiceCursor {
+    pub host: String,
+    pub name_hash: String,
+}
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct NoticeCursor {
+    pub clock: u64,
+    pub entry: String,
+}
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct RoomAdmins {
+    pub creator: String,
+    pub members: Vec<String>,
+    pub next: Option<String>,
+    pub revision: u64,
+}
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct RoomNotices {
+    pub rows: Vec<RoomNoticeRow>,
+    pub before: Option<NoticeCursor>,
+    pub revision: u64,
+}
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct RoomConsentPage {
+    pub author: String,
+    pub targets: Vec<String>,
+    pub next: Option<String>,
+    pub revision: u64,
 }
 
 /// A service a member shares in a room.
@@ -890,10 +942,41 @@ pub struct FfiSession {
     pub pending: u32,
 }
 
+fn ffi_session(
+    s: &vox_core::node::sessions::SessionRow,
+    t: &SessionSummary,
+    known: &Known,
+) -> FfiSession {
+    FfiSession {
+        node_fingerprint: b32_encode(&s.node),
+        node_alias: known.names.get(&s.node).cloned().unwrap_or_default(),
+        short_id: s.id.chars().take(8).collect(),
+        label: known.label(s),
+        session_id: s.id.clone(),
+        name: s.name.clone(),
+        open: s.open,
+        opened_at_ms: s.opened_millis,
+        ended_at_ms: s.ended_millis,
+        can_drive: s.can_drive,
+        pending: t.waiting,
+    }
+}
+
+/// One displayed page of Session metadata. Replace the page when following `next`.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiSessionsPage {
+    /// Complete rows, including complete member-written names.
+    pub sessions: Vec<FfiSession>,
+    /// The exclusive opening cursor for the next page, or none at the end.
+    pub next: Option<String>,
+}
+
 /// One Session read as a member with drive reads it (ADR-029 SC-1, #554), word for word as
 /// `vox room session` prints it (CL-1).
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct FfiSessionRead {
+    /// Opaque 16-byte saved-room identity for revalidating this held window.
+    pub instance: Vec<u8>,
     /// Its entries, oldest first; none when this node may not see inside it.
     pub entries: Vec<FfiSessionEntry>,
     /// What to say besides: "opening not received yet", or whose trust this node lacks to see
@@ -908,6 +991,8 @@ pub struct FfiSessionRead {
 /// One bounded room-history page, with how to fetch the preceding page on scroll (FR-4).
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct FfiRoomRead {
+    /// Opaque 16-byte saved-room identity for refreshing or marking this held window.
+    pub instance: Vec<u8>,
     /// Messages in room order, oldest first.
     pub messages: Vec<RoomMessage>,
     /// How many older messages precede this page.
@@ -1083,8 +1168,9 @@ async fn sessions_addressable(
     if addressed.is_empty() {
         return Ok(());
     }
-    let (sessions, _, known) = sessions_known(c, channel_id).await?;
+    let known = Known::of(c).await?;
     for (fp, id) in addressed {
+        let (sessions, _) = exact_session(c, channel_id, *fp, id).await?;
         match vox_core::node::sessions::addressable(&sessions, fp, id, |s| known.label(s)) {
             Ok(found) if found == *id => {}
             Ok(_) => {
@@ -1099,42 +1185,66 @@ async fn sessions_addressable(
     Ok(())
 }
 
-/// A room's Sessions, what the daemon's index says of each, and how this node names nodes.
-async fn sessions_known(
+/// One logical metadata page. A member-written field is returned whole (ADR-034 FR-7/8),
+/// so the one-large-row exception is distinct from accumulating a room's history.
+async fn room_sessions_page(
     c: &mut IpcClient,
     channel_id: Digest32,
+    after: Option<Digest32>,
 ) -> Result<
     (
         Vec<vox_core::node::sessions::SessionRow>,
         Vec<SessionSummary>,
-        Known,
+        Option<Digest32>,
     ),
     VoxError,
 > {
-    let (sessions, summaries) = room_sessions(c, channel_id).await?;
-    Ok((sessions, summaries, Known::of(c).await?))
-}
-
-/// A room's Sessions, read in pages (ADR-034 FR-1), and what the daemon's index says of each:
-/// how many entries, the newest, and what waits (FR-5). No entry is read for them.
-async fn room_sessions(
-    c: &mut IpcClient,
-    channel_id: Digest32,
-) -> Result<
-    (
-        Vec<vox_core::node::sessions::SessionRow>,
-        Vec<SessionSummary>,
-    ),
-    VoxError,
-> {
-    match c.sessions(channel_id).await {
+    match c.sessions_page(channel_id, after).await {
         Ok(Frame::SessionsPage {
             sessions,
             summaries,
-            ..
-        }) => Ok((sessions, summaries)),
+            more,
+        }) => {
+            if sessions.len() != summaries.len() {
+                return Err(failed("the Session page has mismatched summaries"));
+            }
+            let next = more.then(|| sessions.last().map(|s| s.opening)).flatten();
+            if more && (next.is_none() || next == after) {
+                return Err(failed("the Session page made no progress"));
+            }
+            Ok((sessions, summaries, next))
+        }
         Ok(other) => Err(unexpected(&answered(other)?)),
         Err(e) => Err(listing_failed("a room's Sessions", e)),
+    }
+}
+
+/// Resolve the complete selected identity, without listing other Sessions.
+async fn exact_session(
+    c: &mut IpcClient,
+    room: Digest32,
+    node: Digest32,
+    id: &str,
+) -> Result<
+    (
+        Vec<vox_core::node::sessions::SessionRow>,
+        Vec<SessionSummary>,
+    ),
+    VoxError,
+> {
+    match c.session_lookup(room, node, id.to_owned()).await {
+        Ok(Frame::SessionsPage {
+            sessions,
+            summaries,
+            more: false,
+        }) if sessions.len() <= 1
+            && sessions.len() == summaries.len()
+            && sessions.iter().all(|s| s.node == node && s.id == id) =>
+        {
+            Ok((sessions, summaries))
+        }
+        Ok(other) => Err(unexpected(&answered(other)?)),
+        Err(e) => Err(listing_failed("the selected Session", e)),
     }
 }
 
@@ -1153,10 +1263,14 @@ async fn session_page(
     channel_id: Digest32,
     session_id: &str,
     before: Option<Digest32>,
-) -> Result<(Vec<vox_core::node::drive::SessionRow>, u64), VoxError> {
+) -> Result<(Vec<vox_core::node::drive::SessionRow>, u64, [u8; 16]), VoxError> {
     let which = vox_core::node::drive::SessionFilter::Session(session_id.to_owned());
     match c.session_page(channel_id, which, before).await {
-        Ok(Frame::SessionPage { rows, older }) => Ok((rows, older)),
+        Ok(Frame::SessionPage {
+            rows,
+            older,
+            instance,
+        }) => Ok((rows, older, instance)),
         Ok(other) => Err(unexpected(&answered(other)?)),
         Err(e) => Err(listing_failed("a Session's entries", e)),
     }
@@ -1303,49 +1417,29 @@ pub trait ClientListener: Send + Sync {
     fn on_notice(&self, text: String);
     /// The node was detached, or the daemon stopped: nothing more will come. Said as a sentence.
     fn on_ended(&self, text: String);
-    /// A Session in `room` opened, ended or was renamed, or what in it waits on this node changed
-    /// (ADR-029 CL-2): [`VoxClient::sessions`] has it now.
+    /// A Session's metadata, activity or drive authority in `room` changed. Refresh both the
+    /// displayed Session page and the selected Session, preserving room/node/selection fences.
     fn on_sessions(&self, room: String);
-    /// The Session `session_id` of the node `node` (its fingerprint) in `room` has a new entry, or
-    /// a request in it was resolved: [`VoxClient::session_read`] has it now.
-    fn on_session_entry(&self, room: String, node: String, session_id: String);
 }
 
-/// What the app last heard of a room's Sessions: each Session as [`VoxClient::sessions`] gives
-/// it, and the entries of each session this node holds.
-#[derive(Default)]
-struct SessionsSeen {
-    /// Each Session: its node, id, whether it is open, its name, whether this node may drive it,
-    /// and what in it waits on this node.
-    sessions: Vec<(Digest32, String, bool, Option<String>, bool, u32)>,
-    /// Session id → its node, how many entries the daemon holds of it, and its newest.
-    entries: HashMap<String, (Digest32, u64, Option<Digest32>)>,
-}
-
-/// A room's Sessions as the app hears of them; `None` when the node will not say.
-async fn sessions_seen(c: &mut IpcClient, room: Digest32) -> Option<SessionsSeen> {
-    let (sessions, summaries) = room_sessions(c, room).await.ok()?;
-    Some(SessionsSeen {
-        sessions: sessions
-            .iter()
-            .zip(&summaries)
-            .map(|(s, t)| {
-                (
-                    s.node,
-                    s.id.clone(),
-                    s.open,
-                    s.name.clone(),
-                    s.can_drive,
-                    t.waiting,
-                )
-            })
-            .collect(),
-        entries: sessions
-            .iter()
-            .zip(&summaries)
-            .map(|(s, t)| (s.id.clone(), (s.node, t.entries, t.newest)))
-            .collect(),
-    })
+/// One opaque projection token per open room; no Session records are retained for comparison.
+async fn session_revisions(c: &mut IpcClient) -> Result<HashMap<Digest32, Digest32>, VoxError> {
+    let reply = c
+        .exchange(&vox_core::node::snapshot::request_body())
+        .await
+        .map_err(|e| listing_failed("Session changes", e))?;
+    match vox_core::node::snapshot::NodeSnapshot::from_bytes(&reply) {
+        Ok(Some(snapshot)) => Ok(snapshot
+            .open
+            .into_iter()
+            .map(|room| (room.channel_id, room.session_revision))
+            .collect()),
+        Ok(None) => match Frame::from_bytes(&reply) {
+            Ok(frame) => Err(unexpected(&answered(frame)?)),
+            Err(error) => Err(listing_failed("Session changes", error)),
+        },
+        Err(error) => Err(listing_failed("Session changes", error)),
+    }
 }
 
 /// The node this client holds attached, and the connection its requests go over.
@@ -1871,40 +1965,39 @@ macro_rules! on_held {
     }};
 }
 
-impl VoxClient {
-    async fn oldest_retained_room_entry(
-        &self,
-        channel_id: Digest32,
-        entries: &[Digest32],
-    ) -> Result<Option<String>, VoxError> {
-        let entries = entries.to_vec();
-        on_held!(self, |c| {
-            let mut boundary = None;
-            for chunk in entries.chunks(vox_core::node::ipc::MAX_FIND) {
-                let rows = match ask(
-                    c,
-                    &Request::Find {
-                        channel_id,
-                        entries: chunk.to_vec(),
-                    },
-                )
-                .await?
-                {
-                    Frame::Rows { rows } => rows,
-                    other => return Err(unexpected(&other)),
-                };
-                if let Some(id) = chunk
-                    .iter()
-                    .find(|id| rows.iter().any(|r| r.entry_hash == **id))
-                {
-                    boundary = Some(b32_encode(id));
-                    break;
-                }
-            }
-            Ok(boundary)
-        })
-    }
+/// A native window holds at most 128 selected messages and 128 KiB of raw row data.
+/// One legal row may stand alone above the byte budget, as in the daemon's pages.
+const ROOM_WINDOW_ROWS: usize = 128;
+const ROOM_WINDOW_BYTES: usize = vox_core::node::ipc::ROWS_BUDGET;
 
+async fn room_read_fence(
+    client: &mut IpcClient,
+    channel_id: Digest32,
+) -> Result<([u8; 16], Digest32), VoxError> {
+    let instance = match ask(client, &Request::ArrivalHead { channel_id }).await? {
+        Frame::ArrivalHead { head } => head.instance,
+        other => return Err(unexpected(&other)),
+    };
+    let revision = match ask(client, &Request::RoomDisplayRevision { channel_id }).await? {
+        Frame::RoomDisplayRevision { revision } => revision,
+        other => return Err(unexpected(&other)),
+    };
+    Ok((instance, revision))
+}
+
+fn room_window_bytes(rows: &[MessageRow]) -> Result<(), VoxError> {
+    let bytes = rows.iter().fold(0usize, |total, row| {
+        total.saturating_add(row.text.len() + vox_core::node::ipc::ROW_OVERHEAD)
+    });
+    if rows.len() > ROOM_WINDOW_ROWS || (rows.len() > 1 && bytes > ROOM_WINDOW_BYTES) {
+        return Err(failed(
+            "The held room selection exceeds one window's count or byte budget. Refresh fewer messages.",
+        ));
+    }
+    Ok(())
+}
+
+impl VoxClient {
     async fn room_page_read(
         &self,
         room: String,
@@ -1912,31 +2005,41 @@ impl VoxClient {
     ) -> Result<FfiRoomRead, VoxError> {
         let channel_id = digest(&room, "room id")?;
         on_held!(self, |c| {
+            let actor = c.me().ok_or_else(not_attached)?;
+            let fence = room_read_fence(c, channel_id).await?;
             let names = names(c).await?;
-            let me = c.me().map(|f| b32_encode(&f));
-            match ask(
+            let (rows, older) = match ask(
                 c,
                 &Request::RoomPage {
                     channel_id,
                     before,
-                    limit: 0,
+                    limit: ROOM_WINDOW_ROWS as u64,
                 },
             )
             .await?
             {
-                Frame::RoomPage { rows, older } => Ok(FfiRoomRead {
-                    before: rows
-                        .first()
-                        .filter(|_| older > 0)
-                        .map(|r| b32_encode(&r.entry_hash)),
-                    messages: rows
-                        .iter()
-                        .map(|r| rendered(r, &names, me.as_deref()))
-                        .collect(),
-                    older,
-                }),
-                other => Err(unexpected(&other)),
+                Frame::RoomPage { rows, older } => (rows, older),
+                other => return Err(unexpected(&other)),
+            };
+            room_window_bytes(&rows)?;
+            if room_read_fence(c, channel_id).await? != fence || c.me() != Some(actor) {
+                return Err(failed(
+                    "The room changed while reading. Refresh and try again.",
+                ));
             }
+            let me = b32_encode(&actor);
+            Ok(FfiRoomRead {
+                instance: fence.0.to_vec(),
+                before: rows
+                    .first()
+                    .filter(|_| older > 0)
+                    .map(|r| b32_encode(&r.entry_hash)),
+                messages: rows
+                    .iter()
+                    .map(|r| rendered(r, &names, Some(&me)))
+                    .collect(),
+                older,
+            })
         })
     }
     /// A page of a Session, newest first: see [`VoxClient::session_read`].
@@ -1950,17 +2053,15 @@ impl VoxClient {
         use vox_core::node::session_view::{read, OPENING_NOT_RECEIVED};
         let channel_id = digest(&room, "room id")?;
         let node = digest(&node, "node's fingerprint")?;
-        // Where each file this node pulled landed, by its entry (ADR-028 F-6).
-        let pulled: HashMap<String, String> = self
-            .pulled(room)
-            .await?
-            .into_iter()
-            .map(|p| (p.entry, p.path))
-            .collect();
-        on_held!(self, |c| {
-            let (sessions, _, known) = sessions_known(c, channel_id).await?;
-            let (rows, older) = session_page(c, channel_id, &session_id, before).await?;
-            let first = rows.first().map(|r| b32_encode(&r.entry_hash));
+        let mut page = on_held!(self, |c| {
+            let (sessions, _) = exact_session(c, channel_id, node, &session_id).await?;
+            let known = Known::of(c).await?;
+            let (rows, older, instance) = session_page(c, channel_id, &session_id, before).await?;
+            let first_hash = rows.first().map(|r| r.entry_hash);
+            if older > 0 && (first_hash.is_none() || first_hash == before) {
+                return Err(failed("the Session activity page made no progress"));
+            }
+            let first = first_hash.map(|hash| b32_encode(&hash));
             let r = read(
                 &sessions,
                 rows,
@@ -1974,12 +2075,36 @@ impl VoxClient {
                 (r.state == OPENING_NOT_RECEIVED).then(|| OPENING_NOT_RECEIVED.to_owned())
             });
             Ok(FfiSessionRead {
-                entries: r.lines.iter().map(|l| session_entry(l, &pulled)).collect(),
+                instance: instance.to_vec(),
+                entries: r
+                    .lines
+                    .iter()
+                    .map(|l| session_entry(l, &HashMap::new()))
+                    .collect(),
                 note,
                 older,
                 before: first.filter(|_| older > 0),
             })
-        })
+        })?;
+        let files: Vec<String> = page
+            .entries
+            .iter()
+            .filter_map(|entry| entry.file.as_ref())
+            .map(|file| file.entry.clone())
+            .collect();
+        for chunk in files.chunks(64) {
+            let pulled = self.pulled_for(room.clone(), chunk.to_vec()).await?;
+            for entry in &mut page.entries {
+                if let Some(file) = entry.file.as_mut() {
+                    file.pulled_path = pulled
+                        .iter()
+                        .find(|p| p.entry == file.entry)
+                        .map(|p| p.path.clone())
+                        .or_else(|| file.pulled_path.take());
+                }
+            }
+        }
+        Ok(page)
     }
 
     async fn computer_request(
@@ -2653,61 +2778,96 @@ impl VoxClient {
         self.room_page_read(room, None).await
     }
 
-    /// Reanchor a room while retaining the history extent already loaded by its reader.
-    /// Missing captured entries are pruned; a refused lookup keeps its own error. No cached
-    /// message body is reused: all returned rows come from authoritative history pages.
+    /// Revalidate exactly the held message ids, in their requested order, on the same node
+    /// and saved room. Missing ids are omitted only after every authoritative lookup succeeds.
+    /// This does not add newer messages or walk the gap to the newest page. The caller keeps
+    /// its paging metadata: this exact selection returns `older = 0` and `before = None`.
+    /// At most 128 ids and 128 KiB of raw row data are accepted (one legal large row alone).
     pub async fn room_read_retaining(
         &self,
         room: String,
+        node: String,
+        instance: Vec<u8>,
         loaded: Vec<String>,
     ) -> Result<FfiRoomRead, VoxError> {
+        if loaded.len() > ROOM_WINDOW_ROWS {
+            return Err(failed("A held room window may name at most 128 messages."));
+        }
         let channel_id = digest(&room, "room id")?;
+        let actor = digest(&node, "fingerprint")?;
+        let instance: [u8; 16] = instance
+            .try_into()
+            .map_err(|_| failed("The saved room identity must contain exactly 16 bytes."))?;
         let entries = loaded
             .iter()
             .map(|id| digest(id, "entry"))
             .collect::<Result<Vec<_>, _>>()?;
-        let mut boundary = self
-            .oldest_retained_room_entry(channel_id, &entries)
-            .await?;
-        let mut page = self.room_read(room.clone()).await?;
-        let mut cursors = std::collections::HashSet::new();
-        while let Some(ref oldest) = boundary {
-            if page.messages.iter().any(|row| &row.id == oldest) {
-                break;
+        on_held!(self, |c| {
+            if c.me() != Some(actor) {
+                return Err(failed(
+                    "The acting node changed before refreshing this room.",
+                ));
             }
-            // Retention can prune the selected boundary between Find and pagination.
-            // Recompute it before every older page rather than walking to the room start.
-            boundary = self
-                .oldest_retained_room_entry(channel_id, &entries)
-                .await?;
-            let Some(ref oldest) = boundary else { break };
-            if page.messages.iter().any(|row| &row.id == oldest) {
-                break;
+            let fence = room_read_fence(c, channel_id).await?;
+            if fence.0 != instance {
+                return Err(failed(
+                    "The saved room changed. Open its current page again.",
+                ));
             }
-            let Some(before) = page.before.clone() else {
-                break;
-            };
-            if !cursors.insert(before.clone()) {
-                return Err(VoxError::Failed {
-                    reason: "Room history did not advance while recovering its page.".into(),
-                });
+            let names = names(c).await?;
+            let mut found = HashMap::new();
+            let mut bytes = 0usize;
+            for chunk in entries.chunks(vox_core::node::ipc::MAX_FIND) {
+                // Find itself streams one coherent selection. At most 64 bounded raw rows
+                // exist in this temporary reply, independent of the room's history size.
+                let rows = match ask(
+                    c,
+                    &Request::Find {
+                        channel_id,
+                        entries: chunk.to_vec(),
+                    },
+                )
+                .await?
+                {
+                    Frame::Rows { rows } => rows,
+                    other => return Err(unexpected(&other)),
+                };
+                for row in rows {
+                    if !chunk.contains(&row.entry_hash) {
+                        return Err(failed(
+                            "The room returned a message outside the held selection.",
+                        ));
+                    }
+                    if found.contains_key(&row.entry_hash) {
+                        continue;
+                    }
+                    bytes =
+                        bytes.saturating_add(row.text.len() + vox_core::node::ipc::ROW_OVERHEAD);
+                    if !found.is_empty() && bytes > ROOM_WINDOW_BYTES {
+                        return Err(failed(
+                            "The held room selection exceeds one window's byte budget. Refresh fewer messages.",
+                        ));
+                    }
+                    found.insert(row.entry_hash, row);
+                }
             }
-            let older = self.room_read_older(room.clone(), before).await?;
-            let held: std::collections::HashSet<_> =
-                page.messages.iter().map(|row| row.id.clone()).collect();
-            let mut rows: Vec<_> = older
-                .messages
-                .into_iter()
-                .filter(|row| !held.contains(&row.id))
-                .collect();
-            rows.extend(page.messages);
-            page = FfiRoomRead {
-                messages: rows,
-                older: older.older,
-                before: older.before,
-            };
-        }
-        Ok(page)
+            if room_read_fence(c, channel_id).await? != fence || c.me() != Some(actor) {
+                return Err(failed(
+                    "The room changed while refreshing its held messages. Try again.",
+                ));
+            }
+            let me = b32_encode(&actor);
+            Ok(FfiRoomRead {
+                instance: instance.to_vec(),
+                messages: entries
+                    .iter()
+                    .filter_map(|id| found.remove(id))
+                    .map(|row| rendered(&row, &names, Some(&me)))
+                    .collect(),
+                older: 0,
+                before: None,
+            })
+        })
     }
 
     /// Load the room-history page before `before`, when the person scrolls up (ADR-034 FR-4).
@@ -2839,10 +2999,11 @@ impl VoxClient {
         })
     }
 
-    /// Opaque equality token for the selected room's published display. It changes when the
+    /// Opaque equality token for the selected room's current sealed display. It changes when the
     /// readable timeline changes (including late fills and expiry), on room reopen, or when
     /// display names change. Actor restart changes the token even when this client repairs its
-    /// connection internally. It reads no historical messages or full node snapshot.
+    /// connection internally. The daemon reads it under the same readiness and room-lock
+    /// boundary as exact message lookup, without collecting historical message bodies.
     /// Compare only within this held client's lifetime; discard cached tokens on a new client,
     /// node change, detach or refusal. A newly loaded root still needs its initial summary.
     ///
@@ -3282,15 +3443,60 @@ impl VoxClient {
     ///
     /// # Errors
     /// A malformed id, or the node's refusal (the room not open).
-    pub async fn admins(&self, room: String) -> Result<Vec<String>, VoxError> {
+    pub async fn is_admin(&self, room: String, member: String) -> Result<bool, VoxError> {
+        use vox_core::node::api::{GovernancePage, GovernanceQuery};
         let channel_id = digest(&room, "room id")?;
-        on_held!(
-            self,
-            |c| match ask(c, &Request::Admins { channel_id }).await? {
-                Frame::Members { members } => Ok(members.iter().map(b32_encode).collect()),
-                other => Err(unexpected(&other)),
+        let target = digest(&member, "member fingerprint")?;
+        on_held!(self, |c| match ask(
+            c,
+            &Request::GovernancePage {
+                channel_id,
+                query: GovernanceQuery::Admin { target }
             }
         )
+        .await?
+        {
+            Frame::GovernancePage {
+                page: GovernancePage::Admin { admin, .. },
+            } => Ok(admin),
+            other => Err(unexpected(&other)),
+        })
+    }
+
+    pub async fn admins_page(
+        &self,
+        room: String,
+        after: Option<String>,
+        revision: Option<u64>,
+    ) -> Result<RoomAdmins, VoxError> {
+        use vox_core::node::api::{GovernancePage, GovernanceQuery};
+        let channel_id = digest(&room, "room id")?;
+        let after = after.map(|v| digest(&v, "admin cursor")).transpose()?;
+        on_held!(self, |c| match ask(
+            c,
+            &Request::GovernancePage {
+                channel_id,
+                query: GovernanceQuery::Admins { after, revision }
+            }
+        )
+        .await?
+        {
+            Frame::GovernancePage {
+                page:
+                    GovernancePage::Admins {
+                        creator,
+                        members,
+                        next,
+                        revision,
+                    },
+            } => Ok(RoomAdmins {
+                creator: b32_encode(&creator),
+                members: members.iter().map(b32_encode).collect(),
+                next: next.as_ref().map(b32_encode),
+                revision
+            }),
+            other => Err(unexpected(&other)),
+        })
     }
 
     /// Read creator/admin authority for the currently held node and exact room.
@@ -3303,14 +3509,25 @@ impl VoxClient {
         &self,
         room: String,
     ) -> Result<RoomAnchorAuthority, VoxError> {
+        use vox_core::node::api::{GovernancePage, GovernanceQuery};
         let channel_id = digest(&room, "room id")?;
         on_held!(self, |c| {
             let me = c.me().ok_or_else(not_attached)?;
-            match ask(c, &Request::Admins { channel_id }).await? {
-                Frame::Members { members } => Ok(RoomAnchorAuthority {
+            match ask(
+                c,
+                &Request::GovernancePage {
+                    channel_id,
+                    query: GovernanceQuery::Admin { target: me },
+                },
+            )
+            .await?
+            {
+                Frame::GovernancePage {
+                    page: GovernancePage::Admin { target, admin, .. },
+                } if target == me => Ok(RoomAnchorAuthority {
                     room: b32_encode(&channel_id),
                     node: b32_encode(&me),
-                    can_manage: members.contains(&me),
+                    can_manage: admin,
                 }),
                 other => Err(unexpected(&other)),
             }
@@ -3779,8 +3996,21 @@ impl VoxClient {
     ///
     /// # Errors
     /// A malformed id, or the node's refusal.
-    pub async fn services(&self, room: String) -> Result<RoomServices, VoxError> {
+    pub async fn services_page(
+        &self,
+        room: String,
+        after: Option<ServiceCursor>,
+        revision: Option<u64>,
+    ) -> Result<RoomServices, VoxError> {
         let channel_id = digest(&room, "room id")?;
+        let after = after
+            .map(|v| {
+                Ok::<_, VoxError>((
+                    digest(&v.host, "service cursor host")?,
+                    digest(&v.name_hash, "service cursor name")?,
+                ))
+            })
+            .transpose()?;
         // Whether the `.vox` proxy runs, for the needs of ssh by address and of a URL, asked as
         // `vox service list` asks it.
         let held = Arc::clone(&self.held);
@@ -3800,51 +4030,64 @@ impl VoxClient {
                     }))
             })
             .await?;
-        on_held!(
-            self,
-            |c| match ask(c, &Request::Services { channel_id }).await? {
-                Frame::Services {
-                    room,
-                    services,
-                    shared,
-                } => Ok(RoomServices {
-                    room: shown_name(&room),
-                    shared: shared
-                        .into_iter()
-                        .map(|s| {
-                            use vox_core::node::service_reach::{commands, needs};
-                            SharedService {
-                                commands: commands(&s)
-                                    .into_iter()
-                                    .map(|(what, command)| ServiceCommand {
-                                        what: what.to_owned(),
-                                        command,
-                                    })
-                                    .collect(),
-                                needs: needs(&s, Some(&proxy))
-                                    .into_iter()
-                                    .map(|(need, holds, otherwise)| ServiceNeed {
-                                        need: shown_name(&need),
-                                        holds,
-                                        otherwise: shown_name(&otherwise),
-                                    })
-                                    .collect(),
-                                address: shown_name(&s.address),
-                                canonical: s.canonical,
-                                by: shown_name(&s.by),
-                                udp: s.udp,
-                                kind: shown_name(&s.kind),
-                            }
-                        })
-                        .collect(),
-                    offered: services
-                        .into_iter()
-                        .map(|(tag, local)| OfferedService { tag, local })
-                        .collect(),
-                }),
-                other => Err(unexpected(&other)),
+        on_held!(self, |c| match ask(
+            c,
+            &Request::Services {
+                channel_id,
+                after,
+                revision
             }
         )
+        .await?
+        {
+            Frame::Services {
+                room,
+                services,
+                shared,
+                next,
+                revision,
+            } => Ok(RoomServices {
+                next: next.map(|(host, name_hash)| ServiceCursor {
+                    host: b32_encode(&host),
+                    name_hash: b32_encode(&name_hash)
+                }),
+                revision,
+                room: shown_name(&room),
+                shared: shared
+                    .into_iter()
+                    .map(|s| {
+                        use vox_core::node::service_reach::{commands, needs};
+                        SharedService {
+                            commands: commands(&s)
+                                .into_iter()
+                                .map(|(what, command)| ServiceCommand {
+                                    what: what.to_owned(),
+                                    command,
+                                })
+                                .collect(),
+                            needs: needs(&s, Some(&proxy))
+                                .into_iter()
+                                .map(|(need, holds, otherwise)| ServiceNeed {
+                                    need: shown_name(&need),
+                                    holds,
+                                    otherwise: shown_name(&otherwise),
+                                })
+                                .collect(),
+                            address: shown_name(&s.address),
+                            canonical: s.canonical,
+                            by: shown_name(&s.by),
+                            udp: s.udp,
+                            kind: shown_name(&s.kind),
+                        }
+                    })
+                    .collect(),
+                offered: services
+                    .into_iter()
+                    .map(|(tag, local)| OfferedService { tag, local })
+                    .collect(),
+            }),
+            other => Err(unexpected(&other)),
+        })
     }
 
     /// Offer the local endpoint `local` (`ip:port`) in `room` as the service `tag`, kept across
@@ -4083,28 +4326,49 @@ impl VoxClient {
     ///
     /// # Errors
     /// A malformed id, or the node's refusal (a room not open).
-    pub async fn sessions(&self, room: String) -> Result<Vec<FfiSession>, VoxError> {
+    pub async fn sessions_page(
+        &self,
+        room: String,
+        after: Option<String>,
+    ) -> Result<FfiSessionsPage, VoxError> {
         let channel_id = digest(&room, "room id")?;
+        let after = after
+            .as_deref()
+            .map(|id| digest(id, "Session opening"))
+            .transpose()?;
         on_held!(self, |c| {
-            let (sessions, summaries, known) = sessions_known(c, channel_id).await?;
+            let (sessions, summaries, next) = room_sessions_page(c, channel_id, after).await?;
+            let known = Known::of(c).await?;
+            Ok(FfiSessionsPage {
+                sessions: sessions
+                    .iter()
+                    .zip(&summaries)
+                    .map(|(s, t)| ffi_session(s, t, &known))
+                    .collect(),
+                next: next.map(|id| b32_encode(&id)),
+            })
+        })
+    }
+
+    /// Exact metadata for the selected node and Session ID; none if its opening is absent.
+    ///
+    /// # Errors
+    /// A malformed identity or the daemon's refusal.
+    pub async fn session(
+        &self,
+        room: String,
+        node: String,
+        session_id: String,
+    ) -> Result<Option<FfiSession>, VoxError> {
+        let room = digest(&room, "room id")?;
+        let node = digest(&node, "node fingerprint")?;
+        on_held!(self, |c| {
+            let (sessions, summaries) = exact_session(c, room, node, &session_id).await?;
+            let known = Known::of(c).await?;
             Ok(sessions
-                .iter()
-                .zip(&summaries)
-                .map(|(s, t)| FfiSession {
-                    node_fingerprint: b32_encode(&s.node),
-                    node_alias: known.names.get(&s.node).cloned().unwrap_or_default(),
-                    short_id: s.id.chars().take(8).collect(),
-                    label: known.label(s),
-                    session_id: s.id.clone(),
-                    name: s.name.clone(),
-                    open: s.open,
-                    opened_at_ms: s.opened_millis,
-                    ended_at_ms: s.ended_millis,
-                    can_drive: s.can_drive,
-                    // The daemon counts them from its index (ADR-034 FR-5): no entry is read here.
-                    pending: t.waiting,
-                })
-                .collect())
+                .first()
+                .zip(summaries.first())
+                .map(|(s, t)| ffi_session(s, t, &known)))
         })
     }
 
@@ -4145,62 +4409,70 @@ impl VoxClient {
             .await
     }
 
-    /// The current requests in a Session. With no `references`, returns the requests still
-    /// waiting for an answer. Otherwise returns those named requests, including their current
-    /// resolutions, so loaded older entries and a selected request remain current. Both paths
-    /// use the request index and bounded pages, never a walk through the transcript.
+    /// Re-read at most 128 logical activities already held in this Session window, including
+    /// selected multipart Details. `instance` must be the token of their original page.
+    /// Success contains only current requested entries; missing/expired entries are omitted.
+    /// The caller preserves its pagination cursors separately (`older` is zero here).
     ///
     /// # Errors
-    /// As [`VoxClient::session_read`].
-    pub async fn session_requests(
+    /// Identity/drive/lifetime change, projection/storage failure, more than 128 IDs, or a
+    /// multi-entry selection exceeding one page's byte budget. One legal oversized logical
+    /// activity is streamed whole, just as in an ordinary Session page.
+    pub async fn session_entries(
         &self,
         room: String,
         node: String,
         session_id: String,
-        references: Vec<String>,
-    ) -> Result<Vec<FfiSessionEntry>, VoxError> {
+        instance: Vec<u8>,
+        ids: Vec<String>,
+    ) -> Result<FfiSessionRead, VoxError> {
         use vox_core::node::{drive::SessionFilter, session_view::read};
+        if ids.len() > 128 {
+            return Err(failed(
+                "at most 128 held Session IDs can be refreshed together",
+            ));
+        }
         let channel_id = digest(&room, "room id")?;
         let node = digest(&node, "node's fingerprint")?;
+        let expected: [u8; 16] = instance
+            .try_into()
+            .map_err(|_| failed("invalid saved room instance"))?;
+        let entries: Vec<Digest32> = ids
+            .iter()
+            .map(|id| digest(id, "Session entry id"))
+            .collect::<Result<_, _>>()?;
         on_held!(self, |c| {
-            let (sessions, _, known) = sessions_known(c, channel_id).await?;
-            let filters = if references.is_empty() {
-                vec![SessionFilter::Pending(session_id.clone())]
-            } else {
-                references
-                    .into_iter()
-                    .collect::<std::collections::BTreeSet<_>>()
-                    .into_iter()
-                    .map(|reference| SessionFilter::Request {
-                        session_id: session_id.clone(),
-                        reference,
-                    })
-                    .collect()
+            let (sessions, _) = exact_session(c, channel_id, node, &session_id).await?;
+            let known = Known::of(c).await?;
+            let which = SessionFilter::Entries {
+                node,
+                session_id: session_id.clone(),
+                entries: entries.clone(),
+                instance: expected,
             };
-            let mut rows = Vec::new();
-            for which in filters {
-                let mut before = None;
-                let mut pages = Vec::new();
-                loop {
-                    match c
-                        .session_page(channel_id, which.clone(), before)
-                        .await
-                        .map_err(|e| listing_failed("a Session's requests", e))?
-                    {
-                        Frame::SessionPage { rows, older } => {
-                            before = rows.first().map(|r| r.entry_hash);
-                            if older > 0 && before.is_none() {
-                                return Err(failed("the request page made no progress"));
-                            }
-                            pages.push(rows);
-                            if older == 0 {
-                                break;
-                            }
-                        }
-                        other => return Err(unexpected(&answered(other)?)),
-                    }
-                }
-                rows.extend(pages.into_iter().rev().flatten());
+            let (rows, instance) = match c
+                .session_page(channel_id, which, None)
+                .await
+                .map_err(|e| listing_failed("held Session entries", e))?
+            {
+                Frame::SessionPage {
+                    rows,
+                    instance,
+                    older: 0,
+                } if instance == expected => (rows, instance),
+                other => return Err(unexpected(&answered(other)?)),
+            };
+            // Authority, readiness and the room instance were checked by the successful
+            // exact selection. An opening-not-received Session may have no descriptor once
+            // its final held activity expires; that is a valid empty revalidation.
+            if rows.is_empty() {
+                return Ok(FfiSessionRead {
+                    instance: instance.to_vec(),
+                    entries: Vec::new(),
+                    note: None,
+                    older: 0,
+                    before: None,
+                });
             }
             let r = read(
                 &sessions,
@@ -4211,12 +4483,88 @@ impl VoxClient {
                 &known,
             )
             .map_err(failed)?;
-            let pulled = HashMap::new();
-            Ok(r.lines
-                .iter()
-                .filter(|l| l.request.is_some())
-                .map(|l| session_entry(l, &pulled))
-                .collect())
+            Ok(FfiSessionRead {
+                instance: instance.to_vec(),
+                entries: r
+                    .lines
+                    .iter()
+                    .filter(|line| entries.contains(&line.id))
+                    .map(|line| session_entry(line, &HashMap::new()))
+                    .collect(),
+                note: r.hidden,
+                older: 0,
+                before: None,
+            })
+        })
+    }
+
+    /// One page of pending requests, or of the explicitly named request's resolution history.
+    /// `before` continues that same selection; no other requests are silently included or omitted.
+    ///
+    /// # Errors
+    /// As [`VoxClient::session_read`], or an invalid continuation.
+    pub async fn session_requests_page(
+        &self,
+        room: String,
+        node: String,
+        session_id: String,
+        reference: Option<String>,
+        before: Option<String>,
+    ) -> Result<FfiSessionRead, VoxError> {
+        use vox_core::node::{drive::SessionFilter, session_view::read};
+        let channel_id = digest(&room, "room id")?;
+        let node = digest(&node, "node's fingerprint")?;
+        let before = before
+            .as_deref()
+            .map(|id| digest(id, "entry"))
+            .transpose()?;
+        on_held!(self, |c| {
+            let (sessions, _) = exact_session(c, channel_id, node, &session_id).await?;
+            let known = Known::of(c).await?;
+            let which = match reference {
+                Some(reference) => SessionFilter::Request {
+                    session_id: session_id.clone(),
+                    reference,
+                },
+                None => SessionFilter::Pending(session_id.clone()),
+            };
+            let (rows, older, instance) = match c
+                .session_page(channel_id, which, before)
+                .await
+                .map_err(|e| listing_failed("a Session's requests", e))?
+            {
+                Frame::SessionPage {
+                    rows,
+                    older,
+                    instance,
+                } => (rows, older, instance),
+                other => return Err(unexpected(&answered(other)?)),
+            };
+            let next = rows.first().map(|r| r.entry_hash);
+            if older > 0 && (next.is_none() || next == before) {
+                return Err(failed("the request page made no progress"));
+            }
+            let r = read(
+                &sessions,
+                rows,
+                &session_id,
+                Some(&node),
+                &|s| known.label(s),
+                &known,
+            )
+            .map_err(failed)?;
+            Ok(FfiSessionRead {
+                instance: instance.to_vec(),
+                entries: r
+                    .lines
+                    .iter()
+                    .filter(|l| l.request.is_some())
+                    .map(|l| session_entry(l, &HashMap::new()))
+                    .collect(),
+                note: r.hidden,
+                older,
+                before: next.filter(|_| older > 0).map(|id| b32_encode(&id)),
+            })
         })
     }
 
@@ -4229,11 +4577,13 @@ impl VoxClient {
     pub async fn drive(
         &self,
         room: String,
+        node: String,
         session: String,
         action: DriveAction,
     ) -> Result<DriveAnswer, VoxError> {
         use vox_agentcomms::drive::{Action, Request as Drive};
         let channel_id = digest(&room, "room id")?;
+        let node = digest(&node, "Session node fingerprint")?;
         // A file is served before it is said: its share is started once the Session's node is
         // known, below.
         let mut file = None;
@@ -4263,7 +4613,8 @@ impl VoxClient {
                 let h = slot.as_mut().ok_or_else(not_attached)?;
                 h.mend().await?;
                 let names = names(&mut h.client).await?;
-                let (sessions, _) = room_sessions(&mut h.client, channel_id).await?;
+                let (sessions, _) =
+                    exact_session(&mut h.client, channel_id, node, &session).await?;
                 let row = sessions
                     .into_iter()
                     .find(|s| s.id == session && s.open)
@@ -4482,11 +4833,57 @@ impl VoxClient {
         })
     }
 
+    /// Where the displayed offers stand, without reading older transfers. Read at most 64
+    /// announcement hashes per call; every requested state is returned whole or the call refuses.
+    ///
+    /// # Errors
+    /// No node attached, malformed ids, too many entries, or the node's refusal.
+    pub async fn pull_states_for(
+        &self,
+        room: String,
+        entries: Vec<String>,
+    ) -> Result<Vec<OfferPull>, VoxError> {
+        use vox_core::node::pulls::PullState as P;
+        if entries.len() > 64 {
+            return Err(failed("read at most 64 pull states at a time"));
+        }
+        let channel_id = digest(&room, "room id")?;
+        let entries = entries
+            .iter()
+            .map(|s| digest(s, "offer entry"))
+            .collect::<Result<Vec<_>, _>>()?;
+        on_held!(self, |c| {
+            match ask(
+                c,
+                &Request::PullStatesFor {
+                    channel_id,
+                    entries,
+                },
+            )
+            .await?
+            {
+                Frame::PullStates { states } => Ok(states
+                    .into_iter()
+                    .map(|(entry, state)| OfferPull {
+                        entry: b32_encode(&entry),
+                        state: match state {
+                            P::Pulling { bytes, of } => PullState::Pulling { bytes, of },
+                            P::Waiting { why } => PullState::Waiting { why },
+                            P::Failed { why } => PullState::Failed { why },
+                        },
+                    })
+                    .collect()),
+                other => Err(unexpected(&other)),
+            }
+        })
+    }
+
     /// What this node pulled by itself in `room` and verified, oldest first, each where `vox room
     /// get` puts it: `<data root>/nodes/<node>/files/<room>/`.
     ///
     /// # Errors
-    /// No node attached, or a malformed id.
+    /// No node attached, a malformed id, or more receipts than one reply holds; use
+    /// [`Self::pulled_for`] for the displayed entries in that case.
     pub async fn pulled(&self, room: String) -> Result<Vec<PulledFile>, VoxError> {
         let channel_id = digest(&room, "room id")?;
         let held = Arc::clone(&self.held);
@@ -4504,7 +4901,58 @@ impl VoxClient {
                 .node_paths(&node)
                 .map_err(|e| failed(format!("node {node}: {e}")))?;
             let mut pulled: Vec<PulledFile> = vox_core::node::pulls::recorded(&paths)
-                .into_iter()
+                .filter(|p| p.room == channel_id)
+                .take(65)
+                .map(|p| PulledFile {
+                    entry: b32_encode(&p.entry),
+                    path: p.path.to_string_lossy().into_owned(),
+                    created: p.created_ms / 1_000,
+                })
+                .collect();
+            if pulled.len() > 64 {
+                return Err(failed("this room has more saved copies than one reply holds; read the copies of the displayed entries"));
+            }
+            pulled.sort_by_key(|p| p.created);
+            Ok(pulled)
+        })
+        .await
+    }
+
+    /// The verified local copies of at most 64 displayed announcements. Folder manifests
+    /// remain on disk; only the entry, destination and date cross into the app.
+    ///
+    /// # Errors
+    /// No node attached, malformed ids, or too many entries.
+    pub async fn pulled_for(
+        &self,
+        room: String,
+        entries: Vec<String>,
+    ) -> Result<Vec<PulledFile>, VoxError> {
+        if entries.len() > 64 {
+            return Err(failed("read at most 64 saved copies at a time"));
+        }
+        let channel_id = digest(&room, "room id")?;
+        let entries = entries
+            .iter()
+            .map(|s| digest(s, "offer entry"))
+            .collect::<Result<Vec<_>, _>>()?;
+        let held = Arc::clone(&self.held);
+        let (data_root, config_dir) = (self.data_root.clone(), self.config_dir.clone());
+        self.on_rt(async move {
+            let node = held
+                .lock()
+                .await
+                .as_ref()
+                .map(|h| h.node.clone())
+                .ok_or_else(not_attached)?;
+            let account = Account::of(Some(&data_root), Some(&config_dir))
+                .map_err(|e| failed(format!("data root: {e}")))?;
+            let paths = account
+                .node_paths(&node)
+                .map_err(|e| failed(format!("node {node}: {e}")))?;
+            let mut pulled: Vec<PulledFile> = entries
+                .iter()
+                .filter_map(|entry| vox_core::node::pulls::recorded_entry(&paths, entry))
                 .filter(|p| p.room == channel_id)
                 .map(|p| PulledFile {
                     entry: b32_encode(&p.entry),
@@ -4568,12 +5016,12 @@ impl VoxClient {
     ///
     /// # Errors
     /// A malformed id, or the node's refusal.
-    pub async fn consents(&self, room: String) -> Result<RoomConsents, VoxError> {
+    pub async fn member_consents(&self, room: String) -> Result<RoomConsents, VoxError> {
         let channel_id = digest(&room, "room id")?;
         on_held!(
             self,
-            |c| match ask(c, &Request::Consents { channel_id }).await? {
-                Frame::Consents { outbound, inbound } => Ok(RoomConsents {
+            |c| match ask(c, &Request::MemberConsents { channel_id }).await? {
+                Frame::MemberConsents { outbound, inbound } => Ok(RoomConsents {
                     outbound: outbound.iter().map(b32_encode).collect(),
                     inbound: inbound.iter().map(b32_encode).collect(),
                 }),
@@ -4798,23 +5246,97 @@ impl VoxClient {
     ///
     /// # Errors
     /// A malformed id, the room not open, or the daemon's refusal.
-    pub async fn notices(&self, room: String) -> Result<Vec<RoomNoticeRow>, VoxError> {
-        let (open, names) = self.open_snap(&room).await?;
-        let Some(open) = open else {
-            return Err(failed("the room is not open on this node"));
-        };
-        Ok(open
-            .notices
-            .into_iter()
-            .map(|n| RoomNoticeRow {
-                id: b32_encode(&n.entry_hash),
-                author: b32_encode(&n.author),
-                author_name: names.get(&n.author).cloned().unwrap_or_default(),
-                created_millis: n.created_millis,
-                what: n.what,
-                after: n.after.map(|a| b32_encode(&a)).unwrap_or_default(),
-            })
-            .collect())
+    pub async fn notices_page(
+        &self,
+        room: String,
+        before: Option<NoticeCursor>,
+        revision: Option<u64>,
+    ) -> Result<RoomNotices, VoxError> {
+        use vox_core::node::api::{GovernancePage, GovernanceQuery};
+        let channel_id = digest(&room, "room id")?;
+        let before = before
+            .map(|v| Ok::<_, VoxError>((v.clock, digest(&v.entry, "notice cursor")?)))
+            .transpose()?;
+        let (_, names) = self.open_snap(&room).await?;
+        on_held!(self, |c| match ask(
+            c,
+            &Request::GovernancePage {
+                channel_id,
+                query: GovernanceQuery::Notices { before, revision }
+            }
+        )
+        .await?
+        {
+            Frame::GovernancePage {
+                page:
+                    GovernancePage::Notices {
+                        rows,
+                        before,
+                        revision,
+                    },
+            } => Ok(RoomNotices {
+                rows: rows
+                    .into_iter()
+                    .map(|n| RoomNoticeRow {
+                        id: b32_encode(&n.entry_hash),
+                        author: b32_encode(&n.author),
+                        author_name: names.get(&n.author).cloned().unwrap_or_default(),
+                        created_millis: n.created_millis,
+                        what: n.what,
+                        after: n.after.as_ref().map(b32_encode).unwrap_or_default()
+                    })
+                    .collect(),
+                before: before.map(|(clock, entry)| NoticeCursor {
+                    clock,
+                    entry: b32_encode(&entry)
+                }),
+                revision,
+            }),
+            other => Err(unexpected(&other)),
+        })
+    }
+
+    /// Complete consent history through bounded pages, including targets outside the roster.
+    pub async fn consents_page(
+        &self,
+        room: String,
+        author: Option<String>,
+        after: Option<String>,
+        revision: Option<u64>,
+    ) -> Result<RoomConsentPage, VoxError> {
+        use vox_core::node::api::{GovernancePage, GovernanceQuery};
+        let channel_id = digest(&room, "room id")?;
+        let author = author.map(|v| digest(&v, "consent author")).transpose()?;
+        let after = after.map(|v| digest(&v, "consent cursor")).transpose()?;
+        on_held!(self, |c| match ask(
+            c,
+            &Request::GovernancePage {
+                channel_id,
+                query: GovernanceQuery::Consent {
+                    author,
+                    after,
+                    revision
+                }
+            }
+        )
+        .await?
+        {
+            Frame::GovernancePage {
+                page:
+                    GovernancePage::Consent {
+                        author,
+                        targets,
+                        next,
+                        revision,
+                    },
+            } => Ok(RoomConsentPage {
+                author: b32_encode(&author),
+                targets: targets.iter().map(b32_encode).collect(),
+                next: next.as_ref().map(b32_encode),
+                revision
+            }),
+            other => Err(unexpected(&other)),
+        })
     }
 
     /// How long `room` keeps messages here, as a person reads it ("1 week", "forever"), as the
@@ -4881,6 +5403,24 @@ impl VoxClient {
     ///
     /// # Errors
     /// A malformed id, or the node's refusal (the room not open).
+    pub async fn unread_summary(&self, room: String) -> Result<RoomUnread, VoxError> {
+        let channel_id = digest(&room, "room id")?;
+        on_held!(self, |c| {
+            match ask(c, &Request::UnreadSummary { channel_id }).await? {
+                Frame::UnreadSummary { summary } => Ok(RoomUnread {
+                    addressed: summary.addressed,
+                    urgent: summary.urgent,
+                    new: summary.new,
+                    coordination: summary.coordination,
+                    first: summary.first.as_ref().map(b32_encode),
+                    scan_limited: summary.scan_limited,
+                }),
+                other => Err(unexpected(&other)),
+            }
+        })
+    }
+
+    /// The bounded unread rows, for callers that need their bodies.
     pub async fn unread(&self, room: String) -> Result<Vec<RoomMessage>, VoxError> {
         let channel_id = digest(&room, "room id")?;
         on_held!(self, |c| {
@@ -4917,6 +5457,147 @@ impl VoxClient {
         on_held!(self, |c| done(c, &req).await)
     }
 
+    /// Mark the messages actually shown from this exact held room window. Even an empty
+    /// selection checks the actor and atomically validates the room instance in the daemon.
+    /// Success means the selected marks were admitted to durable local state.
+    pub async fn mark_read_at(
+        &self,
+        room: String,
+        node: String,
+        instance: Vec<u8>,
+        ids: Vec<String>,
+    ) -> Result<(), VoxError> {
+        if ids.len() > ROOM_WINDOW_ROWS {
+            return Err(failed("A held room window may mark at most 128 messages."));
+        }
+        let channel_id = digest(&room, "room id")?;
+        let actor = digest(&node, "fingerprint")?;
+        let instance: [u8; 16] = instance
+            .try_into()
+            .map_err(|_| failed("The saved room identity must contain exactly 16 bytes."))?;
+        let entries = ids
+            .iter()
+            .map(|id| digest(id, "message id"))
+            .collect::<Result<Vec<_>, _>>()?;
+        on_held!(self, |c| {
+            if c.me() != Some(actor) {
+                return Err(failed(
+                    "The acting node changed before marking this room read.",
+                ));
+            }
+            done(
+                c,
+                &Request::MarkReadAt {
+                    channel_id,
+                    instance,
+                    entries,
+                },
+            )
+            .await
+        })
+    }
+
+    /// Mark received messages from other members through one captured arrival head.
+    /// One held actor, one room instance, and one bounded page are retained throughout.
+    /// Cursor, authority and durable-mark failures abort without claiming whole-room success.
+    pub async fn mark_room_read(&self, room: String, node: String) -> Result<u64, VoxError> {
+        let channel_id = digest(&room, "room id")?;
+        let actor = digest(&node, "fingerprint")?;
+        on_held!(self, |c| {
+            if c.me() != Some(actor) {
+                return Err(failed(
+                    "The acting node changed before marking this room read.",
+                ));
+            }
+            let head = match ask(c, &Request::ArrivalHead { channel_id }).await? {
+                Frame::ArrivalHead { head } => head,
+                other => return Err(unexpected(&other)),
+            };
+            let mut cursor = HistoryCursor {
+                instance: head.instance,
+                arrival: 0,
+            };
+            let mut marked = 0u64;
+            while cursor.arrival < head.arrival {
+                let (rows, instance, next) = match ask(
+                    c,
+                    &Request::ArrivalPage {
+                        channel_id,
+                        after: cursor,
+                    },
+                )
+                .await?
+                {
+                    Frame::ArrivalPage {
+                        rows,
+                        instance,
+                        next,
+                    } => (rows, instance, next),
+                    other => return Err(unexpected(&other)),
+                };
+                if instance != head.instance {
+                    return Err(failed(
+                        "The saved room changed while marking it read. Try again.",
+                    ));
+                }
+                let mut last = cursor.arrival;
+                for row in &rows {
+                    if row.arrival <= last || row.owed {
+                        return Err(failed(
+                            "The room's arrival page did not advance consistently.",
+                        ));
+                    }
+                    last = row.arrival;
+                }
+                if next.is_some_and(|n| {
+                    n.instance != head.instance || n.arrival <= cursor.arrival || n.arrival < last
+                }) {
+                    return Err(failed(
+                        "The room's arrival continuation did not advance consistently.",
+                    ));
+                }
+                let mut entries: Vec<_> = rows
+                    .iter()
+                    .filter(|row| row.arrival <= head.arrival && row.author != actor)
+                    .map(|row| row.entry_hash)
+                    .collect();
+                entries.sort_unstable();
+                entries.dedup();
+                for page in entries.chunks(vox_core::node::content::MAX_READ_HASHES) {
+                    done(
+                        c,
+                        &Request::MarkReadAt {
+                            channel_id,
+                            instance: head.instance,
+                            entries: page.to_vec(),
+                        },
+                    )
+                    .await?;
+                    marked = marked
+                        .checked_add(page.len() as u64)
+                        .ok_or_else(|| failed("The room's read count is too large."))?;
+                }
+                if last >= head.arrival {
+                    break;
+                }
+                let Some(next) = next else { break };
+                cursor = next;
+            }
+            // Validate completion even when the captured room was empty, all rows were
+            // ours, or the final page contained no markable rows.
+            done(
+                c,
+                &Request::MarkReadAt {
+                    channel_id,
+                    instance: head.instance,
+                    entries: Vec::new(),
+                },
+            )
+            .await?;
+            Ok(marked)
+        })
+    }
+
     /// Deliver the held node's events to `listener` until it is detached or the daemon stops.
     ///
     /// When the node says a room has new readable messages (its own post, a sync that rendered
@@ -4932,94 +5613,215 @@ impl VoxClient {
         let socket = self.socket.clone();
         // The cursors and the stream are set up before this returns, so nothing posted after it
         // is missed.
-        let (stream, cursors, seen) = self
+        let (stream, cursors, seen, owner, reanchor) = self
             .on_rt({
                 let held = Arc::clone(&held);
                 async move {
                     let mut slot = held.lock().await;
                     let h = slot.as_mut().ok_or_else(not_attached)?;
                     h.mend().await?;
-                    let mut stream = IpcClient::open_at(&h.at)
-                        .await
-                        .map_err(|e| said(&socket, e))?;
-                    stream
-                        .subscribe()
-                        .await
-                        .map_err(|e| failed(format!("cannot follow the node's events: {e}")))?;
                     let mut cursors = HashMap::new();
-                    let mut seen = HashMap::new();
+                    let seen = session_revisions(&mut h.client).await?;
                     for (id, _, open, _) in room_ids(&mut h.client).await? {
                         if !open {
                             continue;
                         }
-                        if let Some(s) = sessions_seen(&mut h.client, id).await {
-                            seen.insert(id, s);
-                        }
-                        let req = Request::Count {
-                            channel_id: id,
-                            since: None,
-                        };
-                        if let Frame::Count { last, .. } = ask(&mut h.client, &req).await? {
-                            cursors.insert(id, last);
+                        match ask(&mut h.client, &Request::ArrivalHead { channel_id: id }).await? {
+                            Frame::ArrivalHead { head } => {
+                                cursors.insert(id, head);
+                            }
+                            other => return Err(unexpected(&other)),
                         }
                     }
-                    Ok((stream, cursors, seen))
+                    let owner = FollowOwner {
+                        node: h.node.clone(),
+                        fingerprint: h.client.me(),
+                    };
+                    // Capture heads before registering: follow immediately reads the gap,
+                    // then queued events only wake reads after those same saved cursors.
+                    let mut stream = IpcClient::open_at(&h.at)
+                        .await
+                        .map_err(|e| said(&socket, e))?;
+                    if h.at.using.node != owner.node || stream.me() != owner.fingerprint {
+                        return Err(failed("the app's node identity changed"));
+                    }
+                    stream
+                        .subscribe()
+                        .await
+                        .map_err(|e| failed(format!("cannot follow the node's events: {e}")))?;
+                    // A room opened before registration has no queued Opened event. Its
+                    // snapshot must be reanchored too, rather than silently baselined late.
+                    let reanchor = room_ids(&mut h.client)
+                        .await?
+                        .into_iter()
+                        .any(|(id, _, open, _)| open && !cursors.contains_key(&id));
+                    Ok((stream, cursors, seen, owner, reanchor))
                 }
             })
             .await?;
-        self.rt.spawn(follow(stream, cursors, seen, held, listener));
+        self.rt.spawn(follow(
+            stream, cursors, seen, held, owner, reanchor, listener,
+        ));
         Ok(())
     }
 }
 
-/// The event loop behind [`VoxClient::subscribe`].
+/// The subscription remains bound to the same attached name and full identity on every read.
+struct FollowOwner {
+    node: NodeName,
+    fingerprint: Option<Digest32>,
+}
+impl FollowOwner {
+    fn holds(&self, held: &Held) -> bool {
+        held.node == self.node && held.client.me() == self.fingerprint
+    }
+}
+
+async fn follow_head(
+    held: &Slot,
+    owner: &FollowOwner,
+    room: Digest32,
+) -> Result<HistoryCursor, String> {
+    let mut slot = held.lock().await;
+    let h = slot
+        .as_mut()
+        .filter(|h| owner.holds(h))
+        .ok_or_else(|| "the app released or changed its node".to_owned())?;
+    h.mend().await.map_err(|e| e.to_string())?;
+    if !owner.holds(h) {
+        return Err("the app's node identity changed".into());
+    }
+    match ask(&mut h.client, &Request::ArrivalHead { channel_id: room })
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        Frame::ArrivalHead { head } => Ok(head),
+        other => Err(unexpected(&other).to_string()),
+    }
+}
+
+/// Deliver one sealed arrival page, retaining only its scalar cursor. Rows already delivered
+/// never reappear merely because their bodies expired, their canonical order changed, or a wake
+/// was duplicated. The room instance fences deletion/rejoin; its old cursor cannot name a new log.
+async fn follow_page(
+    held: &Slot,
+    owner: &FollowOwner,
+    room: Digest32,
+    cursor: &mut HistoryCursor,
+    listener: &dyn ClientListener,
+) -> Result<bool, String> {
+    let mut slot = held.lock().await;
+    let h = slot
+        .as_mut()
+        .filter(|h| owner.holds(h))
+        .ok_or_else(|| "the app released or changed its node".to_owned())?;
+    h.mend().await.map_err(|e| e.to_string())?;
+    if !owner.holds(h) {
+        return Err("the app's node identity changed".into());
+    }
+    let (rows, instance, next) = match ask(
+        &mut h.client,
+        &Request::ArrivalPage {
+            channel_id: room,
+            after: *cursor,
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())?
+    {
+        Frame::ArrivalPage {
+            rows,
+            instance,
+            next,
+        } => (rows, instance, next),
+        other => return Err(unexpected(&other).to_string()),
+    };
+    if instance != cursor.instance {
+        // Ending, rather than a notice alone, enters NodeModel's existing same-node recovery:
+        // refresh authoritative facts, mark the selected room for reload, then resubscribe.
+        return Err(
+            "the saved room changed; refreshing its history and restarting observation".into(),
+        );
+    }
+    let mut last = cursor.arrival;
+    for row in &rows {
+        if row.arrival <= last || row.owed {
+            return Err("the room's arrival page did not advance consistently".into());
+        }
+        last = row.arrival;
+    }
+    if next
+        .is_some_and(|n| n.instance != instance || n.arrival <= cursor.arrival || n.arrival < last)
+    {
+        return Err("the room's arrival continuation did not advance consistently".into());
+    }
+    let names = names(&mut h.client).await.map_err(|e| e.to_string())?;
+    let me = h.client.me().map(|f| b32_encode(&f));
+    // Keep the held-node fence through these synchronous callbacks; a different attach cannot
+    // supply names for this node's page or receive its callbacks between the read and delivery.
+    for row in rows {
+        listener.on_message(b32_encode(&room), rendered(&row, &names, me.as_deref()));
+    }
+    cursor.arrival = next.map_or(last, |n| n.arrival);
+    Ok(next.is_some())
+}
+
+/// The event loop behind [`VoxClient::subscribe`]. Events wake a bounded durable arrival read;
+/// they are not a second delivery route requiring a lifetime set of every delivered hash.
 async fn follow(
     mut stream: IpcClient,
-    mut cursors: HashMap<Digest32, Option<Digest32>>,
-    mut seen: HashMap<Digest32, SessionsSeen>,
+    mut cursors: HashMap<Digest32, HistoryCursor>,
+    mut seen: HashMap<Digest32, Digest32>,
     held: Slot,
+    owner: FollowOwner,
+    reanchor: bool,
     listener: Arc<dyn ClientListener>,
 ) {
-    let mut delivered: HashSet<Digest32> = HashSet::new();
-    loop {
-        // The rooms whose Sessions this event may have changed, besides those it brought messages
-        // to: a Session's opening and end are room messages; its entries are not.
-        let mut sessions_in: Vec<Digest32> = Vec::new();
-        let rooms: Vec<Digest32> = match stream.next().await {
-            // A new entry, with its row: delivered as it came, as `vox room tail` delivers it. Read
-            // back instead, it could come from the room's view before the node published the row in
-            // it, find nothing, and be lost for good with no later event to read it again (the
-            // walkthrough's WHERE-15, posted with every peer offline). The cursor stays where reads
-            // left it: a row rendered late still sits after it, and `delivered` keeps this one from
-            // being told twice when a later read returns it.
-            Ok(Some(Frame::Event(NodeEvent::NewEntry { channel_id, row }))) => {
-                if cursors.contains_key(&channel_id)
-                    && !row.owed
-                    && delivered.insert(row.entry_hash)
-                {
-                    let message = {
-                        let mut slot = held.lock().await;
-                        let Some(h) = slot.as_mut() else {
-                            listener.on_ended("the app released its node".to_owned());
-                            return;
-                        };
-                        let names = match names(&mut h.client).await {
-                            Ok(names) => names,
-                            Err(e) => {
-                                listener.on_ended(e.to_string());
-                                return;
-                            }
-                        };
-                        let me = h.client.me().map(|f| b32_encode(&f));
-                        rendered(&row, &names, me.as_deref())
-                    };
-                    listener.on_message(b32_encode(&channel_id), message);
+    if reanchor {
+        listener.on_ended(
+            "a room opened while observation started; refreshing its history and restarting observation"
+                .into(),
+        );
+        return;
+    }
+    // An arrival between the saved heads and subscription registration has no queued event.
+    // Catch it once without waiting for another message; event-driven reads use these same
+    // cursors, so a row also represented by a queued event is not delivered twice.
+    let initial_rooms: Vec<_> = cursors.keys().copied().collect();
+    for (&room, cursor) in &mut cursors {
+        loop {
+            match follow_page(&held, &owner, room, cursor, listener.as_ref()).await {
+                Ok(true) => tokio::task::yield_now().await,
+                Ok(false) => break,
+                Err(why) => {
+                    listener.on_ended(why);
+                    return;
                 }
-                sessions_in.push(channel_id);
-                Vec::new()
             }
-            // Others' messages: a sync that rendered rows, or a sender key that made rows already
-            // held readable. Said as a notice too, as the TUI says them.
+        }
+    }
+    if !sessions_told(&initial_rooms, &mut seen, &held, &owner, listener.as_ref()).await {
+        return;
+    }
+    loop {
+        let event = stream.next().await;
+        {
+            let slot = held.lock().await;
+            if !slot.as_ref().is_some_and(|h| owner.holds(h)) {
+                listener.on_ended("the app released or changed its node".into());
+                return;
+            }
+        }
+        let mut sessions_in = Vec::new();
+        let rooms: Vec<Digest32> = match event {
+            Ok(Some(Frame::Event(NodeEvent::NewEntry { channel_id, .. }))) => {
+                sessions_in.push(channel_id);
+                cursors
+                    .contains_key(&channel_id)
+                    .then_some(channel_id)
+                    .into_iter()
+                    .collect()
+            }
             Ok(Some(Frame::Event(
                 ev @ (NodeEvent::Synced { .. } | NodeEvent::SenderKeyReceived { .. }),
             ))) => {
@@ -5033,15 +5835,50 @@ async fn follow(
                     _ => None,
                 };
                 listener.on_notice(ev.words());
-                room.into_iter().collect()
+                room.filter(|r| cursors.contains_key(r))
+                    .into_iter()
+                    .collect()
             }
-            // A Session's news (ADR-029 CL-2): told below, with the room's Sessions read again.
+            Ok(Some(Frame::Event(ev @ NodeEvent::ChannelOpened { channel_id }))) => {
+                let Some(previous) = cursors.get(&channel_id) else {
+                    // The event has no opening arrival baseline. A current head could skip
+                    // later queued arrivals; explicit recovery reloads the selected snapshot
+                    // before following this room, without replaying all its old messages.
+                    listener.on_ended(
+                        "a room opened; refreshing its history and restarting observation".into(),
+                    );
+                    return;
+                };
+                match follow_head(&held, &owner, channel_id).await {
+                    Ok(head) => {
+                        if previous.instance != head.instance {
+                            listener.on_ended("the saved room changed; refreshing its history and restarting observation".into());
+                            return;
+                        }
+                    }
+                    Err(why) => {
+                        listener.on_ended(why);
+                        return;
+                    }
+                }
+                listener.on_notice(ev.words());
+                sessions_in.push(channel_id);
+                vec![channel_id]
+            }
+            Ok(Some(Frame::Event(
+                ev @ (NodeEvent::ChannelClosed { channel_id }
+                | NodeEvent::RoomRemoved { channel_id }),
+            ))) => {
+                cursors.remove(&channel_id);
+                seen.remove(&channel_id);
+                listener.on_notice(ev.words());
+                listener.on_sessions(b32_encode(&channel_id));
+                Vec::new()
+            }
             Ok(Some(Frame::Event(NodeEvent::SessionEntry { channel_id, .. }))) => {
                 sessions_in.push(channel_id);
                 Vec::new()
             }
-            // Anything else the node says. Who has drive changed: what every room's Sessions let
-            // this node see and answer.
             Ok(Some(Frame::Event(ev))) => {
                 if matches!(ev, NodeEvent::CapabilityChanged { .. }) {
                     sessions_in.extend(cursors.keys().copied());
@@ -5049,8 +5886,50 @@ async fn follow(
                 listener.on_notice(ev.words());
                 Vec::new()
             }
-            // Events were dropped for this client: every room it follows is read from its cursor.
-            Ok(Some(Frame::Lagged { .. })) => cursors.keys().copied().collect(),
+            Ok(Some(Frame::Lagged { .. })) => {
+                // A lost open/close event must not leave another room's cursor attached to the
+                // wrong incarnation. Existing rooms keep their exact arrival cursor; an unknown
+                // room needs explicit snapshot recovery rather than a silently advanced head.
+                let open = {
+                    let mut slot = held.lock().await;
+                    let Some(h) = slot.as_mut().filter(|h| owner.holds(h)) else {
+                        listener.on_ended("the app released or changed its node".into());
+                        return;
+                    };
+                    if let Err(error) = h.mend().await {
+                        listener.on_ended(error.to_string());
+                        return;
+                    }
+                    if !owner.holds(h) {
+                        listener.on_ended("the app's node identity changed".into());
+                        return;
+                    }
+                    match room_ids(&mut h.client).await {
+                        Ok(rooms) => rooms
+                            .into_iter()
+                            .filter(|r| r.2)
+                            .map(|r| r.0)
+                            .collect::<Vec<_>>(),
+                        Err(error) => {
+                            listener.on_ended(error.to_string());
+                            return;
+                        }
+                    }
+                };
+                cursors.retain(|room, _| open.contains(room));
+                seen.retain(|room, _| open.contains(room));
+                if open.iter().any(|room| !cursors.contains_key(room)) {
+                    listener.on_ended(
+                        "a room opened while events were missed; refreshing its history and restarting observation".into(),
+                    );
+                    return;
+                }
+                listener.on_notice(
+                    "room observation caught up after missed events; refreshing the visible rooms"
+                        .into(),
+                );
+                open
+            }
             Ok(Some(Frame::NodeDetached { node })) => {
                 listener.on_ended(format!("the connection to node {node} ended"));
                 return;
@@ -5062,128 +5941,80 @@ async fn follow(
             }
         };
         sessions_in.extend(rooms.iter().copied());
-        'rooms: for room in rooms {
+        for room in rooms {
+            let Some(cursor) = cursors.get_mut(&room) else {
+                continue;
+            };
             loop {
-                let since = cursors.get(&room).copied().flatten();
-                let rows = {
-                    let mut slot = held.lock().await;
-                    let Some(h) = slot.as_mut() else {
-                        listener.on_ended("the app released its node".to_owned());
-                        return;
-                    };
-                    if let Err(e) = h.mend().await {
-                        listener.on_ended(e.to_string());
+                match follow_page(&held, &owner, room, cursor, listener.as_ref()).await {
+                    Ok(true) => {
+                        tokio::task::yield_now().await;
+                    }
+                    Ok(false) => break,
+                    Err(why) => {
+                        listener.on_ended(why);
                         return;
                     }
-                    let request = match since {
-                        Some(_) => Request::Read {
-                            channel_id: room,
-                            since,
-                            after: None,
-                            limit: 200,
-                        },
-                        None => Request::RoomPage {
-                            channel_id: room,
-                            before: None,
-                            limit: 200,
-                        },
-                    };
-                    let rows = match h.client.request(&request).await {
-                        Ok(Frame::Rows { rows } | Frame::RoomPage { rows, .. }) => rows,
-                        Ok(Frame::NodeDetached { node }) => {
-                            listener.on_ended(format!("the connection to node {node} ended"));
-                            return;
-                        }
-                        // The cursor's row has gone (it expired): start again from the newest.
-                        Ok(_) => {
-                            let req = Request::Count {
-                                channel_id: room,
-                                since: None,
-                            };
-                            if let Ok(Frame::Count { last, .. }) = h.client.request(&req).await {
-                                cursors.insert(room, last);
-                            }
-                            listener.on_notice(
-                                "some messages could not be followed; read the room again"
-                                    .to_owned(),
-                            );
-                            continue 'rooms;
-                        }
-                        Err(e) => {
-                            listener.on_ended(format!("the vox daemon stopped answering: {e}"));
-                            return;
-                        }
-                    };
-                    let names = match names(&mut h.client).await {
-                        Ok(names) => names,
-                        Err(e) => {
-                            listener.on_ended(e.to_string());
-                            return;
-                        }
-                    };
-                    let me = h.client.me().map(|f| b32_encode(&f));
-                    rows.iter()
-                        .map(|r| (r.clone(), rendered(r, &names, me.as_deref())))
-                        .collect::<Vec<_>>()
-                };
-                let next = rows.last().map(|(r, _)| r.entry_hash);
-                let more = since.is_some() && next.is_some() && next != since;
-                cursors.insert(room, next.or(since));
-                for (row, message) in rows {
-                    if !row.owed && delivered.insert(row.entry_hash) {
-                        listener.on_message(b32_encode(&room), message);
-                    }
-                }
-                if !more {
-                    break;
                 }
             }
         }
         sessions_in.sort_unstable();
         sessions_in.dedup();
         sessions_in.retain(|r| cursors.contains_key(r));
-        if !sessions_told(&sessions_in, &mut seen, &held, listener.as_ref()).await {
+        if !sessions_told(&sessions_in, &mut seen, &held, &owner, listener.as_ref()).await {
             return;
         }
     }
 }
 
-/// Read the Sessions of `rooms` again and tell the listener what changed: a Session opened,
-/// ended, renamed or waiting differently ([`ClientListener::on_sessions`]), and a session with
-/// entries it had not held ([`ClientListener::on_session_entry`]). `false` once the node is let go
-/// of: nothing more will come.
+/// Compare opaque room projection tokens, including activity and drive authority.
+/// Native clients refresh the displayed page and selected Session on this notification.
 async fn sessions_told(
     rooms: &[Digest32],
-    seen: &mut HashMap<Digest32, SessionsSeen>,
+    seen: &mut HashMap<Digest32, Digest32>,
     held: &Slot,
+    owner: &FollowOwner,
     listener: &dyn ClientListener,
 ) -> bool {
-    for &room in rooms {
-        let now = {
-            let mut slot = held.lock().await;
-            let Some(h) = slot.as_mut() else {
-                listener.on_ended("the app released its node".to_owned());
-                return false;
-            };
-            if h.mend().await.is_err() {
-                continue;
-            }
-            match sessions_seen(&mut h.client, room).await {
-                Some(now) => now,
-                None => continue,
-            }
+    if rooms.is_empty() {
+        return true;
+    }
+    let now = {
+        let mut slot = held.lock().await;
+        let Some(h) = slot.as_mut().filter(|h| owner.holds(h)) else {
+            listener.on_ended("the app released its node".to_owned());
+            return false;
         };
-        let before = seen.remove(&room).unwrap_or_default();
-        if now.sessions != before.sessions {
+        if let Err(error) = h.mend().await {
+            listener.on_notice(error.to_string());
+            return true;
+        }
+        if !owner.holds(h) {
+            listener.on_ended("the app's node identity changed".into());
+            return false;
+        }
+        match session_revisions(&mut h.client).await {
+            Ok(now) => now,
+            Err(error) => {
+                listener.on_notice(error.to_string());
+                return true;
+            }
+        }
+    };
+    for &room in rooms {
+        if seen.get(&room) != now.get(&room) {
             listener.on_sessions(b32_encode(&room));
         }
-        for (id, (node, entries, newest)) in &now.entries {
-            let old = before.entries.get(id).map(|(_, n, e)| (*n, *e));
-            if old != Some((*entries, *newest)) && (*entries > 0 || old.is_some()) {
-                listener.on_session_entry(b32_encode(&room), b32_encode(node), id.clone());
+        // This callback covers only the requested room. Advancing another room's token
+        // here would swallow its later notification without refreshing its visible state.
+        match now.get(&room) {
+            Some(revision) => {
+                seen.insert(room, *revision);
+            }
+            None => {
+                seen.remove(&room);
             }
         }
-        seen.insert(room, now);
     }
     true
 }

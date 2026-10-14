@@ -78,8 +78,8 @@
 // A call names no session: it acts on the subscribed one, so input reaches exactly the session
 // it is for (DR-5), and the actions are a whitelist, none of which starts a session (DR-7).
 //
-// Every failure path is silent and injects nothing. A hook that breaks the turn it
-// rides on is worse than one that does nothing.
+// Hook failures never throw into OpenCode's turn. Mirror capacity, metadata and control
+// failures are explicit on the private socket so Vox reports stopped observation.
 
 import { appendFileSync, lstatSync, mkdtempSync, readdirSync, rmdirSync, unlinkSync } from "node:fs"
 import { spawn } from "node:child_process"
@@ -249,30 +249,222 @@ const parents = new Map()
 /** Requests OpenCode asked (permission or question id → the Session it was shown in). */
 const asked = new Map()
 const MAX_ASKED = 1024
+const MAX_MIRROR_BYTES = 4 << 20
+const MAX_MIRROR_EVENTS = 64
+const MAX_MESSAGE_ROLES = 256
+const MAX_PARENTS = 256
+const MAX_SESSION_META = 64 << 10
+const MAX_CONNECTIONS = 64
+const MAX_CALLS = 32
+const MAX_QUEUED_FRAMES = 64
+const MAX_RELAYED_BYTES = 4 << 20
+const MAX_CONTROL_BYTES = 64 << 10
+const CALL_WITHIN_MS = 30_000
+let mirrorFailure = null
 
-/** The session an event belongs to, and the Session it is shown in (its parent's, for a sub-agent). */
-function ownerOf(event) {
-  const p = event?.properties ?? {}
-  const sid = p.sessionID ?? p.part?.sessionID ?? p.info?.sessionID ?? p.info?.id
-  if (typeof sid !== "string") return null
-  if ((event.type === "session.created" || event.type === "session.updated") && p.info?.parentID) {
-    parents.set(p.info.id, p.info.parentID)
-  }
-  return parents.get(sid) ?? sid
+/** SDK transport with a deadline and bounded response, including non-success bodies. */
+async function boundedJson(client, url, limit) {
+  const controller = new AbortController()
+  const deadline = setTimeout(() => controller.abort(), AUTH_IDLE_MS)
+  deadline.unref?.()
+  try {
+    const transport = client._client.getConfig().fetch ?? globalThis.fetch
+    const result = await client._client.request({ method: "GET", parseAs: "stream",
+      responseStyle: "fields", signal: controller.signal, url,
+      fetch: async (request) => {
+        const response = await transport(request)
+        if (!response.ok) {
+          await response.body?.cancel()
+          throw new Error("OpenCode metadata lookup answered " + response.status)
+        }
+        return response
+      },
+    })
+    const reader = result?.data?.getReader?.()
+    if (!reader) throw new Error("OpenCode did not stream its metadata lookup")
+    const body = new Uint8Array(limit)
+    let used = 0
+    try {
+      for (;;) {
+        const { value, done } = await reader.read()
+        if (done) break
+        if (value.byteLength > body.length - used) throw new Error("OpenCode metadata exceeds its byte bound")
+        body.set(value, used)
+        used += value.byteLength
+      }
+      return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(body.subarray(0, used)))
+    } finally {
+      await reader.cancel().catch(() => {})
+      reader.releaseLock()
+    }
+  } finally { clearTimeout(deadline) }
 }
 
-function fanout(event) {
-  const owner = ownerOf(event)
-  if (!owner) return
-  if (event.type === "permission.asked" || event.type === "question.asked") {
-    const id = event.properties?.id
-    if (typeof id === "string") {
-      asked.set(id, owner)
-      if (asked.size > MAX_ASKED) asked.delete(asked.keys().next().value)
+function rememberParent(info) {
+  if (typeof info?.id !== "string" || !info.id || info.id.length > 4096
+    || (info.parentID != null && (typeof info.parentID !== "string" || !info.parentID || info.parentID.length > 4096))) {
+    throw new Error("OpenCode supplied invalid session lineage")
+  }
+  // A root's null parent is authoritative too. Only memoized metadata is evicted.
+  parents.delete(info.id)
+  parents.set(info.id, info.parentID ?? null)
+  if (parents.size > MAX_PARENTS) parents.delete(parents.keys().next().value)
+}
+
+async function ownerOf(client, event) {
+  const p = event?.properties ?? {}
+  let sid = p.sessionID ?? p.part?.sessionID ?? p.info?.sessionID ?? p.info?.id
+  if (typeof sid !== "string") return null
+  if ((event.type === "session.created" || event.type === "session.updated") && p.info?.id === sid) {
+    rememberParent(p.info)
+  }
+  const seen = new Set()
+  for (let depth = 0; depth < 32; depth += 1) {
+    if (seen.has(sid)) throw new Error("OpenCode session lineage contains a cycle")
+    seen.add(sid)
+    if (!parents.has(sid)) {
+      const info = await boundedJson(client, `/session/${encodeURIComponent(sid)}`, MAX_SESSION_META)
+      if (info?.id !== sid) throw new Error("OpenCode could not resolve exact session lineage")
+      rememberParent(info)
+    }
+    const parent = parents.get(sid)
+    if (parent === null) return sid
+    sid = parent
+  }
+  throw new Error("OpenCode session lineage exceeds 32 ancestors")
+}
+
+/** A bounded optimization only. A cache miss is resolved against OpenCode's own message. */
+function mirrorEvents(client) {
+  const messages = new Map()
+  const queue = []
+  let bytes = 0
+  let count = 0
+  let running = false
+  const fail = (why) => {
+    if (mirrorFailure) return
+    mirrorFailure = String(why)
+    log("mirror: stopped: " + mirrorFailure)
+    const line = JSON.stringify({ type: "mirror-error", error: mirrorFailure }) + "\n"
+    for (const writers of followers.values()) for (const write of writers) write(line)
+  }
+  const remember = (info) => {
+    if (!info || typeof info.id !== "string" || typeof info.sessionID !== "string"
+      || !["user", "assistant"].includes(info.role)) return null
+    const value = { id: info.id, sessionID: info.sessionID, role: info.role }
+    for (const field of ["agent", "providerID", "modelID"]) {
+      if (typeof info[field] === "string") value[field] = info[field]
+    }
+    if (Buffer.byteLength(JSON.stringify(value)) > 4096) throw new Error("message metadata exceeds its bound")
+    const key = JSON.stringify([value.sessionID, value.id])
+    messages.delete(key)
+    messages.set(key, value)
+    if (messages.size > MAX_MESSAGE_ROLES) messages.delete(messages.keys().next().value)
+    return value
+  }
+  const enrich = async (event) => {
+    if (event.type === "message.updated") remember(event.properties?.info)
+    if (event.type !== "message.part.updated") return event
+    const part = event.properties?.part
+    if (typeof part?.sessionID !== "string" || typeof part?.messageID !== "string") {
+      throw new Error("a part has no authoritative message identity")
+    }
+    const key = JSON.stringify([part.sessionID, part.messageID])
+    let info = messages.get(key)
+    if (!info) {
+      const candidate = (await boundedJson(client,
+        `/session/${encodeURIComponent(part.sessionID)}/message/${encodeURIComponent(part.messageID)}`,
+        MAX_MIRROR_BYTES))?.info
+      if (candidate?.id !== part.messageID || candidate?.sessionID !== part.sessionID) {
+        throw new Error("OpenCode could not resolve a part's message")
+      }
+      info = remember(candidate)
+      if (!info) throw new Error("OpenCode supplied no user or assistant role for a part")
+    }
+    return { ...event, properties: { ...event.properties, voxMessage: info } }
+  }
+  const drain = async () => {
+    if (running) return
+    running = true
+    try {
+      while (queue.length) {
+        const item = queue.shift()
+        try {
+          if (!mirrorFailure) {
+            const raw = JSON.parse(item.line)
+            const owner = await ownerOf(client, raw)
+            // A title snapshot can wait behind a live rename's metadata lookup. Check
+            // again here, not only when that snapshot's HTTP response first arrives.
+            const writers = (item.targets ?? item.followers.get(owner) ?? [])
+              .filter((write) => write.active && (!item.targets || !write.titleUpdated))
+            if (owner && writers.length) {
+              const event = await enrich(raw)
+              if (Buffer.byteLength(JSON.stringify({ type: "event", event })) + 1 > MAX_MIRROR_BYTES) {
+                throw new Error("an enriched mirror event exceeds its line bound")
+              }
+              if (!item.targets && event.type === "session.updated" && event.properties?.info?.id === owner) {
+                for (const write of writers) write.titleUpdated = true
+              }
+              fanout(event, owner, writers)
+            }
+          }
+        } catch (error) {
+          fail(error?.message ?? error)
+        } finally {
+          bytes -= item.bytes
+          count -= 1
+          item.done()
+        }
+      }
+    } finally {
+      running = false
     }
   }
-  const writers = followers.get(owner)
-  if (!writers?.size) return
+  return (event, targets = null) => {
+    // Only events consumed by the Session adapter need lineage. In particular, an unused
+    // deletion must not GET an already-deleted session and stop unrelated observations.
+    if (!["message.updated", "message.part.updated", "session.updated", "session.idle",
+      "permission.asked", "permission.replied", "question.asked", "question.replied",
+      "question.rejected"].includes(event?.type)) return Promise.resolve()
+    if (mirrorFailure) return Promise.resolve()
+    if (!targets && !followers.size) return Promise.resolve()
+    if (!targets && event.type === "session.updated") {
+      const sid = event.properties?.info?.id
+      // Exact subscribed id is already known; mark this before any asynchronous lineage
+      // work, so an older in-flight snapshot cannot overwrite its live rename.
+      for (const write of followers.get(sid) ?? []) write.titleUpdated = true
+    }
+    const line = JSON.stringify(event)
+    const size = Buffer.byteLength(line)
+    // Admission is synchronous. A concurrent hook cannot create an unbounded chain of
+    // promises retaining bodies while one authoritative lookup is awaiting its response.
+    if (count === MAX_MIRROR_EVENTS || size > MAX_MIRROR_BYTES - bytes) {
+      fail("OpenCode events exceeded the bounded mirror queue; observation must restart")
+      return Promise.resolve()
+    }
+    count += 1
+    bytes += size
+    return new Promise((done) => {
+      // Capture recipients now. A later subscriber receives only the title snapshot, not
+      // old part events that happened to be awaiting another session's metadata lookup.
+      queue.push({ line, bytes: size, done, targets,
+        followers: targets ? null : new Map([...followers].map(([id, writers]) => [id, [...writers]])) })
+      void drain()
+    })
+  }
+}
+
+function fanout(event, owner, writers) {
+  if (event.type === "permission.asked" || event.type === "question.asked") {
+    const id = event.properties?.id
+    if (typeof id !== "string" || !id || id.length > 4096) throw new Error("OpenCode request identity is missing or too long")
+    if (asked.has(id) && asked.get(id) !== owner) throw new Error("OpenCode reused a pending request for another session")
+    if (!asked.has(id) && asked.size >= MAX_ASKED) throw new Error("OpenCode has more than 1024 pending requests; observation must restart")
+    asked.set(id, owner)
+  } else if (["permission.replied", "question.replied", "question.rejected"].includes(event.type)) {
+    const id = event.properties?.requestID
+    if (asked.get(id) === owner) asked.delete(id)
+  }
   const line = JSON.stringify({ type: "event", event }) + "\n"
   for (const write of writers) write(line)
 }
@@ -283,23 +475,45 @@ function fanout(event) {
  */
 async function runCall(client, session, call) {
   const raw = client._client
-  const req = (method, url, body) => raw.request({ method, url, body })
+  const req = async (method, url, body) => {
+    const controller = new AbortController()
+    const deadline = setTimeout(() => controller.abort(), CALL_WITHIN_MS)
+    deadline.unref?.()
+    try {
+      const result = await raw.request({ method, url, body, signal: controller.signal,
+        parseAs: "stream", responseStyle: "fields",
+        fetch: async (request) => {
+          const response = await (raw.getConfig().fetch ?? globalThis.fetch)(request)
+          // Only status is needed. Neither success nor error response bodies are retained.
+          await response.body?.cancel()
+          return new Response(null, { status: response.status, statusText: response.statusText, headers: response.headers })
+        },
+      })
+      return result
+    } catch (error) {
+      const uncertain = new Error(controller.signal.aborted
+        ? "OpenCode control timed out; outcome unknown, do not assume it is safe to repeat"
+        : "OpenCode control outcome unknown: " + String(error?.message ?? error))
+      uncertain.outcomeUnknown = true
+      throw uncertain
+    } finally { clearTimeout(deadline) }
+  }
   switch (call.action) {
     case "prompt":
       if (typeof call.text !== "string") throw new Error("a prompt needs text")
-      return req("POST", `/session/${session}/prompt_async`, {
+      return req("POST", `/session/${encodeURIComponent(session)}/prompt_async`, {
         parts: [{ type: "text", text: call.text }],
       })
     case "abort":
-      return req("POST", `/session/${session}/abort`, {})
+      return req("POST", `/session/${encodeURIComponent(session)}/abort`, {})
     case "rename":
       if (typeof call.title !== "string" || !call.title.trim()) throw new Error("a rename needs a title")
-      return req("PATCH", `/session/${session}`, { title: call.title })
+      return req("PATCH", `/session/${encodeURIComponent(session)}`, { title: call.title })
     case "summarize":
       if (typeof call.providerID !== "string" || typeof call.modelID !== "string") {
         throw new Error("a compaction needs the session's provider and model")
       }
-      return req("POST", `/session/${session}/summarize`, {
+      return req("POST", `/session/${encodeURIComponent(session)}/summarize`, {
         providerID: call.providerID,
         modelID: call.modelID,
       })
@@ -307,7 +521,7 @@ async function runCall(client, session, call) {
       if (typeof call.command !== "string" || !/^[A-Za-z0-9_.:-]+$/.test(call.command)) {
         throw new Error("not a command name")
       }
-      return req("POST", `/session/${session}/command`, {
+      return req("POST", `/session/${encodeURIComponent(session)}/command`, {
         command: call.command,
         arguments: typeof call.arguments === "string" ? call.arguments : "",
       })
@@ -316,7 +530,7 @@ async function runCall(client, session, call) {
         throw new Error("a permission reply needs its request and once or reject")
       }
       if (asked.get(call.request) !== session) throw new Error("not a request of this session")
-      return req("POST", `/permission/${call.request}/reply`, {
+      return req("POST", `/permission/${encodeURIComponent(call.request)}/reply`, {
         reply: call.reply,
         ...(typeof call.message === "string" ? { message: call.message } : {}),
       })
@@ -325,7 +539,7 @@ async function runCall(client, session, call) {
         throw new Error("a question reply needs its request and answers")
       }
       if (asked.get(call.request) !== session) throw new Error("not a request of this session")
-      return req("POST", `/question/${call.request}/reply`, { answers: call.answers })
+      return req("POST", `/question/${encodeURIComponent(call.request)}/reply`, { answers: call.answers })
     default:
       throw new Error("unknown action")
   }
@@ -336,7 +550,7 @@ async function runCall(client, session, call) {
  * OpenCode is handed it: OpenCode may run the prompt's `chat.message` before `promptAsync`
  * returns, and that turn must know the message is Vox's notice, not the operator's (V030-21).
  */
-function wakeChannel(client, relayed) {
+function wakeChannel(client, relayed, mirrorEvent) {
   try {
     // `mkdtemp` makes the directory 0700, so only this user can reach the socket;
     // the token keeps every other process of theirs out as well.
@@ -347,7 +561,19 @@ function wakeChannel(client, relayed) {
     const expected = Buffer.from(token)
     // Two sockets, one token: `wake.sock` takes one prompt per connection (ADR-020 6.13);
     // `mirror.sock` takes one subscription per connection and stays open (ADR-029 #542).
+    let connections = 0
+    // Includes queued work of closed sockets until its awaited operation completes.
+    let queuedTotal = 0
+    let queuedTotalBytes = 0
+    let snapshots = 0
     const serve = (kind) => (conn) => {
+      conn.on("error", () => {})
+      if (connections >= MAX_CONNECTIONS) {
+        conn.end(JSON.stringify({ type: "mirror-error", error: "OpenCode has 64 active Vox socket connections; connection refused" }) + "\n")
+        return
+      }
+      connections += 1
+      conn.once("close", () => { connections -= 1 })
       let buf = ""
       // One decoder for the connection: a character whose bytes span two reads is held back
       // until its last byte arrives, rather than each read decoding to U+FFFD at the seam.
@@ -359,7 +585,6 @@ function wakeChannel(client, relayed) {
           conn.end(JSON.stringify(reply) + "\n")
         } catch {}
       }
-      conn.on("error", () => {})
       // Unanswered and closed: a connection that never sends its frames, or sends
       // more than any wake can be. Only this user can reach the socket, but nothing
       // of theirs may pin a connection or its memory here. A deadline from the
@@ -373,11 +598,26 @@ function wakeChannel(client, relayed) {
       let following = null // the session this connection follows, once subscribed
       const write = (line) => {
         try {
-          if (!conn.destroyed) conn.write(line)
+          if (conn.destroyed || conn.writableEnded) return
+          if (conn.writableLength + Buffer.byteLength(line) > MAX_MIRROR_BYTES) {
+            conn.end(JSON.stringify({ type: "mirror-error", error:
+              "the mirror reader could not keep up; observation must restart" }) + "\n")
+            return
+          }
+          conn.write(line)
         } catch {}
       }
+      write.active = true
       conn.on("close", () => {
-        if (following) followers.get(following)?.delete(write)
+        write.active = false
+        if (following) {
+          const writers = followers.get(following)
+          writers?.delete(write)
+          if (writers?.size === 0) {
+            followers.delete(following)
+            for (const [id, owner] of asked) if (owner === following) asked.delete(id)
+          }
+        }
       })
       const onLine = async (line) => {
         let msg
@@ -402,6 +642,9 @@ function wakeChannel(client, relayed) {
         if (following) {
           // A call from `vox daemon` on the followed session.
           if (msg?.type !== "call") return
+          if (!Number.isSafeInteger(msg.id) || msg.id < 1 || Buffer.byteLength(line) > MAX_CONTROL_BYTES) {
+            return write(JSON.stringify({ type: "result", id: msg.id, ok: false, error: "control identity or 64 KiB byte bound refused; nothing was sent" }) + "\n")
+          }
           let reply
           try {
             const res = await runCall(client, following, msg)
@@ -415,7 +658,9 @@ function wakeChannel(client, relayed) {
           return write(JSON.stringify(reply) + "\n")
         }
         if (kind === "mirror") {
-          if (msg?.type !== "subscribe" || typeof msg.session !== "string" || !msg.session) {
+          // A queued subscribe is not admitted after its close callback has already run.
+          if (!write.active) return
+          if (msg?.type !== "subscribe" || typeof msg.session !== "string" || !msg.session || msg.session.length > 4096) {
             return answer({ error: "expected a subscribe frame" })
           }
           done = true // no longer a one-shot: the deadline no longer applies
@@ -425,42 +670,62 @@ function wakeChannel(client, relayed) {
           followers.get(following).add(write)
           log("mirror: following " + following)
           write(JSON.stringify({ type: "subscribed", session: following }) + "\n")
+          if (mirrorFailure) {
+            write(JSON.stringify({ type: "mirror-error", error: mirrorFailure }) + "\n")
+            return
+          }
           // Its title as it is now, said as OpenCode's bus says a change of it: a title set before
           // this follow began (OpenCode's own, or a /rename) is the Session's name from the start
           // (ADR-029 MD-1), not only after the session is next updated.
           const followed = following
-          client._client
-            .request({ method: "GET", url: `/session/${followed}` })
-            .then((res) => {
-              const info = res?.data
-              if (info?.id === followed && typeof info.title === "string") {
+          if (snapshots >= MAX_CONNECTIONS) {
+            write(JSON.stringify({ type: "mirror-error", error: "OpenCode session snapshot queue is full; observation stopped" }) + "\n")
+            return
+          }
+          snapshots += 1
+          boundedJson(client, `/session/${encodeURIComponent(followed)}`, MAX_SESSION_META)
+            .then((info) => {
+              if (info?.id === followed && typeof info.title === "string" && !write.titleUpdated) {
                 const event = { type: "session.updated", properties: { info } }
-                write(JSON.stringify({ type: "event", event }) + "\n")
+                void mirrorEvent(event, [write])
               }
             })
-            .catch(() => {})
+            .catch((error) => write(JSON.stringify({ type: "mirror-error", error: "session snapshot unavailable: " + String(error?.message ?? error) }) + "\n"))
+            .finally(() => { snapshots -= 1 })
           return
         }
-        if (msg?.type !== "prompt" || !msg.session || typeof msg.text !== "string") {
+        if (msg?.type !== "prompt" || typeof msg.session !== "string" || !msg.session
+          || msg.session.length > 4096 || typeof msg.text !== "string") {
           return answer({ error: "expected a prompt frame" })
         }
+        const prior = relayed.get(msg.session) ?? []
+        let retained = 0
+        for (const [id, notes] of relayed) {
+          retained += Buffer.byteLength(id)
+          for (const note of notes) retained += Buffer.byteLength(note.text)
+        }
+        if (prior.length >= MAX_RELAYED || (!relayed.has(msg.session) && relayed.size >= MAX_CONNECTIONS)
+          || retained + Buffer.byteLength(msg.session) + Buffer.byteLength(msg.text) > MAX_RELAYED_BYTES) {
+          return answer({ error: "Vox wake backlog is full; this notice was not relayed" })
+        }
         done = true
-        const noted = [...(relayed.get(msg.session) ?? []), msg.text].slice(-MAX_RELAYED)
+        const ticket = { text: msg.text }
+        const noted = [...prior, ticket]
         relayed.set(msg.session, noted)
         const forget = () => {
           const left = relayed.get(msg.session) ?? []
-          const i = left.lastIndexOf(msg.text)
+          const i = left.indexOf(ticket)
           if (i >= 0) left.splice(i, 1)
+          if (!left.length) relayed.delete(msg.session)
         }
         try {
           let res
           try {
-            res = await client.session.promptAsync({
-              path: { id: msg.session },
-              body: { parts: [{ type: "text", text: msg.text }] },
-            })
+            res = await runCall(client, msg.session, { action: "prompt", text: msg.text })
           } catch (e) {
-            forget()
+            // An uncertain prompt may still run later; retain its provenance until the
+            // matching hook consumes it. Capacity refusal is preferable to calling it human.
+            if (!e?.outcomeUnknown) forget()
             throw e
           }
           const status = res?.response?.status ?? 0
@@ -475,18 +740,38 @@ function wakeChannel(client, relayed) {
       }
       // Lines are handled one at a time, in order.
       let queue = Promise.resolve()
+      let queued = 0
+      let queuedBytes = 0
+      let refused = false
       conn.on("data", (chunk) => {
+        if (refused) return
         if (done && !following) return
         buf += utf8.write(chunk)
-        if (buf.length > MAX_FRAMES_BYTES) {
-          done = true
-          return conn.destroy()
+        if (Buffer.byteLength(buf) > MAX_FRAMES_BYTES) {
+          refused = true
+          return answer({ type: "mirror-error", error: "Vox socket input exceeds 1 MiB; observation stopped" })
         }
         let i
         while ((i = buf.indexOf("\n")) >= 0) {
           const line = buf.slice(0, i)
           buf = buf.slice(i + 1)
+          const size = Buffer.byteLength(line)
+          if (queued >= MAX_CALLS || size > MAX_FRAMES_BYTES - queuedBytes
+            || queuedTotal >= MAX_QUEUED_FRAMES || size > MAX_MIRROR_BYTES - queuedTotalBytes) {
+            refused = true
+            buf = ""
+            // Accepted queued calls keep their order; do not cancel or replay them. The final
+            // failure follows their results, so the reader knows this observation stopped.
+            queue = queue.finally(() => answer({ type: "mirror-error", error:
+              "Vox socket queue exceeded its per-connection (32 frames/1 MiB) or shared (64 frames/4 MiB) bound; observation stopped, excess frames were not executed" }))
+            return
+          }
+          queued += 1
+          queuedBytes += size
+          queuedTotal += 1
+          queuedTotalBytes += size
           queue = queue.then(() => onLine(line)).catch((e) => log("wake: threw: " + e))
+            .finally(() => { queued -= 1; queuedBytes -= size; queuedTotal -= 1; queuedTotalBytes -= size })
         }
       })
     }
@@ -513,14 +798,15 @@ function wakeChannel(client, relayed) {
 export default async function vox({ $, client }) {
   log("plugin loaded (cwd=" + process.cwd() + ")")
   const relayed = new Map()
-  const wake = wakeChannel(client, relayed)
+  const mirrorEvent = mirrorEvents(client)
+  const wake = wakeChannel(client, relayed, mirrorEvent)
   return {
     // Every event of OpenCode's bus, to the connections following its session (#542). The
     // `event` hook is fed in-process with the full set (permission.asked, question.asked,
     // message.*, session.*), and runs for every OpenCode, TUI or not.
     event: async ({ event }) => {
       try {
-        fanout(event)
+        await mirrorEvent(event)
       } catch (e) {
         log("event: threw: " + e)
       }
@@ -559,9 +845,10 @@ export default async function vox({ $, client }) {
         // its text is one this session was relayed and has not had a turn on yet.
         const typed = output.parts.find((p) => p.type === "text" && typeof p.text === "string")
         const notes = relayed.get(sessionID) ?? []
-        const at = typed ? notes.indexOf(typed.text) : -1
+        const at = typed ? notes.findIndex((note) => note.text === typed.text) : -1
         const isWake = at >= 0
         if (isWake) notes.splice(at, 1)
+        if (!notes.length) relayed.delete(sessionID)
 
         // `.quiet()` keeps the child's output out of OpenCode's, `.nothrow()`
         // makes a non-zero exit a value rather than an exception — `vox agent

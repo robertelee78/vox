@@ -845,8 +845,11 @@ async fn sessions(paths: &Paths) -> Vec<Check> {
 /// Trust in each direction with every other member of the room, from the room's log through the
 /// node (`Consents`, V030-17).
 async fn trust(client: &mut IpcClient, channel_id: Digest32) -> Vec<Check> {
-    let (outbound, inbound) = match client.request(&Request::Consents { channel_id }).await {
-        Ok(Frame::Consents { outbound, inbound }) => (outbound, inbound),
+    let (outbound, inbound) = match client
+        .request(&Request::MemberConsents { channel_id })
+        .await
+    {
+        Ok(Frame::MemberConsents { outbound, inbound }) => (outbound, inbound),
         Ok(other) => {
             return vec![warn(
                 "trust",

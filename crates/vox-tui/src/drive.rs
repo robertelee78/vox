@@ -206,15 +206,9 @@ async fn target(
     crate::app::AppError,
 > {
     use crate::app::AppError;
-    use vox_core::node::ipc::{Frame, Request as Ipc};
+    use vox_core::node::ipc::Frame;
     let mut client = crate::room_cli::attach(paths).await?;
     let channel_id = crate::room_cli::room_of(&mut client, room).await?;
-    let sessions = match client.request(&Ipc::Sessions { channel_id }).await {
-        Ok(Frame::Sessions { sessions }) => sessions,
-        Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
-        Ok(other) => return Err(crate::client::unexpected(&other)),
-        Err(e) => return Err(AppError::Usage(e.to_string())),
-    };
     let label_of = |s: &vox_core::node::sessions::SessionRow| {
         vox_agentcomms::envelope::session_label(
             &crate::ident::name_of(&s.node),
@@ -223,9 +217,17 @@ async fn target(
         )
     };
     // Exactly one open Session, never a guess (DR-5); an ended one is refused (TA-5).
-    let row = vox_core::node::sessions::resolve(&sessions, session, false, label_of)
-        .map_err(AppError::Usage)?;
-    let label = label_of(row);
+    let row = vox_core::node::sessions::selection::resolve(
+        &mut client,
+        channel_id,
+        None,
+        session,
+        false,
+        label_of,
+    )
+    .await
+    .map_err(AppError::Usage)?;
+    let label = label_of(&row);
     // The app gate opens a stream only between nodes that trust each other. That costs a member
     // with drive nothing: it reads a Session only through the session node's drive key, which it
     // takes only from a node it trusts (#543), so a driver already trusts the session's node.

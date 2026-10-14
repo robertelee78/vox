@@ -12,16 +12,22 @@ struct RoomServicesRow: Identifiable, Equatable {
     let name: String
     let shared: [SharedService]
     let offered: [OfferedService]
+    let after: ServiceCursor?
+    let next: ServiceCursor?
+    let revision: UInt64
 }
 
 extension NodeModel {
     /// Every open room's services, read now.
-    func readServices() async throws -> [RoomServicesRow] {
+    func readServices(current: [RoomServicesRow] = []) async throws -> [RoomServicesRow] {
         var rows: [RoomServicesRow] = []
         for room in rooms where room.open {
-            let listed = try await services(of: room.id)
+            let selected = current.first { $0.id == room.id }
+            let cursor = selected?.after
+            let listed = try await services(of: room.id, after: cursor,
+                revision: cursor == nil ? nil : selected?.revision)
             rows.append(RoomServicesRow(id: room.id, name: room.name, shared: listed.shared,
-                                        offered: listed.offered))
+                                        offered: listed.offered, after: cursor, next: listed.next, revision: listed.revision))
         }
         return rows
     }
@@ -66,11 +72,21 @@ struct ServicesView: View {
                 Text("SHARED WITH YOU").eyebrow().secondaryText().accessibilityAddTraits(.isHeader)
                 let theirs = rows.flatMap { r in r.shared.filter { $0.by != "you" }.map { (r, $0) } }
                 if theirs.isEmpty && !loadingServices && servicesFailure == nil {
-                    Text("Nothing is shared with this node in its open rooms.").secondaryText()
+                    Text(rows.contains { $0.next != nil || $0.after != nil } ? "No services on these pages." : "Nothing is shared with this node in its open rooms.").secondaryText()
                 }
                 ForEach(theirs, id: \.1.canonical) { room, service in
                     SharedServiceBox(model: model, room: room.name, service: service)
                 }
+                ForEach(rows) { row in
+                    HStack {
+                        Text(row.name).secondaryText()
+                        Button("First Page") { Task { await selectPage(row, first: true) } }
+                        if row.next != nil {
+                            Button("Next Services") { Task { await selectPage(row, first: false) } }
+                        }
+                    }
+                }
+                Button("Reload First Pages") { Task { await refreshServices(first: true) } }
                 Hairline()
                 Text("YOUR SHARES").eyebrow().secondaryText().accessibilityAddTraits(.isHeader)
                 let mine = rows.flatMap { r in r.offered.map { (r, $0) } }
@@ -126,16 +142,27 @@ struct ServicesView: View {
         }
     }
 
-    private func refreshServices() async {
+    private func refreshServices(first: Bool = false) async {
         do {
-            let now = try await AppRequest.run("Reading shared services") { try await model.readServices() }
+            let selected = first ? [] : rows
+            let now = try await AppRequest.run("Reading shared services") { try await model.readServices(current: selected) }
             if now != rows { rows = now }
             servicesFailure = nil
         } catch {
-            rows = []
             servicesFailure = sentence(error)
         }
         loadingServices = false
+    }
+
+    private func selectPage(_ row: RoomServicesRow, first: Bool) async {
+        let cursor = first ? nil : row.next
+        do {
+            let page = try await model.services(of: row.id, after: cursor, revision: first ? nil : row.revision)
+            guard let index = rows.firstIndex(where: { $0.id == row.id }) else { return }
+            rows[index] = RoomServicesRow(id: row.id, name: row.name, shared: page.shared,
+                offered: page.offered, after: cursor, next: page.next, revision: page.revision)
+            servicesFailure = nil
+        } catch { servicesFailure = sentence(error) }
     }
 }
 

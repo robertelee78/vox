@@ -53,6 +53,8 @@ struct MenuBarFacts {
         let outbound: Bool
     }
 
+    struct MoreServices: Hashable { let room: String; let name: String }
+    var moreServiceRooms: [MoreServices] = []
     var services: [Service] = []
     var shares: [Share] = []
     var tunnels: [Tunnel] = []
@@ -124,7 +126,10 @@ private struct NodeFacts: View {
             }
         }
         section("SERVICES SHARED TO YOU") {
-            if facts.services.isEmpty { Text("none").secondaryText() }
+            if facts.services.isEmpty { Text(facts.moreServiceRooms.isEmpty ? "none" : "No services on the selected pages.").secondaryText() }
+            ForEach(facts.moreServiceRooms, id: \.self) { room in
+                Button("More services in \(room.name)…") { NSApp.activate(ignoringOtherApps: true); Task { await model.show(.room(room.room)) } }
+            }
             ForEach(facts.services, id: \.self) { service in
                 HStack {
                     Text(service.address).font(Theme.mono).lineLimit(1).truncationMode(.middle)

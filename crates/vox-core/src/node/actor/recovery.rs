@@ -108,16 +108,29 @@ impl Node {
             self.store_recovery.remove(&id);
             return;
         }
-        // A storage reopen initially knows the room policy. Apply this node's shorter limits
-        // before success is reported or the replacement is exposed; retain the original OS
-        // cause and retry state if that additional write fails.
-        let opened = match opened {
-            Ok(mut channel) => self
-                .retention_before_publication(&mut channel)
-                .await
-                .map(|()| channel),
-            Err(error) => Err(error),
-        };
+        // Keep the poisoned room authoritative (and refusing) while its replacement
+        // advances through the same bounded preparation turns as an ordinary open.
+        match opened {
+            Ok(channel) => {
+                self.preparing_rooms.insert(
+                    id,
+                    RoomPreparation {
+                        channel: tokio::sync::Mutex::new(channel),
+                        reply: None,
+                        reopening: false,
+                        recovery: Some(original),
+                    },
+                );
+            }
+            Err(error) => self.complete_store_recovery(id, Err(error)).await,
+        }
+    }
+
+    pub(super) async fn complete_store_recovery(
+        &mut self,
+        id: Digest32,
+        opened: crate::error::Result<ChannelState>,
+    ) {
         match opened {
             Ok(channel) => {
                 let name = self

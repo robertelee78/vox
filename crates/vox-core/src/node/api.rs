@@ -246,140 +246,6 @@ impl<T: Clone + std::fmt::Debug> std::fmt::Debug for Chunks<T> {
     }
 }
 
-/// Where a room's **structured posts** sit in its timeline (V210-120): by `type`, and by
-/// operation id.
-///
-/// A structured post is a body that parses as a JSON object with a string `type`; it may carry an
-/// operation id, a string at `data.op`. Nothing here knows what any `type` or id means: a client
-/// names the types and ids it wants ([`crate::node::ipc::Request::Structured`]) and is served those
-/// rows. A client that needed a room's claims, or the posts under one operation id, read every row
-/// of the room for them, every time, so its work grew with the room's history. Filled as rows are
-/// added, never rebuilt, and shared like the timeline.
-#[derive(Clone, Default, PartialEq, Eq)]
-pub struct StructuredIndex {
-    /// Positions in the timeline, oldest first, of the posts of each `type`.
-    pub by_type: std::collections::BTreeMap<String, Chunks<u32>>,
-    /// The posts carrying an operation id, by a hash of the id.
-    pub by_op: OpRuns,
-    /// Positions in the timeline, oldest first, of the messages carrying each tag (#636). Built
-    /// from rendered rows, so only from messages this node can read: a tag is part of its
-    /// message, and a node that cannot open the message holds no tag of it.
-    pub by_tag: std::collections::BTreeMap<String, Chunks<u32>>,
-    /// Reply positions by the General message they name (ADR-033 TH-4). Readable rows only.
-    pub by_thread: std::collections::BTreeMap<Digest32, Chunks<u32>>,
-}
-
-impl std::fmt::Debug for StructuredIndex {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("StructuredIndex")
-            .field(
-                "by_type",
-                &self
-                    .by_type
-                    .iter()
-                    .map(|(t, c)| (t, c.len()))
-                    .collect::<Vec<_>>(),
-            )
-            .field("by_op", &self.by_op.len())
-            .field("by_tag", &self.by_tag.len())
-            .field("by_thread", &self.by_thread.len())
-            .finish()
-    }
-}
-
-/// `(hash of an operation id, position)` pairs in sorted runs, each run sorted by hash.
-///
-/// A new post's pair becomes a run of one, and the newest two runs merge while the older is no
-/// longer than the newer, as a binary counter carries: so there are about log2(n) runs, an append
-/// does amortized O(log n) work, a lookup is a binary search in each run, and a clone copies one
-/// pointer per run. (The ids are many, one or a few per post, so a map of them would be copied
-/// whole on every append the view is shared across.)
-#[derive(Clone, Default, PartialEq, Eq)]
-pub struct OpRuns {
-    runs: Vec<std::sync::Arc<[(u64, u32)]>>,
-    len: usize,
-}
-
-impl OpRuns {
-    /// How many pairs.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    /// Whether there are none.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    /// These runs with `pairs` added.
-    #[must_use]
-    pub fn appended(&self, mut pairs: Vec<(u64, u32)>) -> Self {
-        if pairs.is_empty() {
-            return self.clone();
-        }
-        pairs.sort_unstable();
-        let mut next = self.clone();
-        next.len += pairs.len();
-        next.runs.push(pairs.into());
-        while let [.., older, newer] = next.runs.as_slice() {
-            if older.len() > newer.len() {
-                break;
-            }
-            let mut merged: Vec<(u64, u32)> = Vec::with_capacity(older.len() + newer.len());
-            let (mut i, mut j) = (0, 0);
-            while i < older.len() && j < newer.len() {
-                if older[i] <= newer[j] {
-                    merged.push(older[i]);
-                    i += 1;
-                } else {
-                    merged.push(newer[j]);
-                    j += 1;
-                }
-            }
-            merged.extend_from_slice(&older[i..]);
-            merged.extend_from_slice(&newer[j..]);
-            next.runs.pop();
-            next.runs.pop();
-            next.runs.push(merged.into());
-        }
-        next
-    }
-
-    /// The positions of the posts whose id hashes to `hash`, in no order. A hash can collide, so
-    /// a caller checks the id itself.
-    #[must_use]
-    pub fn find(&self, hash: u64) -> Vec<u32> {
-        let mut out = Vec::new();
-        for run in &self.runs {
-            let from = run.partition_point(|(h, _)| *h < hash);
-            out.extend(
-                run[from..]
-                    .iter()
-                    .take_while(|(h, _)| *h == hash)
-                    .map(|(_, p)| *p),
-            );
-        }
-        out
-    }
-}
-
-impl std::fmt::Debug for OpRuns {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "OpRuns({} in {} runs)", self.len, self.runs.len())
-    }
-}
-
-/// The hash an operation id is indexed by: FNV-1a, 64 bits. Not a security boundary: a collision
-/// only serves a client a row it then discards.
-#[must_use]
-pub fn op_hash(op: &str) -> u64 {
-    op.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| {
-        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
-    })
-}
-
 /// A structured post's `type` and operation id, or `None` for any other body.
 #[must_use]
 pub fn structured_kind(text: &str) -> Option<(String, Option<String>)> {
@@ -421,91 +287,6 @@ pub fn message_tags(text: &str) -> Vec<String> {
     tags.sort();
     tags.dedup();
     tags
-}
-
-impl StructuredIndex {
-    /// This index with the bodies of the rows at `start..` of a timeline added.
-    #[must_use]
-    pub fn appended<'a>(&self, start: usize, texts: impl IntoIterator<Item = &'a String>) -> Self {
-        let mut by_type: std::collections::BTreeMap<String, Vec<u32>> =
-            std::collections::BTreeMap::new();
-        let mut by_tag: std::collections::BTreeMap<String, Vec<u32>> =
-            std::collections::BTreeMap::new();
-        let mut by_thread: std::collections::BTreeMap<Digest32, Vec<u32>> =
-            std::collections::BTreeMap::new();
-        let mut ops = Vec::new();
-        for (i, text) in texts.into_iter().enumerate() {
-            let at = u32::try_from(start + i).unwrap_or(u32::MAX);
-            if let Some(root) = vox_agentcomms::envelope::Envelope::parse(text)
-                .ok()
-                .and_then(|e| e.thread)
-                .and_then(|h| crate::node::link::b32_decode(h.trim(), "thread").ok())
-            {
-                by_thread.entry(root).or_default().push(at);
-            }
-            for tag in message_tags(text) {
-                by_tag.entry(tag).or_default().push(at);
-            }
-            let Some((kind, op)) = structured_kind(text) else {
-                continue;
-            };
-            by_type.entry(kind).or_default().push(at);
-            if let Some(op) = op {
-                ops.push((op_hash(&op), at));
-            }
-        }
-        let mut next = self.clone();
-        for (kind, at) in by_type {
-            let entry = next.by_type.entry(kind).or_default();
-            *entry = entry.appended(at);
-        }
-        for (tag, at) in by_tag {
-            let entry = next.by_tag.entry(tag).or_default();
-            *entry = entry.appended(at);
-        }
-        for (root, at) in by_thread {
-            let entry = next.by_thread.entry(root).or_default();
-            *entry = entry.appended(at);
-        }
-        next.by_op = next.by_op.appended(ops);
-        next
-    }
-
-    /// The positions of the messages carrying every tag in `tags`, oldest first (#636): read from
-    /// the index, never from the room's history. No tags, no positions.
-    #[must_use]
-    pub fn tagged(&self, tags: &[String]) -> Vec<u32> {
-        let mut lists = tags.iter().map(|t| self.by_tag.get(t));
-        let Some(Some(first)) = lists.next() else {
-            return Vec::new();
-        };
-        let mut out: Vec<u32> = first.iter().copied().collect();
-        for list in lists {
-            let Some(list) = list else {
-                return Vec::new();
-            };
-            let set: std::collections::BTreeSet<u32> = list.iter().copied().collect();
-            out.retain(|p| set.contains(p));
-        }
-        out
-    }
-
-    /// The positions of the posts of any type in `types`, and of those whose operation id hashes
-    /// like one in `ops`, oldest first, each once.
-    #[must_use]
-    pub fn positions(&self, types: &[String], ops: &[String]) -> Vec<u32> {
-        let mut out: Vec<u32> = types
-            .iter()
-            .filter_map(|t| self.by_type.get(t))
-            .flat_map(|c| c.iter().copied())
-            .collect();
-        for op in ops {
-            out.extend(self.by_op.find(op_hash(op)));
-        }
-        out.sort_unstable();
-        out.dedup();
-        out
-    }
 }
 
 /// Why a member is offered to this node's keyring (ADR-028 K-15, K-17).
@@ -556,6 +337,221 @@ pub struct Offer {
     pub trusted_by: Vec<Digest32>,
 }
 
+/// A local arrival cursor bound to the saved room instance. Deleting and rejoining
+/// a room resets this instance; an ordinary close/reopen preserves it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistoryCursor {
+    /// Opaque local store identity, never a room or trust identity.
+    pub instance: [u8; 16],
+    /// Strictly continue after this local arrival id.
+    pub arrival: u64,
+}
+
+/// One bounded arrival-ordered history result. An explicit scan continuation may
+/// accompany an empty filtered page; only its absence marks the end of this scan.
+#[derive(Debug, Clone)]
+pub struct MessagePage {
+    /// Owned readable rows in this page.
+    pub rows: Vec<MessageRow>,
+    /// The saved room instance used by this page.
+    pub instance: [u8; 16],
+    /// Continue strictly after this cursor, even when there were no matching rows.
+    pub next: Option<HistoryCursor>,
+}
+
+/// One bounded scan of readable files offered by private Session activity.
+/// An empty page can still have a continuation after filtered records.
+#[derive(Debug, Clone)]
+pub struct SessionFilePage {
+    /// Complete ordinary wire rows in this page, never assembled metadata bundles.
+    pub rows: Vec<crate::node::drive::SessionRow>,
+    /// The saved room instance used by this scan.
+    pub instance: [u8; 16],
+    /// Continue strictly after this private arrival; absent only at scan end.
+    pub next: Option<HistoryCursor>,
+}
+
+/// Freshness of a bounded notice count. Ordinary append-only arrivals do not change it.
+#[derive(Debug, Clone)]
+pub struct NoticeRevision {
+    pub(crate) incarnation: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) facts: [u64; 4],
+}
+impl PartialEq for NoticeRevision {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.incarnation, &other.incarnation) && self.facts == other.facts
+    }
+}
+impl Eq for NoticeRevision {}
+
+/// A notice scan's bounded freshness and arrival boundary from one actor read.
+#[derive(Debug, Clone)]
+pub struct NoticeState {
+    /// Current saved room and newest readable arrival (zero for an empty room).
+    pub head: HistoryCursor,
+    /// Prefix/retention changes that require recounting.
+    pub revision: NoticeRevision,
+    /// The node's current wall clock, used for local retention deadlines.
+    pub now_ms: u64,
+}
+
+/// One readable notice or reply parent, with its exact local retention deadline.
+#[derive(Debug, Clone)]
+pub struct NoticeRow {
+    /// Owned authenticated row.
+    pub row: MessageRow,
+    /// A count using this row must be refreshed at this deadline; None means no expiry.
+    pub expires: Option<u64>,
+}
+
+/// One bounded page of notice candidates, plus its exact freshness boundary.
+#[derive(Debug, Clone)]
+pub struct NoticePage {
+    /// Readable, unexpired candidates only.
+    pub rows: Vec<NoticeRow>,
+    /// Continue after this cursor, including across an empty filtered page.
+    pub next: Option<HistoryCursor>,
+    /// State observed in the same short snapshot as the rows.
+    pub state: NoticeState,
+}
+
+/// One bounded display page and the exact number of earlier visible rows.
+#[derive(Debug, Clone)]
+pub struct HistoryPage {
+    /// Oldest first within this page, including owed placeholders.
+    pub rows: Vec<MessageRow>,
+    /// Rows strictly before the first returned row.
+    pub older: u64,
+}
+
+/// A bounded governance selection carried by the existing room-page transport.
+/// Continue a listing with its returned cursor and revision; a stale revision requires
+/// reloading the selection. Authority queries refuse while their projection is refreshing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GovernanceQuery {
+    /// Check one identity against current authority, including the genesis creator.
+    Admin {
+        /// Identity whose admin authority is requested.
+        target: Digest32,
+    },
+    /// Page forward through notices between one visible message and the next.
+    NoticesAfter {
+        /// Visible message anchoring the range; none selects notices before the first message.
+        entry: Option<Digest32>,
+        /// Continue strictly after this canonical clock and entry hash within the range.
+        after: Option<(u64, Digest32)>,
+        /// Revision returned by the preceding page, or none for the first page.
+        revision: Option<u64>,
+    },
+    /// Resolve one current service without scanning the room's shares.
+    Service {
+        /// Identity publishing the service.
+        host: Digest32,
+        /// Exact service name or base32 service fingerprint.
+        selector: String,
+    },
+    /// Page backward through notices, returning each page in chronological order.
+    Notices {
+        /// Continue strictly before this canonical clock and entry hash; none selects newest.
+        before: Option<(u64, Digest32)>,
+        /// Revision returned by the preceding page, or none for the first page.
+        revision: Option<u64>,
+    },
+    /// Page through current services whose hosts have not left the room.
+    Shares {
+        /// Continue strictly after this host and service-name hash; none starts the listing.
+        after: Option<(Digest32, Digest32)>,
+        /// Revision returned by the preceding page, or none for the first page.
+        revision: Option<u64>,
+    },
+    /// Page through current admins other than the separately returned genesis creator.
+    Admins {
+        /// Continue strictly after this identity; none starts the listing.
+        after: Option<Digest32>,
+        /// Revision returned by the preceding page, or none for the first page.
+        revision: Option<u64>,
+    },
+    /// Page through an author's current consent targets, including targets outside the roster.
+    Consent {
+        /// Consent author, or none for this node's identity.
+        author: Option<Digest32>,
+        /// Continue strictly after this target; none starts the listing.
+        after: Option<Digest32>,
+        /// Revision returned by the preceding page, or none for the first page.
+        revision: Option<u64>,
+    },
+}
+
+/// At most 64 inspected slots. Empty rows with a continuation are not exhaustion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GovernancePage {
+    /// Current authority for one identity.
+    Admin {
+        /// Identity that was checked.
+        target: Digest32,
+        /// Whether that identity currently has admin authority.
+        admin: bool,
+        /// Governance revision used for this answer.
+        revision: u64,
+    },
+    /// One exact service lookup.
+    Service {
+        /// Current share, or none when absent, withdrawn, or published by a departed host.
+        share: Option<crate::node::channel::Share>,
+        /// Governance revision used for this answer.
+        revision: u64,
+    },
+    /// A chronological page within the requested visible-message range.
+    NoticesAfter {
+        /// Notices selected from this bounded page.
+        rows: Vec<crate::node::channel::RoomNotice>,
+        /// Continue strictly after this clock and hash; none exhausts the selected range.
+        next: Option<(u64, Digest32)>,
+        /// Revision to supply when continuing this selection.
+        revision: u64,
+    },
+    /// A page selected backward through notices and returned in chronological order.
+    Notices {
+        /// Notices selected from this bounded page.
+        rows: Vec<crate::node::channel::RoomNotice>,
+        /// Continue strictly before this clock and hash; none exhausts older notices.
+        before: Option<(u64, Digest32)>,
+        /// Revision to supply when continuing this selection.
+        revision: u64,
+    },
+    /// Current shares from one page, after filtering withdrawn shares and departed hosts.
+    Shares {
+        /// Current service announcements selected from this page.
+        rows: Vec<crate::node::channel::Share>,
+        /// Last inspected host and service-name hash; none exhausts the listing.
+        next: Option<(Digest32, Digest32)>,
+        /// Revision to supply when continuing this selection.
+        revision: u64,
+    },
+    /// Current admin authority, with the creator separate from the paged identities.
+    Admins {
+        /// Genesis creator, whose authority is immutable.
+        creator: Digest32,
+        /// Active admin identities in fingerprint order, excluding the creator.
+        members: Vec<Digest32>,
+        /// Continue strictly after this identity; none exhausts the listing.
+        next: Option<Digest32>,
+        /// Revision to supply when continuing this selection.
+        revision: u64,
+    },
+    /// One page of an author's current consent targets.
+    Consent {
+        /// Identity whose consent statements were selected.
+        author: Digest32,
+        /// Targets still covered by consent, including targets outside the roster.
+        targets: Vec<Digest32>,
+        /// Last inspected target; none exhausts the listing.
+        next: Option<Digest32>,
+        /// Revision to supply when continuing this selection.
+        revision: u64,
+    },
+}
+
 /// An open channel's full state for display.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelDetail {
@@ -563,35 +559,22 @@ pub struct ChannelDetail {
     pub channel_id: Digest32,
     /// The room's shared name (ADR-028 R-1); `None` for a room no admin has named.
     pub name: Option<String>,
-    /// What a person is told happened to the room, in its order (ADR-028 E-5).
-    pub notices: Vec<crate::node::channel::RoomNotice>,
     /// The current epoch.
     pub epoch: u64,
     /// Members, in fingerprint order.
     pub members: Vec<Digest32>,
-    /// The render-gated timeline, oldest first. Shared, not copied: every clone of the view — each
-    /// IPC read page takes one — used to copy every room's whole timeline (V210-71); and a new
-    /// message adds its row without rebuilding the rest (V210-120).
-    pub timeline: Timeline,
+    /// The newest readable local arrival; used to start bounded subscribers.
+    pub last_arrival: Option<u64>,
+    /// The saved instance that owns local arrival ids, preserved across reopen.
+    pub history_instance: [u8; 16],
     /// Local reuse stamp for the already-built display; never serialized or sent to peers.
     pub(crate) display_stamp: crate::node::channel::DisplayStamp,
     /// Node-local change token for the published timeline, unchanged on projection reuse.
     /// Scoped to this node actor; clients discard it when their node connection changes.
     pub display_revision: u64,
-    /// Entry-hash prefixes to timeline positions. Collisions are checked against the row's full
-    /// hash. Shared sorted runs let history pages locate their cursor without scanning history.
-    pub row_index: OpRuns,
-    /// Every entry this node holds for the channel, readable or not, in the room's one
-    /// order (PRD-001 R13), each with the clock that placed it (ms). `timeline` is this
-    /// sequence restricted to rendered rows.
-    pub order: Vec<(Digest32, u64)>,
-    /// Where its structured posts sit in `timeline`, by `type` (V210-120).
-    pub structured: StructuredIndex,
     /// The services this node offers in this channel: `(service_tag, local address)`
     /// in tag order (ADR-013 Bind config — host configuration, not authorization).
     pub services: Vec<(String, std::net::SocketAddr)>,
-    /// The services shared in this channel by every member, as its log says (V030-25).
-    pub shares: Vec<crate::node::channel::Share>,
     /// Whether this node has completed the room's first sync since joining it (V210-164): until
     /// then its log may not yet hold what the room's members have written, shares included.
     pub synced: bool,
@@ -600,13 +583,13 @@ pub struct ChannelDetail {
     pub equivocations: Vec<(Digest32, u64)>,
     /// The room's genesis creator, its root admin (ADR-007).
     pub creator: Digest32,
-    /// Who this identity consents to reading it here (ADR-007), in fingerprint order. Read off
-    /// the log, so a revocation takes one out; what a client shows as consent (V210-82).
-    pub consented: Vec<Digest32>,
-    /// The room's admins, its creator first (V030-08): who may end it.
-    pub admins: Vec<Digest32>,
+    /// Current members this identity consents to, for roster indicators only.
+    /// Arbitrary consent targets are read through GovernanceQuery::Consent.
+    pub member_consent: Vec<Digest32>,
+    /// Revision of the checked governance projection used by this display.
+    pub governance_revision: u64,
     /// The other members that consent to this identity reading them here, in fingerprint order:
-    /// the inbound half of `consented`, off the log the same way (V030-17).
+    /// the inbound half of `member_consent`, off the log the same way (V030-17).
     pub consenting: Vec<Digest32>,
     /// Who trusts each member here (ADR-028 K-7): `(member, the other members that consent to it
     /// reading them)`, in fingerprint order, a member no one trusts left out. `consenting` is this
@@ -658,11 +641,8 @@ pub struct ChannelDetail {
     /// The nodes whose Sessions this node can read inside here (ADR-029 SC-2), sorted: itself, and
     /// each node whose drive key it holds. What a Session's `can_drive` is said from.
     pub drive_from: Vec<Digest32>,
-    /// The files other members' Sessions sent out here that this node can open (ADR-029
-    /// DR-1.8): what it pulls by itself, as a room share addressed to it.
-    pub session_files: Vec<crate::node::drive::SessionRow>,
-    /// Drive-sealed lifecycle records, kept separate from public chat and activity steps.
-    pub session_records: Vec<crate::node::drive::SessionRow>,
+    /// Opaque Session input/publication/drive token; no retained metadata strings.
+    pub session_revision: Digest32,
 }
 
 /// The node's latest-wins view (published over a `watch`).
@@ -889,13 +869,16 @@ pub enum NodeCommand {
         text: String,
     },
     /// Note that these entries of an open channel were shown to this node's person, or drained
-    /// into its agent's turn (ADR-028 RR-1). The node posts a read record naming them, at most
-    /// one per room per 5 seconds (RR-2).
+    /// into its agent's turn (ADR-028 RR-1). Done means their local read marks are durably
+    /// stored. The node later publishes a signed read record, at most one per room per
+    /// 5 seconds (RR-2); a deferred publication does not lose the local marks.
     MarkRead {
         /// The channelID.
         channel_id: Digest32,
         /// The entries shown.
         entries: Vec<Digest32>,
+        /// When supplied, admission must use this exact saved room incarnation.
+        expected_instance: Option<[u8; 16]>,
     },
     /// Produce a `vox://` invite link for a channel this node holds open, naming this
     /// node, and any anchors the room uses, as where to reach the room, with this node as
@@ -1205,6 +1188,12 @@ pub enum Fault {
     ProfileBusy,
     /// Local pairwise delivery capacity is occupied; no new key was sealed or grant recorded.
     DeliveryBusy,
+    /// Stored governance is being brought current; no permission decision may use its old view.
+    GovernanceRefreshing,
+    /// The requested read marks no longer name the room's readable retained selection.
+    ReadSelectionChanged,
+    /// One admin removal is already being applied over bounded actor turns.
+    AdminChangePending,
     /// A previous hosted room deletion is still awaiting its bounded daemon handoff.
     SessionCleanupBusy,
     /// The hosted daemon's reliable Session cleanup handler has gone away.
@@ -1431,6 +1420,15 @@ impl Fault {
             Fault::DeliveryBusy => {
                 "this node's key-delivery capacity is busy; the key waits locally\n       existing deliveries are retried; no new grant was recorded by this attempt"
             }
+            Fault::GovernanceRefreshing => {
+                "this room's permissions are still being read from local storage\n       try again once the room is ready"
+            }
+            Fault::ReadSelectionChanged => {
+                "the selected messages changed before they could be marked as read\n       refresh the room and try again"
+            }
+            Fault::AdminChangePending => {
+                "an admin change is already being applied on this node\n       wait for its answer before making another admin change"
+            }
             Fault::SessionCleanupBusy => {
                 "an earlier room's Session cleanup is still pending; no deletion started for this request\n       try again after that cleanup finishes"
             }
@@ -1652,6 +1650,9 @@ fault_names!(
     Storage,
     ProfileBusy,
     DeliveryBusy,
+    GovernanceRefreshing,
+    ReadSelectionChanged,
+    AdminChangePending,
     SessionCleanupBusy,
     SessionCleanupUnavailable,
     IdentityFileUnwritable,
@@ -2365,4 +2366,22 @@ impl NodeEvent {
             NodeEvent::Shutdown => "the node stopped".into(),
         }
     }
+}
+
+/// Scalar unread facts under the existing newest-1,000-rows, until-first-read rule.
+/// No retained message bodies or lifetime message IDs cross this boundary.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UnreadSummary {
+    /// Unread messages addressed to this identity.
+    pub addressed: u64,
+    /// Urgent messages among those addressed to this identity.
+    pub urgent: u64,
+    /// Unread room conversation.
+    pub new: u64,
+    /// Unread coordination messages.
+    pub coordination: u64,
+    /// Oldest unread message in the examined range, in display order.
+    pub first: Option<Digest32>,
+    /// Older rows exist beyond the existing unread examination limit.
+    pub scan_limited: bool,
 }

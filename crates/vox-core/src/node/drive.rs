@@ -28,6 +28,7 @@
 //! ledger only says who has been given which generation.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::{Duration, Instant};
 
 use zeroize::Zeroizing;
 
@@ -47,6 +48,12 @@ const DRIVE_VERSION: u64 = 2;
 
 /// The most drive keys a room holds from other members, across generations.
 pub const MAX_DRIVE_CHAINS: usize = 4096;
+
+// Advisory retry bounds, not authorization or missing-body limits. Dropping a hint
+// permits another fetch; it never acknowledges receipt or changes sealed membership.
+const OMISSION_PEERS: usize = 32;
+const OMISSION_POSITIONS_PER_PEER: usize = 128;
+const OMISSION_RETRY_AFTER: Duration = Duration::from_secs(30);
 
 /// The id a room's drive keys are bound to in place of the room's own: `SHA-256(domain ‖ room)`.
 #[must_use]
@@ -97,17 +104,13 @@ pub struct DriveState {
     /// Member → `(generation, iteration)` from which it is owed this node's drive key: where the
     /// live generation stood when it became owed it.
     marks: BTreeMap<Digest32, (u64, u64)>,
-    /// Public authorization floors, derived from verified control entries; never secret keys.
-    pub(crate) floors: BTreeMap<SessionFloorKey, SessionFloorBoundary>,
-    pub(crate) floors_indexed: bool,
-    /// Bodies a particular peer omitted, only until new authorization is learned or restart.
-    pub(crate) omitted: BTreeMap<Digest32, (std::time::Instant, BTreeSet<(Digest32, u64)>)>,
+    /// Short-lived advisory retry hints, bounded independently of accumulated history.
+    /// Authorization and missing-body membership remain in the sealed indexes.
+    omitted: BTreeMap<Digest32, (Instant, BTreeSet<(Digest32, u64)>)>,
     /// Drive keys released to this node, by `(author, generation)`.
     pub(crate) receivers: BTreeMap<(Digest32, u64), ReceiverChain>,
     /// Member → the generation of this node's drive key last released to it.
     pub(crate) delivered: BTreeMap<Digest32, u64>,
-    /// The Session entries opened or written here, in the order they were.
-    pub(crate) sessions: SessionLog,
     /// Entries opened in a render pass, placed once its batch has committed.
     pub(crate) pending: Vec<(SessionRow, u64)>,
     /// The sessions with an entry placed here since the node last said so
@@ -117,8 +120,9 @@ pub struct DriveState {
     /// a member that lost drive cannot tell ([`KEY_CHANGED`]); `None` until worked out from the
     /// room's log. Not kept: it is worked out again when the room is opened.
     pub(crate) change_unsaid: Option<bool>,
-    /// Entries under a key of another author's this node does not hold, already said as news
-    /// (a lost drive key, SC-2b). Not kept.
+    /// Authors whose unavailable drive key has already been announced since their last
+    /// accepted key. Bounded by receiver authors, never by the number of withheld entries.
+    /// Not kept: reopening may announce each current author's unavailable key once again.
     pub(crate) told_unheld: std::collections::HashSet<Digest32>,
 }
 
@@ -132,6 +136,18 @@ pub enum SessionFilter {
     Session(String),
     /// Raw records for the Session summary's entry count and newest-change marker.
     SessionRaw(String),
+    /// Revalidate at most 128 held logical activity origins in one exact room incarnation.
+    /// Missing/expired entries are omitted; mismatched identities or authority are refused.
+    Entries {
+        /// Exact Session author.
+        node: Digest32,
+        /// Complete harness Session id.
+        session_id: String,
+        /// Logical origins already held by the caller, including any selected Details.
+        entries: Vec<Digest32>,
+        /// Opaque saved-room identity from the page that supplied those entries.
+        instance: [u8; 16],
+    },
     /// Those announcing a file out of a Session (DR-1.8).
     FilesOut,
     /// Requests still answerable, without walking the Session's transcript.
@@ -155,303 +171,6 @@ pub struct SessionPage {
     pub older: u64,
 }
 
-/// The Session entries opened or written in a room, in the order they were, with an index by
-/// Session, by entry and of files out (ADR-034 FR-5): a page costs what it carries, whatever the
-/// history's length.
-#[derive(Default)]
-pub struct SessionLog {
-    rows: Vec<SessionRow>,
-    /// The position of every row that is some Session's: all but key-changed entries.
-    all: Vec<usize>,
-    /// Session id → the positions of its rows.
-    by_session: std::collections::HashMap<String, Vec<usize>>,
-    /// The positions of rows announcing a file out of a Session.
-    files_out: Vec<usize>,
-    lifecycle: Vec<usize>,
-    /// Entry hash → its position.
-    at: std::collections::HashMap<Digest32, usize>,
-    requests: std::collections::HashMap<(String, String), Vec<usize>>,
-    pending: std::collections::HashMap<String, Vec<usize>>,
-    resolved: std::collections::HashSet<(String, Digest32, String)>,
-    visible: std::collections::HashMap<String, Vec<usize>>,
-    pieces: std::collections::HashMap<usize, Vec<usize>>,
-    open_parts: std::collections::HashMap<(String, Digest32, String, String), usize>,
-    activity_refs: std::collections::HashMap<usize, String>,
-    outcomes: std::collections::HashMap<(String, String), Vec<usize>>,
-    drives: std::collections::HashSet<(String, String)>,
-}
-
-impl SessionLog {
-    /// A log of `rows`, in that order.
-    #[must_use]
-    pub fn of(rows: Vec<SessionRow>) -> Self {
-        let mut log = Self::default();
-        for row in rows {
-            log.push(row);
-        }
-        log
-    }
-
-    /// Add `row` after the rest.
-    pub fn push(&mut self, row: SessionRow) {
-        let at = self.rows.len();
-        self.at.insert(row.entry_hash, at);
-        if crate::node::sessions::is_record(&row.body) {
-            self.lifecycle.push(at);
-        } else if !is_key_changed(&row.session_id) {
-            self.all.push(at);
-            self.by_session
-                .entry(row.session_id.clone())
-                .or_default()
-                .push(at);
-            if is_file_out(&row) {
-                self.files_out.push(at);
-            }
-            self.index_request(&row, at);
-            self.index_activity(&row, at);
-        }
-        self.rows.push(row);
-    }
-
-    fn index_activity(&mut self, row: &SessionRow, at: usize) {
-        let Ok(serde_json::Value::Object(body)) = serde_json::from_str(&row.body) else {
-            return;
-        };
-        let body = serde_json::Value::Object(body);
-        let kind = body["kind"].as_str().unwrap_or_default();
-        let reference = body["ref"]
-            .as_str()
-            .or_else(|| match kind {
-                "drive" => body["id"].as_str(),
-                "drive-result" => body["of"].as_str(),
-                _ => None,
-            })
-            .unwrap_or_default();
-        if matches!(kind, "tool-done" | "resolved" | "drive-result") && !reference.is_empty() {
-            self.outcomes
-                .entry((row.session_id.clone(), reference.to_owned()))
-                .or_default()
-                .push(at);
-        }
-        let drive_key = (row.session_id.clone(), reference.to_owned());
-        if kind == "drive" && !reference.is_empty() {
-            self.drives.insert(drive_key.clone());
-        }
-        // These records update another line rather than occupying a page themselves.
-        if matches!(kind, "tool-done" | "resolved")
-            || (kind == "drive"
-                && !matches!(
-                    body["action"].as_str(),
-                    Some("text" | "interrupt" | "stop" | "slash" | "file")
-                ))
-            || (kind == "drive-result" && (body["ok"] == true || self.drives.contains(&drive_key)))
-        {
-            return;
-        }
-        let part = body["part"]
-            .as_array()
-            .and_then(|p| Some((p.first()?.as_u64()?, p.get(1)?.as_u64()?)));
-        let key = (
-            row.session_id.clone(),
-            row.author,
-            kind.to_owned(),
-            reference.to_owned(),
-        );
-        if let Some((i, n)) = part {
-            if i > 1 {
-                if let Some(&origin) = self.open_parts.get(&key) {
-                    self.pieces.entry(origin).or_default().push(at);
-                    if i >= n {
-                        self.open_parts.remove(&key);
-                    }
-                    return;
-                }
-            }
-            if i < n {
-                self.open_parts.insert(key, at);
-            }
-        }
-        self.visible
-            .entry(row.session_id.clone())
-            .or_default()
-            .push(at);
-        if !reference.is_empty() {
-            self.activity_refs.insert(at, reference.to_owned());
-        }
-    }
-
-    fn activity(&self, at: usize) -> Vec<usize> {
-        let mut rows = vec![at];
-        if let Some(parts) = self.pieces.get(&at) {
-            rows.extend(parts);
-        }
-        if let Some(reference) = self.activity_refs.get(&at) {
-            if let Some(outcomes) = self
-                .outcomes
-                .get(&(self.rows[at].session_id.clone(), reference.clone()))
-            {
-                rows.extend(outcomes);
-            }
-        }
-        rows
-    }
-
-    fn index_request(&mut self, row: &SessionRow, at: usize) {
-        if !["approval", "question", "resolved"]
-            .iter()
-            .any(|kind| row.body.contains(kind))
-        {
-            return;
-        }
-        let Ok(body) = serde_json::from_str::<serde_json::Value>(&row.body) else {
-            return;
-        };
-        let kind = body["kind"].as_str().unwrap_or_default();
-        if !matches!(kind, "approval" | "question" | "resolved") {
-            return;
-        }
-        let reference = body["ref"].as_str().unwrap_or_default();
-        if reference.is_empty() {
-            return;
-        }
-        let key = (row.session_id.clone(), reference.to_owned());
-        let authored = (row.session_id.clone(), row.author, reference.to_owned());
-        let positions = self.requests.entry(key).or_default();
-        positions.push(at);
-        let pending = self.pending.entry(row.session_id.clone()).or_default();
-        if kind == "resolved" {
-            self.resolved.insert(authored);
-            pending.retain(|old| !positions.contains(old) || self.rows[*old].author != row.author);
-        } else if body["answerable"].as_bool() != Some(false) && !self.resolved.contains(&authored)
-        {
-            pending.push(at);
-        }
-    }
-
-    /// Keep only the rows `keep` says to, in their order.
-    pub fn retain(&mut self, keep: impl FnMut(&SessionRow) -> bool) {
-        let mut rows = std::mem::take(&mut self.rows);
-        rows.retain(keep);
-        *self = Self::of(rows);
-    }
-
-    /// Every row, in order.
-    #[must_use]
-    pub fn rows(&self) -> &[SessionRow] {
-        &self.rows
-    }
-
-    /// How many rows there are.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.rows.len()
-    }
-
-    /// Whether there are none.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.rows.is_empty()
-    }
-
-    /// Retained opening, rename and end records, never activity steps.
-    pub fn lifecycle(&self) -> impl Iterator<Item = &SessionRow> {
-        self.lifecycle.iter().map(|&at| &self.rows[at])
-    }
-
-    /// The rows announcing a file out of a Session, in order.
-    pub fn files_out(&self) -> impl Iterator<Item = &SessionRow> {
-        self.files_out.iter().map(|&at| &self.rows[at])
-    }
-
-    /// The positions `which` names, in order.
-    fn positions(&self, which: &SessionFilter) -> &[usize] {
-        match which {
-            SessionFilter::All => &self.all,
-            SessionFilter::FilesOut => &self.files_out,
-            SessionFilter::Pending(id) => self.pending.get(id).map_or(&[], Vec::as_slice),
-            SessionFilter::Request {
-                session_id,
-                reference,
-            } => self
-                .requests
-                .get(&(session_id.clone(), reference.clone()))
-                .map_or(&[], Vec::as_slice),
-            SessionFilter::Session(id) | SessionFilter::SessionRaw(id) => {
-                let index = if matches!(which, SessionFilter::Session(_)) {
-                    &self.visible
-                } else {
-                    &self.by_session
-                };
-                if let Some(p) = index.get(id) {
-                    return p;
-                }
-                let id = id.trim();
-                if id.chars().count() < 8 {
-                    return &[];
-                }
-                let mut found = index.iter().filter(|(k, _)| k.starts_with(id));
-                match (found.next(), found.next()) {
-                    (Some((_, p)), None) => p,
-                    _ => &[],
-                }
-            }
-        }
-    }
-
-    /// The newest rows of `which` before the entry `before` (the newest of all when `None`): at
-    /// most `max_rows` of them and `max_bytes` of body and id, and at least one while any are
-    /// older. Its cost is the page's, not the history's.
-    ///
-    /// # Errors
-    /// `before` is not among `which`'s rows.
-    pub fn page(
-        &self,
-        which: &SessionFilter,
-        before: Option<Digest32>,
-        max_rows: usize,
-        max_bytes: usize,
-    ) -> std::result::Result<SessionPage, String> {
-        let positions = self.positions(which);
-        let end = match before {
-            None => positions.len(),
-            Some(h) => self
-                .at
-                .get(&h)
-                .and_then(|at| positions.binary_search(at).ok())
-                .ok_or_else(|| "cursor not among these Session entries".to_owned())?,
-        };
-        let visible = matches!(which, SessionFilter::Session(_));
-        let mut start = end;
-        let mut bytes = 0usize;
-        let mut groups = Vec::new();
-        while start > 0 {
-            let at = positions[start - 1];
-            let group = if visible { self.activity(at) } else { vec![at] };
-            let cost = group.iter().fold(0usize, |sum, &p| {
-                sum.saturating_add(self.rows[p].body.len() + self.rows[p].session_id.len())
-            });
-            if start < end && (end - start >= max_rows || bytes.saturating_add(cost) > max_bytes) {
-                break;
-            }
-            bytes = bytes.saturating_add(cost);
-            groups.push(group);
-            start -= 1;
-        }
-        let mut seen = std::collections::HashSet::new();
-        let rows = groups
-            .into_iter()
-            .rev()
-            .flatten()
-            .filter(|p| seen.insert(*p))
-            .map(|p| self.rows[p].clone())
-            .collect();
-        Ok(SessionPage {
-            rows,
-            older: start as u64,
-        })
-    }
-}
-
 /// Whether `row` announces a file out of its Session (ADR-029 DR-1.8, #546): what a member with
 /// drive pulls by itself.
 #[must_use]
@@ -463,6 +182,53 @@ pub fn is_file_out(row: &SessionRow) -> bool {
 }
 
 impl DriveState {
+    pub(crate) fn clear_omissions(&mut self) {
+        self.omitted.clear();
+    }
+
+    pub(crate) fn expire_omissions(&mut self) {
+        self.omitted
+            .retain(|_, (at, _)| at.elapsed() < OMISSION_RETRY_AFTER);
+    }
+
+    /// Cache an omitted position when space permits. A duplicate does not extend its
+    /// retry delay, and a full bucket leaves additional positions eligible for retry.
+    pub(crate) fn note_omission(&mut self, peer: Digest32, position: (Digest32, u64)) {
+        self.expire_omissions();
+        if !self.omitted.contains_key(&peer) && self.omitted.len() >= OMISSION_PEERS {
+            let oldest = self
+                .omitted
+                .iter()
+                .min_by_key(|(_, (at, _))| *at)
+                .map(|(peer, _)| *peer);
+            if let Some(oldest) = oldest {
+                self.omitted.remove(&oldest);
+            }
+        }
+        let (_, positions) = self
+            .omitted
+            .entry(peer)
+            .or_insert_with(|| (Instant::now(), BTreeSet::new()));
+        if positions.len() < OMISSION_POSITIONS_PER_PEER {
+            positions.insert(position);
+        }
+    }
+
+    pub(crate) fn note_body_from(&mut self, peer: &Digest32, position: &(Digest32, u64)) {
+        if let Some((_, positions)) = self.omitted.get_mut(peer) {
+            positions.remove(position);
+            if positions.is_empty() {
+                self.omitted.remove(peer);
+            }
+        }
+    }
+
+    pub(crate) fn peer_omitted(&self, peer: &Digest32, position: &(Digest32, u64)) -> bool {
+        self.omitted.get(peer).is_some_and(|(at, positions)| {
+            at.elapsed() < OMISSION_RETRY_AFTER && positions.contains(position)
+        })
+    }
+
     pub(crate) fn floor_mark(&self, member: &Digest32) -> Option<(u64, u64)> {
         self.marks.get(member).copied()
     }
@@ -638,12 +404,9 @@ impl DriveState {
             chain,
             origin,
             marks,
-            floors: BTreeMap::new(),
-            floors_indexed: false,
             omitted: BTreeMap::new(),
             receivers,
             delivered,
-            sessions: SessionLog::default(),
             pending: Vec::new(),
             news: Vec::new(),
             change_unsaid: None,

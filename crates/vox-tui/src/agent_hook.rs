@@ -227,8 +227,11 @@ async fn joined_notice(
     if !client.me().is_some_and(|me| members.contains(&me)) {
         return Ok(None);
     }
-    let (outbound, inbound) = match client.request(&Request::Consents { channel_id }).await? {
-        Frame::Consents { outbound, inbound } => (outbound, inbound),
+    let (outbound, inbound) = match client
+        .request(&Request::MemberConsents { channel_id })
+        .await?
+    {
+        Frame::MemberConsents { outbound, inbound } => (outbound, inbound),
         Frame::Error { reason } => return Err(AppError::Usage(reason)),
         other => return Err(crate::client::unexpected(&other)),
     };
@@ -577,7 +580,7 @@ struct Parents {
     /// held, so its absence is not claimed.
     looked_up: bool,
     /// The copies this node pulled in the room, by announcement (ADR-028 F-6).
-    pulled: Vec<vox_core::node::pulls::Pulled>,
+    pulled: std::collections::BTreeMap<Digest32, std::path::PathBuf>,
     /// Where this node puts what it pulls from the room (F-4).
     files: std::path::PathBuf,
 }
@@ -615,17 +618,15 @@ fn share_line(
     parents: &Parents,
 ) -> Option<String> {
     let name = pulled_share(r, me)?;
-    Some(
-        match parents.pulled.iter().find(|p| p.entry == r.entry_hash) {
-            Some(p) => format!("{PULLED_TO}{}\n", p.path.display()),
-            None => format!(
-                "  \u{21b3} not pulled yet: it lands in {}/ once its SHA-256 is verified, and a \
+    Some(match parents.pulled.get(&r.entry_hash) {
+        Some(path) => format!("{PULLED_TO}{}\n", path.display()),
+        None => format!(
+            "  \u{21b3} not pulled yet: it lands in {}/ once its SHA-256 is verified, and a \
                  later turn says where; `vox room get` pulls {} now\n",
-                parents.files.display(),
-                vox_core::node::pulls::safe_file_name(&name)
-            ),
-        },
-    )
+            parents.files.display(),
+            vox_core::node::pulls::safe_file_name(&name)
+        ),
+    })
 }
 
 /// The one-line preview of the message `r` replies to, or `None` when it names none (V030-19).
@@ -1187,17 +1188,23 @@ fn room_heading(room_label: &str, room_name: &str) -> String {
     }
 }
 
-/// What a session is owed in one room, for its wake (V030-15, V030-20): one sender's name per
-/// message, as this node's keyring names it.
+/// What a session is owed in one room, for its wake (V030-15, V030-20): exact message
+/// counts and a bounded sender sample, named from this node's keyring.
 pub(crate) struct Owed {
     /// The start of the room's id, as commands take it.
     pub room_label: String,
     /// The room's local name, or empty.
     pub room_name: String,
+    /// Exact counts, independent of the distinct sender names.
+    pub urgent_count: usize,
+    pub reply_count: usize,
     /// The senders of the urgent messages addressed to this node.
     pub urgent: Vec<String>,
     /// The senders of the replies to this session's posts.
     pub replies: Vec<String>,
+    /// Further senders exist beyond the displayed sample; their exact number is not claimed.
+    pub urgent_more: bool,
+    pub replies_more: bool,
 }
 
 /// What a wake puts in front of a session (ADR-020 §6; V030-15, V030-20): **a count and the
@@ -1216,12 +1223,15 @@ pub(crate) struct Owed {
 /// message written to its messaging socket as one "from another Claude session … a teammate's
 /// request" (2.1.287, measured), and OpenCode as the person's own prompt.
 pub(crate) fn render_wake(owed: &[Owed]) -> String {
-    let from = |names: &[String]| {
+    let from = |names: &[String], more: bool| {
         let mut seen: Vec<String> = Vec::new();
         for n in names.iter().map(|n| one_line(n)) {
             if !seen.contains(&n) {
                 seen.push(n);
             }
+        }
+        if more {
+            seen.push("additional senders omitted".to_owned());
         }
         seen.join(", ")
     };
@@ -1229,20 +1239,20 @@ pub(crate) fn render_wake(owed: &[Owed]) -> String {
         .iter()
         .map(|o| {
             let mut said = Vec::new();
-            if !o.urgent.is_empty() {
+            if o.urgent_count != 0 {
                 said.push(format!(
                     "{} urgent message{} addressed to you from {}",
-                    o.urgent.len(),
-                    if o.urgent.len() == 1 { "" } else { "s" },
-                    from(&o.urgent)
+                    o.urgent_count,
+                    if o.urgent_count == 1 { "" } else { "s" },
+                    from(&o.urgent, o.urgent_more)
                 ));
             }
-            if !o.replies.is_empty() {
+            if o.reply_count != 0 {
                 said.push(format!(
                     "{} repl{} to your messages from {}",
-                    o.replies.len(),
-                    if o.replies.len() == 1 { "y" } else { "ies" },
-                    from(&o.replies)
+                    o.reply_count,
+                    if o.reply_count == 1 { "y" } else { "ies" },
+                    from(&o.replies, o.replies_more)
                 ));
             }
             format!(
@@ -1976,7 +1986,7 @@ impl RoomDrain {
         let mut pulling = self.pulling.clone();
         for r in &self.fresh[..shown] {
             if pulled_share(r, me.as_ref()).is_some()
-                && !self.parents.pulled.iter().any(|p| p.entry == r.entry_hash)
+                && !self.parents.pulled.contains_key(&r.entry_hash)
             {
                 pulling.insert(b32_encode(&r.entry_hash));
             }
@@ -2585,9 +2595,12 @@ async fn read_room(
     let mut parent_rows = targets;
     parent_rows.extend(root_rows);
     parent_rows.extend(rows.iter().cloned());
-    let pulled: Vec<vox_core::node::pulls::Pulled> = vox_core::node::pulls::recorded(paths)
-        .into_iter()
+    let pulled = parent_rows
+        .iter()
+        .filter(|row| pulled_share(row, me.as_ref()).is_some())
+        .filter_map(|row| vox_core::node::pulls::recorded_entry(paths, &row.entry_hash))
         .filter(|p| p.room == channel_id)
+        .map(|p| (p.entry, p.path))
         .collect();
     // **Where a share shown before it landed has landed since** (F-6), said once; one whose copy
     // is not there yet waits for a later turn.
@@ -2605,8 +2618,12 @@ async fn read_room(
     })
     .unwrap_or_default();
     let mut landed = Vec::new();
-    pulling.retain(
-        |entry| match pulled.iter().find(|p| b32_encode(&p.entry) == *entry) {
+    pulling.retain(|entry| {
+        match b32_decode(entry, "pull entry")
+            .ok()
+            .and_then(|entry| vox_core::node::pulls::recorded_entry(paths, &entry))
+            .filter(|p| p.room == channel_id)
+        {
             Some(p) => {
                 landed.push(format!(
                     "[{}] the file offered there is pulled: {}",
@@ -2616,8 +2633,8 @@ async fn read_room(
                 false
             }
             None => true,
-        },
-    );
+        }
+    });
     let parents = Parents {
         rows: parent_rows,
         looked_up,

@@ -116,62 +116,236 @@ fn page_id(log_id: u64, pending: bool) -> Result<u64> {
         .ok_or(Error::SizeLimitExceeded("Session classification pages"))
 }
 
+// LogDb starts at one, leaving page zero for bounded reconciliation state.
+const HEADER: u64 = 0;
+const WORK_SLOTS: usize = 64;
+const PAGE_BYTES: usize = MAX_LEGACY_SESSION_HASHES * 34 + 256;
+const REFRESHING: &str = "legacy Session classification is refreshing";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Header {
+    revision: u64,
+    initialized: bool,
+    pending: bool,
+    active: bool,
+    after: u64,
+    through: u64,
+    current: u64,
+    offset: usize,
+    unresolved: bool,
+    again: bool,
+}
+
+impl Header {
+    fn empty(initialized: bool) -> Self {
+        Self {
+            revision: 0,
+            initialized,
+            pending: !initialized,
+            active: false,
+            after: 1,
+            through: 1,
+            current: 0,
+            offset: 0,
+            unresolved: false,
+            again: false,
+        }
+    }
+
+    fn wire(&self) -> Vec<u8> {
+        let mut e = Encoder::new();
+        e.array(11)
+            .uint(1)
+            .uint(self.revision)
+            .uint(u64::from(self.initialized))
+            .uint(u64::from(self.pending))
+            .uint(u64::from(self.active))
+            .uint(self.after)
+            .uint(self.through)
+            .uint(self.current)
+            .uint(self.offset as u64)
+            .uint(u64::from(self.unresolved))
+            .uint(u64::from(self.again));
+        e.finish()
+    }
+
+    fn read(bytes: &[u8]) -> Result<Self> {
+        fn flag(d: &mut Decoder<'_>) -> Result<bool> {
+            match d.uint()? {
+                0 => Ok(false),
+                1 => Ok(true),
+                _ => Err(Error::MalformedAtRest("Session classification cursor flag")),
+            }
+        }
+        let mut d = Decoder::new(bytes);
+        if d.array()? != 11 || d.uint()? != 1 {
+            return Err(Error::MalformedAtRest(
+                "Session classification cursor version",
+            ));
+        }
+        let header = Self {
+            revision: d.uint()?,
+            initialized: flag(&mut d)?,
+            pending: flag(&mut d)?,
+            active: flag(&mut d)?,
+            after: d.uint()?,
+            through: d.uint()?,
+            current: d.uint()?,
+            offset: usize::try_from(d.uint()?)
+                .map_err(|_| Error::MalformedAtRest("Session classification cursor offset"))?,
+            unresolved: flag(&mut d)?,
+            again: flag(&mut d)?,
+        };
+        if header.after < 1
+            || header.after > header.through
+            || (header.current != 0
+                && (header.current <= header.after || header.current > header.through))
+            || header.offset > MAX_LEGACY_SESSION_HASHES
+            || (header.offset != 0 && header.current == 0)
+            || (!header.active && (header.current != 0 || header.offset != 0 || header.again))
+        {
+            return Err(Error::MalformedAtRest("Session classification cursor"));
+        }
+        d.finish()?;
+        Ok(header)
+    }
+
+    fn changed(&mut self) -> Result<()> {
+        self.revision = self.revision.checked_add(1).ok_or(Error::MalformedAtRest(
+            "Session classification revision exhausted",
+        ))?;
+        Ok(())
+    }
+}
+
+/// Only scalar publication state is resident. Pages and pending references remain sealed.
 #[derive(Debug, Default)]
 pub(super) struct LegacySessions {
-    pages: BTreeMap<u64, Page>,
-    /// A view of Target pages, including durable contradictions (false).
-    targets: BTreeMap<Digest32, bool>,
-    /// Changes to whether a target may appear as an owed timeline row.
     display_revision: u64,
-    /// Deletes are dirty ids with no corresponding page. Cleared only after durable commit.
-    dirty: BTreeSet<u64>,
-    /// Verified incoming bodies inspected before their log id is allocated and before floors
-    /// may discard them. Absorption transfers these into durable target pages in its batch.
-    pub(super) observed: BTreeMap<Digest32, (Digest32, bool)>,
+    /// The caller's current Batch contains classification writes and must be committed.
+    dirty: bool,
 }
 
 impl LegacySessions {
-    pub(super) fn is_session(&self, hash: &Digest32) -> bool {
-        self.targets.get(hash) == Some(&true)
-    }
-
     pub(super) fn display_revision(&self) -> u64 {
         self.display_revision
     }
 
     pub(super) fn dirty(&self) -> bool {
-        !self.dirty.is_empty()
+        self.dirty
     }
 
     pub(super) fn committed(&mut self) {
-        self.dirty.clear();
+        self.dirty = false;
     }
+}
 
-    fn put(&mut self, id: u64, page: Page) {
-        if self.pages.get(&id) == Some(&page) {
-            return;
+fn segment(
+    transaction: Transaction<'_, '_>,
+    room: &Digest32,
+    id: u64,
+) -> Result<Option<crate::atrest::store::SealedSegment>> {
+    match transaction {
+        Transaction::Snapshot(snapshot) => {
+            snapshot.get_segment(room, SegmentKind::SessionClassification, id)
         }
-        if let Page::Target { hash, session, .. } = &page {
-            if self.is_session(hash) != *session {
-                self.display_revision = self.display_revision.wrapping_add(1);
-            }
-            self.targets.insert(*hash, *session);
+        Transaction::Batch(batch) => {
+            batch.get_segment(room, SegmentKind::SessionClassification, id)
         }
-        self.pages.insert(id, page);
-        self.dirty.insert(id);
     }
+}
 
-    fn remove(&mut self, id: u64) {
-        if let Some(Page::Target { hash, .. }) = self.pages.remove(&id) {
-            if self.targets.remove(&hash) == Some(true) {
-                self.display_revision = self.display_revision.wrapping_add(1);
-            }
+fn next_id(transaction: Transaction<'_, '_>, room: &Digest32, after: u64) -> Result<Option<u64>> {
+    match transaction {
+        Transaction::Snapshot(snapshot) => {
+            snapshot.segment_id_after(room, SegmentKind::SessionClassification, Some(after))
         }
-        self.dirty.insert(id);
+        Transaction::Batch(batch) => {
+            batch.segment_id_after(room, SegmentKind::SessionClassification, Some(after))
+        }
     }
 }
 
 impl ChannelState {
+    /// Exact retry classification; malformed or unreadable sealed facts remain errors.
+    pub fn legacy_classification_refreshing(error: &Error) -> bool {
+        matches!(error, Error::Profile(why) if *why == REFRESHING)
+    }
+
+    fn legacy_header(&self, transaction: Transaction<'_, '_>) -> Result<Header> {
+        let Some(sealed) = segment(transaction, &self.channel_id, HEADER)? else {
+            return Ok(Header::empty(
+                next_id(transaction, &self.channel_id, 1)?.is_none(),
+            ));
+        };
+        if sealed.ciphertext.len() > 256 {
+            return Err(Error::MalformedAtRest("Session classification cursor size"));
+        }
+        Header::read(&open_segment(
+            &self.sek,
+            SegmentKind::SessionClassification,
+            HEADER,
+            &sealed,
+        )?)
+    }
+
+    fn save_legacy_header(
+        &mut self,
+        batch: &mut crate::node::store::Batch<'_>,
+        header: &Header,
+    ) -> Result<()> {
+        let bytes = header.wire();
+        let same = match segment(Transaction::Batch(batch), &self.channel_id, HEADER)? {
+            Some(sealed) => {
+                open_segment(
+                    &self.sek,
+                    SegmentKind::SessionClassification,
+                    HEADER,
+                    &sealed,
+                )?
+                .as_slice()
+                    == bytes.as_slice()
+            }
+            None => false,
+        };
+        if !same {
+            let sealed = seal_segment(
+                &self.sek,
+                SegmentKind::SessionClassification,
+                HEADER,
+                &bytes,
+            )?;
+            batch.put_segment(
+                &self.channel_id,
+                SegmentKind::SessionClassification,
+                HEADER,
+                &sealed,
+            )?;
+            self.legacy_sessions.dirty = true;
+        }
+        self.legacy_sessions.display_revision = header.revision;
+        Ok(())
+    }
+
+    fn legacy_page(&self, transaction: Transaction<'_, '_>, id: u64) -> Result<Option<Page>> {
+        let Some(sealed) = segment(transaction, &self.channel_id, id)? else {
+            return Ok(None);
+        };
+        if sealed.ciphertext.len() > PAGE_BYTES + crate::atrest::sek::TAG_LEN {
+            return Err(Error::MalformedAtRest("Session classification page size"));
+        }
+        let page = Page::read(&open_segment(
+            &self.sek,
+            SegmentKind::SessionClassification,
+            id,
+            &sealed,
+        )?)?;
+        if matches!(page, Page::Pending { .. }) != (id % 2 == 1) || id < 2 {
+            return Err(Error::MalformedAtRest("Session classification page parity"));
+        }
+        Ok(Some(page))
+    }
+
     /// A verified target, not a claimed time/sequence range or an unverified bare hash.
     fn legacy_target(
         &self,
@@ -186,9 +360,7 @@ impl ChannelState {
         }))
     }
 
-    /// Inspect an authenticated available body before Session floors discard it. A copied
-    /// receiver state checks a decryptable subtype without consuming the live chain twice.
-    /// Its serialized keys and plaintext are zeroized; neither becomes a cache or permission.
+    /// Inspect an authenticated available body without consuming the live receiver chain.
     fn available_legacy_kind(&self, entry: &Entry) -> Option<bool> {
         let payload = entry.payload.as_deref()?;
         if !matches!(classify_payload(payload), Ok(EntryKind::Content)) {
@@ -213,59 +385,202 @@ impl ChannelState {
         ))
     }
 
-    pub(super) fn remember_legacy_kind(
-        &mut self,
+    fn legacy_kind_in(
+        &self,
         transaction: Transaction<'_, '_>,
+        hash: &Digest32,
+    ) -> Result<Option<bool>> {
+        let Some(log) = self.log_id_at(transaction, hash)? else {
+            return Ok(None);
+        };
+        let Some(entry) = self.entry_at(transaction, hash)? else {
+            return Err(Error::MalformedAtRest(
+                "Session classification source missing",
+            ));
+        };
+        let author = entry.skeleton.author_id;
+        if self.legacy_target(transaction, hash, &author)?.is_none() {
+            return Err(Error::MalformedAtRest(
+                "Session classification source unverified",
+            ));
+        }
+        let saved = match self.legacy_page(transaction, page_id(log, false)?)? {
+            Some(Page::Target {
+                hash: saved,
+                author: signer,
+                session,
+            }) if saved == *hash && signer == author => Some(session),
+            Some(_) => {
+                return Err(Error::MalformedAtRest(
+                    "Session classification target binding",
+                ))
+            }
+            None => None,
+        };
+        Ok(self.available_legacy_kind(&entry).or(saved))
+    }
+
+    /// Known subtype evidence for a transaction's derived indexes. Unknown is not a claim
+    /// that pending declarations are complete; selected owed reads use the checked variant.
+    pub(super) fn legacy_is_session_in(
+        &self,
+        transaction: Transaction<'_, '_>,
+        hash: &Digest32,
+    ) -> Result<bool> {
+        Ok(self.legacy_kind_in(transaction, hash)? == Some(true))
+    }
+
+    /// Refuse only an unknown subtype while its declaration evidence is still being examined.
+    pub(super) fn legacy_is_session_current_in(
+        &self,
+        transaction: Transaction<'_, '_>,
+        hash: &Digest32,
+    ) -> Result<bool> {
+        if let Some(session) = self.legacy_kind_in(transaction, hash)? {
+            return Ok(session);
+        }
+        let header = self.legacy_header(transaction)?;
+        if header.active || !header.initialized {
+            return Err(Error::Profile(REFRESHING));
+        }
+        Ok(false)
+    }
+
+    /// Aggregate counts that include owed placeholders need a complete classification pass.
+    /// Readable-only selections do not depend on this fence.
+    pub(super) fn require_legacy_classification_complete_in(
+        &self,
+        transaction: Transaction<'_, '_>,
+    ) -> Result<()> {
+        let header = self.legacy_header(transaction)?;
+        if header.active || !header.initialized {
+            return Err(Error::Profile(REFRESHING));
+        }
+        Ok(())
+    }
+
+    fn put_legacy_target(
+        &mut self,
+        batch: &mut crate::node::store::Batch<'_>,
+        header: &mut Header,
         hash: Digest32,
         author: Digest32,
         session: bool,
     ) -> Result<()> {
-        let Some(log_id) = self.log_id_at(transaction, &hash)? else {
-            self.legacy_sessions
-                .observed
-                .insert(hash, (author, session));
-            return Ok(());
+        let transaction = Transaction::Batch(batch);
+        let log = self
+            .log_id_at(transaction, &hash)?
+            .ok_or(Error::MalformedAtRest(
+                "Session classification source unpublished",
+            ))?;
+        if self.legacy_target(transaction, &hash, &author)?.is_none() {
+            return Err(Error::MalformedAtRest(
+                "Session classification target unverified",
+            ));
+        }
+        let id = page_id(log, false)?;
+        let page = Page::Target {
+            hash,
+            author,
+            session,
         };
-        self.legacy_sessions.put(
-            page_id(log_id, false)?,
-            Page::Target {
-                hash,
-                author,
+        let previous = self.legacy_page(transaction, id)?;
+        if previous.as_ref() == Some(&page) {
+            return Ok(());
+        }
+        let prior = match previous {
+            Some(Page::Target {
+                hash: saved,
+                author: signer,
                 session,
-            },
-        );
+            }) if saved == hash && signer == author => session,
+            Some(_) => {
+                return Err(Error::MalformedAtRest(
+                    "Session classification target binding",
+                ))
+            }
+            None => false,
+        };
+        let sealed = seal_segment(
+            &self.sek,
+            SegmentKind::SessionClassification,
+            id,
+            &page.wire(),
+        )?;
+        batch.put_segment(
+            &self.channel_id,
+            SegmentKind::SessionClassification,
+            id,
+            &sealed,
+        )?;
+        self.legacy_sessions.dirty = true;
+        if prior != session {
+            header.changed()?;
+        }
         Ok(())
     }
 
-    /// Called before receive filtering, while a late contradictory body is still available.
-    pub(super) fn inspect_legacy_bodies(
+    /// Store subtype evidence in the transaction that publishes or prunes its source body.
+    pub(super) fn remember_legacy_kind(
         &mut self,
-        store: &Store,
-        staged: &[Vec<u8>],
+        batch: &mut crate::node::store::Batch<'_>,
+        hash: Digest32,
+        author: Digest32,
+        session: bool,
     ) -> Result<()> {
-        let snapshot = store.snapshot()?;
-        let transaction = Transaction::Snapshot(&snapshot);
-        for wire in staged {
-            let Ok(incoming) = Entry::from_wire(wire) else {
-                continue;
-            };
-            let hash = incoming.entry_hash();
-            let author = incoming.skeleton.author_id;
-            let kind = self
-                .legacy_target(transaction, &hash, &author)?
-                .and_then(|entry| self.available_legacy_kind(&entry));
-            if let Some(session) = kind {
-                // A new entry has no log id yet. Absorption repeats the inspection once it
-                // allocates its page; a refilled skeleton already has its durable log id.
-                self.remember_legacy_kind(transaction, hash, author, session)?;
-            }
+        let mut header = self.legacy_header(Transaction::Batch(batch))?;
+        self.put_legacy_target(batch, &mut header, hash, author, session)?;
+        if self.legacy_sessions.dirty() {
+            self.save_legacy_header(batch, &header)?;
+        }
+        Ok(())
+    }
+
+    /// Called only after the verified entry has its transaction-local LogDb locator.
+    pub(super) fn inspect_legacy_body_into(
+        &mut self,
+        batch: &mut crate::node::store::Batch<'_>,
+        entry: &Entry,
+    ) -> Result<()> {
+        if let Some(session) = self.available_legacy_kind(entry) {
+            self.remember_legacy_kind(
+                batch,
+                entry.entry_hash(),
+                entry.skeleton.author_id,
+                session,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn request_legacy_pass(
+        &self,
+        batch: &crate::node::store::Batch<'_>,
+        header: &mut Header,
+    ) -> Result<()> {
+        if !header.pending && header.initialized {
+            return Ok(());
+        }
+        if header.active {
+            header.again = true;
+        } else {
+            header.active = true;
+            header.after = 1;
+            header.current = 0;
+            header.offset = 0;
+            header.through = batch
+                .last_segment_id(&self.channel_id, SegmentKind::SessionClassification)?
+                .unwrap_or(1)
+                .max(1);
+            header.unresolved = false;
+            header.changed()?;
         }
         Ok(())
     }
 
     pub(super) fn accept_legacy_index(
         &mut self,
-        transaction: Transaction<'_, '_>,
+        batch: &mut crate::node::store::Batch<'_>,
         declaration: Digest32,
         outer_author: Digest32,
         index: LegacySessionIndex,
@@ -274,219 +589,301 @@ impl ChannelState {
         if index.channel_id != self.channel_id || index.author != outer_author {
             return Ok(());
         }
+        let transaction = Transaction::Batch(batch);
         let Some(entry) = self.legacy_target(transaction, &declaration, &outer_author)? else {
             return Ok(());
         };
         if entry.payload.is_none() {
             return Ok(());
         }
-        let log_id = self
+        let log = self
             .log_id_at(transaction, &declaration)?
             .ok_or(Error::MalformedAtRest(
                 "Session declaration has no log page",
             ))?;
+        let id = page_id(log, true)?;
         let first_seen = self
-            .retention
-            .get(&declaration)
+            .retention_get_in(transaction, &declaration)?
             .map_or(now_ms, |t| t.first_seen_ms);
-        self.legacy_sessions.put(
-            page_id(log_id, true)?,
-            Page::Pending {
+        let page = Page::Pending {
+            declaration,
+            author: outer_author,
+            first_seen,
+            steps: index.steps,
+        };
+        // Re-rendering can repeat a declaration. Its original local age is never extended.
+        let page = match self.legacy_page(transaction, id)? {
+            Some(Page::Pending {
+                declaration: saved,
+                author,
+                first_seen: first,
+                steps,
+            }) if saved == declaration && author == outer_author => Page::Pending {
                 declaration,
-                author: outer_author,
-                first_seen,
-                steps: index.steps,
+                author,
+                first_seen: first.min(first_seen),
+                steps,
             },
-        );
-        self.reconcile_legacy_sessions_at(transaction, now_ms)
+            Some(_) => return Err(Error::MalformedAtRest("Session declaration page binding")),
+            None => page,
+        };
+        if self.legacy_page(transaction, id)?.as_ref() != Some(&page) {
+            let sealed = seal_segment(
+                &self.sek,
+                SegmentKind::SessionClassification,
+                id,
+                &page.wire(),
+            )?;
+            batch.put_segment(
+                &self.channel_id,
+                SegmentKind::SessionClassification,
+                id,
+                &sealed,
+            )?;
+            self.legacy_sessions.dirty = true;
+        }
+        let mut header = self.legacy_header(Transaction::Batch(batch))?;
+        header.pending = true;
+        self.request_legacy_pass(batch, &mut header)?;
+        self.save_legacy_header(batch, &header)
     }
 
-    /// Resolve only authenticated skeletons. Missing references age with their declaration;
-    /// resolving a target moves its evidence into that target's own sealed page.
-    pub(super) fn reconcile_legacy_sessions(&mut self, store: &Store, now_ms: u64) -> Result<()> {
-        let snapshot = store.snapshot()?;
-        self.reconcile_legacy_sessions_at(Transaction::Snapshot(&snapshot), now_ms)
+    /// Request a fair pass for new input or retention changes, then inspect one bounded chunk.
+    /// True means another turn is needed; unresolved absent targets do not spin a finished pass.
+    pub(super) fn reconcile_legacy_sessions(&mut self, store: &Store, now_ms: u64) -> Result<bool> {
+        let mut batch = store.batch()?;
+        let more = self.reconcile_legacy_sessions_in(&mut batch, now_ms)?;
+        if self.legacy_sessions.dirty() {
+            batch.commit()?;
+            self.legacy_sessions.committed();
+        }
+        Ok(more)
     }
 
     pub(super) fn reconcile_legacy_sessions_in(
         &mut self,
-        batch: &crate::node::store::Batch<'_>,
+        batch: &mut crate::node::store::Batch<'_>,
         now_ms: u64,
-    ) -> Result<()> {
-        self.reconcile_legacy_sessions_at(Transaction::Batch(batch), now_ms)
+    ) -> Result<bool> {
+        let mut header = self.legacy_header(Transaction::Batch(batch))?;
+        self.request_legacy_pass(batch, &mut header)?;
+        self.advance_legacy_at(batch, &mut header, now_ms)?;
+        self.save_legacy_header(batch, &header)?;
+        Ok(header.active || !header.initialized)
     }
 
-    fn reconcile_legacy_sessions_at(
-        &mut self,
-        transaction: Transaction<'_, '_>,
-        now_ms: u64,
-    ) -> Result<()> {
-        let pending: Vec<_> = self
-            .legacy_sessions
-            .pages
-            .iter()
-            .filter_map(|(id, page)| match page {
-                Page::Pending { .. } => Some((*id, page.clone())),
-                Page::Target { .. } => None,
-            })
-            .collect();
-        let ttl = self.effective_retention();
-        for (id, page) in pending {
-            let Page::Pending {
-                declaration,
-                author,
-                first_seen,
-                steps,
-            } = page
-            else {
-                continue;
-            };
-            // This sealed page already authenticates the declaration. Its verified skeleton
-            // remains sufficient after body pruning: a remote backdated timestamp must not
-            // shorten the pending references' local first-seen lifetime.
-            if self
-                .legacy_target(transaction, &declaration, &author)?
-                .is_none()
-                || (ttl != 0 && first_seen <= now_ms.saturating_sub(ttl.saturating_mul(1_000)))
-            {
-                self.legacy_sessions.remove(id);
-                continue;
-            }
-            let mut remaining = Vec::new();
-            for hash in steps {
-                let Some(entry) = self.entry_at(transaction, &hash)? else {
-                    remaining.push(hash);
-                    continue;
-                };
-                if entry.skeleton.seq > self.dag.verified_head(&entry.skeleton.author_id) {
-                    remaining.push(hash);
-                    continue;
-                }
-                if entry.skeleton.channel_id != self.channel_id
-                    || entry.skeleton.author_id != author
-                {
-                    continue;
-                }
-                let session = self
-                    .available_legacy_kind(&entry)
-                    .or_else(|| self.legacy_sessions.targets.get(&hash).copied())
-                    // A bare verified skeleton proves its signer/room/hash, not its subtype:
-                    // the same author's authenticated exact-hash declaration supplies that.
-                    .unwrap_or(true);
-                self.remember_legacy_kind(transaction, hash, author, session)?;
-            }
-            if remaining.is_empty() {
-                self.legacy_sessions.remove(id);
-            } else {
-                self.legacy_sessions.put(
-                    id,
-                    Page::Pending {
-                        declaration,
-                        author,
-                        first_seen,
-                        steps: remaining,
-                    },
-                );
-            }
+    /// Continue existing work without requesting another pass. No Store or snapshot is retained.
+    pub(crate) fn advance_legacy_sessions(&mut self, store: &Store, now_ms: u64) -> Result<bool> {
+        let mut batch = store.batch()?;
+        let mut header = self.legacy_header(Transaction::Batch(&batch))?;
+        if !header.initialized && !header.active {
+            self.request_legacy_pass(&batch, &mut header)?;
         }
-        Ok(())
+        self.advance_legacy_at(&mut batch, &mut header, now_ms)?;
+        let more = header.active || !header.initialized;
+        if self.legacy_sessions.dirty() || self.legacy_header(Transaction::Batch(&batch))? != header
+        {
+            self.save_legacy_header(&mut batch, &header)?;
+            batch.commit()?;
+            self.legacy_sessions.committed();
+        }
+        Ok(more)
     }
 
-    pub(super) fn restore_legacy_sessions(&mut self, store: &Store, now_ms: u64) -> Result<()> {
+    /// Whether bounded classification work is owed, independent of unresolved absent targets.
+    pub(crate) fn legacy_classification_pending(&self, store: &Store) -> Result<bool> {
         let snapshot = store.snapshot()?;
-        let transaction = Transaction::Snapshot(&snapshot);
-        for (id, segment) in store.segments(&self.channel_id, SegmentKind::SessionClassification)? {
-            let bytes = open_segment(&self.sek, SegmentKind::SessionClassification, id, &segment)?;
-            let page = Page::read(&bytes)?;
+        let header = self.legacy_header(Transaction::Snapshot(&snapshot))?;
+        Ok(header.active || !header.initialized)
+    }
+
+    fn advance_legacy_at(
+        &mut self,
+        batch: &mut crate::node::store::Batch<'_>,
+        header: &mut Header,
+        now_ms: u64,
+    ) -> Result<()> {
+        let mut remaining_work = WORK_SLOTS;
+        while header.active && remaining_work > 0 {
+            // Resolving a declaration can insert target pages before its own locator.
+            // Keep the current page explicit so its reference offset cannot be applied
+            // to one of those newly inserted pages on the next turn.
+            let next = if header.current != 0 {
+                Some(header.current)
+            } else {
+                next_id(Transaction::Batch(batch), &self.channel_id, header.after)?
+                    .filter(|id| *id <= header.through)
+            };
+            let Some(id) = next else {
+                header.initialized = true;
+                header.active = false;
+                header.current = 0;
+                header.offset = 0;
+                let again = std::mem::take(&mut header.again);
+                // New input may have inserted a declaration beyond this pass's fixed tail.
+                // Its request survives even when the old range had no unresolved targets.
+                header.pending = header.unresolved || again;
+                if again {
+                    self.request_legacy_pass(batch, header)?;
+                } else {
+                    header.changed()?;
+                }
+                break;
+            };
+            remaining_work -= 1;
+            let page =
+                self.legacy_page(Transaction::Batch(batch), id)?
+                    .ok_or(Error::MalformedAtRest(
+                        "Session classification cursor page missing",
+                    ))?;
             let (hash, author, pending) = match &page {
+                Page::Target { hash, author, .. } => (*hash, *author, false),
                 Page::Pending {
                     declaration,
                     author,
                     ..
                 } => (*declaration, *author, true),
-                Page::Target { hash, author, .. } => (*hash, *author, false),
             };
-            if let Some(log_id) = self.log_id_at(transaction, &hash)? {
-                if page_id(log_id, pending)? != id {
-                    return Err(Error::MalformedAtRest(
-                        "Session classification page binding",
-                    ));
-                }
-            } else {
-                self.legacy_sessions.dirty.insert(id);
+            let Some(log) = self.log_id_at(Transaction::Batch(batch), &hash)? else {
+                batch.delete_segment(&self.channel_id, SegmentKind::SessionClassification, id)?;
+                self.legacy_sessions.dirty = true;
+                header.after = id;
+                header.current = 0;
+                header.offset = 0;
                 continue;
-            }
-            if self.legacy_target(transaction, &hash, &author)?.is_none() {
+            };
+            if page_id(log, pending)? != id
+                || self
+                    .legacy_target(Transaction::Batch(batch), &hash, &author)?
+                    .is_none()
+            {
                 return Err(Error::MalformedAtRest(
-                    "Session classification target binding",
+                    "Session classification page binding",
                 ));
             }
-            self.legacy_sessions.put(id, page);
-        }
-        // Loaded pages need no rewrite; only reconciliation below creates dirty state.
-        let stale: BTreeSet<_> = self
-            .legacy_sessions
-            .dirty
-            .iter()
-            .filter(|id| !self.legacy_sessions.pages.contains_key(id))
-            .copied()
-            .collect();
-        self.legacy_sessions.dirty = stale;
-        let known: Vec<_> = self
-            .legacy_sessions
-            .pages
-            .values()
-            .filter_map(|page| match page {
-                Page::Target { hash, author, .. } => Some((*hash, *author)),
-                Page::Pending { .. } => None,
-            })
-            .collect();
-        for (hash, author) in known {
-            if let Some(session) = self
-                .legacy_target(transaction, &hash, &author)?
-                .and_then(|entry| self.available_legacy_kind(&entry))
-            {
-                self.remember_legacy_kind(transaction, hash, author, session)?;
+            match page {
+                Page::Target { hash, author, .. } => {
+                    if header.current != 0 || header.offset != 0 {
+                        return Err(Error::MalformedAtRest(
+                            "Session classification pending cursor kind",
+                        ));
+                    }
+                    if let Some(session) = self
+                        .legacy_target(Transaction::Batch(batch), &hash, &author)?
+                        .and_then(|entry| self.available_legacy_kind(&entry))
+                    {
+                        self.put_legacy_target(batch, header, hash, author, session)?;
+                    }
+                    header.after = id;
+                }
+                Page::Pending {
+                    declaration,
+                    author,
+                    first_seen,
+                    steps,
+                } => {
+                    // Neither expiry nor a declaration's remaining lifetime can be decided
+                    // from stale policy. Governance maintenance has no dependency on this pass.
+                    if !self.governance_display_current(now_ms) {
+                        break;
+                    }
+                    let ttl = self.effective_retention();
+                    if ttl != 0 && first_seen <= now_ms.saturating_sub(ttl.saturating_mul(1_000)) {
+                        batch.delete_segment(
+                            &self.channel_id,
+                            SegmentKind::SessionClassification,
+                            id,
+                        )?;
+                        self.legacy_sessions.dirty = true;
+                        header.after = id;
+                        header.current = 0;
+                        header.offset = 0;
+                        continue;
+                    }
+                    if header.offset > steps.len() {
+                        return Err(Error::MalformedAtRest(
+                            "Session classification pending cursor offset",
+                        ));
+                    }
+                    let end = (header.offset + remaining_work).min(steps.len());
+                    let mut remaining = steps[..header.offset].to_vec();
+                    for target in &steps[header.offset..end] {
+                        remaining_work -= 1;
+                        let transaction = Transaction::Batch(batch);
+                        let Some(entry) = self.entry_at(transaction, target)? else {
+                            remaining.push(*target);
+                            continue;
+                        };
+                        if entry.skeleton.seq > self.dag.verified_head(&entry.skeleton.author_id)
+                            || self.log_id_at(transaction, target)?.is_none()
+                        {
+                            remaining.push(*target);
+                            continue;
+                        }
+                        if entry.skeleton.channel_id != self.channel_id
+                            || entry.skeleton.author_id != author
+                        {
+                            continue;
+                        }
+                        let session = self.legacy_kind_in(transaction, target)?.unwrap_or(true);
+                        self.put_legacy_target(batch, header, *target, author, session)?;
+                    }
+                    let offset = remaining.len();
+                    remaining.extend_from_slice(&steps[end..]);
+                    if remaining.is_empty() {
+                        batch.delete_segment(
+                            &self.channel_id,
+                            SegmentKind::SessionClassification,
+                            id,
+                        )?;
+                        self.legacy_sessions.dirty = true;
+                    } else if remaining != steps {
+                        let page = Page::Pending {
+                            declaration,
+                            author,
+                            first_seen,
+                            steps: remaining.clone(),
+                        };
+                        let sealed = seal_segment(
+                            &self.sek,
+                            SegmentKind::SessionClassification,
+                            id,
+                            &page.wire(),
+                        )?;
+                        batch.put_segment(
+                            &self.channel_id,
+                            SegmentKind::SessionClassification,
+                            id,
+                            &sealed,
+                        )?;
+                        self.legacy_sessions.dirty = true;
+                    }
+                    if end == steps.len() {
+                        header.unresolved |= !remaining.is_empty();
+                        header.after = id;
+                        header.current = 0;
+                        header.offset = 0;
+                    } else {
+                        header.current = id;
+                        header.offset = offset;
+                    }
+                }
             }
-        }
-        self.reconcile_legacy_sessions_at(transaction, now_ms)?;
-        if self.legacy_sessions.dirty() {
-            let mut batch = store.batch()?;
-            self.queue_legacy_sessions(&mut batch)?;
-            batch.commit()?;
-            self.legacy_sessions.committed();
         }
         Ok(())
     }
 
-    pub(super) fn queue_legacy_sessions(
-        &self,
-        batch: &mut crate::node::store::Batch<'_>,
-    ) -> Result<()> {
-        for id in &self.legacy_sessions.dirty {
-            match self.legacy_sessions.pages.get(id) {
-                Some(page) => {
-                    let segment = seal_segment(
-                        &self.sek,
-                        SegmentKind::SessionClassification,
-                        *id,
-                        &page.wire(),
-                    )?;
-                    batch.put_segment(
-                        &self.channel_id,
-                        SegmentKind::SessionClassification,
-                        *id,
-                        &segment,
-                    )?;
-                }
-                None => {
-                    batch.delete_segment(
-                        &self.channel_id,
-                        SegmentKind::SessionClassification,
-                        *id,
-                    )?;
-                }
-            }
+    /// Load only the sealed cursor. Existing subtype pages are checked on lookup or one
+    /// bounded reconciliation turn; reopening never materializes the retained classification set.
+    pub(super) fn restore_legacy_sessions(&mut self, store: &Store, _now_ms: u64) -> Result<()> {
+        let mut batch = store.batch()?;
+        let mut header = self.legacy_header(Transaction::Batch(&batch))?;
+        self.request_legacy_pass(&batch, &mut header)?;
+        self.legacy_sessions.display_revision = header.revision;
+        if self.legacy_header(Transaction::Batch(&batch))? != header {
+            self.save_legacy_header(&mut batch, &header)?;
+            batch.commit()?;
+            self.legacy_sessions.committed();
         }
         Ok(())
     }

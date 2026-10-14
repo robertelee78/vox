@@ -101,6 +101,36 @@ impl Drop for Conn {
 /// daemon starts or its port is taken, so not with every snapshot.
 const PROXY_EVERY: Duration = Duration::from_secs(5);
 
+/// One complete Session row as the currently displayed page presents it.
+fn session_view(
+    row: &vox_core::node::sessions::SessionRow,
+    waiting: bool,
+    trusted: &[(Digest32, String)],
+    me: Option<Digest32>,
+) -> crate::viewmodel::SessionView {
+    let node_alias = crate::ident::author_for(trusted, me.as_ref(), &row.node);
+    crate::viewmodel::SessionView {
+        node: row.node,
+        id: row.id.clone(),
+        name: row.name.clone(),
+        label: vox_agentcomms::envelope::session_label(&node_alias, row.name.as_deref(), &row.id),
+        node_alias,
+        opened: row.opened_millis,
+        ended: (!row.open).then(|| row.ended_millis.unwrap_or(row.opened_millis)),
+        can_drive: row.can_drive,
+        waiting,
+    }
+}
+
+struct SessionListing {
+    room: Digest32,
+    after: Option<Digest32>,
+    next: Option<Digest32>,
+    revision: Digest32,
+    rows: Vec<vox_core::node::sessions::SessionRow>,
+    summaries: Vec<vox_core::node::ipc::SessionSummary>,
+}
+
 /// The TUI's binding to the daemon.
 pub struct DaemonCore {
     rt: tokio::runtime::Handle,
@@ -122,6 +152,13 @@ pub struct DaemonCore {
     /// The daemon's event task.
     daemon_events: tokio::task::JoinHandle<()>,
     snapshot: NodeSnapshot,
+    /// Only the selected room's currently requested governance pages.
+    governance: Option<SelectedGovernance>,
+    shown_entries: Vec<Digest32>,
+    service_window: Vec<(Digest32, Digest32, String)>,
+    service_window_next: usize,
+    service_window_rows: Vec<(Digest32, vox_core::node::channel::Share)>,
+
     presented: Vec<(Digest32, String)>,
     /// Storage failures by room id; a recovery replaces the failure with a notice.
     room_save_errors: BTreeMap<Digest32, String>,
@@ -137,10 +174,14 @@ pub struct DaemonCore {
     active: Option<Digest32>,
     /// The Session the room's timeline shows: its room, node and session id (ADR-029 CL-2).
     shown_session: Option<(Digest32, Digest32, String)>,
+    show_all: bool,
+    session_listing: Option<SessionListing>,
+    selected_session: Option<vox_core::node::sessions::SessionRow>,
+    session_before: Option<Digest32>,
     /// Its lines, as last read, for a member with drive (SC-1).
     session_lines: Vec<crate::viewmodel::SessionLineView>,
-    /// Its entries held here, oldest first: the newest page, and the older pages the person went
-    /// up to (ADR-034 FR-4). Never its whole history.
+    /// Its currently displayed page, oldest first. An older page replaces this one; End
+    /// returns to the newest page (ADR-034 FR-4).
     session_rows: Vec<vox_core::node::drive::SessionRow>,
     /// How many of its entries are older than the first held.
     session_older: u64,
@@ -152,13 +193,11 @@ pub struct DaemonCore {
     /// Per room, the approvals and questions waiting on this node in Sessions it may drive there
     /// (ADR-029 CL-2): what puts a room under needs you.
     waiting: BTreeMap<Digest32, usize>,
-    /// The Sessions with one waiting: room, node and session id.
-    waiting_sessions: BTreeSet<(Digest32, Digest32, String)>,
-    /// They are to be counted again: the node said a Session has news, or one was driven.
+    /// The room's exact pending-request counts are to be read again: the node said a Session has news, or one was driven.
     waiting_stale: bool,
     /// The Sessions this node may drive, room by room, when they were last counted: a Session
     /// opened, ended or given drive since is counted again.
-    waiting_of: Vec<(Digest32, Vec<(Digest32, String)>)>,
+    waiting_of: Vec<(Digest32, Digest32)>,
     /// Unread per room off screen, at three levels (ADR-028 R-8, #484).
     unread: BTreeMap<Digest32, RoomUnread>,
     /// Rooms whose unread was counted, when the TUI first saw them open, from what the node
@@ -200,6 +239,10 @@ pub struct DaemonCore {
     checked: std::collections::BTreeSet<Digest32>,
     /// Where the checks say what they found.
     image_checks: (mpsc::Sender<ImageCheck>, mpsc::Receiver<ImageCheck>),
+    /// One verification at a time, even while the person changes pages quickly.
+    image_pending: Option<Digest32>,
+    /// Only actually drawn image offers may retain decoded presentation state.
+    image_visible: BTreeSet<Digest32>,
     /// The last time the node did not take what the room on screen showed, and what the room was
     /// then: it is not asked again until the room has changed and [`MARK_RETRY`] has passed, or
     /// ever, for a room that is over.
@@ -236,21 +279,52 @@ struct RoomUnread {
     pending: usize,
 }
 
-/// The room on screen's rows, in the room's order, and what they were projected as.
-///
-/// **A frame costs what changed, not the room's history** (V210-120). The room is read whole once
-/// when it comes on screen; after that, an event that says rows arrived reads only the rows that
-/// arrived since the newest one held (`Read { since }`, a feed by arrival) and appends them. A row
-/// that took its place above rows already shown (`late`), or a cursor the node no longer knows,
-/// reads the room whole again. A row whose body was owed (V030-10) is replaced in place when its
-/// body arrives, since it then arrives by the feed.
+/// One selected governance page per kind, with revision-bound continuations.
+struct SelectedGovernance {
+    room: Digest32,
+    revision: u64,
+    notices: Vec<vox_core::node::channel::RoomNotice>,
+    notices_cursor: Option<(u64, Digest32)>,
+    notices_next: Option<(u64, Digest32)>,
+    notices_want: bool,
+    shares: Vec<vox_core::node::channel::Share>,
+    shares_cursor: Option<(Digest32, Digest32)>,
+    shares_next: Option<(Digest32, Digest32)>,
+    shares_want: bool,
+}
+impl SelectedGovernance {
+    fn new(room: Digest32, revision: u64) -> Self {
+        Self {
+            room,
+            revision,
+            notices: Vec::new(),
+            notices_cursor: None,
+            notices_next: None,
+            notices_want: true,
+            shares: Vec::new(),
+            shares_cursor: None,
+            shares_next: None,
+            shares_want: true,
+        }
+    }
+}
+
+/// One displayed room page in canonical room order. Older navigation replaces it; End
+/// returns to the newest page. Events refresh the same page without collecting the arrival
+/// feed, whose cursor remains a separate fact used for unread accounting.
 struct Timeline {
     channel_id: Digest32,
     rows: Vec<MessageRow>,
-    /// Messages before the first page loaded by the person.
+    /// Exclusive display-order boundary of the currently shown page.
+    before: Option<Digest32>,
+    /// Messages before the currently shown page.
     older: u64,
     /// The person scrolled above the oldest shown message.
     want_older: bool,
+    /// End returns to the latest page without discarding the visible page before a successful read.
+    want_latest: bool,
+    /// Only one lifecycle page for All, with a strict cursor carried between message ranges.
+    lifecycle: Option<LifecyclePage>,
     /// The row that arrived last, the feed's cursor.
     cursor: Option<Digest32>,
     /// Rows have arrived since the last read.
@@ -260,6 +334,56 @@ struct Timeline {
     /// The machine each member's newest `hello` here says it runs on (ADR-020 §4.9b), and when
     /// that hello was posted: folded as rows arrive, so a frame never reads the room for it.
     machines: std::collections::HashMap<Digest32, (u64, String)>,
+}
+
+struct LifecyclePage {
+    before: Option<vox_core::node::sessions::LifecycleCursor>,
+    next: Option<vox_core::node::sessions::LifecycleCursor>,
+    rows: Vec<vox_core::node::sessions::LifecycleRow>,
+    older: bool,
+    revision: Digest32,
+}
+
+enum PageFailure {
+    Detached,
+    Refused(String),
+}
+
+impl From<String> for PageFailure {
+    fn from(why: String) -> Self {
+        Self::Refused(why)
+    }
+}
+impl From<&str> for PageFailure {
+    fn from(why: &str) -> Self {
+        Self::Refused(why.to_owned())
+    }
+}
+
+/// Fence a multi-request visible page without retaining a database snapshot or lock.
+async fn page_revision(
+    client: &mut IpcClient,
+    room: Digest32,
+) -> Result<(u64, Digest32), PageFailure> {
+    let body = client
+        .exchange(&vox_core::node::snapshot::request_body())
+        .await
+        .map_err(|e| format!("the room's state could not be read: {e}"))?;
+    let Some(snapshot) = NodeSnapshot::from_bytes(&body)
+        .map_err(|e| format!("the room's state could not be read: {e}"))?
+    else {
+        return Err(match Frame::from_bytes(&body) {
+            Ok(Frame::NodeDetached { .. }) => PageFailure::Detached,
+            Ok(Frame::Error { reason }) => reason.into(),
+            _ => "the node did not answer the room's state".into(),
+        });
+    };
+    snapshot
+        .open
+        .into_iter()
+        .find(|r| r.channel_id == room)
+        .map(|r| (r.display_revision, r.session_revision))
+        .ok_or_else(|| "the room is not open".into())
 }
 
 #[derive(PartialEq, Eq)]
@@ -471,6 +595,11 @@ impl DaemonCore {
             rx,
             daemon_events,
             snapshot: NodeSnapshot::default(),
+            governance: None,
+            shown_entries: Vec::new(),
+            service_window: Vec::new(),
+            service_window_next: 0,
+            service_window_rows: Vec::new(),
             presented: Vec::new(),
             room_save_errors: BTreeMap::new(),
             recovered_rooms: BTreeSet::new(),
@@ -481,13 +610,16 @@ impl DaemonCore {
             unread: BTreeMap::new(),
             seeded: BTreeSet::new(),
             shown_session: None,
+            show_all: false,
+            session_listing: None,
+            selected_session: None,
+            session_before: None,
             session_lines: Vec::new(),
             session_rows: Vec::new(),
             session_older: 0,
             session_want_older: false,
             session_stale: true,
             waiting: BTreeMap::new(),
-            waiting_sessions: BTreeSet::new(),
             waiting_stale: true,
             waiting_of: Vec::new(),
             arrived: BTreeMap::new(),
@@ -506,6 +638,8 @@ impl DaemonCore {
             images: BTreeMap::new(),
             checked: std::collections::BTreeSet::new(),
             image_checks: mpsc::channel(),
+            image_pending: None,
+            image_visible: BTreeSet::new(),
             mark_refused: None,
             decisions: (None, Vec::new()),
             room_asks: (None, Vec::new()),
@@ -753,8 +887,27 @@ impl DaemonCore {
             conn.client.session_page(room, which, before),
         )?;
         match self.answered(answer) {
-            Ok(Frame::SessionPage { rows, older }) => Some((rows, older)),
-            _ => None,
+            Ok(Frame::SessionPage { rows, older, .. }) => {
+                let next = rows.first().map(|r| r.entry_hash);
+                if older > 0 && (next.is_none() || next == before) {
+                    self.notice = Some("the Session activity page made no progress".into());
+                    None
+                } else {
+                    Some((rows, older))
+                }
+            }
+            Ok(Frame::Error { reason }) => {
+                self.notice = Some(reason);
+                None
+            }
+            Err(lost) => {
+                self.notice = Some(lost_status(lost).message());
+                None
+            }
+            _ => {
+                self.notice = Some("the daemon did not answer the Session activity page".into());
+                None
+            }
         }
     }
 
@@ -803,10 +956,19 @@ impl DaemonCore {
         self.conn = None;
         self.active = None;
         self.timeline = None;
+        self.image_visible.clear();
+        self.images.clear();
+        self.checked.clear();
         self.thread = None;
         self.thread_summaries.clear();
         self.thread_roots.clear();
         self.snapshot = NodeSnapshot::default();
+        self.session_listing = None;
+        self.selected_session = None;
+        self.session_rows.clear();
+        self.session_lines.clear();
+        self.waiting.clear();
+        self.waiting_of.clear();
         self.room_save_errors.clear();
         self.recovered_rooms.clear();
         self.notice = Some(format!(
@@ -1155,6 +1317,10 @@ impl DaemonCore {
                         };
                         if revision(&before) != revision(&self.snapshot) {
                             self.threads_stale = true;
+                            if let Some(t) = self.timeline.as_mut().filter(|t| t.channel_id == cid)
+                            {
+                                t.stale = true;
+                            }
                         }
                     }
                     self.note_joins(&before);
@@ -1357,13 +1523,21 @@ impl DaemonCore {
     }
 
     /// **Verify what this node pulled of the room on screen's image shares** (ADR-028 F-11): each
-    /// pull record new here is handed once to a thread of its own, which hashes and decodes the
+    /// visible pull record new here is handed to the single in-flight worker, which hashes and decodes the
     /// copy ([`crate::images::verify_and_decode`]), so a large file never holds up a frame. The
     /// daemon checked it as it pulled; this checks the file that is there now, which is what is
     /// drawn. What the checks found is taken in here too.
     fn check_pulls(&mut self) {
         while let Ok((entry, state)) = self.image_checks.1.try_recv() {
-            self.images.insert(entry, state);
+            if self.image_pending == Some(entry) {
+                self.image_pending = None;
+            }
+            if self.image_visible.contains(&entry) {
+                self.images.insert(entry, state);
+            }
+        }
+        if self.image_pending.is_some() {
+            return;
         }
         let Some(t) = self.timeline.as_ref() else {
             return;
@@ -1371,14 +1545,12 @@ impl DaemonCore {
         let Ok(paths) = self.account.node_paths(&self.node) else {
             return;
         };
-        for p in vox_core::node::pulls::recorded(&paths) {
-            if p.room != t.channel_id || self.checked.contains(&p.entry) {
+        for row in &t.rows {
+            if !self.image_visible.contains(&row.entry_hash)
+                || self.checked.contains(&row.entry_hash)
+            {
                 continue;
             }
-            let Some(row) = t.rows.iter().find(|r| r.entry_hash == p.entry) else {
-                continue;
-            };
-            self.checked.insert(p.entry);
             let Ok(e) = vox_agentcomms::envelope::Envelope::parse(&row.text) else {
                 continue;
             };
@@ -1391,6 +1563,12 @@ impl DaemonCore {
             if e.data.get("image").is_none() {
                 continue;
             }
+            let Some(p) = vox_core::node::pulls::recorded_entry(&paths, &row.entry_hash)
+                .filter(|p| p.room == t.channel_id)
+            else {
+                continue;
+            };
+            self.checked.insert(p.entry);
             if size > MAX_DRAWN_BYTES {
                 self.images.insert(
                     p.entry,
@@ -1405,14 +1583,15 @@ impl DaemonCore {
                     let _ = tx.send((entry, crate::images::verify_and_decode(&p.path, size, &sha)));
                 });
             if spawned.is_err() {
-                // Not checked now; looked at again with the next snapshot.
+                // Not checked now; looked at again on the next draw.
                 self.checked.remove(&entry);
+            } else {
+                self.image_pending = Some(entry);
+                break;
             }
         }
     }
 
-    /// Read the room on screen: whole when it first comes on screen, or when a late row or an
-    /// unknown cursor says the order changed above what is shown; else only what arrived since.
     /// Send `act` to the Session `id` of `node` in `room`, through the one sender `vox room
     /// session` uses, and say what came of it in its words (ADR-029 DR-1, DR-6, CL-1).
     fn drive(
@@ -1430,14 +1609,12 @@ impl DaemonCore {
             me: self.snapshot.me,
         };
         let alias = names.alias_of(&node);
-        let row = self
-            .snapshot
-            .open
-            .iter()
-            .find(|o| o.channel_id == room)
-            .and_then(|o| o.sessions.iter().find(|x| x.node == node && x.id == id));
-        let Some(row) = row else {
-            return CommandStatus::Said(format!("no Session in this room is named {id}"));
+        let row = match self.lookup_session(room, node, id) {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                return CommandStatus::Said(format!("no Session in this room is named {id}"))
+            }
+            Err(why) => return CommandStatus::Said(why),
         };
         let t = d::Target {
             room,
@@ -1474,68 +1651,159 @@ impl DaemonCore {
         }
     }
 
-    /// Count the approvals and questions waiting on this node in each open room's Sessions it may
-    /// drive, by the rule that words them (`Line::waiting`, ADR-029 CL-2): again only when the
-    /// node says a Session has news, or the Sessions it may drive change.
-    fn count_waiting(&mut self) {
-        let rooms: Vec<(Digest32, Vec<(Digest32, String)>)> = self
+    fn lookup_session(
+        &mut self,
+        room: Digest32,
+        node: Digest32,
+        id: &str,
+    ) -> Result<Option<vox_core::node::sessions::SessionRow>, String> {
+        let conn = self.conn.as_mut().ok_or("the node is not Ready")?;
+        let answer = until_stopped(
+            &self.rt,
+            &self.stop,
+            conn.client.session_lookup(room, node, id.to_owned()),
+        )
+        .ok_or("the TUI is stopping")?;
+        match self
+            .answered(answer)
+            .map_err(|e| lost_status(e).message())?
+        {
+            Frame::SessionsPage {
+                mut sessions,
+                summaries,
+                more: false,
+            } if sessions.len() <= 1
+                && sessions.len() == summaries.len()
+                && sessions.iter().all(|s| s.node == node && s.id == id) =>
+            {
+                Ok(sessions.pop())
+            }
+            Frame::Error { reason } => Err(reason),
+            _ => Err("the daemon did not answer the selected Session".into()),
+        }
+    }
+
+    fn load_sessions_page(
+        &mut self,
+        room: Digest32,
+        after: Option<Digest32>,
+    ) -> Result<(), String> {
+        let revision = self
             .snapshot
             .open
             .iter()
-            .map(|o| {
-                (
-                    o.channel_id,
-                    o.sessions
-                        .iter()
-                        .filter(|x| x.open && x.can_drive)
-                        .map(|x| (x.node, x.id.clone()))
-                        .collect::<Vec<_>>(),
-                )
-            })
+            .find(|r| r.channel_id == room)
+            .map(|r| r.session_revision)
+            .ok_or("the room is not open")?;
+        let conn = self.conn.as_mut().ok_or("the node is not Ready")?;
+        let answer = until_stopped(&self.rt, &self.stop, conn.client.sessions_page(room, after))
+            .ok_or("the TUI is stopping")?;
+        match self
+            .answered(answer)
+            .map_err(|e| lost_status(e).message())?
+        {
+            Frame::SessionsPage {
+                sessions,
+                summaries,
+                more,
+            } => {
+                if sessions.len() != summaries.len() {
+                    return Err("the Session page has mismatched summaries".into());
+                }
+                let next = more.then(|| sessions.last().map(|s| s.opening)).flatten();
+                if more && (next.is_none() || next == after) {
+                    return Err("the Session page made no progress".into());
+                }
+                self.session_listing = Some(SessionListing {
+                    room,
+                    after,
+                    next,
+                    revision,
+                    rows: sessions,
+                    summaries,
+                });
+                Ok(())
+            }
+            Frame::Error { reason } => Err(reason),
+            _ => Err("the daemon did not answer the Session page".into()),
+        }
+    }
+
+    fn read_sessions_page(&mut self) {
+        let Some(room) = self.active else {
+            self.session_listing = None;
+            return;
+        };
+        let Some(revision) = self
+            .snapshot
+            .open
+            .iter()
+            .find(|r| r.channel_id == room)
+            .map(|r| r.session_revision)
+        else {
+            return;
+        };
+        let current = self.session_listing.as_ref().filter(|p| p.room == room);
+        if current.is_some_and(|p| p.revision == revision) {
+            return;
+        }
+        let after = current.and_then(|p| p.after);
+        if let Err(why) = self.load_sessions_page(room, after) {
+            self.notice = Some(why);
+        }
+        self.session_stale = true;
+    }
+
+    /// Exact authorized room totals come from the daemon's sealed aggregate; displayed
+    /// metadata pages alone never stand for the entire room's pending requests.
+    fn count_waiting(&mut self) {
+        let rooms: Vec<_> = self
+            .snapshot
+            .open
+            .iter()
+            .map(|r| (r.channel_id, r.session_revision))
             .collect();
         if !self.waiting_stale && rooms == self.waiting_of {
             return;
         }
-        self.waiting_stale = false;
-        self.waiting_of = rooms.clone();
-        let mut waiting = BTreeMap::new();
-        let mut sessions = BTreeSet::new();
-        for (room, drivable) in rooms {
-            if drivable.is_empty() {
+        let mut complete = true;
+        for (room, revision) in &rooms {
+            if !self.waiting_stale && self.waiting_of.contains(&(*room, *revision)) {
                 continue;
             }
-            // What the daemon's index says waits in each Session (ADR-034 FR-5): no entry is
-            // read for the count.
             let Some(conn) = self.conn.as_mut() else {
-                break;
+                return;
             };
-            let Some(answer) = until_stopped(&self.rt, &self.stop, conn.client.sessions(room))
+            let Some(answer) =
+                until_stopped(&self.rt, &self.stop, conn.client.sessions_waiting(*room))
             else {
-                break;
+                return;
             };
-            let Ok(Frame::SessionsPage {
-                sessions: listed,
-                summaries,
-                ..
-            }) = self.answered(answer)
-            else {
-                continue;
-            };
-            let mut n = 0;
-            for (s, t) in listed.iter().zip(&summaries) {
-                if t.waiting > 0
-                    && drivable
-                        .iter()
-                        .any(|(node, id)| *node == s.node && *id == s.id)
-                {
-                    sessions.insert((room, s.node, s.id.clone()));
-                    n += t.waiting as usize;
+            match self.answered(answer) {
+                Ok(Frame::SessionsWaiting { waiting }) => {
+                    self.waiting
+                        .insert(*room, usize::try_from(waiting).unwrap_or(usize::MAX));
+                }
+                Ok(Frame::Error { reason }) => {
+                    self.notice = Some(reason);
+                    complete = false;
+                }
+                Err(error) => {
+                    self.notice = Some(lost_status(error).message());
+                    complete = false;
+                }
+                _ => {
+                    self.notice = Some("the daemon did not answer pending Session requests".into());
+                    complete = false;
                 }
             }
-            waiting.insert(room, n);
         }
-        self.waiting = waiting;
-        self.waiting_sessions = sessions;
+        self.waiting
+            .retain(|room, _| rooms.iter().any(|(r, _)| r == room));
+        if complete {
+            self.waiting_of = rooms;
+            self.waiting_stale = false;
+        }
     }
 
     /// Read the shown Session's entries when they are stale, and draw them as `vox room
@@ -1553,31 +1821,30 @@ impl DaemonCore {
         }
         let which = vox_core::node::drive::SessionFilter::Session(id.clone());
         if std::mem::take(&mut self.session_want_older) && self.session_older > 0 {
-            // The page before the oldest held (ADR-034 FR-4), put before it.
             if let Some(first) = self.session_rows.first().map(|r| r.entry_hash) {
-                if let Some((mut rows, older)) = self.session_page(room, which.clone(), Some(first))
-                {
-                    rows.extend(std::mem::take(&mut self.session_rows));
+                if let Some((rows, older)) = self.session_page(room, which.clone(), Some(first)) {
+                    self.session_before = Some(first);
                     self.session_rows = rows;
                     self.session_older = older;
                 }
             }
         }
         if std::mem::take(&mut self.session_stale) {
-            // The newest page (FR-4): what arrived since the last read is at its end, after what
-            // is held. More than a page since, or nothing held: the newest page alone.
-            let Some((rows, older)) = self.session_page(room, which, None) else {
+            let selected = match self.lookup_session(room, node, &id) {
+                Ok(row) => row,
+                Err(why) => {
+                    self.notice = Some(why);
+                    self.session_stale = true;
+                    return;
+                }
+            };
+            let Some((rows, older)) = self.session_page(room, which, self.session_before) else {
+                self.session_stale = true;
                 return;
             };
-            let held: std::collections::HashSet<Digest32> =
-                self.session_rows.iter().map(|r| r.entry_hash).collect();
-            if held.is_empty() || !rows.iter().any(|r| held.contains(&r.entry_hash)) {
-                self.session_rows = rows;
-                self.session_older = older;
-            } else {
-                self.session_rows
-                    .extend(rows.into_iter().filter(|r| !held.contains(&r.entry_hash)));
-            }
+            self.selected_session = selected;
+            self.session_rows = rows;
+            self.session_older = older;
         }
         // The Session's own entries and the drive entries naming it, in written order: as
         // `vox room session` takes them.
@@ -1589,11 +1856,9 @@ impl DaemonCore {
             me,
         };
         let label = self
-            .snapshot
-            .open
-            .iter()
-            .find(|o| o.channel_id == room)
-            .and_then(|o| o.sessions.iter().find(|x| x.node == node && x.id == id))
+            .selected_session
+            .as_ref()
+            .filter(|x| x.node == node && x.id == id)
             .map_or_else(
                 || vox_agentcomms::envelope::session_label(&names.alias_of(&node), None, &id),
                 |x| {
@@ -1633,125 +1898,172 @@ impl DaemonCore {
             self.timeline = None;
             return;
         };
-        if !self.snapshot.open.iter().any(|o| o.channel_id == cid) {
+        let Some(session_revision) = self
+            .snapshot
+            .open
+            .iter()
+            .find(|o| o.channel_id == cid)
+            .map(|o| o.session_revision)
+        else {
             return;
-        }
-        if let Some(t) = self.timeline.as_mut().filter(|t| t.channel_id == cid) {
-            if std::mem::take(&mut t.want_older) && t.older > 0 {
-                let before = t.rows.first().map(|r| r.entry_hash);
-                if let Some(conn) = self.conn.as_mut() {
-                    if let Some(Ok(Frame::RoomPage { mut rows, older })) = until_stopped(
-                        &self.rt,
-                        &self.stop,
-                        conn.client.request(&Request::RoomPage {
-                            channel_id: cid,
-                            before,
-                            limit: 0,
-                        }),
-                    ) {
-                        rows.append(&mut t.rows);
-                        t.rows = rows;
-                        t.older = older;
-                        t.projected = None;
-                        self.threads_stale = true;
-                    }
+        };
+        let current = self.timeline.as_mut().filter(|t| t.channel_id == cid);
+        let (before, life_before) = match current {
+            Some(t) => {
+                let latest = std::mem::take(&mut t.want_latest);
+                let older = std::mem::take(&mut t.want_older);
+                if latest {
+                    (None, None)
+                } else if older && self.show_all && t.lifecycle.as_ref().is_some_and(|p| p.older) {
+                    (t.before, t.lifecycle.as_ref().and_then(|p| p.next))
+                } else if older && t.older > 0 {
+                    let Some(first) = t.rows.first() else {
+                        self.notice =
+                            Some("the room page has no continuation; press End to refresh".into());
+                        return;
+                    };
+                    (
+                        Some(first.entry_hash),
+                        t.lifecycle.as_ref().and_then(|p| p.next),
+                    )
+                } else if t.stale
+                    || (self.show_all
+                        && t.lifecycle
+                            .as_ref()
+                            .is_none_or(|p| p.revision != session_revision))
+                {
+                    (t.before, t.lifecycle.as_ref().and_then(|p| p.before))
+                } else {
+                    return;
                 }
             }
-        }
-        let fresh = !matches!(&self.timeline, Some(t) if t.channel_id == cid);
-        if !fresh && !self.timeline.as_ref().is_some_and(|t| t.stale) {
-            return;
-        }
-        let since = if fresh {
-            None
-        } else {
-            self.timeline.as_ref().and_then(|t| t.cursor)
+            None => (None, None),
         };
         let Some(conn) = self.conn.as_mut() else {
             return;
         };
-        let request = match since {
-            None => Request::RoomPage {
-                channel_id: cid,
-                before: None,
-                limit: 0,
-            },
-            Some(since) => Request::Read {
-                channel_id: cid,
-                since: Some(since),
-                after: None,
-                limit: vox_core::node::ipc::SESSION_PAGE_ROWS as u64,
-            },
-        };
-        let Some(read) = until_stopped(&self.rt, &self.stop, conn.client.request(&request)) else {
-            return;
-        };
-        let (rows, older) = match read {
-            Ok(Frame::Rows { rows }) => (rows, 0),
-            Ok(Frame::RoomPage { rows, older }) => (rows, older),
-            Ok(Frame::NodeDetached { .. }) => return self.detached(),
-            // A cursor the node no longer knows (the row expired): reopen at the newest page.
-            Ok(_) if since.is_some() => {
-                self.timeline = None;
-                return self.read_timeline();
+        let all = self.show_all;
+        let answer = until_stopped(&self.rt, &self.stop, async {
+            let stamp = page_revision(&mut conn.client, cid).await?;
+            let (rows, older) = match conn
+                .client
+                .request(&Request::RoomPage {
+                    channel_id: cid,
+                    before,
+                    limit: 0,
+                })
+                .await
+                .map_err(|e| format!("the room page could not be read: {e}"))?
+            {
+                Frame::RoomPage { rows, older } => (rows, older),
+                Frame::Error { reason } => return Err(reason.into()),
+                Frame::NodeDetached { .. } => return Err(PageFailure::Detached),
+                _ => return Err("the daemon did not answer the room page".into()),
+            };
+            if older > 0
+                && (rows.is_empty() || rows.first().is_some_and(|r| Some(r.entry_hash) == before))
+            {
+                return Err("the room page made no progress; press End to refresh".into());
             }
-            Ok(_) => return,
-            Err(e) => {
-                self.ended
-                    .get_or_insert(format!("the vox daemon stopped answering: {e}"));
+            let lifecycle = if all {
+                // The oldest ordinary page also covers any earlier Session-only history. Carry
+                // the exact cursor across overlapping/equal-time ranges, never subtract a millisecond.
+                let not_before = (older > 0)
+                    .then(|| rows.iter().map(|r| r.created_millis).min())
+                    .flatten();
+                let (life_rows, life_older) = match conn
+                    .client
+                    .session_lifecycle(cid, life_before, not_before)
+                    .await
+                    .map_err(|e| format!("the Session lifecycle page could not be read: {e}"))?
+                {
+                    Frame::SessionLifecyclePage { rows, older } => (rows, older),
+                    Frame::Error { reason } => return Err(reason.into()),
+                    Frame::NodeDetached { .. } => return Err(PageFailure::Detached),
+                    _ => return Err("the daemon did not answer the Session lifecycle page".into()),
+                };
+                let next = life_rows.first().map(|r| r.cursor).or(life_before);
+                if life_older && (life_rows.is_empty() || next == life_before) {
+                    return Err("the Session lifecycle page made no progress".into());
+                }
+                Some(LifecyclePage {
+                    before: life_before,
+                    next,
+                    rows: life_rows,
+                    older: life_older,
+                    revision: stamp.1,
+                })
+            } else {
+                None
+            };
+            if page_revision(&mut conn.client, cid).await? != stamp {
+                return Err(
+                    "the room changed while reading its page; the previous page remains shown"
+                        .into(),
+                );
+            }
+            Ok::<_, PageFailure>((rows, older, lifecycle))
+        });
+        let (rows, older, lifecycle) = match answer {
+            Some(Ok(page)) => page,
+            Some(Err(PageFailure::Detached)) => {
+                self.detached();
                 return;
             }
-        };
-        let newest = |rows: &[MessageRow]| {
-            rows.iter()
-                .filter(|r| !r.owed)
-                .max_by_key(|r| r.arrival)
-                .map(|r| r.entry_hash)
-        };
-        let rows_full = !rows.is_empty();
-        self.threads_stale |= rows_full;
-        match self.timeline.as_mut() {
-            Some(t) if !fresh => {
-                if rows.iter().any(|r| r.late) {
-                    // Above rows already shown: the order is read again.
-                    self.timeline = None;
-                    return self.read_timeline();
-                }
-                if let Some(c) = newest(&rows) {
-                    t.cursor = Some(c);
-                }
-                for row in rows {
-                    note_machine(&mut t.machines, &row);
-                    // An owed row whose body has arrived takes its own place.
-                    match t.rows.iter_mut().find(|r| r.entry_hash == row.entry_hash) {
-                        Some(held) => {
-                            *held = row;
-                            t.projected = None;
-                        }
-                        None => t.rows.push(row),
-                    }
-                }
-                // A full feed page may have a following page; fetch it on the next frame.
-                t.stale = rows_full;
+            Some(Err(PageFailure::Refused(why))) => {
+                self.notice = Some(why);
+                self.asked = None;
+                return;
             }
-            _ => {
-                self.threads_stale = true;
+            None => return,
+        };
+        let newest = rows
+            .iter()
+            .filter(|r| !r.owed)
+            .max_by_key(|r| r.arrival)
+            .map(|r| r.entry_hash);
+        match self.timeline.as_mut().filter(|t| t.channel_id == cid) {
+            Some(t) => {
+                for row in &rows {
+                    note_machine(&mut t.machines, row);
+                }
+                if before.is_none() {
+                    t.cursor = newest.or(t.cursor);
+                }
+                t.before = before;
+                t.rows = rows;
+                t.older = older;
+                t.lifecycle = lifecycle;
+                t.stale = false;
+                t.projected = None;
+            }
+            None => {
                 let mut machines = std::collections::HashMap::new();
                 for row in &rows {
                     note_machine(&mut machines, row);
                 }
                 self.timeline = Some(Timeline {
                     channel_id: cid,
-                    cursor: newest(&rows),
+                    before,
+                    cursor: newest,
                     rows,
                     older,
+                    lifecycle,
                     want_older: false,
+                    want_latest: false,
                     stale: false,
                     projected: None,
                     machines,
                 });
             }
         }
+        if let Some(t) = self.timeline.as_ref() {
+            let shown: BTreeSet<_> = t.rows.iter().map(|r| r.entry_hash).collect();
+            self.marked.retain(|h| shown.contains(h));
+            self.checked.retain(|h| shown.contains(h));
+            self.images.retain(|h, _| shown.contains(h));
+        }
+        self.threads_stale = true;
     }
 
     /// Read summaries for General's loaded roots and one explicitly opened reply page.
@@ -2110,6 +2422,137 @@ impl DaemonCore {
         }
     }
 
+    fn read_governance(&mut self) {
+        use vox_core::node::api::{GovernancePage as Page, GovernanceQuery as Query};
+        let Some(room) = self.active else {
+            self.governance = None;
+            self.service_window.clear();
+            self.service_window_rows.clear();
+            return;
+        };
+        let Some(revision) = self
+            .snapshot
+            .open
+            .iter()
+            .find(|r| r.channel_id == room)
+            .map(|r| r.governance_revision)
+        else {
+            return;
+        };
+        if self
+            .governance
+            .as_ref()
+            .is_none_or(|g| g.room != room || g.revision != revision)
+        {
+            self.governance = Some(SelectedGovernance::new(room, revision));
+            self.service_window.clear();
+            self.service_window_rows.clear();
+            self.service_window_next = 0;
+        }
+        let Some(conn) = self.conn.as_mut() else {
+            return;
+        };
+        let Some(g) = self.governance.as_mut() else {
+            return;
+        };
+        for notices in [true, false] {
+            let wanted = if notices {
+                g.notices_want
+            } else {
+                g.shares_want
+            };
+            if !wanted {
+                continue;
+            }
+            let query = if notices {
+                Query::Notices {
+                    before: g.notices_cursor,
+                    revision: Some(g.revision),
+                }
+            } else {
+                Query::Shares {
+                    after: g.shares_cursor,
+                    revision: Some(g.revision),
+                }
+            };
+            match until_stopped(
+                &self.rt,
+                &self.stop,
+                conn.client.request(&Request::GovernancePage {
+                    channel_id: room,
+                    query,
+                }),
+            ) {
+                Some(Ok(Frame::GovernancePage {
+                    page: Page::Notices { rows, before, .. },
+                })) => {
+                    g.notices = rows;
+                    g.notices_next = before;
+                    g.notices_want = false;
+                }
+                Some(Ok(Frame::GovernancePage {
+                    page: Page::Shares { rows, next, .. },
+                })) => {
+                    g.shares = rows;
+                    g.shares_next = next;
+                    g.shares_want = false;
+                }
+                Some(Ok(Frame::Error { reason })) => {
+                    self.notice = Some(reason);
+                    return;
+                }
+                Some(Err(e)) => {
+                    self.notice = Some(e.to_string());
+                    return;
+                }
+                _ => return,
+            }
+        }
+        let selected: BTreeSet<_> = self
+            .timeline
+            .iter()
+            .flat_map(|t| t.rows.iter())
+            .chain(self.thread.iter().flat_map(|t| t.rows.iter()))
+            .filter(|r| self.shown_entries.contains(&r.entry_hash))
+            .flat_map(|r| vox_core::node::resolver::canonical_services(&r.text))
+            .collect();
+        let selected: Vec<_> = selected.into_iter().collect();
+        if selected != self.service_window {
+            self.service_window = selected;
+            self.service_window_next = 0;
+            self.service_window_rows.clear();
+        }
+        for _ in 0..64 {
+            let Some((channel_id, host, selector)) =
+                self.service_window.get(self.service_window_next).cloned()
+            else {
+                break;
+            };
+            match until_stopped(
+                &self.rt,
+                &self.stop,
+                conn.client.request(&Request::GovernancePage {
+                    channel_id,
+                    query: Query::Service { host, selector },
+                }),
+            ) {
+                Some(Ok(Frame::GovernancePage {
+                    page: Page::Service { share, .. },
+                })) => {
+                    if let Some(share) = share {
+                        self.service_window_rows.push((channel_id, share));
+                    }
+                    self.service_window_next += 1;
+                }
+                Some(Ok(Frame::Error { reason })) => {
+                    self.notice = Some(reason);
+                    break;
+                }
+                _ => break,
+            }
+        }
+    }
+
     fn project(&mut self) -> ViewModel {
         let snap = self.snapshot.clone();
         let me = snap.me;
@@ -2181,7 +2624,15 @@ impl DaemonCore {
         channels.sort_by_key(|c| c.group);
         let machine_nodes = self.machine_nodes.clone();
         // This node's names, for every address the views write readable (ADR-028 S-1a).
-        let names = vox_core::node::resolver::VoxResolver::of_snapshot(&snap);
+        let mut names = vox_core::node::resolver::VoxResolver::of_snapshot(&snap);
+        if let Some(g) = &self.governance {
+            for share in &g.shares {
+                names.add_share(g.room, share.host, &share.name, share.udp);
+            }
+        }
+        for (room, share) in &self.service_window_rows {
+            names.add_share(*room, share.host, &share.name, share.udp);
+        }
         let mut thread_replies = std::sync::Arc::default();
         let timeline = self.active.and_then(|cid| {
             let room = snap.open.iter().find(|d| d.channel_id == cid)?;
@@ -2206,9 +2657,20 @@ impl DaemonCore {
                         names_here(),
                     ),
                     retention: vox_core::node::retention::describe(d.retention),
-                    notices: d
-                        .notices
-                        .iter()
+                    notices_more: self
+                        .governance
+                        .as_ref()
+                        .is_some_and(|g| g.room == d.channel_id && g.notices_next.is_some()),
+                    shared_more: self
+                        .governance
+                        .as_ref()
+                        .is_some_and(|g| g.room == d.channel_id && g.shares_next.is_some()),
+                    notices: self
+                        .governance
+                        .as_ref()
+                        .filter(|g| g.room == d.channel_id)
+                        .into_iter()
+                        .flat_map(|g| g.notices.iter())
                         .map(|n| NoticeView {
                             timestamp: n.created_millis,
                             after: n.after,
@@ -2269,7 +2731,7 @@ impl DaemonCore {
                                 // only to a member its keyring trusts (V210-148), and takes a
                                 // member's key only if it trusts it.
                                 trust: {
-                                    let reads_you = d.consented.binary_search(m).is_ok();
+                                    let reads_you = d.member_consent.binary_search(m).is_ok();
                                     let trusts_you = d.consenting.binary_search(m).is_ok();
                                     if is_me {
                                         Trust::You
@@ -2323,11 +2785,23 @@ impl DaemonCore {
                         .as_ref()
                         .filter(|t| t.channel_id == d.channel_id)
                         .map_or(0, |t| t.older),
+                    page: self
+                        .timeline
+                        .as_ref()
+                        .filter(|t| t.channel_id == d.channel_id)
+                        .map(|t| crate::viewmodel::RoomPagePosition {
+                            before: t.before,
+                            lifecycle: t.lifecycle.as_ref().and_then(|p| p.before),
+                        })
+                        .unwrap_or_default(),
                     // What is shared here, in this operator's own words (V030-25): the same
                     // addresses `vox service list` prints.
                     shared: {
-                        d.shares
-                            .iter()
+                        self.governance
+                            .as_ref()
+                            .filter(|g| g.room == d.channel_id)
+                            .into_iter()
+                            .flat_map(|g| g.shares.iter())
                             .map(|s| {
                                 let who = if me == Some(s.host) {
                                     "you".to_owned()
@@ -2408,36 +2882,71 @@ impl DaemonCore {
                     } else {
                         0
                     },
-                    // The room's Sessions (ADR-029 CL-2), newest opening first, each labelled as
-                    // `vox room sessions` labels it (SE-3).
-                    sessions: d
-                        .sessions
-                        .iter()
-                        .rev()
-                        .map(|x| {
-                            let node_alias =
-                                crate::ident::author_for(&snap.trusted, me.as_ref(), &x.node);
-                            crate::viewmodel::SessionView {
-                                node: x.node,
-                                id: x.id.clone(),
-                                name: x.name.clone(),
-                                label: vox_agentcomms::envelope::session_label(
-                                    &node_alias,
-                                    x.name.as_deref(),
-                                    &x.id,
-                                ),
-                                node_alias,
-                                opened: x.opened_millis,
-                                ended: (!x.open).then(|| x.ended_millis.unwrap_or(x.opened_millis)),
-                                can_drive: x.can_drive,
-                                waiting: self.waiting_sessions.contains(&(
-                                    d.channel_id,
-                                    x.node,
-                                    x.id.clone(),
-                                )),
-                            }
+                    session_before: self
+                        .shown_session
+                        .as_ref()
+                        .filter(|(room, _, _)| *room == d.channel_id)
+                        .and(self.session_before),
+                    sessions: self
+                        .session_listing
+                        .as_ref()
+                        .filter(|p| p.room == d.channel_id)
+                        .map(|p| {
+                            p.rows
+                                .iter()
+                                .zip(&p.summaries)
+                                .map(|(row, summary)| {
+                                    session_view(row, summary.waiting > 0, &snap.trusted, me)
+                                })
+                                .collect()
                         })
-                        .collect(),
+                        .unwrap_or_default(),
+                    sessions_first: self
+                        .session_listing
+                        .as_ref()
+                        .is_some_and(|p| p.room == d.channel_id && p.after.is_some()),
+                    sessions_more: self
+                        .session_listing
+                        .as_ref()
+                        .is_some_and(|p| p.room == d.channel_id && p.next.is_some()),
+                    selected_session: self
+                        .selected_session
+                        .as_ref()
+                        .filter(|s| {
+                            self.shown_session.as_ref().is_some_and(|(r, n, id)| {
+                                *r == d.channel_id && *n == s.node && *id == s.id
+                            })
+                        })
+                        .map(|s| session_view(s, false, &snap.trusted, me)),
+                    session_lifecycle: self
+                        .timeline
+                        .as_ref()
+                        .filter(|t| t.channel_id == d.channel_id)
+                        .and_then(|t| t.lifecycle.as_ref())
+                        .map(|p| {
+                            p.rows
+                                .iter()
+                                .map(|row| {
+                                    let view = session_view(&row.session, false, &snap.trusted, me);
+                                    NoticeView {
+                                        timestamp: row.cursor.at_millis,
+                                        after: None,
+                                        text: format!(
+                                            "{} {}",
+                                            view.label,
+                                            if row.cursor.ended { "ended" } else { "opened" }
+                                        ),
+                                    }
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    lifecycle_older: self
+                        .timeline
+                        .as_ref()
+                        .filter(|t| t.channel_id == d.channel_id)
+                        .and_then(|t| t.lifecycle.as_ref())
+                        .is_some_and(|p| p.older),
                     // **Every member held back, each on its own line** (V210-66).
                     held_back: self
                         .room_save_errors
@@ -2760,6 +3269,8 @@ impl CoreHandle for DaemonCore {
         }
         self.read_timeline();
         self.read_threads();
+        self.read_sessions_page();
+        self.read_governance();
         self.read_session();
         self.count_waiting();
         self.count_unread();
@@ -2771,6 +3282,13 @@ impl CoreHandle for DaemonCore {
     }
 
     fn shown(&mut self, entries: &[Digest32]) {
+        self.image_visible = entries.iter().copied().collect();
+        self.images
+            .retain(|entry, _| self.image_visible.contains(entry));
+        self.checked
+            .retain(|entry| self.image_visible.contains(entry));
+        self.check_pulls();
+        self.shown_entries = entries.to_vec();
         let Some(cid) = self.active else {
             return;
         };
@@ -2995,14 +3513,108 @@ impl CoreHandle for DaemonCore {
             Command::ShowSession {
                 channel_id,
                 session,
+                all,
             } => {
+                if all && !self.show_all {
+                    if let Some(t) = self
+                        .timeline
+                        .as_mut()
+                        .filter(|t| t.channel_id == channel_id)
+                    {
+                        t.want_latest = true;
+                    }
+                }
+                self.show_all = all;
                 self.thread = None;
                 self.shown_session = session.map(|(node, id)| (channel_id, node, id));
                 self.session_lines.clear();
                 self.session_rows.clear();
+                self.selected_session = None;
+                self.session_before = None;
                 self.session_older = 0;
                 self.session_want_older = false;
                 self.session_stale = true;
+                CommandStatus::Done
+            }
+            Command::FindSession { channel_id, typed } => {
+                let Some(conn) = self.conn.as_mut() else {
+                    return CommandStatus::NotConnected;
+                };
+                let names = SessionNames {
+                    trusted: &self.snapshot.trusted,
+                    presented: &self.presented,
+                    me: self.snapshot.me,
+                };
+                let selected = until_stopped(
+                    &self.rt,
+                    &self.stop,
+                    vox_core::node::sessions::selection::resolve(
+                        &mut conn.client,
+                        channel_id,
+                        None,
+                        &typed,
+                        true,
+                        |row| {
+                            vox_agentcomms::envelope::session_label(
+                                &names.alias_of(&row.node),
+                                row.name.as_deref(),
+                                &row.id,
+                            )
+                        },
+                    ),
+                );
+                match selected {
+                    Some(Ok(row)) => {
+                        let node = row.node;
+                        let id = row.id.clone();
+                        self.thread = None;
+                        self.show_all = false;
+                        self.shown_session = Some((channel_id, node, id.clone()));
+                        self.selected_session = Some(row);
+                        self.session_lines.clear();
+                        self.session_rows.clear();
+                        self.session_before = None;
+                        self.session_older = 0;
+                        self.session_want_older = false;
+                        self.session_stale = true;
+                        CommandStatus::SessionShown {
+                            room: channel_id,
+                            node,
+                            id,
+                        }
+                    }
+                    Some(Err(why)) => CommandStatus::Said(why),
+                    None => CommandStatus::NotConnected,
+                }
+            }
+            Command::SessionsPage { channel_id, first } => {
+                let after = if first {
+                    None
+                } else {
+                    let Some(next) = self
+                        .session_listing
+                        .as_ref()
+                        .filter(|p| p.room == channel_id)
+                        .and_then(|p| p.next)
+                    else {
+                        return CommandStatus::Said("there is no next Session page".into());
+                    };
+                    Some(next)
+                };
+                match self.load_sessions_page(channel_id, after) {
+                    Ok(()) => CommandStatus::Done,
+                    Err(why) => CommandStatus::Said(why),
+                }
+            }
+            Command::LatestSession { channel_id } => {
+                if self
+                    .shown_session
+                    .as_ref()
+                    .is_some_and(|(r, _, _)| *r == channel_id)
+                {
+                    self.session_before = None;
+                    self.session_stale = true;
+                }
                 CommandStatus::Done
             }
             Command::OlderSession {
@@ -3011,6 +3623,34 @@ impl CoreHandle for DaemonCore {
             } => {
                 if self.shown_session.as_ref() == Some(&(channel_id, node, id)) {
                     self.session_want_older = true;
+                }
+                CommandStatus::Done
+            }
+            Command::LatestRoom { channel_id } => {
+                if let Some(t) = self
+                    .timeline
+                    .as_mut()
+                    .filter(|t| t.channel_id == channel_id)
+                {
+                    t.want_latest = true;
+                }
+                CommandStatus::Done
+            }
+            Command::GovernancePage {
+                channel_id,
+                notices,
+                first,
+            } => {
+                if let Some(g) = self.governance.as_mut().filter(|g| g.room == channel_id) {
+                    if notices {
+                        if first || g.notices_next.is_some() {
+                            g.notices_cursor = if first { None } else { g.notices_next };
+                            g.notices_want = true;
+                        }
+                    } else if first || g.shares_next.is_some() {
+                        g.shares_cursor = if first { None } else { g.shares_next };
+                        g.shares_want = true;
+                    }
                 }
                 CommandStatus::Done
             }
@@ -3051,6 +3691,7 @@ impl CoreHandle for DaemonCore {
             }
             Command::SelectChannel { channel_id } => {
                 if self.active != channel_id {
+                    self.show_all = false;
                     self.thread = None;
                     self.thread_summaries.clear();
                     self.thread_roots.clear();

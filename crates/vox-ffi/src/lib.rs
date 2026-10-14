@@ -40,9 +40,10 @@ mod computer;
 pub use client::{
     config_dir, room_group, room_group_words, AnchorReachSummary, AnchorSourceSummary,
     AnchorSummary, ClientListener, DecisionEvent, FileOffer, FileShare, IndividualTrustEligibility,
-    Member, NodeSummary, NodeView, OfferedService, Passphrase, PulledFile, ReadBy,
-    RoomAnchorAuthority, RoomAnchorConfiguration, RoomAnchorEndpoint, RoomConsents, RoomGroup,
-    RoomLink, RoomMessage, RoomServices, RoomSummary, SharedService, ThreadAuthor, ThreadSummary,
+    Member, NodeSummary, NodeView, NoticeCursor, OfferedService, Passphrase, PulledFile, ReadBy,
+    RoomAdmins, RoomAnchorAuthority, RoomAnchorConfiguration, RoomAnchorEndpoint, RoomConsentPage,
+    RoomConsents, RoomGroup, RoomLink, RoomLinkPreview, RoomMessage, RoomNotices, RoomServices,
+    RoomSummary, RoomUnread, ServiceCursor, SharedService, ThreadAuthor, ThreadSummary,
     TrustedNode, UnreadLevel, VoxClient,
 };
 pub use computer::{
@@ -193,6 +194,15 @@ pub struct Message {
     pub created_millis: u64,
     /// The text.
     pub text: String,
+}
+
+/// One bounded display page from an embedded node.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MessagePage {
+    /// Messages in canonical display order, oldest first within this page.
+    pub messages: Vec<Message>,
+    /// Number of earlier visible rows. Continue before the first message's id.
+    pub older: u64,
 }
 
 /// An incoming app stream, waiting for [`AppListener::accept`].
@@ -482,68 +492,89 @@ impl VoxNode {
             .await
     }
 
-    /// A room's readable messages, oldest first.
+    /// Read one bounded display page, newest when `before` is absent. Continue before
+    /// the first returned message while `older` is nonzero; no retained history is truncated.
     ///
     /// # Errors
-    /// If the room is not open.
-    pub fn read(&self, room: String) -> Result<Vec<Message>, VoxError> {
+    /// The room/cursor is unavailable or its saved history could not be read.
+    pub async fn read_page(
+        &self,
+        room: String,
+        before: Option<String>,
+    ) -> Result<MessagePage, VoxError> {
         let channel_id = digest(&room, "room id")?;
-        let view = self.node.view();
-        let detail = view
-            .open_channels
-            .iter()
-            .find(|d| d.channel_id == channel_id)
-            .ok_or_else(|| failed("that room is not open"))?;
-        Ok(detail.timeline.iter().map(message).collect())
+        let before = before
+            .as_deref()
+            .map(|h| digest(h, "message id"))
+            .transpose()?;
+        let history = self.node.history_reader();
+        self.on_node(async move {
+            let page = history
+                .older_page(channel_id, before, 64)
+                .await
+                .map_err(failed)?;
+            Ok(MessagePage {
+                messages: page.rows.iter().map(message).collect(),
+                older: page.older,
+            })
+        })
+        .await
     }
 
-    /// Deliver this node's events to `listener` until the node stops.
-    ///
-    /// Every message that becomes readable is delivered once through
-    /// [`EventListener::on_message`] — this node's own posts, and others' as sync brings
-    /// them in or a sender key makes them readable. The node's own `NewEntry` event covers
-    /// only local posts, so after every event the open rooms' timelines are compared with
-    /// what was already delivered. Messages already readable when this is called are not
-    /// delivered again: [`VoxNode::read`] has them.
+    /// Deliver newly readable messages without retaining every delivered hash.
+    /// Existing readable history is available through [`VoxNode::read_page`].
     pub fn subscribe(&self, listener: Arc<dyn EventListener>) {
         let mut events = self.node.subscribe();
         let node = self.node.clone();
-        let mut delivered: std::collections::HashSet<Digest32> = node
-            .view()
-            .open_channels
-            .iter()
-            .flat_map(|d| d.timeline.iter().map(|r| r.entry_hash))
-            .collect();
+        let history = node.history_reader();
+        let mut delivered: std::collections::HashMap<Digest32, vox_core::node::api::HistoryCursor> =
+            node.view()
+                .open_channels
+                .iter()
+                .map(|room| {
+                    (
+                        room.channel_id,
+                        vox_core::node::api::HistoryCursor {
+                            instance: room.history_instance,
+                            arrival: room.last_arrival.unwrap_or(0),
+                        },
+                    )
+                })
+                .collect();
         let mut view = node.watch();
         self.rt.spawn(async move {
+            let mut retry = tokio::time::interval(std::time::Duration::from_secs(2));
+            let mut more = false;
             loop {
-                // The view is republished after the event that changed it, so a new row
-                // may appear with the view rather than with the event: watch both.
-                tokio::select! {
-                    item = events.next() => match item {
-                        None => return,
-                        Some(EventStreamItem::Event(
-                            NodeEvent::NewEntry { .. } | NodeEvent::SessionEntry { .. },
-                        )) => {}
-                        Some(EventStreamItem::Event(other)) => {
-                            listener.on_notice(other.words());
-                        }
-                        Some(EventStreamItem::Lagged(n)) => listener.on_notice(format!(
-                            "missed {n} events; read the rooms again for what is current"
-                        )),
-                    },
-                    changed = view.changed() => {
-                        if changed.is_err() {
-                            return;
-                        }
+                if !more {
+                    tokio::select! {
+                        item = events.next() => match item {
+                            None => return,
+                            Some(EventStreamItem::Event(NodeEvent::NewEntry {..} | NodeEvent::SessionEntry {..})) => {},
+                            Some(EventStreamItem::Event(other)) => listener.on_notice(other.words()),
+                            Some(EventStreamItem::Lagged(n)) => listener.on_notice(format!("missed {n} events; rereading saved arrivals")),
+                        },
+                        changed = view.changed() => { if changed.is_err() {return;} },
+                        _ = retry.tick() => {},
                     }
-                }
-                let current = view.borrow_and_update().clone();
-                for room in current.open_channels {
-                    for row in room.timeline.iter() {
-                        if delivered.insert(row.entry_hash) {
-                            listener.on_message(b32_encode(&room.channel_id), message(row));
+                } else { tokio::task::yield_now().await; }
+                more = false;
+                let rooms: Vec<_> = {
+                    let current = view.borrow_and_update();
+                    delivered.retain(|room,_| current.channels.iter().any(|c|c.channel_id == *room));
+                    current.open_channels.iter().map(|r|r.channel_id).collect()
+                };
+                for room in rooms {
+                    let after = delivered.get(&room).copied();
+                    match history.arrival_page(room,after,64).await {
+                        Ok(page) => {
+                            for row in page.rows {
+                                listener.on_message(b32_encode(&room),message(&row));
+                                delivered.insert(room,vox_core::node::api::HistoryCursor {instance:page.instance, arrival:row.arrival});
+                            }
+                            more |= page.next.is_some();
                         }
+                        Err(e) => listener.on_notice(format!("could not read messages; will retry: {e}")),
                     }
                 }
             }

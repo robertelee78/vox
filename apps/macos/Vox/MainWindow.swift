@@ -181,7 +181,20 @@ private struct Sidebar: View {
                     RoomRow(room: room, selected: model.selection == .room(room.id), health: model.roomHealth(room.id))
                         .tag(NodeModel.Selection.room(room.id))
                         .sidebarRow(model.selection == .room(room.id))
-                        .copyMenu([("Copy Name", room.name)])
+                        .contextMenu {
+                            Button("Copy Room Link") {
+                                Task { await model.copyRoomLink(room: room.id) }
+                            }
+                            .keyboardShortcut("c", modifiers: .command)
+                            Button("Mark as Read") {
+                                Task { await model.markRoomRead(room.id) }
+                            }
+                            .disabled(model.busy)
+                            Button("Copy Name") {
+                                NSPasteboard.general.clearContents()
+                                NSPasteboard.general.setString(room.name, forType: .string)
+                            }
+                        }
                 }
             }
         }
@@ -912,7 +925,7 @@ private struct RoomView: View {
             VStack(spacing: 0) {
                 RoomHeader(model: model, room: room)
                 Divider()
-                if !model.roomServices.isEmpty {
+                if !model.roomServices.isEmpty || model.roomServicesNext != nil {
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: Space.s8 * scale) {
                             ForEach(model.roomServices, id: \.address) { service in
@@ -934,6 +947,32 @@ private struct RoomView: View {
                         .voxPadding(Space.s8)
                     }
                     Hairline()
+                }
+                HStack {
+                    Button("First Services") { Task { await model.readGovernancePages(first: true) } }
+                    if model.roomServicesNext != nil {
+                        Button("Next Services") { Task { await model.readGovernancePages(nextServices: true) } }
+                    }
+                }.voxPadding(.horizontal, Space.s12)
+                DisclosureGroup("Room Activity") {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: Space.s4) {
+                            ForEach(model.notices, id: \.id) { notice in
+                                Text("\(notice.authorName.isEmpty ? String(notice.author.prefix(12)) : notice.authorName) \(notice.what)")
+                                    .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                        }
+                    }.frame(maxHeight: Theme.scaled(180))
+                    HStack {
+                        Button("Latest Activity") { Task { await model.readGovernancePages(first: true) } }
+                        if model.noticesBefore != nil {
+                            Button("Older Activity") { Task { await model.readGovernancePages(olderNotices: true) } }
+                        }
+                    }
+                }.voxPadding(.horizontal, Space.s12)
+                if let failure = model.governancePageError {
+                    StateMark(kind: .danger, words: failure)
+                    Button("Reload Services and Activity") { Task { await model.readGovernancePages(first: true) } }
                 }
                 Text(model.timelineTitle)
                     .secondaryText()
@@ -1057,10 +1096,10 @@ private struct RoomView: View {
                                         following = false
                                         readLog.debug("follow in \(room, privacy: .public): following false, why: scrolled by hand")
                                     }, ended: {
-                                        following = model.followItem.map { inView.contains($0) } ?? true
+                                        following = !model.hasNewerTimeline && (model.followItem.map { inView.contains($0) } ?? true)
                                         readLog.debug("follow in \(room, privacy: .public): following \(following), why: scroll by hand ended")
                                     }, toward: {
-                                        guard !following, let last = model.followItem,
+                                        guard !following, !model.hasNewerTimeline, let last = model.followItem,
                                               inView.contains(last) else { return }
                                         following = true
                                         readLog.debug("follow in \(room, privacy: .public): following true, why: scrolled down to the newest line")
@@ -1232,6 +1271,8 @@ private struct RoomView: View {
                         }
                     }
                     .background(WindowReader(seen: window))
+                    .onChange(of: following) { value in model.timelineFollowingNewest = value }
+                    .onChange(of: model.timelineFollowingNewest) { value in following = value }
                     .onChange(of: window.seen) { _ in markSeen() }
                     .onChange(of: model.showing) { _ in updateLooking() }
                     .onDisappear { if model.lookingAt == room { model.lookingAt = nil } }
@@ -1511,14 +1552,17 @@ private struct RoomView: View {
             scroller.scrollTo(first, anchor: .top)
         case .end:
             following = true
-            scroller.scrollTo(TimelineEnd.id, anchor: .bottom)
+            Task {
+                await model.readNewestTimeline()
+                DispatchQueue.main.async { scroller.scrollTo(TimelineEnd.id, anchor: .bottom) }
+            }
         case .pageUp:
             guard let top = shown.min(by: { $0.value.minY < $1.value.minY })?.key else { return false }
             following = false
             scroller.scrollTo(top, anchor: .bottom)
         case .pageDown:
             guard let bottom = shown.max(by: { $0.value.maxY < $1.value.maxY })?.key else { return false }
-            if bottom == model.followItem {
+            if bottom == model.followItem && !model.hasNewerTimeline {
                 following = true
                 scroller.scrollTo(TimelineEnd.id, anchor: .bottom)
             } else {

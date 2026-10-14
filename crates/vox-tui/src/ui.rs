@@ -616,22 +616,16 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
         ),
         Showing::All => {
             let mut notices = channel.notices.clone();
-            for x in &channel.sessions {
-                notices.push(NoticeView {
-                    timestamp: x.opened,
-                    after: None,
-                    text: format!("{} opened", x.label),
-                });
-                if let Some(at) = x.ended {
-                    notices.push(NoticeView {
-                        timestamp: at,
-                        after: None,
-                        text: format!("{} ended", x.label),
-                    });
-                }
-            }
+            notices.extend(channel.session_lifecycle.iter().cloned());
             notices.sort_by_key(|n| n.timestamp);
-            (notices, " — All".to_owned())
+            let hint = if channel.lifecycle_older {
+                " — All · earlier lifecycle notices: ↑ at top"
+            } else if channel.room_older > 0 {
+                " — All · earlier page: ↑ at top"
+            } else {
+                " — All"
+            };
+            (notices, hint.to_owned())
         }
         Showing::Session(..) => {
             let mut notices = Vec::new();
@@ -718,7 +712,7 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
             focused(ui, Focus::Timeline),
         );
     } else {
-        (ui.timeline_scroll, ui.on_screen) = render_timeline(
+        (ui.timeline_scroll, ui.on_screen, ui.timeline_at_top) = render_timeline(
             frame,
             area,
             &channel.held_back,
@@ -798,7 +792,7 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
     let inner = usize::from(cols[1].width.saturating_sub(2)).max(20);
     let shared_lines = shared_lines(&channel.shared, ui.selected_share, shared_focus, inner);
     // The room's Sessions on top (ADR-029 CL-2), at most a third of the column.
-    let rows = session_rows(&channel.sessions, ui.ended_open);
+    let rows = session_rows(channel, ui.ended_open);
     let tall = u16::try_from(rows.len().saturating_add(2))
         .unwrap_or(u16::MAX)
         .min(cols[1].height / 3);
@@ -807,7 +801,7 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
         .constraints([Constraint::Length(tall), Constraint::Min(3)])
         .split(cols[1]);
     render_sessions(frame, column[0], channel, &rows, ui);
-    let side = if channel.shared.is_empty() {
+    let side = if channel.shared.is_empty() && !channel.shared_more {
         vec![column[1]]
     } else {
         Layout::default()
@@ -831,7 +825,14 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
     if let Some(area) = side.get(1) {
         let items: Vec<ListItem> = shared_lines.into_iter().map(ListItem::new).collect();
         frame.render_widget(
-            List::new(items).block(pane_block("Shared", shared_focus)),
+            List::new(items).block(pane_block(
+                if channel.shared_more {
+                    "Shared · n: next · r: first"
+                } else {
+                    "Shared · r: first"
+                },
+                shared_focus,
+            )),
             *area,
         );
     }
@@ -930,7 +931,9 @@ fn render_sessions(
                         (format!("● {}", x.label), on)
                     }
                 }
-                SessionRow::Ended(n) => (format!("Ended ({n})"), false),
+                SessionRow::Ended(n) => (format!("Ended on this page ({n})"), false),
+                SessionRow::First => ("First Session page".into(), false),
+                SessionRow::Next => ("Next Session page".into(), false),
             };
             let mark = if on { "▸ " } else { "  " };
             let style = if focus && i == ui.selected_session_row {
@@ -941,7 +944,10 @@ fn render_sessions(
             ListItem::new(Line::from(Span::styled(format!("{mark}{text}"), style)))
         })
         .collect();
-    frame.render_widget(List::new(items).block(pane_block("Sessions", focus)), area);
+    frame.render_widget(
+        List::new(items).block(pane_block("Sessions · page", focus)),
+        area,
+    );
 }
 
 /// The Shared pane's lines (ADR-028 S-3): each service, and under the one selected while the pane
@@ -1007,7 +1013,7 @@ fn render_timeline<'a>(
     (room_notices, channel, showing, general): (&[NoticeView], &ChannelView, &str, bool),
     at: Selection,
     images: &mut crate::images::Images,
-) -> (usize, Vec<Digest32>) {
+) -> (usize, Vec<Digest32>, bool) {
     let retention = &channel.retention;
     let thread = channel.expanded_thread.as_ref().filter(|_| general);
     let indented: std::collections::HashSet<_> = thread
@@ -1268,10 +1274,18 @@ fn render_timeline<'a>(
     let title = if scroll > 0 {
         format!("Timeline{showing} · {RETENTION} {retention} (scrolled — End: newest)")
     } else {
-        format!("Timeline{showing} · {RETENTION} {retention}")
+        format!(
+            "Timeline{showing} · {RETENTION} {retention}{}",
+            if channel.notices_more {
+                " · N: older notices · R: latest"
+            } else {
+                " · R: latest notices"
+            }
+        )
     };
     let p = Paragraph::new(shown).block(pane_block(&title, focus));
     frame.render_widget(p, area);
+    images.retain_visible(&on_screen, area.width.saturating_sub(2));
     // Each image whose rows are all in the window is drawn over them; one cut by its edge is not.
     for (at, (entry, img)) in drawn.iter().enumerate() {
         let mine: Vec<usize> = window.clone().filter(|i| pics[*i] == Some(at)).collect();
@@ -1286,7 +1300,7 @@ fn render_timeline<'a>(
             images.draw(frame, rect, *entry, img);
         }
     }
-    (scroll, on_screen)
+    (scroll, on_screen, reached_oldest && window.start == 0)
 }
 
 /// One message as the timeline draws it: who, to whom, and what it says; `chosen` marks it
@@ -1565,18 +1579,18 @@ fn hint_text(ui: &UiState, vm: &ViewModel) -> String {
             " ↑/↓ select · Enter open · t tunnels · k keyring · d decisions · :new <name> · :join · :unlock · Ctrl-C quit"
         }
         Screen::Channel if ui.focus == Focus::Sessions => {
-            " A step is one thing an agent did in its Session: a message, a command it ran, or a file it edited. · ↑/↓ select · Enter open · Tab switch pane · :general · :all · Esc back"
+            " A step is one thing an agent did in its Session: a message, a command it ran, or a file it edited. · ↑/↓ select · Enter open/page · :sessions-first / :sessions-next · Tab switch pane · :general · :all · Esc back"
         }
         // A Session's own help line (ADR-029 §8): its driving words join it as they are built,
         // for a member with drive only (CL-3).
         Screen::Channel if showing_session(ui, vm).is_some_and(|x| x.can_drive) => {
-            " Tab switch pane · ↑/↓ select a line · Enter or d: Details · a approve · r reject · 1-9 answer · type to the session, /command · :share <path> · :interrupt · :stop · :general · : command · Esc back"
+            " Tab switch pane · ↑/↓ select a line · End latest · Enter or d: Details · a approve · r reject · 1-9 answer · type to the session, /command · :share <path> · :interrupt · :stop · :general · : command · Esc back"
         }
         Screen::Channel if matches!(ui.showing, Showing::Session(..)) => {
             " Tab switch pane · ↑/↓ select · Enter show · :general · :all · :session <name> · : command · Esc back"
         }
         Screen::Channel => {
-            " Tab switch pane · ↑/↓ select · Ctrl-R reply in thread · Enter open thread / go to quote · → next replies · ← close thread · PgUp/PgDn scroll · :to <name> · :urgent · :share <path> · :link · :general · :all · :session <name> · :tag <tag> · : command · Esc back"
+            " Tab switch pane · ↑/↓ select · Ctrl-R reply in thread · Enter open thread / go to quote · → next replies · ← close thread · PgUp/PgDn page/scroll · End/:latest newest · :to <name> · :urgent · :share <path> · :link · :general · :all · :session <name> · :tag <tag> · : command · Esc back"
         }
         Screen::Tunnels => " ↑/↓ select · x close the selected tunnel · : command · Esc back",
         Screen::Serve if vm.serve_preview.is_some() => " Enter share it · Esc back to the list",

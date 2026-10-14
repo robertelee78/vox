@@ -43,6 +43,41 @@ const TRANSCRIPT_POLL: Duration = Duration::from_millis(250);
 /// rejection at the terminal.
 pub const REJECTED_IN_VOX: &str = "rejected in Vox by";
 
+/// Internal admission detail: a repeated source receipt must not repeat control side effects.
+pub struct Posted {
+    /// Existing public outcome; the daemon wire format is unchanged.
+    pub admission: SessionAdmission,
+    /// A new source activity began, or an unkeyed activity was durably admitted.
+    pub fresh: bool,
+}
+
+/// Authority observed when one source event arrived. Held admission carries this bounded
+/// snapshot with its first part, so recovery cannot affect a later request or delivery.
+pub struct SourceEffects {
+    requests: Vec<Arc<()>>,
+    expire: bool,
+    echo: Option<Arc<()>>,
+}
+
+impl SourceEffects {
+    /// Conservative allocation charge for the existing bounded volatile hold.
+    pub fn charge(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.requests.capacity()
+                * (std::mem::size_of::<Arc<()>>() + 3 * std::mem::size_of::<usize>())
+            + usize::from(self.echo.is_some()) * 3 * std::mem::size_of::<usize>()
+    }
+}
+
+impl From<SessionAdmission> for Posted {
+    fn from(admission: SessionAdmission) -> Self {
+        Self {
+            admission,
+            fresh: false,
+        }
+    }
+}
+
 /// Commit a bounded batch into the node's sealed inbox, returning its durable receipt.
 pub type Poster = Arc<
     dyn Fn(
@@ -50,7 +85,8 @@ pub type Poster = Arc<
             String,
             vox_core::hash::Digest32,
             Vec<String>,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = SessionAdmission> + Send>>
+            Option<SourceEffects>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Posted> + Send>>
         + Send
         + Sync,
 >;
@@ -77,7 +113,7 @@ struct Session {
     /// Requests waiting, by the call they are tied to.
     asks: BTreeMap<String, Ask>,
     /// Text drivers typed into the session lately, and when (see [`Sink::delivered_text`]).
-    delivered: Vec<(String, std::time::Instant)>,
+    delivered: Vec<(String, std::time::Instant, Arc<()>)>,
     /// Requests settled lately, with what a late answer to each is told.
     settled: std::collections::VecDeque<(String, String)>,
 }
@@ -165,6 +201,27 @@ impl Sink {
         session: &str,
         bodies: Vec<String>,
     ) -> SessionAdmission {
+        self.post_numbered_result(node, session, bodies)
+            .await
+            .admission
+    }
+
+    async fn post_numbered_result(
+        &self,
+        node: &NodeName,
+        session: &str,
+        bodies: Vec<String>,
+    ) -> Posted {
+        self.post_with_effects(node, session, bodies, None).await
+    }
+
+    async fn post_with_effects(
+        &self,
+        node: &NodeName,
+        session: &str,
+        bodies: Vec<String>,
+        mut effects: Option<SourceEffects>,
+    ) -> Posted {
         use vox_core::node::session_ingress::{MAX_BATCH_BYTES, MAX_BATCH_ITEMS};
         let invalid = bodies.iter().find_map(|body| {
             if !serde_json::from_str::<Value>(body).is_ok_and(|v| v.is_object()) {
@@ -176,14 +233,15 @@ impl Sink {
             }
         });
         if let Some(why) = invalid {
-            return reported(node, session, SessionAdmission::Refused(why.into()));
+            return reported(node, session, SessionAdmission::Refused(why.into())).into();
         }
         let Some(room) = (self.room_of)(node, session) else {
-            return SessionAdmission::Skipped;
+            return SessionAdmission::Skipped.into();
         };
         let mut batch = Vec::new();
         let mut bytes = 0usize;
         let mut result = SessionAdmission::Skipped;
+        let mut fresh = false;
         for body in bodies {
             if !batch.is_empty()
                 && (bytes + body.len() > MAX_BATCH_BYTES || batch.len() == MAX_BATCH_ITEMS)
@@ -193,11 +251,16 @@ impl Sink {
                     session.to_owned(),
                     room,
                     std::mem::take(&mut batch),
+                    effects.take(),
                 )
                 .await;
-                result = combine(result, next);
+                fresh |= next.fresh;
+                result = combine(result, next.admission);
                 if !result.taken() {
-                    return reported(node, session, result);
+                    return Posted {
+                        admission: reported(node, session, result),
+                        fresh,
+                    };
                 }
                 bytes = 0;
             }
@@ -205,12 +268,175 @@ impl Sink {
             batch.push(body);
         }
         if !batch.is_empty() {
-            result = combine(
-                result,
-                (self.post)(node.clone(), session.to_owned(), room, batch).await,
-            );
+            let next = (self.post)(node.clone(), session.to_owned(), room, batch, effects).await;
+            fresh |= next.fresh;
+            result = combine(result, next.admission);
         }
-        reported(node, session, result)
+        Posted {
+            admission: reported(node, session, result),
+            fresh,
+        }
+    }
+
+    /// An adapter source has durable deduplication. Only a newly stored activity may settle
+    /// current requests; an old user/tool event must not expire a later turn's authority.
+    pub async fn source_activity(
+        self: &Arc<Self>,
+        node: &NodeName,
+        session: &str,
+        mut bodies: Vec<String>,
+        echo: Option<&str>,
+    ) -> Posted {
+        let Some(first) = bodies
+            .first()
+            .and_then(|body| serde_json::from_str::<Value>(body).ok())
+        else {
+            return reported(
+                node,
+                session,
+                SessionAdmission::Refused("invalid source activity".into()),
+            )
+            .into();
+        };
+        let valid = first
+            .get("_vox_source")
+            .and_then(Value::as_object)
+            .is_some_and(|source| {
+                source.get("parts").and_then(Value::as_u64) == Some(bodies.len() as u64)
+                    && !source.contains_key("suppressed")
+                    && bodies.iter().enumerate().all(|(index, body)| {
+                        serde_json::from_str::<Value>(body).is_ok_and(|value| {
+                            value.get("kind") == first.get("kind")
+                                && value.pointer("/_vox_source/id") == source.get("id")
+                                && value.pointer("/_vox_source/revision") == source.get("revision")
+                                && value.pointer("/_vox_source/parts") == source.get("parts")
+                                && value.pointer("/_vox_source/part").and_then(Value::as_u64)
+                                    == Some(index as u64 + 1)
+                                && value.pointer("/_vox_source/suppressed").is_none()
+                        })
+                    })
+            });
+        if !valid {
+            return reported(
+                node,
+                session,
+                SessionAdmission::Refused("inconsistent source activity parts".into()),
+            )
+            .into();
+        }
+        let echo = echo.and_then(|text| {
+            self.delivered_ticket(node, session, &json!({"kind": "user", "text": text}), false)
+        });
+        let suppressed = echo.is_some();
+        let expire = first.get("kind").and_then(Value::as_str) == Some("user");
+        let requests = self.with(|all| {
+            all.get(&(node.clone(), session.to_owned()))
+                .into_iter()
+                .flat_map(|s| &s.asks)
+                .filter(|(id, _)| {
+                    !suppressed
+                        && (expire
+                            || (first.get("kind").and_then(Value::as_str) == Some("tool-done")
+                                && first.get("ref").and_then(Value::as_str) == Some(id.as_str())))
+                })
+                .map(|(_, ask)| Arc::clone(&ask.ticket))
+                .collect()
+        });
+        if suppressed {
+            for body in &mut bodies {
+                let Ok(mut value) = serde_json::from_str::<Value>(body) else {
+                    return reported(
+                        node,
+                        session,
+                        SessionAdmission::Refused("invalid source activity".into()),
+                    )
+                    .into();
+                };
+                let Some(source) = value.get_mut("_vox_source").and_then(Value::as_object_mut)
+                else {
+                    return reported(
+                        node,
+                        session,
+                        SessionAdmission::Refused("invalid source identity".into()),
+                    )
+                    .into();
+                };
+                source.insert("suppressed".into(), json!(true));
+                *body = value.to_string();
+            }
+        }
+        let mut result = self
+            .post_with_effects(
+                node,
+                session,
+                bodies,
+                Some(SourceEffects {
+                    requests,
+                    expire,
+                    echo,
+                }),
+            )
+            .await;
+        if suppressed {
+            result.fresh = false;
+        }
+        result
+    }
+
+    /// Apply one confirmed fresh source's original authority snapshot. This never calls the
+    /// Poster: the host saves returned resolution rows through its existing bounded hold.
+    pub fn committed_source(
+        &self,
+        node: &NodeName,
+        session: &str,
+        effects: SourceEffects,
+    ) -> Vec<String> {
+        let targets: Vec<_> = self.with(|all| {
+            let Some(s) = all.get_mut(&(node.clone(), session.to_owned())) else {
+                return Vec::new();
+            };
+            if let Some(echo) = effects.echo {
+                s.delivered
+                    .retain(|(_, _, ticket)| !Arc::ptr_eq(ticket, &echo));
+            }
+            s.asks
+                .iter()
+                .filter(|(_, ask)| {
+                    effects
+                        .requests
+                        .iter()
+                        .any(|ticket| Arc::ptr_eq(ticket, &ask.ticket))
+                })
+                .map(|(id, ask)| (id.clone(), Arc::clone(&ask.ticket)))
+                .collect()
+        });
+        let mut entries = Vec::new();
+        for (id, ticket) in targets {
+            let (waiting, settled) = self.settled_entry_if(node, session, &id, Some(&ticket));
+            entries.extend(settled);
+            if !effects.expire || !waiting {
+                continue;
+            }
+            let ask = self.with(|all| {
+                let s = all.get_mut(&(node.clone(), session.to_owned()))?;
+                s.asks
+                    .get(&id)
+                    .filter(|ask| Arc::ptr_eq(&ask.ticket, &ticket))?;
+                s.asks.remove(&id)
+            });
+            if let Some(mut ask) = ask {
+                if let Some(Waiter::Hook(h)) = ask.waiter.take() {
+                    let _ = h.send(None);
+                }
+                self.remember(node, session, &id, "the request expired before an answer");
+                entries.push(
+                    json!({"v": crate::session_mirror::VERSION, "session": session,
+                    "kind":"resolved", "ref":id, "of":ask.of, "outcome":"expired"})
+                    .to_string(),
+                );
+            }
+        }
+        entries
     }
 
     /// A harness's activity ([`vox_core::node::daemonipc::DaemonRequest::SessionActivity`]).
@@ -223,6 +449,34 @@ impl Sink {
         bodies: Vec<String>,
         call: Option<ToolCall>,
     ) -> SessionAdmission {
+        // Source identities have the same deduplication and control semantics at the public
+        // ingress seam as at the in-daemon adapter; never pass them through the eager path.
+        if bodies.iter().any(|body| {
+            serde_json::from_str::<Value>(body)
+                .is_ok_and(|value| value.get("_vox_source").is_some())
+        }) {
+            if call.is_some() {
+                return reported(
+                    node,
+                    session,
+                    SessionAdmission::Refused(
+                        "source activity cannot replace an open tool call".into(),
+                    ),
+                );
+            }
+            let echo = bodies
+                .first()
+                .and_then(|body| serde_json::from_str::<Value>(body).ok())
+                .filter(|value| {
+                    value.get("kind").and_then(Value::as_str) == Some("user")
+                        && value.get("part").is_none()
+                })
+                .and_then(|value| value.get("text").and_then(Value::as_str).map(str::to_owned));
+            return self
+                .source_activity(node, session, bodies, echo.as_deref())
+                .await
+                .admission;
+        }
         if bodies
             .iter()
             .any(|body| !serde_json::from_str::<Value>(body).is_ok_and(|v| v.is_object()))
@@ -285,32 +539,46 @@ impl Sink {
     pub fn delivered_text(&self, node: &NodeName, session: &str, text: &str) {
         self.with(|all| {
             let s = all.entry((node.clone(), session.to_owned())).or_default();
-            s.delivered.retain(|(_, at)| at.elapsed() < DELIVERED_FOR);
             s.delivered
-                .push((text.trim().to_owned(), std::time::Instant::now()));
+                .retain(|(_, at, _)| at.elapsed() < DELIVERED_FOR);
+            s.delivered.push((
+                text.trim().to_owned(),
+                std::time::Instant::now(),
+                Arc::new(()),
+            ));
         });
     }
 
     /// Whether `body` is the harness's prompt event for text a driver delivered; that delivery is
     /// then used up.
     fn was_delivered(&self, node: &NodeName, session: &str, body: &Value) -> bool {
+        self.delivered_ticket(node, session, body, true).is_some()
+    }
+
+    fn delivered_ticket(
+        &self,
+        node: &NodeName,
+        session: &str,
+        body: &Value,
+        consume: bool,
+    ) -> Option<Arc<()>> {
         if body.get("kind").and_then(Value::as_str) != Some("user") || body.get("part").is_some() {
-            return false;
+            return None;
         }
-        let Some(text) = body.get("text").and_then(Value::as_str) else {
-            return false;
-        };
+        let text = body.get("text").and_then(Value::as_str)?;
         self.with(|all| {
-            let Some(s) = all.get_mut(&(node.clone(), session.to_owned())) else {
-                return false;
-            };
-            s.delivered.retain(|(_, at)| at.elapsed() < DELIVERED_FOR);
-            match s.delivered.iter().position(|(t, _)| t == text.trim()) {
+            let s = all.get_mut(&(node.clone(), session.to_owned()))?;
+            s.delivered
+                .retain(|(_, at, _)| at.elapsed() < DELIVERED_FOR);
+            match s.delivered.iter().position(|(t, _, _)| t == text.trim()) {
                 Some(i) => {
-                    s.delivered.remove(i);
-                    true
+                    let ticket = Arc::clone(&s.delivered[i].2);
+                    if consume {
+                        s.delivered.remove(i);
+                    }
+                    Some(ticket)
                 }
-                None => false,
+                None => None,
             }
         })
     }
@@ -436,9 +704,20 @@ impl Sink {
     /// Retire `id`'s request if the transcript records its result. Returns whether it is still
     /// waiting.
     fn settled_entry(&self, node: &NodeName, session: &str, id: &str) -> (bool, Option<String>) {
+        self.settled_entry_if(node, session, id, None)
+    }
+
+    fn settled_entry_if(
+        &self,
+        node: &NodeName,
+        session: &str,
+        id: &str,
+        ticket: Option<&Arc<()>>,
+    ) -> (bool, Option<String>) {
         let path = self.with(|all| {
             all.get(&(node.clone(), session.to_owned()))
                 .and_then(|s| s.asks.get(id))
+                .filter(|ask| ticket.is_none_or(|ticket| Arc::ptr_eq(ticket, &ask.ticket)))
                 .map(|a| a.transcript.clone())
         });
         let Some(path) = path else {
@@ -453,7 +732,7 @@ impl Sink {
         let outcome = if r.is_error { "denied" } else { "" };
         (
             false,
-            self.retired_entry(node, session, id, outcome, r.answers, &r.text),
+            self.retired_entry_if(node, session, (id, ticket), outcome, r.answers, &r.text),
         )
     }
 
@@ -493,9 +772,25 @@ impl Sink {
         answers: Option<Value>,
         said: &str,
     ) -> Option<String> {
+        self.retired_entry_if(node, session, (id, None), outcome, answers, said)
+    }
+
+    fn retired_entry_if(
+        &self,
+        node: &NodeName,
+        session: &str,
+        request: (&str, Option<&Arc<()>>),
+        outcome: &str,
+        answers: Option<Value>,
+        said: &str,
+    ) -> Option<String> {
+        let (id, ticket) = request;
         let ask = self.with(|all| {
-            all.get_mut(&(node.clone(), session.to_owned()))
-                .and_then(|s| s.asks.remove(id))
+            let s = all.get_mut(&(node.clone(), session.to_owned()))?;
+            s.asks
+                .get(id)
+                .filter(|ask| ticket.is_none_or(|ticket| Arc::ptr_eq(ticket, &ask.ticket)))?;
+            s.asks.remove(id)
         });
         let mut ask = ask?;
         let outcome = match outcome {
@@ -795,7 +1090,7 @@ fn resolved(
 fn reported(node: &NodeName, session: &str, result: SessionAdmission) -> SessionAdmission {
     match &result {
         SessionAdmission::Held(why) => eprintln!("vox daemon: {node}: session {session}: some activity is held only in memory, not saved: {why}"),
-        SessionAdmission::Refused(why) => eprintln!("vox daemon: {node}: session {session}: this batch and any following unsubmitted activity were not retained: {why}"),
+        SessionAdmission::Refused(why) => eprintln!("vox daemon: {node}: session {session}: this batch was refused and following activity was not submitted; earlier source receipts still stand: {why}"),
         SessionAdmission::Unconfirmed(why) => eprintln!("vox daemon: {node}: session {session}: acceptance is unknown; do not replay this batch; following unsubmitted activity was not retained: {why}"),
         _ => {}
     }
@@ -822,9 +1117,13 @@ fn combine(before: SessionAdmission, next: SessionAdmission) -> SessionAdmission
         (r @ SessionAdmission::Refused(_), _) => r,
         (_, h @ SessionAdmission::Held(_)) => h,
         (h @ SessionAdmission::Held(_), _) => h,
-        (SessionAdmission::Committed { first, .. }, SessionAdmission::Committed { last, .. }) => {
-            SessionAdmission::Committed { first, last }
-        }
+        (
+            SessionAdmission::Committed { first: a, last: b },
+            SessionAdmission::Committed { first: c, last: d },
+        ) => SessionAdmission::Committed {
+            first: a.min(c),
+            last: b.max(d),
+        },
         (s, SessionAdmission::Skipped) => s,
         (_, s) => s,
     }

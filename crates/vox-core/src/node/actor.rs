@@ -45,6 +45,7 @@ use crate::node::open_rooms::OpenRooms;
 use crate::node::paths::Paths;
 
 mod computer;
+mod governance;
 mod local_trust;
 mod recovery;
 use crate::node::prekeys::{self, PrekeyRing};
@@ -300,111 +301,57 @@ fn over_of(ch: &ChannelState) -> Option<String> {
     ch.has_left(&ch.me()).then(|| "left".to_owned())
 }
 
-/// A room's detail for the view, reusing the previous timeline and its indices whenever the
-/// display inputs still match, including owed rows (#862). Pure end appends extend the shared
-/// prefix (V210-120); fills, expiry, classification and ordering changes rebuild it.
+/// A room summary and opaque display tokens; history and Sessions are queried in pages.
 fn detail_of(
     ch: &ChannelState,
     store: &crate::node::store::Store,
     prev: Option<&ChannelDetail>,
-    now: crate::time::Ms,
+    _now: crate::time::Ms,
     sequence: &std::sync::atomic::AtomicU64,
 ) -> crate::error::Result<ChannelDetail> {
     if ch.is_poisoned() {
         return Err(ch.save_failure());
     }
     let (frozen, refused_below_checkpoint) = ch.fork_watch();
-    let (timeline, structured, row_index, display_stamp, display_revision) = if let Some(p) =
-        prev.filter(|p| ch.display_is_current(&p.display_stamp))
-    {
-        (
-            p.timeline.clone(),
-            p.structured.clone(),
-            p.row_index.clone(),
-            p.display_stamp.clone(),
-            p.display_revision,
-        )
-    } else {
-        let (rows, stamp) = ch.display_timeline(store)?;
-        let prefix = prev.filter(|p| {
-            let n = p.timeline.len();
-            !stamp.owed
-                && !p.display_stamp.owed
-                && ch.display_extends(&p.display_stamp)
-                && n <= rows.len()
-                && p.timeline.first().map(|r| r.entry_hash) == rows.first().map(|r| r.entry_hash)
-                && p.timeline.last().map(|r| r.entry_hash)
-                    == n.checked_sub(1).map(|i| rows[i].entry_hash)
-        });
-        // All three projections use the same prefix decision. First/last hashes alone
-        // cannot establish that a middle row's text, position or late flag is unchanged.
-        let (timeline, structured, base, from) = match prefix {
-            Some(p) => {
-                let from = p.timeline.len();
-                (
-                    p.timeline.appended(rows[from..].iter().map(row_of)),
-                    p.structured
-                        .appended(from, rows[from..].iter().map(|r| &r.text)),
-                    p.row_index.clone(),
-                    from,
-                )
-            }
-            None => (
-                rows.iter().map(row_of).collect(),
-                crate::node::api::StructuredIndex::default()
-                    .appended(0, rows.iter().map(|r| &r.text)),
-                crate::node::api::OpRuns::default(),
-                0,
-            ),
+    let display_stamp = ch.display_stamp(store)?;
+    let display_revision =
+        match prev.filter(|p| ch.display_is_current(&p.display_stamp, &display_stamp)) {
+            Some(p) => p.display_revision,
+            None => sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         };
-        let row_index = base.appended(
-            rows[from..]
-                .iter()
-                .enumerate()
-                .filter_map(|(i, r)| {
-                    Some((
-                        u64::from_be_bytes(r.entry_hash[..8].try_into().ok()?),
-                        u32::try_from(from + i).ok()?,
-                    ))
-                })
-                .collect(),
-        );
-        (
-            timeline,
-            structured,
-            row_index,
-            stamp,
-            sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-        )
-    };
     // Who trusts each member (ADR-028 K-7), once: this identity's own entry is `consenting`.
-    let trusted_by = ch.trusted_by();
+    let trusted_by = ch.trusted_by(store)?;
+    let member_consent = ch
+        .members()
+        .into_iter()
+        .filter_map(|member| match ch.has_consented(store, &member) {
+            Ok(true) => Some(Ok(member)),
+            Ok(false) => None,
+            Err(e) => Some(Err(e)),
+        })
+        .collect::<crate::error::Result<Vec<_>>>()?;
     let consenting = trusted_by.get(&ch.me()).cloned().unwrap_or_default();
     Ok(ChannelDetail {
         channel_id: ch.channel_id(),
         name: ch.name().map(str::to_owned),
-        notices: ch.notices(store)?,
         epoch: ch.epoch(),
         members: ch.members(),
-        timeline,
+        last_arrival: ch.last_arrival(store)?,
+        history_instance: ch.history_instance(store)?,
         display_stamp,
         display_revision,
-        row_index,
-        order: ch.order_keys(store)?,
-        structured,
         services: ch
             .services()
             .iter()
             .map(|(tag, addr)| (tag.clone(), *addr))
             .collect(),
-        shares: ch.shares(),
         synced: ch.is_settled(),
         equivocations: ch.equivocations(),
         creator: ch.genesis().creator_pubkey().fingerprint(),
-        consented: ch.consented().into_iter().collect(),
-        admins: ch.admins(now),
+        member_consent,
+        governance_revision: ch.governance_revision(store)?,
         consenting: consenting.into_iter().collect(),
-        offer_bases: ch.offer_bases(),
+        offer_bases: ch.offer_bases(store)?,
         trusted_by: trusted_by
             .into_iter()
             .map(|(member, by)| (member, by.into_iter().collect()))
@@ -419,13 +366,23 @@ fn detail_of(
         received_key_generations: ch.received_key_generations(),
         frozen,
         refused_below_checkpoint,
-        read_by: ch.read_by_own(),
+        read_by: ch.read_by_own(store)?,
         held: ch.held_own(store)?,
-        unread: ch.unread(),
+        unread: ch.unread(store)?,
         drive_from: ch.drive_from(store)?,
-        session_files: ch.session_files(),
-        session_records: ch.session_records(),
+        session_revision: ch.sessions_revision(store)?,
     })
+}
+
+/// A pending bounded Session fold is not an I/O failure. Keep the last good
+/// display while exact Session queries refuse; real local failures still poison.
+fn detail_failed(ch: &mut ChannelState, error: &Error) {
+    if !matches!(
+        error,
+        Error::StreamRefused("Session control facts are refreshing")
+    ) {
+        ch.poison(error);
+    }
 }
 
 /// A room's lock if it can be had by `deadline`. A free lock is taken even once the deadline has
@@ -641,9 +598,11 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::Stopped { .. } => "shutting the network down",
         NetEvent::AppDial(_) => "reaching a peer for an app stream",
         NetEvent::Status(_) => "reporting status",
-        NetEvent::Names(_) => "resolving a .vox name",
-        NetEvent::SessionPage { .. } => "reading a page of a room's Session entries",
+        NetEvent::Names(_) | NetEvent::Resolve { .. } => "resolving a .vox name",
+        NetEvent::SessionActivity { .. } => "reading a page of a room's Session entries",
         NetEvent::RoomHistory { .. } => "reading a page of a room's history",
+        NetEvent::SessionProjection { .. } => "reading bounded Session metadata",
+        NetEvent::SessionFiles { .. } => "reading bounded Session file offers",
         NetEvent::MemberDialer(_) => "lending the proxy its dialer",
         NetEvent::ComputerPolicy(_) => "applying computer trust",
         NetEvent::LocalTrustBlacklist(_) => "reading local trust removal decisions",
@@ -1030,22 +989,30 @@ enum NetEvent {
     /// A `.vox` name is being resolved (PRD-001 R20): answer with a snapshot of this
     /// node's rooms and keyring names.
     Names(oneshot::Sender<crate::node::resolver::VoxResolver>),
-    /// One page of the Session entries this node can read in a room (ADR-029 SC-2; ADR-034
-    /// FR-5), or `None` if the room is not open.
-    SessionPage {
-        /// The room.
+    Resolve {
+        name: String,
+        reply: oneshot::Sender<std::result::Result<crate::node::resolver::ServiceRoom, String>>,
+    },
+    SessionActivity {
         channel_id: Digest32,
-        /// Whose entries.
-        which: crate::node::drive::SessionFilter,
-        /// The page ends before this entry; the newest when `None`.
-        before: Option<Digest32>,
-        /// At most this many rows.
-        max_rows: usize,
-        /// At most this many bytes of body and id.
-        max_bytes: usize,
-        /// Where the answer goes.
-        reply:
-            oneshot::Sender<Option<std::result::Result<crate::node::drive::SessionPage, String>>>,
+        query: crate::node::channel::session_projection::ActivityQuery,
+        reply: oneshot::Sender<
+            std::result::Result<crate::node::channel::session_projection::ActivityReply, String>,
+        >,
+    },
+    SessionProjection {
+        channel_id: Digest32,
+        query: crate::node::channel::session_projection::Query,
+        reply: oneshot::Sender<
+            std::result::Result<crate::node::channel::session_projection::Reply, String>,
+        >,
+    },
+    SessionFiles {
+        channel_id: Digest32,
+        query: crate::node::channel::session_projection::FileQuery,
+        reply: oneshot::Sender<
+            std::result::Result<crate::node::channel::session_projection::FileReply, String>,
+        >,
     },
     RoomHistory {
         channel_id: Digest32,
@@ -1564,6 +1531,8 @@ enum NetEvent {
         reply: oneshot::Sender<Outcome>,
         /// The room.
         channel_id: Digest32,
+        /// The exact open operation; close/lock invalidate it before publication.
+        opening: Arc<()>,
         /// The opened room, or why it would not open.
         opened: Box<crate::error::Result<ChannelState>>,
     },
@@ -4067,30 +4036,67 @@ impl NodeHandle {
             .map_err(|_| crate::error::Error::Unreachable("the node has stopped"))
     }
 
-    /// One page of the Session entries this node can read in a room (ADR-029 SC-2: its own, and
-    /// each node's that released it its drive key), as
-    /// [`crate::node::drive::SessionLog::page`] gives it; `None` if the room is not open.
-    pub async fn session_page(
+    /// One bounded activity lookup. No transcript or snapshot survives this reply.
+    pub(crate) async fn session_activity(
         &self,
         channel_id: Digest32,
-        which: crate::node::drive::SessionFilter,
-        before: Option<Digest32>,
-        max_rows: usize,
-        max_bytes: usize,
-    ) -> Option<std::result::Result<crate::node::drive::SessionPage, String>> {
+        query: crate::node::channel::session_projection::ActivityQuery,
+    ) -> std::result::Result<crate::node::channel::session_projection::ActivityReply, String> {
         let (reply, rx) = oneshot::channel();
         self.net_tx
-            .send(NetEvent::SessionPage {
+            .send(NetEvent::SessionActivity {
                 channel_id,
-                which,
-                before,
-                max_rows,
-                max_bytes,
+                query,
                 reply,
             })
             .await
-            .ok()?;
-        rx.await.ok()?
+            .map_err(|_| "the node has stopped".to_owned())?;
+        rx.await
+            .map_err(|_| "the node stopped before answering".to_owned())?
+    }
+
+    pub(crate) async fn session_projection(
+        &self,
+        channel_id: Digest32,
+        query: crate::node::channel::session_projection::Query,
+    ) -> std::result::Result<crate::node::channel::session_projection::Reply, String> {
+        let (reply, rx) = oneshot::channel();
+        self.net_tx
+            .send(NetEvent::SessionProjection {
+                channel_id,
+                query,
+                reply,
+            })
+            .await
+            .map_err(|_| "the node has stopped".to_owned())?;
+        rx.await
+            .map_err(|_| "the node stopped before answering".to_owned())?
+    }
+
+    /// Whether this node already retains the named own Session in this room.
+    /// A failed or incomplete read is an error, never proof of absence.
+    pub async fn session_seen(
+        &self,
+        room: Digest32,
+        id: &str,
+    ) -> std::result::Result<bool, String> {
+        let me = self
+            .view()
+            .identity
+            .as_ref()
+            .map(|i| i.fingerprint)
+            .ok_or_else(|| "the node is locked".to_owned())?;
+        crate::node::sessions::lookup(self, room, me, id)
+            .await
+            .map(|row| row.is_some())
+    }
+
+    /// A bounded history reader that does not hold this node alive.
+    #[must_use]
+    pub fn history_reader(&self) -> HistoryReader {
+        HistoryReader {
+            tx: self.net_tx.downgrade(),
+        }
     }
 
     /// One bounded selected-room query. No snapshot or room lock crosses this reply.
@@ -4099,16 +4105,7 @@ impl NodeHandle {
         channel_id: Digest32,
         query: crate::node::channel::history::Query,
     ) -> std::result::Result<crate::node::channel::history::Reply, String> {
-        let (reply, rx) = oneshot::channel();
-        self.net_tx
-            .send(NetEvent::RoomHistory {
-                channel_id,
-                query,
-                reply,
-            })
-            .await
-            .map_err(|_| "the node has stopped".to_owned())?;
-        rx.await.map_err(|_| "the node has stopped".to_owned())?
+        query_history(&self.net_tx, channel_id, query).await
     }
 
     /// Borrow metadata directly: cloning NodeView also clones every room's complete order.
@@ -4185,34 +4182,37 @@ impl NodeHandle {
         view
     }
 
-    /// An opaque cache token for one open room's published rows and display names (#754).
-    /// Borrows the watch: no timeline scan, snapshot construction or retained view clone.
-    /// Name hashing is proportional to the current keyring/presentations, not room history.
-    /// Callers discard tokens when replacing their selected-node connection.
-    pub(crate) fn room_display_revision(&self, channel_id: &Digest32) -> Option<Digest32> {
-        use sha2::{Digest, Sha256};
-        let view = self.view_rx.borrow();
-        let detail = view
-            .open_channels
-            .iter()
-            .find(|d| &d.channel_id == channel_id)?;
-        let mut hash = Sha256::new();
-        hash.update(b"vox-room-display-revision-v1");
-        hash.update(self.display_incarnation);
-        hash.update(view.identity.as_ref()?.fingerprint);
-        hash.update(channel_id);
-        hash.update(detail.display_revision.to_be_bytes());
-        // Alias collisions depend on the whole keyring. A name change can alter a shown
-        // author's suffix even when the renamed fingerprint is not a thread participant.
-        for names in [&view.trusted, &view.presented] {
-            hash.update((names.len() as u64).to_be_bytes());
-            for (fingerprint, name) in names {
-                hash.update(fingerprint);
-                hash.update((name.len() as u64).to_be_bytes());
-                hash.update(name.as_bytes());
-            }
+    /// Current Session token with actor lifetime and effective local policy. Reopening
+    /// a held connection to a replacement actor cannot alias its old cached token.
+    pub(crate) fn session_display_token(&self, detail: &ChannelDetail, current: bool) -> Digest32 {
+        crate::hash::sha256_concat(&[
+            b"vox/session-view/v1",
+            &self.display_incarnation,
+            &detail.channel_id,
+            &detail.session_revision,
+            &[u8::from(current)],
+        ])
+    }
+
+    /// An opaque token for the authoritative selected history and current display names.
+    /// The actor reads the sealed revision under the same gate and room lock as Find; a
+    /// busy room cannot substitute an older published watch value. No rows are collected.
+    pub(crate) async fn room_display_revision(
+        &self,
+        channel_id: &Digest32,
+    ) -> std::result::Result<Digest32, String> {
+        use crate::node::channel::history::{Query, Reply};
+        match self
+            .room_history(*channel_id, Query::DisplayRevision)
+            .await?
+        {
+            Reply::DisplayRevision(revision) => Ok(crate::hash::sha256_concat(&[
+                b"vox-room-display-revision-v2",
+                &self.display_incarnation,
+                &revision,
+            ])),
+            _ => Err("unexpected history revision answer".into()),
         }
-        Some(hash.finalize().into())
     }
 
     /// A receiver that resolves whenever the view changes.
@@ -4224,51 +4224,64 @@ impl NodeHandle {
     /// The services shared in an open room (V030-25): each address readable, as **this** node
     /// writes it — its own aliases for the node and the room where it has them, the fingerprints
     /// where it has not — and canonical (ADR-028 S-1), with its sharer as this node names them,
-    /// and whether the sharer trusts this node and is reachable now (ADR-028 S-3); or `None` if
-    /// the room is not open.
-    pub async fn shared_in(
+    /// and whether the sharer trusts this node and is reachable now (ADR-028 S-3).
+    /// A closed room or stale revision returns an explicit error.
+    pub async fn shared_page(
         &self,
         channel_id: Digest32,
-    ) -> Option<Vec<crate::node::ipc::SharedService>> {
-        let detail = self.open_detail(channel_id).await?;
-        let (tx, rx) = oneshot::channel();
-        self.net_tx.send(NetEvent::Names(tx)).await.ok()?;
-        let names = rx.await.ok()?;
-        let (me, connected) = {
-            let view = self.view_rx.borrow();
-            (
-                view.identity.as_ref().map(|i| i.fingerprint),
-                view.connected_peers.clone(),
-            )
+        after: Option<(Digest32, Digest32)>,
+        revision: Option<u64>,
+    ) -> std::result::Result<
+        (
+            Vec<crate::node::ipc::SharedService>,
+            Option<(Digest32, Digest32)>,
+            u64,
+        ),
+        String,
+    > {
+        use crate::node::{
+            api::{GovernancePage, GovernanceQuery},
+            channel::history::{Query, Reply},
         };
-        Some(
-            detail
-                .shares
-                .iter()
-                .map(|s| {
-                    let who = if Some(s.host) == me {
-                        "you".to_owned()
-                    } else {
-                        names.alias_of(&s.host)
-                    };
-                    crate::node::ipc::SharedService {
-                        address: names.address_of(&channel_id, &s.host, &s.name),
-                        canonical: crate::node::resolver::canonical_address(
-                            &channel_id,
-                            &s.host,
-                            &s.name,
-                        ),
-                        by: who,
-                        udp: s.udp,
-                        kind: s.kind.as_str().to_owned(),
-                        // Off the room's log: the sharer consents to this node reading it, which
-                        // its node does for a member it trusts (ADR-020 §3).
-                        trusts_you: Some(s.host) == me || detail.consenting.contains(&s.host),
-                        online: Some(s.host) == me || connected.contains(&s.host),
-                    }
-                })
-                .collect(),
-        )
+        let Reply::Governance(GovernancePage::Shares {
+            rows,
+            next,
+            revision,
+        }) = self
+            .room_history(
+                channel_id,
+                Query::Governance(GovernanceQuery::Shares { after, revision }),
+            )
+            .await?
+        else {
+            return Err("unexpected service page reply".into());
+        };
+        let detail = self.open_detail(channel_id).await.ok_or("room not open")?;
+        let (tx, rx) = oneshot::channel();
+        self.net_tx
+            .send(NetEvent::Names(tx))
+            .await
+            .map_err(|_| "the node has stopped")?;
+        let names = rx.await.map_err(|_| "the node has stopped")?;
+        let view = self.view_rx.borrow();
+        let me = view.identity.as_ref().map(|i| i.fingerprint);
+        let shared = rows
+            .into_iter()
+            .map(|s| crate::node::ipc::SharedService {
+                address: names.address_of(&channel_id, &s.host, &s.name),
+                canonical: crate::node::resolver::canonical_address(&channel_id, &s.host, &s.name),
+                by: if Some(s.host) == me {
+                    "you".to_owned()
+                } else {
+                    names.alias_of(&s.host)
+                },
+                udp: s.udp,
+                kind: s.kind.as_str().to_owned(),
+                trusts_you: Some(s.host) == me || detail.consenting.contains(&s.host),
+                online: Some(s.host) == me || view.connected_peers.contains(&s.host),
+            })
+            .collect();
+        Ok((shared, next, revision))
     }
 
     /// A room's detail, or `None` if this node does not hold the room open (V210-149).
@@ -4417,8 +4430,27 @@ struct PendingWithdrawal {
     routes: BTreeMap<Digest32, Vec<std::net::SocketAddr>>,
 }
 
+/// An opened room stays private until one bounded recovery/retention turn completes.
+/// Only its original caller is held; no transcript-sized task or waiter list is retained.
+struct RoomPreparation {
+    channel: tokio::sync::Mutex<ChannelState>,
+    reply: Option<oneshot::Sender<Outcome>>,
+    reopening: bool,
+    recovery: Option<std::sync::Weak<tokio::sync::Mutex<ChannelState>>>,
+}
+
+/// One original open/create/join reply, fenced to the room it actually published.
+/// Reopens use the same completion without retaining an individual reply.
+struct RoomPublication {
+    instance: std::sync::Weak<tokio::sync::Mutex<ChannelState>>,
+    reply: Option<oneshot::Sender<Outcome>>,
+    outcome: Outcome,
+    reopening: bool,
+}
+
 /// The node actor's state (owned by its task).
 pub struct Node {
+    governance_work: governance::Maintenance,
     paths: Paths,
     store_recovery: BTreeMap<Digest32, recovery::Retry>,
     store_recovered: BTreeMap<Digest32, String>,
@@ -4617,6 +4649,14 @@ pub struct Node {
     /// The reopening task, aborted at lock: it holds room keys, and a locked node holds none
     /// (ADR-015).
     reopen_task: Option<tokio::task::JoinHandle<()>>,
+    /// One unpublished state per room being prepared; round-robin bounded actor turns.
+    preparing_rooms: BTreeMap<Digest32, RoomPreparation>,
+    preparation_after: Option<Digest32>,
+    /// One pending bit per open room; true requests a replay of retained package locators.
+    key_package_rooms: BTreeMap<Digest32, bool>,
+    key_package_after: Option<Digest32>,
+    /// Exact off-actor unwraps; a close/lock cannot be undone by their late result.
+    opening_rooms: BTreeMap<Digest32, Arc<()>>,
     /// Unlock replies held until the reopening has finished (#208).
     unlock_waiters: Vec<oneshot::Sender<Outcome>>,
     /// Locks begun whose settling — the wait for work still holding a secret — has not reported
@@ -4663,9 +4703,12 @@ pub struct Node {
     /// `(room, board)` pairs whose last publish round **failed**, with how many times in a row. A
     /// retry for each is scheduled on a backoff; see [`publish_retry_after`].
     publish_failures: std::collections::BTreeMap<(Digest32, Digest32), u32>,
-    /// Creates and joins answered once their room's publish rounds have ended: see
-    /// `answer_when_published`.
-    publish_waiters: Vec<(Digest32, oneshot::Sender<Outcome>, Outcome)>,
+    /// One completion per room, after current detail is published and any required
+    /// initial anchor round ends. Neither room keys nor a snapshot survive a wait.
+    publish_waiters: BTreeMap<Digest32, RoomPublication>,
+    publication_after: Option<Digest32>,
+    publication_pending: bool,
+    publication_again: bool,
     /// `(room, board)` pairs whose last publish round left the board holding the room (`holds_room`),
     /// until it reconnects: the boards an address may name (V210-96; see `Node::begin_invite`).
     on_board: std::collections::BTreeSet<(Digest32, Digest32)>,
@@ -4718,10 +4761,8 @@ pub struct Node {
     /// entry is removed once a view reads the room under its lock, since that read includes the
     /// write: an entry here is therefore always newer than the published one.
     fresh_details: BTreeMap<Digest32, (ChannelSummary, ChannelDetail)>,
-    /// Per room, the entries shown to this node's person or drained into its agent's turn and not
-    /// yet named by a read record of its own, and when it last posted one (ms): ADR-028 RR-2's
-    /// "at most one per room per 5 seconds" ([`READ_RECORD_EVERY_MS`]).
-    reads_pending: BTreeMap<Digest32, (BTreeSet<Digest32>, u64)>,
+    /// Fair room cursor for bounded publication of durably accepted local read marks.
+    reads_after: Option<Digest32>,
     /// What this node decided, kept on its disk for 14 days (ADR-028 §7).
     decisions: crate::node::decisions::DecisionLog,
     /// Rooms this node holds ended, passing the end on before it deletes them (V030-08).
@@ -4737,6 +4778,10 @@ pub struct Node {
     /// tick does not send it another. Without it, a pair that could not converge was sent a key
     /// once a tick for as long as both ran: 560 refusals in 3 minutes, measured.
     key_backoff: BTreeMap<(Digest32, Digest32), (u32, u64)>,
+    /// One progress cursor per open room, not a materialized set of every historical consenter.
+    rekey_after: BTreeMap<Digest32, Digest32>,
+    history_after: BTreeMap<Digest32, Digest32>,
+    untrusted_after: BTreeMap<Digest32, Digest32>,
     /// Set when this node adopted a peer's session over its own (ADR-004 O3): what it owes that
     /// peer goes out as soon as the stream that carried the hello is answered, not on the tick.
     redeliver_now: bool,
@@ -4971,7 +5016,7 @@ fn consent_release(
         ))?;
         return Ok((live, Some(plan)));
     }
-    let plan = channel.history_plan(&target, decision);
+    let plan = channel.history_plan(profile.store(), &target, decision)?;
     if let Some(&(live, from)) = plan.as_ref().and_then(|p| p.last()) {
         return Ok((channel.release_generation(profile, live, from)?, plan));
     }
@@ -5217,6 +5262,11 @@ impl Node {
             joins_answered: BTreeMap::new(),
             reopening: std::collections::BTreeSet::new(),
             reopen_task: None,
+            preparing_rooms: BTreeMap::new(),
+            preparation_after: None,
+            key_package_rooms: BTreeMap::new(),
+            key_package_after: None,
+            opening_rooms: BTreeMap::new(),
             unlock_waiters: Vec::new(),
             locking: 0,
             unlock_after_lock: Vec::new(),
@@ -5234,7 +5284,10 @@ impl Node {
             republish_pending: std::collections::BTreeSet::new(),
             stale_held: std::collections::BTreeSet::new(),
             publish_failures: std::collections::BTreeMap::new(),
-            publish_waiters: Vec::new(),
+            publish_waiters: BTreeMap::new(),
+            publication_after: None,
+            publication_pending: false,
+            publication_again: false,
             on_board: std::collections::BTreeSet::new(),
             publish_trouble: BTreeMap::new(),
             address_waiters: Vec::new(),
@@ -5252,11 +5305,15 @@ impl Node {
             nearby_rooms: 0,
             nearby_dialed: BTreeMap::new(),
             fresh_details: BTreeMap::new(),
-            reads_pending: BTreeMap::new(),
+            reads_after: None,
             winding: BTreeMap::new(),
             departed_seen: BTreeMap::new(),
             withdrawn: BTreeMap::new(),
+            governance_work: governance::Maintenance::default(),
             key_backoff: BTreeMap::new(),
+            rekey_after: BTreeMap::new(),
+            history_after: BTreeMap::new(),
+            untrusted_after: BTreeMap::new(),
             redeliver_now: false,
             reoffer: BTreeSet::new(),
             keys_in_flight: BTreeMap::new(),
@@ -5376,6 +5433,9 @@ impl Node {
             node.paths.clone(),
             cmd_tx.downgrade(),
             node.view_tx.subscribe(),
+            HistoryReader {
+                tx: handle_net_tx.downgrade(),
+            },
             handle_event_tx.clone(),
         );
         let paths = node.paths.clone();
@@ -5418,8 +5478,35 @@ impl Node {
         // A `Shutdown`'s reply, held until the node is actually gone: see the end of this function.
         let mut shutdown_reply: Option<oneshot::Sender<Outcome>> = None;
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Preparation, governance and package scans share one select slot. Rotate between
+        // ready classes; each retains its own room cursor and yields after one bounded turn.
+        let mut maintenance_next = 0u8;
         loop {
             tokio::select! {
+                () = tokio::task::yield_now(), if self.governance_work.pending || !self.preparing_rooms.is_empty() || self.publication_pending || self.key_package_work_ready() => {
+                    if self.apply_computer_keyring().await.is_err() { continue; }
+                    for _ in 0..3 {
+                        let turn = maintenance_next;
+                        maintenance_next = (maintenance_next + 1) % 3;
+                        match turn {
+                            0 if !self.preparing_rooms.is_empty() || self.publication_pending => {
+                                self.advance_room_preparation().await;
+                                break;
+                            }
+                            1 if self.governance_work.pending => {
+                                self.advance_governance_turn().await;
+                                self.publication_pending |= !self.publish_waiters.is_empty();
+                                self.publication_again |= !self.publish_waiters.is_empty();
+                                break;
+                            }
+                            2 if self.key_package_work_ready() => {
+                                self.advance_key_package_turn().await;
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 received = cmd_rx.recv() => {
                     let Some((command, reply)) = received else { break };
                     let shutdown = matches!(command, NodeCommand::Shutdown);
@@ -5437,6 +5524,13 @@ impl Node {
                     // is published or scheduled for it.
                     if matches!(command, NodeCommand::Ping) {
                         let _ = reply.send(Outcome::Done);
+                        continue;
+                    }
+                    self.governance_work.pending = true;
+                    self.publication_pending |= !self.publish_waiters.is_empty();
+                    self.publication_again |= !self.publish_waiters.is_empty();
+                    if let NodeCommand::SetAdmin { channel_id, member, admin: false } = command {
+                        self.begin_admin_removal(channel_id, member, reply);
                         continue;
                     }
                     // **Answered off the actor.** Checking the identity passphrase is production
@@ -5600,6 +5694,9 @@ impl Node {
                     self.schedule().await;
                 }
                 Some(event) = net_rx.recv() => {
+                    self.governance_work.pending = true;
+                    self.publication_pending |= !self.publish_waiters.is_empty();
+                    self.publication_again |= !self.publish_waiters.is_empty();
                     if !matches!(&event, NetEvent::ComputerPolicy(_)) && self.apply_computer_keyring().await.is_err() { continue; }
                     let name = net_event_name(&event);
                     let started = std::time::Instant::now();
@@ -5621,6 +5718,9 @@ impl Node {
                     }
                 }
                 _ = ticker.tick() => {
+                    self.governance_work.pending = true;
+                    self.publication_pending |= !self.publish_waiters.is_empty();
+                    self.publication_again |= !self.publish_waiters.is_empty();
                     if self.apply_computer_keyring().await.is_err() { continue; }
                     if let Some(net) = self.net.as_ref() {
                         // Connections a better path displaced are closed once their
@@ -5654,7 +5754,7 @@ impl Node {
                     self.deliver_owed_consents(None).await;
                     // Drive keys too (ADR-029 SC-2a, SC-2b): changed if a holder lost drive,
                     // and released to whoever is owed one.
-                    self.tend_drive_keys().await;
+                    let sessions_changed = self.tend_drive_keys().await;
                     self.tend_private_sessions().await;
                     let peers: Vec<_> = self.net.as_ref().map(|n| n.manager().peers()).unwrap_or_default();
                     for peer in peers { self.pull_presentation(peer); }
@@ -5669,7 +5769,7 @@ impl Node {
                     // connection died (D1a) and raises the periodic request (D7).
                     self.sync_tick().await;
                     let ran = self.schedule().await;
-                    if ran || tended || pruned || self.paths_moved() {
+                    if ran || tended || pruned || sessions_changed || self.paths_moved() {
                         self.publish().await;
                     }
                     // Retention on every tick: the index is ordered by age, so a pass that
@@ -5678,7 +5778,7 @@ impl Node {
                         self.publish().await;
                     }
                     // A read record held back by the 5-second batch goes out when it is due.
-                    self.flush_reads().await;
+                    if self.flush_reads().await { self.publish().await; }
                     // A folded decision's count is written once its hour is over (ADR-028 D-1).
                     self.decisions.flush_folded((self.millis_clock)());
                 }
@@ -5841,7 +5941,11 @@ impl Node {
             NodeCommand::MarkRead {
                 channel_id,
                 entries,
-            } => self.mark_read(&channel_id, entries).await,
+                expected_instance,
+            } => {
+                self.mark_read(&channel_id, entries, expected_instance)
+                    .await
+            }
             NodeCommand::Invite { channel_id } => self.invite(&channel_id).await,
             // Answered through `begin_join_channel`, which the run loop calls instead of this; a
             // join reaching here would have to be answered inline, which is the stall that
@@ -6758,15 +6862,243 @@ impl Node {
         reply: oneshot::Sender<Outcome>,
         outcome: Outcome,
     ) {
-        if outcome.is_done()
-            && self.own_routes().is_empty()
-            && self.publishing.iter().any(|(r, _)| *r == room)
-        {
-            self.publish_waiters.push((room, reply, outcome));
+        if outcome.is_done() {
+            self.queue_room_publication(room, Some(reply), outcome, false);
             return;
         }
         self.publish().await;
         let _ = reply.send(outcome);
+    }
+
+    fn queue_room_publication(
+        &mut self,
+        room: Digest32,
+        reply: Option<oneshot::Sender<Outcome>>,
+        outcome: Outcome,
+        reopening: bool,
+    ) {
+        let Some(shared) = self.channels.get(&room) else {
+            if let Some(reply) = reply {
+                let _ = reply.send(Outcome::Failed(Fault::ChannelNotOpen));
+            }
+            self.reopening.remove(&room);
+            self.answer_prepared_unlocks();
+            return;
+        };
+        if let Some(waiting) = self.publish_waiters.get_mut(&room) {
+            waiting.reopening |= reopening;
+            if waiting.reply.is_none() {
+                waiting.reply = reply;
+                waiting.outcome = outcome;
+            } else if let Some(reply) = reply {
+                // One original caller per room; repeated requests cannot build a waiter list.
+                let _ = reply.send(Outcome::Failed(Fault::ChannelNotOpen));
+            }
+        } else {
+            self.publish_waiters.insert(
+                room,
+                RoomPublication {
+                    instance: Arc::downgrade(shared),
+                    reply,
+                    outcome,
+                    reopening,
+                },
+            );
+        }
+        self.publication_pending = true;
+        self.publication_again = true;
+        self.governance_work.pending = true;
+    }
+
+    /// Check one completion per turn. A room's post-open narrowing writes can make
+    /// governance pending again, so holding the room is not yet a successful publication.
+    async fn advance_room_publication(&mut self) {
+        if !self.publication_pending {
+            return;
+        }
+        use std::ops::Bound::{Excluded, Unbounded};
+        let next = match self.publication_after {
+            Some(after) => self
+                .publish_waiters
+                .range((Excluded(after), Unbounded))
+                .next(),
+            None => self.publish_waiters.first_key_value(),
+        }
+        .map(|(id, _)| *id);
+        let Some(room) = next else {
+            self.publication_after = None;
+            self.publication_pending = std::mem::take(&mut self.publication_again);
+            return;
+        };
+        self.publication_after = Some(room);
+        let Some(mut waiting) = self.publish_waiters.remove(&room) else {
+            return;
+        };
+        let checked = (|| -> crate::error::Result<Option<(ChannelSummary, ChannelDetail)>> {
+            let profile = self
+                .profile
+                .as_ref()
+                .filter(|p| p.is_unlocked())
+                .ok_or(Error::AtRestLocked)?;
+            let shared = self
+                .channels
+                .get(&room)
+                .zip(waiting.instance.upgrade())
+                .filter(|(current, original)| Arc::ptr_eq(current, original))
+                .map(|(current, _)| current)
+                .ok_or(Error::Profile("room publication instance changed"))?;
+            let Ok(mut channel) = shared.try_lock() else {
+                return Ok(None);
+            };
+            channel.require_governance_ready(profile.store(), self.now_ms())?;
+            channel.advance_sessions(profile.store(), self.now_ms().get())?;
+            let view = self.view_tx.borrow();
+            let previous = view
+                .open_channels
+                .iter()
+                .find(|detail| detail.channel_id == room);
+            match detail_of(
+                &channel,
+                profile.store(),
+                previous,
+                self.now_ms(),
+                &self.display_sequence,
+            ) {
+                Ok(detail) => Ok(Some((summary_of(&channel), detail))),
+                Err(error) => {
+                    detail_failed(&mut channel, &error);
+                    Err(error)
+                }
+            }
+        })();
+        let (summary, detail) = match checked {
+            Ok(Some(detail)) => detail,
+            Ok(None) => {
+                self.publish_waiters.insert(room, waiting);
+                return;
+            }
+            Err(error)
+                if ChannelState::governance_refreshing(&error)
+                    || ChannelState::legacy_classification_refreshing(&error)
+                    || matches!(
+                        error,
+                        Error::StreamRefused("Session control facts are refreshing")
+                    ) =>
+            {
+                self.publication_again = true;
+                self.publish_waiters.insert(room, waiting);
+                return;
+            }
+            Err(error) => {
+                let fault = if matches!(error, Error::Profile("room publication instance changed"))
+                {
+                    Fault::ChannelNotOpen
+                } else {
+                    fault_of(&error)
+                };
+                self.fail_room_publication(room, waiting, fault);
+                return;
+            }
+        };
+        self.fresh_details.insert(room, (summary, detail));
+        self.publish().await;
+        let published = (|| -> crate::error::Result<Option<bool>> {
+            let profile = self
+                .profile
+                .as_ref()
+                .filter(|p| p.is_unlocked())
+                .ok_or(Error::AtRestLocked)?;
+            let shared = self
+                .channels
+                .get(&room)
+                .zip(waiting.instance.upgrade())
+                .filter(|(current, original)| Arc::ptr_eq(current, original))
+                .map(|(current, _)| current)
+                .ok_or(Error::Profile("room publication instance changed"))?;
+            let Ok(channel) = shared.try_lock() else {
+                return Ok(None);
+            };
+            channel.require_governance_ready(profile.store(), self.now_ms())?;
+            let view = self.view_tx.borrow();
+            let Some(detail) = view
+                .open_channels
+                .iter()
+                .find(|detail| detail.channel_id == room)
+            else {
+                return Ok(Some(false));
+            };
+            // A later chat row need not hold an open reply hostage. The published
+            // room must have this incarnation and current policy/drive authority.
+            Ok(Some(
+                detail.history_instance == channel.history_instance(profile.store())?
+                    && detail.governance_revision
+                        == channel.governance_revision(profile.store())?
+                    && detail.drive_from == channel.drive_from(profile.store())?,
+            ))
+        })();
+        match published {
+            Ok(Some(true)) => {}
+            Ok(None) => {
+                self.publish_waiters.insert(room, waiting);
+                return;
+            }
+            Ok(Some(false)) => {
+                self.publication_again = true;
+                self.publish_waiters.insert(room, waiting);
+                return;
+            }
+            Err(error)
+                if ChannelState::governance_refreshing(&error)
+                    || ChannelState::legacy_classification_refreshing(&error)
+                    || matches!(
+                        error,
+                        Error::StreamRefused("Session control facts are refreshing")
+                    ) =>
+            {
+                self.publication_again = true;
+                self.publish_waiters.insert(room, waiting);
+                return;
+            }
+            Err(error) => {
+                let fault = if matches!(error, Error::Profile("room publication instance changed"))
+                {
+                    Fault::ChannelNotOpen
+                } else {
+                    fault_of(&error)
+                };
+                self.fail_room_publication(room, waiting, fault);
+                return;
+            }
+        }
+        if waiting.reopening {
+            self.reopening.remove(&room);
+            waiting.reopening = false;
+            self.answer_prepared_unlocks();
+        }
+        // Unlock waits for its held-room view, not an unnecessary anchor. Explicit
+        // create/join/open replies keep the original routing condition.
+        if waiting.reply.is_some()
+            && self.own_routes().is_empty()
+            && self.publishing.iter().any(|(id, _)| *id == room)
+        {
+            self.publish_waiters.insert(room, waiting);
+            return;
+        }
+        if let Some(reply) = waiting.reply {
+            let _ = reply.send(waiting.outcome);
+        }
+    }
+
+    fn fail_room_publication(&mut self, room: Digest32, waiting: RoomPublication, fault: Fault) {
+        if let Some(reply) = waiting.reply {
+            let _ = reply.send(Outcome::Failed(fault));
+        }
+        if waiting.reopening {
+            self.reopening.remove(&room);
+            for reply in std::mem::take(&mut self.unlock_waiters) {
+                let _ = reply.send(Outcome::Failed(fault));
+            }
+        }
     }
 
     /// Keep a failed publish round from being the last word for that `(room, board)`.
@@ -7323,6 +7655,15 @@ impl Node {
         };
         let (anchors, own, members, settled) = {
             let channel = shared.lock().await;
+            let Some(profile) = self.profile.as_ref() else {
+                return;
+            };
+            if channel
+                .require_governance_ready(profile.store(), self.now_ms())
+                .is_err()
+            {
+                return; // Last-known anchors remain display data, never new dialing authority.
+            }
             let anchors = channel.anchors();
             // A known member is reached through the member ladder, even if the room's
             // statement names it; it must not become an anchor-only dial.
@@ -7574,48 +7915,13 @@ impl Node {
                 channel_id,
                 channel,
             } => {
-                // Held only if it is still wanted: closed while it was opening, the identity
-                // locked meanwhile, or opened by hand in between — each drops it, and its keys
-                // zeroize with it.
-                let wanted = self.reopening.remove(&channel_id)
+                if self.reopening.contains(&channel_id)
                     && !self.channels.contains_key(&channel_id)
-                    && self.profile.as_ref().is_some_and(Profile::is_unlocked);
-                if wanted {
-                    // Everything `open_channel` does to a room it opens: a room reopened after an
-                    // unlock is the same room, and a restart is exactly when its members have to
-                    // be dialled from where they were last reached (`node::peer_book`).
-                    let mut channel = *channel;
-                    if let Err(e) = self.retention_before_publication(&mut channel).await {
-                        let _ = self.event_tx.send(NodeEvent::NodeNote {
-                            note: format!(
-                                "room {} did not reopen: {e}; it stays closed",
-                                crate::node::link::b32_encode(&channel_id)
-                            ),
-                        });
-                        return;
-                    }
-                    crate::node::status::SyncBook::note_set_aside(
-                        &self.sync_book,
-                        channel_id,
-                        channel.set_aside(),
-                    );
-                    self.channels
-                        .insert(channel_id, Arc::new(tokio::sync::Mutex::new(channel)));
-                    self.mark_decisions_on_open(&channel_id).await;
-                    self.resume_leave(&channel_id).await;
-                    self.act_on_removals_while_closed(&channel_id).await;
-                    self.adopt_channel_anchors(&channel_id).await;
-                    self.refresh_network_view().await;
-                    // Who may reach this room's services and apps: the app gate holds no room it
-                    // was not told about, and refused every dial here with "this node does not
-                    // hold that room" until a sync happened to refresh it (#227, family-LAN proof).
-                    self.refresh_reachers().await;
-                    self.publish_channel_locally(&channel_id).await;
-                    self.publish_channel_to_anchors(&channel_id, PublishCause::Opened)
-                        .await;
-                    self.install_key_packages(&channel_id).await;
-                    self.reach_members_of(&channel_id).await;
-                    let _ = self.event_tx.send(NodeEvent::ChannelOpened { channel_id });
+                    && self.profile.as_ref().is_some_and(Profile::is_unlocked)
+                {
+                    self.queue_room_preparation(*channel, None, true);
+                } else {
+                    self.reopening.remove(&channel_id);
                 }
             }
             NetEvent::ReopenGone { channel_id } => {
@@ -7623,6 +7929,7 @@ impl Node {
                 let _ = self.forget_open(&channel_id);
             }
             NetEvent::ReopenFailed { channel_id, why } => {
+                self.reopening.remove(&channel_id);
                 let _ = self.event_tx.send(NodeEvent::NodeNote {
                     note: format!(
                         "room {} did not reopen: {why}; it stays closed",
@@ -7643,11 +7950,17 @@ impl Node {
                     .await;
             }
             NetEvent::ReopenFinished => {
-                self.reopening.clear();
                 self.reopen_task = None;
-                for reply in std::mem::take(&mut self.unlock_waiters) {
-                    let _ = reply.send(Outcome::Done);
-                }
+                // Opening the store is finished; bounded private preparation may still
+                // be pending. Unlock must not report Ready before those rooms are held.
+                self.reopening.retain(|room| {
+                    self.preparing_rooms.contains_key(room)
+                        || self
+                            .publish_waiters
+                            .get(room)
+                            .is_some_and(|waiting| waiting.reopening)
+                });
+                self.answer_prepared_unlocks();
             }
             NetEvent::HandshakesQueued {
                 waited,
@@ -8050,19 +8363,35 @@ impl Node {
             NetEvent::ChannelUnsealed {
                 reply,
                 channel_id,
+                opening,
                 opened,
             } => {
-                let outcome = match *opened {
-                    // Opened meanwhile by another command, or by the reopening: that one is held.
-                    _ if self.channels.contains_key(&channel_id) => Outcome::Done,
-                    // Locked meanwhile: a locked node holds no room key (ADR-015).
-                    _ if !self.profile.as_ref().is_some_and(Profile::is_unlocked) => {
-                        Outcome::Failed(Fault::NoIdentity)
+                if !self
+                    .opening_rooms
+                    .get(&channel_id)
+                    .is_some_and(|pending| Arc::ptr_eq(pending, &opening))
+                {
+                    if let Ok(mut room) = *opened {
+                        room.lock_now();
                     }
-                    Ok(ch) => self.finish_open_channel(ch).await,
-                    Err(e) => Outcome::Failed(fault_of(&e)),
+                    let _ = reply.send(Outcome::Failed(Fault::ChannelNotOpen));
+                    return;
+                }
+                self.opening_rooms.remove(&channel_id);
+                let outcome = match *opened {
+                    _ if self.channels.contains_key(&channel_id) => Some(Outcome::Done),
+                    _ if !self.profile.as_ref().is_some_and(Profile::is_unlocked) => {
+                        Some(Outcome::Failed(Fault::NoIdentity))
+                    }
+                    Ok(ch) => {
+                        self.queue_room_preparation(ch, Some(reply), false);
+                        return;
+                    }
+                    Err(e) => Some(Outcome::Failed(fault_of(&e))),
                 };
-                self.answer_when_published(channel_id, reply, outcome).await;
+                if let Some(outcome) = outcome {
+                    self.answer_when_published(channel_id, reply, outcome).await;
+                }
             }
             // Nothing to do but publish the view, which every event does once handled.
             NetEvent::BoardWithdrew => {}
@@ -8690,19 +9019,10 @@ impl Node {
                         ),
                     });
                 }
-                if !self.publishing.iter().any(|(room, _)| *room == channel_id) {
-                    let (ready, waiting): (Vec<_>, Vec<_>) =
-                        std::mem::take(&mut self.publish_waiters)
-                            .into_iter()
-                            .partition(|(room, _, _)| *room == channel_id);
-                    self.publish_waiters = waiting;
-                    if !ready.is_empty() {
-                        self.publish().await;
-                        for (_, reply, outcome) in ready {
-                            let _ = reply.send(outcome);
-                        }
-                    }
-                }
+                // The bounded completion cursor rechecks current room publication as
+                // well as the routing condition; an anchor reply cannot bypass either.
+                self.publication_pending |= !self.publish_waiters.is_empty();
+                self.publication_again |= !self.publish_waiters.is_empty();
                 if let Some(cause) = self.publish_again.remove(&(channel_id, board)) {
                     let conn = self.net.as_ref().and_then(|n| n.manager().existing(&board));
                     if let Some(conn) = conn {
@@ -9003,7 +9323,14 @@ impl Node {
                     if !self.trust.is_empty() {
                         let trusted = self.trust.trusted();
                         let owes = match self.channels.get(&channel_id).map(Arc::clone) {
-                            Some(shared) => !shared.lock().await.owed_consents(&trusted).is_empty(),
+                            Some(shared) => match self.profile.as_ref() {
+                                Some(profile) => shared
+                                    .lock()
+                                    .await
+                                    .owed_consents(profile.store(), &trusted)
+                                    .is_ok_and(|owed| !owed.is_empty()),
+                                None => false,
+                            },
                             None => false,
                         };
                         if owes {
@@ -9026,24 +9353,78 @@ impl Node {
             NetEvent::Status(reply) => {
                 let _ = reply.send(self.status_report());
             }
-            NetEvent::SessionPage {
+            NetEvent::SessionActivity {
                 channel_id,
-                which,
-                before,
-                max_rows,
-                max_bytes,
+                query,
                 reply,
             } => {
-                let page = match self.channels.get(&channel_id).map(Arc::clone) {
-                    Some(shared) => Some(
-                        shared
-                            .lock()
-                            .await
-                            .session_page(&which, before, max_rows, max_bytes),
-                    ),
-                    None => None,
+                let result = match (self.channels.get(&channel_id), self.profile.as_ref()) {
+                    (Some(shared), Some(profile)) => {
+                        let mut room = shared.lock().await;
+                        match room
+                            .require_governance_ready(profile.store(), self.now_ms())
+                            .and_then(|()| {
+                                room.advance_sessions(profile.store(), self.now_ms().get())
+                            }) {
+                            Ok(_) => room.session_activity_query(
+                                profile.store(),
+                                query,
+                                self.now_ms().get(),
+                            ),
+                            Err(error) => Err(error.to_string()),
+                        }
+                    }
+                    _ => Err("room not open".into()),
                 };
-                let _ = reply.send(page);
+                let _ = reply.send(result);
+            }
+            NetEvent::SessionProjection {
+                channel_id,
+                query,
+                reply,
+            } => {
+                let result = match (self.channels.get(&channel_id), self.profile.as_ref()) {
+                    (Some(shared), Some(profile)) => {
+                        let mut room = shared.lock().await;
+                        match room
+                            .require_governance_ready(profile.store(), self.now_ms())
+                            .and_then(|()| {
+                                room.advance_sessions(profile.store(), self.now_ms().get())
+                            }) {
+                            Ok(_) => room.session_query(
+                                profile.store(),
+                                query,
+                                crate::node::ipc::rows_budget(),
+                                self.now_ms().get(),
+                            ),
+                            Err(error) => Err(error.to_string()),
+                        }
+                    }
+                    _ => Err("room not open".into()),
+                };
+                let _ = reply.send(result);
+            }
+            NetEvent::SessionFiles {
+                channel_id,
+                query,
+                reply,
+            } => {
+                let result = match (self.channels.get(&channel_id), self.profile.as_ref()) {
+                    (Some(shared), Some(profile)) => {
+                        let mut room = shared.lock().await;
+                        match room.require_governance_ready(profile.store(), self.now_ms()) {
+                            Ok(()) => room.session_file_query(
+                                profile.store(),
+                                query,
+                                crate::node::ipc::rows_budget(),
+                                self.now_ms().get(),
+                            ),
+                            Err(error) => Err(error.to_string()),
+                        }
+                    }
+                    _ => Err("room not open".into()),
+                };
+                let _ = reply.send(result);
             }
             NetEvent::RoomHistory {
                 channel_id,
@@ -9051,17 +9432,69 @@ impl Node {
                 reply,
             } => {
                 let result = match (self.channels.get(&channel_id), self.profile.as_ref()) {
-                    (Some(shared), Some(profile)) => shared.lock().await.history_query(
-                        profile.store(),
-                        query,
-                        crate::node::ipc::rows_budget(),
-                    ),
+                    (Some(shared), Some(profile)) => {
+                        use crate::node::channel::history::Reply;
+                        let mut room = shared.lock().await;
+                        match room.history_query(
+                            profile.store(),
+                            query,
+                            crate::node::ipc::rows_budget(),
+                            (self.clock)(),
+                        ) {
+                            Ok(Reply::DisplayRevision(revision)) => {
+                                use sha2::{Digest, Sha256};
+                                let mut hash = Sha256::new();
+                                hash.update(b"vox-room-display-names-v1");
+                                hash.update(profile.fingerprint());
+                                hash.update(revision);
+                                // Alias collisions depend on the entire current keyring.
+                                // These bounded maps are actor-owned and cannot change
+                                // while this serialized query holds the selected room.
+                                hash.update((self.trust.iter().count() as u64).to_be_bytes());
+                                for (fingerprint, name) in self.trust.iter() {
+                                    hash.update(fingerprint);
+                                    hash.update((name.len() as u64).to_be_bytes());
+                                    hash.update(name.as_bytes());
+                                }
+                                hash.update((self.presented.len() as u64).to_be_bytes());
+                                for (fingerprint, (name, _)) in &self.presented {
+                                    hash.update(fingerprint);
+                                    hash.update((name.len() as u64).to_be_bytes());
+                                    hash.update(name.as_bytes());
+                                }
+                                Ok(Reply::DisplayRevision(hash.finalize().into()))
+                            }
+                            other => other,
+                        }
+                    }
                     _ => Err("room not open".into()),
                 };
                 let _ = reply.send(result);
             }
             NetEvent::Names(reply) => {
                 let _ = reply.send(self.resolver_snapshot().await);
+            }
+            NetEvent::Resolve { name, reply } => {
+                let mut names = self.resolver_snapshot().await;
+                let result = async {
+                    let target = names.lookup(&name)?;
+                    let shared = self
+                        .channels
+                        .get(&target.channel_id)
+                        .ok_or("room not open")?;
+                    let profile = self.profile.as_ref().ok_or("the node is locked")?;
+                    let share = shared
+                        .lock()
+                        .await
+                        .shared_service(profile.store(), &target.host, &target.service)
+                        .map_err(|e| e.to_string())?;
+                    if let Some(share) = share {
+                        names.add_share(target.channel_id, share.host, &share.name, share.udp);
+                    }
+                    names.lookup(&name)
+                }
+                .await;
+                let _ = reply.send(result);
             }
             NetEvent::ComputerPolicy(reply) => {
                 let result = match self.prepare_computer_binding() {
@@ -9813,6 +10246,19 @@ impl Node {
         };
         if !self.channels.contains_key(channel_id) {
             return Outcome::Failed(Fault::UnknownChannel);
+        }
+        if let (Some(profile), Some(shared)) =
+            (self.profile.as_ref(), self.channels.get(channel_id))
+        {
+            if let Err(error) = shared
+                .lock()
+                .await
+                .require_governance_ready(profile.store(), self.now_ms())
+            {
+                return Outcome::Failed(fault_of(&error));
+            }
+        } else {
+            return Outcome::Failed(Fault::NoIdentity);
         }
         let anchors = self.link_boards(channel_id).await;
         // Each entry that is a member of the room — this node, and any other whose address the
@@ -11359,19 +11805,18 @@ impl Node {
         if removed.is_empty() {
             return;
         }
-        let mut owed = Vec::new();
-        {
-            let channel = shared.lock().await;
-            for member in removed {
-                if !self.trust.is_trusted(&member) && channel.has_consented(&member) {
-                    owed.push(member);
-                }
-            }
-        }
         // The lock changes before the record goes: a failure in between changes it again on the
         // next open, which narrows nothing that should be read.
-        for member in owed {
-            let _ = self.revoke(channel_id, member).await;
+        drop(shared);
+        for member in removed {
+            if !self.trust.is_trusted(&member)
+                && !self
+                    .withdraw_for_untrust(channel_id, member)
+                    .await
+                    .is_done()
+            {
+                return; // Preserve the durable removal until its narrowing fact is committed.
+            }
         }
         let Some(profile) = self.profile.as_ref() else {
             return;
@@ -11389,20 +11834,49 @@ impl Node {
     /// the keyring — one a room-only grant made before that grant was removed, or one the ring
     /// lost while the room was closed — changes the lock against that member. What it already
     /// holds cannot be taken back; it reads nothing written from now on.
-    async fn revoke_untrusted_consents(&mut self, channel_id: &Digest32) {
+    async fn revoke_untrusted_consents(&mut self, channel_id: &Digest32) -> bool {
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
-            return;
+            return false;
         };
-        let untrusted: Vec<Digest32> = shared
-            .lock()
-            .await
-            .consented()
-            .into_iter()
-            .filter(|m| !self.trust.is_trusted(m))
-            .collect();
-        for member in untrusted {
-            let _ = self.revoke(channel_id, member).await;
+        let page = {
+            let Some(profile) = self.profile.as_ref() else {
+                return false;
+            };
+            let Ok(channel) = shared.try_lock() else {
+                return false;
+            };
+            match channel.consent_page(
+                profile.store(),
+                &channel.me(),
+                self.untrusted_after.get(channel_id).copied(),
+                64,
+            ) {
+                Ok(page) => page,
+                Err(_) => return false,
+            }
+        };
+        // One narrowing append per actor turn, even if this page names many stale consenters.
+        if let Some(member) = page
+            .targets
+            .iter()
+            .find(|m| !self.trust.is_trusted(m))
+            .copied()
+        {
+            if self
+                .withdraw_for_untrust(channel_id, member)
+                .await
+                .is_done()
+            {
+                self.untrusted_after.insert(*channel_id, member);
+                return true;
+            }
+        } else if let Some(next) = page.next {
+            self.untrusted_after.insert(*channel_id, next);
+            return true;
+        } else {
+            self.untrusted_after.remove(channel_id);
         }
+        false
     }
 
     async fn forget_untrusted_keys(&mut self, channel_id: &Digest32) {
@@ -11504,6 +11978,9 @@ impl Node {
         self.deliver_owed_consents(Some(fingerprint)).await;
         // A key that reached this node by the log from the member just trusted was held
         // (V210-118): taken now.
+        for prepared in self.preparing_rooms.values_mut() {
+            prepared.channel.get_mut().release_held_packages();
+        }
         let rooms: Vec<Digest32> = self.channels.keys().copied().collect();
         for channel_id in rooms {
             if let Some(shared) = self.channels.get(&channel_id).map(Arc::clone) {
@@ -11568,24 +12045,19 @@ impl Node {
         // a new place in the consent order, and a decision is only read for a trusted identity,
         // so a failure here leaves nothing that could widen a later release.
         let _ = crate::node::consent_order::forget_trust(profile.store(), signer, fingerprint);
-        // **A room that is closed now acts on the removal when it opens** (V210-118 amendment):
-        // its key is not held while it is closed, so neither the lock change nor the key drop
-        // below can reach it. Recorded before the ring is written, so a removal whose record
-        // cannot be kept is refused whole rather than left undone in the closed rooms.
-        let closed: Vec<Digest32> = profile
-            .store()
-            .channels()
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|c| !self.channels.contains_key(c))
-            .collect();
-        if !closed.is_empty() {
+        // Record every room before the ring changes. Closed rooms act when reopened; an open
+        // room whose narrowing write fails retains the same durable retry across restart.
+        let rooms = match profile.store().channels() {
+            Ok(rooms) => rooms,
+            Err(error) => return Outcome::Failed(fault_of(&error)),
+        };
+        if !rooms.is_empty() {
             let mut locks =
                 match crate::node::pending_lock::PendingLocks::load(profile.store(), signer) {
                     Ok(l) => l,
                     Err(e) => return Outcome::Failed(fault_of(&e)),
                 };
-            for room in closed {
+            for room in rooms {
                 if !locks.insert(room, *fingerprint) {
                     return Outcome::Failed(Fault::Internal);
                 }
@@ -11623,9 +12095,9 @@ impl Node {
         // Before the rotation, not after: rotation talks to the network and may be slow,
         // and the removal must bite the moment it is decided (M17.11).
         self.refresh_reachers().await;
-        self.change_the_lock_against(fingerprint).await;
+        let rotation = self.change_the_lock_against(fingerprint).await;
         self.publish().await;
-        Outcome::Done
+        rotation
     }
 
     /// Rotate this identity's sender key and re-key everyone still in the ring, in
@@ -11646,21 +12118,51 @@ impl Node {
     /// the re-keys are best-effort and retried on the tick for whoever is offline —
     /// exactly as `revoke` does, because this reuses that machinery rather than
     /// inventing a second kind of revocation.
-    async fn change_the_lock_against(&mut self, removed: &Digest32) {
+    async fn change_the_lock_against(&mut self, removed: &Digest32) -> Outcome {
         let channels: Vec<Digest32> = self.channels.keys().copied().collect();
         for channel_id in channels {
-            let Some(shared) = self.channels.get(&channel_id).map(Arc::clone) else {
-                continue;
-            };
-            if shared.lock().await.has_consented(removed) {
-                // `revoke` is the whole act: rotate, record the log fact, re-key the
-                // members who keep consent, and emit `Revoked`.
-                let _ = self.revoke(&channel_id, *removed).await;
+            let result = self.withdraw_for_untrust(&channel_id, *removed).await;
+            if !result.is_done() {
+                return result;
             }
             // And any other consent outside the keyring (V210-148): a key goes only to a member
             // the owner trusts, so nothing the ring does not name keeps one past this.
-            self.revoke_untrusted_consents(&channel_id).await;
+            self.act_on_removals_while_closed(&channel_id).await;
         }
+        Outcome::Done
+    }
+
+    /// A withdrawal never waits for a historical projection to learn whether consent existed.
+    /// The narrow Channel path rotates conservatively if that fact is not yet known.
+    async fn withdraw_for_untrust(&mut self, room: &Digest32, target: Digest32) -> Outcome {
+        let (Some(profile), Some(shared)) = (
+            self.profile.as_ref(),
+            self.channels.get(room).map(Arc::clone),
+        ) else {
+            return Outcome::Failed(Fault::ChannelNotOpen);
+        };
+        let result = shared
+            .lock()
+            .await
+            .withdraw_consent(profile, target, self.now_ms());
+        let generation = match result {
+            Ok(Some(revocation)) => revocation.body.new_chain_id,
+            Ok(None) => return Outcome::Done,
+            Err(error) => return Outcome::Failed(fault_of(&error)),
+        };
+        self.deliveries
+            .retain(|(r, peer, _), _| r != room || *peer != target);
+        self.delivery_reserved
+            .retain(|(r, peer, _), _| r != room || *peer != target);
+        self.key_waiting.remove(&(*room, target));
+        self.note_local_append(room);
+        let _ = self.event_tx.send(NodeEvent::Revoked {
+            channel_id: *room,
+            target,
+            generation,
+            rekeyed: 0,
+        });
+        Outcome::Done
     }
 
     /// Delete every superseded sender-key generation this node no longer needs
@@ -11696,7 +12198,13 @@ impl Node {
             pruned |= channel
                 .prune_superseded_receivers(&store)
                 .is_ok_and(|n| n > 0);
-            if channel.key_generations() <= 1 || !channel.owed_consents(&full).is_empty() {
+            // A refreshing or unreadable consent projection cannot prove that old keys are
+            // no longer owed. Preserve them until a later bounded governance turn settles it.
+            if channel.key_generations() <= 1
+                || !channel
+                    .owed_consents(&store, &full)
+                    .is_ok_and(|owed| owed.is_empty())
+            {
                 continue;
             }
             let keep_from = channel
@@ -11737,7 +12245,24 @@ impl Node {
                     continue;
                 };
                 let ch = shared.lock().await;
-                let owed = ch.owed_consents(&trusted);
+                let Some(profile) = self.profile.as_ref() else {
+                    return;
+                };
+                let owed = match ch.owed_consents(profile.store(), &trusted) {
+                    Ok(owed) => owed,
+                    Err(error) => {
+                        if let (Some(target), Some(net)) = (asked_for, self.net.as_ref()) {
+                            net.manager().note(
+                                target,
+                                format!(
+                                    "your key for it in room {} waits: {error}",
+                                    crate::node::network::short_id(channel_id)
+                                ),
+                            );
+                        }
+                        continue;
+                    }
+                };
                 // **A consent the person just asked for that cannot go yet is said, with why**
                 // (#335). It was left out of what is owed in silence, so a `vox trust add` whose
                 // key could not go — this node has not synced the room since it joined, or has
@@ -11775,52 +12300,6 @@ impl Node {
         }
     }
 
-    /// Revoke `target`'s consent (ADR-007 §Revocation, M18.1): rotate this
-    /// identity's sender key, record the revocation, and re-key everyone who keeps
-    /// consent.
-    ///
-    /// The order is deliberate. The rotation and the log fact land **first** and
-    /// unconditionally; the re-keys follow on a best-effort basis and are retried by
-    /// the tick for whoever was unreachable. A revocation that waited for the rest of
-    /// the room to be online would be a revocation in name only.
-    fn revoke<'a>(&'a mut self, channel_id: &'a Digest32, target: Digest32) -> Boxed<'a, Outcome> {
-        Box::pin(self.revoke_unboxed(channel_id, target))
-    }
-
-    /// [`Self::revoke`], unboxed: see [`Boxed`].
-    async fn revoke_unboxed(&mut self, channel_id: &Digest32, target: Digest32) -> Outcome {
-        let now_ms = self.now_ms();
-        let (Some(profile), Some(shared)) = (
-            self.profile.as_ref(),
-            self.channels.get(channel_id).map(Arc::clone),
-        ) else {
-            return Outcome::Failed(Fault::UnknownChannel);
-        };
-        let generation = {
-            let mut channel = shared.lock().await;
-            match channel.revoke_consent(profile, target, now_ms) {
-                Ok(r) => r.body.new_chain_id,
-                Err(e) => return Outcome::Failed(fault_of(&e)),
-            }
-        };
-        // The revocation is durable: this member is no longer owed any cached delivery.
-        self.deliveries
-            .retain(|(room, peer, _), _| room != channel_id || *peer != target);
-        self.delivery_reserved
-            .retain(|(room, peer, _), _| room != channel_id || *peer != target);
-        self.key_waiting.remove(&(*channel_id, target));
-        // The revocation is a log fact the whole channel converges on.
-        self.note_local_append(channel_id);
-        let rekeyed = self.deliver_rekeys_for(channel_id, true).await;
-        let _ = self.event_tx.send(NodeEvent::Revoked {
-            channel_id: *channel_id,
-            target,
-            generation,
-            rekeyed,
-        });
-        Outcome::Done
-    }
-
     /// Deliver the current sender-key generation to every member of every open
     /// channel that keeps consent and does not hold it yet.
     fn deliver_owed_rekeys(&mut self) -> Boxed<'_, ()> {
@@ -11829,6 +12308,12 @@ impl Node {
 
     /// [`Self::deliver_owed_rekeys`], unboxed: see [`Boxed`].
     async fn deliver_owed_rekeys_unboxed(&mut self) {
+        self.rekey_after
+            .retain(|room, _| self.channels.contains_key(room));
+        self.history_after
+            .retain(|room, _| self.channels.contains_key(room));
+        self.untrusted_after
+            .retain(|room, _| self.channels.contains_key(room));
         let channels: Vec<Digest32> = self.channels.keys().copied().collect();
         for channel_id in channels {
             let _ = self.deliver_rekeys_for(&channel_id, false).await;
@@ -11845,14 +12330,66 @@ impl Node {
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return 0;
         };
-        let (owed, history) = {
+        let (owed, mut history) = {
+            let Some(profile) = self.profile.as_ref() else {
+                return 0;
+            };
             let channel = shared.lock().await;
-            (channel.owed_rekeys(), channel.owed_history())
+            let owed = match channel
+                .owed_rekeys(profile.store(), self.rekey_after.get(channel_id).copied())
+            {
+                Ok(page) => page,
+                Err(_) => return 0,
+            };
+            let (history, history_next) = match channel
+                .owed_history_page(profile.store(), self.history_after.get(channel_id).copied())
+            {
+                Ok(page) => page,
+                Err(_) => return 0,
+            };
+            match owed.next {
+                Some(next) => {
+                    self.rekey_after.insert(*channel_id, next);
+                }
+                None => {
+                    self.rekey_after.remove(channel_id);
+                }
+            }
+            match history_next {
+                Some(next) => {
+                    self.history_after.insert(*channel_id, next);
+                }
+                None => {
+                    self.history_after.remove(channel_id);
+                }
+            }
+            (owed.targets, history)
         };
         let mut delivered = 0u64;
         let now_ms = self.now_ms().get();
         let targets: BTreeSet<Digest32> = owed.into_iter().chain(history.keys().copied()).collect();
         for target in targets {
+            if !self.trust.is_trusted(&target) {
+                continue; // A historical consent never overrides the current keyring.
+            }
+            // The two bounded scans need not be at the same position. Check this target's
+            // history exactly before choosing a live re-key, preserving history precedence.
+            if let std::collections::btree_map::Entry::Vacant(slot) = history.entry(target) {
+                let Some(profile) = self.profile.as_ref() else {
+                    return delivered;
+                };
+                match shared
+                    .lock()
+                    .await
+                    .owed_history_for(profile.store(), &target)
+                {
+                    Ok(Some(floor)) => {
+                        slot.insert(floor);
+                    }
+                    Ok(None) => {}
+                    Err(_) => continue,
+                }
+            }
             // A member whose last keys were not taken waits out its backoff, unless a person asked.
             if !asked
                 && self
@@ -12771,6 +13308,9 @@ impl Node {
         for (cid, shared) in &self.channels {
             let (anchors, known) = {
                 let ch = shared.lock().await;
+                if ch.require_governance_ready(&store, now_ms).is_err() {
+                    continue;
+                }
                 let anchors: BTreeSet<Digest32> = ch
                     .anchors()
                     .nodes()
@@ -13334,9 +13874,15 @@ impl Node {
         let view = self.view_tx.subscribe();
         let tx = self.net_tx.clone();
         tokio::spawn(async move {
-            let r = agree_round(net, tx, view, question, members, skipped).await;
-            let _ = report.send(r);
-            let _ = reply.send(Outcome::Done);
+            match agree_round(net, tx, view, question, members, skipped).await {
+                Ok(r) => {
+                    let _ = report.send(r);
+                    let _ = reply.send(Outcome::Done);
+                }
+                Err(fault) => {
+                    let _ = reply.send(Outcome::Failed(fault));
+                }
+            }
         });
     }
 
@@ -13488,16 +14034,27 @@ impl Node {
         }
         let mut view = self.view_tx.subscribe();
         let clock = Arc::clone(&self.millis_clock);
-        let held = listed(&view.borrow_and_update(), &ask, clock()).is_some();
-        if !held {
-            self.sync_with(&ask.channel_id, &[peer]).await;
-        }
+        let tx = self.net_tx.clone();
         tokio::spawn(async move {
             let deadline = tokio::time::Instant::now() + crate::node::agreestream::HOLD_PATIENCE;
+            let mut fetched = false;
             let a = loop {
-                let now = listed(&view.borrow_and_update(), &ask, clock());
-                if let Some(a) = now {
-                    break a;
+                match tokio::time::timeout_at(deadline, listed(&tx, &ask, clock())).await {
+                    Ok(Ok(Some(answer))) => break answer,
+                    Ok(Ok(None)) => {}
+                    Err(_) => break Answer::NotReceived,
+                    // The room's query records/poisons local storage failure. Do not invent
+                    // NotReceived or a held set from a failed local read.
+                    Ok(Err(_)) => return,
+                }
+                if !fetched {
+                    let _ = tx
+                        .send(NetEvent::AgreeFetch {
+                            channel_id: ask.channel_id,
+                            peers: vec![peer],
+                        })
+                        .await;
+                    fetched = true;
                 }
                 match tokio::time::timeout_at(deadline, view.changed()).await {
                     Ok(Ok(())) => {}
@@ -13718,7 +14275,15 @@ impl Node {
             let Some(shared) = self.channels.get(&channel_id).map(Arc::clone) else {
                 continue;
             };
-            let owes_consent = shared.lock().await.owed_consents(&trusted).contains(&peer);
+            let owes_consent = {
+                let Some(profile) = self.profile.as_ref() else {
+                    return;
+                };
+                match shared.lock().await.owed_consents(profile.store(), &trusted) {
+                    Ok(owed) => owed.contains(&peer),
+                    Err(_) => continue, // Keep the durable obligation; do not release on stale consent.
+                }
+            };
             if owes_consent {
                 // **The same release the pairwise stream would have carried** (`consent_release`):
                 // what this member may read depends on when it was trusted, never on the path its
@@ -13791,12 +14356,16 @@ impl Node {
                     return;
                 };
                 let channel = shared.lock().await;
-                let history = channel
-                    .owed_history()
-                    .get(&peer)
-                    .and_then(|floor| channel.history_skdms(profile, &peer, *floor).ok())
+                let Ok(history_floor) = channel.owed_history_for(profile.store(), &peer) else {
+                    continue;
+                };
+                let history = history_floor
+                    .and_then(|floor| channel.history_skdms(profile, &peer, floor).ok())
                     .filter(|batch| !batch.is_empty());
-                let rekey = if history.is_none() && channel.owed_rekeys().contains(&peer) {
+                let Ok(owes_rekey) = channel.owed_rekey(profile.store(), &peer) else {
+                    continue;
+                };
+                let rekey = if history.is_none() && owes_rekey {
                     channel.rekey_skdm_for(profile, &peer).ok()
                 } else {
                     None
@@ -13912,67 +14481,124 @@ impl Node {
         posted
     }
 
-    /// Install the key-packages the log has delivered to this identity in `channel_id`: open
-    /// each with a one-shot PQXDH against this node's own prekeys and hand the sender key to
-    /// the channel, which verifies it against its author and backfills what it opens.
-    async fn install_key_packages(&mut self, channel_id: &Digest32) {
-        // Test-only: leave every key-package queued, unopened, while the file the knob names
-        // exists (`TEST_HOLD_PACKAGES_ENV`).
+    fn key_package_work_ready(&self) -> bool {
         #[cfg(feature = "test-knobs")]
         if std::env::var_os(TEST_HOLD_PACKAGES_ENV)
             .is_some_and(|f| std::path::Path::new(&f).exists())
         {
-            return;
+            return false;
         }
+        !self.key_package_rooms.is_empty()
+    }
+
+    /// Resume one room after the previous package/scan budget. A room with no package in
+    /// its first 64 positions still gets its next turn without another network event.
+    async fn advance_key_package_turn(&mut self) {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let room = self
+            .key_package_after
+            .and_then(|after| {
+                self.key_package_rooms
+                    .range((Excluded(after), Unbounded))
+                    .next()
+                    .map(|(id, _)| *id)
+            })
+            .or_else(|| self.key_package_rooms.first_key_value().map(|(id, _)| *id));
+        let Some(room) = room else { return };
+        self.key_package_after = Some(room);
+        if self.install_key_packages(&room).await {
+            self.publish().await;
+            self.schedule().await;
+        }
+    }
+
+    /// Open one retained package against this node's prekeys, retaining no body after the
+    /// attempt. The sender key still needs both explicit trust and the channel's validation.
+    async fn open_logged_key_package(
+        &mut self,
+        package: &crate::node::keypackage::KeyPackage,
+        ctx: &crate::join::session::JoinContext,
+        now: u64,
+    ) -> Option<crate::group::skdm::Skdm> {
+        let init = package.initial_message().ok()?;
+        let mut session = self.respond_to_initial(&init, ctx).await?;
+        let skdm = package.open(&mut session, now).ok()?;
+        self.trust.is_trusted(&skdm.body.author_id).then_some(skdm)
+    }
+
+    /// Attempt at most one package after examining at most 64 sealed log positions.
+    /// Acknowledgement releases only its drive-discovery hint. Trust changes request a
+    /// replay from disk, including packages which failed to open or were not trusted.
+    async fn install_key_packages(&mut self, channel_id: &Digest32) -> bool {
+        #[cfg(feature = "test-knobs")]
+        if std::env::var_os(TEST_HOLD_PACKAGES_ENV)
+            .is_some_and(|f| std::path::Path::new(&f).exists())
+        {
+            self.key_package_rooms.entry(*channel_id).or_insert(false);
+            return false;
+        }
+        let replay = self.key_package_rooms.remove(channel_id).unwrap_or(false);
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
-            return;
+            return false;
         };
-        let (packages, ctx) = {
+        let fetched = {
             let mut channel = shared.lock().await;
-            let packages = channel.take_inbound_packages();
-            if packages.is_empty() {
-                return;
+            if channel.is_poisoned() {
+                return false;
             }
-            let Ok(ctx) = channel.join_context() else {
-                return;
+            let Some(profile) = self.profile.as_ref() else {
+                return false;
             };
-            (packages, ctx)
+            if replay {
+                channel.release_held_packages();
+            }
+            let fetched = (|| -> crate::error::Result<_> {
+                // Establish the context before advancing the queue's cursor.
+                let ctx = channel.join_context()?;
+                let progress = channel.next_key_package(profile.store())?;
+                Ok((progress, ctx))
+            })();
+            if let Err(ref error) = fetched {
+                channel.poison(error);
+            }
+            fetched
         };
-        let now_ms = self.now_ms();
-        let now = now_ms.get();
-        for package in packages {
-            let Ok(init) = package.initial_message() else {
-                continue;
-            };
-            let Some(mut session) = self.respond_to_initial(&init, &ctx).await else {
-                continue;
-            };
-            let Ok(skdm) = package.open(&mut session, now) else {
-                continue;
-            };
-            let author = skdm.body.author_id;
-            // **A node reads only the members its owner trusts** (V210-118), whichever path the
-            // key took. The pairwise path refused a key from an untrusted author, and this one,
-            // the log's, took it: a member trusted by someone whose node was down when trusted
-            // (its key then goes by the log) was read by a node that never trusted it. Held, not
-            // dropped, so the key is taken once the owner trusts its author.
-            if !self.trust.is_trusted(&author) {
-                shared.lock().await.hold_package(package);
-                continue;
+        let (progress, ctx) = match fetched {
+            Ok(fetched) => fetched,
+            Err(error) => {
+                let _ = self.event_tx.send(NodeEvent::NodeNote {
+                    note: format!(
+                        "room {} could not read its saved key deliveries: {error}",
+                        crate::node::link::b32_encode(channel_id)
+                    ),
+                });
+                return true;
             }
+        };
+        if progress.pending {
+            self.key_package_rooms.entry(*channel_id).or_insert(false);
+        }
+        let Some(pending) = progress.package else {
+            return false;
+        };
+        let now = self.now_ms();
+        let opened = self
+            .open_logged_key_package(&pending.package, &ctx, now.get())
+            .await;
+        let mut changed = false;
+        if let Some(skdm) = opened {
             let installed = {
                 let Some(profile) = self.profile.as_ref() else {
-                    return;
+                    shared
+                        .lock()
+                        .await
+                        .key_package_attempted(&pending.author, pending.log_id);
+                    return false;
                 };
-                shared
-                    .lock()
-                    .await
-                    .accept_skdm(profile.store(), &skdm, now_ms)
+                shared.lock().await.accept_skdm(profile.store(), &skdm, now)
             };
             if let Ok(backfilled) = installed {
-                // A drive key opens a node's Sessions, not its messages: what changed is what this
-                // node may see of them, said as Session news (no row, nothing shown), so a client
-                // reads the room's Sessions again; "messages can be read now" would be untrue.
+                changed = true;
                 let _ = self.event_tx.send(
                     if skdm.body.channel_id == crate::node::drive::drive_channel(channel_id) {
                         NodeEvent::SessionEntry {
@@ -13982,13 +14608,19 @@ impl Node {
                     } else {
                         NodeEvent::SenderKeyReceived {
                             channel_id: *channel_id,
-                            peer: author,
+                            peer: skdm.body.author_id,
                             backfilled: backfilled as u64,
                         }
                     },
                 );
             }
         }
+        let mut channel = shared.lock().await;
+        channel.key_package_attempted(&pending.author, pending.log_id);
+        if channel.key_packages_pending() && !channel.is_poisoned() {
+            self.key_package_rooms.entry(*channel_id).or_insert(false);
+        }
+        changed || channel.is_poisoned()
     }
 
     /// The responder half of an ADR-004 PQXDH opening message: consume the one-time prekey it
@@ -15259,6 +15891,16 @@ impl Node {
             // maintained again at the next unlock.
             let _ = prekeys::save(profile.store(), signer, &ring);
         }
+        // Only newly usable key material can make a previous failed package open. Ordinary
+        // ticks and expiry/pruning of old keys do not replay the room's retained history.
+        if done.rotated || done.one_time_added > 0 {
+            for room in self.channels.keys() {
+                self.key_package_rooms.insert(*room, true);
+            }
+            for prepared in self.preparing_rooms.values_mut() {
+                prepared.channel.get_mut().release_held_packages();
+            }
+        }
         // What the bundle names now, against what it named when last looked at.
         let offered = ring.offered();
         let republish = self.prekeys_offered.is_some_and(|was| was != offered);
@@ -15310,6 +15952,24 @@ impl Node {
         if self.headless.is_none() {
             self.decisions.lock();
         }
+        self.opening_rooms.clear();
+        for (_, mut prepared) in std::mem::take(&mut self.preparing_rooms) {
+            prepared.channel.get_mut().lock_now();
+            if let Some(reply) = prepared.reply {
+                let _ = reply.send(Outcome::Failed(Fault::Locked));
+            }
+        }
+        self.preparation_after = None;
+        self.key_package_rooms.clear();
+        self.key_package_after = None;
+        for (_, waiting) in std::mem::take(&mut self.publish_waiters) {
+            if let Some(reply) = waiting.reply {
+                let _ = reply.send(Outcome::Failed(Fault::Locked));
+            }
+        }
+        self.publication_after = None;
+        self.publication_pending = false;
+        self.publication_again = false;
         for (_, shared) in std::mem::take(&mut self.channels) {
             shared.lock().await.lock_now();
         }
@@ -15367,9 +16027,9 @@ impl Node {
                 let _ = reply.send(Outcome::Failed(Fault::Locked));
             }
         }
-        // The unlock they wait on did happen; what it reopened is locked again with the rest.
+        // The held-room publication was cancelled before this unlock could complete.
         for reply in std::mem::take(&mut self.unlock_waiters) {
-            let _ = reply.send(Outcome::Done);
+            let _ = reply.send(Outcome::Failed(Fault::Locked));
         }
         // Drop the prekey ring: its secrets zeroize on drop, so a locked node holds
         // no key-agreement material (ADR-015 lock/zeroize).
@@ -15456,7 +16116,7 @@ impl Node {
         // The view first, as for every command: a caller told `Done` reads the view at once (the
         // trust keyring, the rooms) and must find the unlock in it.
         self.publish().await;
-        if outcome.is_done() && self.reopen_task.is_some() {
+        if outcome.is_done() && (self.reopen_task.is_some() || !self.reopening.is_empty()) {
             self.unlock_waiters.push(reply);
         } else {
             let _ = reply.send(outcome);
@@ -15836,7 +16496,17 @@ impl Node {
         reply: oneshot::Sender<Outcome>,
     ) {
         if self.channels.contains_key(&channel_id) {
-            let _ = reply.send(Outcome::Done);
+            if self.publish_waiters.contains_key(&channel_id) {
+                self.queue_room_publication(channel_id, Some(reply), Outcome::Done, false);
+            } else {
+                let _ = reply.send(Outcome::Done);
+            }
+            return;
+        }
+        if self.opening_rooms.contains_key(&channel_id)
+            || self.preparing_rooms.contains_key(&channel_id)
+        {
+            let _ = reply.send(Outcome::Failed(Fault::ChannelNotOpen));
             return;
         }
         let now_ms = self.now_ms();
@@ -15854,6 +16524,8 @@ impl Node {
         let me = crate::identity::composite::RootSigner::fingerprint(&*signer);
         let store = profile.store_handle();
         let tx = self.net_tx.clone();
+        let opening = Arc::new(());
+        self.opening_rooms.insert(channel_id, Arc::clone(&opening));
         tokio::spawn(async move {
             let opened = tokio::task::spawn_blocking(move || {
                 let wrap = store
@@ -15869,75 +16541,228 @@ impl Node {
                 .send(NetEvent::ChannelUnsealed {
                     reply,
                     channel_id,
+                    opening,
                     opened: Box::new(opened),
                 })
                 .await;
         });
     }
 
-    /// Hold a room opened off the actor: everything [`Self::begin_open_channel`] leaves.
-    fn finish_open_channel(&mut self, ch: ChannelState) -> Boxed<'_, Outcome> {
-        Box::pin(self.finish_open_channel_unboxed(ch))
+    fn queue_room_preparation(
+        &mut self,
+        channel: ChannelState,
+        reply: Option<oneshot::Sender<Outcome>>,
+        reopening: bool,
+    ) {
+        let id = channel.channel_id();
+        if let Some(pending) = self.preparing_rooms.get_mut(&id) {
+            pending.reopening |= reopening;
+            if pending.reply.is_none() {
+                pending.reply = reply;
+            } else if let Some(reply) = reply {
+                // Do not retain an unlimited waiter list for repeated open requests.
+                let _ = reply.send(Outcome::Failed(Fault::ChannelNotOpen));
+            }
+            return;
+        }
+        self.preparing_rooms.insert(
+            id,
+            RoomPreparation {
+                channel: tokio::sync::Mutex::new(channel),
+                reply,
+                reopening,
+                recovery: None,
+            },
+        );
     }
 
-    /// Apply this node's shorter limits after opening under the room policy, before a cached
-    /// row can be read or relayed. Failure follows the caller's ordinary open/recovery error path.
+    fn answer_prepared_unlocks(&mut self) {
+        if self.reopen_task.is_none() && self.reopening.is_empty() {
+            for reply in std::mem::take(&mut self.unlock_waiters) {
+                let _ = reply.send(Outcome::Done);
+            }
+        }
+    }
+
+    fn cancel_room_preparation(&mut self, id: &Digest32, fault: Fault) -> bool {
+        let opening = self.opening_rooms.remove(id).is_some();
+        let publishing = if let Some(waiting) = self.publish_waiters.remove(id) {
+            if let Some(reply) = waiting.reply {
+                let _ = reply.send(Outcome::Failed(fault));
+            }
+            self.reopening.remove(id);
+            true
+        } else {
+            false
+        };
+        let Some(mut prepared) = self.preparing_rooms.remove(id) else {
+            return opening || publishing;
+        };
+        prepared.channel.get_mut().lock_now();
+        if let Some(reply) = prepared.reply {
+            let _ = reply.send(Outcome::Failed(fault));
+        }
+        self.reopening.remove(id);
+        true
+    }
+
+    /// One room, one bounded storage turn. The main select loop services commands,
+    /// lock/close and network work between turns; no room is published half recovered.
+    async fn advance_room_preparation(&mut self) {
+        self.advance_room_publication().await;
+        use std::ops::Bound::{Excluded, Unbounded};
+        let id = self
+            .preparation_after
+            .and_then(|after| {
+                self.preparing_rooms
+                    .range((Excluded(after), Unbounded))
+                    .next()
+                    .map(|(id, _)| *id)
+            })
+            .or_else(|| self.preparing_rooms.first_key_value().map(|(id, _)| *id));
+        let Some(id) = id else { return };
+        self.preparation_after = Some(id);
+        let Some(mut prepared) = self.preparing_rooms.remove(&id) else {
+            return;
+        };
+        let outcome =
+            if !self.profile.as_ref().is_some_and(Profile::is_unlocked) || self.locking != 0 {
+                Outcome::Failed(Fault::Locked)
+            } else if prepared.recovery.as_ref().is_some_and(|original| {
+                !self
+                    .channels
+                    .get(&id)
+                    .zip(original.upgrade())
+                    .is_some_and(|(a, b)| Arc::ptr_eq(a, &b))
+            }) {
+                Outcome::Failed(Fault::ChannelNotOpen)
+            } else if prepared.recovery.is_none() && self.channels.contains_key(&id) {
+                Outcome::Done
+            } else if prepared.reopening && !self.reopening.contains(&id) {
+                Outcome::Failed(Fault::ChannelNotOpen)
+            } else {
+                match self.retention_before_publication(&mut prepared).await {
+                    Ok(false) => {
+                        self.preparing_rooms.insert(id, prepared);
+                        return;
+                    }
+                    Err(error)
+                        if ChannelState::governance_refreshing(&error)
+                            || ChannelState::legacy_classification_refreshing(&error) =>
+                    {
+                        // Current policy and classification are prerequisites for private
+                        // retention/publication. Pending replay keeps this room unpublished.
+                        self.preparing_rooms.insert(id, prepared);
+                        return;
+                    }
+                    Ok(true) => {
+                        if prepared.recovery.is_some() {
+                            self.complete_store_recovery(id, Ok(prepared.channel.into_inner()))
+                                .await;
+                            Outcome::Done
+                        } else {
+                            self.publish_open_channel(prepared.channel.into_inner())
+                                .await
+                        }
+                    }
+                    Err(error) => {
+                        let fault = fault_of(&error);
+                        if prepared.recovery.is_some() {
+                            self.complete_store_recovery(id, Err(error)).await;
+                            self.publish().await;
+                            return;
+                        }
+                        let _ = self.event_tx.send(NodeEvent::NodeNote {
+                            note: format!(
+                                "room {} could not finish opening: {error}; it stays closed",
+                                crate::node::link::b32_encode(&id)
+                            ),
+                        });
+                        Outcome::Failed(fault)
+                    }
+                }
+            };
+        if outcome.is_done() {
+            self.queue_room_publication(id, prepared.reply, outcome, prepared.reopening);
+            return;
+        }
+        self.reopening.remove(&id);
+        if let Some(reply) = prepared.reply {
+            self.answer_when_published(id, reply, outcome).await;
+        } else {
+            // An Unlock waiter observes the held-room view before Ready.
+            self.publish().await;
+        }
+        self.answer_prepared_unlocks();
+    }
+
+    /// Establish current governance, then apply shorter limits and private recovery
+    /// before publication. A false result retains the original state for the next turn.
     async fn retention_before_publication(
         &mut self,
-        ch: &mut ChannelState,
-    ) -> crate::error::Result<()> {
-        // Resolve stored packages before deciding which pre-upgrade Session copies the node
-        // may keep. The room is not published or available to readers/sync yet. This uses the
-        // usual prekey-consumption path and trust check, never a new source of permission.
-        if ch.needs_session_upgrade() {
-            let ctx = ch.join_context()?;
+        prepared: &mut RoomPreparation,
+    ) -> crate::error::Result<bool> {
+        let ch = prepared.channel.get_mut();
+        {
+            let profile = self.profile.as_ref().ok_or(Error::AtRestLocked)?;
             let now = self.now_ms();
-            for package in ch.take_inbound_packages() {
-                let Ok(init) = package.initial_message() else {
-                    continue;
+            if !ch.advance_governance(profile.store(), now)?.ready {
+                return Ok(false);
+            }
+            ch.require_governance_ready(profile.store(), now)?;
+        }
+        if ch.needs_session_upgrade() && ch.key_packages_pending() {
+            let ctx = ch.join_context()?;
+            let profile = self.profile.as_ref().ok_or(Error::AtRestLocked)?;
+            let progress = ch.next_key_package(profile.store())?;
+            if let Some(pending) = progress.package {
+                let now = self.now_ms();
+                let opened = self
+                    .open_logged_key_package(&pending.package, &ctx, now.get())
+                    .await;
+                let installed = if let Some(skdm) = opened {
+                    match self.profile.as_ref() {
+                        Some(profile) => ch.accept_skdm(profile.store(), &skdm, now).map(|_| ()),
+                        None => Err(Error::AtRestLocked),
+                    }
+                } else {
+                    Ok(())
                 };
-                let Some(mut session) = self.respond_to_initial(&init, &ctx).await else {
-                    continue;
-                };
-                let Ok(skdm) = package.open(&mut session, now.get()) else {
-                    continue;
-                };
-                if !self.trust.is_trusted(&skdm.body.author_id) {
-                    ch.hold_package(package);
-                    continue;
+                ch.key_package_attempted(&pending.author, pending.log_id);
+                // Every attempted outcome is acknowledged; storage faults keep the room closed.
+                if let Err(error) = installed {
+                    if ch.is_poisoned() || matches!(error, Error::AtRestLocked) {
+                        return Err(error);
+                    }
                 }
-                let profile = self.profile.as_ref().ok_or(Error::AtRestLocked)?;
-                // A malformed package is skipped just as during ordinary delivery. A failed
-                // durable write poisons the room, which finish_session_upgrade refuses below.
-                let _ = ch.accept_skdm(profile.store(), &skdm, now);
+                return Ok(false);
+            }
+            if progress.pending {
+                return Ok(false);
+            }
+        }
+        {
+            let profile = self.profile.as_ref().ok_or(Error::AtRestLocked)?;
+            if ch.advance_legacy_sessions(profile.store(), self.now_ms().get())? {
+                return Ok(false);
             }
         }
         let id = ch.channel_id();
         let retention = self.node_retention_for(&id);
-        let profile = self
-            .profile
-            .as_ref()
-            .ok_or(crate::error::Error::AtRestLocked)?;
+        let profile = self.profile.as_ref().ok_or(Error::AtRestLocked)?;
         ch.set_node_retention(profile.store(), retention)?;
         ch.set_node_step_retention(profile.store(), self.node_step_retention.for_room(&id))?;
-        ch.finish_session_upgrade(profile.store(), self.now_ms().get())?;
-        ch.refresh_session_records(profile, &self.drive_holders(), &[], self.now_ms().get())?;
-        ch.sweep_retention(profile.store(), self.now_ms())?;
-        Ok(())
-    }
-
-    /// [`Self::finish_open_channel`], unboxed: see [`Boxed`].
-    async fn finish_open_channel_unboxed(&mut self, mut ch: ChannelState) -> Outcome {
-        if let Err(e) = self.retention_before_publication(&mut ch).await {
-            let _ = self.event_tx.send(NodeEvent::NodeNote {
-                note: format!(
-                    "room {} could not apply retention before opening: {e}",
-                    crate::node::link::b32_encode(&ch.channel_id())
-                ),
-            });
-            return Outcome::Failed(fault_of(&e));
+        if !ch.finish_session_upgrade(profile.store(), self.now_ms().get())? {
+            return Ok(false);
         }
-        self.publish_open_channel(ch).await
+        if !ch.refresh_session_records(profile, &self.drive_holders(), &[], self.now_ms().get())? {
+            return Ok(false);
+        }
+        ch.sweep_retention(profile.store(), self.now_ms())?;
+        if ch.legacy_classification_pending(profile.store())? {
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     /// Publish a room only after both shared and local retention have been applied durably.
@@ -15969,13 +16794,22 @@ impl Node {
         // that stayed in the set would come back by itself, which is not what closing it meant.
         // A room still reopening is closed too: it leaves `reopening`, so its state is dropped
         // when it arrives rather than held.
-        let reopening = self.reopening.remove(channel_id);
-        if self.channels.contains_key(channel_id) || reopening {
+        let held = self.channels.contains_key(channel_id)
+            || self.reopening.contains(channel_id)
+            || self.opening_rooms.contains_key(channel_id)
+            || self.preparing_rooms.contains_key(channel_id)
+            || self.publish_waiters.contains_key(channel_id);
+        if held {
+            // Keep the original preparation/publication and Unlock waiters intact if the
+            // durable close fails. No caller has observed a close or a completed Unlock yet.
             if let Err(e) = self.forget_open(channel_id) {
                 return Outcome::Failed(fault_of(&e));
             }
         }
-        match self.channels.remove(channel_id) {
+        self.key_package_rooms.remove(channel_id);
+        let preparing = self.cancel_room_preparation(channel_id, Fault::ChannelNotOpen);
+        let reopening = self.reopening.remove(channel_id);
+        let outcome = match self.channels.remove(channel_id) {
             Some(shared) => {
                 shared.lock().await.lock_now();
                 // The channel is gone from the view the board reads, so its members
@@ -16001,8 +16835,15 @@ impl Node {
                 });
                 Outcome::Done
             }
+            None if preparing || reopening => Outcome::Done,
             None => Outcome::Failed(Fault::ChannelNotOpen),
+        };
+        if outcome.is_done() {
+            // A concurrent Unlock may complete only after this successful close is visible.
+            self.publish().await;
+            self.answer_prepared_unlocks();
         }
+        outcome
     }
 
     /// Leave a room (V210-164): write this identity's departure into it, take this identity's
@@ -16053,7 +16894,7 @@ impl Node {
                         self.fresh_details
                             .insert(channel_id, (summary_of(&ch), detail));
                     }
-                    Err(error) => ch.poison(&error),
+                    Err(error) => detail_failed(&mut ch, &error),
                 }
             }
             written
@@ -16225,15 +17066,35 @@ impl Node {
         let stamp = match ch.admin_change_clock(profile.store()) {
             Ok(stamp) => stamp?,
             Err(error) => {
-                ch.poison(&error);
+                if !ChannelState::governance_refreshing(&error) {
+                    ch.poison(&error);
+                }
                 return None;
             }
         };
-        let admins: Vec<Digest32> = ch
-            .admins(self.now_ms())
-            .into_iter()
-            .filter(|a| *a != me)
-            .collect();
+        // This is one protocol-bounded signed message, not a historical admin projection.
+        // Refuse an oversized roster whole rather than publishing a truncated authority set.
+        let mut admins = Vec::new();
+        let mut after = None;
+        loop {
+            let page = match ch.admin_page(profile.store(), after, 64, self.now_ms()) {
+                Ok(page) => page,
+                Err(error) => {
+                    if !ChannelState::governance_refreshing(&error) {
+                        ch.poison(&error);
+                    }
+                    return None;
+                }
+            };
+            if admins.len().saturating_add(page.targets.len()) > crate::nat::withdraw::MAX_ROSTER {
+                return None;
+            }
+            admins.extend(page.targets);
+            match page.next {
+                Some(next) => after = Some(next),
+                None => break,
+            }
+        }
         crate::nat::withdraw::AdminRoster::build(signer, channel_id, stamp, admins)
             .ok()
             .map(|r| r.to_wire())
@@ -16347,7 +17208,7 @@ impl Node {
                     self.fresh_details
                         .insert(*channel_id, (summary_of(&ch), detail));
                 }
-                Err(error) => ch.poison(&error),
+                Err(error) => detail_failed(&mut ch, &error),
             }
         }
         self.note_local_append(channel_id);
@@ -16365,6 +17226,9 @@ impl Node {
         member: &Digest32,
         admin: bool,
     ) -> Outcome {
+        if self.governance_work.removal.is_some() {
+            return Outcome::Failed(Fault::AdminChangePending);
+        }
         let now_ms = self.now_ms();
         let Some(profile) = self.profile.as_ref() else {
             return Outcome::Failed(Fault::NoIdentity);
@@ -16377,7 +17241,8 @@ impl Node {
             let done = if admin {
                 ch.add_admin(profile, member, now_ms).map(|_| ())
             } else {
-                ch.remove_admin(profile, member, now_ms).map(|_| ())
+                // The public command is held by begin_admin_removal across bounded turns.
+                return Outcome::Failed(Fault::Internal);
             };
             if let Err(e) = done {
                 return Outcome::Failed(fault_of(&e));
@@ -16393,7 +17258,7 @@ impl Node {
                     self.fresh_details
                         .insert(*channel_id, (summary_of(&ch), detail));
                 }
-                Err(error) => ch.poison(&error),
+                Err(error) => detail_failed(&mut ch, &error),
             }
         }
         self.note_local_append(channel_id);
@@ -16427,7 +17292,7 @@ impl Node {
                     self.fresh_details
                         .insert(*channel_id, (summary_of(&ch), detail));
                 }
-                Err(error) => ch.poison(&error),
+                Err(error) => detail_failed(&mut ch, &error),
             }
         }
         self.note_local_append(channel_id);
@@ -16475,6 +17340,15 @@ impl Node {
                 }
             },
         };
+        let interrupted_unlock = self.reopening.contains(channel_id);
+        self.cancel_room_preparation(channel_id, Fault::UnknownChannel);
+        if interrupted_unlock {
+            // Deletion overtakes an Unlock that still owes this room. It must not report
+            // success before deletion finishes, including a later storage failure.
+            for reply in std::mem::take(&mut self.unlock_waiters) {
+                let _ = reply.send(Outcome::Failed(Fault::UnknownChannel));
+            }
+        }
         // A leave still waiting for this room is overtaken: the room is joined again from scratch.
         let (overtaken, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.leave_waiters)
             .into_iter()
@@ -16484,6 +17358,7 @@ impl Node {
             let _ = reply.send(Outcome::Failed(Fault::LeaveUndone));
         }
         let mut name = String::new();
+        self.key_package_rooms.remove(channel_id);
         if let Some(shared) = self.channels.remove(channel_id) {
             let mut ch = shared.lock().await;
             name = crate::node::resolver::room_shown(ch.name(), channel_id);
@@ -16917,9 +17792,6 @@ impl Node {
         for room in &view.open_channels {
             names.add_room(room.channel_id, room.name.as_deref(), &room.members);
             names.set_synced(room.channel_id, room.synced);
-            for share in &room.shares {
-                names.add_share(room.channel_id, share.host, &share.name, share.udp);
-            }
         }
         for (fp, petname) in self.trust.iter() {
             names.name(*fp, petname);
@@ -17412,6 +18284,9 @@ impl Node {
         };
         let changed = {
             let mut ch = shared.lock().await;
+            if let Err(error) = ch.require_governance_ready(profile.store(), now) {
+                return Outcome::Failed(fault_of(&error));
+            }
             let mut next = BootstrapSet::new();
             for anchor in ch.anchors().nodes() {
                 // A link's member address is bootstrap routing, never a room anchor.
@@ -17469,9 +18344,13 @@ impl Node {
         let (governs, room) = {
             let ch = shared.lock().await;
             (
-                ch.governs_retention(&me, self.now_ms()),
+                ch.governs_retention(profile.store(), &me, self.now_ms()),
                 ch.room_retention(),
             )
+        };
+        let governs = match governs {
+            Ok(governs) => governs,
+            Err(error) => return Outcome::Failed(fault_of(&error)),
         };
         if !governs {
             // Longer than the room keeps is refused; `0` is forever, the longest of all.
@@ -17521,9 +18400,13 @@ impl Node {
         let (governs, room) = {
             let ch = shared.lock().await;
             (
-                ch.governs_retention(&me, self.now_ms()),
+                ch.governs_retention(profile.store(), &me, self.now_ms()),
                 crate::node::retention::shortest(ch.room_retention(), ch.room_step_retention()),
             )
+        };
+        let governs = match governs {
+            Ok(governs) => governs,
+            Err(error) => return Outcome::Failed(fault_of(&error)),
         };
         if !governs {
             // Longer than the room keeps is refused; `0` is forever, the longest of all.
@@ -17676,87 +18559,111 @@ impl Node {
         pruned > 0 || !checkpointed.is_empty() || applied
     }
 
-    /// Note that `entries` of a room were shown to this node's person or drained into its agent's
-    /// turn (ADR-028 RR-1), and post a read record for them if one is due (RR-2).
-    async fn mark_read(&mut self, channel_id: &Digest32, entries: Vec<Digest32>) -> Outcome {
+    /// Done acknowledges durable local read state. Signed receipt publication is bounded
+    /// background work; it may wait for sync without retaining or losing a volatile backlog.
+    async fn mark_read(
+        &mut self,
+        channel_id: &Digest32,
+        entries: Vec<Digest32>,
+        expected_instance: Option<[u8; 16]>,
+    ) -> Outcome {
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return Outcome::Failed(Fault::ChannelNotOpen);
         };
-        // A room that is over takes no record (one after a leave would undo it, V210-164), so
-        // the client is told and asks no more: it is not left to retry what can never be posted.
-        {
-            let ch = shared.lock().await;
-            if ch.ended((self.millis_clock)()).is_some() {
-                return Outcome::Failed(Fault::RoomEnded);
-            }
-            if ch.has_left(&ch.me()) {
-                return Outcome::Failed(Fault::RoomLeft);
+        let Some(profile) = self
+            .profile
+            .as_ref()
+            .filter(|profile| profile.is_unlocked())
+        else {
+            return Outcome::Failed(Fault::Locked);
+        };
+        let mut ch = shared.lock().await;
+        // This check and admission share the same room lock. A previous page read alone
+        // cannot fence another client's leave/rejoin, including a final empty completion.
+        if let Some(expected) = expected_instance {
+            match ch.history_instance(profile.store()) {
+                Ok(actual) if actual == expected => {}
+                Ok(_) => return Outcome::Failed(Fault::ReadSelectionChanged),
+                Err(error) => {
+                    ch.poison(&error);
+                    return Outcome::Failed(fault_of(&error));
+                }
             }
         }
-        if !entries.is_empty() {
-            self.reads_pending
-                .entry(*channel_id)
-                .or_insert_with(|| (BTreeSet::new(), 0))
-                .0
-                .extend(entries);
-            self.flush_reads().await;
+        match ch.admit_read_marks(profile, &entries, (self.millis_clock)()) {
+            Ok(()) => Outcome::Done,
+            Err(error) => {
+                if !matches!(
+                    error,
+                    Error::Profile(
+                        "read selection changed; refresh and retry"
+                            | "this identity has left the room"
+                            | "this room has ended"
+                    ) | Error::SizeLimitExceeded(_)
+                ) {
+                    ch.poison(&error);
+                }
+                Outcome::Failed(fault_of(&error))
+            }
         }
-        Outcome::Done
     }
 
-    /// Post a read record in each room whose pending reads are due: the last record is
-    /// [`READ_RECORD_EVERY_MS`] old. A room not synced yet keeps its reads for a later tick; one
-    /// that refuses the record (ended, left) drops them.
-    async fn flush_reads(&mut self) {
-        let now_millis = (self.millis_clock)();
-        let due: Vec<Digest32> = self
-            .reads_pending
-            .iter()
-            .filter(|(_, (pending, last))| {
-                !pending.is_empty() && now_millis >= last.saturating_add(READ_RECORD_EVERY_MS)
+    /// Give one open room one page per timer turn. The Channel persists cadence and marks;
+    /// reopening resumes them from disk. A failed publication never discards accepted marks.
+    async fn flush_reads(&mut self) -> bool {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let room = self
+            .reads_after
+            .and_then(|after| {
+                self.channels
+                    .range((Excluded(after), Unbounded))
+                    .next()
+                    .map(|(id, _)| *id)
             })
-            .map(|(cid, _)| *cid)
-            .collect();
-        for cid in due {
-            let Some(profile) = self.profile.as_ref() else {
-                return;
-            };
-            let Some(shared) = self.channels.get(&cid).map(Arc::clone) else {
-                self.reads_pending.remove(&cid);
-                continue;
-            };
-            // A room mid-session is left for the next tick, as the sweep does.
-            let Ok(mut ch) = shared.try_lock() else {
-                continue;
-            };
-            let me = profile.fingerprint();
-            let Some((pending, last)) = self.reads_pending.get_mut(&cid) else {
-                continue;
-            };
-            let shown: Vec<Digest32> = pending.iter().copied().collect();
-            let mut read = ch.unrecorded_reads(&me, &shown);
-            read.truncate(crate::node::content::MAX_READ_HASHES);
-            if read.is_empty() {
-                pending.clear();
-                continue;
+            .or_else(|| self.channels.first_key_value().map(|(id, _)| *id));
+        let Some(cid) = room else {
+            return false;
+        };
+        self.reads_after = Some(cid);
+        let Some(profile) = self
+            .profile
+            .as_ref()
+            .filter(|profile| profile.is_unlocked())
+        else {
+            return false;
+        };
+        let Some(shared) = self.channels.get(&cid).map(Arc::clone) else {
+            return false;
+        };
+        let Ok(mut ch) = shared.try_lock() else {
+            return false;
+        };
+        if ch.is_poisoned() {
+            return false;
+        }
+        let result = ch.flush_read_marks(profile, (self.millis_clock)(), READ_RECORD_EVERY_MS);
+        match result {
+            Ok(false) => false,
+            Ok(true) => {
+                drop(ch);
+                self.note_local_append(&cid);
+                true
             }
-            match ch.append_read(profile, read.clone(), now_millis) {
-                Ok(_) => {
-                    for h in &read {
-                        pending.remove(h);
-                    }
-                    *last = now_millis;
-                }
-                Err(crate::error::Error::RoomNotSynced) => continue,
-                Err(_) => {
-                    pending.clear();
-                    continue;
-                }
+            Err(error)
+                if matches!(error, Error::RoomNotSynced)
+                    || ChannelState::governance_refreshing(&error)
+                    || ChannelState::legacy_classification_refreshing(&error) =>
+            {
+                false
             }
-            drop(ch);
-            // Pushed like a post, so the members it trusts learn of it promptly; no event, since
-            // a read record wakes nobody and is no row (RR-4).
-            self.note_local_append(&cid);
+            Err(error) => {
+                ch.poison(&error);
+                let _ = self.event_tx.send(NodeEvent::NodeNote {
+                    note: format!("room {} could not publish its saved read marks: {error}; the marks remain saved",
+                        crate::node::link::b32_encode(&cid)),
+                });
+                true
+            }
         }
     }
 
@@ -18027,12 +18934,30 @@ impl Node {
     }
 
     /// [`Self::tend_drive_keys_in`] in every open room.
-    async fn tend_drive_keys(&mut self) {
+    async fn tend_drive_keys(&mut self) -> bool {
         let holders = self.drive_holders();
         let channels: Vec<Digest32> = self.channels.keys().copied().collect();
+        let mut changed = false;
         for channel_id in channels {
+            let before = self.session_projection_revision(&channel_id).await;
             self.tend_drive_keys_in(&channel_id, &holders).await;
+            let after = self.session_projection_revision(&channel_id).await;
+            // A failed read also schedules publication, where its actual error is
+            // reported/poisoned; it must not silently look like an unchanged token.
+            changed |= before.is_err() || after.is_err() || before.ok() != after.ok();
         }
+        changed
+    }
+
+    async fn session_projection_revision(
+        &self,
+        channel_id: &Digest32,
+    ) -> crate::error::Result<Digest32> {
+        let (Some(profile), Some(shared)) = (self.profile.as_ref(), self.channels.get(channel_id))
+        else {
+            return Err(Error::AtRestLocked);
+        };
+        shared.lock().await.sessions_revision(profile.store())
     }
 
     /// This node's drive key in one room (ADR-029 SC-2a, SC-2b): **changed first** if a member it
@@ -18049,23 +18974,24 @@ impl Node {
         };
         let now_ms = self.now_ms();
         let now_millis = (self.millis_clock)();
-        let has_session = {
-            let me = self.profile.as_ref().map(Profile::fingerprint);
-            let view = self.view_tx.borrow();
-            view.open_channels
-                .iter()
-                .find(|d| d.channel_id == *channel_id)
-                .is_some_and(|d| {
-                    crate::node::sessions::fold(d)
-                        .iter()
-                        .any(|s| s.open && Some(s.node) == me)
-                })
-        };
         let releases = {
             let Some(profile) = self.profile.as_ref() else {
                 return;
             };
             let mut ch = shared.lock().await;
+            // Pending policy cannot authorize private expiry or a drive-key release.
+            // The shared maintenance branch advances governance independently.
+            if ch
+                .require_governance_ready(profile.store(), now_ms)
+                .is_err()
+            {
+                return;
+            }
+            // Recovery/control catch-up must run before an announcement can refuse
+            // for pending facts, or the same refusal would starve its own repair.
+            if ch.advance_sessions(profile.store(), now_millis).is_err() {
+                return;
+            }
             // Ordinary-key declarations name only this node's authenticated legacy hashes.
             // They let read-only peers identify withheld steps without granting drive.
             if ch.announce_legacy_sessions(profile, now_millis).is_err() {
@@ -18080,6 +19006,19 @@ impl Node {
             {
                 return;
             }
+            use crate::node::channel::session_projection::{Query, Reply};
+            let has_session = match ch.session_query(
+                profile.store(),
+                Query::HasOpen {
+                    node: profile.fingerprint(),
+                },
+                1,
+                now_millis,
+            ) {
+                Ok(Reply::HasOpen(open)) => open,
+                // A rebuilding or failed projection does not assert absence or release keys.
+                _ => return,
+            };
             if has_session && ch.ensure_drive(profile.store(), holders, now_ms).is_err() {
                 return;
             }
@@ -18087,9 +19026,9 @@ impl Node {
                 return;
             };
             if !owed.is_empty()
-                && ch
+                && !ch
                     .refresh_session_records(profile, holders, &owed, now_millis)
-                    .is_err()
+                    .is_ok_and(|complete| complete)
             {
                 return;
             }
@@ -18162,7 +19101,7 @@ impl Node {
         // ordering inversion this change exists to remove.
         let now_millis = (self.millis_clock)();
         let appended = match ch.append_text(profile, text, now_millis) {
-            Ok(r) => row_of(r),
+            Ok(r) => row_of(&r),
             Err(e) => return Outcome::Failed(fault_of(&e)),
         };
         // ADR-006's scheduled rotation: at `N` messages or `T` elapsed the sender key
@@ -18192,7 +19131,7 @@ impl Node {
                 self.fresh_details
                     .insert(*channel_id, (summary_of(&ch), detail));
             }
-            Err(error) => ch.poison(&error),
+            Err(error) => detail_failed(&mut ch, &error),
         }
         drop(ch);
         let channel_id = *channel_id;
@@ -18470,7 +19409,6 @@ impl Node {
                         self.fresh_details
                             .get(id)
                             .map(|(_, detail)| detail)
-                            .filter(|detail| ch.display_is_current(&detail.display_stamp))
                             .or_else(|| prev.open_channels.iter().find(|d| d.channel_id == *id)),
                         self.now_ms(),
                         &self.display_sequence,
@@ -18482,9 +19420,9 @@ impl Node {
                     open_channels.push(detail);
                 }
                 Err(error) => {
-                    // Preserve the last successful view; storage health names the failure and
-                    // the existing recovery path reopens this poisoned room before more work.
-                    ch.poison(&error);
+                    // Preserve the last successful view during bounded Session catch-up.
+                    // Actual I/O failure still poisons and follows existing recovery.
+                    detail_failed(&mut ch, &error);
                     if let Some(detail) = self
                         .fresh_details
                         .get(id)
@@ -18862,11 +19800,13 @@ impl NodeNames {
     ) -> std::result::Result<crate::node::resolver::ServiceRoom, String> {
         let (tx, rx) = oneshot::channel();
         self.net_tx
-            .send(NetEvent::Names(tx))
+            .send(NetEvent::Resolve {
+                name: name.to_owned(),
+                reply: tx,
+            })
             .await
             .map_err(|_| "the node has stopped".to_owned())?;
-        let names = rx.await.map_err(|_| "the node has stopped".to_owned())?;
-        names.lookup(name)
+        rx.await.map_err(|_| "the node has stopped".to_owned())?
     }
 }
 
@@ -19193,6 +20133,248 @@ async fn test_admission_gate() {
     }
 }
 
+/// A bounded reader of the selected node's room history. It owns no room, profile,
+/// snapshot, or keys and cannot keep a stopped node alive.
+#[derive(Clone)]
+pub struct HistoryReader {
+    tx: mpsc::WeakSender<NetEvent>,
+}
+impl HistoryReader {
+    async fn session_files_query(
+        &self,
+        room: Digest32,
+        query: crate::node::channel::session_projection::FileQuery,
+    ) -> std::result::Result<crate::node::channel::session_projection::FileReply, String> {
+        let tx = self
+            .tx
+            .upgrade()
+            .ok_or_else(|| "the node has stopped".to_owned())?;
+        let (reply, rx) = oneshot::channel();
+        tx.send(NetEvent::SessionFiles {
+            channel_id: room,
+            query,
+            reply,
+        })
+        .await
+        .map_err(|_| "the node has stopped".to_owned())?;
+        rx.await
+            .map_err(|_| "the node stopped before answering".to_owned())?
+    }
+
+    /// One currently readable, unexpired private Session file offer.
+    /// A local storage failure is an error, never an absent offer.
+    pub async fn session_file(
+        &self,
+        room: Digest32,
+        entry: Digest32,
+    ) -> std::result::Result<Option<crate::node::drive::SessionRow>, String> {
+        use crate::node::channel::session_projection::{FileQuery, FileReply};
+        match self
+            .session_files_query(room, FileQuery::Exact(entry))
+            .await?
+        {
+            FileReply::Exact(row) => Ok(row),
+            _ => Err("unexpected Session file answer".into()),
+        }
+    }
+
+    /// One bounded private-file scan. Follow an explicit continuation even when
+    /// the page is empty; a deleted/rejoined room restarts the saved-instance cursor.
+    pub async fn session_files_page(
+        &self,
+        room: Digest32,
+        after: Option<crate::node::api::HistoryCursor>,
+        limit: usize,
+    ) -> std::result::Result<crate::node::api::SessionFilePage, String> {
+        use crate::node::channel::session_projection::{FileQuery, FileReply};
+        match self
+            .session_files_query(room, FileQuery::Page { after, limit })
+            .await?
+        {
+            FileReply::Page(page) => Ok(page),
+            _ => Err("unexpected Session files answer".into()),
+        }
+    }
+
+    async fn query(
+        &self,
+        room: Digest32,
+        query: crate::node::channel::history::Query,
+    ) -> std::result::Result<crate::node::channel::history::Reply, String> {
+        let tx = self
+            .tx
+            .upgrade()
+            .ok_or_else(|| "the node has stopped".to_owned())?;
+        query_history(&tx, room, query).await
+    }
+    /// The saved room instance and newest readable arrival, without loading a body.
+    pub async fn arrival_head(
+        &self,
+        room: Digest32,
+    ) -> std::result::Result<crate::node::api::HistoryCursor, String> {
+        use crate::node::channel::history::{Query, Reply};
+        match self.query(room, Query::ArrivalHead).await? {
+            Reply::ArrivalHead(head) => Ok(head),
+            _ => Err("unexpected arrival-head answer".into()),
+        }
+    }
+    /// Freshness for a notice count, without retaining a snapshot across client work.
+    pub async fn notice_state(
+        &self,
+        room: Digest32,
+    ) -> std::result::Result<crate::node::api::NoticeState, String> {
+        use crate::node::channel::history::{Query, Reply};
+        match self.query(room, Query::NoticeState).await? {
+            Reply::NoticeState(state) => Ok(state),
+            _ => Err("unexpected notice-state answer".into()),
+        }
+    }
+    /// One readable, unexpired notice parent and its local expiry deadline.
+    pub async fn notice_exact(
+        &self,
+        room: Digest32,
+        entry: Digest32,
+    ) -> std::result::Result<Option<crate::node::api::NoticeRow>, String> {
+        use crate::node::channel::history::{Query, Reply};
+        match self.query(room, Query::NoticeExact { entry }).await? {
+            Reply::NoticeExact(row) => Ok(row),
+            _ => Err("unexpected notice-row answer".into()),
+        }
+    }
+    /// One display-ordered page, newest when `before` is absent.
+    pub async fn older_page(
+        &self,
+        room: Digest32,
+        before: Option<Digest32>,
+        limit: usize,
+    ) -> std::result::Result<crate::node::api::HistoryPage, String> {
+        use crate::node::channel::history::{Query, Reply};
+        match self
+            .query(
+                room,
+                Query::Older {
+                    before,
+                    limit: limit.clamp(1, crate::node::ipc::PAGE_ENTRIES),
+                },
+            )
+            .await?
+        {
+            Reply::Older { rows, older } => Ok(crate::node::api::HistoryPage { rows, older }),
+            _ => Err("unexpected older history answer".into()),
+        }
+    }
+    /// Read one arrival page, resetting a cursor from a deleted/rejoined saved room.
+    pub async fn arrival_page(
+        &self,
+        room: Digest32,
+        after: Option<crate::node::api::HistoryCursor>,
+        limit: usize,
+    ) -> std::result::Result<crate::node::api::MessagePage, String> {
+        self.cursor_page(room, after, None, limit).await
+    }
+    /// Read one page of these structured types, selected by the sealed room index.
+    pub async fn typed_page(
+        &self,
+        room: Digest32,
+        types: Vec<String>,
+        after: Option<crate::node::api::HistoryCursor>,
+        limit: usize,
+    ) -> std::result::Result<crate::node::api::MessagePage, String> {
+        use crate::node::channel::history::{Filter, Selection};
+        self.cursor_page(
+            room,
+            after,
+            Some(Selection::Any(
+                types.into_iter().map(Filter::Type).collect(),
+            )),
+            limit,
+        )
+        .await
+    }
+    async fn cursor_page(
+        &self,
+        room: Digest32,
+        after: Option<crate::node::api::HistoryCursor>,
+        selection: Option<crate::node::channel::history::Selection>,
+        limit: usize,
+    ) -> std::result::Result<crate::node::api::MessagePage, String> {
+        use crate::node::channel::history::{Query, Reply};
+        match self
+            .query(
+                room,
+                Query::CursorPage {
+                    after,
+                    selection,
+                    limit: limit.clamp(1, crate::node::ipc::PAGE_ENTRIES),
+                },
+            )
+            .await?
+        {
+            Reply::CursorPage(page) => Ok(page),
+            _ => Err("unexpected history page answer".into()),
+        }
+    }
+    /// A bounded page of unexpired wake/reply candidates and its freshness token.
+    pub async fn notice_page(
+        &self,
+        room: Digest32,
+        after: Option<crate::node::api::HistoryCursor>,
+    ) -> std::result::Result<crate::node::api::NoticePage, String> {
+        use crate::node::channel::history::{Query, Reply};
+        match self.query(room, Query::NoticePage { after }).await? {
+            Reply::NoticePage(page) => Ok(page),
+            _ => Err("unexpected notice page answer".into()),
+        }
+    }
+    /// Resolve bounded exact hashes. Missing is absent; owed rows retain their owed flag;
+    /// a storage/revision error discards the whole partial answer.
+    pub async fn exact(
+        &self,
+        room: Digest32,
+        hashes: Vec<Digest32>,
+    ) -> std::result::Result<Vec<MessageRow>, String> {
+        use crate::node::channel::history::{Query, Reply};
+        let Reply::Located { entries, revision } =
+            self.query(room, Query::Locate { entries: hashes }).await?
+        else {
+            return Err("unexpected exact history answer".into());
+        };
+        let mut rows = Vec::new();
+        for entry in entries {
+            let Reply::Exact(row) = self
+                .query(
+                    room,
+                    Query::Exact {
+                        entry,
+                        revision: revision.clone(),
+                    },
+                )
+                .await?
+            else {
+                return Err("unexpected exact history row".into());
+            };
+            rows.push(row);
+        }
+        Ok(rows)
+    }
+}
+
+async fn query_history(
+    tx: &mpsc::Sender<NetEvent>,
+    channel_id: Digest32,
+    query: crate::node::channel::history::Query,
+) -> std::result::Result<crate::node::channel::history::Reply, String> {
+    let (reply, rx) = oneshot::channel();
+    tx.send(NetEvent::RoomHistory {
+        channel_id,
+        query,
+        reply,
+    })
+    .await
+    .map_err(|_| "the node has stopped".to_owned())?;
+    rx.await.map_err(|_| "the node has stopped".to_owned())?
+}
+
 /// The posts of `ask.types` this node's view of a room holds, once it holds `ask.entry`; `None`
 /// while it does not (V210-168).
 ///
@@ -19202,55 +20384,59 @@ async fn test_admission_gate() {
 /// clock is more than that behind this node's skipped this node's posts when it stamped, so its
 /// claim can sort before one this node already holds. Agreeing then could tell two claimants "you
 /// hold it"; the answer says the clocks are apart instead.
-fn listed(
-    view: &crate::node::api::NodeView,
+async fn listed(
+    tx: &mpsc::Sender<NetEvent>,
     ask: &crate::node::agreestream::Ask,
     now_millis: u64,
-) -> Option<crate::node::agreestream::Answer> {
-    use crate::node::agreestream::{Answer, MAX_LISTED, STAMP_LEAD_LIMIT_MILLIS};
+) -> std::result::Result<Option<crate::node::agreestream::Answer>, String> {
+    use crate::node::{
+        agreestream::{Answer, STAMP_LEAD_LIMIT_MILLIS},
+        channel::history::{Query, Reply},
+    };
     if now_millis.abs_diff(ask.sent_millis) > STAMP_LEAD_LIMIT_MILLIS {
-        return Some(Answer::ClocksApart);
+        return Ok(Some(Answer::ClocksApart));
     }
-    let d = view
-        .open_channels
-        .iter()
-        .find(|d| d.channel_id == ask.channel_id)?;
-    let asked = d
-        .timeline
-        .iter()
-        .rev()
-        .find(|r| r.entry_hash == ask.entry)?;
-    if asked.created_millis > now_millis.saturating_add(STAMP_LEAD_LIMIT_MILLIS) {
-        return Some(Answer::ClocksApart);
+    match query_history(
+        tx,
+        ask.channel_id,
+        Query::Agreement {
+            entry: Some(ask.entry),
+            types: ask.types.clone(),
+            now: now_millis,
+        },
+    )
+    .await?
+    {
+        Reply::Agreement(answer) => Ok(answer),
+        _ => Err("unexpected agreement history answer".into()),
     }
-    let at = d.structured.positions(&ask.types, &[]);
-    if at.len() > MAX_LISTED {
-        return Some(Answer::TooMany);
-    }
-    Some(Answer::Holds(
-        at.iter()
-            .filter_map(|i| d.timeline.get(*i as usize).map(|r| r.entry_hash))
-            .collect(),
-    ))
 }
 
-/// The posts of `types` this node's view of a room holds.
-fn own_listed(
-    view: &crate::node::api::NodeView,
-    channel_id: &Digest32,
+async fn own_listed(
+    tx: &mpsc::Sender<NetEvent>,
+    channel_id: Digest32,
     types: &[String],
-) -> Vec<Digest32> {
-    view.open_channels
-        .iter()
-        .find(|d| d.channel_id == *channel_id)
-        .map(|d| {
-            d.structured
-                .positions(types, &[])
-                .iter()
-                .filter_map(|i| d.timeline.get(*i as usize).map(|r| r.entry_hash))
-                .collect()
-        })
-        .unwrap_or_default()
+) -> std::result::Result<Vec<Digest32>, Fault> {
+    use crate::node::{
+        agreestream::Answer,
+        channel::history::{Query, Reply},
+    };
+    match query_history(
+        tx,
+        channel_id,
+        Query::Agreement {
+            entry: None,
+            types: types.to_vec(),
+            now: 0,
+        },
+    )
+    .await
+    .map_err(|_| Fault::Storage)?
+    {
+        Reply::Agreement(Some(Answer::Holds(entries))) => Ok(entries),
+        Reply::Agreement(Some(Answer::TooMany)) => Err(Fault::TooLong),
+        _ => Err(Fault::Internal),
+    }
 }
 
 /// **One agreement round** (V210-168; see [`crate::node::agreestream`]): reach and ask every
@@ -19269,7 +20455,7 @@ async fn agree_round(
     question: crate::node::agreestream::Ask,
     members: Vec<(Digest32, crate::nat::multiaddr::EndpointList)>,
     skipped: Vec<Digest32>,
-) -> crate::node::agreestream::Report {
+) -> std::result::Result<crate::node::agreestream::Report, Fault> {
     use crate::node::agreestream::{self as agree, Agreement, Answer, Asking};
     let deadline = tokio::time::Instant::now() + agree::ASK_PATIENCE;
     let mut asking = tokio::task::JoinSet::new();
@@ -19339,20 +20525,13 @@ async fn agree_round(
 
     // **Pull what members hold and this node does not**, so the client can fold their sets: a
     // claim that crossed this one is usually exactly that.
-    let lacking = |view: &crate::node::api::NodeView| -> Vec<Digest32> {
-        let mine: BTreeSet<Digest32> = own_listed(view, &question.channel_id, &question.types)
-            .into_iter()
-            .collect();
-        asked
-            .iter()
-            .filter(|(_, a)| {
-                matches!(a, Asking::Answered(Answer::Holds(list))
-                    if list.iter().any(|h| !mine.contains(h)))
-            })
-            .map(|(m, _)| *m)
-            .collect()
+    let lacking = |mine: &[Digest32]| -> Vec<Digest32> {
+        let mine: BTreeSet<_> = mine.iter().copied().collect();
+        asked.iter().filter(|(_,a)|matches!(a,Asking::Answered(Answer::Holds(list)) if list.iter().any(|h|!mine.contains(h))))
+            .map(|(m,_)|*m).collect()
     };
-    let peers = lacking(&view.borrow_and_update());
+    let mut mine = own_listed(&tx, question.channel_id, &question.types).await?;
+    let peers = lacking(&mine);
     if !peers.is_empty() {
         let _ = tx
             .send(NetEvent::AgreeFetch {
@@ -19361,17 +20540,16 @@ async fn agree_round(
             })
             .await;
         let by = tokio::time::Instant::now() + agree::FETCH_PATIENCE;
-        while !lacking(&view.borrow_and_update()).is_empty() {
+        while !lacking(&mine).is_empty() {
             if !matches!(
                 tokio::time::timeout_at(by, view.changed()).await,
                 Ok(Ok(()))
             ) {
                 break;
             }
+            mine = own_listed(&tx, question.channel_id, &question.types).await?;
         }
     }
-
-    let mine = own_listed(&view.borrow(), &question.channel_id, &question.types);
     let mut members: Vec<(Digest32, Agreement)> = asked
         .into_iter()
         .map(|(m, a)| {
@@ -19391,16 +20569,22 @@ async fn agree_round(
     // can sort before it although it was made after, so whatever the members answered, the claim
     // is not agreed. Its author is named, this node itself included, beside its answer.
     members.extend(skipped.into_iter().map(|a| (a, Agreement::StampedAhead)));
-    agree::Report {
+    Ok(agree::Report {
         mine: mine.len() as u64,
         members,
-    }
+    })
 }
 
 /// The [`Fault`] a person is told for `e`: one mapping, shared by the actor and by a client verb
 /// that does the same work itself (`vox id` making an identity, ADR-026 C-5).
 #[must_use]
 pub fn fault_of(e: &Error) -> Fault {
+    if ChannelState::governance_refreshing(e)
+        || ChannelState::legacy_classification_refreshing(e)
+        || ChannelState::authorization_refreshing(e)
+    {
+        return Fault::GovernanceRefreshing;
+    }
     match e {
         // A ladder that tried every rung and got nowhere is unreachable, not an internal
         // fault: falling through to `Internal` made the join walk stop after one responder.
@@ -19447,6 +20631,8 @@ pub fn fault_of(e: &Error) -> Fault {
         Error::MalformedGovernance("room name is not a DNS label") => Fault::NotARoomName,
         // A room's lifecycle (V030-08): said as what it is, not as an internal fault.
         Error::Profile("this room has ended") => Fault::RoomEnded,
+        Error::Profile("this identity has left the room") => Fault::RoomLeft,
+        Error::Profile("read selection changed; refresh and retry") => Fault::ReadSelectionChanged,
         Error::Profile(
             "only the room's creator or an admin may end it"
             | "only the room's creator may choose its idle end",

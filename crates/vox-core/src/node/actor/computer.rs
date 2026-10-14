@@ -117,6 +117,9 @@ impl Node {
             // The existing room machinery performs pending removals, sender-key rotation, and
             // consent delivery. Computer policy does not create a second room authorization path.
             self.refresh_reachers().await;
+            for prepared in self.preparing_rooms.values_mut() {
+                prepared.channel.get_mut().release_held_packages();
+            }
             let rooms: Vec<_> = self.channels.keys().copied().collect();
             for room in rooms {
                 self.act_on_removals_while_closed(&room).await;

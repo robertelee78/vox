@@ -310,7 +310,11 @@ async fn held_names(
                     continue;
                 };
                 if let Frame::Services { room, services, .. } = client
-                    .request(&Request::Services { channel_id: id })
+                    .request(&Request::Services {
+                        channel_id: id,
+                        after: None,
+                        revision: None,
+                    })
                     .await
                     .map_err(|e| crate::app::AppError::Usage(e.to_string()))?
                 {
