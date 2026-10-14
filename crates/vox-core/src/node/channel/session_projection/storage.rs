@@ -47,9 +47,12 @@ pub(super) enum Tree {
     ActivitySessions,
     ActivityCreated,
     Lifecycle,
+    RefreshRecords,
+    PrivateAge,
+    PrivateStepAge,
 }
 
-const TREES: usize = 26;
+const TREES: usize = 29;
 
 impl Tree {
     fn index(self) -> usize {
@@ -80,6 +83,9 @@ impl Tree {
             Self::ActivitySessions => 23,
             Self::ActivityCreated => 24,
             Self::Lifecycle => 25,
+            Self::RefreshRecords => 26,
+            Self::PrivateAge => 27,
+            Self::PrivateStepAge => 28,
         }
     }
 }
@@ -754,6 +760,9 @@ impl<'a, 's> Write<'a, 's> {
             Tree::ActivitySessions,
             Tree::ActivityCreated,
             Tree::Lifecycle,
+            Tree::RefreshRecords,
+            Tree::PrivateAge,
+            Tree::PrivateStepAge,
         ];
         self.working = true;
         for _ in 0..limit {
