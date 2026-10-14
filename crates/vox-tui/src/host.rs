@@ -1207,14 +1207,31 @@ impl Router {
         }
         // **New** is new to this node: no registration before, and no Session of it in any room
         // its log holds, so a daemon restarted mid-session still knows it (ADR-029 RB-5).
-        let seen = handle.as_ref().is_some_and(|h| {
-            let me = h.view().identity.as_ref().map(|i| i.fingerprint);
-            h.view().open_channels.iter().any(|d| {
-                vox_core::node::sessions::fold(d)
-                    .iter()
-                    .any(|s| Some(s.node) == me && s.id == id)
-            })
-        });
+        let seen = if let Some(handle) = &handle {
+            let rooms: Vec<_> = handle
+                .view()
+                .open_channels
+                .iter()
+                .map(|d| d.channel_id)
+                .collect();
+            let mut seen = false;
+            for room in rooms {
+                if handle
+                    .session_seen(room, &id)
+                    .await
+                    .map_err(|why| Refusal::Failed {
+                        node: node.clone(),
+                        why,
+                    })?
+                {
+                    seen = true;
+                    break;
+                }
+            }
+            seen
+        } else {
+            false
+        };
         Ok(DaemonFrame::SessionRegistered {
             info: g.info,
             room,

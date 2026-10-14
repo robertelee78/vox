@@ -43,6 +43,7 @@ mod legacy_session;
 mod legacy_session_sender;
 mod private_session;
 pub(crate) mod session_floor;
+pub(crate) mod session_projection;
 
 pub use entry_store::OrderView;
 use entry_store::Transaction;
@@ -4836,15 +4837,18 @@ impl ChannelState {
             let mut changed = false;
             for position in positions {
                 let entry = writer.get(&position.0, position.1)?;
-                let keep = entry.as_ref().is_some_and(|e| {
-                    e.payload.is_none()
-                        && !self.private_sessions.contains(&e.entry_hash())
-                        && !expired_at(
-                            e.skeleton.claimed_ms,
-                            self.now_hint,
-                            self.entry_retention(e),
-                        )
-                });
+                let keep = match entry.as_ref() {
+                    Some(e) => {
+                        e.payload.is_none()
+                            && !self.private_contains_in(writer.batch(), &e.entry_hash())?
+                            && !expired_at(
+                                e.skeleton.claimed_ms,
+                                self.now_hint,
+                                self.entry_retention(e),
+                            )
+                    }
+                    None => false,
+                };
                 if !keep {
                     if let Some(entry) = entry {
                         writer.set_owed(entry.entry_hash(), None)?;
@@ -6154,7 +6158,7 @@ impl ChannelState {
                         {
                             self.invalidate_display();
                         }
-                        let visibility = self.owed_visibility(&held);
+                        let visibility = self.owed_visibility(&batch, &held)?;
                         let mut writer =
                             self.entries
                                 .write(&mut batch, &self.sek, &self.channel_id)?;
@@ -6560,7 +6564,7 @@ impl ChannelState {
     fn drive_used(&self, store: &Store) -> Result<Option<u64>> {
         let me = self.me();
         let ns = drive_channel(&self.channel_id);
-        let mut used = self.private_drive_used();
+        let mut used = self.private_drive_used(store)?;
         let entries = self.entries.read(store, &self.sek, &self.channel_id)?;
         if let Some(feed) = self.dag.feed(&me) {
             for entry in feed.iter(&entries) {

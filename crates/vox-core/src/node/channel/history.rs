@@ -884,28 +884,32 @@ impl State {
     }
 }
 impl ChannelState {
-    pub(super) fn owed_visibility(&self, entry: &Entry) -> Option<(u64, u64)> {
+    pub(super) fn owed_visibility(
+        &self,
+        batch: &crate::node::store::Batch<'_>,
+        entry: &Entry,
+    ) -> Result<Option<(u64, u64)>> {
         let hash = entry.entry_hash();
         if entry.payload.is_some()
-            || self.private_sessions.contains(&hash)
+            || self.private_contains_in(batch, &hash)?
             || self.legacy_sessions.is_session(&hash)
             || !self
                 .owed
                 .contains(&(entry.skeleton.author_id, entry.skeleton.seq))
         {
-            return None;
+            return Ok(None);
         }
         let created = entry.skeleton.claimed_ms;
         let ttl = self.entry_retention(entry);
         if expired_at(created, self.now_hint, ttl) {
-            return None;
+            return Ok(None);
         }
         let expires = if ttl == 0 {
             u64::MAX
         } else {
             created.saturating_add(ttl.saturating_mul(1_000))
         };
-        Some((created, expires))
+        Ok(Some((created, expires)))
     }
     /// At most 64 selected owed entries plus 64 expired visibility facts per actor turn.
     /// Exact counts never decrypt/scan the remaining history while a client waits.
@@ -939,7 +943,8 @@ impl ChannelState {
                     let entry = writer
                         .get(author, *seq)?
                         .ok_or(Error::MalformedAtRest("owed entry missing"))?;
-                    writer.set_owed(entry.entry_hash(), self.owed_visibility(&entry))?;
+                    let visibility = self.owed_visibility(writer.batch(), &entry)?;
+                    writer.set_owed(entry.entry_hash(), visibility)?;
                 }
                 self.projection_state.cursor =
                     positions.last().copied().or(self.projection_state.cursor);

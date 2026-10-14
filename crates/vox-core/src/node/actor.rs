@@ -395,6 +395,7 @@ fn detail_of(
         drive_from: ch.drive_from(store)?,
         session_files: ch.session_files(),
         session_records: ch.session_records(),
+        session_revision: ch.sessions_revision(store)?,
     })
 }
 
@@ -614,6 +615,8 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::Names(_) => "resolving a .vox name",
         NetEvent::SessionPage { .. } => "reading a page of a room's Session entries",
         NetEvent::RoomHistory { .. } => "reading a page of a room's history",
+        NetEvent::SessionProjection { .. } => "reading bounded Session metadata",
+        NetEvent::SessionFiles { .. } => "reading bounded Session file offers",
         NetEvent::MemberDialer(_) => "lending the proxy its dialer",
         NetEvent::ComputerPolicy(_) => "applying computer trust",
         NetEvent::LocalTrustBlacklist(_) => "reading local trust removal decisions",
@@ -1012,6 +1015,20 @@ enum NetEvent {
         /// Where the answer goes.
         reply:
             oneshot::Sender<Option<std::result::Result<crate::node::drive::SessionPage, String>>>,
+    },
+    SessionProjection {
+        channel_id: Digest32,
+        query: crate::node::channel::session_projection::Query,
+        reply: oneshot::Sender<
+            std::result::Result<crate::node::channel::session_projection::Reply, String>,
+        >,
+    },
+    SessionFiles {
+        channel_id: Digest32,
+        query: crate::node::channel::session_projection::FileQuery,
+        reply: oneshot::Sender<
+            std::result::Result<crate::node::channel::session_projection::FileReply, String>,
+        >,
     },
     RoomHistory {
         channel_id: Digest32,
@@ -4057,6 +4074,42 @@ impl NodeHandle {
         rx.await.ok()?
     }
 
+    pub(crate) async fn session_projection(
+        &self,
+        channel_id: Digest32,
+        query: crate::node::channel::session_projection::Query,
+    ) -> std::result::Result<crate::node::channel::session_projection::Reply, String> {
+        let (reply, rx) = oneshot::channel();
+        self.net_tx
+            .send(NetEvent::SessionProjection {
+                channel_id,
+                query,
+                reply,
+            })
+            .await
+            .map_err(|_| "the node has stopped".to_owned())?;
+        rx.await
+            .map_err(|_| "the node stopped before answering".to_owned())?
+    }
+
+    /// Whether this node already retains the named own Session in this room.
+    /// A failed or incomplete read is an error, never proof of absence.
+    pub async fn session_seen(
+        &self,
+        room: Digest32,
+        id: &str,
+    ) -> std::result::Result<bool, String> {
+        let me = self
+            .view()
+            .identity
+            .as_ref()
+            .map(|i| i.fingerprint)
+            .ok_or_else(|| "the node is locked".to_owned())?;
+        crate::node::sessions::lookup(self, room, me, id)
+            .await
+            .map(|row| row.is_some())
+    }
+
     /// A bounded history reader that does not hold this node alive.
     #[must_use]
     pub fn history_reader(&self) -> HistoryReader {
@@ -4146,6 +4199,18 @@ impl NodeHandle {
             }
         }
         view
+    }
+
+    /// Current Session token with actor lifetime and effective local policy. Reopening
+    /// a held connection to a replacement actor cannot alias its old cached token.
+    pub(crate) fn session_display_token(&self, detail: &ChannelDetail, current: bool) -> Digest32 {
+        crate::hash::sha256_concat(&[
+            b"vox/session-view/v1",
+            &self.display_incarnation,
+            &detail.channel_id,
+            &detail.session_revision,
+            &[u8::from(current)],
+        ])
     }
 
     /// An opaque cache token for one open room's published rows and display names (#754).
@@ -8913,6 +8978,43 @@ impl Node {
                     None => None,
                 };
                 let _ = reply.send(page);
+            }
+            NetEvent::SessionProjection {
+                channel_id,
+                query,
+                reply,
+            } => {
+                let result = match (self.channels.get(&channel_id), self.profile.as_ref()) {
+                    (Some(shared), Some(profile)) => {
+                        let mut room = shared.lock().await;
+                        match room.advance_sessions(profile.store()) {
+                            Ok(_) => room.session_query(
+                                profile.store(),
+                                query,
+                                crate::node::ipc::rows_budget(),
+                            ),
+                            Err(error) => Err(error.to_string()),
+                        }
+                    }
+                    _ => Err("room not open".into()),
+                };
+                let _ = reply.send(result);
+            }
+            NetEvent::SessionFiles {
+                channel_id,
+                query,
+                reply,
+            } => {
+                let result = match (self.channels.get(&channel_id), self.profile.as_ref()) {
+                    (Some(shared), Some(profile)) => shared.lock().await.session_file_query(
+                        profile.store(),
+                        query,
+                        crate::node::ipc::rows_budget(),
+                        self.now_ms().get(),
+                    ),
+                    _ => Err("room not open".into()),
+                };
+                let _ = reply.send(result);
             }
             NetEvent::RoomHistory {
                 channel_id,
@@ -17804,18 +17906,6 @@ impl Node {
         };
         let now_ms = self.now_ms();
         let now_millis = (self.millis_clock)();
-        let has_session = {
-            let me = self.profile.as_ref().map(Profile::fingerprint);
-            let view = self.view_tx.borrow();
-            view.open_channels
-                .iter()
-                .find(|d| d.channel_id == *channel_id)
-                .is_some_and(|d| {
-                    crate::node::sessions::fold(d)
-                        .iter()
-                        .any(|s| s.open && Some(s.node) == me)
-                })
-        };
         let releases = {
             let Some(profile) = self.profile.as_ref() else {
                 return;
@@ -17835,6 +17925,21 @@ impl Node {
             {
                 return;
             }
+            use crate::node::channel::session_projection::{Query, Reply};
+            if ch.advance_sessions(profile.store()).is_err() {
+                return;
+            }
+            let has_session = match ch.session_query(
+                profile.store(),
+                Query::HasOpen {
+                    node: profile.fingerprint(),
+                },
+                1,
+            ) {
+                Ok(Reply::HasOpen(open)) => open,
+                // A rebuilding or failed projection does not assert absence or release keys.
+                _ => return,
+            };
             if has_session && ch.ensure_drive(profile.store(), holders, now_ms).is_err() {
                 return;
             }
@@ -18955,6 +19060,62 @@ pub struct HistoryReader {
     tx: mpsc::WeakSender<NetEvent>,
 }
 impl HistoryReader {
+    async fn session_files_query(
+        &self,
+        room: Digest32,
+        query: crate::node::channel::session_projection::FileQuery,
+    ) -> std::result::Result<crate::node::channel::session_projection::FileReply, String> {
+        let tx = self
+            .tx
+            .upgrade()
+            .ok_or_else(|| "the node has stopped".to_owned())?;
+        let (reply, rx) = oneshot::channel();
+        tx.send(NetEvent::SessionFiles {
+            channel_id: room,
+            query,
+            reply,
+        })
+        .await
+        .map_err(|_| "the node has stopped".to_owned())?;
+        rx.await
+            .map_err(|_| "the node stopped before answering".to_owned())?
+    }
+
+    /// One currently readable, unexpired private Session file offer.
+    /// A local storage failure is an error, never an absent offer.
+    pub async fn session_file(
+        &self,
+        room: Digest32,
+        entry: Digest32,
+    ) -> std::result::Result<Option<crate::node::drive::SessionRow>, String> {
+        use crate::node::channel::session_projection::{FileQuery, FileReply};
+        match self
+            .session_files_query(room, FileQuery::Exact(entry))
+            .await?
+        {
+            FileReply::Exact(row) => Ok(row),
+            _ => Err("unexpected Session file answer".into()),
+        }
+    }
+
+    /// One bounded private-file scan. Follow an explicit continuation even when
+    /// the page is empty; a deleted/rejoined room restarts the saved-instance cursor.
+    pub async fn session_files_page(
+        &self,
+        room: Digest32,
+        after: Option<crate::node::api::HistoryCursor>,
+        limit: usize,
+    ) -> std::result::Result<crate::node::api::SessionFilePage, String> {
+        use crate::node::channel::session_projection::{FileQuery, FileReply};
+        match self
+            .session_files_query(room, FileQuery::Page { after, limit })
+            .await?
+        {
+            FileReply::Page(page) => Ok(page),
+            _ => Err("unexpected Session files answer".into()),
+        }
+    }
+
     async fn query(
         &self,
         room: Digest32,
