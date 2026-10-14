@@ -123,6 +123,7 @@ final class NodeModel: ObservableObject {
     @Published var selection: Selection? {
         didSet {
             roomReadGeneration = UUID()
+            invalidateRoomAnchorState()
             individualTrustFacts = [:]
             individualTrustReads = [:]
             rejectedRoomMark = nil
@@ -761,6 +762,7 @@ final class NodeModel: ObservableObject {
             individualTrustReads = [:]
             machineStateKnown = false
             nodeObservationEpoch = UUID()
+            invalidateRoomAnchorState()
             daemonFailure = sentence(error)
             reportBackground(error)
             return
@@ -2216,6 +2218,7 @@ final class NodeModel: ObservableObject {
     fileprivate func stopped(_ text: String) {
         nodeObservationEpoch = UUID()
         roomReadGeneration = UUID()
+        invalidateRoomAnchorState()
         rejectedRoomMark = nil
         roomNeedsPage = false
         // An ended stream does not establish whether a protected node is Locked or a
