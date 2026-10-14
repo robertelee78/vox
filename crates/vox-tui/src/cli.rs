@@ -561,6 +561,13 @@ pub struct JoinRoomArgs {
 pub struct CreateRoomArgs {
     #[command(flatten)]
     pub profile: NodeArgs,
+    /// An anchor for this room only: fingerprint@address or host:port. Repeat for more.
+    /// The machine's --anchor/VOX_ANCHORS settings are not imported into this room.
+    #[arg(long = "room-anchor", value_name = "ANCHOR")]
+    pub room_anchors: Vec<String>,
+    /// Search the local network for anchors to keep in this room; finding none still creates it.
+    #[arg(long)]
+    pub find_anchor: bool,
     /// The room's name, which every member sees: one DNS label (a-z, 0-9 and `-`), because it
     /// is the room part of every service address in it. Its creator or an admin can change it
     /// with `vox room rename`.
@@ -605,10 +612,13 @@ pub struct RoomAnchorsArgs {
 
 #[derive(Subcommand, Debug, Clone)]
 pub enum RoomAnchorChange {
-    /// Add anchors as fingerprint@host:port or fingerprint@multiaddr.
+    /// Add anchors as fingerprint@address or host:port, or search the local network.
     Add {
-        #[arg(required = true)]
+        #[arg(required_unless_present = "find_anchor")]
         anchors: Vec<String>,
+        /// Keep the anchors found by an explicit local-network search in this room only.
+        #[arg(long)]
+        find_anchor: bool,
     },
     /// Remove an anchor by its full fingerprint; removing the last clears the set.
     Remove { fingerprint: String },
@@ -2843,6 +2853,8 @@ pub fn run() -> ExitCode {
                                 a.passphrase_file.as_deref(),
                                 a.idle_end.as_deref(),
                                 a.bind.as_deref(),
+                                &a.room_anchors,
+                                a.find_anchor,
                             )
                             .await
                         }

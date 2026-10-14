@@ -74,6 +74,7 @@ pub mod retention;
 pub mod room_join;
 pub mod seatstream;
 pub mod service_reach;
+pub mod session_ingress;
 pub mod session_view;
 pub mod sessions;
 pub(crate) mod sessionstream;

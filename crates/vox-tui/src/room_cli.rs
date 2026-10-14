@@ -298,33 +298,7 @@ pub(crate) async fn post(
         }
         _ => body,
     };
-    // Pasted envelopes are a supported posting verb too. Keep their metadata, while adding
-    // the same starting tags as the flag-built reply; no tag is resolved outside this room.
-    let body = if let Ok(mut env) = Envelope::parse(&body) {
-        if env.re.is_some() || env.thread.is_some() {
-            let root = match (&env.thread, &env.re) {
-                (Some(root), _) => Some(root.clone()),
-                (None, Some(re)) => {
-                    let chain = coord::reply_chain(&mut client, channel_id, re).await?;
-                    vox_agentcomms::envelope::reply_thread_by(re, |h| {
-                        let hash = b32_decode(h.trim(), "re").ok()?;
-                        chain
-                            .iter()
-                            .find(|r| r.entry_hash == hash)
-                            .map(|r| r.text.clone())
-                    })
-                    .or_else(|| Some(re.clone()))
-                }
-                _ => None,
-            };
-            env.tags = reply_tags(&mut client, channel_id, root.as_deref(), &env.tags).await?;
-            env.to_text()
-        } else {
-            body
-        }
-    } else {
-        body
-    };
+    let body = prepare_reply(&mut client, channel_id, &body).await?;
     match client
         .request(&Request::Post {
             channel_id,
@@ -478,6 +452,63 @@ impl PostReport {
                     .map(|r| format!("to {}: {}", r.name, r.says)),
             )
             .collect()
+    }
+}
+
+/// Prepare a pasted envelope before it is signed, in both the CLI and the TUI. Prose is
+/// unchanged; a reply must name a readable parent and carry that parent's canonical thread.
+pub(crate) async fn prepare_reply(
+    client: &mut IpcClient,
+    cid: Digest32,
+    body: &str,
+) -> Result<String, AppError> {
+    let Ok(mut env) = Envelope::parse(body) else {
+        return Ok(body.to_owned());
+    };
+    if env.re.is_none() && env.thread.is_none() {
+        return Ok(body.to_owned());
+    }
+    let known = match env.re.as_deref() {
+        Some(re) => {
+            let chain = coord::reply_chain(client, cid, re).await?;
+            vox_agentcomms::envelope::reply_thread_by(re, |h| {
+                let hash = b32_decode(h.trim(), "re").ok()?;
+                chain
+                    .iter()
+                    .find(|r| r.entry_hash == hash)
+                    .map(|r| r.text.clone())
+            })
+        }
+        None => None,
+    };
+    env.thread = reply_thread(env.re.as_deref(), known, env.thread.as_deref())?;
+    env.tags = reply_tags(client, cid, env.thread.as_deref(), &env.tags).await?;
+    Ok(env.to_text())
+}
+
+/// Resolve a new reply's thread, after a structured operation has had the chance to reuse its
+/// recorded root. An explicit thread alone is caller intent; it cannot make an unreadable `re`
+/// into a known General message or override the readable parent's canonical root.
+pub(crate) fn reply_thread(
+    re: Option<&str>,
+    known: Option<String>,
+    explicit: Option<&str>,
+) -> Result<Option<String>, AppError> {
+    if let Some(re) = re {
+        if known.is_none() {
+            return Err(AppError::Usage(format!(
+                "cannot reply to {re}: this node cannot read that message; nothing was posted"
+            )));
+        }
+    }
+    match (known, explicit) {
+        (Some(root), Some(explicit)) if !root.eq_ignore_ascii_case(explicit.trim()) => {
+            Err(AppError::Usage(format!(
+                "thread {explicit} contradicts the message being replied to: its thread is {root}"
+            )))
+        }
+        (Some(root), _) => Ok(Some(root)),
+        (None, explicit) => Ok(explicit.map(str::to_owned)),
     }
 }
 
@@ -654,16 +685,7 @@ pub(crate) async fn post_structured(
     let thread = if let Some(original) = retry {
         original.envelope.thread.clone()
     } else {
-        match (known_thread, &opts.thread) {
-            (Some(root), Some(explicit)) if !root.eq_ignore_ascii_case(explicit.trim()) => {
-                return Err(AppError::Usage(format!(
-                    "--thread {explicit} contradicts the message being replied to: its thread is {root}"
-                )));
-            }
-            (Some(root), _) => Some(root),
-            (None, Some(explicit)) => Some(explicit.clone()),
-            (None, None) => re.clone(),
-        }
+        reply_thread(re.as_deref(), known_thread, opts.thread.as_deref())?
     };
     let tags = if thread.is_some() {
         let inherited: Vec<String> = match retry {
@@ -1462,8 +1484,9 @@ pub(crate) fn shown_tags(tags: &[String]) -> String {
 /// woke `session`; and that parent's budget less one.
 ///
 /// # Errors
-/// An urgent post from a session woken by several unanswered messages names none of them, or a
-/// parent cannot be read.
+/// An urgent post from a session woken by several unanswered messages names none of them, or
+/// the node cannot answer. An unavailable parent leaves the root unknown: callers must use
+/// `reply_thread` before a new post, after checking for an existing operation retry.
 pub(crate) async fn answers(
     client: &mut IpcClient,
     cid: Digest32,
@@ -1531,7 +1554,7 @@ pub(crate) async fn answers(
 }
 
 /// Inherit only the canonical starting message's tags, even when a reply answers another reply.
-/// A missing root cannot supply tags; the existing missing-parent behavior is unchanged.
+/// A missing root cannot supply tags. This does not infer a root from an unavailable parent.
 pub(crate) async fn reply_tags(
     client: &mut IpcClient,
     cid: Digest32,
@@ -4917,6 +4940,8 @@ pub async fn create(
     passphrase_file: Option<&std::path::Path>,
     idle_end: Option<&str>,
     bind: Option<&std::path::Path>,
+    anchor_inputs: &[String],
+    find_anchor: bool,
 ) -> Result<(), AppError> {
     // Every member sees the room under this name, and it is the room part of every service
     // address in it: one DNS label (ADR-028 R-1, R-2). Said before a passphrase is asked for.
@@ -4970,6 +4995,8 @@ pub async fn create(
             short(&id)
         )));
     }
+    let anchors = chosen_anchors(paths, anchor_inputs, find_anchor).await?;
+    show_link_preview(&mut client, &anchors).await?;
     let passphrase = room_passphrase(passphrase_file, "a passphrase for the new room", true)?;
     let kept = zeroize::Zeroizing::new(if bind.is_some() {
         passphrase.clone()
@@ -4988,6 +5015,7 @@ pub async fn create(
         .request(&Request::Create {
             name: name.clone(),
             passphrase: zeroize::Zeroizing::new(passphrase),
+            anchors,
         })
         .await
     {
@@ -5055,6 +5083,123 @@ pub async fn create(
     }
 }
 
+/// Show the exact capped link routes, separately from the complete signed room configuration.
+async fn show_link_preview(
+    client: &mut IpcClient,
+    anchors: &vox_core::nat::bootstrap::BootstrapSet,
+) -> Result<(), AppError> {
+    match client
+        .request(&Request::LinkPreview {
+            anchors: anchors.clone(),
+        })
+        .await?
+    {
+        Frame::LinkPreview {
+            node,
+            routes,
+            omitted,
+        } => {
+            if routes.iter().all(|r| r.id == node) {
+                println!("vox: the room link will carry no anchors");
+            }
+            for route in routes {
+                let kind = if route.id == node {
+                    "direct route"
+                } else {
+                    "anchor"
+                };
+                for address in route.endpoints.addrs() {
+                    println!("vox: link {kind} {} at {address}", b32_encode(&route.id));
+                }
+            }
+            if omitted > 0 {
+                println!(
+                    "vox: {omitted} more room anchor(s) stay configured but do not fit in the link"
+                );
+            }
+            Ok(())
+        }
+        Frame::Error { reason } => Err(AppError::Usage(format!(
+            "cannot preview the room link: {reason}"
+        ))),
+        other => Err(crate::client::unexpected(&other)),
+    }
+}
+
+/// Resolve only inputs the person supplied, and search only on their explicit request.
+async fn chosen_anchors(
+    paths: &Paths,
+    inputs: &[String],
+    find: bool,
+) -> Result<vox_core::nat::bootstrap::BootstrapSet, AppError> {
+    use vox_core::nat::bootstrap::{BootstrapSet, MAX_BOOTSTRAP_NODES};
+    use vox_core::node::daemonipc::{DaemonClient, DaemonFrame, DaemonRequest};
+    if inputs.len() > MAX_BOOTSTRAP_NODES {
+        return Err(AppError::Usage(
+            "at most 64 room anchors can be supplied".into(),
+        ));
+    }
+    let mut set = BootstrapSet::new();
+    // Creating without an anchor never waits on discovery or anchor reachability.
+    if inputs.is_empty() && !find {
+        return Ok(set);
+    }
+    for input in inputs {
+        // A daemon request is a connection's opening, followed by one reply and close.
+        let mut daemon = DaemonClient::open(&paths.account().socket()).await?;
+        let spec = match daemon
+            .request(DaemonRequest::AnchorResolve {
+                input: input.clone(),
+            })
+            .await?
+        {
+            DaemonFrame::AnchorResolved(spec) => spec,
+            DaemonFrame::AnchorFailed(why) => return Err(AppError::Usage(why)),
+            DaemonFrame::Refused(why) => return Err(AppError::Usage(why.to_string())),
+            _ => {
+                return Err(AppError::Usage(
+                    "the daemon did not resolve the anchor".into(),
+                ))
+            }
+        };
+        set = tokio::task::spawn_blocking(move || {
+            vox_core::node::link::merge_anchor_spec(&mut set, &spec)?;
+            Ok::<_, vox_core::error::Error>(set)
+        })
+        .await
+        .map_err(|e| AppError::Usage(e.to_string()))??;
+    }
+    if find {
+        let mut daemon = DaemonClient::open(&paths.account().socket()).await?;
+        match daemon.request(DaemonRequest::AnchorSearch).await? {
+            DaemonFrame::AnchorsFound(found) => {
+                if found.is_empty() {
+                    println!("vox: no anchor answered the local network search.");
+                }
+                for anchor in found.nodes() {
+                    set.add(anchor.clone())?;
+                }
+            }
+            DaemonFrame::AnchorFailed(why) => {
+                // An optional search failing must not strand ordinary local room creation.
+                eprintln!("vox: {why}; continuing with the anchors already supplied.");
+            }
+            DaemonFrame::Refused(why) => return Err(AppError::Usage(why.to_string())),
+            _ => {
+                return Err(AppError::Usage(
+                    "the daemon did not answer the anchor search".into(),
+                ))
+            }
+        }
+    }
+    for anchor in set.nodes() {
+        for address in anchor.endpoints.addrs() {
+            println!("vox: room anchor {} at {address}", short(&anchor.id));
+        }
+    }
+    Ok(set)
+}
+
 /// Change a room's anchors through its ordinary governance writer.
 ///
 /// # Errors
@@ -5064,24 +5209,16 @@ pub async fn anchors(
     room: &str,
     change: &crate::cli::RoomAnchorChange,
 ) -> Result<(), AppError> {
-    let change = change.clone();
-    let (add, remove) = tokio::task::spawn_blocking(move || {
-        let mut add = vox_core::nat::bootstrap::BootstrapSet::new();
-        let remove = match change {
-            crate::cli::RoomAnchorChange::Add { anchors } => {
-                for spec in anchors {
-                    vox_core::node::link::merge_anchor_spec(&mut add, &spec)?;
-                }
-                None
-            }
-            crate::cli::RoomAnchorChange::Remove { fingerprint } => Some(
-                vox_core::node::link::b32_decode(&fingerprint, "anchor fingerprint")?,
-            ),
-        };
-        Ok::<_, vox_core::error::Error>((add, remove))
-    })
-    .await
-    .map_err(|error| AppError::Usage(error.to_string()))??;
+    let (add, remove) = match change {
+        crate::cli::RoomAnchorChange::Add {
+            anchors,
+            find_anchor,
+        } => (chosen_anchors(paths, anchors, *find_anchor).await?, None),
+        crate::cli::RoomAnchorChange::Remove { fingerprint } => (
+            vox_core::nat::bootstrap::BootstrapSet::new(),
+            Some(b32_decode(fingerprint, "anchor fingerprint")?),
+        ),
+    };
     let mut client = attach(paths).await?;
     let channel_id = room_of(&mut client, room).await?;
     match client

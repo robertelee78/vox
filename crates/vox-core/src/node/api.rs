@@ -712,6 +712,8 @@ pub enum NodeCommand {
         name: String,
         /// The channel passphrase (the second lock factor).
         passphrase: Secret,
+        /// Explicitly chosen room anchors; never inherited from machine settings.
+        anchors: crate::nat::bootstrap::BootstrapSet,
     },
     /// Open a channel: double-lock unwrap of its SEK.
     OpenChannel {
@@ -991,6 +993,26 @@ pub enum NodeCommand {
         /// The activity item.
         body: String,
     },
+    /// Persist a complete Session activity batch before acknowledging it. Delivery is local,
+    /// bounded work on the actor's tick, independently of the producer's lifetime.
+    AcceptSessionBatch {
+        /// Destination captured by the registered session at admission.
+        channel_id: Digest32,
+        /// The harness session.
+        session_id: String,
+        /// Unnumbered shared-format activity, within the ingress batch bound.
+        bodies: Vec<String>,
+        /// Exact committed range, or the saving/refusal error. Never a network receipt.
+        reply: tokio::sync::oneshot::Sender<crate::node::session_ingress::AdmissionResult>,
+    },
+    /// Finish a hosted daemon's ordered cleanup after it retired this room's volatile tails
+    /// and session bindings. Does not delete room history or reset persistent counters.
+    RetireSessionRoom {
+        /// The exact deletion whose saved bindings the owner cleared.
+        retirement: crate::node::session_ingress::Retirement,
+        /// Receipt for the final inbox cleanup.
+        reply: tokio::sync::oneshot::Sender<crate::error::Result<()>>,
+    },
     /// Reconcile a channel's log with the members this node can reach (ADR-008
     /// frontier sync).
     Sync {
@@ -1063,6 +1085,10 @@ pub enum Fault {
     GovernanceRefreshing,
     /// One admin removal is already being applied over bounded actor turns.
     AdminChangePending,
+    /// A previous hosted room deletion is still awaiting its bounded daemon handoff.
+    SessionCleanupBusy,
+    /// The hosted daemon's reliable Session cleanup handler has gone away.
+    SessionCleanupUnavailable,
     /// Making an identity, its file (`vault.cbor`) could not be written. Not [`Fault::Storage`],
     /// which named the store when the store was fine (V210-77).
     IdentityFileUnwritable,
@@ -1291,6 +1317,12 @@ impl Fault {
             Fault::AdminChangePending => {
                 "an admin change is already being applied on this node\n       wait for its answer before making another admin change"
             }
+            Fault::SessionCleanupBusy => {
+                "an earlier room's Session cleanup is still pending; no deletion started for this request\n       try again after that cleanup finishes"
+            }
+            Fault::SessionCleanupUnavailable => {
+                "the daemon's Session cleanup handler is unavailable; no deletion started for this request\n       restart the daemon before trying again"
+            }
             Fault::RetentionFileUnwritable => {
                 "your retention for this room could not be saved: the node's retention file (`retention`, in its configuration directory) could not be written\n       check free disk space, and that the configuration directory is writable; then run it again"
             }
@@ -1508,6 +1540,8 @@ fault_names!(
     DeliveryBusy,
     GovernanceRefreshing,
     AdminChangePending,
+    SessionCleanupBusy,
+    SessionCleanupUnavailable,
     IdentityFileUnwritable,
     RetentionFileUnwritable,
     SealedUnreadable,

@@ -92,6 +92,11 @@ vox room post family --to ann 'can you check the file?'
 vox room post family --re kfk6r6pysreyhbdkyvzuqoqdwidrfzb4ulxjw6d5tiq74svhnr6q 'yes, it arrived'
 ```
 
+A reply requires this node to have received and opened the message it answers. If that message
+is missing or still waiting for its body/key, Vox refuses the reply instead of guessing its thread.
+Once it is readable, repeat the command. Retrying an already posted `--op` keeps its original
+entry, thread and inherited tags even if retention has since removed the parent.
+
 `--to` takes your name for a member or its fingerprint. An addressed message is still readable by
 every member who can read you. Vox tells you what it knows about each addressee, such as `vox: to
 ann: none of its sessions has announced itself in this room; you trust it; it trusts you`.

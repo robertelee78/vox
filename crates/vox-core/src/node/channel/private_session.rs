@@ -867,8 +867,21 @@ impl ChannelState {
         self.advance_private_sessions(store, now)
     }
 
+    // An incomplete governance projection must neither expire saved Session bodies nor
+    // release them using a policy sampled before the current canonical room history.
+    fn private_policy_ready(&self, store: &Store, now: u64) -> Result<bool> {
+        match self.require_governance_ready(store, crate::time::Ms(now)) {
+            Ok(()) => Ok(true),
+            Err(error) if super::governance::refreshing(&error) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Also driven by ordinary maintenance, before Session projection or grant release.
     pub(crate) fn advance_private_sessions(&mut self, store: &Store, now: u64) -> Result<bool> {
+        if !self.private_policy_ready(store, now)? {
+            return Ok(false);
+        }
         if self.poisoned {
             return Err(self.save_failure());
         }
@@ -976,6 +989,9 @@ impl ChannelState {
     }
 
     pub(super) fn sweep_private_sessions(&mut self, store: &Store, now: u64) -> Result<usize> {
+        if !self.private_policy_ready(store, now)? {
+            return Ok(0);
+        }
         if self.poisoned {
             return Ok(0);
         }
@@ -1029,6 +1045,9 @@ impl ChannelState {
     }
 
     pub(super) fn private_expiry_ready(&self, store: &Store, now: u64) -> Result<bool> {
+        if !self.private_policy_ready(store, now)? {
+            return Ok(false);
+        }
         if self.needs_session_upgrade() {
             return Ok(false);
         }
@@ -1063,11 +1082,19 @@ impl ChannelState {
     }
 
     fn private_save_failed(&mut self, error: &Error) {
+        if super::governance::refreshing(error) {
+            return;
+        }
         self.poisoned = true;
         self.save_error = Some(error.to_string());
     }
 
-    fn keep_private(&mut self, store: &Store, saved: Stored) -> Result<Digest32> {
+    fn keep_private(
+        &mut self,
+        store: &Store,
+        saved: Stored,
+        completion: Option<&crate::node::session_ingress::Completion>,
+    ) -> Result<Digest32> {
         let hash = saved.record.hash();
         let id = self
             .private_id(store, &hash)?
@@ -1089,6 +1116,9 @@ impl ChannelState {
             batch.put_segment(&self.channel_id, SegmentKind::PrivateSession, id, &segment)?;
             self.queue_drive(&mut batch)?;
             private_index::put(&mut batch, &self.sek, &self.channel_id, id, &saved)?;
+            if let Some(completion) = completion {
+                completion.queue(&mut batch)?;
+            }
             batch.commit()
         })();
         if let Err(e) = result {
@@ -1114,6 +1144,9 @@ impl ChannelState {
         owed: &[Digest32],
         now: u64,
     ) -> Result<bool> {
+        if !self.private_policy_ready(profile.store(), now)? {
+            return Ok(false);
+        }
         if self.poisoned {
             return Err(self.save_failure());
         }
@@ -1354,7 +1387,7 @@ impl ChannelState {
             }
         }
         let content = crate::node::content::SessionEntry::new(created, session, body)?;
-        self.append_private_content(profile, content, holders, now)?;
+        self.append_private_content(profile, content, holders, now, None)?;
         Ok(())
     }
 
@@ -1368,7 +1401,20 @@ impl ChannelState {
         now: u64,
     ) -> Result<Digest32> {
         let content = crate::node::content::SessionEntry::new(now, session_id, body)?;
-        self.append_private_content(profile, content, holders, now)
+        self.append_private_content(profile, content, holders, now, None)
+    }
+
+    pub(crate) fn append_ingress_session(
+        &mut self,
+        profile: &Profile,
+        session_id: &str,
+        body: &str,
+        holders: &BTreeSet<Digest32>,
+        now: u64,
+        completion: &crate::node::session_ingress::Completion,
+    ) -> Result<Digest32> {
+        let content = crate::node::content::SessionEntry::new(now, session_id, body)?;
+        self.append_private_content(profile, content, holders, now, Some(completion))
     }
 
     fn append_private_content(
@@ -1377,7 +1423,9 @@ impl ChannelState {
         content: crate::node::content::SessionEntry,
         holders: &BTreeSet<Digest32>,
         now: u64,
+        completion: Option<&crate::node::session_ingress::Completion>,
     ) -> Result<Digest32> {
+        self.require_governance_ready(profile.store(), crate::time::Ms(now))?;
         if self.poisoned {
             return Err(Error::Profile("room save failed; reopen it"));
         }
@@ -1423,6 +1471,7 @@ impl ChannelState {
                     row: Some(row),
                     first_seen: now,
                 },
+                completion,
             )
         })();
         if let Err(e) = &result {
@@ -1492,6 +1541,7 @@ impl ChannelState {
         peer: &Digest32,
         holders: &BTreeSet<Digest32>,
     ) -> Result<Page> {
+        self.require_governance_ready(store, crate::time::Ms(self.now_hint))?;
         if self.poisoned
             || self.needs_session_upgrade()
             || ask.room != self.channel_id
@@ -1552,6 +1602,9 @@ impl ChannelState {
         store: &Store,
         peer: Digest32,
     ) -> Result<Option<Ask>> {
+        if !self.private_policy_ready(store, self.now_hint)? {
+            return Ok(None);
+        }
         if self.poisoned
             || self.drive.receivers.is_empty()
             || !self.supports_private(store, &peer)?
@@ -1589,6 +1642,7 @@ impl ChannelState {
     ) -> Result<bool> {
         self.private_sessions.pulling.remove(&peer);
         let page = page?;
+        self.require_governance_ready(store, crate::time::Ms(now))?;
         if self.poisoned || !self.drive_members().contains(&peer) {
             return Err(Error::StreamRefused("private Session room unavailable"));
         }
@@ -1608,6 +1662,7 @@ impl ChannelState {
     }
 
     fn take_private_record(&mut self, store: &Store, wire: &[u8], now: u64) -> Result<()> {
+        self.require_governance_ready(store, crate::time::Ms(now))?;
         let record = Record::read(wire)?;
         let hash = record.hash();
         let known = (|| {
@@ -1674,6 +1729,7 @@ impl ChannelState {
                 row: Some(row),
                 first_seen,
             },
+            None,
         )?;
         self.sweep_private_sessions(store, now)?;
         Ok(())

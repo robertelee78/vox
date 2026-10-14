@@ -321,7 +321,7 @@ fn pretty(v: &Value) -> String {
 /// `m` as entries of at most the log's text limit each (the shared format's `split`).
 #[must_use]
 pub fn split(m: Map<String, Value>, big: &str) -> Vec<String> {
-    vox_agentcomms::activity::split(m, big, MAX_TEXT_LEN)
+    vox_agentcomms::activity::split(m, big, MAX_TEXT_LEN - 512)
 }
 
 // ---- the hook's side ---------------------------------------------------------------------------
@@ -372,7 +372,7 @@ fn call(ev: &Event, id: &str) -> vox_core::node::daemonipc::ToolCall {
 /// Returns what the hook prints for the harness: only a permission request answered in Vox prints
 /// anything. Every failure is said on stderr and the turn goes on.
 pub async fn hook(daemon: &crate::agent_hook::Daemon, ev: &Event, session: &str) -> Option<String> {
-    use vox_core::node::daemonipc::{DaemonFrame, DaemonRequest};
+    use vox_core::node::daemonipc::{DaemonFrame, DaemonRequest, SessionAdmission};
     let now = now_ms();
     if let Some(mut entry) = ev.request(session, now) {
         // The request travels in one frame; an input too large for it is cut, and says so.
@@ -441,8 +441,12 @@ pub async fn hook(daemon: &crate::agent_hook::Daemon, ev: &Event, session: &str)
                 },
             )
             .await;
-            if !matches!(r, Ok(DaemonFrame::Ok)) {
-                return r;
+            match r {
+                Ok(DaemonFrame::SessionActivity(SessionAdmission::Committed { .. } | SessionAdmission::Skipped)) => {},
+                Ok(DaemonFrame::SessionActivity(SessionAdmission::Held(why))) => {
+                    eprintln!("vox agent hook: activity is held only in memory, not saved; a daemon restart can lose it: {why}");
+                }
+                other => return other,
             }
         }
         Ok(DaemonFrame::Ok)
@@ -452,7 +456,7 @@ pub async fn hook(daemon: &crate::agent_hook::Daemon, ev: &Event, session: &str)
         Ok(Ok(DaemonFrame::Ok)) => {}
         Ok(other) => said(other),
         Err(_) => eprintln!(
-            "vox agent hook: the daemon did not take this session's activity within {} s",
+            "vox agent hook: acceptance of this session's activity was not confirmed within {} s; its outcome is unknown",
             QUEUE_WITHIN.as_secs()
         ),
     }
@@ -461,7 +465,7 @@ pub async fn hook(daemon: &crate::agent_hook::Daemon, ev: &Event, session: &str)
 
 /// The most a hook puts in one frame to the daemon: well under the IPC limit, for the frame's own
 /// fields and encoding.
-const BATCH_MAX: usize = vox_core::node::ipc::MAX_FRAME / 2;
+const BATCH_MAX: usize = vox_core::node::session_ingress::MAX_BATCH_BYTES;
 
 /// The most of a tool's input an approval request carries.
 const ASK_INPUT_MAX: usize = vox_core::node::ipc::MAX_FRAME / 2;

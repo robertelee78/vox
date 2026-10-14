@@ -143,7 +143,7 @@ pub(crate) async fn offer(
         opts.urgent,
     )
     .await?;
-    let thread = thread.or_else(|| re.clone());
+    let thread = crate::room_cli::reply_thread(re.as_deref(), thread, None)?;
     let tags = crate::room_cli::reply_tags(&mut client, channel_id, thread.as_deref(), &[]).await?;
     let env = {
         // The note is the message's body; with none, the daemon says what is shared.

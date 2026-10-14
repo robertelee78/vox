@@ -165,9 +165,10 @@ final class AppModel: ObservableObject {
             self.client = client
             let nodes = try await client.nodes()
             guard ownsNodeRequest(client, generation) else { return }
-            if let chosen = chosenNode(client), let node = nodes.first(where: { $0.name == chosen }) {
-                guard ownsNodeRequest(client, generation) else { return }
-            await use(node)
+            let chosen = try await client.computerStatus().selectedName
+            guard ownsNodeRequest(client, generation) else { return }
+            if let chosen, let node = nodes.first(where: { $0.name == chosen }) {
+                await use(node)
             } else {
                 await offerNodes(nodes)
             }
@@ -262,6 +263,120 @@ final class AppModel: ObservableObject {
     /// identity passphrase typed twice, then attach it with that passphrase. The bytes go into a
     /// `Passphrase` at once and are wiped (M-5).
     private var nodeActionInProgress = false
+    var canChooseAppNode: Bool { node != nil && !nodeActionInProgress }
+    /// Explicit CT-13 selection keeps the current window and its drafts until authenticated.
+    @Published var appNodeChooser = false
+    @Published private(set) var appNodeChoices: [NodeSummary] = []
+    @Published private(set) var appNodeChoiceSaid: String?
+    @Published private(set) var appNodeChoiceBusy = false
+
+    func askAppNodeChoice() async {
+        guard let client, node != nil, !nodeActionInProgress else { return }
+        let generation = beginNodeRequest()
+        appNodeChoiceSaid = nil
+        do {
+            let choices = try await client.nodes()
+            guard ownsNodeRequest(client, generation) else { return }
+            appNodeChoices = choices
+            appNodeChooser = true
+        } catch {
+            guard ownsNodeRequest(client, generation) else { return }
+            appNodeChoiceSaid = sentence(error)
+            appNodeChooser = true
+        }
+    }
+
+    func selectAppNode(_ name: String, fingerprint expected: String, passphrase secret: Secret) async {
+        guard let original = client, let old = node, appNodeChooser,
+              !nodeActionInProgress, appNodeChoices.contains(where: {
+                  $0.name == name && $0.fingerprint == expected
+              }) else { secret.wipe(); return }
+        if old.me == expected { secret.wipe(); appNodeChooser = false; return }
+        let generation = beginNodeRequest()
+        nodeActionInProgress = true
+        appNodeChoiceBusy = true
+        defer { nodeActionInProgress = false; appNodeChoiceBusy = false }
+        var prospective: VoxClient?
+        var committed = false
+        do {
+            let passphrase = try secret.passphrase()
+            defer { passphrase.wipe() }
+            let connection = try await VoxClient.open(dataRoot: "")
+            prospective = connection
+            guard ownsNodeRequest(original, generation), self.node === old,
+                  connection.configDir() == original.configDir() else {
+                await connection.close(); return
+            }
+            let choices = try await connection.nodes()
+            guard ownsNodeRequest(original, generation), self.node === old,
+                  choices.contains(where: { $0.name == name && $0.fingerprint == expected }) else {
+                await connection.close(); return
+            }
+            let actual = try await connection.attach(node: name, passphrase: passphrase)
+            guard ownsNodeRequest(original, generation), self.node === old, actual == expected else {
+                await connection.close(); return
+            }
+            // Only an authenticated, still-selected request changes the daemon's personal role.
+            let selected = try await connection.selectPersonalNode(node: name)
+            committed = true
+            guard ownsNodeRequest(original, generation), self.node === old else {
+                // The role committed while another request superseded this one. Capture that
+                // request's generation: never revive this choice or write its local mirror.
+                let reconciliationGeneration = nodeRequestGeneration
+                await connection.close()
+                guard !Task.isCancelled, nodeRequestGeneration == reconciliationGeneration,
+                      self.client === original, self.node === old else { return }
+                // Some superseding requests leave the old actor on screen. Start a new
+                // authoritative reach so it cannot indefinitely contradict the saved role.
+                await reach()
+                return
+            }
+            guard selected.selectedNode == expected, selected.selectedName == name else {
+                await connection.close()
+                guard ownsNodeRequest(original, generation), self.node === old else { return }
+                appNodeChooser = false
+                appNodeChoiceSaid = "The daemon selected a different node. Reconnecting to its saved selection."
+                await reach()
+                return
+            }
+            self.client = connection
+            enter(name, actual, connection)
+            appNodeChooser = false
+            do {
+                let file = choiceFile(connection)
+                try FileManager.default.createDirectory(at: file.deletingLastPathComponent(),
+                    withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+                try Data((name + "\n").utf8).write(to: file, options: .atomic)
+            } catch {
+                // The daemon already committed the role. Report the local mirror failure
+                // without pretending the old node still acts in this window.
+                let mirrorFailure = sentence(error)
+                do {
+                    let fresh = try await connection.nodes()
+                    guard ownsNodeRequest(connection, generation), self.node?.me == expected else {
+                        await original.close(); return
+                    }
+                    appNodeChoices = fresh
+                    appNodeChoiceSaid = mirrorFailure
+                } catch {
+                    guard ownsNodeRequest(connection, generation), self.node?.me == expected else {
+                        await original.close(); return
+                    }
+                    appNodeChoices = []
+                    appNodeChoiceSaid = mirrorFailure + " " + sentence(error)
+                }
+                appNodeChooser = true
+            }
+            await original.close()
+        } catch {
+            secret.wipe()
+            if let prospective { await prospective.close() }
+            guard ownsNodeRequest(original, generation), self.node === old else { return }
+            appNodeChoiceSaid = sentence(error)
+            if committed { await reach() }
+        }
+    }
+
     private var nodeRequestGeneration: UInt64 = 0
 
     private func beginNodeRequest() -> UInt64 {
@@ -318,7 +433,8 @@ final class AppModel: ObservableObject {
             guard ownsNodeRequest(client, generation) else { return }
             try await refreshNodeState(client, generation: generation)
             guard ownsNodeRequest(client, generation) else { return }
-            remember(name, client)
+            try await remember(name, client, generation: generation)
+            guard ownsNodeRequest(client, generation) else { return }
             enter(name, fingerprint, client)
         } catch {
             guard ownsNodeRequest(client, generation) else { return }
@@ -327,8 +443,7 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// The person picked `name` at first run. Only then: a window already opened as a node never
-    /// becomes another (E-4).
+    /// First-run selection. Later CT-13 changes use the explicit, authenticated modal.
     func choose(_ name: String) async {
         guard let client, case .choosing = phase else { return }
         let generation = beginNodeRequest()
@@ -372,7 +487,8 @@ final class AppModel: ObservableObject {
             guard ownsNodeRequest(client, generation) else { return }
             try await refreshNodeState(client, generation: generation)
             guard ownsNodeRequest(client, generation) else { return }
-            remember(node, client)
+            try await remember(node, client, generation: generation)
+            guard ownsNodeRequest(client, generation) else { return }
             enter(node, fingerprint, client)
         } catch VoxError.WrongPassphrase(let reason) {
             guard ownsNodeRequest(client, generation) else { return }
@@ -709,7 +825,8 @@ final class AppModel: ObservableObject {
             guard ownsNodeRequest(client, generation) else { return }
             try await refreshNodeState(client, generation: generation)
             guard ownsNodeRequest(client, generation) else { return }
-            remember(node.name, client)
+            try await remember(node.name, client, generation: generation)
+            guard ownsNodeRequest(client, generation) else { return }
             enter(node.name, fingerprint, client)
         } catch VoxError.Busy(let reason) {
             guard ownsNodeRequest(client, generation) else { return }
@@ -742,27 +859,16 @@ final class AppModel: ObservableObject {
         URL(fileURLWithPath: client.configDir()).appendingPathComponent("app/node")
     }
 
-    private func chosenNode(_ client: VoxClient) -> String? {
-        guard let text = try? String(contentsOf: choiceFile(client), encoding: .utf8) else {
-            return nil
-        }
-        let name = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        return name.isEmpty ? nil : name
-    }
-
-    /// Forget the remembered node, if it is `node`.
-    private func forget(_ node: String, _ client: VoxClient) {
-        if chosenNode(client) == node {
-            try? FileManager.default.removeItem(at: choiceFile(client))
-        }
-    }
-
-    private func remember(_ node: String, _ client: VoxClient) {
+    private func remember(_ node: String, _ client: VoxClient, generation: UInt64) async throws {
+        // The daemon owns the saved identity and signed personal-role update. Saving a name
+        // in the app alone must never leave the old node's automatic drive authority active.
+        _ = try await client.selectPersonalNode(node: node)
+        guard ownsNodeRequest(client, generation) else { return }
         let file = choiceFile(client)
-        try? FileManager.default.createDirectory(
+        try FileManager.default.createDirectory(
             at: file.deletingLastPathComponent(), withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o700])
-        try? Data((node + "\n").utf8).write(to: file, options: .atomic)
+        try Data((node + "\n").utf8).write(to: file, options: .atomic)
     }
 
     func refreshAgentSetups() {
@@ -866,6 +972,8 @@ final class AppModel: ObservableObject {
 /// capital and ended with a full stop (P6).
 func sentence(_ error: Error) -> String {
     switch error {
+    case let VoxError.Unreachable(reason): return asSentence(reason)
+    case let VoxError.ReadInterrupted(reason): return asSentence(reason)
     case let VoxError.Failed(reason): return asSentence(reason)
     case let VoxError.Detached(reason): return asSentence(reason)
     case let VoxError.Unknown(reason): return asSentence(reason)

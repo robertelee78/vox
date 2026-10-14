@@ -3392,6 +3392,7 @@ impl CoreHandle for DaemonCore {
             }
             Command::CreateChannel { name, passphrase } => self.send(Request::Create {
                 name,
+                anchors: vox_core::nat::bootstrap::BootstrapSet::new(),
                 passphrase: Zeroizing::new(secret(&passphrase)),
             }),
             Command::RenameRoom { channel_id, name } => {
@@ -3845,6 +3846,18 @@ impl CoreHandle for DaemonCore {
                 })
             }
             Command::SendText { channel_id, text } => {
+                let Some(conn) = self.conn.as_mut() else {
+                    return CommandStatus::NotConnected;
+                };
+                let text = match until_stopped(
+                    &self.rt,
+                    &self.stop,
+                    crate::room_cli::prepare_reply(&mut conn.client, channel_id, &text),
+                ) {
+                    Some(Ok(text)) => text,
+                    Some(Err(error)) => return CommandStatus::Said(error.to_string()),
+                    None => return CommandStatus::NotConnected,
+                };
                 // A link card, fetched by this node (ADR-028 F-10).
                 let status = self.send(Request::Post {
                     channel_id,

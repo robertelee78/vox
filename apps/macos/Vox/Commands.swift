@@ -11,7 +11,7 @@ extension Notification.Name {
 
 /// A sheet a menu, key or palette action opens.
 enum NodeSheet: String, Identifiable {
-    case palette, newRoom, joinRoom, repoRoom, fingerprint, rename, retention, admins, leave, end
+    case palette, newRoom, joinRoom, repoRoom, fingerprint, rename, retention, admins, roomAnchors, leave, end
     var id: String { rawValue }
 }
 
@@ -81,9 +81,12 @@ extension VoxAction {
             VoxAction("Room", "Rename…", enabled: inRoom) { node?.sheet = .rename },
             VoxAction("Room", "Retention…", enabled: inRoom) { node?.sheet = .retention },
             VoxAction("Room", "Admins…", enabled: inRoom) { node?.sheet = .admins },
+            VoxAction("Room", "Anchors…", enabled: inRoom && node?.canManageRoomAnchors == true) {
+                Task { await node?.openRoomAnchors() }
+            },
             VoxAction("Room", "Reply in Thread", "r",
-                      enabled: inRoom && node?.messages.contains { $0.id == node?.selectedMessage } == true) {
-                node?.replyTo = node?.messages.first { $0.id == node?.selectedMessage }
+                      enabled: inRoom && node?.selectedChatMessage != nil) {
+                node?.replyTo = node?.selectedChatMessage
             },
             // The room's composer only: never while a Session is shown (D2).
             VoxAction("Room", "Send Urgent", .return, enabled: inRoom && !inSession) {
@@ -160,6 +163,8 @@ struct VoxCommands: Commands {
         CommandGroup(replacing: .newItem) { items("File") }
         CommandMenu("Room") { items("Room") }
         CommandMenu("Node") {
+            Button("Choose Node…") { Task { await app.askAppNodeChoice() } }
+                .disabled(!app.canChooseAppNode)
             Button("Unlock…") { Task { await app.attachAgain() } }
                 .disabled(app.selectedNodeStatus != "Locked")
             Button("Forget") { Task { await app.detachNode() } }
@@ -268,6 +273,7 @@ struct NodeSheets: View {
             case .rename: RenameSheet(model: model)
             case .retention: RetentionSheet(model: model)
             case .admins: AdminsSheet(model: model)
+            case .roomAnchors: RoomAnchorEditor(model: model)
             case .leave: LeaveSheet(model: model, ending: false)
             case .end: LeaveSheet(model: model, ending: true)
             }
@@ -288,6 +294,8 @@ private struct RoomForm: View {
     @State private var noPassphrase = true
     /// A create or join under way: Return and the button may both ask.
     @State private var submitting = false
+    @State private var submission = UUID()
+    @StateObject private var anchors = RoomAnchorChoices()
 
     var body: some View {
         VStack(alignment: .leading, spacing: Space.s12) {
@@ -315,6 +323,7 @@ private struct RoomForm: View {
                 Text("No passphrase: anyone with the link can join.")
                     .accessibilityIdentifier("room-form-no-passphrase")
             }
+            if !joining { RoomAnchorSearch(model: model, choices: anchors).disabled(submitting) }
             if submitting {
                 ProgressView(joining ? "Joining the room…" : "Creating the room…")
                     .accessibilityIdentifier("room-form-progress")
@@ -330,6 +339,7 @@ private struct RoomForm: View {
         }
         .padding(Space.s24)
         .frame(width: Theme.scaled(440))
+        .onDisappear { submission = UUID(); anchors.retire() }
         .onAppear {
             model.clearOutcome(of: operation)
             // A link the system opened the app with fills the field; nothing is joined until the
@@ -351,9 +361,14 @@ private struct RoomForm: View {
         // The secure control keeps the person's input through the result (ADR-034 PR-3).
         let secret = field.copyAllowingEmpty()
         let (l, n) = (link, name)
+        let kept = anchors.kept, context = model.anchorChoiceContext
+        let request = UUID(), actor = model.me
+        submission = request
         Task {
             let ok = joining ? await model.joinRoom(l, passphrase: secret)
-                : await model.createRoom(n, passphrase: secret)
+                : await model.createRoom(n, passphrase: secret, anchors: kept, context: context)
+            guard !Task.isCancelled, submission == request, model.me == actor,
+                  model.sheet == (joining ? .joinRoom : .newRoom) else { return }
             submitting = false
             if ok {
                 field.clear()

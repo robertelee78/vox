@@ -68,6 +68,30 @@ pub struct ComputerApplication {
     /// This member signed a complete applied receipt for the current frontier.
     pub confirmed: bool,
 }
+/// A node identity proved by its node and managing computer, with current policy role.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ComputerNode {
+    /// Full management identity.
+    pub computer: String,
+    /// Full node identity, never inferred from its name.
+    pub fingerprint: String,
+    /// Authenticated presented name; local keyring aliases are separate.
+    pub name: String,
+    /// Saved selected personal node; drives non-personal nodes while enrolled.
+    pub personal: bool,
+}
+/// One available explicit operation derived from retained authenticated binding evidence.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ComputerBindingAction {
+    /// Full node identity.
+    pub node: String,
+    /// Authenticated presented node name.
+    pub name: String,
+    /// Previous/current managing computer identity.
+    pub computer: String,
+    /// release / transfer / recover.
+    pub action: String,
+}
 /// Daemon-wide public state. A failed reach is not a rejection of the pairing code.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ComputerStatus {
@@ -89,6 +113,18 @@ pub struct ComputerStatus {
     pub computers: Vec<ComputerIdentity>,
     /// Per-member application; unreachable members never get a fabricated acknowledgement.
     pub applications: Vec<ComputerApplication>,
+    /// Current authenticated roster and personal roles.
+    pub nodes: Vec<ComputerNode>,
+    /// Explicit binding operations supported by retained signed evidence.
+    pub binding_actions: Vec<ComputerBindingAction>,
+    /// Former members retained as removal history, never acknowledgement of remote erasure.
+    pub removed: Vec<ComputerIdentity>,
+    /// Exact frontier to confirm when removing a computer; stale confirmations are refused.
+    pub frontier: String,
+    /// Saved local selection, including before a group is formed.
+    pub selected_node: Option<String>,
+    /// Local name captured from the same verified actor as the selection.
+    pub selected_name: Option<String>,
     /// Managed nodes still needing attach/unlock or policy reconciliation.
     pub pending_nodes: Vec<String>,
     /// Last reach or protocol failure, without any secret or full link.
@@ -200,7 +236,7 @@ pub struct Management {
 }
 impl Management {
     /// The account's explicit host:port lookup uses its existing socket, but no management
-    /// identity or authority. The returned fingerprint is proved before it is persisted.
+    /// identity or authority. The returned fingerprint is proved; lookup persists no anchor source.
     pub async fn lookup_anchor(&self, input: &str) -> Result<String> {
         let input = input.to_owned();
         tokio::time::timeout(std::time::Duration::from_secs(20), async {
@@ -267,7 +303,8 @@ impl Management {
             let Some(g) = &s.genesis else {
                 return Ok(());
             };
-            if !s.quarantined.is_empty() || !s.history_complete() {
+            if !s.quarantined.is_empty() || !s.history_complete() || !s.binding_approvals.is_empty()
+            {
                 return Ok(());
             }
             if s.rosters.len() != s.descriptions().len() {
@@ -588,11 +625,12 @@ impl Management {
         }
         {
             let s = lock(&self.computer.state);
-            if s.genesis.is_some() {
-                return Err(Error::Profile("this computer is already paired"));
-            }
-            if s.pair_link.as_ref().is_some_and(|l| l.as_str() != url)
-                || (s.pending.is_some() && s.pair_link.is_none())
+            // A fresh authenticated invitation can carry a removal this offline computer
+            // has not learned yet. The merge below still refuses an already-active target,
+            // another group, and every unapproved enrollment.
+            if s.genesis.is_none()
+                && (s.pair_link.as_ref().is_some_and(|l| l.as_str() != url)
+                    || (s.pending.is_some() && s.pair_link.is_none()))
             {
                 return Err(Error::Profile(
                     "another computer pairing is pending; cancel it first",
@@ -653,6 +691,135 @@ impl Management {
         })?;
         self.status()
     }
+    /// Explicit source release or destination approval. The destination's ordinary Unlock
+    /// supplies the node signature later; no secret or copied fingerprint acts as a transfer.
+    pub fn binding_update(
+        &self,
+        action: &str,
+        node: &str,
+        destination: &str,
+        expected: &str,
+    ) -> Result<ComputerStatus> {
+        if action == "recover-group" {
+            return self.recover_group(expected);
+        }
+        let node = crate::node::link::b32_decode(node, "node fingerprint")?;
+        let local = self.computer.signer.fingerprint();
+        self.computer.change(|s| {
+            if frontier(s) != expected { return Err(Error::Profile("computer trust changed; review the binding operation again")); }
+            let group = s.genesis.as_ref().map(Enrollment::incarnation).ok_or(Error::Profile("computer enrollment must finish before changing a management binding"))?;
+            if s.grant(&local).is_none() { return Err(Error::Profile("an active computer manager must approve this binding operation")); }
+            let bindings: Vec<_> = s.terminal_bindings()?.into_iter().filter(|(manager, binding)|
+                binding.verify(manager, &group).ok() == Some(node)).collect();
+            if bindings.len() != 1 { return Err(Error::Profile("the node has no unambiguous retained management binding; use a fresh node identity or resolve conflicting managers")); }
+            let (manager, binding) = &bindings[0];
+            match action {
+                "release" => {
+                    let destination = crate::node::link::b32_decode(destination, "destination computer fingerprint")?;
+                    if *manager != local || destination == local || s.grant(&destination).is_none() {
+                        return Err(Error::Profile("release requires this node's current manager and another active destination computer"));
+                    }
+                    let (_, personal, mut roster) = s.rosters.get(&local).ok_or_else(bad)?.read(&local, &group)?;
+                    if !roster.iter().any(|b| b.id() == binding.id()) { return Err(Error::Profile("this node was already released")); }
+                    let mut body = Encoder::new();
+                    body.array(4).bytes(&node).bytes(&binding.id()).bytes(&destination).bytes(&random_array::<32>()?);
+                    let release = Control::sign(s, "release", body.finish(), self.computer.signer.as_ref())?;
+                    s.retain_roster(release)?;
+                    roster.retain(|b| b.id() != binding.id());
+                    let personal = personal.filter(|p| *p != node);
+                    let update = Control::create(s, &roster, personal, self.computer.signer.as_ref())?;
+                    s.retain_roster(update)?;
+                    if s.selected == Some(node) { s.selected = None; s.selected_name.clear(); }
+                }
+                "transfer" | "recover" => {
+                    if *manager == local { return Err(Error::Profile("this computer already holds this node's binding")); }
+                    let authority = s.derive()?;
+                    let proof = if action == "transfer" {
+                        let releases: Vec<_> = authority.valid_releases.iter().filter(|id|
+                            s.history[*id].event().ok().and_then(|e| e.release).is_some_and(|r|
+                                r.previous == binding.id() && r.node == node && r.destination == local)).copied().collect();
+                        if releases.len() != 1 { return Err(Error::Profile("no unique effective signed release names this destination; ask the previous manager to release it or explicitly recover after removal")); }
+                        releases[0]
+                    } else {
+                        if s.grant(manager).is_some() { return Err(Error::Profile("recovery requires retained removal or fault evidence for the previous manager; an active manager must release the node")); }
+                        [0; 32]
+                    };
+                    s.binding_approvals.insert(node, BindingApproval { kind: if action == "transfer" { 1 } else { 2 },
+                        previous: binding.id(), proof, heads: s.heads() });
+                }
+                _ => return Err(Error::Profile("unknown computer binding operation")),
+            }
+            Ok(())
+        })?;
+        self.status()
+    }
+
+    /// Deliberate local abandonment after removal/fault. Retired history remains pinned against
+    /// replay. Every old covered grant is journalled for purge before any new group can apply.
+    fn recover_group(&self, expected: &str) -> Result<ComputerStatus> {
+        let local = self.computer.signer.fingerprint();
+        self.computer.change(|s| {
+            if frontier(s) != expected {
+                return Err(Error::Profile(
+                    "computer trust changed; review local recovery again",
+                ));
+            }
+            if s.grant(&local).is_some() {
+                return Err(Error::Profile(
+                    "remove this computer from the group before abandoning its incarnation",
+                ));
+            }
+            let genesis = s
+                .genesis
+                .take()
+                .ok_or(Error::Profile("there is no established group to retire"))?;
+            s.revision = s.revision.checked_add(1).ok_or_else(bad)?;
+            for intervals in s.intervals.values_mut() {
+                if let Some(interval) = intervals.last_mut().filter(|i| i.retirement.is_none()) {
+                    interval.retirement = Some(s.revision);
+                }
+            }
+            s.retired_groups.insert(genesis.incarnation(), genesis);
+            s.members.clear();
+            s.rosters.clear();
+            s.reaches.clear();
+            s.quarantined.clear();
+            s.receipts.clear();
+            s.pending = None;
+            s.group_genesis = None;
+            s.pair_link = None;
+            s.links.clear();
+            s.pending_expires = 0;
+            s.binding_approvals.clear();
+            for invitation in &mut s.invitations {
+                invitation.cancelled = true;
+            }
+            Ok(())
+        })?;
+        self.status()
+    }
+
+    /// Confirm removal against the exact displayed signed frontier and affected roster.
+    pub fn remove(&self, target: &str, expected: &str) -> Result<ComputerStatus> {
+        let target = crate::node::link::b32_decode(target, "computer fingerprint")?;
+        self.computer.change(|s| {
+            if frontier(s) != expected { return Err(Error::Profile("computer trust changed; review the computer and affected nodes again before removing it")); }
+            if s.genesis.is_none() { return Err(Error::Profile("computer enrollment must finish before removing a member")); }
+            let mut grants: Vec<_> = s.members.iter().filter_map(|(id, g)|
+                (g.computer.fingerprint().ok() == Some(target)).then_some(*id)).collect();
+            grants.sort();
+            if grants.is_empty() { return Err(Error::Profile("this computer is not an active group member")); }
+            let mut body = Encoder::new();
+            body.array(3).bytes(&target).array(grants.len());
+            for grant in grants { body.bytes(&grant); }
+            body.bytes(&s.rosters.get(&target).map(Control::id).unwrap_or([0; 32]));
+            let event = Control::sign(s, "remove", body.finish(), self.computer.signer.as_ref())?;
+            s.retain_roster(event)?;
+            Ok(())
+        })?;
+        self.status()
+    }
+
     /// Public readback; never treats a timeout or missing receipt as established policy.
     pub fn status(&self) -> Result<ComputerStatus> {
         let s = lock(&self.computer.state);
@@ -694,7 +861,13 @@ impl Management {
                 })
             })
             .transpose()?;
-        let pending_nodes = lock(&self.pending_nodes).clone();
+        let mut pending_nodes = lock(&self.pending_nodes).clone();
+        for node in s.binding_approvals.keys() {
+            pending_nodes.push(format!(
+                "{}: binding approved here; unlock its local vault to sign and apply it",
+                text_id(node)
+            ));
+        }
         let storage_failed = self.computer.storage_ready().is_err();
         let descriptions = if s.genesis.is_some() {
             s.descriptions()
@@ -713,8 +886,71 @@ impl Management {
                 })
             })
             .collect::<Result<_>>()?;
+        let mut nodes = Vec::new();
+        let authority = s.derive()?;
+        for (manager, roster) in &s.rosters {
+            let e = roster.event()?;
+            for binding in &e.bindings {
+                let id = binding.verify(manager, &e.group)?;
+                if authority.binding_owners.get(&id) != Some(&binding.id()) {
+                    continue;
+                }
+                nodes.push(ComputerNode {
+                    computer: text_id(manager),
+                    fingerprint: text_id(&id),
+                    name: binding.name.clone(),
+                    personal: e.personal == Some(id),
+                });
+            }
+        }
+        let mut binding_actions = Vec::new();
+        if s.genesis.is_some() && s.grant(&local).is_some() {
+            for (manager, binding) in s.terminal_bindings()? {
+                let node = binding.verify(&manager, &s.group().ok_or_else(bad)?)?;
+                let released_here = authority.valid_releases.iter().any(|id| {
+                    s.history[id]
+                        .event()
+                        .ok()
+                        .and_then(|e| e.release)
+                        .is_some_and(|r| r.previous == binding.id() && r.destination == local)
+                });
+                let action = if manager == local
+                    && authority.binding_owners.get(&node) == Some(&binding.id())
+                {
+                    Some("release")
+                } else if manager != local && released_here {
+                    Some("transfer")
+                } else if manager != local && s.grant(&manager).is_none() {
+                    Some("recover")
+                } else {
+                    None
+                };
+                if let Some(action) = action {
+                    binding_actions.push(ComputerBindingAction {
+                        node: text_id(&node),
+                        name: binding.name,
+                        computer: text_id(&manager),
+                        action: action.into(),
+                    });
+                }
+            }
+        }
+        let mut former = BTreeMap::new();
+        if let Some(g) = &s.genesis {
+            for description in &g.computers {
+                former.insert(description.fingerprint()?, description.clone());
+            }
+            for record in s.history.values() {
+                if let Some(add) = record.event()?.addition {
+                    former.insert(add.computers[1].fingerprint()?, add.computers[1].clone());
+                }
+            }
+        }
+        former.retain(|id, _| !descriptions.contains_key(id));
         let state = if storage_failed || !s.quarantined.is_empty() {
             "quarantined"
+        } else if s.genesis.is_some() && s.grant(&local).is_none() && !busy {
+            "removed"
         } else if busy && pairing.as_ref().is_some_and(|p| !p.approved_here) {
             "needs-approval"
         } else if busy || invitation.is_some() {
@@ -744,6 +980,15 @@ impl Management {
                 .map(ComputerIdentity::of)
                 .collect::<Result<_>>()?,
             applications,
+            nodes,
+            binding_actions,
+            removed: former
+                .values()
+                .map(ComputerIdentity::of)
+                .collect::<Result<_>>()?,
+            frontier: frontier(&s),
+            selected_node: s.selected.as_ref().map(text_id),
+            selected_name: s.selected.map(|_| s.selected_name.clone()),
             pending_nodes,
             problem: if storage_failed {
                 Some(STORAGE_FAILED.into())
@@ -1151,13 +1396,18 @@ impl Management {
         let exchange = d.bytes()?.to_vec();
         d.finish()?;
         self.computer.change(|s| {
-            if s.pending.as_ref().is_some_and(|p| p.body() != g.body()) {
+            if s.pending
+                .as_ref()
+                .is_some_and(|p| !enrolled(s, p) && p.body() != g.body())
+            {
                 return Err(Error::Profile(
                     "the pairing identity or policy changed; no approval was reused",
                 ));
             }
             if let Some(p) = &s.pending {
-                g.approvals = p.approvals.clone();
+                if p.body() == g.body() {
+                    g.approvals = p.approvals.clone();
+                }
             }
             s.pending = Some(g);
             s.pending_expires = link.expires;
@@ -1462,6 +1712,7 @@ fn activate(s: &mut State, signer: &dyn RootSigner) -> Result<()> {
             if s.genesis.is_none() {
                 return Err(bad());
             }
+            s.fold_history()?;
             s.revision = s.revision.checked_add(1).ok_or_else(bad)?;
             s.receipts.clear();
         }
@@ -1514,6 +1765,15 @@ fn merge(s: &mut State, bytes: &[u8], peer: Digest32, signer: &dyn RootSigner) -
     };
     let genesis = read(d.bytes()?)?;
     let incoming = read(d.bytes()?)?;
+    if genesis
+        .iter()
+        .chain(incoming.iter())
+        .any(|g| s.retired_groups.contains_key(&g.incarnation()))
+    {
+        return Err(Error::Profile(
+            "this group was retired locally; old signed state cannot reactivate it",
+        ));
+    }
     // A fresh invitation has no current intent to compare with. Recognize an exact retired
     // operation before the group/current-intent checks so its late result keeps the truthful
     // local-close outcome instead of turning into an unexplained authentication refusal.
@@ -1528,7 +1788,9 @@ fn merge(s: &mut State, bytes: &[u8], peer: Digest32, signer: &dyn RootSigner) -
     }
     let local = s.description.fingerprint()?;
     let candidate = s.pending.as_ref().is_some_and(|p| side(p, &peer).is_ok());
-    let previously_enrolled = s.grant(&peer).is_some();
+    // Former managers may carry retained negative/fork evidence and receive their removal.
+    // This grants no positive authority: every event is independently checked at its prefix.
+    let previously_enrolled = s.was_enrolled(&peer);
     if let Some(g) = genesis {
         g.verify(true)?;
         if g.group.is_some() || Some(g.incarnation()) != s.group() {
@@ -1569,6 +1831,8 @@ fn merge(s: &mut State, bytes: &[u8], peer: Digest32, signer: &dyn RootSigner) -
     }
     // Union first, then fold once: wire order is not causal order.
     let group = s.group().ok_or_else(bad)?;
+    let previous_len = s.history.len();
+    let previous_revision = s.revision;
     for _ in 0..count(&mut d)? {
         arity(&mut d, 2)?;
         let id = digest(&mut d)?;
@@ -1589,6 +1853,10 @@ fn merge(s: &mut State, bytes: &[u8], peer: Digest32, signer: &dyn RootSigner) -
         s.history.insert(id, r);
     }
     s.fold_history()?;
+    if s.history.len() != previous_len && s.revision == previous_revision {
+        s.revision = s.revision.checked_add(1).ok_or_else(bad)?;
+        s.receipts.clear();
+    }
     if s.grant(&peer).is_none() && !candidate && !previously_enrolled {
         return Err(Error::SignatureInvalid);
     }
@@ -1684,4 +1952,15 @@ fn valid_receipt(s: &State, author: &Digest32, r: &Signed) -> Result<bool> {
     }
     d.finish()?;
     Ok(true)
+}
+
+fn frontier(s: &State) -> String {
+    let mut e = Encoder::new();
+    e.array(2)
+        .bytes(&s.group().unwrap_or([0; 32]))
+        .array(s.heads().len());
+    for head in s.heads() {
+        e.bytes(&head);
+    }
+    text_id(&sha256(&e.finish()))
 }

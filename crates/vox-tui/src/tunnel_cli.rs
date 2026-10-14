@@ -1292,6 +1292,7 @@ pub async fn serve(
         held.client
             .request(&Request::Create {
                 name: name.clone(),
+                anchors: vox_core::nat::bootstrap::BootstrapSet::new(),
                 passphrase: zeroize::Zeroizing::new(passphrase.as_str().to_owned()),
             })
             .await,

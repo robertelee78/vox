@@ -47,6 +47,9 @@ const T_REQ_COMPUTER_BEGIN: u64 = 4141;
 const T_REQ_COMPUTER_PREVIEW: u64 = 4142;
 const T_REQ_COMPUTER_APPROVE: u64 = 4143;
 const T_REQ_COMPUTER_CANCEL: u64 = 4144;
+const T_REQ_COMPUTER_PERSONAL: u64 = 4145;
+const T_REQ_COMPUTER_REMOVE: u64 = 4146;
+const T_REQ_COMPUTER_BINDING: u64 = 4147;
 const T_DAEMON_EVENT: u64 = 4007;
 const T_METRICS: u64 = 4008;
 const T_DAEMON_STATUS: u64 = 4009;
@@ -56,8 +59,11 @@ const T_ROOM_ASKS: u64 = 4012;
 const T_ROOM_ANSWER: u64 = 4013;
 const T_ANCHORS: u64 = 4014;
 const T_ANCHOR_FAILED: u64 = 4015;
+const T_ANCHOR_RESOLVED: u64 = 4016;
+const T_ANCHORS_FOUND: u64 = 4017;
 /// 4020–4029: the Session activity sink (ADR-029 §2, §3).
 const T_SESSION_ANSWER: u64 = 4020;
+const T_SESSION_ACTIVITY: u64 = 4021;
 
 // Client → daemon: the opening frame.
 const T_USE: u64 = 4100;
@@ -79,6 +85,8 @@ const T_REQ_DETACH_FOR_RENAME: u64 = 4115;
 const T_REQ_ANCHORS: u64 = 4116;
 const T_REQ_ANCHOR_ADD: u64 = 4117;
 const T_REQ_ANCHOR_REMOVE: u64 = 4118;
+const T_REQ_ANCHOR_RESOLVE: u64 = 4119;
+const T_REQ_ANCHOR_SEARCH: u64 = 4130;
 /// 4120–4129: the Session activity sink (ADR-029 §2, §3).
 const T_REQ_SESSION_ACTIVITY: u64 = 4120;
 const T_REQ_SESSION_ASK: u64 = 4121;
@@ -213,6 +221,13 @@ pub enum KeepSource {
 pub enum DaemonRequest {
     /// The daemon's manual and saved-room anchor list, with provenance. Needs no node.
     Anchors,
+    /// Explicit TTL-one LAN search; no room identity or persistent source.
+    AnchorSearch,
+    /// Resolve an anchor input without adding a machine or room source.
+    AnchorResolve {
+        /// Explicit fingerprint@address, or host:port for authenticated lookup.
+        input: String,
+    },
     /// Keep a manual fingerprint@address or look up an anchor at host:port.
     AnchorAdd {
         /// Fingerprint@address, or an address for bounded identity lookup.
@@ -241,6 +256,29 @@ pub enum DaemonRequest {
     ComputerCancel {
         /// Displayed invitation or operation identity.
         operation: String,
+    },
+    /// Save the app's selected node after verifying its live local identity; empty clears it.
+    ComputerPersonal {
+        /// Local node name; resolved only through an attached actor.
+        node: String,
+    },
+    /// Operator confirms removal of this exact computer at the displayed policy frontier.
+    ComputerRemove {
+        /// Full management fingerprint.
+        computer: String,
+        /// Exact displayed frontier.
+        frontier: String,
+    },
+    /// Operator-approved source release or destination transfer/recovery.
+    ComputerBinding {
+        /// release / transfer / recover.
+        action: String,
+        /// Full retained node fingerprint.
+        node: String,
+        /// Active destination for release; empty otherwise.
+        destination: String,
+        /// Exact displayed policy frontier.
+        frontier: String,
     },
     /// Every node on disk, with its state: answered [`DaemonFrame::Nodes`].
     Nodes,
@@ -351,8 +389,8 @@ pub enum DaemonRequest {
     Stop,
     /// A harness session's activity for its Session (ADR-029 SC-1): `bodies` are entries in the
     /// shared activity format, already split to fit, in the harness's order. Answered
-    /// [`DaemonFrame::Ok`] once they are queued, never after they are sent: a hook must not wait
-    /// on the network inside a model's turn.
+    /// [`DaemonFrame::SessionActivity`] distinguishes committed local acceptance from a
+    /// volatile hold or refusal. A hook never waits for network delivery inside a turn.
     SessionActivity {
         /// The session's node.
         node: NodeName,
@@ -440,6 +478,34 @@ pub enum DaemonEvent {
         /// Why.
         cause: DetachCause,
     },
+}
+
+/// What happened to one batch of mirrored Session activity. Only Committed survives restart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionAdmission {
+    /// Every item is committed to the encrypted inbox, with this sequence range.
+    Committed {
+        /// First sequence committed in this batch.
+        first: u64,
+        /// Last sequence committed in this batch.
+        last: u64,
+    },
+    /// Retained only in the bounded volatile tail; no restart guarantee.
+    Held(String),
+    /// Not retained. The producer must not claim acceptance or silently replay it.
+    Refused(String),
+    /// The receipt disappeared; do not claim either acceptance or rejection, or replay it.
+    Unconfirmed(String),
+    /// This activity has no applicable Session or was an intentionally suppressed copy.
+    Skipped,
+}
+
+impl SessionAdmission {
+    /// The sink owns the activity (possibly only in memory), or it deliberately did not apply.
+    #[must_use]
+    pub fn taken(&self) -> bool {
+        !matches!(self, Self::Refused(_) | Self::Unconfirmed(_))
+    }
 }
 
 /// Why the daemon would not do what a `Use` or a [`DaemonRequest`] asked. Each says what to do; none
@@ -724,6 +790,10 @@ pub enum DaemonFrame {
     Anchors(Vec<AnchorInfo>),
     /// A machine anchor operation failed, without selecting a node.
     AnchorFailed(String),
+    /// A pinned spec. Bare-address lookup proves its fingerprint; explicit pins are checked syntax.
+    AnchorResolved(String),
+    /// Concrete pinned endpoints found in one explicit LAN search; empty is a completed search.
+    AnchorsFound(crate::nat::bootstrap::BootstrapSet),
     /// Typed computer status encoded as public JSON, including the local one-time link.
     ComputerStatus(String),
     /// A computer operation failed; no node identity is involved.
@@ -784,6 +854,8 @@ pub enum DaemonFrame {
     /// The answer to a [`DaemonRequest::SessionAsk`]: what the hook gives its harness, or
     /// nothing when the harness settled the request without Vox.
     SessionAnswer(Option<String>),
+    /// Local durable/volatile admission of one activity batch.
+    SessionActivity(SessionAdmission),
     /// What a [`DaemonRequest::RoomAsks`] asked for: one per directory, oldest session first.
     RoomAsks(Vec<RoomAsk>),
     /// What a [`DaemonRequest::RoomBind`] or [`DaemonRequest::RoomDecline`] did: whether it was
@@ -1172,11 +1244,17 @@ impl Opening {
                 DaemonRequest::AnchorAdd { input } => {
                     e.array(2).uint(T_REQ_ANCHOR_ADD).text(input);
                 }
+                DaemonRequest::AnchorResolve { input } => {
+                    e.array(2).uint(T_REQ_ANCHOR_RESOLVE).text(input);
+                }
                 DaemonRequest::AnchorRemove { fingerprint } => {
                     e.array(2).uint(T_REQ_ANCHOR_REMOVE).bytes(fingerprint);
                 }
                 DaemonRequest::Anchors => {
                     e.array(1).uint(T_REQ_ANCHORS);
+                }
+                DaemonRequest::AnchorSearch => {
+                    e.array(1).uint(T_REQ_ANCHOR_SEARCH);
                 }
                 DaemonRequest::Metrics => {
                     e.array(1).uint(T_REQ_METRICS);
@@ -1198,6 +1276,28 @@ impl Opening {
                 }
                 DaemonRequest::ComputerCancel { operation } => {
                     e.array(2).uint(T_REQ_COMPUTER_CANCEL).text(operation);
+                }
+                DaemonRequest::ComputerBinding {
+                    action,
+                    node,
+                    destination,
+                    frontier,
+                } => {
+                    e.array(5)
+                        .uint(T_REQ_COMPUTER_BINDING)
+                        .text(action)
+                        .text(node)
+                        .text(destination)
+                        .text(frontier);
+                }
+                DaemonRequest::ComputerPersonal { node } => {
+                    e.array(2).uint(T_REQ_COMPUTER_PERSONAL).text(node);
+                }
+                DaemonRequest::ComputerRemove { computer, frontier } => {
+                    e.array(3)
+                        .uint(T_REQ_COMPUTER_REMOVE)
+                        .text(computer)
+                        .text(frontier);
                 }
                 DaemonRequest::Stop => {
                     e.array(1).uint(T_REQ_STOP);
@@ -1347,8 +1447,12 @@ impl Opening {
             }),
             (T_REQ_STATUS, 1) => Opening::Daemon(DaemonRequest::Status),
             (T_REQ_ANCHORS, 1) => Opening::Daemon(DaemonRequest::Anchors),
+            (T_REQ_ANCHOR_SEARCH, 1) => Opening::Daemon(DaemonRequest::AnchorSearch),
             (T_REQ_ANCHOR_ADD, 2) => Opening::Daemon(DaemonRequest::AnchorAdd {
                 input: text(&mut d, "ipc anchor input")?,
+            }),
+            (T_REQ_ANCHOR_RESOLVE, 2) => Opening::Daemon(DaemonRequest::AnchorResolve {
+                input: text(&mut d, "ipc anchor lookup input")?,
             }),
             (T_REQ_ANCHOR_REMOVE, 2) => Opening::Daemon(DaemonRequest::AnchorRemove {
                 fingerprint: fp(&mut d, "ipc anchor fingerprint")?
@@ -1356,6 +1460,19 @@ impl Opening {
             }),
             (T_REQ_METRICS, 1) => Opening::Daemon(DaemonRequest::Metrics),
             (T_REQ_SUBSCRIBE, 1) => Opening::Daemon(DaemonRequest::Subscribe),
+            (T_REQ_COMPUTER_BINDING, 5) => Opening::Daemon(DaemonRequest::ComputerBinding {
+                action: text(&mut d, "binding action")?,
+                node: text(&mut d, "node fingerprint")?,
+                destination: text(&mut d, "destination computer")?,
+                frontier: text(&mut d, "computer frontier")?,
+            }),
+            (T_REQ_COMPUTER_PERSONAL, 2) => Opening::Daemon(DaemonRequest::ComputerPersonal {
+                node: text(&mut d, "selected node")?,
+            }),
+            (T_REQ_COMPUTER_REMOVE, 3) => Opening::Daemon(DaemonRequest::ComputerRemove {
+                computer: text(&mut d, "computer fingerprint")?,
+                frontier: text(&mut d, "computer frontier")?,
+            }),
             (T_REQ_COMPUTER_STATUS, 1) => Opening::Daemon(DaemonRequest::ComputerStatus),
             (T_REQ_COMPUTER_BEGIN, 1) => Opening::Daemon(DaemonRequest::ComputerBegin),
             (T_REQ_COMPUTER_PREVIEW, 2) => Opening::Daemon(DaemonRequest::ComputerPreview {
@@ -1371,7 +1488,27 @@ impl Opening {
             (T_REQ_SESSION_ACTIVITY, 5) => {
                 let node = name(&mut d, "ipc session activity node")?;
                 let session = text(&mut d, "ipc session activity session")?;
-                let bodies = texts(&mut d, "ipc session activity bodies")?;
+                if session.is_empty() || session.len() > crate::node::content::MAX_SESSION_ID_LEN {
+                    return Err(Error::MalformedIpc("ipc session activity session"));
+                }
+                let count = d
+                    .array()
+                    .map_err(malformed("ipc session activity bodies"))?;
+                if count > crate::node::session_ingress::MAX_BATCH_ITEMS {
+                    return Err(Error::SizeLimitExceeded("Session activity batch"));
+                }
+                let mut bodies = Vec::with_capacity(count);
+                let mut bytes = 0usize;
+                for _ in 0..count {
+                    let body = d.text().map_err(malformed("ipc session activity body"))?;
+                    bytes = bytes
+                        .checked_add(body.len())
+                        .ok_or(Error::SizeLimitExceeded("Session activity batch"))?;
+                    if bytes > crate::node::session_ingress::MAX_BATCH_BYTES {
+                        return Err(Error::SizeLimitExceeded("Session activity batch"));
+                    }
+                    bodies.push(body.to_owned());
+                }
                 let call = match d.array().map_err(malformed("ipc session activity call"))? {
                     0 => None,
                     1 => Some(call(&mut d)?),
@@ -1441,6 +1578,27 @@ impl DaemonFrame {
             DaemonFrame::ComputerFailed(why) => {
                 e.array(2).uint(T_COMPUTER_FAILED).text(why);
             }
+            DaemonFrame::SessionActivity(outcome) => match outcome {
+                SessionAdmission::Committed { first, last } => {
+                    e.array(4)
+                        .uint(T_SESSION_ACTIVITY)
+                        .uint(0)
+                        .uint(*first)
+                        .uint(*last);
+                }
+                SessionAdmission::Held(why) => {
+                    e.array(3).uint(T_SESSION_ACTIVITY).uint(1).text(why);
+                }
+                SessionAdmission::Refused(why) => {
+                    e.array(3).uint(T_SESSION_ACTIVITY).uint(2).text(why);
+                }
+                SessionAdmission::Skipped => {
+                    e.array(2).uint(T_SESSION_ACTIVITY).uint(3);
+                }
+                SessionAdmission::Unconfirmed(why) => {
+                    e.array(3).uint(T_SESSION_ACTIVITY).uint(4).text(why);
+                }
+            },
             DaemonFrame::Ok => {
                 e.array(1).uint(T_DAEMON_OK);
             }
@@ -1530,6 +1688,12 @@ impl DaemonFrame {
             }
             DaemonFrame::AnchorFailed(why) => {
                 e.array(2).uint(T_ANCHOR_FAILED).text(why);
+            }
+            DaemonFrame::AnchorResolved(spec) => {
+                e.array(2).uint(T_ANCHOR_RESOLVED).text(spec);
+            }
+            DaemonFrame::AnchorsFound(anchors) => {
+                e.array(2).uint(T_ANCHORS_FOUND).bytes(&anchors.to_bytes());
             }
             DaemonFrame::Metrics(text) => {
                 e.array(2).uint(T_METRICS).text(text);
@@ -1649,9 +1813,34 @@ impl DaemonFrame {
                 DaemonFrame::Attached(info(&mut d)?, texts(&mut d, "ipc attached notes")?)
             }
             (T_ANCHOR_FAILED, 2) => DaemonFrame::AnchorFailed(text(&mut d, "anchor failure")?),
+            (T_ANCHOR_RESOLVED, 2) => DaemonFrame::AnchorResolved(text(&mut d, "resolved anchor")?),
+            (T_ANCHORS_FOUND, 2) => DaemonFrame::AnchorsFound(
+                crate::nat::bootstrap::BootstrapSet::from_bytes(d.bytes()?)?,
+            ),
             (T_COMPUTER_STATUS, 2) => DaemonFrame::ComputerStatus(text(&mut d, "computer status")?),
             (T_COMPUTER_FAILED, 2) => {
                 DaemonFrame::ComputerFailed(text(&mut d, "computer refusal")?)
+            }
+            (T_SESSION_ACTIVITY, n @ (2..=4)) => {
+                let kind = d.uint().map_err(malformed("ipc Session admission"))?;
+                let outcome = match (kind, n) {
+                    (0, 4) => {
+                        let first = d.uint().map_err(malformed("ipc Session first sequence"))?;
+                        let last = d.uint().map_err(malformed("ipc Session last sequence"))?;
+                        if first == 0 || last < first {
+                            return Err(Error::MalformedIpc("ipc Session sequence range"));
+                        }
+                        SessionAdmission::Committed { first, last }
+                    }
+                    (1, 3) => SessionAdmission::Held(text(&mut d, "ipc Session held")?),
+                    (2, 3) => SessionAdmission::Refused(text(&mut d, "ipc Session refused")?),
+                    (3, 2) => SessionAdmission::Skipped,
+                    (4, 3) => {
+                        SessionAdmission::Unconfirmed(text(&mut d, "ipc Session unconfirmed")?)
+                    }
+                    _ => return Err(Error::MalformedIpc("ipc Session admission kind")),
+                };
+                DaemonFrame::SessionActivity(outcome)
             }
             (T_DAEMON_OK, 1) => DaemonFrame::Ok,
             (T_SESSION_REGISTERED, 5) => {

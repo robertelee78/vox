@@ -364,6 +364,13 @@ const T_ADMINS: u64 = 35;
 const T_RENAME_ROOM: u64 = 36;
 /// Room anchor governance (ADR-032 AN-5); no identity-passphrase gate.
 const T_ROOM_ANCHORS: u64 = 781;
+/// Read one room's signed anchor configuration, without machine/other-room sources.
+const T_ROOM_ANCHORS_READ: u64 = 782;
+/// The exact room-owned anchors returned by [`Request::RoomAnchors`].
+const T_ROOM_ANCHORS_CONFIG: u64 = 783;
+/// Creation's exact link preview, with no search, dial or room mutation (ADR-032 AN-10).
+const T_LINK_PREVIEW_REQ: u64 = 7850;
+const T_LINK_PREVIEW: u64 = 7851;
 /// `NodeEvent::RoomEnded` and `NodeEvent::RoomRemoved` (V030-08). Additive.
 const T_ROOM_ENDED: u64 = 2440;
 const T_ROOM_REMOVED: u64 = 2441;
@@ -445,6 +452,8 @@ pub enum SessionTo {
     /// Into a Session on this node: the Session's node.
     Node(Digest32),
 }
+const T_INDIVIDUAL_TRUST_REQ: u64 = 8011;
+const T_INDIVIDUAL_TRUST: u64 = 8012;
 const T_OFFERS_REQ: u64 = 4950;
 const T_DISMISS_OFFER: u64 = 4951;
 const T_OFFERS: u64 = 4952;
@@ -724,6 +733,11 @@ pub enum Request {
     /// The members offered to this node's keyring (ADR-028 K-15 – K-18), answered with
     /// [`Frame::Offers`].
     Offers,
+    /// Current signed computer-policy eligibility, independent of a stale offers snapshot.
+    IndividualTrustEligibility {
+        /// The complete node fingerprint whose individual trust the client would manage.
+        member: Digest32,
+    },
     /// Dismiss the offer of `member` (ADR-028 K-18): on this node alone, and silently.
     DismissOffer {
         /// The member offered.
@@ -779,6 +793,8 @@ pub enum Request {
         name: String,
         /// The room's passphrase.
         passphrase: zeroize::Zeroizing<String>,
+        /// The anchors explicitly kept for this room before creation.
+        anchors: crate::nat::bootstrap::BootstrapSet,
     },
     /// Mint an invite link for a room.
     ///
@@ -849,6 +865,17 @@ pub enum Request {
         channel_id: Digest32,
         /// Seconds a Session step is kept; zero means forever, still bounded by messages.
         seconds: u64,
+    },
+    /// Preview the link routes for explicitly selected anchors on this node.
+    LinkPreview {
+        /// The full proposed room configuration; the preview alone applies the link cap.
+        anchors: crate::nat::bootstrap::BootstrapSet,
+    },
+    /// Read an open room's own signed anchors, answered as [`Frame::RoomAnchors`].
+    /// Stale or unavailable observations are errors, never an empty configuration.
+    RoomAnchors {
+        /// The room.
+        channel_id: Digest32,
     },
     /// Add/remove room anchors by appending the resulting complete signed set (ADR-032 AN-5).
     ChangeRoomAnchors {
@@ -1293,6 +1320,9 @@ impl Request {
             Request::Decisions { limit } => {
                 e.array(2).uint(T_DECISIONS_REQ).uint(*limit);
             }
+            Request::IndividualTrustEligibility { member } => {
+                e.array(2).uint(T_INDIVIDUAL_TRUST_REQ).bytes(member);
+            }
             Request::Offers => {
                 e.array(1).uint(T_OFFERS_REQ);
             }
@@ -1430,8 +1460,24 @@ impl Request {
                     .bytes(channel_id)
                     .text(passphrase);
             }
-            Request::Create { name, passphrase } => {
-                e.array(3).uint(T_CREATE).text(name).text(passphrase);
+            Request::Create {
+                name,
+                passphrase,
+                anchors,
+            } => {
+                e.array(4)
+                    .uint(T_CREATE)
+                    .text(name)
+                    .text(passphrase)
+                    .bytes(&anchors.to_bytes());
+            }
+            Request::LinkPreview { anchors } => {
+                e.array(2)
+                    .uint(T_LINK_PREVIEW_REQ)
+                    .bytes(&anchors.to_bytes());
+            }
+            Request::RoomAnchors { channel_id } => {
+                e.array(2).uint(T_ROOM_ANCHORS_READ).bytes(channel_id);
             }
             Request::ChangeRoomAnchors {
                 channel_id,
@@ -1890,6 +1936,18 @@ impl Request {
                     identity_passphrase,
                 })
             }
+            (T_LINK_PREVIEW_REQ, 2) => {
+                let anchors = crate::nat::bootstrap::BootstrapSet::from_bytes(d.bytes()?)?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::LinkPreview { anchors })
+            }
+            (T_ROOM_ANCHORS_READ, 2) => {
+                let channel_id = digest(&mut d)?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::RoomAnchors { channel_id })
+            }
             (T_ROOM_ANCHORS, 4) => {
                 let channel_id = digest(&mut d)?;
                 let add = crate::nat::bootstrap::BootstrapSet::from_bytes(d.bytes()?)?;
@@ -2177,6 +2235,12 @@ impl Request {
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Decisions { limit })
             }
+            (T_INDIVIDUAL_TRUST_REQ, 2) => {
+                let member = digest(&mut d)?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::IndividualTrustEligibility { member })
+            }
             (T_OFFERS_REQ, 1) => {
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
@@ -2248,12 +2312,17 @@ impl Request {
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Join { link, passphrase })
             }
-            (T_CREATE, 3) => {
+            (T_CREATE, 4) => {
                 let name = text(&mut d, "ipc create name")?;
                 let passphrase = secret_text(&mut d, "ipc create passphrase")?;
+                let anchors = crate::nat::bootstrap::BootstrapSet::from_bytes(d.bytes()?)?;
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
-                Ok(Request::Create { name, passphrase })
+                Ok(Request::Create {
+                    name,
+                    passphrase,
+                    anchors,
+                })
             }
             (T_INVITE, 2) => {
                 let channel_id = digest(&mut d)?;
@@ -2484,6 +2553,20 @@ pub enum Frame {
         /// The bound local address.
         local: String,
     },
+    /// Exact creation link routes, without adding machine or other-room anchors.
+    LinkPreview {
+        /// The node whose current direct route is included, when it has one.
+        node: Digest32,
+        /// Ordered room anchors followed by this node's direct route, at most four.
+        routes: Vec<crate::nat::bootstrap::BootstrapNode>,
+        /// Room anchors retained in configuration but outside the link cap.
+        omitted: usize,
+    },
+    /// The room's complete signed anchor configuration.
+    RoomAnchors {
+        /// The room-owned fingerprints and their exact addresses.
+        anchors: crate::nat::bootstrap::BootstrapSet,
+    },
     /// The invite link a [`Request::Invite`] asked for.
     Link {
         /// The `vox://` address.
@@ -2595,6 +2678,13 @@ pub enum Frame {
         /// Each event, newest first.
         events: Vec<crate::node::decisions::Event>,
     },
+    /// Current eligibility for individual Trust controls, not a mutation authorization token.
+    IndividualTrustEligibility {
+        /// Whether ordinary individual trust is outside the current computer policy.
+        can_manage: bool,
+        /// A user-facing reason when unavailable; empty when eligible.
+        reason: String,
+    },
     /// The members offered to the keyring, as a [`Request::Offers`] asked for.
     Offers {
         /// Each offer, in fingerprint order.
@@ -2705,6 +2795,25 @@ impl Frame {
                 }
                 encode_order_cursor(&mut e, *next);
                 e.uint(*revision);
+            }
+            Frame::LinkPreview {
+                node,
+                routes,
+                omitted,
+            } => {
+                e.array(4)
+                    .uint(T_LINK_PREVIEW)
+                    .bytes(node)
+                    .array(routes.len());
+                for route in routes {
+                    route.encode_into(&mut e);
+                }
+                e.uint(*omitted as u64);
+            }
+            Frame::RoomAnchors { anchors } => {
+                e.array(2)
+                    .uint(T_ROOM_ANCHORS_CONFIG)
+                    .bytes(&anchors.to_bytes());
             }
             Frame::Members { members } => {
                 e.array(2).uint(T_MEMBERS).array(members.len());
@@ -2908,6 +3017,12 @@ impl Frame {
                         }
                     }
                 }
+            }
+            Frame::IndividualTrustEligibility { can_manage, reason } => {
+                e.array(3)
+                    .uint(T_INDIVIDUAL_TRUST)
+                    .uint(u64::from(*can_manage))
+                    .text(reason);
             }
             Frame::Offers { offers } => {
                 e.array(2).uint(T_OFFERS);
@@ -3492,6 +3607,31 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 revision,
             });
         }
+        (T_LINK_PREVIEW, 4) => {
+            let node = digest(d)?;
+            let n = d.array()?;
+            if n > crate::node::link::MAX_LINK_ANCHORS {
+                return Err(Error::MalformedIpc("link preview route count"));
+            }
+            let mut routes = Vec::with_capacity(n);
+            for _ in 0..n {
+                routes.push(crate::nat::bootstrap::BootstrapNode::decode_from(d)?);
+            }
+            let omitted = d.uint()?;
+            if omitted > crate::nat::bootstrap::MAX_BOOTSTRAP_NODES as u64 {
+                return Err(Error::MalformedIpc("link preview omitted count"));
+            }
+            return Ok(Frame::LinkPreview {
+                node,
+                routes,
+                omitted: omitted as usize,
+            });
+        }
+        (T_ROOM_ANCHORS_CONFIG, 2) => {
+            return Ok(Frame::RoomAnchors {
+                anchors: crate::nat::bootstrap::BootstrapSet::from_bytes(d.bytes()?)?,
+            });
+        }
         (T_MEMBERS, 2) => {
             let n = d.array().map_err(|_| Error::MalformedIpc("ipc members"))?;
             let mut members = Vec::with_capacity(n.min(1024));
@@ -3853,6 +3993,12 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 });
             }
             return Ok(Frame::Decisions { events });
+        }
+        (T_INDIVIDUAL_TRUST, 3) => {
+            return Ok(Frame::IndividualTrustEligibility {
+                can_manage: flag(d, "ipc individual trust eligibility")?,
+                reason: text(d, "ipc individual trust reason")?,
+            });
         }
         (T_OFFERS, 2) => {
             let offers = crate::node::offers::read_offers(d)?;
@@ -5995,6 +6141,36 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 },
             },
         },
+        Request::LinkPreview { anchors } => {
+            let view = handle.view();
+            let Some(identity) = view.identity.filter(|_| !view.locked && !view.locking) else {
+                return Frame::Error { reason: "the creating node is not ready".into() };
+            };
+            let endpoints = view.listening.iter()
+                .map(|a| crate::nat::multiaddr::Multiaddr::parse(a))
+                .collect::<Result<Vec<_>>>()
+                .and_then(crate::nat::multiaddr::EndpointList::new);
+            let endpoints = match endpoints {
+                Ok(endpoints) => Some(endpoints),
+                Err(e) => return Frame::Error { reason: format!("the node's link addresses could not be read: {e}") },
+            };
+            let (routes, omitted) = crate::node::link::preview_routes(&anchors, identity.fingerprint, endpoints);
+            Frame::LinkPreview { node: identity.fingerprint, routes, omitted }
+        }
+        Request::RoomAnchors { channel_id } => {
+            let view = handle.view();
+            if !view.open_channels.iter().any(|room| room.channel_id == channel_id) {
+                return Frame::Error { reason: "room not open".into() };
+            }
+            if let Some(error) = view.anchor_inventory_error {
+                return Frame::Error { reason: format!("room anchors could not be read: {error}") };
+            }
+            match view.room_anchors.iter().find(|room| room.room == channel_id) {
+                Some(room) if !room.stale => Frame::RoomAnchors { anchors: room.anchors.clone() },
+                Some(_) => Frame::Error { reason: "room anchors have not refreshed yet; try again".into() },
+                None => Frame::Error { reason: "room anchors are not available yet; try again".into() },
+            }
+        }
         Request::ChangeRoomAnchors { channel_id, add, remove } => match handle
             .apply(crate::node::api::NodeCommand::ChangeRoomAnchors { channel_id, add, remove })
             .await
@@ -6400,6 +6576,10 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 None,
             ),
         },
+        Request::IndividualTrustEligibility { member } => {
+            let (can_manage, reason) = handle.individual_trust_eligibility(member);
+            Frame::IndividualTrustEligibility { can_manage, reason }
+        }
         Request::Offers => Frame::Offers {
             offers: handle.view().offers.clone(),
         },
@@ -6685,9 +6865,11 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         Request::Create {
             name,
             mut passphrase,
+            anchors,
         } => match handle
             .apply(crate::node::api::NodeCommand::CreateChannel {
                 name,
+                anchors,
                 passphrase: crate::node::api::Secret::new(
                     std::mem::take(&mut *passphrase).into_bytes(),
                 ),

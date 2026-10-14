@@ -674,6 +674,9 @@ pub struct NodeConfig {
     pub bind: Option<Bind>,
     /// Owning daemon's durable computer policy, consulted before networking.
     pub computer: Option<Arc<crate::node::computer::Computer>>,
+    /// Reliable capacity-bounded handoff of removed rooms to this hosted node's daemon.
+    /// Standalone nodes have no daemon-owned volatile Session tails and leave this absent.
+    pub session_room_removed: Option<mpsc::Sender<crate::node::session_ingress::Retirement>>,
     /// An override for the ADR-005 PoW parameters a join binds (tests reduce them).
     pub pow_params: Option<crate::join::pow::PowParams>,
     /// The anchors, if any, that bridge this node to peers it cannot reach directly
@@ -758,6 +761,7 @@ impl NodeConfig {
             argon2: Argon2Profile::default(),
             bind: None,
             computer: None,
+            session_room_removed: None,
             pow_params: None,
             anchors: BootstrapSet::new(),
             headless: None,
@@ -1503,6 +1507,8 @@ enum NetEvent {
         room_name: String,
         /// The passphrase, kept by the room's state.
         passphrase: Secret,
+        /// The chosen set, signed before the new room is published.
+        anchors: BootstrapSet,
         /// The genesis made before the seal.
         genesis: Box<crate::governance::genesis::Genesis>,
         /// When the room was begun.
@@ -4888,6 +4894,12 @@ pub struct Node {
     /// Consents decided but not yet delivered, each with the key it releases, taken at the
     /// decision (V210-30). Kept beside the keyring, sealed the same way.
     consent_keys: crate::node::pending_consent::PendingConsents,
+    /// Fair scheduling cursor only; accepted Session work is in the encrypted Store.
+    session_room_removed: Option<mpsc::Sender<crate::node::session_ingress::Retirement>>,
+    session_rooms_retiring: BTreeSet<crate::node::session_ingress::Retirement>,
+    session_ingress_cursor: usize,
+    session_ingress_error: Option<String>,
+    session_ingress_wake: Arc<tokio::sync::Notify>,
     /// When each peer was last tried for a better path (unix milliseconds), so a relayed connection is retried
     /// on a schedule rather than only at the moment it was made.
     last_upgrade: std::collections::BTreeMap<Digest32, u64>,
@@ -5111,6 +5123,7 @@ impl Node {
             argon2,
             bind,
             computer,
+            session_room_removed,
             pow_params,
             anchors,
             headless,
@@ -5306,6 +5319,11 @@ impl Node {
             retention_dirty: std::collections::BTreeSet::new(),
             retention_warned: std::collections::BTreeSet::new(),
             consent_keys: crate::node::pending_consent::PendingConsents::default(),
+            session_room_removed,
+            session_rooms_retiring: BTreeSet::new(),
+            session_ingress_cursor: 0,
+            session_ingress_error: None,
+            session_ingress_wake: Arc::new(tokio::sync::Notify::new()),
             last_upgrade: std::collections::BTreeMap::new(),
             reachers: std::collections::BTreeMap::new(),
             udp_flows: Arc::new(crate::tunnel::udp::UdpFlows::default()),
@@ -5421,6 +5439,7 @@ impl Node {
         // interleaved here, so channel state is only ever mutated by this task
         // (ADR-016). The actor holds a `net_tx` clone, so `net_rx` never closes and
         // this select cannot spin on a dead branch.
+        let ingress_wake = Arc::clone(&self.session_ingress_wake);
         let mut ticker = tokio::time::interval(TICK);
         // A `Shutdown`'s reply, held until the node is actually gone: see the end of this function.
         let mut shutdown_reply: Option<oneshot::Sender<Outcome>> = None;
@@ -5485,9 +5504,10 @@ impl Node {
                     if let NodeCommand::CreateChannel {
                         name: room_name,
                         passphrase,
+                        anchors,
                     } = command
                     {
-                        self.begin_create_channel(room_name, passphrase, None, reply)
+                        self.begin_create_channel(room_name, passphrase, anchors, None, reply)
                             .await;
                         self.note_if_stalled(name, started);
                         self.publish().await;
@@ -5517,6 +5537,7 @@ impl Node {
                         self.begin_create_channel(
                             room_name,
                             passphrase,
+                            BootstrapSet::new(),
                             Some((tag, endpoint)),
                             reply,
                         )
@@ -5609,6 +5630,7 @@ impl Node {
                         continue;
                     }
                     let outcome = self.handle(command).await;
+                    self.resume_session_retirements();
                     if self
                         .drive_changed
                         .swap(false, std::sync::atomic::Ordering::Relaxed)
@@ -5637,6 +5659,18 @@ impl Node {
                     self.publish().await;
                     self.schedule().await;
                 }
+                _ = ingress_wake.notified() => {
+                    if self.apply_computer_keyring().await.is_err() { continue; }
+                    let mut progressed = false;
+                    for _ in 0..16 {
+                        progressed |= self.drain_session_ingress().await;
+                    }
+                    if progressed {
+                        self.publish().await;
+                        self.schedule().await;
+                        ingress_wake.notify_one();
+                    }
+                }
                 _ = ticker.tick() => {
                     self.governance_work.pending = true;
                     self.publication_pending |= !self.publish_waiters.is_empty();
@@ -5650,6 +5684,8 @@ impl Node {
                     }
                     self.note_peers_seen();
                     self.recover_storage();
+                    self.resume_session_retirements();
+                    ingress_wake.notify_one();
                     self.retry_upgrades_if_due().await;
                     self.maintain_prekeys();
                     self.renew_records_if_due().await;
@@ -5773,9 +5809,6 @@ impl Node {
                     Err(_) => Outcome::Failed(Fault::WrongPassphrase),
                 },
             },
-            NodeCommand::CreateChannel { name, passphrase } => {
-                self.create_channel(&name, &passphrase).await
-            }
             NodeCommand::ChangeRoomAnchors {
                 channel_id,
                 add,
@@ -5783,6 +5816,58 @@ impl Node {
             } => self.change_room_anchors(&channel_id, &add, remove).await,
             NodeCommand::RenameRoom { channel_id, name } => {
                 self.rename_room(&channel_id, &name).await
+            }
+            NodeCommand::AcceptSessionBatch {
+                channel_id,
+                session_id,
+                bodies,
+                reply,
+            } => {
+                let result = if self
+                    .session_rooms_retiring
+                    .iter()
+                    .any(|item| item.room == channel_id)
+                {
+                    Err(crate::error::Error::Profile(
+                        "this room was removed; its Session activity was not accepted",
+                    )
+                    .into())
+                } else {
+                    self.profile
+                        .as_ref()
+                        .ok_or_else(|| {
+                            crate::node::session_ingress::AdmissionError::from(
+                                crate::error::Error::Profile("the node is locked"),
+                            )
+                        })
+                        .and_then(|profile| {
+                            crate::node::session_ingress::admit(
+                                profile,
+                                channel_id,
+                                &session_id,
+                                bodies,
+                            )
+                        })
+                };
+                if result.is_ok() {
+                    self.session_ingress_wake.notify_one();
+                }
+                let _ = reply.send(result);
+                Outcome::Done
+            }
+            NodeCommand::RetireSessionRoom { retirement, reply } => {
+                let result = self
+                    .profile
+                    .as_ref()
+                    .ok_or(crate::error::Error::Profile("the node is locked"))
+                    .and_then(|profile| {
+                        crate::node::session_ingress::complete_retirement(profile, retirement)
+                    });
+                if result.is_ok() {
+                    self.session_rooms_retiring.remove(&retirement);
+                }
+                let _ = reply.send(result);
+                Outcome::Done
             }
             NodeCommand::AppendSession {
                 channel_id,
@@ -5858,6 +5943,13 @@ impl Node {
                 fingerprint,
                 petname,
             } => {
+                if let (Some(c), Some(profile)) = (&self.computer, &self.profile) {
+                    if c.grouped() {
+                        if let Err(e) = c.individual_choice(profile.fingerprint(), fingerprint) {
+                            return Outcome::Failed(fault_of(&e));
+                        }
+                    }
+                }
                 let was = self.trust.is_trusted(&fingerprint);
                 let out = self
                     .trust_identity(
@@ -5876,6 +5968,13 @@ impl Node {
                 history,
                 capability,
             } => {
+                if let (Some(c), Some(profile)) = (&self.computer, &self.profile) {
+                    if c.grouped() {
+                        if let Err(e) = c.individual_choice(profile.fingerprint(), fingerprint) {
+                            return Outcome::Failed(fault_of(&e));
+                        }
+                    }
+                }
                 let was = self.trust.is_trusted(&fingerprint);
                 let out = self
                     .trust_identity(fingerprint, &petname, history, capability)
@@ -5942,7 +6041,9 @@ impl Node {
                 out
             }
             // Answered through `begin_create_channel`, which the run loop calls instead of this.
-            NodeCommand::Serve { .. } => Outcome::Failed(Fault::Internal),
+            NodeCommand::CreateChannel { .. } | NodeCommand::Serve { .. } => {
+                Outcome::Failed(Fault::Internal)
+            }
             NodeCommand::Up { channel_id, bind } => self.bring_up(&channel_id, bind).await,
             NodeCommand::AddService {
                 channel_id,
@@ -8104,6 +8205,7 @@ impl Node {
                 reply,
                 room_name,
                 passphrase,
+                anchors,
                 genesis,
                 now,
                 sealed,
@@ -8125,6 +8227,7 @@ impl Node {
                             sek,
                             &wrap,
                             now,
+                            &anchors,
                         ) {
                             Ok(ch) => match service {
                                 None => self.finish_create_channel(ch).await,
@@ -10027,23 +10130,14 @@ impl Node {
         // The link names the room's own anchors and this node last. Machine hand-added
         // anchors do not become the room's merely because this node uses them. This node's own
         // addresses may not be, and a joiner tries them in this order.
-        let mut anchors: Vec<BootstrapNode> = Vec::new();
-        if let Some(shared) = self.channels.get(channel_id) {
-            for n in shared.lock().await.anchors().nodes() {
-                anchors.push(n.clone());
-            }
-        }
+        let anchors = match self.channels.get(channel_id) {
+            Some(shared) => shared.lock().await.anchors().clone(),
+            None => crate::nat::bootstrap::BootstrapSet::new(),
+        };
         // **This node always survives the cap** (V210-96, C6): it was appended last and then
         // truncated with the rest, so four anchors left the link naming no route to the host itself,
         // which always holds its room, and a guest who could reach it directly had no way to.
-        anchors.retain(|a| a.id != net.local_id());
-        let me = net
-            .local_endpoints()
-            .ok()
-            .and_then(|own| BootstrapNode::new(net.local_id(), own).ok());
-        anchors.truncate(crate::node::link::MAX_LINK_ANCHORS - usize::from(me.is_some()));
-        anchors.extend(me);
-        anchors
+        crate::node::link::preview_routes(&anchors, net.local_id(), net.local_endpoints().ok()).0
     }
 
     /// **An address is handed out at once whenever a guest could find the host through it**
@@ -10807,6 +10901,21 @@ impl Node {
                     let _ = reply.send(Outcome::Failed(f));
                     return;
                 }
+            }
+        }
+        // A prior deletion's owner must finish clearing its saved bindings before the same
+        // room can be rejoined; otherwise that cleanup could erase the new binding.
+        if let Some(profile) = self.profile.as_ref() {
+            match crate::node::session_ingress::retirements(profile) {
+                Ok(rooms) if rooms.iter().any(|item| item.room == parsed.channel_id) => {
+                    let _ = reply.send(Outcome::Failed(Fault::SessionCleanupBusy));
+                    return;
+                }
+                Err(error) => {
+                    let _ = reply.send(Outcome::Failed(fault_of(&error)));
+                    return;
+                }
+                Ok(_) => {}
             }
         }
         if self.channels.contains_key(&parsed.channel_id) {
@@ -15772,30 +15881,6 @@ impl Node {
         }
     }
 
-    fn create_channel<'a>(
-        &'a mut self,
-        room_name: &'a str,
-        passphrase: &'a Secret,
-    ) -> Boxed<'a, Outcome> {
-        Box::pin(self.create_channel_unboxed(room_name, passphrase))
-    }
-
-    /// [`Self::create_channel`], unboxed: see [`Boxed`].
-    async fn create_channel_unboxed(&mut self, room_name: &str, passphrase: &Secret) -> Outcome {
-        if self.room_named(room_name).is_some() {
-            return Outcome::Failed(Fault::RoomNameTaken);
-        }
-        let now_ms = self.now_ms();
-        let Some(profile) = self.profile.as_ref() else {
-            return Outcome::Failed(Fault::NoIdentity);
-        };
-        match ChannelState::create_with_profile(profile, room_name, passphrase, now_ms, self.argon2)
-        {
-            Ok(ch) => self.finish_create_channel(ch).await,
-            Err(e) => Outcome::Failed(fault_of(&e)),
-        }
-    }
-
     /// Everything after a room exists: hold it, give it anchors, publish it, say so.
     fn finish_create_channel(&mut self, ch: ChannelState) -> Boxed<'_, Outcome> {
         Box::pin(self.finish_create_channel_unboxed(ch))
@@ -15877,6 +15962,7 @@ impl Node {
         &mut self,
         room_name: String,
         passphrase: Secret,
+        anchors: BootstrapSet,
         service: Option<(String, SocketAddr)>,
         reply: oneshot::Sender<Outcome>,
     ) {
@@ -15944,6 +16030,7 @@ impl Node {
                     reply,
                     room_name,
                     passphrase,
+                    anchors,
                     genesis: Box::new(genesis),
                     now: now_ms,
                     sealed,
@@ -16947,6 +17034,42 @@ impl Node {
     /// and then the store is rewritten so none of the deleted bytes stay in the file. A room left
     /// (V210-164) or ended (the decider, 2026-10-03) goes this way.
     async fn purge_room(&mut self, channel_id: &Digest32) -> Outcome {
+        if self
+            .session_rooms_retiring
+            .iter()
+            .any(|item| item.room == *channel_id)
+        {
+            return Outcome::Failed(Fault::SessionCleanupBusy);
+        }
+        let Some(profile) = self.profile.as_ref() else {
+            return Outcome::Failed(Fault::NoIdentity);
+        };
+        // Recovery may have delivered only one of two durable markers to the capacity-one
+        // queue. Check the authoritative bound before any cursor/channel state is removed.
+        match crate::node::session_ingress::retirements(profile) {
+            Ok(pending)
+                if pending.iter().any(|item| item.room == *channel_id)
+                    || (self.session_room_removed.is_some() && pending.len() == 2) =>
+            {
+                return Outcome::Failed(Fault::SessionCleanupBusy);
+            }
+            Err(error) => return Outcome::Failed(fault_of(&error)),
+            Ok(_) => {}
+        }
+        // Reserve before deleting anything. Never await a full owner queue while the owner
+        // may hold admission ordering and be waiting for this actor to finish an admission.
+        let retirement = match &self.session_room_removed {
+            None => None,
+            Some(owner) => match owner.clone().try_reserve_owned() {
+                Ok(permit) => Some(permit),
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    return Outcome::Failed(Fault::SessionCleanupBusy)
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    return Outcome::Failed(Fault::SessionCleanupUnavailable)
+                }
+            },
+        };
         self.cancel_room_preparation(channel_id, Fault::UnknownChannel);
         // A leave still waiting for this room is overtaken: the room is joined again from scratch.
         let (overtaken, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.leave_waiters)
@@ -17013,8 +17136,21 @@ impl Node {
                 }
             }
         }
-        if let Err(e) = profile.store().purge_channel(channel_id) {
-            return Outcome::Failed(fault_of(&e));
+        // Accepted Session activity is node-scoped so it survives detach, but the operator's
+        // explicit deletion of its captured room removes it with that room's other data.
+        let pending = match crate::node::session_ingress::remove_room(
+            profile,
+            channel_id,
+            retirement.is_some(),
+        ) {
+            Ok(pending) => pending,
+            Err(error) => return Outcome::Failed(fault_of(&error)),
+        };
+        if let (Some(permit), Some(pending)) = (retirement, pending) {
+            // The corresponding bounded receipt is already durable with the deletion.
+            // Notify before rewrite_fresh: failure there must not strand owner cleanup.
+            self.session_rooms_retiring.insert(pending);
+            permit.send(pending);
         }
         if let Err(e) = profile.store().rewrite_fresh() {
             return Outcome::Failed(fault_of(&e));
@@ -17767,6 +17903,12 @@ impl Node {
             .collect();
         report.diagnose();
         self.storage_health(&mut report);
+        if let Some(message) = &self.session_ingress_error {
+            report.unhealthy.push(crate::node::status::Unhealthy {
+                key: "session-ingress".into(),
+                message: message.clone(),
+            });
+        }
         report
             .unhealthy
             .extend(crate::node::status::SyncBook::failing_peers(
@@ -18344,8 +18486,107 @@ impl Node {
         });
     }
 
+    /// Re-send durable room-deletion cleanups after unlock, without accepting old-room work.
+    fn resume_session_retirements(&mut self) {
+        let Some(profile) = self
+            .profile
+            .as_ref()
+            .filter(|profile| profile.is_unlocked())
+        else {
+            return;
+        };
+        let Some(owner) = &self.session_room_removed else {
+            return;
+        };
+        let rooms = match crate::node::session_ingress::retirements(profile) {
+            Ok(rooms) => rooms,
+            Err(error) => {
+                self.session_ingress_error =
+                    Some(format!("Session room cleanup cannot recover: {error}"));
+                return;
+            }
+        };
+        for room in rooms {
+            if self.session_rooms_retiring.contains(&room) {
+                continue;
+            }
+            match owner.clone().try_reserve_owned() {
+                Ok(permit) => {
+                    self.session_rooms_retiring.insert(room);
+                    permit.send(room);
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => break,
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    self.session_ingress_error = Some(
+                        "Session room cleanup owner is unavailable; restart the daemon".into(),
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
     /// Append one Session entry under this node's drive key (ADR-029 SC-1, SC-2), then release
     /// that key to whoever with drive is owed it, so a member owed it from the entry reads it.
+    /// One bounded item per tick. Closed/joining rooms keep their durable head; another
+    /// session is tried next tick. No harness/registration lifetime owns accepted bodies.
+    async fn drain_session_ingress(&mut self) -> bool {
+        let Some(profile) = self.profile.as_ref() else {
+            return false;
+        };
+        let pending = match crate::node::session_ingress::pending(
+            profile,
+            &mut self.session_ingress_cursor,
+        ) {
+            Ok(Some(pending)) => pending,
+            Ok(None) => return false,
+            Err(error) => {
+                self.session_ingress_error =
+                    Some(format!("Session activity cannot be recovered: {error}"));
+                return false;
+            }
+        };
+        let Some(channel) = self.channels.get(&pending.room).cloned() else {
+            return false;
+        };
+        let holders = self.drive_holders();
+        let now = (self.millis_clock)();
+        let result = {
+            let Ok(mut channel) = channel.try_lock() else {
+                return false;
+            };
+            channel
+                .rotate_drive_if_lost(profile.store(), &holders, crate::time::Ms(now))
+                .and_then(|_| {
+                    channel.append_ingress_session(
+                        profile,
+                        &pending.session,
+                        &pending.body,
+                        &holders,
+                        now,
+                        &pending.completion,
+                    )
+                })
+        };
+        match result {
+            Ok(_) => {
+                self.session_ingress_error = None;
+                self.note_local_append(&pending.room);
+                self.tend_drive_keys_in(&pending.room, &holders).await;
+                self.say_session_news(&pending.room).await;
+                true
+            }
+            Err(error) => {
+                if !matches!(error, crate::error::Error::RoomNotSynced) {
+                    self.session_ingress_error = Some(format!(
+                        "Session activity is saved and waiting for its room: {error}"
+                    ));
+                }
+                false
+            }
+        }
+    }
+
     async fn append_session(
         &mut self,
         channel_id: &Digest32,

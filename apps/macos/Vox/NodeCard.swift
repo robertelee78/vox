@@ -34,14 +34,48 @@ struct NodeActions: ViewModifier {
             if let presented = model.presentedNames[fingerprint] {
                 Button("Copy Name and Fingerprint") { copyWords("\(presented) <\(fingerprint)>") }
             }
-            if !trust.inKeyring {
-                Button("Trust…") { model.openCard(fingerprint, name: name, act: .trust) }
+            if !trust.inKeyring && model.canManageIndividualTrust(fingerprint) {
+                Button("Trust…") { Task { await model.openTrustCard(fingerprint, name: name) } }
+            }
+            if let room = model.roomOnScreen, let offer = model.memberOffer(fingerprint, in: room),
+               model.canManageIndividualTrust(fingerprint) {
+                Button("Dismiss") { Task { await model.dismiss(offer) } }
             }
             Button("Compare…") { model.openCard(fingerprint, name: name, act: .compare) }
             if trust.inKeyring {
                 Button("Remove…", role: .destructive) {
                     model.openCard(fingerprint, name: name, act: .remove)
                 }
+            }
+        }
+        .task(id: fingerprint + "/" + (model.roomOnScreen ?? "")) { await model.refreshIndividualTrustEligibility(fingerprint, invalidate: true) }
+    }
+}
+
+/// A pending individual newcomer stays a member; its offer is handled beside that member.
+struct MemberTrustActions: View {
+    @ObservedObject var model: NodeModel
+    let fingerprint: String
+    let name: String
+    let room: String
+
+    var body: some View {
+        if !model.trust(of: fingerprint).inKeyring,
+           let offer = model.memberOffer(fingerprint, in: room) {
+            if model.canManageIndividualTrust(fingerprint) {
+                VStack(alignment: .leading, spacing: Space.s4) {
+                    Text("New member").eyebrow().secondaryText()
+                        .accessibilityIdentifier("member-new-" + fingerprint)
+                    HStack {
+                        Button("Trust") { Task { await model.openTrustCard(fingerprint, name: name) } }
+                            .accessibilityIdentifier("member-trust-" + fingerprint)
+                        Button("Dismiss") { Task { await model.dismiss(offer) } }
+                            .accessibilityIdentifier("member-dismiss-" + fingerprint)
+                    }
+                }
+            } else {
+                Text(model.individualTrustReason(fingerprint)).secondaryText()
+                    .accessibilityIdentifier("member-trust-reason-" + fingerprint)
             }
         }
     }
@@ -111,9 +145,16 @@ struct NodeCard: View {
                         .secondaryText()
                 }
                 HStack {
-                    if !trust.inKeyring {
-                        Button("Trust…") { act = .trust }
+                    if !trust.inKeyring && model.canManageIndividualTrust(node.fingerprint) {
+                        Button("Trust…") {
+                            Task { if await model.prepareCardTrust(node.fingerprint) { act = .trust } }
+                        }
                             .accessibilityIdentifier("card-trust-open")
+                    }
+                    if let room = model.roomOnScreen, let offer = model.memberOffer(node.fingerprint, in: room),
+                       model.canManageIndividualTrust(node.fingerprint) {
+                        Button("Dismiss") { Task { await model.dismiss(offer) } }
+                            .accessibilityIdentifier("card-dismiss")
                     }
                     Button("Compare…") { act = .compare }
                         .accessibilityIdentifier("card-compare-open")
@@ -162,6 +203,7 @@ struct NodeCard: View {
         .accessibilityIdentifier("node-card")
         .onAppear { act = node.act }
         .task(id: node.fingerprint) {
+            await model.refreshIndividualTrustEligibility(node.fingerprint, invalidate: true)
             if let name = await model.presentedName(node.fingerprint), alias.isEmpty { alias = name }
         }
     }
@@ -169,6 +211,7 @@ struct NodeCard: View {
     /// Trust it: an alias, and it is given read, the only grant here (the decider, v0.4.1: no
     /// drive choice when trusting); what it does said first (E-5), as an offer is accepted (K-16).
     @ViewBuilder private var trusting: some View {
+        if model.canManageIndividualTrust(node.fingerprint) {
         TextField("Alias", text: $alias)
             .accessibilityLabel("Alias")
             .frame(width: Theme.scaled(320))
@@ -184,6 +227,10 @@ struct NodeCard: View {
         }
         .disabled(alias.isEmpty)
         .accessibilityIdentifier("card-trust-confirm")
+        } else {
+            Text(model.individualTrustReason(node.fingerprint)).secondaryText()
+                .accessibilityIdentifier("card-trust-reason")
+        }
     }
 
     /// Compare a fingerprint pasted or typed with this node's, group by group (K-5, #624): only a

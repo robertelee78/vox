@@ -123,7 +123,11 @@ final class NodeModel: ObservableObject {
     @Published var selection: Selection? {
         didSet {
             roomReadGeneration = UUID()
+            invalidateRoomAnchorState(preservingSnapshot: oldValue == selection)
+            individualTrustFacts = [:]
+            individualTrustReads = [:]
             rejectedRoomMark = nil
+            clearThreadState()
             if case .room = selection { roomNeedsPage = true } else { roomNeedsPage = false }
         }
     }
@@ -141,11 +145,35 @@ final class NodeModel: ObservableObject {
         didSet {
             roomMessageRevision = UUID()
             byID = Dictionary(messages.map { ($0.id, $0) }) { $1 }
+            if let root = openThread { threadRootMessage = byID[root] }
+
             var said: [String: NodePlatform] = [:]
             for message in messages { if let p = message.platform { said[message.author] = p } }
             if said != platforms { platforms = said }
+            scheduleThreadRefresh()
         }
     }
+    /// Thread data is an authoritative retained/readable snapshot, separate from General pages.
+    @Published private(set) var threadSummaries: [String: ThreadSummary] = [:]
+    @Published private(set) var threadSummaryErrors: [String: String] = [:]
+    @Published private(set) var openThread: String?
+    @Published private(set) var threadRootMessage: RoomMessage?
+    @Published private(set) var threadReplies: [RoomMessage] = []
+    @Published private(set) var threadLoading = false
+    @Published private(set) var threadHasMore = false
+    @Published private(set) var threadError: String?
+    private var threadGeneration = UUID()
+    private var threadRefreshID = UUID()
+    private var threadSummaryVersions: [String: UUID] = [:]
+    private var threadAuthorRequests: [String: UUID] = [:]
+    private var threadPageDirty = false
+    private var threadRefreshDirty = false
+    private var threadDisplayRevision: String?
+    private var threadForcedSummaries: Set<String> = []
+    private var threadPagesLoaded = 1
+    private var threadRefreshTask: Task<Void, Never>?
+    private var threadPageTask: Task<Void, Never>?
+
     @Published private(set) var roomOlder: UInt64 = 0
     private var roomBefore: String?
     @Published private var roomReadingOlder = false
@@ -181,6 +209,7 @@ final class NodeModel: ObservableObject {
     @Published var showing: Showing = .general {
         didSet {
             guard showing != oldValue else { return }
+            if showing != .general { closeThread() }
             // Another Session's entries are never drawn, nor acted on, under this one's header
             // while it loads (D3): cleared, and said to be loading.
             sessionPages.clear()
@@ -253,7 +282,42 @@ final class NodeModel: ObservableObject {
     // ---- what the menus, keys and palette ask for (M-19–M-21) ---------------------------------
 
     /// The sheet a menu, key or palette action opened.
-    @Published var sheet: NodeSheet?
+    @Published private(set) var roomAnchorAuthority: RoomAnchorAuthority?
+    @Published private(set) var roomAnchorEntries: [RoomAnchorEndpoint] = []
+    private var roomAnchorSnapshotRoom: String?
+    private var roomAnchorSnapshotNode: String?
+    private var roomAnchorSnapshotEpoch: UUID?
+    private var roomAnchorSnapshotGeneration: UUID?
+    var roomAnchorSnapshotKnown: Bool {
+        roomAnchorSnapshotRoom == roomOnScreen && roomAnchorSnapshotRoom != nil
+            && roomAnchorSnapshotNode == me
+    }
+    var roomAnchorSnapshotCurrent: Bool {
+        roomAnchorSnapshotKnown && daemonReachable && ended == nil && roomAnchorError == nil
+            && roomAnchorSnapshotEpoch == nodeObservationEpoch
+            && roomAnchorSnapshotGeneration == roomReadGeneration
+    }
+    @Published private(set) var roomAnchorReach: [String: String] = [:]
+    @Published private(set) var roomAnchorReachError: String?
+    @Published private(set) var roomAnchorError: String?
+    @Published private(set) var roomAnchorLoading = false
+    @Published private(set) var roomAnchorChanging = false
+    private var roomAnchorRead = UUID()
+    private var roomAnchorAction = UUID()
+    private var roomAnchorAuthorityEpoch: UUID?
+    private var roomAnchorAuthorityGeneration: UUID?
+    var canManageRoomAnchors: Bool {
+        guard let room = roomOnScreen, ended == nil, daemonReachable,
+              let authority = roomAnchorAuthority else { return false }
+        return authority.room == room && authority.node == me && authority.canManage
+            && roomAnchorAuthorityEpoch == nodeObservationEpoch
+            && roomAnchorAuthorityGeneration == roomReadGeneration
+    }
+
+    private var sheetInstance = UUID()
+    @Published var sheet: NodeSheet? {
+        didSet { if oldValue != sheet { sheetInstance = UUID() } }
+    }
     /// Whether the room's inspector shows (View > Hide Inspector, ⌥⌘I), kept across launches.
     @Published var inspectorShown = Columns.inspectorShown {
         didSet { UserDefaults.standard.set(inspectorShown, forKey: Columns.inspectorShownKey) }
@@ -348,7 +412,71 @@ final class NodeModel: ObservableObject {
     /// or not (ADR-028 R-5, D4).
     @Published private(set) var trustsMe: Set<String> = []
     /// The node whose card is open (D4): from a member row, a message's author or a decision row.
-    @Published var card: NodeCardFor?
+    struct IndividualTrustFact: Equatable {
+        var allowed: Bool?
+        var reason: String
+    }
+    @Published private(set) var individualTrustFacts: [String: IndividualTrustFact] = [:]
+    private var individualTrustReads: [String: UUID] = [:]
+
+    func canManageIndividualTrust(_ fingerprint: String) -> Bool {
+        individualTrustFacts[fingerprint]?.allowed == true
+    }
+
+    func individualTrustReason(_ fingerprint: String) -> String {
+        individualTrustFacts[fingerprint]?.reason ?? "Checking whether individual trust can be changed…"
+    }
+
+    func memberOffer(_ fingerprint: String, in room: String) -> OfferInfo? {
+        offers.first { $0.fingerprint == fingerprint && $0.rooms.contains { $0.id == room } }
+    }
+
+    /// Selected-node authority, never inferred from a name, address or cached body.
+    func refreshIndividualTrustEligibility(_ fingerprint: String, invalidate: Bool = false) async {
+        let request = UUID(), generation = roomReadGeneration, epoch = nodeObservationEpoch
+        let room = roomOnScreen
+        individualTrustReads[fingerprint] = request
+        // Entry checks retire stale authority; background refresh keeps a current form stable.
+        if invalidate {
+            individualTrustFacts[fingerprint] = IndividualTrustFact(allowed: nil, reason: "Checking whether individual trust can be changed…")
+        }
+        do {
+            let fact = try await client.individualTrustEligibility(fingerprint: fingerprint)
+            guard individualTrustReads[fingerprint] == request, generation == roomReadGeneration,
+                  epoch == nodeObservationEpoch, roomOnScreen == room, ended == nil, !Task.isCancelled else { return }
+            individualTrustFacts[fingerprint] = IndividualTrustFact(allowed: fact.canManageIndividualTrust, reason: fact.reason)
+        } catch {
+            guard individualTrustReads[fingerprint] == request, generation == roomReadGeneration,
+                  epoch == nodeObservationEpoch, roomOnScreen == room, ended == nil, !Task.isCancelled else { return }
+            individualTrustFacts[fingerprint] = IndividualTrustFact(allowed: nil, reason: sentence(error))
+        }
+    }
+
+    private func checkIndividualTrust(_ fingerprint: String, operation: String) async -> Bool {
+        let generation = roomReadGeneration, epoch = nodeObservationEpoch, request = UUID()
+        individualTrustReads[fingerprint] = request
+        individualTrustFacts[fingerprint] = IndividualTrustFact(allowed: nil, reason: "Checking whether individual trust can be changed…")
+        do {
+            let fact = try await client.individualTrustEligibility(fingerprint: fingerprint)
+            guard individualTrustReads[fingerprint] == request, generation == roomReadGeneration, epoch == nodeObservationEpoch, ended == nil, !Task.isCancelled else { return false }
+            individualTrustFacts[fingerprint] = IndividualTrustFact(allowed: fact.canManageIndividualTrust, reason: fact.reason)
+            guard fact.canManageIndividualTrust else {
+                let refused = Outcome(operation: operation, kind: .refused, words: fact.reason)
+                outcomes[operation] = refused
+                outcome = refused
+                return false
+            }
+            return true
+        } catch {
+            guard individualTrustReads[fingerprint] == request, generation == roomReadGeneration, epoch == nodeObservationEpoch, ended == nil, !Task.isCancelled else { return false }
+            individualTrustFacts[fingerprint] = IndividualTrustFact(allowed: nil, reason: sentence(error))
+            report(error, operation: operation)
+            return false
+        }
+    }
+
+    private var individualTrustIntent = UUID()
+    @Published var card: NodeCardFor? { didSet { individualTrustIntent = UUID() } }
     /// The keyring row selected, by fingerprint: what Keyring > Compare, Rename and Remove act on.
     @Published var keyringSelected: String?
     /// What a Keyring menu action asks the keyring view to open; each ask counts one up.
@@ -429,7 +557,9 @@ final class NodeModel: ObservableObject {
     }
 
     /// The node ended: detached, or the daemon stopped.
-    @Published private(set) var ended: String?
+    @Published private(set) var ended: String? {
+        didSet { if ended != nil { clearThreadState() } }
+    }
 
     /// Whether macOS lets Vox notify; nil until it says.
     @Published private(set) var notifying: Bool?
@@ -644,15 +774,21 @@ final class NodeModel: ObservableObject {
             if fresh != nodes { nodes = fresh }
             if fresh.first(where: { $0.name == node })?.state != "attached" {
                 nodeObservationEpoch = UUID()
+                invalidateRoomAnchorState(preservingSnapshot: true)
                 daemonReachable = true
                 ended = fresh.first(where: { $0.name == node })?.status == "Locked"
                     ? "Node \(node) is Locked." : "Node \(node) is unavailable."
+                clearThreadState()
                 peers = 0
                 return
             }
             let view = try await client.view()
             guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
             daemonReachable = true
+            // Both public daemon and held-node reads succeeded for this observation epoch.
+            // Retire only a typed background connection fault, even when another poll never
+            // changed daemonReachable. Foreground and unrelated read failures remain visible.
+            if outcome?.operation == "", outcome?.backgroundConnectivity == true { outcome = nil }
             if Int(view.peers) != peers { peers = Int(view.peers) }
             if view.keyring != keyring { keyring = view.keyring }
             if fresh.first(where: { $0.name == node })?.state == "attached" {
@@ -663,13 +799,14 @@ final class NodeModel: ObservableObject {
                 // or its watcher survived the interruption. Preserve its visible content
                 // until an authoritative page and roster replace it together.
                 if case .room = selection {
+                    threadDisplayRevision = nil
                     roomReadGeneration = UUID()
                     roomNeedsPage = true
                     watching?.cancel()
                     stepRetentionRead = UUID()
                     stepRetentionLoading = false
                 }
-                if outcome?.operation == "" { outcome = nil }
+
                 try await client.subscribe(listener: Listener(model: self))
                 guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
                 lastRead.removeAll()
@@ -681,8 +818,12 @@ final class NodeModel: ObservableObject {
         } catch {
             guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
             daemonReachable = false
+            individualTrustFacts = [:]
+            individualTrustReads = [:]
             machineStateKnown = false
             nodeObservationEpoch = UUID()
+            threadDisplayRevision = nil
+            invalidateRoomAnchorState(preservingSnapshot: true)
             daemonFailure = sentence(error)
             reportBackground(error)
             return
@@ -693,6 +834,11 @@ final class NodeModel: ObservableObject {
         let currentOffers = try? await client.pendingOffers()
         guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
         if let currentOffers, currentOffers != offers { offers = currentOffers }
+        let eligibilityTargets = Set(members.map(\.id) + offers.map(\.fingerprint) + (card.map { [$0.fingerprint] } ?? []))
+        for fingerprint in eligibilityTargets {
+            await refreshIndividualTrustEligibility(fingerprint)
+            guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
+        }
         await readRoomAsks()
         guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
         // Each room counts the offers from its members (K-15), shown in it.
@@ -930,6 +1076,8 @@ final class NodeModel: ObservableObject {
             noticesRevision = done.revision
             sessions = listed
             await loadStepRetention()
+            guard !Task.isCancelled, generation == roomReadGeneration, selection == .room(id), ended == nil else { return }
+            await loadRoomAnchorState()
             guard generation == roomReadGeneration, self.selection == .room(id), ended == nil else { return }
             // A Session restored as this room's last view is read once the room lists it (D12).
             if showingSession { await readSession() }
@@ -963,7 +1111,30 @@ final class NodeModel: ObservableObject {
     }
 
     /// Open `fingerprint`'s card (D4), named `name` as the room names it.
+    func openTrustCard(_ fingerprint: String, name: String) async {
+        let intent = UUID()
+        individualTrustIntent = intent
+        guard await checkIndividualTrust(fingerprint, operation: "trust"),
+              individualTrustIntent == intent, !Task.isCancelled else { return }
+        keyringDid = nil
+        keyringFailed = nil
+        card = NodeCardFor(fingerprint: fingerprint, name: name, act: .trust)
+    }
+
+    func prepareCardTrust(_ fingerprint: String) async -> Bool {
+        let intent = individualTrustIntent
+        guard card?.fingerprint == fingerprint,
+              await checkIndividualTrust(fingerprint, operation: "trust"),
+              individualTrustIntent == intent, card?.fingerprint == fingerprint,
+              !Task.isCancelled else { return false }
+        return true
+    }
+
     func openCard(_ fingerprint: String, name: String, act: NodeCardFor.Act? = nil) {
+        if act == .trust {
+            Task { await openTrustCard(fingerprint, name: name) }
+            return
+        }
         keyringDid = nil
         keyringFailed = nil
         card = NodeCardFor(fingerprint: fingerprint, name: name, act: act)
@@ -1015,6 +1186,7 @@ final class NodeModel: ObservableObject {
     func trust(_ fingerprint: String, as alias: String, drive: Bool) async -> Bool {
         guard let parsed = identityInput(fingerprint) else { return false }
         let fp = parsed.fingerprint
+        guard await checkIndividualTrust(fp, operation: "trust") else { return false }
         return await keyringChange(fingerprint: fp, alias: alias,
                                    words: "trust \(alias), \(Capability.words(drive))",
                                    action: "Trust") { [client] pass in
@@ -1239,8 +1411,11 @@ final class NodeModel: ObservableObject {
     /// Accept `offer`: trust it under `alias`, read or read + drive (K-16), behind the passphrase
     /// gate; the offer then leaves needs you. Whether it was done.
     func accept(_ offer: OfferInfo, as alias: String, drive: Bool) async -> Bool {
+        let generation = roomReadGeneration, epoch = nodeObservationEpoch
         guard await trust(offer.fingerprint, as: alias, drive: drive) else { return false }
-        if let waiting = try? await client.pendingOffers() { offers = waiting }
+        let waiting = try? await client.pendingOffers()
+        guard generation == roomReadGeneration, epoch == nodeObservationEpoch, ended == nil, !Task.isCancelled else { return false }
+        if let waiting { offers = waiting }
         return true
     }
 
@@ -1248,13 +1423,18 @@ final class NodeModel: ObservableObject {
     /// stays reachable from the member pane.
     func dismiss(_ offer: OfferInfo) async {
         let operation = "dismiss-offer"
+        guard await checkIndividualTrust(offer.fingerprint, operation: operation) else { return }
+        let generation = roomReadGeneration, epoch = nodeObservationEpoch
         let attempt = begin(operation)
         defer { end(attempt) }
         do {
             try await client.dismissOffer(fingerprint: offer.fingerprint)
-            if let waiting = try? await client.pendingOffers() { offers = waiting }
+            let waiting = try? await client.pendingOffers()
+            guard generation == roomReadGeneration, epoch == nodeObservationEpoch, ended == nil, !Task.isCancelled else { return }
+            if let waiting { offers = waiting }
             if selection == .offer(offer.fingerprint) { selection = nil }
         } catch {
+            guard generation == roomReadGeneration, epoch == nodeObservationEpoch, ended == nil, !Task.isCancelled else { return }
             report(error, operation: operation)
         }
     }
@@ -1451,6 +1631,61 @@ final class NodeModel: ObservableObject {
         return nil
     }
 
+    /// A sheet's search results belong to this exact actor, room generation and sheet.
+    var anchorChoiceContext: String {
+        me + "/" + nodeObservationEpoch.uuidString + "/" + roomReadGeneration.uuidString
+            + "/" + (sheet?.rawValue ?? "closed") + "/" + sheetInstance.uuidString
+    }
+
+    func previewRoomAnchorChoices(_ anchors: [RoomAnchorEndpoint], context: String) async throws -> RoomLinkPreview {
+        guard context == anchorChoiceContext, ended == nil, sheet == .newRoom else { throw CancellationError() }
+        let preview = try await client.previewRoomLink(anchors: anchors, node: me)
+        guard !Task.isCancelled, context == anchorChoiceContext, ended == nil,
+              preview.node == me else { throw CancellationError() }
+        return preview
+    }
+
+    func searchRoomAnchorChoices(context: String) async throws -> [RoomAnchorEndpoint] {
+        guard context == anchorChoiceContext, ended == nil,
+              sheet == .newRoom || sheet == .roomAnchors else { throw CancellationError() }
+        let found = try await client.searchAnchors()
+        guard !Task.isCancelled, context == anchorChoiceContext, ended == nil else { throw CancellationError() }
+        return found
+    }
+
+    func resolveRoomAnchorChoice(_ input: String, context: String) async throws -> RoomAnchorEndpoint {
+        guard context == anchorChoiceContext, ended == nil,
+              sheet == .newRoom || sheet == .roomAnchors else { throw CancellationError() }
+        let found = try await client.resolveAnchorEndpoint(input: input)
+        guard !Task.isCancelled, context == anchorChoiceContext, ended == nil else { throw CancellationError() }
+        return found
+    }
+
+    /// Create from a snapshot of explicitly kept, already numeric endpoints. Search and DNS
+    /// never hold this mutation, and closing/changing the sheet retires its UI publication.
+    func createRoom(_ name: String, passphrase secret: Secret, anchors: [RoomAnchorEndpoint],
+                    context: String) async -> Bool {
+        let operation = "create-room", attempt = begin("create-room")
+        defer { end(attempt) }
+        guard context == anchorChoiceContext, sheet == .newRoom, ended == nil else { secret.wipe(); return false }
+        do {
+            let passphrase = try secret.passphrase()
+            defer { passphrase.wipe() }
+            let room = try await client.createRoomWithAnchors(name: name, passphrase: passphrase,
+                                                             anchors: anchors, node: me)
+            guard !Task.isCancelled, context == anchorChoiceContext, ended == nil else { return false }
+            report(operation: operation, done: "Created the room.")
+            await refresh()
+            guard !Task.isCancelled, context == anchorChoiceContext, ended == nil else { return false }
+            await show(.room(room))
+            return true
+        } catch {
+            guard !Task.isCancelled, context == anchorChoiceContext, ended == nil else { return false }
+            report(error, operation: operation)
+            return false
+        }
+    }
+
     /// Create a room named `name` under `passphrase`, and show it.
     func createRoom(_ name: String, passphrase secret: Secret) async -> Bool {
         let operation = "create-room"
@@ -1533,6 +1768,135 @@ final class NodeModel: ObservableObject {
             return true
         } catch {
             report(error, operation: operation)
+            return false
+        }
+    }
+
+    private func invalidateRoomAnchorState(preservingSnapshot: Bool = false) {
+        roomAnchorRead = UUID()
+        roomAnchorAction = UUID()
+        roomAnchorAuthority = nil
+        roomAnchorAuthorityEpoch = nil
+        roomAnchorAuthorityGeneration = nil
+        // Retire every authority/action even when a same-identity read-only snapshot remains.
+        if preservingSnapshot && roomAnchorSnapshotKnown {
+            roomAnchorSnapshotEpoch = nil
+            roomAnchorSnapshotGeneration = nil
+            roomAnchorError = "Room configuration unavailable; showing last known configuration."
+            roomAnchorReachError = "Identity reach unavailable; showing last known observation."
+        } else {
+            roomAnchorEntries = []
+            roomAnchorReach = [:]
+            roomAnchorReachError = nil
+            roomAnchorError = nil
+            roomAnchorSnapshotRoom = nil
+            roomAnchorSnapshotNode = nil
+            roomAnchorSnapshotEpoch = nil
+            roomAnchorSnapshotGeneration = nil
+        }
+        roomAnchorLoading = false
+        roomAnchorChanging = false
+        if sheet == .roomAnchors { sheet = nil }
+    }
+
+    func loadRoomAnchorState() async {
+        guard let room = roomOnScreen, ended == nil else { return }
+        let generation = roomReadGeneration, epoch = nodeObservationEpoch, request = UUID()
+        roomAnchorRead = request
+        roomAnchorLoading = true
+        defer { if roomAnchorRead == request { roomAnchorLoading = false } }
+        @MainActor func current() -> Bool {
+            !Task.isCancelled && roomAnchorRead == request && roomReadGeneration == generation
+                && nodeObservationEpoch == epoch && roomOnScreen == room && ended == nil
+        }
+        do {
+            let authority = try await client.roomAnchorAuthority(room: room)
+            guard current() else { return }
+            guard authority.room == room, authority.node == me else {
+                throw VoxError.Failed(reason: "The room-anchor authority belongs to another room or node.")
+            }
+            roomAnchorAuthority = authority
+            roomAnchorAuthorityEpoch = epoch
+            roomAnchorAuthorityGeneration = generation
+            let configuration = try await client.roomAnchorConfiguration(room: room)
+            guard current() else { return }
+            guard configuration.room == room, configuration.node == me else {
+                throw VoxError.Failed(reason: "The anchor configuration belongs to another room or node.")
+            }
+            roomAnchorEntries = configuration.anchors
+            roomAnchorSnapshotRoom = room
+            roomAnchorSnapshotNode = me
+            roomAnchorSnapshotEpoch = epoch
+            roomAnchorSnapshotGeneration = generation
+            roomAnchorError = nil
+            // Reach is an identity-level observation across machine sources, not proof that
+            // every address in this room's signed configuration is reachable.
+            do {
+                let inventory = try await client.anchors()
+                guard current() else { return }
+                roomAnchorReach = Dictionary(uniqueKeysWithValues: inventory.map { ($0.fingerprint, $0.reachText) })
+                roomAnchorReachError = nil
+            } catch {
+                guard current() else { return }
+                roomAnchorReachError = sentence(error)
+            }
+        } catch {
+            guard current() else { return }
+            roomAnchorAuthority = nil
+            roomAnchorError = sentence(error)
+        }
+    }
+
+    func openRoomAnchors() async {
+        let room = roomOnScreen, generation = roomReadGeneration, epoch = nodeObservationEpoch
+        roomAnchorAuthority = nil
+        await loadRoomAnchorState()
+        guard !Task.isCancelled, roomOnScreen == room, roomReadGeneration == generation,
+              nodeObservationEpoch == epoch, canManageRoomAnchors else { return }
+        sheet = .roomAnchors
+    }
+
+    /// Resolve input without a manual write; only the held actor signs this room's change.
+    @discardableResult
+    func changeRoomAnchor(input: String? = nil, removing: String? = nil) async -> Bool {
+        guard let room = roomOnScreen, ended == nil, !roomAnchorChanging, sheet == .roomAnchors,
+              (input != nil) != (removing != nil) else { return false }
+        let generation = roomReadGeneration, epoch = nodeObservationEpoch, request = UUID()
+        let editor = sheetInstance
+        roomAnchorAction = request
+        roomAnchorChanging = true
+        roomAnchorAuthority = nil
+        roomAnchorError = nil
+        defer { if roomAnchorAction == request { roomAnchorChanging = false } }
+        @MainActor func current() -> Bool {
+            !Task.isCancelled && sheet == .roomAnchors && sheetInstance == editor
+                && roomAnchorAction == request && roomReadGeneration == generation
+                && nodeObservationEpoch == epoch && roomOnScreen == room && ended == nil
+        }
+        do {
+            let authority = try await client.roomAnchorAuthority(room: room)
+            guard current() else { return false }
+            guard authority.room == room, authority.node == me, authority.canManage else {
+                throw VoxError.Failed(reason: "Only the room's creator or an admin can change its anchors.")
+            }
+            roomAnchorAuthority = authority
+            roomAnchorAuthorityEpoch = epoch
+            roomAnchorAuthorityGeneration = generation
+            if let input {
+                let spec = try await client.resolveAnchor(input: input)
+                guard current() else { return false }
+                try await client.addRoomAnchorPinned(room: room, spec: spec)
+            } else if let removing {
+                try await client.removeRoomAnchor(room: room, fingerprint: removing)
+            }
+            guard current() else { return false }
+            await loadRoomAnchorState()
+            guard current() else { return false }
+            return true
+        } catch {
+            guard current() else { return false }
+            roomAnchorAuthority = nil
+            roomAnchorError = sentence(error)
             return false
         }
     }
@@ -1830,7 +2194,13 @@ final class NodeModel: ObservableObject {
     /// never over what a person's own operation came to.
     private func reportBackground(_ error: Error) {
         guard outcome == nil || outcome?.operation == "" else { return }
-        outcome = Outcome(operation: "", kind: Outcome.kind(of: error), words: sentence(error))
+        let connectivity: Bool
+        switch error {
+        case VoxError.Unreachable(_), VoxError.ReadInterrupted(_): connectivity = true
+        default: connectivity = false
+        }
+        outcome = Outcome(operation: "", kind: Outcome.kind(of: error), words: sentence(error),
+                          backgroundConnectivity: connectivity)
     }
 
     // ---- what the node says -------------------------------------------------------------------
@@ -1929,6 +2299,9 @@ final class NodeModel: ObservableObject {
                 await self.loadStepRetention()
                 guard !Task.isCancelled, self.roomReadGeneration == generation,
                       self.selection == .room(room), self.ended == nil else { return }
+                await self.loadRoomAnchorState()
+                guard !Task.isCancelled, self.roomReadGeneration == generation,
+                      self.selection == .room(room), self.ended == nil else { return }
                 let listed = try? await self.client.sessions(room: room)
                 guard !Task.isCancelled, self.roomReadGeneration == generation,
                       self.selection == .room(room), self.ended == nil else { return }
@@ -1969,6 +2342,7 @@ final class NodeModel: ObservableObject {
                         }
                     }
                 }
+                self.scheduleThreadRefresh()
                 // Each join said, and said again as the room's consent grants name more of the
                 // keyring's nodes trusting the newcomer.
                 for (i, line) in self.joins.enumerated() {
@@ -2037,10 +2411,12 @@ final class NodeModel: ObservableObject {
     fileprivate func stopped(_ text: String) {
         nodeObservationEpoch = UUID()
         roomReadGeneration = UUID()
+        invalidateRoomAnchorState(preservingSnapshot: true)
         rejectedRoomMark = nil
         roomNeedsPage = false
         // An ended stream does not establish whether a protected node is Locked or a
         // passphraseless node is already Ready again. Display only the fresh snapshot.
+        clearThreadState()
         ended = "Node \(node) is unavailable."
         machineStateKnown = false
         daemonReachable = text.localizedCaseInsensitiveContains("detached")
@@ -2373,9 +2749,342 @@ struct Outcome: Equatable {
     let kind: Kind
     /// What to say: what it did, or the daemon's sentence for why not.
     let words: String
+    var backgroundConnectivity = false
 
     static func kind(of error: Error) -> Kind {
         if case VoxError.Unknown(_) = error { return .unknown }
+        if case VoxError.ReadInterrupted(_) = error { return .unknown }
         return .refused
+    }
+}
+
+
+// ADR-033 TH-2: independent, bounded thread reads never replace General or its read cursor.
+extension NodeModel {
+    private func clearThreadState() {
+        threadGeneration = UUID()
+        threadRefreshTask?.cancel()
+        threadRefreshTask = nil
+        threadRefreshID = UUID()
+        threadRefreshDirty = false
+        threadDisplayRevision = nil
+        threadForcedSummaries = []
+        threadSummaryVersions = [:]
+        threadAuthorRequests = [:]
+        threadPageDirty = false
+        threadPagesLoaded = 1
+        threadPageTask?.cancel()
+        threadSummaries = [:]
+        threadSummaryErrors = [:]
+        openThread = nil
+        threadRootMessage = nil
+        threadReplies = []
+        threadLoading = false
+        threadHasMore = false
+        threadError = nil
+    }
+
+    private func threadReadIsCurrent(room: String, generation: UUID, epoch: UUID, request: UUID) -> Bool {
+        roomReadGeneration == generation && nodeObservationEpoch == epoch
+            && roomOnScreen == room && ended == nil && threadRefreshID == request
+    }
+
+    private func scheduleThreadRefresh() {
+        guard let room = roomOnScreen, ended == nil else { return }
+        threadRefreshDirty = true
+        guard threadRefreshTask == nil else { return }
+        let generation = roomReadGeneration
+        let epoch = nodeObservationEpoch
+        let refreshID = UUID()
+        threadRefreshID = refreshID
+        threadRefreshTask = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                if self.threadRefreshID == refreshID {
+                    self.threadRefreshTask = nil
+                    if self.threadRefreshDirty { self.scheduleThreadRefresh() }
+                }
+            }
+            repeat {
+                self.threadRefreshDirty = false
+                @MainActor func current() -> Bool {
+                    !Task.isCancelled && self.threadReadIsCurrent(room: room, generation: generation,
+                        epoch: epoch, request: refreshID)
+                }
+                let revision: String
+                do {
+                    revision = try await self.client.roomDisplayRevision(room: room)
+                    guard current() else { return }
+                } catch {
+                    guard current() else { return }
+                    // A refused revision is not permission to retain formerly readable bodies.
+                    self.threadDisplayRevision = nil
+                    self.threadSummaries = [:]
+                    self.threadSummaryVersions = [:]
+                    self.threadAuthorRequests = [:]
+                    self.retireThreadSelection()
+                    self.threadRootMessage = nil
+                    self.threadReplies = []
+                    self.threadHasMore = false
+                    self.threadGeneration = UUID()
+                    self.threadPageTask?.cancel()
+                    self.threadPageDirty = false
+                    self.threadLoading = false
+                    self.threadError = sentence(error)
+                    for root in self.messages.filter({ $0.thread.isEmpty && !$0.owed }).map(\.id) {
+                        self.threadSummaryErrors[root] = sentence(error)
+                    }
+                    return
+                }
+                let changed = self.threadDisplayRevision != revision
+                self.threadDisplayRevision = revision
+                if changed { self.refreshOpenThread() }
+                let roots = self.messages.filter { $0.thread.isEmpty && !$0.owed }.map(\.id)
+                let known = Set(roots)
+                self.threadSummaries = self.threadSummaries.filter { known.contains($0.key) }
+                self.threadSummaryErrors = self.threadSummaryErrors.filter { known.contains($0.key) }
+                let forced = self.threadForcedSummaries
+                self.threadForcedSummaries = []
+                for root in roots where changed || forced.contains(root)
+                    || (self.threadSummaries[root] == nil && self.threadSummaryErrors[root] == nil) {
+                    guard current() else { return }
+                    do {
+                        let summary = try await self.client.threadSummary(room: room, root: root, afterAuthor: nil)
+                        guard current() else { return }
+                        guard summary.root == root else {
+                            throw VoxError.Failed(reason: "The reply summary belongs to another message.")
+                        }
+                        self.threadSummaries[root] = summary
+                        self.threadSummaryVersions[root] = UUID()
+                        self.threadSummaryErrors[root] = nil
+                    } catch {
+                        guard current() else { return }
+                        self.threadSummaries[root] = nil
+                        self.threadSummaryVersions[root] = UUID()
+                        self.threadSummaryErrors[root] = sentence(error)
+                    }
+                }
+            } while self.threadRefreshDirty
+        }
+    }
+
+    /// Only retained/readable messages of the currently displayed room can be acted on.
+    var selectedChatMessage: RoomMessage? {
+        guard roomOnScreen != nil, ended == nil, let id = selectedMessage else { return nil }
+        // The center's currently displayed roots/tag rows remain actionable. Hidden General
+        // reply bodies in the room cache are not an authority after a panel read refusal.
+        if let current = timelineItems.compactMap(\.message).first(where: { $0.id == id && !$0.owed }) { return current }
+        guard showing == .general, let root = openThread else { return nil }
+        return threadReplies.first { $0.id == id && $0.thread == root && !$0.owed }
+    }
+
+    private func retireThreadSelection() {
+        guard openThread != nil, let id = selectedMessage,
+              threadReplies.contains(where: { $0.id == id })
+                || messages.contains(where: { $0.id == id && !$0.thread.isEmpty }) else { return }
+        selectedMessage = nil
+        selectedMessages = []
+        selectionAnchor = nil
+    }
+
+    struct ThreadSelectionScope: Equatable {
+        let room: UUID
+        let thread: UUID
+        let node: UUID
+    }
+    var threadSelectionGeneration: ThreadSelectionScope {
+        ThreadSelectionScope(room: roomReadGeneration, thread: threadGeneration, node: nodeObservationEpoch)
+    }
+    func threadSelectionIsCurrent(room: String, root: String, generation: ThreadSelectionScope) -> Bool {
+        roomOnScreen == room && openThread == root && threadSelectionGeneration == generation && ended == nil
+    }
+
+    func showThread(_ message: RoomMessage) {
+        guard roomOnScreen != nil, ended == nil, !message.owed, message.thread.isEmpty,
+              messages.contains(where: { $0.id == message.id && !$0.owed }) else { return }
+        selectedMessage = message.id
+        selectedMessages = [message.id]
+        selectionAnchor = message.id
+        threadGeneration = UUID()
+        threadPageTask?.cancel()
+        threadLoading = false
+        threadPagesLoaded = 1
+        threadPageDirty = false
+        openThread = message.id
+        threadRootMessage = message
+        threadReplies = []
+        threadHasMore = false
+        threadError = nil
+        inspectorShown = true
+        showing = .general
+        refreshOpenThread()
+    }
+
+    func closeThread() {
+        let root = openThread.flatMap { id in messages.first { $0.id == id && !$0.owed } }
+        selectedMessage = root?.id
+        selectedMessages = Set(root.map { [$0.id] } ?? [])
+        selectionAnchor = root?.id
+        threadGeneration = UUID()
+        threadPageTask?.cancel()
+        threadPagesLoaded = 1
+        threadPageDirty = false
+        openThread = nil
+        threadRootMessage = nil
+        threadReplies = []
+        threadLoading = false
+        threadHasMore = false
+        threadError = nil
+    }
+
+    private func refreshOpenThread() {
+        guard openThread != nil else { return }
+        if threadLoading {
+            threadPageDirty = true
+            return
+        }
+        threadPageDirty = false
+        loadThreadPage(replacing: true)
+    }
+
+    func moreThreadReplies() { loadThreadPage(replacing: false) }
+    func retryThread() { loadThreadPage(replacing: true) }
+
+    private func loadThreadPage(replacing: Bool) {
+        guard let room = roomOnScreen, let root = openThread, ended == nil, !threadLoading else { return }
+        let generation = threadGeneration
+        let roomGeneration = roomReadGeneration
+        let epoch = nodeObservationEpoch
+        let cursor = replacing ? "" : threadReplies.last?.id ?? ""
+        threadLoading = true
+        threadError = nil
+        threadPageTask = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                if self.threadGeneration == generation, self.openThread == root {
+                    self.threadLoading = false
+                    if self.threadPageDirty {
+                        self.threadPageDirty = false
+                        self.refreshOpenThread()
+                    }
+                }
+            }
+            @MainActor func current() -> Bool {
+                !Task.isCancelled && self.roomOnScreen == room && self.openThread == root
+                    && self.threadGeneration == generation && self.roomReadGeneration == roomGeneration
+                    && self.nodeObservationEpoch == epoch && self.ended == nil
+            }
+            do {
+                if self.threadRootMessage == nil {
+                    // Recovery revalidates exactly one root through the daemon's indexed
+                    // read; it never walks General or reuses a formerly readable cached body.
+                    let readable = try await self.client.threadRoot(room: room, root: root)
+                    guard current() else { return }
+                    guard let readable, readable.id == root, !readable.owed, readable.thread.isEmpty else {
+                        throw VoxError.Failed(reason: "The thread's starting message is no longer readable or retained.")
+                    }
+                    self.threadRootMessage = readable
+                }
+                var next = cursor
+                var result: [RoomMessage] = []
+                let pages = replacing ? self.threadPagesLoaded : 1
+                var more = false
+                var awaitingBodies = false
+                for _ in 0..<pages {
+                    let page = try await self.client.readThreadPage(room: room, root: root, since: next)
+                    guard current() else { return }
+                    guard page.allSatisfy({ $0.owed || $0.thread == root }),
+                          page.isEmpty || page.last?.id != next else {
+                        throw VoxError.Failed(reason: "The thread page did not belong to this thread or advance its cursor.")
+                    }
+                    result += page
+                    more = !page.isEmpty
+                    if page.isEmpty { break }
+                    guard let mark = page.last, !mark.owed else {
+                        // The current API refuses an owed cursor. Keep that absence honest;
+                        // never drain/replay a page or pretend the thread ended.
+                        awaitingBodies = true
+                        more = false
+                        break
+                    }
+                    next = mark.id
+                }
+                if replacing { self.threadReplies = result }
+                else {
+                    let held = Set(self.threadReplies.map(\.id))
+                    self.threadReplies += result.filter { !held.contains($0.id) }
+                    if !result.isEmpty { self.threadPagesLoaded += 1 }
+                }
+                self.threadHasMore = more
+                if awaitingBodies { self.threadError = "Some reply bodies have not been received. Retry when they arrive." }
+                self.threadLoading = false
+            } catch {
+                guard current() else { return }
+                // A read refusal is not an empty thread; old bodies are not retained under a
+                // potentially changed read permission. The room/root identity stays for Retry.
+                self.threadRootMessage = nil
+                self.retireThreadSelection()
+                self.threadReplies = []
+                self.threadHasMore = false
+                self.threadError = sentence(error)
+                self.threadLoading = false
+            }
+        }
+    }
+
+    func threadMessage(_ id: String) -> RoomMessage? {
+        threadRootMessage?.id == id ? threadRootMessage : threadReplies.first { $0.id == id }
+    }
+
+    func retryThreadSummary(_ root: String) {
+        if threadSummaries[root]?.nextAuthor != nil {
+            Task { await moreThreadAuthors(root) }
+        } else {
+            threadForcedSummaries.insert(root)
+            scheduleThreadRefresh()
+        }
+    }
+
+    func moreThreadAuthors(_ root: String) async {
+        guard let room = roomOnScreen, let held = threadSummaries[root],
+              let after = held.nextAuthor, ended == nil else { return }
+        let generation = roomReadGeneration
+        let epoch = nodeObservationEpoch
+        let snapshot = threadSummaryVersions[root]
+        let request = UUID()
+        threadAuthorRequests[root] = request
+        threadSummaryErrors[root] = nil
+        @MainActor func current() -> Bool {
+            roomOnScreen == room && roomReadGeneration == generation
+                && nodeObservationEpoch == epoch && ended == nil && !Task.isCancelled
+                && threadSummaryVersions[root] == snapshot && threadAuthorRequests[root] == request
+        }
+        do {
+            let page = try await client.threadSummary(room: room, root: root, afterAuthor: after)
+            guard current(), let latest = threadSummaries[root],
+                  latest.root == held.root, latest.replyCount == held.replyCount,
+                  latest.lastReplyMillis == held.lastReplyMillis,
+                  latest.nextAuthor == held.nextAuthor,
+                  latest.authors.map({ $0.fingerprint + "\u{0}" + $0.name })
+                    == held.authors.map({ $0.fingerprint + "\u{0}" + $0.name }) else { return }
+            guard page.root == root, page.nextAuthor != after else {
+                throw VoxError.Failed(reason: "The thread's author page did not advance.")
+            }
+            // Only combine pages from the same authoritative count/time snapshot.
+            guard page.replyCount == held.replyCount, page.lastReplyMillis == held.lastReplyMillis else {
+                threadForcedSummaries.insert(root)
+                scheduleThreadRefresh()
+                return
+            }
+            let known = Set(held.authors.map(\.fingerprint))
+            threadSummaries[root] = ThreadSummary(root: root, replyCount: held.replyCount,
+                lastReplyMillis: held.lastReplyMillis,
+                authors: held.authors + page.authors.filter { !known.contains($0.fingerprint) },
+                nextAuthor: page.nextAuthor)
+            threadSummaryVersions[root] = UUID()
+        } catch {
+            guard current() else { return }
+            threadSummaryErrors[root] = sentence(error)
+        }
     }
 }

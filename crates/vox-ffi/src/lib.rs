@@ -39,17 +39,35 @@ mod client;
 mod computer;
 pub use client::{
     config_dir, room_group, room_group_words, AnchorReachSummary, AnchorSourceSummary,
-    AnchorSummary, ClientListener, DecisionEvent, FileOffer, FileShare, Member, NodeSummary,
-    NodeView, NoticeCursor, OfferedService, Passphrase, PulledFile, ReadBy, RoomAdmins,
-    RoomConsentPage, RoomConsents, RoomGroup, RoomLink, RoomMessage, RoomNotices, RoomServices,
+    AnchorSummary, ClientListener, DecisionEvent, FileOffer, FileShare, IndividualTrustEligibility,
+    Member, NodeSummary, NodeView, NoticeCursor, OfferedService, Passphrase, PulledFile, ReadBy,
+    RoomAdmins, RoomAnchorAuthority, RoomAnchorConfiguration, RoomAnchorEndpoint, RoomConsentPage,
+    RoomConsents, RoomGroup, RoomLink, RoomLinkPreview, RoomMessage, RoomNotices, RoomServices,
     RoomSummary, ServiceCursor, SharedService, ThreadAuthor, ThreadSummary, TrustedNode,
     UnreadLevel, VoxClient,
 };
-pub use computer::{ComputerApplication, ComputerIdentity, ComputerStatus, PairingPreview};
+pub use computer::{
+    ComputerApplication, ComputerBindingAction, ComputerIdentity, ComputerNode, ComputerStatus,
+    PairingPreview,
+};
 
 /// Anything that went wrong, with the core's reason.
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum VoxError {
+    /// The connection to the daemon could not be established. A later healthy daemon and
+    /// held-node read may retire this background fault without hiding an operation refusal.
+    #[error("{reason}")]
+    Unreachable {
+        /// The existing daemon connection sentence, unchanged for a person.
+        reason: String,
+    },
+    /// The daemon connection ended before its answer. The request outcome is unknown;
+    /// only a background read may retire this observation after later healthy reads.
+    #[error("{reason}")]
+    ReadInterrupted {
+        /// The existing interruption sentence, unchanged for a person.
+        reason: String,
+    },
     /// The operation failed.
     #[error("{reason}")]
     Failed {
@@ -377,6 +395,7 @@ impl VoxNode {
             "creating the room",
             NodeCommand::CreateChannel {
                 name,
+                anchors: vox_core::nat::bootstrap::BootstrapSet::new(),
                 passphrase: Secret::new(passphrase.into_bytes()),
             },
         )

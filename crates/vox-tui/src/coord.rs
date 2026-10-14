@@ -334,7 +334,8 @@ pub async fn op_group(
 
 /// The chain of messages `re` replies through, parent first, as far as the room holds it and no
 /// further than a hop budget can reach: what [`crate::wake::reply_hops`] walks. Fetched a row at a
-/// time by entry hash (V210-120), not by reading the room.
+/// time by entry hash (V210-120), not by reading the room. An owed row is unavailable content,
+/// never a plain-text General message from which a reply's thread can be inferred.
 ///
 /// # Errors
 /// If the node cannot answer.
@@ -363,7 +364,7 @@ pub async fn reply_chain(
             Frame::Rows { rows } => rows,
             other => return Err(crate::client::unexpected(&other)),
         };
-        let Some(row) = rows.into_iter().find(|r| r.entry_hash == hash) else {
+        let Some(row) = rows.into_iter().find(|r| r.entry_hash == hash && !r.owed) else {
             break;
         };
         next = Envelope::parse(&row.text)

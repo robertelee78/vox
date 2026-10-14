@@ -168,6 +168,51 @@ impl From<vox_core::node::daemonipc::AnchorInfo> for AnchorSummary {
     }
 }
 
+/// The selected node's current room-anchor editing capability, not a cached UI decision.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct RoomAnchorAuthority {
+    /// Full room identity that was queried.
+    pub room: String,
+    /// Full identity of the held actor that the daemon answered for.
+    pub node: String,
+    /// The room creator and currently delegated admins only.
+    pub can_manage: bool,
+}
+
+/// An anchor and the addresses named by this room's own signed configuration.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct RoomAnchorEndpoint {
+    /// Full anchor identity.
+    pub fingerprint: String,
+    /// Only the addresses recorded for this anchor in the selected room.
+    pub addresses: Vec<String>,
+}
+
+/// Exactly what a newly created room's link would carry on this node now.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct RoomLinkPreview {
+    /// Full fingerprint of the node whose addresses were read.
+    pub node: String,
+    /// Room anchors inside the link cap, in the link's order.
+    pub anchors: Vec<RoomAnchorEndpoint>,
+    /// This node's own direct route, separate from the room's anchors.
+    pub direct: Option<RoomAnchorEndpoint>,
+    /// Selected room anchors kept in the configuration but omitted from the link.
+    pub omitted: u32,
+}
+
+/// The held node's current observation of one room's signed anchor configuration.
+/// Identity-level reach observations are separate and do not prove these addresses were dialed.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct RoomAnchorConfiguration {
+    /// Full room identity that was queried.
+    pub room: String,
+    /// Full identity of the held actor that answered.
+    pub node: String,
+    /// The room's anchors only; machine and other-room sources are excluded.
+    pub anchors: Vec<RoomAnchorEndpoint>,
+}
+
 /// A room the acting node holds.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct RoomSummary {
@@ -599,6 +644,16 @@ pub struct Member {
     /// D-5, W-4): that the key waits, and why, or that it runs an older Vox. As `vox room roster`
     /// says it.
     pub key_waits: Option<String>,
+}
+
+/// Current daemon-derived eligibility for individual Trust controls. Refresh when policy
+/// changes; the daemon separately rechecks authorization when the person performs the action.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct IndividualTrustEligibility {
+    /// False for managed group grants, quarantine, or policy still applying locally.
+    pub can_manage_individual_trust: bool,
+    /// User-facing reason when false; empty when eligible.
+    pub reason: String,
 }
 
 /// An entry of the trust keyring.
@@ -1401,11 +1456,27 @@ impl Held {
         self.client = IpcClient::open_at(&again)
             .await
             .map_err(|e| {
-                failed(format!(
+                let contextual = |reason| {
+                    format!(
                     "the app's connection to node {} broke, and a new one could not be opened: {}",
-                    self.node,
-                    said(&self.at.path, e)
-                ))
+                    self.node, reason
+                )
+                };
+                match said(&self.at.path, e) {
+                    VoxError::Unreachable { reason } => VoxError::Unreachable {
+                        reason: contextual(reason),
+                    },
+                    VoxError::ReadInterrupted { reason } => VoxError::ReadInterrupted {
+                        reason: contextual(reason),
+                    },
+                    VoxError::Unknown { reason } => VoxError::Unknown {
+                        reason: contextual(reason),
+                    },
+                    VoxError::Failed { reason } => VoxError::Failed {
+                        reason: contextual(reason),
+                    },
+                    other => other,
+                }
             })?
             .with_answer_bound(REQUEST_WITHIN);
         Ok(())
@@ -1436,7 +1507,39 @@ pub struct VoxClient {
 /// A failure to reach the daemon, said for a person.
 /// The sentence vox-core writes for it, which the CLI shows too (ADR-028 E-7).
 fn said(socket: &std::path::Path, e: Error) -> VoxError {
-    failed(vox_core::node::daemonipc::unreached(socket, None, e))
+    use vox_core::error::IpcHandshake;
+    let unreachable = matches!(&e, Error::Ipc(IpcHandshake::Unreachable { .. }));
+    let interrupted = matches!(&e, Error::Ipc(IpcHandshake::HungUp { .. }));
+    let uncertain = matches!(&e, Error::Ipc(IpcHandshake::RequestTimedOut { .. }));
+    let reason = vox_core::node::daemonipc::unreached(socket, None, e);
+    if unreachable {
+        VoxError::Unreachable { reason }
+    } else if interrupted || uncertain {
+        VoxError::Unknown { reason }
+    } else {
+        VoxError::Failed { reason }
+    }
+}
+
+/// A transport failure of an authoritative read, replaceable by a later healthy read.
+/// Mutation exchanges and malformed or refused replies never use this boundary.
+fn read_interrupted(e: Error, words: impl FnOnce(Error) -> String) -> VoxError {
+    use vox_core::error::IpcHandshake;
+    let interrupted = matches!(
+        &e,
+        Error::Ipc(
+            IpcHandshake::Unreachable { .. }
+                | IpcHandshake::HungUp { .. }
+                | IpcHandshake::Cut
+                | IpcHandshake::RequestTimedOut { .. }
+        )
+    );
+    let reason = words(e);
+    if interrupted {
+        VoxError::ReadInterrupted { reason }
+    } else {
+        VoxError::Failed { reason }
+    }
 }
 
 /// An attach's failure, typed where a client acts on it (P4): a wrong passphrase is asked for
@@ -1704,6 +1807,63 @@ async fn keyring(client: &mut IpcClient) -> Result<Vec<(Digest32, String, bool)>
     }
 }
 
+fn anchor_endpoints(anchors: &vox_core::nat::bootstrap::BootstrapSet) -> Vec<RoomAnchorEndpoint> {
+    anchors
+        .nodes()
+        .iter()
+        .map(|a| RoomAnchorEndpoint {
+            fingerprint: b32_encode(&a.id),
+            addresses: a
+                .endpoints
+                .addrs()
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+        })
+        .collect()
+}
+
+fn pinned_anchor_set(
+    anchors: Vec<RoomAnchorEndpoint>,
+) -> Result<vox_core::nat::bootstrap::BootstrapSet, VoxError> {
+    use vox_core::nat::bootstrap::{BootstrapSet, MAX_BOOTSTRAP_NODES};
+    use vox_core::nat::multiaddr::{Multiaddr, MAX_ENDPOINTS};
+    if anchors.len() > MAX_BOOTSTRAP_NODES {
+        return Err(failed("at most 64 room anchors can be kept"));
+    }
+    let mut set = BootstrapSet::new();
+    for anchor in anchors {
+        if anchor.addresses.len() > MAX_ENDPOINTS {
+            return Err(failed("an anchor has more than 8 endpoints"));
+        }
+        let id = digest(&anchor.fingerprint, "anchor fingerprint")?;
+        let mut endpoints = Vec::new();
+        for text in anchor.addresses {
+            let address = Multiaddr::parse(&text)
+                .map_err(|e| failed(format!("invalid resolved anchor address: {e}")))?;
+            if address
+                .socket_addr()
+                .is_none_or(|s| s.port() == 0 || s.ip().is_unspecified() || s.ip().is_multicast())
+            {
+                return Err(failed("an anchor must name a concrete served address"));
+            }
+            if !endpoints.contains(&address) {
+                endpoints.push(address);
+            }
+        }
+        if endpoints.is_empty() {
+            return Err(failed("an anchor has no endpoint"));
+        }
+        // Repeated chips for one identity combine their explicitly kept addresses.
+        for endpoint in endpoints {
+            let spec = format!("{}@{endpoint}", b32_encode(&id));
+            vox_core::node::link::merge_anchor_spec(&mut set, &spec)
+                .map_err(|e| failed(e.to_string()))?;
+        }
+    }
+    Ok(set)
+}
+
 async fn room_ids(
     client: &mut IpcClient,
 ) -> Result<Vec<(Digest32, String, bool, String)>, VoxError> {
@@ -1751,7 +1911,7 @@ async fn reply_chain(
             Frame::Rows { rows } => rows,
             other => return Err(unexpected(&other)),
         };
-        let Some(row) = rows.into_iter().find(|r| r.entry_hash == hash) else {
+        let Some(row) = rows.into_iter().find(|r| r.entry_hash == hash && !r.owed) else {
             break;
         };
         next = vox_agentcomms::envelope::Envelope::parse(&row.text)
@@ -1958,6 +2118,8 @@ impl VoxClient {
     }
 
     async fn daemon(&self, req: DaemonRequest) -> Result<DaemonFrame, VoxError> {
+        // Only Nodes is classified here as an authoritative read; other requests may mutate.
+        let read_only = matches!(&req, DaemonRequest::Nodes);
         let socket = self.socket.clone();
         self.on_rt(async move {
             let mut d = DaemonClient::open(&socket)
@@ -1966,6 +2128,9 @@ impl VoxClient {
             match d.request(req).await {
                 Ok(DaemonFrame::Refused(r)) => Err(failed(r.to_string())),
                 Ok(f) => Ok(f),
+                Err(e) if read_only => Err(read_interrupted(e, |e| {
+                    vox_core::node::daemonipc::unreached(&socket, None, e)
+                })),
                 Err(e) => Err(said(&socket, e)),
             }
         })
@@ -2036,10 +2201,9 @@ impl VoxClient {
         let body = vox_core::node::snapshot::request_body();
         let (reply, names) = on_held!(self, |c| {
             let names = names(c).await?;
-            let reply = c
-                .exchange(&body)
-                .await
-                .map_err(|e| failed(format!("the vox daemon stopped answering: {e}")))?;
+            let reply = c.exchange(&body).await.map_err(|e| {
+                read_interrupted(e, |e| format!("the vox daemon stopped answering: {e}"))
+            })?;
             Ok((reply, names))
         })?;
         let Ok(Some(snap)) = vox_core::node::snapshot::NodeSnapshot::from_bytes(&reply) else {
@@ -2133,6 +2297,42 @@ impl VoxClient {
     pub async fn computer_status(&self) -> Result<crate::ComputerStatus, VoxError> {
         self.computer_request(DaemonRequest::ComputerStatus).await
     }
+    /// Explicit operator release, destination transfer approval, or recovery after removal/fault.
+    pub async fn change_computer_binding(
+        &self,
+        action: String,
+        node: String,
+        destination: String,
+        frontier: String,
+    ) -> Result<crate::ComputerStatus, VoxError> {
+        vox_core::node::computer::operator_only().map_err(|e| failed(e.to_string()))?;
+        self.computer_request(DaemonRequest::ComputerBinding {
+            action,
+            node,
+            destination,
+            frontier,
+        })
+        .await
+    }
+    /// Save the personal selection using a Ready node's authenticated local identity.
+    pub async fn select_personal_node(
+        &self,
+        node: String,
+    ) -> Result<crate::ComputerStatus, VoxError> {
+        vox_core::node::computer::operator_only().map_err(|e| failed(e.to_string()))?;
+        self.computer_request(DaemonRequest::ComputerPersonal { node })
+            .await
+    }
+    /// Remove the exact displayed computer and policy frontier after operator confirmation.
+    pub async fn remove_computer(
+        &self,
+        computer: String,
+        frontier: String,
+    ) -> Result<crate::ComputerStatus, VoxError> {
+        vox_core::node::computer::operator_only().map_err(|e| failed(e.to_string()))?;
+        self.computer_request(DaemonRequest::ComputerRemove { computer, frontier })
+            .await
+    }
     /// Produce one expiring invitation for an operator.
     pub async fn begin_computer_pairing(&self) -> Result<crate::ComputerStatus, VoxError> {
         vox_core::node::computer::operator_only().map_err(|e| failed(e.to_string()))?;
@@ -2175,6 +2375,52 @@ impl VoxClient {
     /// The machine's manual and saved-room anchor sources and actual dial observations.
     pub async fn anchors(&self) -> Result<Vec<AnchorSummary>, VoxError> {
         self.anchor_request(DaemonRequest::Anchors).await
+    }
+
+    /// Resolve an optional room anchor field without saving it anywhere.
+    /// A bare host:port proves the responding anchor's fingerprint. An explicit
+    /// fingerprint@address is checked as input and authenticated when the room dials it.
+    /// Callers must still discard a stale result after the field, room or node changes.
+    pub async fn resolve_anchor(&self, input: String) -> Result<String, VoxError> {
+        match self.daemon(DaemonRequest::AnchorResolve { input }).await? {
+            DaemonFrame::AnchorResolved(spec) => Ok(spec),
+            DaemonFrame::AnchorFailed(why) => Err(failed(why)),
+            _ => Err(failed("the daemon did not return the resolved anchor")),
+        }
+    }
+
+    /// Search only when explicitly chosen. This uses a separate daemon connection, names no
+    /// room, persists nothing, and holds no selected-node lock. Callers discard results after
+    /// their sheet/search generation changes; cancellation can never change a room.
+    pub async fn search_anchors(&self) -> Result<Vec<RoomAnchorEndpoint>, VoxError> {
+        match self.daemon(DaemonRequest::AnchorSearch).await? {
+            DaemonFrame::AnchorsFound(anchors) => Ok(anchor_endpoints(&anchors)),
+            DaemonFrame::AnchorFailed(why) => Err(failed(why)),
+            _ => Err(failed("the daemon did not answer the anchor search")),
+        }
+    }
+
+    /// Resolve a manually entered chip before creation, producing numeric pinned endpoints.
+    /// Hostname lookup happens here, never in create_room_with_anchors.
+    pub async fn resolve_anchor_endpoint(
+        &self,
+        input: String,
+    ) -> Result<RoomAnchorEndpoint, VoxError> {
+        let spec = self.resolve_anchor(input).await?;
+        self.on_rt(async move {
+            tokio::task::spawn_blocking(move || {
+                let mut set = vox_core::nat::bootstrap::BootstrapSet::new();
+                vox_core::node::link::merge_anchor_spec(&mut set, &spec)
+                    .map_err(|e| failed(e.to_string()))?;
+                anchor_endpoints(&set)
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| failed("the anchor has no endpoint"))
+            })
+            .await
+            .map_err(|e| failed(e.to_string()))?
+        })
+        .await
     }
 
     /// Add fingerprint@address or host:port; host lookup proves the returned fingerprint.
@@ -2848,8 +3094,13 @@ impl VoxClient {
                     chain.get(&hash).cloned()
                 };
                 env.hops = vox_agentcomms::envelope::reply_hops_by(&re, parent);
-                env.thread =
-                    Some(vox_agentcomms::envelope::reply_thread_by(&re, parent).unwrap_or(re));
+                env.thread = Some(
+                    vox_agentcomms::envelope::reply_thread_by(&re, parent).ok_or_else(|| {
+                        failed(format!(
+                            "cannot reply to {re}: this node cannot read that message; nothing was posted"
+                        ))
+                    })?,
+                );
                 if let Some(root) = env.thread.as_deref().and_then(|h| digest(h, "thread").ok()) {
                     match ask(
                         c,
@@ -2903,9 +3154,103 @@ impl VoxClient {
         let req = Request::Create {
             name,
             passphrase: passphrase.copy(),
+            anchors: vox_core::nat::bootstrap::BootstrapSet::new(),
         };
         on_held!(self, |c| done(c, &req).await)?;
         self.new_room(before, "the room was created").await
+    }
+
+    /// Preview exactly the link routes for the resolved anchors the person kept, without
+    /// creating a room, searching or dialing. Fence the full selected-node fingerprint.
+    pub async fn preview_room_link(
+        &self,
+        anchors: Vec<RoomAnchorEndpoint>,
+        node: String,
+    ) -> Result<RoomLinkPreview, VoxError> {
+        let expected = digest(&node, "creating node")?;
+        let anchors = pinned_anchor_set(anchors)?;
+        on_held!(self, |c| {
+            if c.me() != Some(expected) {
+                return Err(failed(
+                    "the selected node changed; review the room before creating it",
+                ));
+            }
+            match ask(c, &Request::LinkPreview { anchors }).await? {
+                Frame::LinkPreview {
+                    node,
+                    routes,
+                    omitted,
+                } if node == expected => {
+                    let mut anchors = Vec::new();
+                    let mut direct = None;
+                    for route in routes {
+                        let endpoint = RoomAnchorEndpoint {
+                            fingerprint: b32_encode(&route.id),
+                            addresses: route
+                                .endpoints
+                                .addrs()
+                                .iter()
+                                .map(ToString::to_string)
+                                .collect(),
+                        };
+                        if route.id == node {
+                            direct = Some(endpoint);
+                        } else {
+                            anchors.push(endpoint);
+                        }
+                    }
+                    Ok(RoomLinkPreview {
+                        node: b32_encode(&node),
+                        anchors,
+                        direct,
+                        omitted: omitted as u32,
+                    })
+                }
+                Frame::LinkPreview { .. } => Err(failed(
+                    "the selected node changed; review the room before creating it",
+                )),
+                other => Err(unexpected(&other)),
+            }
+        })
+    }
+
+    /// Create using only the already resolved anchors the person kept. Check the full expected
+    /// node fingerprint before mutation and keep its connection locked through the result read.
+    /// Pending searches do not hold this lock. An empty set creates a room without an anchor.
+    pub async fn create_room_with_anchors(
+        &self,
+        name: String,
+        passphrase: Arc<Passphrase>,
+        anchors: Vec<RoomAnchorEndpoint>,
+        node: String,
+    ) -> Result<String, VoxError> {
+        let expected = digest(&node, "creating node")?;
+        let anchors = pinned_anchor_set(anchors)?;
+        on_held!(self, |c| {
+            if c.me() != Some(expected) {
+                return Err(failed(
+                    "the selected node changed; review the room before creating it",
+                ));
+            }
+            let before = room_ids(c).await?;
+            done(
+                c,
+                &Request::Create {
+                    name: name.clone(),
+                    passphrase: passphrase.copy(),
+                    anchors,
+                },
+            )
+            .await?;
+            room_ids(c)
+                .await?
+                .into_iter()
+                .find(|(id, held, _, _)| held == &name && !before.iter().any(|(old, ..)| old == id))
+                .map(|(id, ..)| b32_encode(&id))
+                .ok_or_else(|| {
+                    failed("the room was created, but it is not listed on the creating node")
+                })
+        })
     }
 
     /// Join a room from its `vox://` link with its passphrase; returns its id. The room keeps the
@@ -3083,6 +3428,137 @@ impl VoxClient {
         })
     }
 
+    /// Read creator/admin authority for the currently held node and exact room.
+    /// A caller must fence room/node changes before publishing this snapshot. Mutations below
+    /// independently enforce current authority in the daemon; this snapshot grants nothing.
+    ///
+    /// # Errors
+    /// A malformed room, no selected actor, a closed room, or the daemon's refusal.
+    pub async fn room_anchor_authority(
+        &self,
+        room: String,
+    ) -> Result<RoomAnchorAuthority, VoxError> {
+        use vox_core::node::api::{GovernancePage, GovernanceQuery};
+        let channel_id = digest(&room, "room id")?;
+        on_held!(self, |c| {
+            let me = c.me().ok_or_else(not_attached)?;
+            match ask(
+                c,
+                &Request::GovernancePage {
+                    channel_id,
+                    query: GovernanceQuery::Admin { target: me },
+                },
+            )
+            .await?
+            {
+                Frame::GovernancePage {
+                    page: GovernancePage::Admin { target, admin, .. },
+                } if target == me => Ok(RoomAnchorAuthority {
+                    room: b32_encode(&channel_id),
+                    node: b32_encode(&me),
+                    can_manage: admin,
+                }),
+                other => Err(unexpected(&other)),
+            }
+        })
+    }
+
+    /// Read only this room's signed anchor configuration, preserving each address's scope.
+    /// A caller must fence room/node changes before publishing this snapshot, just as it does
+    /// for room_anchor_authority. The daemon refuses stale or unavailable observations.
+    ///
+    /// # Errors
+    /// A malformed room, no held actor, a closed room, or unavailable room provenance.
+    pub async fn room_anchor_configuration(
+        &self,
+        room: String,
+    ) -> Result<RoomAnchorConfiguration, VoxError> {
+        let channel_id = digest(&room, "room id")?;
+        on_held!(self, |c| {
+            let me = c.me().ok_or_else(not_attached)?;
+            match ask(c, &Request::RoomAnchors { channel_id }).await? {
+                Frame::RoomAnchors { anchors } => Ok(RoomAnchorConfiguration {
+                    room: b32_encode(&channel_id),
+                    node: b32_encode(&me),
+                    anchors: anchors
+                        .nodes()
+                        .iter()
+                        .map(|anchor| RoomAnchorEndpoint {
+                            fingerprint: b32_encode(&anchor.id),
+                            addresses: anchor
+                                .endpoints
+                                .addrs()
+                                .iter()
+                                .map(ToString::to_string)
+                                .collect(),
+                        })
+                        .collect(),
+                }),
+                other => Err(unexpected(&other)),
+            }
+        })
+    }
+
+    /// Add a full pinned fingerprint@address to this room's signed governance statement.
+    /// This consumes an already authenticated/resolved spec, or a fingerprint the
+    /// person explicitly pinned. It does not perform bare host:port identity discovery/search,
+    /// and never changes the machine's manual-anchor list. DNS parsing is off the async workers;
+    /// the room's ordinary anchor transport still authenticates the pinned identity on dial.
+    ///
+    /// # Errors
+    /// Malformed pinned input, a closed room, or the daemon's fresh NotAdmin refusal.
+    pub async fn add_room_anchor_pinned(&self, room: String, spec: String) -> Result<(), VoxError> {
+        let channel_id = digest(&room, "room id")?;
+        on_held!(self, |c| {
+            // Hold the selected actor across DNS parsing and mutation: switching this client
+            // during the await must never submit the old intent as the newly selected node.
+            let add = tokio::task::spawn_blocking(move || {
+                let mut add = vox_core::nat::bootstrap::BootstrapSet::new();
+                vox_core::node::link::merge_anchor_spec(&mut add, &spec)
+                    .map_err(|error| failed(error.to_string()))?;
+                Ok::<_, VoxError>(add)
+            })
+            .await
+            .map_err(|error| {
+                failed(format!(
+                    "the pinned room anchor could not be parsed: {error}"
+                ))
+            })??;
+            done(
+                c,
+                &Request::ChangeRoomAnchors {
+                    channel_id,
+                    add,
+                    remove: None,
+                },
+            )
+            .await
+        })
+    }
+
+    /// Remove the exact full anchor fingerprint from this room's signed governance statement.
+    /// The machine's independent manual source and other rooms are unchanged.
+    ///
+    /// # Errors
+    /// A malformed room/fingerprint, a closed room, or the daemon's fresh NotAdmin refusal.
+    pub async fn remove_room_anchor(
+        &self,
+        room: String,
+        fingerprint: String,
+    ) -> Result<(), VoxError> {
+        let channel_id = digest(&room, "room id")?;
+        let remove = Some(digest(&fingerprint, "anchor fingerprint")?);
+        on_held!(self, |c| done(
+            c,
+            &Request::ChangeRoomAnchors {
+                channel_id,
+                add: vox_core::nat::bootstrap::BootstrapSet::new(),
+                remove,
+            }
+        )
+        .await)
+    }
+
     /// Make `member` an admin of `room`, or (`admin` false) take it back; its creator only.
     ///
     /// # Errors
@@ -3169,8 +3645,33 @@ impl VoxClient {
         Ok(list)
     }
 
-    /// The nodes offered to the keyring (ADR-028 K-15 – K-18), in fingerprint order: as the node
-    /// keeps them, so the TUI and the app always agree, dismissals included.
+    /// Whether current daemon policy permits individual Trust controls for this fingerprint.
+    /// This is a current observation; mutations check policy again when performed.
+    ///
+    /// # Errors
+    /// Invalid fingerprint, unavailable node, or daemon refusal.
+    pub async fn individual_trust_eligibility(
+        &self,
+        fingerprint: String,
+    ) -> Result<IndividualTrustEligibility, VoxError> {
+        let member = digest(&fingerprint, "node fingerprint")?;
+        on_held!(self, |c| {
+            match ask(c, &Request::IndividualTrustEligibility { member }).await? {
+                Frame::IndividualTrustEligibility { can_manage, reason } => {
+                    Ok(IndividualTrustEligibility {
+                        can_manage_individual_trust: can_manage,
+                        reason,
+                    })
+                }
+                _ => Err(failed(
+                    "the node did not report individual trust eligibility",
+                )),
+            }
+        })
+    }
+
+    /// The current keyring offers in fingerprint order, including local dismissals.
+    /// Presence alone is not individual-trust eligibility.
     ///
     /// # Errors
     /// The node's refusal.
@@ -3700,8 +4201,13 @@ impl VoxClient {
                     chain.get(&hash).cloned()
                 };
                 env.hops = vox_agentcomms::envelope::reply_hops_by(&re, parent);
-                env.thread =
-                    Some(vox_agentcomms::envelope::reply_thread_by(&re, parent).unwrap_or(re));
+                env.thread = Some(
+                    vox_agentcomms::envelope::reply_thread_by(&re, parent).ok_or_else(|| {
+                        failed(format!(
+                            "cannot reply to {re}: this node cannot read that message; nothing was shared"
+                        ))
+                    })?,
+                );
                 if let Some(root) = env.thread.as_deref().and_then(|h| digest(h, "thread").ok()) {
                     match ask(
                         c,
@@ -4321,10 +4827,9 @@ impl VoxClient {
     /// No node attached, or the daemon's refusal.
     pub async fn view(&self) -> Result<NodeView, VoxError> {
         let body = vox_core::node::snapshot::request_body();
-        let reply = on_held!(self, |c| c
-            .exchange(&body)
-            .await
-            .map_err(|e| failed(format!("the vox daemon stopped answering: {e}"))))?;
+        let reply = on_held!(self, |c| c.exchange(&body).await.map_err(|e| {
+            read_interrupted(e, |e| format!("the vox daemon stopped answering: {e}"))
+        }))?;
         match vox_core::node::snapshot::NodeSnapshot::from_bytes(&reply) {
             Ok(Some(s)) => Ok(NodeView {
                 me: s.me.map(|m| b32_encode(&m)).unwrap_or_default(),
