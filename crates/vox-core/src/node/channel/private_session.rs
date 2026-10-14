@@ -113,7 +113,7 @@ impl ChannelState {
             .transpose()
     }
 
-    fn read_private(
+    pub(super) fn read_private(
         &self,
         id: u64,
         segment: &crate::atrest::store::SealedSegment,

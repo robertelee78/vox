@@ -616,6 +616,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::SessionPage { .. } => "reading a page of a room's Session entries",
         NetEvent::RoomHistory { .. } => "reading a page of a room's history",
         NetEvent::SessionProjection { .. } => "reading bounded Session metadata",
+        NetEvent::SessionFiles { .. } => "reading bounded Session file offers",
         NetEvent::MemberDialer(_) => "lending the proxy its dialer",
         NetEvent::ComputerPolicy(_) => "applying computer trust",
         NetEvent::LocalTrustBlacklist(_) => "reading local trust removal decisions",
@@ -1020,6 +1021,13 @@ enum NetEvent {
         query: crate::node::channel::session_projection::Query,
         reply: oneshot::Sender<
             std::result::Result<crate::node::channel::session_projection::Reply, String>,
+        >,
+    },
+    SessionFiles {
+        channel_id: Digest32,
+        query: crate::node::channel::session_projection::FileQuery,
+        reply: oneshot::Sender<
+            std::result::Result<crate::node::channel::session_projection::FileReply, String>,
         >,
     },
     RoomHistory {
@@ -8988,6 +8996,22 @@ impl Node {
                             Err(error) => Err(error.to_string()),
                         }
                     }
+                    _ => Err("room not open".into()),
+                };
+                let _ = reply.send(result);
+            }
+            NetEvent::SessionFiles {
+                channel_id,
+                query,
+                reply,
+            } => {
+                let result = match (self.channels.get(&channel_id), self.profile.as_ref()) {
+                    (Some(shared), Some(profile)) => shared.lock().await.session_file_query(
+                        profile.store(),
+                        query,
+                        crate::node::ipc::rows_budget(),
+                        self.now_ms().get(),
+                    ),
                     _ => Err("room not open".into()),
                 };
                 let _ = reply.send(result);
@@ -19036,6 +19060,62 @@ pub struct HistoryReader {
     tx: mpsc::WeakSender<NetEvent>,
 }
 impl HistoryReader {
+    async fn session_files_query(
+        &self,
+        room: Digest32,
+        query: crate::node::channel::session_projection::FileQuery,
+    ) -> std::result::Result<crate::node::channel::session_projection::FileReply, String> {
+        let tx = self
+            .tx
+            .upgrade()
+            .ok_or_else(|| "the node has stopped".to_owned())?;
+        let (reply, rx) = oneshot::channel();
+        tx.send(NetEvent::SessionFiles {
+            channel_id: room,
+            query,
+            reply,
+        })
+        .await
+        .map_err(|_| "the node has stopped".to_owned())?;
+        rx.await
+            .map_err(|_| "the node stopped before answering".to_owned())?
+    }
+
+    /// One currently readable, unexpired private Session file offer.
+    /// A local storage failure is an error, never an absent offer.
+    pub async fn session_file(
+        &self,
+        room: Digest32,
+        entry: Digest32,
+    ) -> std::result::Result<Option<crate::node::drive::SessionRow>, String> {
+        use crate::node::channel::session_projection::{FileQuery, FileReply};
+        match self
+            .session_files_query(room, FileQuery::Exact(entry))
+            .await?
+        {
+            FileReply::Exact(row) => Ok(row),
+            _ => Err("unexpected Session file answer".into()),
+        }
+    }
+
+    /// One bounded private-file scan. Follow an explicit continuation even when
+    /// the page is empty; a deleted/rejoined room restarts the saved-instance cursor.
+    pub async fn session_files_page(
+        &self,
+        room: Digest32,
+        after: Option<crate::node::api::HistoryCursor>,
+        limit: usize,
+    ) -> std::result::Result<crate::node::api::SessionFilePage, String> {
+        use crate::node::channel::session_projection::{FileQuery, FileReply};
+        match self
+            .session_files_query(room, FileQuery::Page { after, limit })
+            .await?
+        {
+            FileReply::Page(page) => Ok(page),
+            _ => Err("unexpected Session files answer".into()),
+        }
+    }
+
     async fn query(
         &self,
         room: Digest32,

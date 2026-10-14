@@ -13,6 +13,7 @@
 //!   resumes bounded work without accepting an unauthenticated or partially parsed field.
 
 mod build;
+mod files;
 mod metadata;
 mod query;
 mod record;
@@ -22,4 +23,5 @@ mod text;
 
 pub(super) mod private_index;
 
+pub(crate) use files::{FileQuery, FileReply};
 pub(crate) use query::{FieldKind, Query, Reply, Revision, Row, TextPage};

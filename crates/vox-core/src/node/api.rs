@@ -359,6 +359,18 @@ pub struct MessagePage {
     pub next: Option<HistoryCursor>,
 }
 
+/// One bounded scan of readable files offered by private Session activity.
+/// An empty page can still have a continuation after filtered records.
+#[derive(Debug, Clone)]
+pub struct SessionFilePage {
+    /// Complete ordinary wire rows in this page, never assembled metadata bundles.
+    pub rows: Vec<crate::node::drive::SessionRow>,
+    /// The saved room instance used by this scan.
+    pub instance: [u8; 16],
+    /// Continue strictly after this private arrival; absent only at scan end.
+    pub next: Option<HistoryCursor>,
+}
+
 /// Freshness of a bounded notice count. Ordinary append-only arrivals do not change it.
 #[derive(Debug, Clone)]
 pub struct NoticeRevision {
