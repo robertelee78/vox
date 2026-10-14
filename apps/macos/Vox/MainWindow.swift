@@ -1313,7 +1313,13 @@ private struct RoomView: View {
             .frame(minWidth: Theme.scaled(400), maxWidth: .infinity)
             if model.inspectorShown {
                 ColumnDivider(width: $inspectorWidth, side: .inspector)
-                Inspector(model: model, room: room)
+                Group {
+                    if model.openThread != nil {
+                        ThreadPanel(model: model, room: room, look: { looking = $0 })
+                    } else {
+                        Inspector(model: model, room: room)
+                    }
+                }
                     .raisedSurface()
                     .frame(width: inspectorWidth)
             }
@@ -1739,6 +1745,9 @@ private struct MessageRow: View {
                     Text("arrived late").eyebrow().secondaryText()
                         .accessibilityIdentifier("late-\(message.id)")
                 }
+            }
+            if message.thread.isEmpty {
+                ThreadSummaryLine(model: model, message: message)
             }
             if let quote {
                 // The message it replies to, one level, as a link to it (ADR-028 R-9).
@@ -2498,5 +2507,109 @@ extension Outcome {
         case .refused: return "refused"
         case .unknown: return "unknown"
         }
+    }
+}
+
+
+/// General keeps its root message; the daemon supplies the complete retained/readable summary.
+private struct ThreadSummaryLine: View {
+    @ObservedObject var model: NodeModel
+    let message: RoomMessage
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Space.s4) {
+            if let summary = model.threadSummaries[message.id], summary.replyCount > 0 {
+                Button { model.showThread(message) } label: {
+                    Text("\(summary.replyCount) \(summary.replyCount == 1 ? "reply" : "replies") · \(authors(summary)) · \(TimelineTime.short(summary.lastReplyMillis))")
+                        .caption().fixedSize(horizontal: false, vertical: true)
+                }
+                .buttonStyle(.plain)
+                .help("Last reply: " + TimelineTime.full(summary.lastReplyMillis))
+                .accessibilityIdentifier("thread-summary-" + message.id)
+                if summary.nextAuthor != nil {
+                    Button("More repliers") { Task { await model.moreThreadAuthors(message.id) } }
+                        .buttonStyle(.plain)
+                        .accessibilityIdentifier("thread-authors-more-" + message.id)
+                }
+            } else if let error = model.threadSummaryErrors[message.id] {
+                Text("Replies unavailable: " + error).secondaryText()
+                    .accessibilityIdentifier("thread-summary-error-" + message.id)
+                Button("Open thread") { model.showThread(message) }
+                    .buttonStyle(.plain)
+            } else if model.threadSummaries[message.id] == nil && !message.owed {
+                Text("Replies loading…").secondaryText()
+                    .accessibilityIdentifier("thread-summary-loading-" + message.id)
+            }
+        }
+    }
+
+    private func authors(_ summary: ThreadSummary) -> String {
+        let names = summary.authors.map { $0.name.isEmpty ? String($0.fingerprint.prefix(12)) : $0.name }
+        return names.joined(separator: ", ") + (summary.nextAuthor == nil ? "" : ", …")
+    }
+}
+
+/// The existing inspector slot shows one thread beside General, never another room's transcript.
+private struct ThreadPanel: View {
+    @ObservedObject var model: NodeModel
+    let room: String
+    let look: (URL) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Space.s8) {
+            HStack {
+                Text("THREAD").eyebrow()
+                Spacer()
+                Button("Close") { model.closeThread() }
+                    .accessibilityIdentifier("thread-close")
+            }
+            if let root = model.threadRootMessage {
+                Text(root.text).lineLimit(3).textSelection(.enabled)
+                    .accessibilityIdentifier("thread-root-" + root.id)
+                Button("Reply in Thread") { model.replyTo = root }
+                    .accessibilityIdentifier("thread-reply-root")
+            } else {
+                Text("The starting message is not on this room's retained page.").secondaryText()
+            }
+            ScrollViewReader { reader in
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: Space.s8) {
+                        ForEach(model.threadReplies, id: \.id) { message in
+                            MessageRow(model: model, message: message, me: model.me,
+                                quote: model.quote(of: message),
+                                jump: { id in
+                                    if model.threadReplies.contains(where: { $0.id == id }) {
+                                        reader.scrollTo(id, anchor: .center)
+                                    } else { model.jumpTo = id }
+                                }, readBy: model.readBy[message.id] ?? [],
+                                whereabouts: model.whereabouts[message.id],
+                                pulledBy: model.pulledBy[message.id] ?? [],
+                                pulled: model.pulled[message.id], look: look)
+                                .id(message.id)
+                                .accessibilityIdentifier("thread-message-" + message.id)
+                            Button("Reply in Thread") { model.replyTo = message }
+                                .accessibilityIdentifier("thread-reply-" + message.id)
+                        }
+                        if model.threadLoading {
+                            Text("Loading replies…").secondaryText()
+                        } else if let error = model.threadError {
+                            Text("Replies unavailable: " + error).secondaryText()
+                                .accessibilityIdentifier("thread-error")
+                            Button("Retry") { model.retryThread() }
+                        } else if model.threadReplies.isEmpty {
+                            Text("No retained replies you can read.").secondaryText()
+                                .accessibilityIdentifier("thread-empty")
+                        }
+                        if model.threadHasMore && !model.threadLoading {
+                            Button("More replies") { model.moreThreadReplies() }
+                                .accessibilityIdentifier("thread-more")
+                        }
+                    }
+                }
+            }
+        }
+        .padding(Space.s12)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("thread-panel")
     }
 }

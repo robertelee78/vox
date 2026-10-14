@@ -124,6 +124,7 @@ final class NodeModel: ObservableObject {
         didSet {
             roomReadGeneration = UUID()
             rejectedRoomMark = nil
+            clearThreadState()
             if case .room = selection { roomNeedsPage = true } else { roomNeedsPage = false }
         }
     }
@@ -141,11 +142,30 @@ final class NodeModel: ObservableObject {
         didSet {
             roomMessageRevision = UUID()
             byID = Dictionary(messages.map { ($0.id, $0) }) { $1 }
+            if let root = openThread { threadRootMessage = byID[root] }
+
             var said: [String: NodePlatform] = [:]
             for message in messages { if let p = message.platform { said[message.author] = p } }
             if said != platforms { platforms = said }
+            scheduleThreadRefresh()
         }
     }
+    /// Thread data is an authoritative retained/readable snapshot, separate from General pages.
+    @Published private(set) var threadSummaries: [String: ThreadSummary] = [:]
+    @Published private(set) var threadSummaryErrors: [String: String] = [:]
+    @Published private(set) var openThread: String?
+    @Published private(set) var threadRootMessage: RoomMessage?
+    @Published private(set) var threadReplies: [RoomMessage] = []
+    @Published private(set) var threadLoading = false
+    @Published private(set) var threadHasMore = false
+    @Published private(set) var threadError: String?
+    private var threadGeneration = UUID()
+    private var threadRefreshID = UUID()
+    private var threadRefreshDirty = false
+    private var threadPagesLoaded = 1
+    private var threadRefreshTask: Task<Void, Never>?
+    private var threadPageTask: Task<Void, Never>?
+
     @Published private(set) var roomOlder: UInt64 = 0
     private var roomBefore: String?
     @Published private var roomReadingOlder = false
@@ -181,6 +201,7 @@ final class NodeModel: ObservableObject {
     @Published var showing: Showing = .general {
         didSet {
             guard showing != oldValue else { return }
+            if showing != .general { closeThread() }
             // Another Session's entries are never drawn, nor acted on, under this one's header
             // while it loads (D3): cleared, and said to be loading.
             sessionPages.clear()
@@ -421,7 +442,9 @@ final class NodeModel: ObservableObject {
     }
 
     /// The node ended: detached, or the daemon stopped.
-    @Published private(set) var ended: String?
+    @Published private(set) var ended: String? {
+        didSet { if ended != nil { clearThreadState() } }
+    }
 
     /// Whether macOS lets Vox notify; nil until it says.
     @Published private(set) var notifying: Bool?
@@ -639,6 +662,7 @@ final class NodeModel: ObservableObject {
                 daemonReachable = true
                 ended = fresh.first(where: { $0.name == node })?.status == "Locked"
                     ? "Node \(node) is Locked." : "Node \(node) is unavailable."
+                clearThreadState()
                 peers = 0
                 return
             }
@@ -1925,6 +1949,7 @@ final class NodeModel: ObservableObject {
                         }
                     }
                 }
+                self.scheduleThreadRefresh()
                 // Each join said, and said again as the room's consent grants name more of the
                 // keyring's nodes trusting the newcomer.
                 for (i, line) in self.joins.enumerated() {
@@ -1997,6 +2022,7 @@ final class NodeModel: ObservableObject {
         roomNeedsPage = false
         // An ended stream does not establish whether a protected node is Locked or a
         // passphraseless node is already Ready again. Display only the fresh snapshot.
+        clearThreadState()
         ended = "Node \(node) is unavailable."
         machineStateKnown = false
         daemonReachable = text.localizedCaseInsensitiveContains("detached")
@@ -2332,5 +2358,214 @@ struct Outcome: Equatable {
     static func kind(of error: Error) -> Kind {
         if case VoxError.Unknown(_) = error { return .unknown }
         return .refused
+    }
+}
+
+
+// ADR-033 TH-2: independent, bounded thread reads never replace General or its read cursor.
+extension NodeModel {
+    private func clearThreadState() {
+        threadGeneration = UUID()
+        threadRefreshTask?.cancel()
+        threadRefreshTask = nil
+        threadRefreshID = UUID()
+        threadRefreshDirty = false
+        threadPagesLoaded = 1
+        threadPageTask?.cancel()
+        threadSummaries = [:]
+        threadSummaryErrors = [:]
+        openThread = nil
+        threadRootMessage = nil
+        threadReplies = []
+        threadLoading = false
+        threadHasMore = false
+        threadError = nil
+    }
+
+    private func scheduleThreadRefresh() {
+        guard let room = roomOnScreen, ended == nil else { return }
+        refreshOpenThread()
+        threadRefreshDirty = true
+        guard threadRefreshTask == nil else { return }
+        let generation = roomReadGeneration
+        let epoch = nodeObservationEpoch
+        let refreshID = UUID()
+        threadRefreshID = refreshID
+        threadRefreshTask = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                if self.threadRefreshID == refreshID {
+                    self.threadRefreshTask = nil
+                    if self.threadRefreshDirty { self.scheduleThreadRefresh() }
+                }
+            }
+            repeat {
+                self.threadRefreshDirty = false
+                let roots = self.messages.filter { $0.thread.isEmpty && !$0.owed }.map(\.id)
+                let known = Set(roots)
+                self.threadSummaries = self.threadSummaries.filter { known.contains($0.key) }
+                self.threadSummaryErrors = self.threadSummaryErrors.filter { known.contains($0.key) }
+                for root in roots {
+                    guard !Task.isCancelled, self.roomReadGeneration == generation,
+                          self.nodeObservationEpoch == epoch, self.roomOnScreen == room,
+                          self.ended == nil else { return }
+                    do {
+                        let summary = try await self.client.threadSummary(room: room, root: root, afterAuthor: nil)
+                        guard !Task.isCancelled, self.roomReadGeneration == generation,
+                              self.nodeObservationEpoch == epoch, self.roomOnScreen == room,
+                              self.ended == nil else { return }
+                        guard summary.root == root else {
+                            throw VoxError.Failed(reason: "The reply summary belongs to another message.")
+                        }
+                        self.threadSummaries[root] = summary
+                        self.threadSummaryErrors[root] = nil
+                    } catch {
+                        guard !Task.isCancelled, self.roomReadGeneration == generation,
+                              self.nodeObservationEpoch == epoch, self.roomOnScreen == room,
+                              self.ended == nil else { return }
+                        self.threadSummaries[root] = nil
+                        self.threadSummaryErrors[root] = sentence(error)
+                    }
+                }
+            } while self.threadRefreshDirty
+        }
+    }
+
+    func showThread(_ message: RoomMessage) {
+        guard roomOnScreen != nil, ended == nil, !message.owed, message.thread.isEmpty else { return }
+        threadGeneration = UUID()
+        threadPageTask?.cancel()
+        threadLoading = false
+        threadPagesLoaded = 1
+        openThread = message.id
+        threadRootMessage = message
+        threadReplies = []
+        threadHasMore = false
+        threadError = nil
+        inspectorShown = true
+        showing = .general
+        refreshOpenThread()
+    }
+
+    func closeThread() {
+        threadGeneration = UUID()
+        threadPageTask?.cancel()
+        threadPagesLoaded = 1
+        openThread = nil
+        threadRootMessage = nil
+        threadReplies = []
+        threadLoading = false
+        threadHasMore = false
+        threadError = nil
+    }
+
+    private func refreshOpenThread() {
+        guard openThread != nil, !threadLoading else { return }
+        loadThreadPage(replacing: true)
+    }
+
+    func moreThreadReplies() { loadThreadPage(replacing: false) }
+    func retryThread() { loadThreadPage(replacing: true) }
+
+    private func loadThreadPage(replacing: Bool) {
+        guard let room = roomOnScreen, let root = openThread, ended == nil, !threadLoading else { return }
+        let generation = threadGeneration
+        let roomGeneration = roomReadGeneration
+        let epoch = nodeObservationEpoch
+        let cursor = replacing ? "" : threadReplies.last?.id ?? ""
+        threadLoading = true
+        threadError = nil
+        threadPageTask = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                if self.threadGeneration == generation, self.openThread == root {
+                    self.threadLoading = false
+                }
+            }
+            func current() -> Bool {
+                !Task.isCancelled && self.roomOnScreen == room && self.openThread == root
+                    && self.threadGeneration == generation && self.roomReadGeneration == roomGeneration
+                    && self.nodeObservationEpoch == epoch && self.ended == nil
+            }
+            do {
+                var next = cursor
+                var result: [RoomMessage] = []
+                let pages = replacing ? self.threadPagesLoaded : 1
+                var more = false
+                var awaitingBodies = false
+                for _ in 0..<pages {
+                    let page = try await self.client.readThreadPage(room: room, root: root, since: next)
+                    guard current() else { return }
+                    guard page.allSatisfy({ $0.owed || $0.thread == root }),
+                          page.isEmpty || page.last?.id != next else {
+                        throw VoxError.Failed(reason: "The thread page did not belong to this thread or advance its cursor.")
+                    }
+                    result += page
+                    more = !page.isEmpty
+                    if page.isEmpty { break }
+                    guard let mark = page.last, !mark.owed else {
+                        // The current API refuses an owed cursor. Keep that absence honest;
+                        // never drain/replay a page or pretend the thread ended.
+                        awaitingBodies = true
+                        more = false
+                        break
+                    }
+                    next = mark.id
+                }
+                if replacing { self.threadReplies = result }
+                else {
+                    let held = Set(self.threadReplies.map(\.id))
+                    self.threadReplies += result.filter { !held.contains($0.id) }
+                    if !result.isEmpty { self.threadPagesLoaded += 1 }
+                }
+                self.threadHasMore = more
+                if awaitingBodies { self.threadError = "Some reply bodies have not been received. Retry when they arrive." }
+                self.threadLoading = false
+            } catch {
+                guard current() else { return }
+                // A read refusal is not an empty thread; old bodies are not retained under a
+                // potentially changed read permission. The room/root identity stays for Retry.
+                self.threadRootMessage = nil
+                self.threadReplies = []
+                self.threadHasMore = false
+                self.threadError = sentence(error)
+                self.threadLoading = false
+            }
+        }
+    }
+
+    func threadMessage(_ id: String) -> RoomMessage? {
+        threadRootMessage?.id == id ? threadRootMessage : threadReplies.first { $0.id == id }
+    }
+
+    func moreThreadAuthors(_ root: String) async {
+        guard let room = roomOnScreen, let held = threadSummaries[root],
+              let after = held.nextAuthor, ended == nil else { return }
+        let generation = roomReadGeneration
+        let epoch = nodeObservationEpoch
+        do {
+            let page = try await client.threadSummary(room: room, root: root, afterAuthor: after)
+            guard roomOnScreen == room, roomReadGeneration == generation,
+                  nodeObservationEpoch == epoch, ended == nil, !Task.isCancelled,
+                  threadSummaries[root]?.nextAuthor == after else { return }
+            guard page.root == root, page.nextAuthor != after else {
+                throw VoxError.Failed(reason: "The thread's author page did not advance.")
+            }
+            // Only combine pages from the same authoritative count/time snapshot.
+            guard page.replyCount == held.replyCount, page.lastReplyMillis == held.lastReplyMillis else {
+                threadSummaries[root] = page
+                scheduleThreadRefresh()
+                return
+            }
+            let known = Set(held.authors.map(\.fingerprint))
+            threadSummaries[root] = ThreadSummary(root: root, replyCount: held.replyCount,
+                lastReplyMillis: held.lastReplyMillis,
+                authors: held.authors + page.authors.filter { !known.contains($0.fingerprint) },
+                nextAuthor: page.nextAuthor)
+        } catch {
+            guard roomOnScreen == room, roomReadGeneration == generation,
+                  nodeObservationEpoch == epoch, ended == nil else { return }
+            threadSummaryErrors[root] = sentence(error)
+        }
     }
 }
