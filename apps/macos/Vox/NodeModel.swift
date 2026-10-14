@@ -1959,6 +1959,20 @@ final class NodeModel: ObservableObject {
         }
     }
 
+    /// Bind an ending permission read to the same room and acting node throughout.
+    func canEndRoom(_ room: String) async throws -> Bool {
+        let epoch = nodeObservationEpoch, actor = me, generation = roomReadGeneration
+        guard roomOnScreen == room, sheet == .end, ended == nil else {
+            throw VoxError.Failed(reason: "The room to end is no longer selected.")
+        }
+        let admins = try await client.admins(room: room)
+        guard !Task.isCancelled, nodeObservationEpoch == epoch, me == actor,
+              roomReadGeneration == generation, roomOnScreen == room, sheet == .end, ended == nil else {
+            throw VoxError.Failed(reason: "The room or acting node changed while checking who may end it.")
+        }
+        return admins.contains(actor)
+    }
+
     /// The room on screen's admins, creator first.
     func admins() async -> [String] {
         guard let id = roomOnScreen else { return [] }
