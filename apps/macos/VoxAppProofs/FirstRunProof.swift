@@ -1390,8 +1390,8 @@ final class FirstRunProof: XCTestCase {
     /// and the width is the same after ⌘Q and a new launch; the sidebar's own resize is the
     /// decider's hand test (XCTest's drag does not reach it; see below); and View >
     /// Hide Inspector (⌥⌘I) hides the inspector and Show Inspector brings it back. Made short, the
-    /// window cuts the inspector's family LAN section off, and scrolling the inspector brings it
-    /// into view with MEMBERS still at the top (P13).
+    /// window cuts the inspector's last remote member off, and scrolling the inspector brings
+    /// that member into view with MEMBERS still at the top (P13).
     /// Mutations: Columns.remember a no-op → red at "after a new launch"; the inspector without
     /// its scroll view → red at "must scroll".
     func testColumnsResizeAndAreRememberedAndTheInspectorHides() throws {
@@ -1466,14 +1466,23 @@ final class FirstRunProof: XCTestCase {
             expectedMembers.append(try line(staged(vox, ["id", "--node", name], env: membersEnv)) { $0.count == 52 })
         }
         var roster = Set<String>()
+        var rosterOrder: [String] = []
         let rosterDeadline = Date().addingTimeInterval(20)
         while Date() < rosterDeadline {
             let read = run(vox, ["room", "roster", room, "--node", "alice"], env: voxEnv)
-            if read.status == 0 { roster = Set(read.out.split(whereSeparator: \.isWhitespace).map(String.init)) }
+            if read.status == 0 {
+                // Public roster stdout is one fingerprint per line, in the same order the
+                // app receives. Ignore accompanying name/status diagnostics on stderr.
+                rosterOrder = read.out.split(separator: "\n")
+                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    .filter { expectedMembers.contains($0) }
+                roster = Set(rosterOrder)
+            }
             if expectedMembers.allSatisfy({ roster.contains($0) }) { break }
             Thread.sleep(forTimeInterval: 0.25)
         }
-        guard expectedMembers.allSatisfy({ roster.contains($0) }) else {
+        guard expectedMembers.allSatisfy({ roster.contains($0) }),
+              let lastRemoteMember = rosterOrder.last(where: { $0 != expectedMembers[0] }) else {
             throw Apparatus("inspector staging not achieved: Alice's public roster is missing remote members")
         }
         // Nine saved identities exercise the machine footer independently of the remote roster.
@@ -1592,32 +1601,36 @@ final class FirstRunProof: XCTestCase {
         XCTAssertTrue(hidden && back,
                       "PRODUCT: View > Hide Inspector (⌥⌘I) must hide the inspector and Show Inspector bring it back; hidden \(hidden), back \(back)")
 
-        // A short window (P13): the inspector's last section, the family LAN, is below its
-        // bottom, and scrolling the inspector brings it into view while MEMBERS stays pinned.
+        // A short window (P13): the last publicly listed remote member is below its
+        // bottom, and scrolling brings that member into view while MEMBERS stays pinned.
         let bottom = window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 1))
             .withOffset(CGVector(dx: 0, dy: -1))
         bottom.press(forDuration: 0.5, thenDragTo: bottom.withOffset(CGVector(dx: 0, dy: -(window.frame.height - 300))),
                      withVelocity: .slow, thenHoldForDuration: 0.5)
         Thread.sleep(forTimeInterval: 1)
         let inspector = ui.descendants(matching: .any).matching(identifier: "inspector").firstMatch
-        // The read-only LAN status remains in the inspector; its control lives in Room.
-        // Turning the LAN on from Room asks for its helper; there is no inline control.
-        let lan = ui.descendants(matching: .any).matching(NSPredicate(
-            format: "identifier == 'family-lan-status'")).firstMatch
-        func lanInView() -> Bool {
-            lan.exists && lan.frame.maxY <= inspector.frame.maxY + 1 && lan.frame.minY >= inspector.frame.minY
+        // Fingerprint identity stays stable whether its presented name has arrived yet or not.
+        let lastMember = inspector.descendants(matching: .any)
+            .matching(identifier: "member-trust-directions-" + lastRemoteMember).firstMatch
+        func lastMemberInView() -> Bool {
+            lastMember.exists && lastMember.frame.maxY <= inspector.frame.maxY + 1
+                && lastMember.frame.minY >= inspector.frame.minY
         }
-        guard !lanInView() else {
-            throw Apparatus("staging not achieved: the window is \(window.frame.height) high and the inspector's family LAN section still fits (\(lan.frame) in \(inspector.frame)), so there is nothing to scroll")
+        guard !lastMemberInView() else {
+            throw Apparatus("staging not achieved: the window is \(window.frame.height) high and the inspector's last remote member still fits (\(lastMember.frame) in \(inspector.frame)), so there is nothing to scroll")
         }
-        inspector.scroll(byDeltaX: 0, deltaY: -2000)
-        Thread.sleep(forTimeInterval: 1)
+        // Stop when the row is visible rather than scrolling past its start to the end of
+        // its remaining member details. This is still the real scroll view, not a row jump.
+        for _ in 0..<40 where !lastMemberInView() {
+            inspector.scroll(byDeltaX: 0, deltaY: -100)
+            Thread.sleep(forTimeInterval: 0.1)
+        }
         let members = locate(ui, Key.showing("MEMBERS"))?.frame ?? .null
-        XCTAssertTrue(lanInView(),
-                      "PRODUCT: the inspector must scroll (P13): in a window \(window.frame.height) high, scrolled down, its family LAN section is still out of view (\(lan.exists ? "\(lan.frame)" : "not shown") in \(inspector.frame))")
+        XCTAssertTrue(lastMemberInView(),
+                      "PRODUCT: the inspector must scroll (P13): in a window \(window.frame.height) high, scrolled down, its last remote member is still out of view (\(lastMember.exists ? "\(lastMember.frame)" : "not shown") in \(inspector.frame))")
         XCTAssertTrue(!members.isNull && members.minY >= inspector.frame.minY - 1 && members.maxY <= inspector.frame.maxY,
                       "PRODUCT: scrolled, the inspector's MEMBERS heading must stay in view (P13); it is at \(members) in \(inspector.frame)")
-        print("[proof] columns: inspector \(inspector0) → \(inspector1) → \(inspector2); hide \(hidden), show \(back); scrolled, LAN in view \(lanInView()), MEMBERS at \(members.minY)")
+        print("[proof] columns: inspector \(inspector0) → \(inspector1) → \(inspector2); hide \(hidden), show \(back); scrolled, last remote member \(lastRemoteMember) in view \(lastMemberInView()), MEMBERS at \(members.minY)")
     }
 
     /// (8) Notifications (ADR-014 M-23, ADR-028 R-10, #448), alone: the one step that needs a
@@ -4143,6 +4156,11 @@ final class FirstRunProof: XCTestCase {
         guard asked.hasPrefix("awaiting-approval") else {
             throw Apparatus("the stand-in LAN helper was to wait for approval once registered; its file says \"\(asked)\", so the wait for the person cannot be staged")
         }
+        // The shared status bar may still show the helper's approval request. It is not
+        // the daemon's later LAN outcome and must not satisfy that assertion.
+        let lanOutcomeKeys = [Key.id("status-outcome-done"), Key.id("status-outcome-refused"),
+                              Key.id("status-outcome-unknown")]
+        let beforeLanAnswer = Set(lanOutcomeKeys.compactMap { locate(ui, $0).map(shown) })
         // The person goes to System Settings, turns Vox on there, and comes back. The proof hands
         // the foreground away itself, so it is not counted as lost.
         handedOff = true
@@ -4164,14 +4182,27 @@ final class FirstRunProof: XCTestCase {
             var answer = ""
             let answerUntil = Date().addingTimeInterval(15)
             while Date() < answerUntil && answer.isEmpty {
-                for key in [Key.id("family-lan-said"), Key.id("family-lan-failed")] {
-                    if let e = locate(ui, key) { answer = shown(e) }
+                // A background status error during the LAN request is not its completed
+                // answer. The action clears the old outcome before starting and publishes
+                // its result before retiring this progress mark.
+                if let progress = locate(ui, Key.id("action-progress")),
+                   shown(progress).contains("Updating the family LAN…") {
+                    Thread.sleep(forTimeInterval: 0.25)
+                    continue
+                }
+                for key in lanOutcomeKeys {
+                    if let e = locate(ui, key) {
+                        let said = shown(e)
+                        if !beforeLanAnswer.contains(said)
+                            && said != "The LAN helper is waiting for your approval in System Settings."
+                            && said != "The LAN helper is ready." { answer = said }
+                    }
                 }
                 if answer.isEmpty { Thread.sleep(forTimeInterval: 0.25) }
             }
             if answer.isEmpty {
                 keepTree(ui, "the family LAN was not asked for after approval")
-                XCTFail("PRODUCT: with the LAN helper allowed, Vox must go on to turn mission's family LAN on and say the daemon's answer; the inspector shows neither family-lan-said nor family-lan-failed")
+                XCTFail("PRODUCT: with the LAN helper allowed, Vox must go on to turn mission's family LAN on and say the daemon's answer; the status bar shows no new done, refused or unknown LAN outcome")
             }
             print("[proof] family LAN: asked (\(steps)); allowed; the daemon said \(answer)")
         }
