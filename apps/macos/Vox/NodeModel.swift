@@ -201,6 +201,16 @@ final class NodeModel: ObservableObject {
     @Published private(set) var platforms: [String: NodePlatform] = [:]
     /// Who has read each of this node's own messages in the room on screen, by message id (R-6).
     @Published private(set) var readBy: [String: [String]] = [:]
+    @Published private(set) var messageFooters: [String: MessageFooter] = [:]
+    @Published private(set) var messageFooterErrors: [String: String] = [:]
+    @Published private(set) var messageFootersLoading = false
+    private struct FooterCursor: Equatable {
+        var read: String?
+        var pulled: UInt64?
+    }
+    private var footerCursors: [String: FooterCursor] = [:]
+    private var footerRead = UUID()
+
     /// Where each of this node's own messages is, while no member is known to have read it
     /// (ADR-028 R-6, D9): "only on this machine", "on N of M members' nodes".
     @Published private(set) var whereabouts: [String: String] = [:]
@@ -1120,6 +1130,11 @@ final class NodeModel: ObservableObject {
         roomReloadNeeded = false
         unreadFrom = nil
         unreadCount = 0
+        messageFooters = [:]
+        messageFooterErrors = [:]
+        footerCursors = [:]
+        footerRead = UUID()
+        messageFootersLoading = false
         readBy = [:]
         whereabouts = [:]
         joins = []
@@ -2555,10 +2570,128 @@ final class NodeModel: ObservableObject {
             .filter { $0.file != nil }.map(\.id))
     }
 
+    private var displayedFooterIDs: Set<String> {
+        Set((messages + threadReplies + [threadRootMessage].compactMap { $0 })
+            .filter { $0.author == me && !$0.owed }.map(\.id))
+    }
+
     private func retireFileFactsOutsideWindows() {
         let held = displayedFileIDs
         pulled = pulled.filter { held.contains($0.key) }
         pulling = pulling.filter { held.contains($0.key) }
+        let own = displayedFooterIDs
+        messageFooters = messageFooters.filter { own.contains($0.key) }
+        messageFooterErrors = messageFooterErrors.filter { own.contains($0.key) }
+        footerCursors = footerCursors.filter { own.contains($0.key) }
+        readBy = readBy.filter { own.contains($0.key) }
+        whereabouts = whereabouts.filter { own.contains($0.key) }
+        pulledBy = pulledBy.filter { own.contains($0.key) }
+    }
+
+    func hasRecipientNavigation(_ id: String) -> Bool {
+        messageFooters[id]?.readAfter != nil || messageFooters[id]?.pulledAfter != nil
+            || footerIsPaged(id) || messageFooterErrors[id] != nil
+    }
+
+    func footerIsPaged(_ id: String) -> Bool {
+        footerCursors[id]?.read != nil || footerCursors[id]?.pulled != nil
+    }
+
+    func moreMessageReaders(_ id: String) async {
+        guard !messageFootersLoading, displayedFooterIDs.contains(id),
+              let next = messageFooters[id]?.readAfter, let room = roomOnScreen else { return }
+        footerCursors[id, default: FooterCursor()].read = next
+        await refreshMessageFooters(room)
+    }
+
+    func moreMessageDownloads(_ id: String) async {
+        guard !messageFootersLoading, displayedFooterIDs.contains(id),
+              let next = messageFooters[id]?.pulledAfter, let room = roomOnScreen else { return }
+        footerCursors[id, default: FooterCursor()].pulled = next
+        await refreshMessageFooters(room)
+    }
+
+    func firstMessageRecipients(_ id: String) async {
+        guard !messageFootersLoading, displayedFooterIDs.contains(id), let room = roomOnScreen else { return }
+        footerCursors[id] = nil
+        await refreshMessageFooters(room)
+    }
+
+    private func firstFooterRows(_ room: String, instance: Data, ids: [String],
+                                 current: () -> Bool) async throws -> [MessageFooter] {
+        guard !ids.isEmpty else { return [] }
+        do {
+            let result = try await client.messageFooters(room: room, node: me,
+                instance: instance, entries: ids)
+            guard current() else { throw CancellationError() }
+            guard result.instance == instance, result.rows.count == ids.count,
+                  Set(result.rows.map(\.id)) == Set(ids) else {
+                throw VoxError.Failed(reason: "The message footer selection did not match its saved room or messages.")
+            }
+            return result.rows
+        } catch {
+            guard current() else { throw CancellationError() }
+            guard ids.count > 1, case let VoxError.Failed(reason) = error,
+                  reason == "Message footer names exceed 128 KiB. Select fewer messages." else { throw error }
+            let middle = ids.count / 2
+            let left = try await firstFooterRows(room, instance: instance,
+                ids: Array(ids[..<middle]), current: current)
+            let right = try await firstFooterRows(room, instance: instance,
+                ids: Array(ids[middle...]), current: current)
+            return left + right
+        }
+    }
+
+    /// Keep one recipient page per held own message. Exact old-message projections and
+    /// pagination live in the daemon; no room-wide snapshot or recipient union is retained.
+    func refreshMessageFooters(_ room: String) async {
+        guard roomOnScreen == room, ended == nil, !messageFootersLoading,
+              let instance = roomInstance ?? threadInstance else { return }
+        let ids = displayedFooterIDs, cursors = footerCursors
+        let epoch = nodeObservationEpoch, generation = roomReadGeneration, request = UUID()
+        footerRead = request
+        messageFootersLoading = true
+        func current() -> Bool {
+            !Task.isCancelled && epoch == nodeObservationEpoch && generation == roomReadGeneration
+                && roomOnScreen == room && ended == nil && footerRead == request
+                && ids == displayedFooterIDs && cursors == footerCursors
+                && (roomInstance ?? threadInstance) == instance
+        }
+        defer { if footerRead == request { messageFootersLoading = false } }
+        do {
+            var rows: [MessageFooter] = []
+            let first = ids.filter { !footerIsPaged($0) }.sorted()
+            for offset in stride(from: 0, to: first.count, by: 128) {
+                guard current() else { return }
+                rows += try await firstFooterRows(room, instance: instance,
+                    ids: Array(first[offset..<min(offset + 128, first.count)]), current: current)
+            }
+            for id in ids.filter({ footerIsPaged($0) }).sorted() {
+                guard current() else { return }
+                let cursor = cursors[id] ?? FooterCursor()
+                let result = try await client.messageFooterPage(room: room, node: me,
+                    instance: instance, entry: id, readAfter: cursor.read, pulledAfter: cursor.pulled)
+                guard current() else { return }
+                guard result.instance == instance, result.rows.count == 1, result.rows.first?.id == id else {
+                    throw VoxError.Failed(reason: "The recipient page did not match its saved room or message.")
+                }
+                rows += result.rows
+            }
+            guard current() else { return }
+            let visible = rows.filter(\.present)
+            messageFooters = Dictionary(uniqueKeysWithValues: visible.map { ($0.id, $0) })
+            readBy = Dictionary(uniqueKeysWithValues: visible.map { ($0.id, $0.readBy) })
+            whereabouts = Dictionary(uniqueKeysWithValues: visible.map { ($0.id, $0.whereabouts) })
+            pulledBy = Dictionary(uniqueKeysWithValues: visible.map { ($0.id, $0.pulledBy) })
+            messageFooterErrors = [:]
+            let present = Set(visible.map(\.id))
+            footerCursors = footerCursors.filter { present.contains($0.key) }
+        } catch {
+            guard current() else { return }
+            messageFooters = [:]; readBy = [:]; whereabouts = [:]; pulledBy = [:]
+            messageFooterErrors = Dictionary(uniqueKeysWithValues: ids.map { ($0, sentence(error)) })
+            reportBackground(error)
+        }
     }
 
     private func displayedFileFacts(_ room: String, ids: Set<String>) async throws
@@ -2587,9 +2720,7 @@ final class NodeModel: ObservableObject {
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
                 guard !Task.isCancelled, let self, self.roomReadGeneration == generation,
                       self.selection == .room(room), self.ended == nil else { return }
-                let reads = try? await self.client.readBy(room: room)
-                let where_ = try? await self.client.whereabouts(room: room)
-                let pulls = try? await self.client.pulledBy(room: room)
+                await self.refreshMessageFooters(room)
                 let fileIDs = self.displayedFileIDs
                 let fileFacts = try? await self.displayedFileFacts(room, ids: fileIDs)
                 let rows = try? await self.memberRows(room)
@@ -2609,18 +2740,6 @@ final class NodeModel: ObservableObject {
                 await self.refreshSessionMetadata()
                 guard !Task.isCancelled, self.roomReadGeneration == generation,
                       self.selection == .room(room), self.ended == nil else { return }
-                if let reads {
-                    let now = Dictionary(uniqueKeysWithValues: reads.map { ($0.id, $0.names) })
-                    if now != self.readBy { self.readBy = now }
-                }
-                if let where_ {
-                    let now = Dictionary(where_.map { ($0.id, $0.words) }) { $1 }
-                    if now != self.whereabouts { self.whereabouts = now }
-                }
-                if let pulls {
-                    let now = Dictionary(pulls.map { ($0.id, $0.names) }) { $1 }
-                    if now != self.pulledBy { self.pulledBy = now }
-                }
                 let visibleFiles = self.displayedFileIDs
                 if visibleFiles == fileIDs, let copies = fileFacts?.copies {
                     let now = Dictionary(copies.filter { visibleFiles.contains($0.entry) }
@@ -2766,6 +2885,11 @@ final class NodeModel: ObservableObject {
         sessionNote = nil
         sessionReloadNeeded = false
         sessionLoading = false
+        messageFooters = [:]
+        messageFooterErrors = [:]
+        footerCursors = [:]
+        footerRead = UUID()
+        messageFootersLoading = false
         readBy = [:]
         whereabouts = [:]
         pulledBy = [:]
