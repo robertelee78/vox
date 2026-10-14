@@ -1662,6 +1662,13 @@ fn event_loop(io: &mut impl TerminalIo, core: &mut impl CoreHandle) -> Result<()
                     ui.status_message = Some(WAITING_FOR_PROFILE_TUI.into());
                     let _ = io.draw(&mut |f| render(f, &vm, &mut ui));
                 });
+                if let CommandStatus::RoomPauseReport(nodes) = &status {
+                    ui.mode = crate::state::Mode::PauseReport {
+                        nodes: nodes.clone(),
+                        selected: 0,
+                        scroll: 0,
+                    };
+                }
                 if let CommandStatus::SessionShown { room, node, id } = &status {
                     if ui.active_channel_id(&vm) == Some(*room) {
                         let _ = ui.show(crate::state::Showing::Session(*node, id.clone()), &vm);

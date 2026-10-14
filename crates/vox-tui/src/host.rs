@@ -27,6 +27,7 @@ use std::collections::{BTreeMap, BTreeSet};
 mod anchor_discovery;
 mod computer;
 mod local_trust;
+pub(crate) mod room_pause;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
@@ -1650,6 +1651,7 @@ impl Router {
                 ok: false,
                 said: "this node is locked; nothing was sent".into(),
                 code: None,
+                pause: None,
             },
         };
         let _ = vox_core::node::ipc::write_frame(
@@ -1685,16 +1687,19 @@ impl Router {
                 ok: false,
                 said: "no drive request arrived in time".into(),
                 code: None,
+                pause: None,
             },
-            (_, Err(_)) if buf.len() > MAX_REQUEST => Answer {
+            (_, _) if buf.len() > MAX_REQUEST => Answer {
                 ok: false,
                 said: "the drive request is too long".into(),
                 code: None,
+                pause: None,
             },
             (_, Err(_)) => Answer {
                 ok: false,
                 said: "not a drive request this vox reads".into(),
                 code: None,
+                pause: None,
             },
             (Ok(()), Ok(req)) => self.drive(node, handle, &info, req).await,
         };
@@ -1719,6 +1724,7 @@ impl Router {
             ok: false,
             said,
             code: None,
+            pause: None,
         };
         if req.v != 1 {
             return refuse(format!(
@@ -1752,16 +1758,50 @@ impl Router {
         // operator (SC-2), which reaches here only from its own socket (`drive_own`).
         // Said without this node's name for itself, which the driver may not know it by: the
         // driver names it (`code`).
-        if me != Some(info.peer) && !view.drive.contains(&info.peer) {
+        if !matches!(
+            &req.action,
+            Action::RoomPause {
+                paused: None,
+                expected_instance: None,
+                after: None,
+                expected: None
+            }
+        ) && me != Some(info.peer)
+            && !view.drive.contains(&info.peer)
+        {
             return Answer {
                 ok: false,
                 said: vox_agentcomms::drive::no_drive("the session's node"),
                 code: Some(vox_agentcomms::drive::NO_DRIVE.to_owned()),
+                pause: None,
             };
         }
         let Ok(paths) = self.inner.account.node_paths(node) else {
             return refuse("this node's files cannot be read".into());
         };
+        if let Action::RoomPause {
+            paused,
+            expected_instance,
+            after,
+            expected,
+        } = &req.action
+        {
+            if !req.session.is_empty() {
+                return refuse("a room pause must not select a Session".into());
+            }
+            return self
+                .pause_room(
+                    node,
+                    handle,
+                    info,
+                    generation,
+                    *paused,
+                    *expected_instance,
+                    after.as_deref(),
+                    *expected,
+                )
+                .await;
+        }
         // DR-5 and TA-5: exactly this session, open on this node, and none other.
         let Some(reg) = crate::wake::registration(&paths, &req.session) else {
             return refuse(
@@ -1805,7 +1845,7 @@ impl Router {
             | Action::Answer { r#ref, .. } => {
                 copy.insert("ref".into(), serde_json::json!(r#ref));
             }
-            Action::Interrupt | Action::Stop => {}
+            Action::Interrupt | Action::Stop | Action::RoomPause { .. } => {}
             Action::File {
                 name,
                 size,
@@ -1857,6 +1897,7 @@ impl Router {
                 ok: false,
                 said: vox_agentcomms::drive::no_drive("the session's node"),
                 code: Some(vox_agentcomms::drive::NO_DRIVE.to_owned()),
+                pause: None,
             };
         }
         let Some(current_reg) = crate::wake::registration(&paths, &req.session) else {
@@ -1971,11 +2012,13 @@ impl Router {
                 ok: true,
                 said,
                 code: None,
+                pause: None,
             },
             Err(said) => Answer {
                 ok: false,
                 said,
                 code: None,
+                pause: None,
             },
         }
     }
@@ -2059,6 +2102,16 @@ impl Router {
         reg: &crate::wake::Session,
         action: &crate::drive::Action,
     ) -> Result<String, String> {
+        self.steer_guarded(node, reg, action, None).await
+    }
+
+    async fn steer_guarded(
+        &self,
+        node: &NodeName,
+        reg: &crate::wake::Session,
+        action: &crate::drive::Action,
+        guard: Option<room_pause::InterruptGuard>,
+    ) -> Result<String, String> {
         use crate::codex_mirror::Steer;
         use crate::drive::Action;
         let steer = match action {
@@ -2084,14 +2137,22 @@ impl Router {
                 }
                 self.inner
                     .codex
-                    .steer(std::path::Path::new(&reg.codex_home), &reg.session, steer)
+                    .steer_guarded(
+                        std::path::Path::new(&reg.codex_home),
+                        &reg.session,
+                        steer,
+                        guard,
+                    )
                     .await
             }
             "opencode" => {
                 if let Some(reservation) = &mut delivery {
                     reservation.attempting();
                 }
-                self.inner.opencode.steer(&reg.session, steer).await
+                self.inner
+                    .opencode
+                    .steer_guarded(&reg.session, steer, guard)
+                    .await
             }
             "claude" => {
                 use crate::claude_injector::Act;
@@ -2106,10 +2167,12 @@ impl Router {
                 if let Some(reservation) = &mut delivery {
                     reservation.attempting();
                 }
-                tokio::task::spawn_blocking(move || crate::claude_injector::drive(&reg, &act))
-                    .await
-                    .unwrap_or_else(|_| Err("the delivery to the terminal failed".into()))
-                    .map(|()| "delivered to its terminal".to_owned())
+                tokio::task::spawn_blocking(move || {
+                    crate::claude_injector::drive_guarded(&reg, &act, guard.as_ref())
+                })
+                .await
+                .unwrap_or_else(|_| Err("the delivery to the terminal failed".into()))
+                .map(|()| "delivered to its terminal".to_owned())
             }
             "codex" => Err(
                 "this Codex session registered no CODEX_HOME, so Vox cannot reach its app-server"

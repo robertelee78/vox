@@ -186,6 +186,28 @@ pub fn render(frame: &mut Frame, vm: &ViewModel, ui: &mut UiState) {
     match ui.mode {
         Mode::CommandPalette(ref buf) => render_palette(frame, area, buf),
         Mode::Prompt(ref p) => render_prompt(frame, area, p),
+        Mode::PauseReport {
+            ref nodes,
+            selected,
+            scroll,
+        } => {
+            let title = format!(
+                " Room pause/resume result {}/{} · ←/→ target · ↑/↓ scroll · Esc close ",
+                selected.saturating_add(1),
+                nodes.len()
+            );
+            let text = nodes
+                .get(selected)
+                .map_or("No nodes were selected", String::as_str);
+            frame.render_widget(ratatui::widgets::Clear, area);
+            frame.render_widget(
+                Paragraph::new(text)
+                    .wrap(Wrap { trim: false })
+                    .scroll((scroll, 0))
+                    .block(Block::default().borders(Borders::ALL).title(title)),
+                area,
+            );
+        }
         Mode::Normal => {}
     }
 }
@@ -1590,7 +1612,7 @@ fn hint_text(ui: &UiState, vm: &ViewModel) -> String {
             " Tab switch pane · ↑/↓ select · Enter show · :general · :all · :session <name> · : command · Esc back"
         }
         Screen::Channel => {
-            " Tab switch pane · ↑/↓ select · Ctrl-R reply in thread · Enter open thread / go to quote · → next replies · ← close thread · PgUp/PgDn page/scroll · End/:latest newest · :to <name> · :urgent · :share <path> · :link · :general · :all · :session <name> · :tag <tag> · : command · Esc back"
+            " Tab switch pane · ↑/↓ select · Ctrl-R reply in thread · Enter open thread / go to quote · → next replies · ← close thread · PgUp/PgDn page/scroll · End/:latest newest · :to <name> · :urgent · :pause [nodes] · :resume [nodes] · :share <path> · :link · :general · :all · :session <name> · :tag <tag> · : command · Esc back"
         }
         Screen::Tunnels => " ↑/↓ select · x close the selected tunnel · : command · Esc back",
         Screen::Serve if vm.serve_preview.is_some() => " Enter share it · Esc back to the list",
