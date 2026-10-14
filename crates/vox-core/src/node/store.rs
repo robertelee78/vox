@@ -47,6 +47,16 @@ const SEK_WRAPS: TableDefinition<Digest32, &[u8]> = TableDefinition::new("sek_wr
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const META_SCHEMA: &str = "schema_version";
 
+/// The cache budget for each open redb handle, not a node or process memory bound. A fresh
+/// rewrite temporarily opens two handles. This does not budget decoded room state.
+const DATABASE_CACHE_BYTES: usize = 32 * 1024 * 1024;
+
+fn database_builder() -> redb::Builder {
+    let mut builder = redb::Builder::new();
+    builder.set_cache_size(DATABASE_CACHE_BYTES);
+    builder
+}
+
 // Segment codes 6 and 7 (an anchor's ciphertext copy of a room, ADR-023 decision 6) are retired
 // and never reused.
 
@@ -133,7 +143,7 @@ impl Store {
     /// initialize or verify the schema version. A file this build cannot read
     /// (garbage, or a newer schema) is a [`Error::Storage`], never a panic.
     pub fn open(path: &Path) -> Result<Self> {
-        let db = Database::create(path).map_err(open_error)?;
+        let db = database_builder().create(path).map_err(open_error)?;
         super::paths::set_private_file_mode(path)?;
         let store = Self {
             db: RwLock::new(Backing::Writable(db)),
@@ -152,7 +162,7 @@ impl Store {
     /// is opened writable instead, as [`Self::open`] would: that is a store that needs writing
     /// whoever opens it.
     pub fn open_read_only(path: &Path) -> Result<Self> {
-        let db = match redb::Builder::new().open_read_only(path) {
+        let db = match database_builder().open_read_only(path) {
             Ok(db) => db,
             Err(redb::DatabaseError::DatabaseAlreadyOpen) => return Err(Error::ProfileBusy),
             Err(_) => return Self::open(path),
@@ -185,11 +195,11 @@ impl Store {
     pub fn reopen_after_write_failure(&self, channel: &Digest32) -> Result<()> {
         let mut backing = self.db.write().unwrap_or_else(PoisonError::into_inner);
         drop(std::mem::replace(&mut *backing, Backing::Closed));
-        let db = match Database::create(&self.path) {
+        let db = match database_builder().create(&self.path) {
             Ok(db) => db,
             Err(e) => {
                 // A failed writable reopen must not hide saved rooms while waiting to retry.
-                if let Ok(db) = redb::Builder::new().open_read_only(&self.path) {
+                if let Ok(db) = database_builder().open_read_only(&self.path) {
                     *backing = Backing::ReadOnly(db);
                 }
                 return Err(open_error(e));
@@ -248,14 +258,14 @@ impl Store {
         // The read-only handle is released first: redb refuses a writable open of a file this
         // process still holds open.
         drop(std::mem::replace(&mut *backing, Backing::Closed));
-        match Database::create(&self.path) {
+        match database_builder().create(&self.path) {
             Ok(db) => {
                 super::paths::set_private_file_mode(&self.path)?;
                 *backing = Backing::Writable(db);
                 Ok(())
             }
             Err(e) => {
-                if let Ok(db) = redb::Builder::new().open_read_only(&self.path) {
+                if let Ok(db) = database_builder().open_read_only(&self.path) {
                     *backing = Backing::ReadOnly(db);
                 }
                 Err(open_error(e))
@@ -292,7 +302,7 @@ impl Store {
         let fresh_path = PathBuf::from(fresh_path);
         let _ = std::fs::remove_file(&fresh_path);
         let copied = (|| -> Result<()> {
-            let fresh = Database::create(&fresh_path).map_err(open_error)?;
+            let fresh = database_builder().create(&fresh_path).map_err(open_error)?;
             super::paths::set_private_file_mode(&fresh_path)?;
             let r = old.begin_read().map_err(storage("begin read"))?;
             let w = fresh.begin_write().map_err(storage("begin write"))?;
@@ -332,7 +342,8 @@ impl Store {
         drop(std::mem::replace(&mut *backing, Backing::Closed));
         if let Err(e) = std::fs::rename(&fresh_path, &self.path) {
             let _ = std::fs::remove_file(&fresh_path);
-            *backing = Backing::Writable(Database::create(&self.path).map_err(open_error)?);
+            *backing =
+                Backing::Writable(database_builder().create(&self.path).map_err(open_error)?);
             return Err(Error::Path {
                 op: "replace store",
                 detail: format!("{}: {e}", self.path.display()),
@@ -340,7 +351,7 @@ impl Store {
         }
         // The store is open again before the directory's flush is reported, so a failed flush
         // leaves a usable store and says so, rather than being ignored (V210-55).
-        *backing = Backing::Writable(Database::create(&self.path).map_err(open_error)?);
+        *backing = Backing::Writable(database_builder().create(&self.path).map_err(open_error)?);
         super::paths::sync_dir(&self.path)
     }
 
@@ -494,16 +505,34 @@ impl Store {
         channel: &Digest32,
         kind: SegmentKind,
     ) -> Result<Vec<(u64, SealedSegment)>> {
+        let mut out = Vec::new();
+        self.visit_segments(channel, kind, |id, segment| {
+            out.push((id, segment));
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// Visit sealed segments in ascending id order from one consistent read snapshot.
+    ///
+    /// Only the current segment is decoded here; the visitor decides what it retains. The
+    /// transaction stays open through the synchronous visit, without a whole-room ciphertext
+    /// collection. Any read, decode or visitor error stops the visit and is returned unchanged.
+    pub fn visit_segments(
+        &self,
+        channel: &Digest32,
+        kind: SegmentKind,
+        mut visit: impl FnMut(u64, SealedSegment) -> Result<()>,
+    ) -> Result<()> {
         let txn = self.begin_read()?;
         let t = txn.open_table(SEGMENTS).map_err(storage("open segments"))?;
         let lo: SegmentKey = (*channel, kind_code(kind), 0);
         let hi: SegmentKey = (*channel, kind_code(kind), u64::MAX);
-        let mut out = Vec::new();
         for item in t.range(lo..=hi).map_err(storage("range segments"))? {
             let (k, v) = item.map_err(storage("iterate segments"))?;
-            out.push((k.value().2, sealed_segment_from_slice(v.value())?));
+            visit(k.value().2, sealed_segment_from_slice(v.value())?)?;
         }
-        Ok(out)
+        Ok(())
     }
 
     /// Delete one sealed segment; returns whether it existed.
