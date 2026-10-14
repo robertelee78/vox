@@ -205,19 +205,6 @@ impl Read<'_> {
     }
 }
 
-impl View<'_, '_> {
-    pub(crate) fn missing_contains(&self, author: &Digest32, seq: u64) -> Result<bool> {
-        contains(
-            &self.transaction.source(),
-            self.sek,
-            self.channel,
-            self.directory.active.missing_positions,
-            author,
-            seq,
-        )
-    }
-}
-
 impl RenderView<'_> {
     pub(crate) fn missing_contains(&self, author: &Digest32, seq: u64) -> Result<bool> {
         self.order.read.missing_contains(author, seq)

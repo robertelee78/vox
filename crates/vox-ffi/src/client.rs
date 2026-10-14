@@ -13,14 +13,14 @@
 //! Every failure is the daemon's own sentence (M-7): a refusal's words, a node's reason, or what
 //! went wrong reaching the daemon, said for a person.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use tokio::runtime::{Handle, Runtime};
 use vox_core::error::Error;
 use vox_core::hash::Digest32;
-use vox_core::node::api::{MessageRow, NodeEvent};
+use vox_core::node::api::{HistoryCursor, MessageRow, NodeEvent};
 use vox_core::node::daemonipc::{
     AttachMode, DaemonClient, DaemonFrame, DaemonRequest, KeepSource, NodeName, NodeState, UseNode,
 };
@@ -5289,7 +5289,7 @@ impl VoxClient {
         let socket = self.socket.clone();
         // The cursors and the stream are set up before this returns, so nothing posted after it
         // is missed.
-        let (stream, cursors, seen) = self
+        let (stream, cursors, seen, owner) = self
             .on_rt({
                 let held = Arc::clone(&held);
                 async move {
@@ -5309,71 +5309,156 @@ impl VoxClient {
                         if !open {
                             continue;
                         }
-                        let req = Request::Count {
-                            channel_id: id,
-                            since: None,
-                        };
-                        if let Frame::Count { last, .. } = ask(&mut h.client, &req).await? {
-                            cursors.insert(id, last);
+                        match ask(&mut h.client, &Request::ArrivalHead { channel_id: id }).await? {
+                            Frame::ArrivalHead { head } => {
+                                cursors.insert(id, head);
+                            }
+                            other => return Err(unexpected(&other)),
                         }
                     }
-                    Ok((stream, cursors, seen))
+                    let owner = FollowOwner {
+                        node: h.node.clone(),
+                        fingerprint: h.client.me(),
+                    };
+                    Ok((stream, cursors, seen, owner))
                 }
             })
             .await?;
-        self.rt.spawn(follow(stream, cursors, seen, held, listener));
+        self.rt
+            .spawn(follow(stream, cursors, seen, held, owner, listener));
         Ok(())
     }
 }
 
-/// The event loop behind [`VoxClient::subscribe`].
+/// The subscription remains bound to the same attached name and full identity on every read.
+struct FollowOwner {
+    node: NodeName,
+    fingerprint: Option<Digest32>,
+}
+impl FollowOwner {
+    fn holds(&self, held: &Held) -> bool {
+        held.node == self.node && held.client.me() == self.fingerprint
+    }
+}
+
+async fn follow_head(
+    held: &Slot,
+    owner: &FollowOwner,
+    room: Digest32,
+) -> Result<HistoryCursor, String> {
+    let mut slot = held.lock().await;
+    let h = slot
+        .as_mut()
+        .filter(|h| owner.holds(h))
+        .ok_or_else(|| "the app released or changed its node".to_owned())?;
+    h.mend().await.map_err(|e| e.to_string())?;
+    if !owner.holds(h) {
+        return Err("the app's node identity changed".into());
+    }
+    match ask(&mut h.client, &Request::ArrivalHead { channel_id: room })
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        Frame::ArrivalHead { head } => Ok(head),
+        other => Err(unexpected(&other).to_string()),
+    }
+}
+
+/// Deliver one sealed arrival page, retaining only its scalar cursor. Rows already delivered
+/// never reappear merely because their bodies expired, their canonical order changed, or a wake
+/// was duplicated. The room instance fences deletion/rejoin; its old cursor cannot name a new log.
+async fn follow_page(
+    held: &Slot,
+    owner: &FollowOwner,
+    room: Digest32,
+    cursor: &mut HistoryCursor,
+    listener: &dyn ClientListener,
+) -> Result<bool, String> {
+    let mut slot = held.lock().await;
+    let h = slot
+        .as_mut()
+        .filter(|h| owner.holds(h))
+        .ok_or_else(|| "the app released or changed its node".to_owned())?;
+    h.mend().await.map_err(|e| e.to_string())?;
+    if !owner.holds(h) {
+        return Err("the app's node identity changed".into());
+    }
+    let (rows, instance, next) = match ask(
+        &mut h.client,
+        &Request::ArrivalPage {
+            channel_id: room,
+            after: *cursor,
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())?
+    {
+        Frame::ArrivalPage {
+            rows,
+            instance,
+            next,
+        } => (rows, instance, next),
+        other => return Err(unexpected(&other).to_string()),
+    };
+    if instance != cursor.instance {
+        // Ending, rather than a notice alone, enters NodeModel's existing same-node recovery:
+        // refresh authoritative facts, mark the selected room for reload, then resubscribe.
+        return Err(
+            "the saved room changed; refreshing its history and restarting observation".into(),
+        );
+    }
+    let mut last = cursor.arrival;
+    for row in &rows {
+        if row.arrival <= last || row.owed {
+            return Err("the room's arrival page did not advance consistently".into());
+        }
+        last = row.arrival;
+    }
+    if next
+        .is_some_and(|n| n.instance != instance || n.arrival <= cursor.arrival || n.arrival < last)
+    {
+        return Err("the room's arrival continuation did not advance consistently".into());
+    }
+    let names = names(&mut h.client).await.map_err(|e| e.to_string())?;
+    let me = h.client.me().map(|f| b32_encode(&f));
+    // Keep the held-node fence through these synchronous callbacks; a different attach cannot
+    // supply names for this node's page or receive its callbacks between the read and delivery.
+    for row in rows {
+        listener.on_message(b32_encode(&room), rendered(&row, &names, me.as_deref()));
+    }
+    cursor.arrival = next.map_or(last, |n| n.arrival);
+    Ok(next.is_some())
+}
+
+/// The event loop behind [`VoxClient::subscribe`]. Events wake a bounded durable arrival read;
+/// they are not a second delivery route requiring a lifetime set of every delivered hash.
 async fn follow(
     mut stream: IpcClient,
-    mut cursors: HashMap<Digest32, Option<Digest32>>,
+    mut cursors: HashMap<Digest32, HistoryCursor>,
     mut seen: HashMap<Digest32, Digest32>,
     held: Slot,
+    owner: FollowOwner,
     listener: Arc<dyn ClientListener>,
 ) {
-    let mut delivered: HashSet<Digest32> = HashSet::new();
     loop {
-        // The rooms whose Sessions this event may have changed, besides those it brought messages
-        // to: a Session's opening and end are room messages; its entries are not.
-        let mut sessions_in: Vec<Digest32> = Vec::new();
-        let rooms: Vec<Digest32> = match stream.next().await {
-            // A new entry, with its row: delivered as it came, as `vox room tail` delivers it. Read
-            // back instead, it could come from the room's view before the node published the row in
-            // it, find nothing, and be lost for good with no later event to read it again (the
-            // walkthrough's WHERE-15, posted with every peer offline). The cursor stays where reads
-            // left it: a row rendered late still sits after it, and `delivered` keeps this one from
-            // being told twice when a later read returns it.
-            Ok(Some(Frame::Event(NodeEvent::NewEntry { channel_id, row }))) => {
-                if cursors.contains_key(&channel_id)
-                    && !row.owed
-                    && delivered.insert(row.entry_hash)
-                {
-                    let message = {
-                        let mut slot = held.lock().await;
-                        let Some(h) = slot.as_mut() else {
-                            listener.on_ended("the app released its node".to_owned());
-                            return;
-                        };
-                        let names = match names(&mut h.client).await {
-                            Ok(names) => names,
-                            Err(e) => {
-                                listener.on_ended(e.to_string());
-                                return;
-                            }
-                        };
-                        let me = h.client.me().map(|f| b32_encode(&f));
-                        rendered(&row, &names, me.as_deref())
-                    };
-                    listener.on_message(b32_encode(&channel_id), message);
-                }
-                sessions_in.push(channel_id);
-                Vec::new()
+        let event = stream.next().await;
+        {
+            let slot = held.lock().await;
+            if !slot.as_ref().is_some_and(|h| owner.holds(h)) {
+                listener.on_ended("the app released or changed its node".into());
+                return;
             }
-            // Others' messages: a sync that rendered rows, or a sender key that made rows already
-            // held readable. Said as a notice too, as the TUI says them.
+        }
+        let mut sessions_in = Vec::new();
+        let rooms: Vec<Digest32> = match event {
+            Ok(Some(Frame::Event(NodeEvent::NewEntry { channel_id, .. }))) => {
+                sessions_in.push(channel_id);
+                cursors
+                    .contains_key(&channel_id)
+                    .then_some(channel_id)
+                    .into_iter()
+                    .collect()
+            }
             Ok(Some(Frame::Event(
                 ev @ (NodeEvent::Synced { .. } | NodeEvent::SenderKeyReceived { .. }),
             ))) => {
@@ -5387,15 +5472,45 @@ async fn follow(
                     _ => None,
                 };
                 listener.on_notice(ev.words());
-                room.into_iter().collect()
+                room.filter(|r| cursors.contains_key(r))
+                    .into_iter()
+                    .collect()
             }
-            // A Session's news (ADR-029 CL-2): told below, with the room's Sessions read again.
+            Ok(Some(Frame::Event(ev @ NodeEvent::ChannelOpened { channel_id }))) => {
+                match follow_head(&held, &owner, channel_id).await {
+                    Ok(head) => {
+                        if let Some(previous) = cursors.get(&channel_id) {
+                            if previous.instance != head.instance {
+                                listener.on_ended("the saved room changed; refreshing its history and restarting observation".into());
+                                return;
+                            }
+                        } else {
+                            cursors.insert(channel_id, head);
+                        }
+                    }
+                    Err(why) => {
+                        listener.on_ended(why);
+                        return;
+                    }
+                }
+                listener.on_notice(ev.words());
+                sessions_in.push(channel_id);
+                vec![channel_id]
+            }
+            Ok(Some(Frame::Event(
+                ev @ (NodeEvent::ChannelClosed { channel_id }
+                | NodeEvent::RoomRemoved { channel_id }),
+            ))) => {
+                cursors.remove(&channel_id);
+                seen.remove(&channel_id);
+                listener.on_notice(ev.words());
+                listener.on_sessions(b32_encode(&channel_id));
+                Vec::new()
+            }
             Ok(Some(Frame::Event(NodeEvent::SessionEntry { channel_id, .. }))) => {
                 sessions_in.push(channel_id);
                 Vec::new()
             }
-            // Anything else the node says. Who has drive changed: what every room's Sessions let
-            // this node see and answer.
             Ok(Some(Frame::Event(ev))) => {
                 if matches!(ev, NodeEvent::CapabilityChanged { .. }) {
                     sessions_in.extend(cursors.keys().copied());
@@ -5403,8 +5518,57 @@ async fn follow(
                 listener.on_notice(ev.words());
                 Vec::new()
             }
-            // Events were dropped for this client: every room it follows is read from its cursor.
-            Ok(Some(Frame::Lagged { .. })) => cursors.keys().copied().collect(),
+            Ok(Some(Frame::Lagged { .. })) => {
+                // A lost open/close event must not leave another room's cursor attached to the
+                // wrong incarnation. Existing rooms keep their exact arrival cursor; new rooms
+                // start at their current head and the app reloads their visible history normally.
+                let open = {
+                    let mut slot = held.lock().await;
+                    let Some(h) = slot.as_mut().filter(|h| owner.holds(h)) else {
+                        listener.on_ended("the app released or changed its node".into());
+                        return;
+                    };
+                    if let Err(error) = h.mend().await {
+                        listener.on_ended(error.to_string());
+                        return;
+                    }
+                    if !owner.holds(h) {
+                        listener.on_ended("the app's node identity changed".into());
+                        return;
+                    }
+                    match room_ids(&mut h.client).await {
+                        Ok(rooms) => rooms
+                            .into_iter()
+                            .filter(|r| r.2)
+                            .map(|r| r.0)
+                            .collect::<Vec<_>>(),
+                        Err(error) => {
+                            listener.on_ended(error.to_string());
+                            return;
+                        }
+                    }
+                };
+                cursors.retain(|room, _| open.contains(room));
+                seen.retain(|room, _| open.contains(room));
+                for &room in &open {
+                    if !cursors.contains_key(&room) {
+                        match follow_head(&held, &owner, room).await {
+                            Ok(head) => {
+                                cursors.insert(room, head);
+                            }
+                            Err(why) => {
+                                listener.on_ended(why);
+                                return;
+                            }
+                        }
+                    }
+                }
+                listener.on_notice(
+                    "room observation caught up after missed events; refreshing the visible rooms"
+                        .into(),
+                );
+                open
+            }
             Ok(Some(Frame::NodeDetached { node })) => {
                 listener.on_ended(format!("the connection to node {node} ended"));
                 return;
@@ -5416,87 +5580,27 @@ async fn follow(
             }
         };
         sessions_in.extend(rooms.iter().copied());
-        'rooms: for room in rooms {
+        for room in rooms {
+            let Some(cursor) = cursors.get_mut(&room) else {
+                continue;
+            };
             loop {
-                let since = cursors.get(&room).copied().flatten();
-                let rows = {
-                    let mut slot = held.lock().await;
-                    let Some(h) = slot.as_mut() else {
-                        listener.on_ended("the app released its node".to_owned());
-                        return;
-                    };
-                    if let Err(e) = h.mend().await {
-                        listener.on_ended(e.to_string());
+                match follow_page(&held, &owner, room, cursor, listener.as_ref()).await {
+                    Ok(true) => {
+                        tokio::task::yield_now().await;
+                    }
+                    Ok(false) => break,
+                    Err(why) => {
+                        listener.on_ended(why);
                         return;
                     }
-                    let request = match since {
-                        Some(_) => Request::Read {
-                            channel_id: room,
-                            since,
-                            after: None,
-                            limit: 200,
-                        },
-                        None => Request::RoomPage {
-                            channel_id: room,
-                            before: None,
-                            limit: 200,
-                        },
-                    };
-                    let rows = match h.client.request(&request).await {
-                        Ok(Frame::Rows { rows } | Frame::RoomPage { rows, .. }) => rows,
-                        Ok(Frame::NodeDetached { node }) => {
-                            listener.on_ended(format!("the connection to node {node} ended"));
-                            return;
-                        }
-                        // The cursor's row has gone (it expired): start again from the newest.
-                        Ok(_) => {
-                            let req = Request::Count {
-                                channel_id: room,
-                                since: None,
-                            };
-                            if let Ok(Frame::Count { last, .. }) = h.client.request(&req).await {
-                                cursors.insert(room, last);
-                            }
-                            listener.on_notice(
-                                "some messages could not be followed; read the room again"
-                                    .to_owned(),
-                            );
-                            continue 'rooms;
-                        }
-                        Err(e) => {
-                            listener.on_ended(format!("the vox daemon stopped answering: {e}"));
-                            return;
-                        }
-                    };
-                    let names = match names(&mut h.client).await {
-                        Ok(names) => names,
-                        Err(e) => {
-                            listener.on_ended(e.to_string());
-                            return;
-                        }
-                    };
-                    let me = h.client.me().map(|f| b32_encode(&f));
-                    rows.iter()
-                        .map(|r| (r.clone(), rendered(r, &names, me.as_deref())))
-                        .collect::<Vec<_>>()
-                };
-                let next = rows.last().map(|(r, _)| r.entry_hash);
-                let more = since.is_some() && next.is_some() && next != since;
-                cursors.insert(room, next.or(since));
-                for (row, message) in rows {
-                    if !row.owed && delivered.insert(row.entry_hash) {
-                        listener.on_message(b32_encode(&room), message);
-                    }
-                }
-                if !more {
-                    break;
                 }
             }
         }
         sessions_in.sort_unstable();
         sessions_in.dedup();
         sessions_in.retain(|r| cursors.contains_key(r));
-        if !sessions_told(&sessions_in, &mut seen, &held, listener.as_ref()).await {
+        if !sessions_told(&sessions_in, &mut seen, &held, &owner, listener.as_ref()).await {
             return;
         }
     }
@@ -5508,6 +5612,7 @@ async fn sessions_told(
     rooms: &[Digest32],
     seen: &mut HashMap<Digest32, Digest32>,
     held: &Slot,
+    owner: &FollowOwner,
     listener: &dyn ClientListener,
 ) -> bool {
     if rooms.is_empty() {
@@ -5515,13 +5620,17 @@ async fn sessions_told(
     }
     let now = {
         let mut slot = held.lock().await;
-        let Some(h) = slot.as_mut() else {
+        let Some(h) = slot.as_mut().filter(|h| owner.holds(h)) else {
             listener.on_ended("the app released its node".to_owned());
             return false;
         };
         if let Err(error) = h.mend().await {
             listener.on_notice(error.to_string());
             return true;
+        }
+        if !owner.holds(h) {
+            listener.on_ended("the app's node identity changed".into());
+            return false;
         }
         match session_revisions(&mut h.client).await {
             Ok(now) => now,

@@ -406,6 +406,11 @@ const T_SESSIONS_PENDING_REQ: u64 = 8726;
 const T_SESSIONS_PENDING: u64 = 8727;
 const T_SESSION_LIFECYCLE_REQ: u64 = 8724;
 const T_SESSION_LIFECYCLE: u64 = 8725;
+// Saved room-instance arrival cursors survive retention without per-message client dedup sets.
+const T_ARRIVAL_HEAD_REQ: u64 = 8728;
+const T_ARRIVAL_HEAD: u64 = 8729;
+const T_ARRIVAL_PAGE_REQ: u64 = 8731;
+const T_ARRIVAL_PAGE: u64 = 8732;
 const T_ROOM_PAGE_REQ: u64 = 5492;
 const T_ROOM_PAGE: u64 = 5493;
 
@@ -467,6 +472,18 @@ const T_OFFERS: u64 = 4952;
 /// is accident prevention on top of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
+    /// The selected room's saved instance and newest readable arrival, without loading bodies.
+    ArrivalHead {
+        /// The room on this held node.
+        channel_id: Digest32,
+    },
+    /// One bounded arrival page after an instance-bound cursor, including late readable rows.
+    ArrivalPage {
+        /// The room on this held node.
+        channel_id: Digest32,
+        /// The last scanned arrival; zero starts an empty room's future feed.
+        after: crate::node::api::HistoryCursor,
+    },
     /// One stateless bounded governance page on the room-page transport.
     GovernancePage {
         /// Room whose current governance is selected.
@@ -1068,6 +1085,13 @@ impl Request {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut e = Encoder::new();
         match self {
+            Request::ArrivalHead { channel_id } => {
+                e.array(2).uint(T_ARRIVAL_HEAD_REQ).bytes(channel_id);
+            }
+            Request::ArrivalPage { channel_id, after } => {
+                e.array(3).uint(T_ARRIVAL_PAGE_REQ).bytes(channel_id);
+                encode_history_cursor(&mut e, *after);
+            }
             Request::GovernancePage { channel_id, query } => {
                 e.array(3).uint(T_ROOM_PAGE_REQ).bytes(channel_id);
                 governance_page::put_query(&mut e, query);
@@ -1626,6 +1650,17 @@ impl Request {
             .uint()
             .map_err(|_| Error::MalformedIpc("ipc request tag"))?;
         match (tag, n) {
+            (T_ARRIVAL_HEAD_REQ, 2) => {
+                let channel_id = digest(&mut d)?;
+                d.finish()?;
+                Ok(Request::ArrivalHead { channel_id })
+            }
+            (T_ARRIVAL_PAGE_REQ, 3) => {
+                let channel_id = digest(&mut d)?;
+                let after = history_cursor(&mut d)?;
+                d.finish()?;
+                Ok(Request::ArrivalPage { channel_id, after })
+            }
             (T_SUBSCRIBE, 1) => {
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
@@ -2419,6 +2454,20 @@ pub struct SharedService {
 /// how a `Lagged` report comes to be silently swallowed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
+    /// The current saved room instance and its newest readable arrival.
+    ArrivalHead {
+        /// This cursor has no dependency on retaining the newest message body.
+        head: crate::node::api::HistoryCursor,
+    },
+    /// A bounded arrival page. A different instance requires an explicit client reanchor.
+    ArrivalPage {
+        /// Complete readable rows, in strictly increasing local arrival order.
+        rows: Vec<MessageRow>,
+        /// The saved room instance from the same read snapshot as these rows.
+        instance: [u8; 16],
+        /// Continue here, including after an empty filtered page; absent at this scan's end.
+        next: Option<crate::node::api::HistoryCursor>,
+    },
     /// A bounded governance result with explicit continuation and revision.
     GovernancePage {
         /// Selected result; an empty listing with a continuation is not exhausted.
@@ -2712,6 +2761,30 @@ impl Frame {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut e = Encoder::new();
         match self {
+            Frame::ArrivalHead { head } => {
+                e.array(2).uint(T_ARRIVAL_HEAD);
+                encode_history_cursor(&mut e, *head);
+            }
+            Frame::ArrivalPage {
+                rows,
+                instance,
+                next,
+            } => {
+                e.array(4).uint(T_ARRIVAL_PAGE).array(rows.len());
+                for row in rows {
+                    encode_row(&mut e, row);
+                }
+                e.bytes(instance);
+                match next {
+                    Some(cursor) => {
+                        e.array(1);
+                        encode_history_cursor(&mut e, *cursor);
+                    }
+                    None => {
+                        e.array(0);
+                    }
+                }
+            }
             Frame::GovernancePage { page } => {
                 e.array(2).uint(T_ROOM_PAGE);
                 governance_page::put_page(&mut e, page);
@@ -3072,6 +3145,24 @@ fn order_cursor(d: &mut Decoder<'_>) -> Result<Option<(u64, Digest32)>> {
         ))),
         _ => Err(Error::MalformedIpc("order cursor arity")),
     }
+}
+
+fn encode_history_cursor(e: &mut Encoder, cursor: crate::node::api::HistoryCursor) {
+    e.array(2).bytes(&cursor.instance).uint(cursor.arrival);
+}
+
+fn history_cursor(d: &mut Decoder<'_>) -> Result<crate::node::api::HistoryCursor> {
+    if d.array()? != 2 {
+        return Err(Error::MalformedIpc("arrival cursor arity"));
+    }
+    let instance = d
+        .bytes()?
+        .try_into()
+        .map_err(|_| Error::MalformedIpc("arrival cursor instance"))?;
+    Ok(crate::node::api::HistoryCursor {
+        instance,
+        arrival: d.uint()?,
+    })
 }
 
 fn encode_optional_u64(e: &mut Encoder, value: Option<u64>) {
@@ -3527,6 +3618,36 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
         (T_ROOM_DISPLAY_REVISION, 2) => {
             return Ok(Frame::RoomDisplayRevision {
                 revision: digest(d)?,
+            });
+        }
+        (T_ARRIVAL_HEAD, 2) => {
+            return Ok(Frame::ArrivalHead {
+                head: history_cursor(d)?,
+            });
+        }
+        (T_ARRIVAL_PAGE, 4) => {
+            let Frame::Rows { rows } = decode_body(d, T_ROWS, 2)? else {
+                return Err(Error::MalformedIpc("arrival page rows"));
+            };
+            if rows.len() > PAGE_ENTRIES {
+                return Err(Error::MalformedIpc("arrival page row count"));
+            }
+            let instance = d
+                .bytes()?
+                .try_into()
+                .map_err(|_| Error::MalformedIpc("arrival page instance"))?;
+            let next = match d.array()? {
+                0 => None,
+                1 => Some(history_cursor(d)?),
+                _ => return Err(Error::MalformedIpc("arrival page continuation")),
+            };
+            if next.is_some_and(|cursor| cursor.instance != instance) {
+                return Err(Error::MalformedIpc("arrival page cursor instance"));
+            }
+            return Ok(Frame::ArrivalPage {
+                rows,
+                instance,
+                next,
             });
         }
         (T_ROOM_PAGE, 2) => {
@@ -5591,6 +5712,7 @@ async fn serve_requests(
         if matches!(
             reply,
             Frame::Rows { .. }
+                | Frame::ArrivalPage { .. }
                 | Frame::FilteredRows { .. }
                 | Frame::RoomPage { .. }
                 | Frame::GovernancePage { .. }
@@ -6075,6 +6197,26 @@ fn one_line(text: &str) -> String {
 /// and be able to ask something else.
 async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
     let frame = match request {
+        Request::ArrivalHead { channel_id } => {
+            match handle.history_reader().arrival_head(channel_id).await {
+                Ok(head) => Frame::ArrivalHead { head },
+                Err(reason) => Frame::Error { reason },
+            }
+        }
+        Request::ArrivalPage { channel_id, after } => {
+            match handle
+                .history_reader()
+                .arrival_page(channel_id, Some(after), PAGE_ENTRIES)
+                .await
+            {
+                Ok(page) => Frame::ArrivalPage {
+                    rows: page.rows,
+                    instance: page.instance,
+                    next: page.next,
+                },
+                Err(reason) => Frame::Error { reason },
+            }
+        }
         Request::GovernancePage { channel_id, query } => {
             use crate::node::channel::history::{Query, Reply};
             match handle
