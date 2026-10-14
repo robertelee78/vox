@@ -1277,6 +1277,7 @@ private struct RoomView: View {
                     .onChange(of: following) { value in model.timelineFollowingNewest = value }
                     .onChange(of: model.timelineFollowingNewest) { value in following = value }
                     .onChange(of: window.seen) { _ in markSeen() }
+                    .onChange(of: model.readMarkRevision) { _ in markSeen() }
                     .onChange(of: model.showing) { _ in updateLooking() }
                     .onDisappear { if model.lookingAt == room { model.lookingAt = nil } }
                     // A row whose body has just arrived is read now, even if its frame is

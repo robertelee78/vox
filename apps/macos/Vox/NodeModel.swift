@@ -2323,6 +2323,7 @@ final class NodeModel: ObservableObject {
                   !self.readRoomOrder.isEmpty {
                 let room = self.readRoomOrder.removeFirst()
                 guard let ids = self.unmarked.removeValue(forKey: room) else { continue }
+                var acknowledged = false
                 do {
                     try await self.client.markRead(room: room, ids: ids)
                     guard epoch == self.nodeObservationEpoch, !Task.isCancelled else { return }
@@ -2332,6 +2333,7 @@ final class NodeModel: ObservableObject {
                     while self.markedOrder.count > Self.recentReadLimit {
                         self.marked.remove(self.markedOrder.removeFirst())
                     }
+                    acknowledged = true
                     self.scheduleUnread(room)
                     readLog.debug("marked read: \(ids.count) in \(room, privacy: .public)")
                 } catch {
@@ -2340,12 +2342,14 @@ final class NodeModel: ObservableObject {
                     }
                 }
                 self.pendingReadIDs.subtract(ids)
+                if acknowledged { self.readMarkRevision = UUID() }
             }
         }
     }
 
     /// Recent successful deduplication only. Evicted IDs may be marked again idempotently;
     /// durable read state belongs to the node, not this bounded client cache.
+    @Published private(set) var readMarkRevision = UUID()
     private static let recentReadLimit = 1024
     private static let pendingReadLimit = 1024
     private var readMarkEpoch = UUID()
