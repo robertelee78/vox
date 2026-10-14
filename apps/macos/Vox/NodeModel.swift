@@ -2417,7 +2417,7 @@ extension NodeModel {
             }
             repeat {
                 self.threadRefreshDirty = false
-                func current() -> Bool {
+                @MainActor func current() -> Bool {
                     !Task.isCancelled && self.threadReadIsCurrent(room: room, generation: generation,
                         epoch: epoch, request: refreshID)
                 }
@@ -2664,7 +2664,7 @@ extension NodeModel {
         let request = UUID()
         threadAuthorRequests[root] = request
         threadSummaryErrors[root] = nil
-        func current() -> Bool {
+        @MainActor func current() -> Bool {
             roomOnScreen == room && roomReadGeneration == generation
                 && nodeObservationEpoch == epoch && ended == nil && !Task.isCancelled
                 && threadSummaryVersions[root] == snapshot && threadAuthorRequests[root] == request
