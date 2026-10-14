@@ -416,6 +416,9 @@ const T_OPERATION_PAGE: u64 = 8734;
 const T_UNREAD_SUMMARY_REQ: u64 = 8735;
 const T_UNREAD_SUMMARY: u64 = 8736;
 const T_MARK_READ_AT: u64 = 8737;
+const T_SESSIONS_OPEN_REQ: u64 = 8738;
+const T_THREAD_PAGE_REQ: u64 = 8739;
+const T_THREAD_PAGE: u64 = 8740;
 const T_ROOM_PAGE_REQ: u64 = 5492;
 const T_ROOM_PAGE: u64 = 5493;
 
@@ -520,6 +523,17 @@ pub enum Request {
         before: Option<Digest32>,
         /// The most rows requested; zero uses the daemon's bounded page size.
         limit: u64,
+    },
+    /// A bounded previous/next page in one thread's existing arrival index.
+    ThreadPage {
+        /// Selected room.
+        channel_id: Digest32,
+        /// Canonical thread root.
+        root: Digest32,
+        /// Exclusive first held reply when moving earlier.
+        before: Option<Digest32>,
+        /// Exclusive last held reply when moving later; cannot accompany before.
+        after: Option<Digest32>,
     },
     /// Begin streaming events. Everything emitted from this point reaches this
     /// client; nothing before it does. **Terminal** — the connection becomes a
@@ -721,6 +735,14 @@ pub enum Request {
         /// The room.
         channel_id: Digest32,
         /// The opening entry of the last Session of the page before; `None` from the start.
+        after: Option<Digest32>,
+    },
+    /// One indexed page of currently open Sessions this node may drive.
+    /// Uses SessionsPage; ended history is not walked to produce this live selection.
+    SessionsOpenPage {
+        /// Selected room.
+        channel_id: Digest32,
+        /// Exclusive opening from the previous page.
         after: Option<Digest32>,
     },
     /// Exact number of answerable requests across every currently readable open Session.
@@ -1175,6 +1197,19 @@ impl Request {
                     .bytes(before.as_ref().map_or(&[][..], |d| &d[..]))
                     .uint(*limit);
             }
+            Request::ThreadPage {
+                channel_id,
+                root,
+                before,
+                after,
+            } => {
+                e.array(5)
+                    .uint(T_THREAD_PAGE_REQ)
+                    .bytes(channel_id)
+                    .bytes(root)
+                    .bytes(before.as_ref().map_or(&[][..], |hash| &hash[..]))
+                    .bytes(after.as_ref().map_or(&[][..], |hash| &hash[..]));
+            }
             Request::Subscribe => {
                 e.array(1).uint(T_SUBSCRIBE);
             }
@@ -1371,6 +1406,10 @@ impl Request {
             }
             Request::Sessions { channel_id } => {
                 e.array(2).uint(T_SESSIONS_REQ).bytes(channel_id);
+            }
+            Request::SessionsOpenPage { channel_id, after } => {
+                e.array(3).uint(T_SESSIONS_OPEN_REQ).bytes(channel_id);
+                e.bytes(after.as_ref().map_or(&[][..], |hash| &hash[..]));
             }
             Request::SessionsPending { channel_id, after } => {
                 e.array(3).uint(T_SESSIONS_PENDING_REQ).bytes(channel_id);
@@ -2319,6 +2358,29 @@ impl Request {
                     not_before,
                 })
             }
+            (T_THREAD_PAGE_REQ, 5) => {
+                let channel_id = digest(&mut d)?;
+                let root = digest(&mut d)?;
+                let before = optional_digest(&mut d)?;
+                let after = optional_digest(&mut d)?;
+                if before.is_some() && after.is_some() {
+                    return Err(Error::MalformedIpc("thread page direction"));
+                }
+                d.finish()?;
+                Ok(Request::ThreadPage {
+                    channel_id,
+                    root,
+                    before,
+                    after,
+                })
+            }
+            (T_SESSIONS_OPEN_REQ, 3) => {
+                let channel_id = digest(&mut d)?;
+                let after = optional_digest(&mut d)?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::SessionsOpenPage { channel_id, after })
+            }
             (T_SESSIONS_PAGE_REQ, 3) => {
                 let channel_id = digest(&mut d)?;
                 let after = optional_digest(&mut d)?;
@@ -2707,6 +2769,15 @@ pub enum Frame {
         /// Continue after this author when another page remains.
         next_author: Option<Digest32>,
     },
+    /// One bounded thread window, in arrival order, with exclusive navigation cursors.
+    ThreadPage {
+        /// Readable replies only.
+        rows: Vec<MessageRow>,
+        /// Fetch earlier replies before this entry, or no earlier page.
+        before: Option<Digest32>,
+        /// Fetch later replies after this entry, or no later page.
+        after: Option<Digest32>,
+    },
     /// The selected room's display token; only comparable on the same held node connection.
     RoomDisplayRevision {
         /// Opaque equality token, never an authorization grant or a read cursor.
@@ -3034,6 +3105,18 @@ impl Frame {
                     e.bytes(author);
                 }
                 e.bytes(next_author.as_ref().map_or(&[][..], |d| &d[..]));
+            }
+            Frame::ThreadPage {
+                rows,
+                before,
+                after,
+            } => {
+                e.array(4).uint(T_THREAD_PAGE).array(rows.len());
+                for row in rows {
+                    encode_row(&mut e, row);
+                }
+                e.bytes(before.as_ref().map_or(&[][..], |hash| &hash[..]))
+                    .bytes(after.as_ref().map_or(&[][..], |hash| &hash[..]));
             }
             Frame::FilteredRows { rows, next } => {
                 e.array(3).uint(T_FILTERED_ROWS).array(rows.len());
@@ -3842,6 +3925,21 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
         (T_ARRIVAL_HEAD, 2) => {
             return Ok(Frame::ArrivalHead {
                 head: history_cursor(d)?,
+            });
+        }
+        (T_THREAD_PAGE, 4) => {
+            let Frame::Rows { rows } = decode_body(d, T_ROWS, 2)? else {
+                return Err(Error::MalformedIpc("thread page rows"));
+            };
+            if rows.len() > PAGE_ENTRIES {
+                return Err(Error::MalformedIpc("thread page row count"));
+            }
+            let before = optional_digest(d)?;
+            let after = optional_digest(d)?;
+            return Ok(Frame::ThreadPage {
+                rows,
+                before,
+                after,
             });
         }
         (T_OPERATION_PAGE, 5) => {
@@ -5140,6 +5238,7 @@ async fn write_sessions(
     room: Digest32,
     after: Option<Digest32>,
     whole: bool,
+    open_only: bool,
     exact: Option<(Digest32, String)>,
     lifecycle: Option<(Option<crate::node::sessions::LifecycleCursor>, Option<u64>)>,
     writing: &std::sync::atomic::AtomicBool,
@@ -5155,6 +5254,7 @@ async fn write_sessions(
         match exact {
             Some((node, id)) => Query::Exact { node, id },
             None => Query::Page {
+                open_only,
                 after,
                 revision: None,
                 limit: SESSIONS_PAGE_ROWS,
@@ -5869,26 +5969,43 @@ async fn serve_requests(
             continue;
         }
         let sessions = match &request {
-            Request::Sessions { channel_id } => Some((*channel_id, None, true, None, None)),
+            Request::Sessions { channel_id } => Some((*channel_id, None, true, false, None, None)),
             Request::SessionsPage { channel_id, after } => {
-                Some((*channel_id, *after, false, None, None))
+                Some((*channel_id, *after, false, false, None, None))
+            }
+            Request::SessionsOpenPage { channel_id, after } => {
+                Some((*channel_id, *after, false, true, None, None))
             }
             Request::SessionLookup {
                 channel_id,
                 node,
                 id,
-            } => Some((*channel_id, None, false, Some((*node, id.clone())), None)),
+            } => Some((
+                *channel_id,
+                None,
+                false,
+                false,
+                Some((*node, id.clone())),
+                None,
+            )),
             Request::SessionLifecycle {
                 channel_id,
                 before,
                 not_before,
-            } => Some((*channel_id, None, false, None, Some((*before, *not_before)))),
+            } => Some((
+                *channel_id,
+                None,
+                false,
+                false,
+                None,
+                Some((*before, *not_before)),
+            )),
             _ => None,
         };
-        if let Some((room, after, whole, exact, lifecycle)) = sessions {
+        if let Some((room, after, whole, open_only, exact, lifecycle)) = sessions {
             let writing = std::sync::atomic::AtomicBool::new(false);
             tokio::select! {
-                result = write_sessions(&mut stream, handle, room, after, whole, exact, lifecycle, &writing) => {
+                result = write_sessions(&mut stream, handle, room, after, whole, open_only, exact, lifecycle, &writing) => {
                     if !result? { return Ok(()); }
                 },
                 () = node_detached(&mut watch) => {
@@ -5961,6 +6078,7 @@ async fn serve_requests(
                 | Frame::ArrivalPage { .. }
                 | Frame::FilteredRows { .. }
                 | Frame::RoomPage { .. }
+                | Frame::ThreadPage { .. }
                 | Frame::GovernancePage { .. }
                 | Frame::Order { .. }
                 | Frame::Members { .. }
@@ -7058,6 +7176,39 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 Err(reason) => Frame::Error { reason },
             }
         }
+        Request::ThreadPage {
+            channel_id,
+            root,
+            before,
+            after,
+        } => {
+            use crate::node::channel::history::{Query, Reply};
+            match handle
+                .room_history(
+                    channel_id,
+                    Query::ThreadPage {
+                        root,
+                        before,
+                        after,
+                    },
+                )
+                .await
+            {
+                Ok(Reply::ThreadPage {
+                    rows,
+                    before,
+                    after,
+                }) => Frame::ThreadPage {
+                    rows,
+                    before,
+                    after,
+                },
+                Ok(_) => Frame::Error {
+                    reason: "unexpected thread page answer".into(),
+                },
+                Err(reason) => Frame::Error { reason },
+            }
+        }
         Request::RoomDisplayRevision { channel_id } => {
             match handle.room_display_revision(&channel_id).await {
                 Ok(revision) => Frame::RoomDisplayRevision { revision },
@@ -7295,6 +7446,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         }
         Request::Sessions { .. }
         | Request::SessionsPage { .. }
+        | Request::SessionsOpenPage { .. }
         | Request::SessionLookup { .. }
         | Request::SessionLifecycle { .. } => Frame::Error {
             reason: "Sessions require a reply stream".into(),

@@ -38,6 +38,11 @@ pub(crate) enum Query {
         after: Option<u64>,
         limit: usize,
     },
+    ThreadPage {
+        root: Digest32,
+        before: Option<Digest32>,
+        after: Option<Digest32>,
+    },
     ThreadSummary {
         root: Digest32,
         after_author: Option<Digest32>,
@@ -93,6 +98,11 @@ pub(crate) enum Reply {
     NoticeExact(Option<NoticeRow>),
     NoticePage(NoticePage),
     CursorPage(MessagePage),
+    ThreadPage {
+        rows: Vec<MessageRow>,
+        before: Option<Digest32>,
+        after: Option<Digest32>,
+    },
     ThreadSummary {
         count: u64,
         last: u64,
@@ -638,6 +648,96 @@ impl View<'_> {
                     rows.push(row);
                 }
                 Ok(Reply::Page { rows, next: cursor })
+            }
+            Query::ThreadPage {
+                root,
+                before,
+                after,
+            } => {
+                if before.is_some() && after.is_some() {
+                    return Err(Failure::Request(
+                        "choose either earlier or later thread replies",
+                    ));
+                }
+                let filter = Filter::Thread(root);
+                let anchor = before.or(after);
+                let mut cursor = if let Some(hash) = anchor {
+                    if !self.rendered.contains(&filter, &hash)? {
+                        return Err(Failure::Request(
+                            "cursor not among this room's thread replies",
+                        ));
+                    }
+                    let fact = self.rendered.fact(&hash)?.ok_or(Failure::Request(
+                        "cursor not among this room's thread replies",
+                    ))?;
+                    Some((fact.cache, hash))
+                } else {
+                    None
+                };
+                let anchor_key = cursor;
+                let backwards = before.is_some();
+                let mut rows = Vec::new();
+                let mut used = 0usize;
+                let mut first = None;
+                let mut last = None;
+                for _ in 0..crate::node::ipc::PAGE_ENTRIES {
+                    let Some((key, _)) =
+                        self.rendered
+                            .step(Some(&filter), false, cursor, backwards)?
+                    else {
+                        break;
+                    };
+                    let row = self
+                        .row(&key.1)?
+                        .ok_or(Error::MalformedAtRest("thread row missing"))?;
+                    let cost = row
+                        .text
+                        .len()
+                        .saturating_add(crate::node::ipc::ROW_OVERHEAD);
+                    if !rows.is_empty() && used.saturating_add(cost) > bytes {
+                        break;
+                    }
+                    used = used.saturating_add(cost);
+                    if first.is_none() {
+                        first = Some(key);
+                    }
+                    last = Some(key);
+                    cursor = Some(key);
+                    rows.push(row);
+                }
+                if backwards {
+                    rows.reverse();
+                    std::mem::swap(&mut first, &mut last);
+                }
+                let first = first.or(anchor_key);
+                let last = last.or(anchor_key);
+                let before = match first {
+                    Some(key)
+                        if self
+                            .rendered
+                            .step(Some(&filter), false, Some(key), true)?
+                            .is_some() =>
+                    {
+                        Some(key.1)
+                    }
+                    _ => None,
+                };
+                let after = match last {
+                    Some(key)
+                        if self
+                            .rendered
+                            .step(Some(&filter), false, Some(key), false)?
+                            .is_some() =>
+                    {
+                        Some(key.1)
+                    }
+                    _ => None,
+                };
+                Ok(Reply::ThreadPage {
+                    rows,
+                    before,
+                    after,
+                })
             }
             Query::ThreadSummary { root, after_author } => {
                 let (count, last) = self.rendered.summary(&entry_store::Filter::Thread(root))?;

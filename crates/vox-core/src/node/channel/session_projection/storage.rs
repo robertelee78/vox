@@ -56,9 +56,10 @@ pub(super) enum Tree {
     FloorSelf,
     FloorContinuity,
     FloorFirst,
+    OpenSessions,
 }
 
-const TREES: usize = 35;
+const TREES: usize = 36;
 
 impl Tree {
     fn index(self) -> usize {
@@ -98,6 +99,7 @@ impl Tree {
             Self::FloorSelf => 32,
             Self::FloorContinuity => 33,
             Self::FloorFirst => 34,
+            Self::OpenSessions => 35,
         }
     }
 }
@@ -217,7 +219,7 @@ impl Header {
         let stored_trees = d.array()?;
         // These are append-only derived roots within the current development format. Keep
         // every original locator; startup streams the absent private/control facts.
-        if next == 0 || !matches!(stored_trees, 26 | 29 | 30 | TREES) {
+        if next == 0 || !matches!(stored_trees, 26 | 29 | 30 | 35 | TREES) {
             return Err(invalid("Session index header roots"));
         }
         let mut roots = [0; TREES];
@@ -248,14 +250,14 @@ impl Header {
             }
             _ => return Err(invalid("Session index public cursor")),
         };
-        let ready = match d.uint()? {
+        let mut ready = match d.uint()? {
             0 => false,
             1 => true,
             _ => return Err(invalid("Session index ready state")),
         };
         let private_generation = d.uint()?;
         let activity_generation = d.uint()?;
-        let published = match d.array()? {
+        let mut published = match d.array()? {
             0 => None,
             1 => {
                 if d.array()? != 2 {
@@ -265,7 +267,7 @@ impl Header {
             }
             _ => return Err(invalid("Session published revision option")),
         };
-        let building = match d.array()? {
+        let mut building = match d.array()? {
             0 => None,
             1 => {
                 if d.array()? != 6 {
@@ -313,6 +315,17 @@ impl Header {
         };
         let activity = ActivityState::read(&mut d, next)?;
         d.finish()?;
+        if stored_trees < TREES {
+            // Preserve all original private locators and bodies. The new derived open-only
+            // selector is unpublished until the existing bounded metadata fold fills it.
+            ready = false;
+            published = None;
+            if let Some(work) = &mut building {
+                work.phase = 7;
+                work.cursor = None;
+                work.cleanup = 0;
+            }
+        }
         Ok(Self {
             roots,
             next,
@@ -734,6 +747,7 @@ impl<'a, 's> Write<'a, 's> {
             Tree::Counts,
             Tree::AuthorOpenings,
             Tree::OpenCounts,
+            Tree::OpenSessions,
             Tree::Lifecycle,
         ] {
             std::mem::swap(
@@ -773,6 +787,7 @@ impl<'a, 's> Write<'a, 's> {
             Tree::Counts,
             Tree::AuthorOpenings,
             Tree::OpenCounts,
+            Tree::OpenSessions,
             Tree::ActivityFacts,
             Tree::ActivityRaw,
             Tree::ActivityCounts,
@@ -815,6 +830,7 @@ impl<'a, 's> Write<'a, 's> {
                         | Tree::Counts
                         | Tree::AuthorOpenings
                         | Tree::OpenCounts
+                        | Tree::OpenSessions
                         | Tree::ActivityRaw
                         | Tree::ActivityCounts
                         | Tree::ActivitySessions
