@@ -1860,6 +1860,9 @@ private struct MessageRow: View {
                     .caption().secondaryText()
                     .accessibilityIdentifier("whereabouts-\(message.id)")
             }
+            if model.hasRecipientNavigation(message.id) {
+                MessageRecipientNavigation(model: model, id: message.id)
+            }
         }
         .padding(.leading, addressedToMe ? Space.s8 * scale : 0)
         .overlay(alignment: .leading) {
@@ -2776,4 +2779,39 @@ private struct ThreadPanel: View {
         }
     }
 
+}
+
+
+private struct MessageRecipientNavigation: View {
+    @ObservedObject var model: NodeModel
+    let id: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Space.s4) {
+            if let footer = model.messageFooters[id] {
+                HStack {
+                    if footer.readAfter != nil {
+                        Button("More readers") { Task { await model.moreMessageReaders(id) } }
+                            .accessibilityIdentifier("message-readers-more-" + id)
+                    }
+                    if footer.pulledAfter != nil {
+                        Button("More downloads") { Task { await model.moreMessageDownloads(id) } }
+                            .accessibilityIdentifier("message-downloads-more-" + id)
+                    }
+                    if model.footerIsPaged(id) {
+                        Button("First recipients") { Task { await model.firstMessageRecipients(id) } }
+                            .accessibilityIdentifier("message-recipients-first-" + id)
+                    }
+                }
+                .buttonStyle(.plain)
+                .disabled(model.messageFootersLoading)
+            }
+            if let error = model.messageFooterErrors[id] {
+                Text("Recipients unavailable: " + error).secondaryText()
+                    .accessibilityIdentifier("message-recipients-error-" + id)
+                Button("Reload recipients") { Task { await model.firstMessageRecipients(id) } }
+                    .buttonStyle(.plain)
+            }
+        }
+    }
 }
