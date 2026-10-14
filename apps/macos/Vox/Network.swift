@@ -398,7 +398,7 @@ struct RoomAnchorSearch: View {
                     .secondaryText().fixedSize(horizontal: false, vertical: true)
             }
         }
-        .onChange(of: model.anchorChoiceContext) { _, _ in choices.retire() }
+        .onChange(of: model.anchorChoiceContext) { _ in choices.retire() }
         .onDisappear { choices.retire() }
     }
 }
