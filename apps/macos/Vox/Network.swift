@@ -307,7 +307,7 @@ final class RoomAnchorChoices: ObservableObject {
                 noSearchAnswers = result.isEmpty
                 found = kept
             }
-            for endpoint in result where !kept.contains(where: { $0.fingerprint == endpoint.fingerprint }) {
+            for endpoint in result {
                 found.removeAll { $0.fingerprint == endpoint.fingerprint }
                 found.append(endpoint)
             }
@@ -317,7 +317,13 @@ final class RoomAnchorChoices: ObservableObject {
         }
     }
     func keep(_ endpoint: RoomAnchorEndpoint) {
-        kept.removeAll { $0.fingerprint == endpoint.fingerprint }; kept.append(endpoint)
+        // A newly resolved address for a kept identity is offered, never silently applied
+        // or ignored. Only this explicit Keep merges it into the creation snapshot.
+        let previous = kept.first { $0.fingerprint == endpoint.fingerprint }
+        let merged = RoomAnchorEndpoint(fingerprint: endpoint.fingerprint,
+            addresses: Array(Set((previous?.addresses ?? []) + endpoint.addresses)).sorted())
+        kept.removeAll { $0.fingerprint == endpoint.fingerprint }; kept.append(merged)
+        found.removeAll { $0.fingerprint == endpoint.fingerprint }; found.append(merged)
     }
     func remove(_ endpoint: RoomAnchorEndpoint) { kept.removeAll { $0.fingerprint == endpoint.fingerprint } }
 }
@@ -337,6 +343,7 @@ struct RoomAnchorSearch: View {
                 .accessibilityIdentifier("room-anchor-search")
             HStack {
                 TextField("fingerprint@address or host:port", text: $input)
+                    .disabled(choices.busy || (applyingToRoom && !model.canManageRoomAnchors))
                     .accessibilityIdentifier("room-anchor-choice-input")
                 Button("Resolve") {
                     let value = input.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -355,10 +362,14 @@ struct RoomAnchorSearch: View {
                         VStack(alignment: .leading, spacing: Space.s4) {
                             Text(endpoint.fingerprint).font(Theme.mono).textSelection(.enabled)
                             Text(endpoint.addresses.joined(separator: ", ")).font(Theme.mono).textSelection(.enabled)
-                            if !applyingToRoom && choices.kept.contains(where: { $0.fingerprint == endpoint.fingerprint }) {
+                            if !applyingToRoom && choices.kept.contains(where: {
+                                $0.fingerprint == endpoint.fingerprint && Set($0.addresses) == Set(endpoint.addresses)
+                            }) {
                                 Button("Remove") { choices.remove(endpoint) }
                             } else {
-                                Button(applyingToRoom ? "Keep for This Room" : "Keep") {
+                                Button(applyingToRoom ? "Keep for This Room"
+                                       : (choices.kept.contains(where: { $0.fingerprint == endpoint.fingerprint })
+                                          ? "Keep Additional Addresses" : "Keep")) {
                                     if applyingToRoom {
                                         let context = model.anchorChoiceContext
                                         Task {

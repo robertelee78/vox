@@ -283,7 +283,10 @@ final class NodeModel: ObservableObject {
             && roomAnchorAuthorityGeneration == roomReadGeneration
     }
 
-    @Published var sheet: NodeSheet?
+    private var sheetInstance = UUID()
+    @Published var sheet: NodeSheet? {
+        didSet { if oldValue != sheet { sheetInstance = UUID() } }
+    }
     /// Whether the room's inspector shows (View > Hide Inspector, ⌥⌘I), kept across launches.
     @Published var inspectorShown = Columns.inspectorShown {
         didSet { UserDefaults.standard.set(inspectorShown, forKey: Columns.inspectorShownKey) }
@@ -1576,7 +1579,7 @@ final class NodeModel: ObservableObject {
     /// A sheet's search results belong to this exact actor, room generation and sheet.
     var anchorChoiceContext: String {
         me + "/" + nodeObservationEpoch.uuidString + "/" + roomReadGeneration.uuidString
-            + "/" + (sheet?.rawValue ?? "closed")
+            + "/" + (sheet?.rawValue ?? "closed") + "/" + sheetInstance.uuidString
     }
 
     func searchRoomAnchorChoices(context: String) async throws -> [RoomAnchorEndpoint] {
