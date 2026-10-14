@@ -2666,10 +2666,14 @@ private struct ThreadPanel: View {
                         } else if let error = model.threadError {
                             Text("Replies unavailable: " + error).secondaryText()
                                 .accessibilityIdentifier("thread-error")
-                            Button("Retry") { model.retryThread() }
+                            Button("Reload first replies") { model.retryThread() }
                         } else if model.threadReplies.isEmpty {
                             Text("No retained replies you can read.").secondaryText()
                                 .accessibilityIdentifier("thread-empty")
+                        }
+                        if model.threadHasEarlier && !model.threadLoading {
+                            Button("Earlier replies") { model.earlierThreadReplies() }
+                                .accessibilityIdentifier("thread-earlier")
                         }
                         if model.threadHasMore && !model.threadLoading {
                             Button("More replies") { model.moreThreadReplies() }

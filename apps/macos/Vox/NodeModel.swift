@@ -162,6 +162,10 @@ final class NodeModel: ObservableObject {
     @Published private(set) var threadReplies: [RoomMessage] = []
     @Published private(set) var threadLoading = false
     @Published private(set) var threadHasMore = false
+    @Published private(set) var threadHasEarlier = false
+    private var threadInstance: Data?
+    private var threadBefore: String?
+    private var threadAfter: String?
     @Published private(set) var threadError: String?
     private var threadGeneration = UUID()
     private var threadRefreshID = UUID()
@@ -171,7 +175,6 @@ final class NodeModel: ObservableObject {
     private var threadRefreshDirty = false
     private var threadDisplayRevision: String?
     private var threadForcedSummaries: Set<String> = []
-    private var threadPagesLoaded = 1
     private var threadRefreshTask: Task<Void, Never>?
     private var threadPageTask: Task<Void, Never>?
 
@@ -3287,7 +3290,10 @@ extension NodeModel {
         threadSummaryVersions = [:]
         threadAuthorRequests = [:]
         threadPageDirty = false
-        threadPagesLoaded = 1
+        threadInstance = nil
+        threadBefore = nil
+        threadAfter = nil
+        threadHasEarlier = false
         threadPageTask?.cancel()
         threadSummaries = [:]
         threadSummaryErrors = [:]
@@ -3423,7 +3429,10 @@ extension NodeModel {
         threadGeneration = UUID()
         threadPageTask?.cancel()
         threadLoading = false
-        threadPagesLoaded = 1
+        threadInstance = nil
+        threadBefore = nil
+        threadAfter = nil
+        threadHasEarlier = false
         threadPageDirty = false
         openThread = message.id
         threadRootMessage = message
@@ -3442,7 +3451,10 @@ extension NodeModel {
         selectionAnchor = root?.id
         threadGeneration = UUID()
         threadPageTask?.cancel()
-        threadPagesLoaded = 1
+        threadInstance = nil
+        threadBefore = nil
+        threadAfter = nil
+        threadHasEarlier = false
         threadPageDirty = false
         openThread = nil
         threadRootMessage = nil
@@ -3463,14 +3475,24 @@ extension NodeModel {
     }
 
     func moreThreadReplies() { loadThreadPage(replacing: false) }
-    func retryThread() { loadThreadPage(replacing: true) }
+    func earlierThreadReplies() { loadThreadPage(replacing: false, earlier: true) }
+    func retryThread() {
+        threadInstance = nil
+        threadBefore = nil
+        threadAfter = nil
+        loadThreadPage(replacing: true)
+    }
 
-    private func loadThreadPage(replacing: Bool) {
+    private func loadThreadPage(replacing: Bool, earlier: Bool = false) {
         guard let room = roomOnScreen, let root = openThread, ended == nil, !threadLoading else { return }
         let generation = threadGeneration
         let roomGeneration = roomReadGeneration
         let epoch = nodeObservationEpoch
-        let cursor = replacing ? "" : threadReplies.last?.id ?? ""
+        let instance = threadInstance
+        let before = earlier ? threadBefore : nil
+        let after = !replacing && !earlier ? threadAfter : nil
+        let heldIDs = threadReplies.map(\.id)
+        if !replacing && (earlier ? before == nil : after == nil) { return }
         threadLoading = true
         threadError = nil
         threadPageTask = Task { [weak self] in
@@ -3490,48 +3512,36 @@ extension NodeModel {
                     && self.nodeObservationEpoch == epoch && self.ended == nil
             }
             do {
-                if self.threadRootMessage == nil {
-                    // Recovery revalidates exactly one root through the daemon's indexed
-                    // read; it never walks General or reuses a formerly readable cached body.
-                    let readable = try await self.client.threadRoot(room: room, root: root)
+                let readable = try await self.client.threadRoot(room: room, root: root)
+                guard current() else { return }
+                guard let readable, readable.id == root, !readable.owed, readable.thread.isEmpty else {
+                    throw VoxError.Failed(reason: "The thread's starting message is no longer readable or retained.")
+                }
+                if replacing, let instance, !heldIDs.isEmpty {
+                    let rows = try await self.retainedRoomEntries(room: room, instance: instance,
+                        ids: heldIDs, current: current)
                     guard current() else { return }
-                    guard let readable, readable.id == root, !readable.owed, readable.thread.isEmpty else {
-                        throw VoxError.Failed(reason: "The thread's starting message is no longer readable or retained.")
+                    guard rows.allSatisfy({ !$0.owed && $0.thread == root }) else {
+                        throw VoxError.Failed(reason: "A held reply is no longer readable in this thread.")
                     }
-                    self.threadRootMessage = readable
-                }
-                var next = cursor
-                var result: [RoomMessage] = []
-                let pages = replacing ? self.threadPagesLoaded : 1
-                var more = false
-                var awaitingBodies = false
-                for _ in 0..<pages {
-                    let page = try await self.client.readThreadPage(room: room, root: root, since: next)
+                    self.threadReplies = Self.boundedRoomRows(rows, newest: false)
+                    // Exact refresh is not a new navigation page; keep its existing cursors.
+                } else {
+                    let page = try await self.client.threadPage(room: room, root: root,
+                        instance: instance, before: before, after: after)
                     guard current() else { return }
-                    guard page.allSatisfy({ $0.owed || $0.thread == root }),
-                          page.isEmpty || page.last?.id != next else {
-                        throw VoxError.Failed(reason: "The thread page did not belong to this thread or advance its cursor.")
+                    guard page.messages.allSatisfy({ $0.owed || $0.thread == root }),
+                          instance == nil || page.instance == instance else {
+                        throw VoxError.Failed(reason: "The thread page did not match its saved room or root.")
                     }
-                    result += page
-                    more = !page.isEmpty
-                    if page.isEmpty { break }
-                    guard let mark = page.last, !mark.owed else {
-                        // The current API refuses an owed cursor. Keep that absence honest;
-                        // never drain/replay a page or pretend the thread ended.
-                        awaitingBodies = true
-                        more = false
-                        break
-                    }
-                    next = mark.id
+                    self.threadReplies = Self.boundedRoomRows(page.messages, newest: false)
+                    self.threadInstance = page.instance
+                    self.threadBefore = page.before
+                    self.threadAfter = page.after
+                    self.threadHasEarlier = page.before != nil
+                    self.threadHasMore = page.after != nil
                 }
-                if replacing { self.threadReplies = result }
-                else {
-                    let held = Set(self.threadReplies.map(\.id))
-                    self.threadReplies += result.filter { !held.contains($0.id) }
-                    if !result.isEmpty { self.threadPagesLoaded += 1 }
-                }
-                self.threadHasMore = more
-                if awaitingBodies { self.threadError = "Some reply bodies have not been received. Retry when they arrive." }
+                self.threadRootMessage = readable
                 self.threadLoading = false
             } catch {
                 guard current() else { return }
