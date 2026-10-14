@@ -202,13 +202,13 @@ impl ChannelState {
                     &signer.public_key(),
                     now_ms,
                 )?;
-                Some((hash, id, log, sender, seen))
+                Some((entry, hash, id, log, sender, seen))
             } else {
                 None
             };
             let mut batch = profile.store().batch()?;
-            let posted = if let Some((hash, id, log, sender, seen)) = prepared {
-                self.publish_entry_into(&mut batch)?;
+            let posted = if let Some((entry, hash, id, log, sender, seen)) = prepared {
+                self.publish_entry_into(&mut batch, &entry)?;
                 batch.put_segment(&self.channel_id, SegmentKind::LogDb, id, &log)?;
                 batch.put_segment(&self.channel_id, SegmentKind::Index, id, &seen)?;
                 batch.put_segment(
