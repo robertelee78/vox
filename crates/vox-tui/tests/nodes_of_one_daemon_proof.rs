@@ -1770,13 +1770,13 @@ fn enrolled_computers_follow_node_changes_and_retire_removed_authority() {
     }
     computer(&a, &["personal", "old-personal"]);
     computer(&b, &["personal", "remote-personal"]);
-    let enroll = |sponsor: &Account, incoming: &Account| {
+    let enroll = |sponsor: &Account, incoming: &Account, verdict: &str| {
         let staging = |account: &Account, args: &[&str]| {
             let args: Vec<_> = [vec!["computer"], args.to_vec(), vec!["--json"]].concat();
             let (ok, out, err) = account.run(&args, "");
-            assert!(ok, "APPARATUS: enrollment staging {args:?}: {out}{err}");
+            assert!(ok, "{verdict}: enrollment command {args:?}: {out}{err}");
             serde_json::from_str::<serde_json::Value>(&out)
-                .unwrap_or_else(|e| panic!("APPARATUS: enrollment status: {e}: {out}"))
+                .unwrap_or_else(|e| panic!("{verdict}: enrollment status: {e}: {out}"))
         };
         let offer = staging(sponsor, &["invite"]);
         let preview = staging(
@@ -1794,11 +1794,11 @@ fn enrolled_computers_follow_node_changes_and_retire_removed_authority() {
                         && status["computers"].as_array().is_some_and(|v| v.len() >= 2)
                 })
             }),
-            "APPARATUS: enrollment did not complete before the next setup operation"
+            "{verdict}: enrollment did not complete before the next operation"
         );
     };
-    enroll(&a, &b);
-    enroll(&b, &c);
+    enroll(&a, &b, "APPARATUS");
+    enroll(&b, &c, "APPARATUS");
     assert!(
         wait_until(Duration::from_secs(60), || has(
             &ring(&b, "worker"),
@@ -2304,7 +2304,7 @@ fn enrolled_computers_follow_node_changes_and_retire_removed_authority() {
             .any(|n| n["fingerprint"] == worker && n["computer"] == c_id)),
         "PRODUCT: explicit recovery did not publish its successor management binding"
     );
-    enroll(&a, &b);
+    enroll(&a, &b, "PRODUCT");
     assert!(
         wait_until(Duration::from_secs(30), || computer(&b, &["status"])
             ["computers"]
@@ -2363,7 +2363,7 @@ fn enrolled_computers_follow_node_changes_and_retire_removed_authority() {
         "PRODUCT: locally removed manager did not retain retirement evidence"
     );
     binding(&a, "recover-group", "group", "");
-    enroll(&b, &a);
+    enroll(&b, &a, "PRODUCT");
     assert!(
         wait_until(Duration::from_secs(30), || computer(&a, &["status"])
             ["computers"]
