@@ -107,6 +107,18 @@ fn outcome_authors<'a>(origin: &'a Fact, authors: &'a [Digest32]) -> &'a [Digest
         authors
     }
 }
+
+/// The reference index is shared across activity kinds. A matching reference alone must
+/// not attach an unrelated failed drive result as another rendered line. `Other` includes
+/// tool calls; their tool-done records are folded into the call, never standalone lines.
+fn outcome_kind(origin: Kind) -> Option<Kind> {
+    match origin {
+        Kind::Other => Some(Kind::ToolDone),
+        Kind::Approval | Kind::Question => Some(Kind::Resolved),
+        Kind::Drive => Some(Kind::DriveResult),
+        Kind::Resolved | Kind::ToolDone | Kind::DriveResult => None,
+    }
+}
 /// Each applicable author contributes one indexed predecessor, not its whole
 /// transcript. The greatest arrival is the room's next raw/visible origin.
 fn previous(
@@ -163,7 +175,10 @@ fn cost(
         bytes = bytes
             .checked_add(byte_prefix(read, T::PartBytes, &origin.hash, boundary)?)
             .ok_or_else(bad)?;
-        if let Some(reference) = origin.outcome_reference() {
+        if let Some(reference) = origin
+            .outcome_reference()
+            .filter(|_| outcome_kind(origin.kind).is_some())
+        {
             for author in outcome_authors(origin, authors) {
                 bytes = bytes
                     .checked_add(byte_prefix(
@@ -197,7 +212,10 @@ fn physical_rows(
                     .unwrap_or(0),
             )
             .ok_or(Error::StreamRefused(crate::node::ipc::SESSION_READ_LIMIT))?;
-        if let Some(reference) = origin.outcome_reference() {
+        if let Some(reference) = origin
+            .outcome_reference()
+            .filter(|_| outcome_kind(origin.kind).is_some())
+        {
             for author in outcome_authors(origin, authors) {
                 // OutcomeCount's producer uses (reference, author), unlike OutcomeBytes'
                 // authored-reference hash. Keep this identical to activity_fold::visible.
@@ -240,6 +258,9 @@ fn already_in(read: &Read<'_>, origins: &[u64], f: &Fact) -> Result<bool> {
             return Ok(true);
         }
         if let Some(reference) = old.outcome_reference() {
+            if outcome_kind(old.kind) != Some(f.kind) {
+                continue;
+            }
             if old.association.is_some() && old.author != f.author {
                 continue;
             }
@@ -294,7 +315,9 @@ fn next_companion(
         }
         2 => {
             let mut next = None;
-            if let Some(reference) = original.outcome_reference() {
+            if let (Some(reference), Some(kind)) =
+                (original.outcome_reference(), outcome_kind(original.kind))
+            {
                 for author in outcome_authors(&original, authors) {
                     let group = authored(&reference, author);
                     let bound = cursor
@@ -309,10 +332,12 @@ fn next_companion(
                         }
                     }
                 }
-            }
-            if let Some(arrival) = next {
-                cursor.after = Some(arrival);
-                return Ok(Some(arrival));
+                if let Some(arrival) = next {
+                    // Advancing even past an unrelated kind keeps the actor's bounded scan
+                    // progressing. Do not suppress that row when it is selected as an origin.
+                    cursor.after = Some(arrival);
+                    return Ok((fact(read, arrival)?.kind == kind).then_some(arrival));
+                }
             }
             cursor.origin += 1;
             cursor.phase = 0;

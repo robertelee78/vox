@@ -389,7 +389,8 @@ const T_SESSION_ENTRIES: u64 = 5431;
 const T_SESSION_ROWS: u64 = 5432;
 /// `[5435, channel_id, before, which, session_id]` — [`Request::SessionPage`]; an empty `before`
 /// is the newest page; `which` is 0 every Session, 1 the Session `session_id`, 2 files out
-/// (ADR-034 FR-4, FR-5).
+/// (ADR-034 FR-4, FR-5). An optional final `limit` selects fewer logical origins; omitted or
+/// zero preserves the usual page size. Request/exact filters keep their fields before it.
 const T_SESSION_PAGE_REQ: u64 = 5435;
 /// `[5436, [row, …], older, instance]` — [`Frame::SessionPage`].
 const T_SESSION_PAGE: u64 = 5436;
@@ -775,6 +776,9 @@ pub enum Request {
         which: crate::node::drive::SessionFilter,
         /// The first entry of the page after this one; `None` for the newest page.
         before: Option<Digest32>,
+        /// A smaller origin count for a bounded consumer; zero keeps [`SESSION_PAGE_ROWS`].
+        /// Applied before selection, so `older` and the returned cursor remain authoritative.
+        limit: u64,
     },
     /// A room's Sessions (ADR-029), as its log says, answered with [`Frame::Sessions`], all in one
     /// frame, or with a plain error when they do not fit one (ADR-034 FR-2).
@@ -1630,6 +1634,7 @@ impl Request {
                 channel_id,
                 which,
                 before,
+                limit,
             } => {
                 use crate::node::drive::SessionFilter;
                 let (kind, id) = match which {
@@ -1641,16 +1646,17 @@ impl Request {
                     SessionFilter::Request { session_id, .. } => (4, session_id.as_str()),
                     SessionFilter::Entries { session_id, .. } => (6, session_id.as_str()),
                 };
-                e.array(match kind {
+                let fields = match kind {
                     4 => 6,
                     6 => 8,
                     _ => 5,
-                })
-                .uint(T_SESSION_PAGE_REQ)
-                .bytes(channel_id)
-                .bytes(before.as_ref().map_or(&[][..], |d| &d[..]))
-                .uint(kind)
-                .text(id);
+                };
+                e.array(fields + usize::from(*limit != 0))
+                    .uint(T_SESSION_PAGE_REQ)
+                    .bytes(channel_id)
+                    .bytes(before.as_ref().map_or(&[][..], |d| &d[..]))
+                    .uint(kind)
+                    .text(id);
                 if let SessionFilter::Request { reference, .. } = which {
                     e.text(reference);
                 }
@@ -1665,6 +1671,9 @@ impl Request {
                     for hash in entries {
                         e.bytes(hash);
                     }
+                }
+                if *limit != 0 {
+                    e.uint(*limit);
                 }
             }
             Request::Pull { channel_id, entry } => {
@@ -2629,7 +2638,7 @@ impl Request {
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::SessionsPage { channel_id, after })
             }
-            (T_SESSION_PAGE_REQ, 5 | 6 | 8) => {
+            (T_SESSION_PAGE_REQ, 5..=9) => {
                 use crate::node::drive::SessionFilter;
                 let channel_id = digest(&mut d)?;
                 let before = optional_digest(&mut d)?;
@@ -2637,17 +2646,25 @@ impl Request {
                     .uint()
                     .map_err(|_| Error::MalformedIpc("ipc session page kind"))?;
                 let id = text(&mut d, "ipc session page id")?;
+                let fields = match kind {
+                    4 => 6,
+                    6 => 8,
+                    _ => 5,
+                };
+                if n != fields && n != fields + 1 {
+                    return Err(Error::MalformedIpc("ipc session page fields"));
+                }
                 let which = match kind {
-                    0 if n == 5 => SessionFilter::All,
-                    1 if n == 5 => SessionFilter::Session(id),
-                    2 if n == 5 => SessionFilter::FilesOut,
-                    3 if n == 5 => SessionFilter::Pending(id),
-                    5 if n == 5 => SessionFilter::SessionRaw(id),
-                    4 if n == 6 => SessionFilter::Request {
+                    0 => SessionFilter::All,
+                    1 => SessionFilter::Session(id),
+                    2 => SessionFilter::FilesOut,
+                    3 => SessionFilter::Pending(id),
+                    5 => SessionFilter::SessionRaw(id),
+                    4 => SessionFilter::Request {
                         session_id: id,
                         reference: text(&mut d, "ipc request reference")?,
                     },
-                    6 if n == 8 => {
+                    6 => {
                         let node = digest(&mut d)?;
                         let instance = d
                             .bytes()?
@@ -2670,12 +2687,14 @@ impl Request {
                     }
                     _ => return Err(Error::MalformedIpc("ipc session page kind")),
                 };
+                let limit = if n == fields + 1 { d.uint()? } else { 0 };
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::SessionPage {
                     channel_id,
                     which,
                     before,
+                    limit,
                 })
             }
             (T_PULL, 3) => {
@@ -5304,13 +5323,16 @@ async fn write_session_activity(
     room: Digest32,
     mut which: crate::node::drive::SessionFilter,
     before: Option<Digest32>,
-    whole: bool,
+    page_limit: Option<usize>,
     writing: &std::sync::atomic::AtomicBool,
 ) -> Result<bool> {
     use crate::node::channel::session_projection::{
         ActivityCursor as Cursor, ActivityQuery as Query, ActivityReply as Reply,
     };
     use crate::node::drive::SessionFilter;
+    // The legacy whole-room read still refuses a partial answer. Paged readers may choose
+    // fewer origins without changing the index's order, byte budget or companion semantics.
+    let whole = page_limit.is_none();
     macro_rules! answer {
         ($query:expr) => {{
             let answer = tokio::select! {
@@ -5366,7 +5388,7 @@ async fn write_session_activity(
     let Reply::Selected(plan) = answer!(Query::Select {
         which,
         before,
-        max_rows: SESSION_PAGE_ROWS,
+        max_rows: page_limit.unwrap_or(SESSION_PAGE_ROWS),
         max_bytes: session_page_bytes(),
         revision
     }) else {
@@ -6327,19 +6349,29 @@ async fn serve_requests(
                 channel_id,
                 which,
                 before,
-            } => Some((*channel_id, which.clone(), *before, false)),
+                limit,
+            } => {
+                let limit = if *limit == 0 {
+                    SESSION_PAGE_ROWS
+                } else {
+                    usize::try_from(*limit)
+                        .unwrap_or(usize::MAX)
+                        .min(SESSION_PAGE_ROWS)
+                };
+                Some((*channel_id, which.clone(), *before, Some(limit)))
+            }
             Request::SessionEntries { channel_id } => Some((
                 *channel_id,
                 crate::node::drive::SessionFilter::All,
                 None,
-                true,
+                None,
             )),
             _ => None,
         };
-        if let Some((room, which, before, whole)) = activity {
+        if let Some((room, which, before, page_limit)) = activity {
             let writing = std::sync::atomic::AtomicBool::new(false);
             tokio::select! {
-                result = write_session_activity(&mut stream,handle,room,which,before,whole,&writing) => {
+                result = write_session_activity(&mut stream,handle,room,which,before,page_limit,&writing) => {
                     if !result? { return Ok(()); }
                 },
                 () = node_detached(&mut watch) => {
@@ -9106,11 +9138,30 @@ impl IpcClient {
         which: crate::node::drive::SessionFilter,
         before: Option<Digest32>,
     ) -> Result<Frame> {
+        self.session_page_limited(channel_id, which, before, 0)
+            .await
+    }
+
+    /// A Session page with a smaller origin budget. Zero preserves the normal page size;
+    /// a positive limit is capped at [`SESSION_PAGE_ROWS`]. Counts and cursors come from the
+    /// same indexed selection, never from dropping rendered lines after the page was read.
+    /// Complete multipart activities and their outcomes retain the existing byte rules.
+    ///
+    /// # Errors
+    /// As [`IpcClient::session_page`].
+    pub async fn session_page_limited(
+        &mut self,
+        channel_id: Digest32,
+        which: crate::node::drive::SessionFilter,
+        before: Option<Digest32>,
+        limit: u64,
+    ) -> Result<Frame> {
         let reply = self
             .request(&Request::SessionPage {
                 channel_id,
                 which,
                 before,
+                limit,
             })
             .await?;
         Ok(self.older_daemon(reply))

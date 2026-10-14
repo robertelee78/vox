@@ -24,6 +24,9 @@ struct SessionPages: Equatable {
 
     /// Following replaces the window with the authoritative newest page. While the reader
     /// is on older activity, refresh only held rows; new output must not move that window.
+    /// The FFI selects at most 128 logical origins under its byte budget before rendering,
+    /// retaining one complete oversized activity. Keep its older count and cursor intact:
+    /// trimming rendered lines here could skip origins that join or render no line.
     mutating func newest(_ page: FfiSessionRead, following: Bool) {
         if following {
             instance = page.instance

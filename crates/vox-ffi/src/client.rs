@@ -1361,7 +1361,8 @@ fn listing_failed(what: &str, e: Error) -> VoxError {
 }
 
 /// One page of the Session `session_id`'s entries (ADR-034 FR-4): the newest before `before`, or
-/// the newest when `None`; and how many are older.
+/// the newest when `None`; and how many are older. Limit origins before rendering, so
+/// companions can join or suppress lines without inventing a pagination cursor.
 async fn session_page(
     c: &mut IpcClient,
     channel_id: Digest32,
@@ -1369,7 +1370,10 @@ async fn session_page(
     before: Option<Digest32>,
 ) -> Result<(Vec<vox_core::node::drive::SessionRow>, u64, [u8; 16]), VoxError> {
     let which = vox_core::node::drive::SessionFilter::Session(session_id.to_owned());
-    match c.session_page(channel_id, which, before).await {
+    match c
+        .session_page_limited(channel_id, which, before, SESSION_WINDOW_ROWS as u64)
+        .await
+    {
         Ok(Frame::SessionPage {
             rows,
             older,
@@ -2217,6 +2221,11 @@ macro_rules! on_held {
 /// One legal row may stand alone above the byte budget, as in the daemon's pages.
 const ROOM_WINDOW_ROWS: usize = 128;
 const ROOM_WINDOW_BYTES: usize = vox_core::node::ipc::ROWS_BUDGET;
+
+/// Newest/older pages and exact held refresh share this logical-origin ceiling.
+/// Multipart pieces and outcomes do not add rendered rows. The daemon's existing
+/// byte budget still applies, including one complete legal oversized activity.
+const SESSION_WINDOW_ROWS: usize = 128;
 
 async fn room_read_fence(
     client: &mut IpcClient,
@@ -5144,6 +5153,8 @@ impl VoxClient {
     /// them. An ended Session stays readable (SE-5); one whose opening has not reached this node is
     /// read from its entries, with a note saying so. Without drive, no entries and a note saying
     /// whose trust this node lacks (SC-3).
+    /// The daemon selects at most 128 logical origins before rendering. Its byte budget may
+    /// select fewer; one legal oversized activity stays complete and readable on its own.
     ///
     /// # Errors
     /// A malformed id, the node's refusal, or no such Session, said as `vox room session` says it.
@@ -5192,7 +5203,7 @@ impl VoxClient {
         ids: Vec<String>,
     ) -> Result<FfiSessionRead, VoxError> {
         use vox_core::node::{drive::SessionFilter, session_view::read};
-        if ids.len() > 128 {
+        if ids.len() > SESSION_WINDOW_ROWS {
             return Err(failed(
                 "at most 128 held Session IDs can be refreshed together",
             ));

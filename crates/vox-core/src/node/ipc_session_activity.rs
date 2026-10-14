@@ -48,6 +48,27 @@ impl Preflight {
         }
         let body: serde_json::Value = serde_json::from_str(&row.body).map_err(|_| INVALID)?;
         let object = body.as_object().ok_or(INVALID)?;
+        // The sealed index uses an explicit ref before falling back to id/of; the renderer
+        // uses id/of for drive pairing. Refuse contradictory aliases before emitting any
+        // logical rows, rather than letting an unrelated result add a standalone line.
+        let canonical = match object.get("kind").and_then(serde_json::Value::as_str) {
+            Some("drive") => Some("id"),
+            Some("drive-result") => Some("of"),
+            _ => None,
+        };
+        if let (Some(canonical), Some(reference)) = (
+            canonical,
+            object.get("ref").and_then(serde_json::Value::as_str),
+        ) {
+            if reference
+                != object
+                    .get(canonical)
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+            {
+                return Err("this Session activity has conflicting drive references; use vox room session ROOM SESSION --raw, then --before ENTRY for older raw pages");
+            }
+        }
         let Some(part) = object.get("part") else {
             return Ok(());
         };
