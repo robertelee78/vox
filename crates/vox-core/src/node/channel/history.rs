@@ -10,6 +10,17 @@ use crate::node::api::{
 };
 
 pub(crate) enum Query {
+    ViewPage {
+        view: crate::node::api::RoomView,
+        instance: Option<[u8; 16]>,
+        before: Option<Digest32>,
+        limit: usize,
+    },
+    ViewLocate {
+        view: crate::node::api::RoomView,
+        instance: [u8; 16],
+        entries: Vec<Digest32>,
+    },
     Footers {
         instance: [u8; 16],
         entries: Vec<crate::node::api::FooterSelection>,
@@ -337,6 +348,117 @@ impl View<'_> {
         Ok(row)
     }
 
+    fn view_filter(&self, view: &crate::node::api::RoomView) -> Answer<Filter> {
+        use crate::node::api::RoomView;
+        match view {
+            RoomView::General | RoomView::All => {
+                if !self.rendered.room_views_ready()? {
+                    return Err(Failure::Request(
+                        "the room is preparing selected history; retry",
+                    ));
+                }
+                Ok(Filter::General)
+            }
+            RoomView::Tag(tag) => {
+                if !vox_agentcomms::envelope::is_valid_tag(tag) {
+                    return Err(Failure::Request("invalid room history tag"));
+                }
+                Ok(Filter::Tag(tag.clone()))
+            }
+        }
+    }
+    fn view_contains(&self, filter: &Filter, hash: &Digest32) -> Result<bool> {
+        Ok(self.rendered.contains(filter, hash)?
+            || (matches!(filter, Filter::General) && self.rendered.is_owed(hash)?))
+    }
+    fn view_page(
+        &self,
+        view: &crate::node::api::RoomView,
+        instance: Option<[u8; 16]>,
+        before: Option<Digest32>,
+        limit: usize,
+        bytes: usize,
+    ) -> Answer<Reply> {
+        if instance.is_some_and(|value| value != self.rendered.history_instance()) {
+            return Err(Failure::Request(
+                "the saved room changed; open its current page again",
+            ));
+        }
+        if before.is_some() && instance.is_none() {
+            return Err(Failure::Request(
+                "an earlier selected page requires its saved room identity",
+            ));
+        }
+        let filter = self.view_filter(view)?;
+        let mut cursor = match before {
+            Some(hash) => {
+                if !self.view_contains(&filter, &hash)? {
+                    return Err(Failure::Request(
+                        "cursor not among this room's selected messages",
+                    ));
+                }
+                self.mark(
+                    hash,
+                    false,
+                    "cursor not among this room's selected messages",
+                )?;
+                self.rendered.order().key(&hash)?
+            }
+            None => None,
+        };
+        let mut total = self.rendered.selected_before(&filter, cursor)?;
+        if matches!(filter, Filter::General) {
+            let owed = self.rendered.owed_before(cursor)?;
+            if owed != 0 {
+                self.ch
+                    .require_legacy_classification_complete_in(self.rendered.transaction())?;
+            }
+            total = total
+                .checked_add(owed)
+                .ok_or(Error::MalformedAtRest("selected history count overflow"))?;
+        }
+        let mut rows = Vec::new();
+        let mut used = 0usize;
+        for _ in 0..limit.min(128) {
+            let rendered = self
+                .rendered
+                .step(Some(&filter), true, cursor, true)?
+                .map(|(key, _)| key);
+            let owed = if matches!(filter, Filter::General) {
+                self.rendered.owed_step(cursor, true)?
+            } else {
+                None
+            };
+            let key = match (rendered, owed) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, b) => a.or(b),
+            };
+            let Some(key) = key else {
+                break;
+            };
+            let row = self
+                .row(&key.1)?
+                .ok_or(Error::MalformedAtRest("selected visible row missing"))?;
+            let cost = row
+                .text
+                .len()
+                .saturating_add(crate::node::ipc::ROW_OVERHEAD);
+            if !rows.is_empty() && used.saturating_add(cost) > bytes {
+                break;
+            }
+            used = used.saturating_add(cost);
+            cursor = Some(key);
+            rows.push(row);
+        }
+        let older = total
+            .checked_sub(rows.len() as u64)
+            .ok_or(Error::MalformedAtRest(
+                "selected history count smaller than page",
+            ))?;
+        rows.reverse();
+        Ok(Reply::Older { rows, older })
+    }
+
     fn filtered(
         &self,
         selection: Selection,
@@ -503,6 +625,42 @@ impl View<'_> {
     fn answer(&self, query: Query, bytes: usize) -> Answer<Reply> {
         let cursor_error = "cursor not in this room's timeline";
         match query {
+            Query::ViewPage {
+                view,
+                instance,
+                before,
+                limit,
+            } => self.view_page(&view, instance, before, limit, bytes),
+            Query::ViewLocate {
+                view,
+                instance,
+                entries,
+            } => {
+                if instance != self.rendered.history_instance() {
+                    return Err(Failure::Request(
+                        "the saved room changed; open its current page again",
+                    ));
+                }
+                if entries.len() > crate::node::ipc::MAX_FIND {
+                    return Err(Failure::Request("too many message ids"));
+                }
+                let filter = self.view_filter(&view)?;
+                let mut found = BTreeSet::new();
+                for hash in entries {
+                    if self.view_contains(&filter, &hash)? && self.row(&hash)?.is_some() {
+                        let key = self
+                            .rendered
+                            .order()
+                            .key(&hash)?
+                            .ok_or(Error::MalformedAtRest("selected located row order missing"))?;
+                        found.insert(key);
+                    }
+                }
+                Ok(Reply::Located {
+                    entries: found.into_iter().map(|(_, hash)| hash).collect(),
+                    revision: Revision::of(self.ch, &self.rendered)?,
+                })
+            }
             Query::DisplayRevision => {
                 use sha2::{Digest, Sha256};
                 let revision = Revision::of(self.ch, &self.rendered)?;
@@ -1097,6 +1255,17 @@ impl View<'_> {
 }
 
 impl ChannelState {
+    /// One bounded turn of derived view-index catch-up: (more work, just became ready).
+    pub(crate) fn advance_room_views(&self, store: &Store) -> Result<(bool, bool)> {
+        let was_ready = self
+            .entries
+            .render_view(store, &self.sek, &self.channel_id)?
+            .room_views_ready()?;
+        let more = self
+            .entries
+            .advance_room_views(store, &self.sek, &self.channel_id)?;
+        Ok((more, !was_ready && !more))
+    }
     pub(crate) fn history_instance(&self, store: &Store) -> Result<[u8; 16]> {
         Ok(self
             .entries

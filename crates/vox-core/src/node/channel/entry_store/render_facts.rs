@@ -239,6 +239,7 @@ impl Page {
 /// Concrete rendered subsets, all computed only after a body has passed its read gate.
 #[derive(Clone, Debug)]
 pub(crate) enum Filter {
+    General,
     Type(String),
     Op(String),
     Tag(String),
@@ -251,6 +252,7 @@ impl Filter {
     fn digest(&self) -> Digest32 {
         use crate::hash::sha256_concat;
         match self {
+            Self::General => sha256_concat(&[b"render-general\0"]),
             Self::Type(s) => sha256_concat(&[b"render-type\0", s.as_bytes()]),
             Self::Op(s) => sha256_concat(&[b"render-op\0", s.as_bytes()]),
             Self::Tag(s) => sha256_concat(&[b"render-tag\0", s.as_bytes()]),
@@ -266,6 +268,13 @@ fn filter_key(filter: &Filter, display: bool) -> Key {
     key[32] = u8::from(display);
     key
 }
+// These are derived selection metadata in the existing filter directory, not page
+// locators. An absent marker means bounded catch-up is required, never an empty view.
+fn general_state_key(ready: bool) -> Key {
+    let mut key = hashed(&crate::hash::sha256(b"render-general-state-v1"));
+    key[32] = u8::from(ready);
+    key
+}
 fn operation_key(author: &Digest32, op: &str, selector: u8) -> Key {
     let mut key = hashed(&crate::hash::sha256_concat(&[
         b"render-operation\0",
@@ -277,6 +286,9 @@ fn operation_key(author: &Digest32, op: &str, selector: u8) -> Key {
 }
 fn filters(row: &super::super::Rendered) -> Vec<Filter> {
     let mut out = vec![Filter::Author(row.author)];
+    if crate::node::api::message_thread(&row.text).is_none() {
+        out.push(Filter::General);
+    }
     if let Some((kind, op)) = crate::node::api::structured_kind(&row.text) {
         out.push(Filter::Type(kind));
         if let Some(op) = op {
@@ -842,6 +854,36 @@ impl RenderView<'_> {
             &hashed(hash),
         )
     }
+    pub(crate) fn room_views_ready(&self) -> Result<bool> {
+        match self.source().number(
+            self.order.read.sek,
+            self.order.read.channel,
+            self.roots().filters,
+            &general_state_key(true),
+        )? {
+            None => Ok(false),
+            Some(1) => Ok(true),
+            Some(_) => Err(invalid("room view readiness marker")),
+        }
+    }
+    pub(crate) fn selected_before(&self, filter: &Filter, before: Option<OrderKey>) -> Result<u64> {
+        let root = self.root(Some(filter), true)?;
+        let summary = match before {
+            Some(key) => self.source().render_range(
+                self.order.read.sek,
+                self.order.read.channel,
+                root,
+                &ordered(key),
+                true,
+                0,
+            )?,
+            None => {
+                self.source()
+                    .render_summary(self.order.read.sek, self.order.read.channel, root)?
+            }
+        };
+        Ok(summary.count)
+    }
     pub(crate) fn count(&self) -> Result<u64> {
         Ok(self
             .source()
@@ -1096,6 +1138,123 @@ impl Write<'_, '_> {
     }
 }
 impl EntryIndex {
+    /// Add the General selector to current-version saved rooms without resetting their
+    /// authoritative history or other indexes. One transaction examines at most 64 current
+    /// rendered arrivals / 1 MiB (one legal large row alone); a restart resumes the prefix.
+    /// Returns true while another fair maintenance turn is required.
+    pub(crate) fn advance_room_views(
+        &self,
+        store: &Store,
+        sek: &Sek,
+        channel: &Digest32,
+    ) -> Result<bool> {
+        let mut batch = store.batch()?;
+        let mut writer = self.write(&mut batch, sek, channel)?;
+        if writer.directory.phase == Phase::Building {
+            return Ok(true);
+        }
+        let mut roots = writer.render_roots()?;
+        match Source::Batch(writer.batch).number(
+            sek,
+            channel,
+            roots.rendered.filters,
+            &general_state_key(true),
+        )? {
+            Some(1) => return Ok(false),
+            Some(_) => return Err(invalid("room view readiness marker")),
+            None => {}
+        }
+        let mut after = Source::Batch(writer.batch).number(
+            sek,
+            channel,
+            roots.rendered.filters,
+            &general_state_key(false),
+        )?;
+        let mut bytes = 0usize;
+        let mut pending = true;
+        for _ in 0..PROMOTION_ENTRIES {
+            let start = match after {
+                Some(id) => match successor(ordered((id, [u8::MAX; 32]))) {
+                    Some(key) => key,
+                    None => {
+                        pending = false;
+                        break;
+                    }
+                },
+                None => [0; 64],
+            };
+            let next = Source::Batch(writer.batch).first(
+                sek,
+                channel,
+                roots.rendered.arrival,
+                &start,
+                0,
+            )?;
+            let Some((key, Value::Rendered(fact))) = next else {
+                if next.is_some() {
+                    return Err(invalid("room view arrival fact"));
+                }
+                pending = false;
+                break;
+            };
+            let (arrival, hash) = order_key(key)?;
+            let opened = Source::Batch(writer.batch)
+                .open(sek, channel, SegmentKind::PlaintextCache, fact.cache)?
+                .ok_or(invalid("room view cache missing"))?;
+            if bytes != 0 && bytes.saturating_add(opened.len()) > PROMOTION_BYTES {
+                break;
+            }
+            bytes = bytes.saturating_add(opened.len());
+            let super::super::CacheRow::Text(row) = super::super::parse_cache(&opened)? else {
+                return Err(invalid("room view cache kind"));
+            };
+            if row.entry_hash != hash || fact.cache != arrival {
+                return Err(invalid("room view cache locator"));
+            }
+            if crate::node::api::message_thread(&row.text).is_none() {
+                let clock = Source::Batch(writer.batch)
+                    .number(sek, channel, roots.clock, &hashed(&hash))?
+                    .ok_or(invalid("room view clock missing"))?;
+                writer.change_filter(
+                    &mut roots.rendered,
+                    &Filter::General,
+                    (arrival, hash),
+                    false,
+                    Some(fact),
+                )?;
+                writer.change_filter(
+                    &mut roots.rendered,
+                    &Filter::General,
+                    (clock, hash),
+                    true,
+                    Some(fact),
+                )?;
+            }
+            after = Some(arrival);
+        }
+        roots.rendered.filters = writer.change_value(
+            roots.rendered.filters,
+            general_state_key(false),
+            if pending {
+                after.map(Value::Number)
+            } else {
+                None
+            },
+        )?;
+        if !pending {
+            roots.rendered.filters = writer.change_value(
+                roots.rendered.filters,
+                general_state_key(true),
+                Some(Value::Number(1)),
+            )?;
+        }
+        writer.set_render_roots(roots)?;
+        writer.seal()?;
+        batch.commit()?;
+        self.committed();
+        Ok(pending)
+    }
+
     /// Only a missing derived index is rebuilt. Each transaction visits a bounded cache
     /// prefix and stores its exact continuation; a restart resumes without resetting history.
     pub(crate) fn prepare_rendered(

@@ -263,6 +263,26 @@ pub fn structured_kind(text: &str) -> Option<(String, Option<String>)> {
     Some((kind, op))
 }
 
+/// The message domain selected before applying a bounded room-page limit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RoomView {
+    /// General roots and currently unclassified owed placeholders.
+    General,
+    /// General's messages; clients add their separately bounded Session lifecycle notices.
+    All,
+    /// Every readable message carrying this exact tag, including thread replies.
+    Tag(String),
+}
+
+/// A valid explicit thread reference, shared by indexed selection and message display.
+#[must_use]
+pub fn message_thread(text: &str) -> Option<Digest32> {
+    vox_agentcomms::envelope::Envelope::parse(text)
+        .ok()?
+        .thread
+        .and_then(|root| crate::node::link::b32_decode(root.trim(), "thread").ok())
+}
+
 /// The tags a message's text carries (#636): its envelope's `tags`, each a valid tag
 /// ([`vox_agentcomms::envelope::is_valid_tag`]), none for prose or an envelope without them.
 #[must_use]
