@@ -16,7 +16,6 @@
 //! the policy. An entry this node cannot read has no claimed time it can see, and ages from when it
 //! was first seen.
 
-use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 use crate::hash::Digest32;
@@ -236,74 +235,5 @@ impl Tracked {
     pub fn base(&self) -> u64 {
         self.claimed_ms
             .map_or(self.first_seen_ms, |c| c.min(self.first_seen_ms))
-    }
-}
-
-/// Every content entry of a room that still holds its body, ordered by age, so a sweep costs what
-/// it prunes rather than what the room holds.
-#[derive(Debug, Default)]
-pub(crate) struct RetentionIndex {
-    live: HashMap<Digest32, Tracked>,
-    by_age: BTreeSet<(u64, Digest32)>,
-    by_step_age: BTreeSet<(u64, Digest32)>,
-}
-
-impl RetentionIndex {
-    /// Start tracking a stored body.
-    pub fn track(&mut self, hash: Digest32, tracked: Tracked) {
-        self.forget(&hash);
-        self.by_age.insert((tracked.base(), hash));
-        if tracked.steps {
-            self.by_step_age.insert((tracked.base(), hash));
-        }
-        self.live.insert(hash, tracked);
-    }
-
-    /// Record that the body was read: its claimed time, milliseconds, and its cache row.
-    pub fn rendered(&mut self, hash: &Digest32, claimed_ms: u64, cache_id: u64) {
-        if let Some(mut t) = self.live.get(hash).copied() {
-            t.claimed_ms = Some(claimed_ms);
-            t.cache_id = Some(cache_id);
-            self.track(*hash, t);
-        }
-    }
-
-    /// What is known about `hash`, if its body is still held.
-    pub fn get(&self, hash: &Digest32) -> Option<Tracked> {
-        self.live.get(hash).copied()
-    }
-
-    /// Stop tracking `hash`, returning what was known.
-    pub fn forget(&mut self, hash: &Digest32) -> Option<Tracked> {
-        let t = self.live.remove(hash)?;
-        self.by_age.remove(&(t.base(), *hash));
-        self.by_step_age.remove(&(t.base(), *hash));
-        Some(t)
-    }
-
-    /// Remove Session bodies due under their separate policy without scanning messages.
-    pub fn take_steps_due(&mut self, cutoff_ms: u64) -> Vec<(Digest32, Tracked)> {
-        let due: Vec<Digest32> = self
-            .by_step_age
-            .iter()
-            .take_while(|(base, _)| *base <= cutoff_ms)
-            .map(|(_, hash)| *hash)
-            .collect();
-        due.into_iter()
-            .filter_map(|hash| self.forget(&hash).map(|t| (hash, t)))
-            .collect()
-    }
-
-    /// Remove and return every entry whose age base is at or before `cutoff_ms`.
-    pub fn take_due(&mut self, cutoff_ms: u64) -> Vec<(Digest32, Tracked)> {
-        let due: Vec<Digest32> = self
-            .by_age
-            .iter()
-            .take_while(|(base, _)| *base <= cutoff_ms)
-            .map(|(_, h)| *h)
-            .collect();
-        due.into_iter()
-            .filter_map(|h| self.forget(&h).map(|t| (h, t)))
-            .collect()
     }
 }

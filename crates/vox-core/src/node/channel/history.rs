@@ -444,9 +444,8 @@ impl View<'_> {
             None
         } else {
             let tracked = self
-                .ch
-                .retention
-                .get(&row.entry_hash)
+                .rendered
+                .retention(&row.entry_hash)?
                 .ok_or(Error::MalformedAtRest("notice retention missing"))?;
             Some(tracked.base().saturating_add(ttl.saturating_mul(1_000)))
         };
@@ -832,6 +831,12 @@ impl ChannelState {
             return Err(self.save_failure().to_string());
         }
         let result = (|| -> Answer<Reply> {
+            self.prune_retention_page(store)?;
+            if self.retention_due(store, 0)?.1 {
+                return Err(Failure::Request(
+                    "the room is removing expired saved history; retry",
+                ));
+            }
             if !self.refresh_projection(store)? {
                 return Err(Failure::Request(
                     "the room is refreshing saved history; retry",

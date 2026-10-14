@@ -445,7 +445,7 @@ impl Write<'_, '_> {
     fn change_rendered(&mut self, root: u64, key: Key, value: Option<RenderFact>) -> Result<u64> {
         self.change_ranked(root, key, value.map(Value::Rendered))
     }
-    fn render_roots(&self) -> Result<super::Roots> {
+    pub(super) fn render_roots(&self) -> Result<super::Roots> {
         match self.directory.phase {
             Phase::Building => self
                 .directory
@@ -456,7 +456,7 @@ impl Write<'_, '_> {
             Phase::Idle | Phase::Rebuilding | Phase::Switched => Ok(self.directory.active),
         }
     }
-    fn set_render_roots(&mut self, roots: super::Roots) -> Result<()> {
+    pub(super) fn set_render_roots(&mut self, roots: super::Roots) -> Result<()> {
         if self.directory.phase == Phase::Building {
             self.directory
                 .promotion
@@ -925,6 +925,8 @@ impl Write<'_, '_> {
         self.directory.render_epoch = 1;
         self.directory.render_ready = true;
         self.directory.render_cursor = None;
+        self.directory.retention_stage = 2;
+        self.directory.retention_cursor = None;
         Ok(())
     }
 }
@@ -936,7 +938,7 @@ impl EntryIndex {
         store: &Store,
         sek: &Sek,
         channel: &Digest32,
-        retained: impl Fn(&Digest32, u64) -> bool,
+        retained: impl Fn(&Batch<'_>, &Digest32, u64) -> Result<bool>,
     ) -> Result<()> {
         loop {
             let mut batch = store.batch()?;
@@ -962,7 +964,7 @@ impl EntryIndex {
                 bytes = bytes.saturating_add(opened.len());
                 if let super::super::CacheRow::Text(mut row) = super::super::parse_cache(&opened)? {
                     row.arrival = id;
-                    if retained(&row.entry_hash, id) {
+                    if retained(writer.batch, &row.entry_hash, id)? {
                         writer.put_rendered(&row, 0)?;
                     }
                 }

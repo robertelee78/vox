@@ -217,6 +217,17 @@ impl ChannelState {
                     SEG_SENDER,
                     &sender,
                 )?;
+                self.queue_retention(
+                    &mut batch,
+                    hash,
+                    Some(Tracked {
+                        log_id: id,
+                        first_seen_ms: now_ms,
+                        steps: false,
+                        claimed_ms: Some(now_ms),
+                        cache_id: None,
+                    }),
+                )?;
                 Some((hash, id))
             } else {
                 None
@@ -245,16 +256,7 @@ impl ChannelState {
         if let Some((hash, id)) = posted {
             self.entries.committed();
             self.next_log_id = id.saturating_add(1);
-            self.retention.track(
-                hash,
-                Tracked {
-                    log_id: id,
-                    first_seen_ms: now_ms,
-                    steps: false,
-                    claimed_ms: Some(now_ms),
-                    cache_id: None,
-                },
-            );
+
             self.gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.finish_entry_publication(profile.store())?;
         }

@@ -235,7 +235,7 @@ impl ChannelState {
             {
                 continue;
             }
-            let Some(tracked) = self.retention.get(&hash) else {
+            let Some(tracked) = self.retention_get(store, &hash)? else {
                 continue;
             };
             if let Ok(record) = Record::legacy(entry) {
@@ -327,6 +327,7 @@ impl ChannelState {
                     .write(&mut batch, &self.sek, &self.channel_id)?;
                 index.committing(self.next_log_id);
                 self.dag.prune_payload(&mut index, &hash)?;
+                index.set_retention(hash, None)?;
                 index.seal()?;
             }
             let age = seal_segment(
@@ -349,9 +350,6 @@ impl ChannelState {
         self.private_sessions.next = next;
         self.entries.committed();
         let gone: BTreeSet<_> = records.iter().map(|(hash, _)| *hash).collect();
-        for hash in &gone {
-            self.retention.forget(hash);
-        }
         self.drive.sessions.retain(|row| {
             !gone.contains(&row.entry_hash)
                 || self.private_sessions.hashes.contains_key(&row.entry_hash)
