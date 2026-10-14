@@ -4700,8 +4700,8 @@ final class FirstRunProof: XCTestCase {
                       "PRODUCT: alice's post with bob's Session ticked in To: must be addressed to that Session alone, <bob>/\(d7Session); bob's node holds it addressed to \(addressedTo)")
         print("[proof] To: bob's Session: the post is addressed to \(addressedTo)")
 
-        // (4e) @alias (ADR-028 K-4, D8): typing "@b" in the composer offers @bob; picked, it is
-        // written in full and bob is addressed, as ticking him in To: does.
+        // (4e) @alias (ADR-028 K-4, D8): typing "@b" in the composer offers @bob; picked, it
+        // becomes a removable address token and bob is addressed, as ticking him in To: does.
         // From an empty To:: bob's d7 Session, ticked in 4d, stays ticked in the room after its post.
         tap(ui, Key.id("compose-to"), "To:")
         tap(ui, Key.id("to-bob-\(d7Session.prefix(8))"), "bob's Session \(d7Session), ticked in 4d, to untick it")
@@ -4714,6 +4714,9 @@ final class FirstRunProof: XCTestCase {
             premise: member(vox, voxEnv, room, bobFp, "bob"))
         words(ui, Key.id("compose-to"), timeout: 10, "@bob picked must address bob, as To: says",
               until: { $0 == "To: bob" })
+        present(ui, Key.id("compose-remove-to-\(bobFp.lowercased())"), timeout: 10,
+                "@bob picked must appear as a removable token for bob's exact fingerprint",
+                premise: member(vox, voxEnv, room, bobFp, "bob"))
         el(ui, composeBox).typeText("\r")
         var mentionedTo: [String] = []
         let mentionUntil = Date().addingTimeInterval(30)
@@ -4721,13 +4724,15 @@ final class FirstRunProof: XCTestCase {
             let rows = run(vox, ["room", "read", "--node", "bob", "--json", room], env: voxEnv).out
             for line in rows.split(separator: "\n") {
                 guard let row = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
-                      (row["text"] as? String)?.contains("MENTION @bob") == true else { continue }
-                mentionedTo = (row["envelope"] as? [String: Any])?["to"] as? [String] ?? ["(not addressed)"]
+                      (row["author"] as? String)?.lowercased() == aliceFp.lowercased(),
+                      let envelope = row["envelope"] as? [String: Any],
+                      (envelope["body"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) == "MENTION" else { continue }
+                mentionedTo = envelope["to"] as? [String] ?? ["(not addressed)"]
             }
             if mentionedTo.isEmpty { Thread.sleep(forTimeInterval: 0.5) }
         }
         XCTAssertEqual(mentionedTo.map { $0.lowercased() }, [bobFp.lowercased()],
-                       "PRODUCT: \"MENTION @bob\", @bob picked in the composer, must be addressed to bob; bob's node holds it addressed to \(mentionedTo)")
+                       "PRODUCT: alice's \"MENTION\", with @bob picked as an address token, must be addressed to bob; bob's node holds it addressed to \(mentionedTo)")
 
         // (4e2) The composer takes more than one line (P19): ⇧↩ adds a line, Return sends both.
         // ⇧↩, not ⌥↩: a Mac's global hotkey may take ⌥↩ (the decider's brings Alacritty forward).
@@ -5235,8 +5240,8 @@ final class FirstRunProof: XCTestCase {
         // (6a) The composer's To: and Urgent, set first: the file takes them (F-1, D11).
         tap(ui, Key.id("compose-to"), "the composer's To:")
         tap(ui, Key.id("to-bob"), "To: bob in the composer", premise: member(vox, voxEnv, room, bobFp, "bob"))
-        ui.typeKey(.escape, modifierFlags: [])
         tap(ui, Key.id("compose-urgent"), "the composer's Urgent")
+        ui.typeKey(.escape, modifierFlags: [])
         let attachButton = Key.id("attach")
         present(ui, attachButton, timeout: 10, "the room must offer Attach")
         tap(ui, attachButton, "Attach (the paperclip)")
@@ -5339,8 +5344,8 @@ final class FirstRunProof: XCTestCase {
         let pulledBytes: Data? = got == want ? bytes : nil
         print("[proof] attached for-bob.bin To: bob; bob pulled \(pulledBytes?.count ?? 0) bytes; rows with the note: \(bobRows.count)")
         // The composer as it was: nobody addressed, not urgent.
-        tap(ui, Key.id("compose-urgent"), "the composer's Urgent, off again")
         tap(ui, Key.id("compose-to"), "the composer's To:")
+        tap(ui, Key.id("compose-urgent"), "the composer's Urgent, off again")
         tap(ui, Key.id("to-bob"), "To: bob in the composer, off again")
         ui.typeKey(.escape, modifierFlags: [])
 
