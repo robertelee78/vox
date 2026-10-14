@@ -43,6 +43,13 @@ pub(super) fn visible(index: &mut Write<'_, '_>, f: &Fact) -> Result<()> {
     let group = f.group();
     let rank = plus(index, T::RawCount, hash_key(&group), 1)?;
     index.activity_set(T::RawRank, member_key(&group, f.arrival), Some(rank))?;
+    let rank = plus(index, T::AllCount, hash_key(&f.author), 1)?;
+    index.activity_set(T::AllRank, member_key(&f.author, f.arrival), Some(rank))?;
+    if f.file_out {
+        let rank = plus(index, T::FileCount, hash_key(&f.author), 1)?;
+        index.activity_set(T::FileRank, member_key(&f.author, f.arrival), Some(rank))?;
+    }
+    super::activity_pending::observe(index, f)?;
     let Some(part_group) = f.part_group else {
         return Ok(());
     };
@@ -50,19 +57,31 @@ pub(super) fn visible(index: &mut Write<'_, '_>, f: &Fact) -> Result<()> {
         if matches!(f.kind, Kind::ToolDone | Kind::Resolved | Kind::DriveResult) {
             index.activity_set(
                 T::Outcomes,
-                member_key(&reference, f.arrival),
+                member_key(&authored_reference(f, &reference), f.arrival),
                 Some(f.arrival),
             )?;
             let mut key = hash_key(&reference);
             key[32..].copy_from_slice(&f.author);
             plus(index, T::OutcomeCount, key, 1)?;
+            let authored = authored_reference(f, &reference);
+            let bytes = plus(index, T::OutcomeBytes, hash_key(&authored), f.bytes)?;
+            index.activity_set(
+                T::OutcomeBytes,
+                member_key(&authored, f.arrival),
+                Some(bytes),
+            )?;
         }
         if matches!(f.kind, Kind::Approval | Kind::Question | Kind::Resolved) {
             index.activity_set(
                 T::Requests,
-                member_key(&reference, f.arrival),
+                member_key(&authored_reference(f, &reference), f.arrival),
                 Some(f.arrival),
             )?;
+        }
+        if matches!(f.kind, Kind::Approval | Kind::Question | Kind::Resolved) {
+            let authored = authored_reference(f, &reference);
+            let rank = plus(index, T::RequestCount, hash_key(&authored), 1)?;
+            index.activity_set(T::RequestRank, member_key(&authored, f.arrival), Some(rank))?;
         }
         if f.kind == Kind::Drive {
             index.activity_set(T::Driven, hash_key(&reference), Some(1))?;
@@ -90,6 +109,12 @@ pub(super) fn visible(index: &mut Write<'_, '_>, f: &Fact) -> Result<()> {
                     Some(f.arrival),
                 )?;
                 plus(index, T::PartCount, hash_key(&original.hash), 1)?;
+                let bytes = plus(index, T::PartBytes, hash_key(&original.hash), f.bytes)?;
+                index.activity_set(
+                    T::PartBytes,
+                    member_key(&original.hash, f.arrival),
+                    Some(bytes),
+                )?;
                 if i >= n {
                     index.activity_set(T::OpenParts, hash_key(&part_group), None)?;
                 }
@@ -202,11 +227,20 @@ pub(super) fn advance(ch: &ChannelState, store: &Store) -> Result<bool> {
     let Some(read) = Read::existing(&snapshot, &ch.sek, &ch.channel_id)? else {
         return Ok(false);
     };
-    if read.header.activity.ready && read.header.activity.work.is_none() {
+    let retire = read.header.activity.ready && read.activity_next(T::RawRetire, None)?.is_some();
+    if read.header.activity.ready && read.header.activity.work.is_none() && !retire {
         return Ok(false);
     }
     let mut batch = store.batch()?;
     let mut index = Write::open(&mut batch, &ch.sek, &ch.channel_id)?;
+    if retire {
+        super::activity_pending::advance(&mut index, 32)?;
+    }
+    if read.header.activity.ready && read.header.activity.work.is_none() {
+        index.seal()?;
+        batch.commit()?;
+        return Ok(true);
+    }
     if let Some(work) = &mut index.header.activity.work {
         if work.phase != 5 && work.invalidated != index.header.activity.invalidated {
             work.phase = 5;
@@ -300,7 +334,7 @@ pub(super) fn advance(ch: &ChannelState, store: &Store) -> Result<bool> {
                 .is_some()
             {
                 phase(&mut index, 3)?;
-            } else {
+            } else if super::activity_pending::advance(&mut index, 32)? {
                 index.publish_activity()?;
             }
         }

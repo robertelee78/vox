@@ -36,6 +36,8 @@ pub(super) struct Fact {
     pub answerable: bool,
     pub direct_action: bool,
     pub succeeded: bool,
+    pub bytes: u64,
+    pub file_out: bool,
 }
 
 pub(super) fn group(session: &str, author: &Digest32) -> Digest32 {
@@ -131,6 +133,8 @@ impl Fact {
                 text("action"),
                 "text" | "interrupt" | "stop" | "slash" | "file"
             ),
+            bytes: (row.body.len() as u64).saturating_add(row.session_id.len() as u64),
+            file_out: kind == "file" && text("dir") == "out",
             succeeded: object
                 .and_then(|b| b.get("ok"))
                 .and_then(serde_json::Value::as_bool)
@@ -149,8 +153,8 @@ impl Fact {
     }
     fn bytes(&self) -> Vec<u8> {
         let mut e = Encoder::new();
-        e.array(14)
-            .uint(1)
+        e.array(16)
+            .uint(2)
             .uint(self.arrival)
             .bytes(&self.hash)
             .bytes(&self.author)
@@ -166,12 +170,14 @@ impl Fact {
         }
         e.uint(u64::from(self.answerable))
             .uint(u64::from(self.direct_action))
-            .uint(u64::from(self.succeeded));
+            .uint(u64::from(self.succeeded))
+            .uint(self.bytes)
+            .uint(u64::from(self.file_out));
         e.finish()
     }
     pub fn read(bytes: &[u8]) -> Result<Self> {
         let mut d = Decoder::new(bytes);
-        if d.array()? != 14 || d.uint()? != 1 {
+        if d.array()? != 16 || d.uint()? != 2 {
             return Err(Error::MalformedAtRest("Session activity fact format"));
         }
         let arrival = d.uint()?;
@@ -229,6 +235,8 @@ impl Fact {
         let answerable = boolean(&mut d)?;
         let direct_action = boolean(&mut d)?;
         let succeeded = boolean(&mut d)?;
+        let bytes = d.uint()?;
+        let file_out = boolean(&mut d)?;
         d.finish()?;
         if arrival == 0 {
             return Err(Error::MalformedAtRest("Session activity arrival"));
@@ -247,6 +255,8 @@ impl Fact {
             answerable,
             direct_action,
             succeeded,
+            bytes,
+            file_out,
         })
     }
 }

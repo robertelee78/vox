@@ -26,8 +26,20 @@ pub(super) enum ActivityTree {
     RoomPending,
     RawCount,
     WaitingParts,
+    PartBytes,
+    OutcomeBytes,
+    AllRank,
+    AllCount,
+    FileRank,
+    FileCount,
+    RequestRank,
+    RequestCount,
+    RawPending,
+    RawPendingPrefix,
+    RawResolved,
+    RawRetire,
 }
-pub(super) const ACTIVITY_TREES: usize = 19;
+pub(super) const ACTIVITY_TREES: usize = 31;
 pub(super) const ALL: [ActivityTree; ACTIVITY_TREES] = [
     ActivityTree::Visible,
     ActivityTree::VisibleCount,
@@ -48,6 +60,18 @@ pub(super) const ALL: [ActivityTree; ACTIVITY_TREES] = [
     ActivityTree::RoomPending,
     ActivityTree::RawCount,
     ActivityTree::WaitingParts,
+    ActivityTree::PartBytes,
+    ActivityTree::OutcomeBytes,
+    ActivityTree::AllRank,
+    ActivityTree::AllCount,
+    ActivityTree::FileRank,
+    ActivityTree::FileCount,
+    ActivityTree::RequestRank,
+    ActivityTree::RequestCount,
+    ActivityTree::RawPending,
+    ActivityTree::RawPendingPrefix,
+    ActivityTree::RawResolved,
+    ActivityTree::RawRetire,
 ];
 impl ActivityTree {
     pub fn index(self) -> usize {

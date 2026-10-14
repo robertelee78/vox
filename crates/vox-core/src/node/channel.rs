@@ -2242,7 +2242,6 @@ impl ChannelState {
         // was gone from the room at the next restart.
         let mut timeline = Vec::new();
         let (mut read_records, mut reads) = (BTreeMap::new(), BTreeMap::new());
-        let mut sessions = Vec::new();
         store.visit_segments(channel_id, SegmentKind::PlaintextCache, |id, seg| {
             next_log_id = next_log_id.max(id.saturating_add(1));
             let row = open_segment(&sek, SegmentKind::PlaintextCache, id, &seg)?;
@@ -2265,16 +2264,9 @@ impl ChannelState {
                         index_read(&mut read_records, &mut reads, r);
                     }
                 }
-                // A Session entry ages like a message (SE-5) and is never a row of the timeline
-                // (SC-4).
-                CacheRow::Session(r) => {
-                    if entry_read
-                        .retention(&r.entry_hash)?
-                        .is_some_and(|t| t.cache_id == Some(id))
-                    {
-                        sessions.push(r);
-                    }
-                }
+                // Private startup/migration indexes these one row at a time before
+                // publication; no resident transcript is reconstructed here.
+                CacheRow::Session(_) => {}
             }
             Ok(())
         })?;
@@ -2374,14 +2366,13 @@ impl ChannelState {
                 }
                 None => BTreeSet::new(),
             };
-        let mut drive = match store.get_segment(channel_id, SegmentKind::KeyMaterial, SEG_DRIVE)? {
+        let drive = match store.get_segment(channel_id, SegmentKind::KeyMaterial, SEG_DRIVE)? {
             Some(seg) => {
                 let bytes = open_segment(&sek, SegmentKind::KeyMaterial, SEG_DRIVE, &seg)?;
                 DriveState::from_state(&bytes)?
             }
             None => DriveState::default(),
         };
-        drive.sessions = crate::node::drive::SessionLog::of(sessions);
         let board_kept =
             match store.get_segment(channel_id, SegmentKind::KeyMaterial, SEG_BOARD_KEPT)? {
                 Some(seg) => {
@@ -6507,23 +6498,6 @@ impl ChannelState {
 
     // ---- Sessions: the drive key (ADR-029 SC-2, SC-2a, SC-2b; #543) ----------------------------
 
-    /// One page of the Session entries this node has opened or written here (ADR-034 FR-5): each
-    /// node's entries only if this node holds its drive key (SC-2), or wrote them; a key-changed
-    /// entry ([`crate::node::drive::KEY_CHANGED`]) is no Session's, and is left out. As
-    /// [`crate::node::drive::SessionLog::page`] gives it.
-    ///
-    /// # Errors
-    /// `before` is not among the filter's entries.
-    pub fn session_page(
-        &self,
-        which: &crate::node::drive::SessionFilter,
-        before: Option<Digest32>,
-        max_rows: usize,
-        max_bytes: usize,
-    ) -> std::result::Result<crate::node::drive::SessionPage, String> {
-        self.drive.sessions.page(which, before, max_rows, max_bytes)
-    }
-
     /// Whether this node holds any drive key of `author`'s here: whether it can read inside
     /// `author`'s Sessions.
     #[must_use]
@@ -6802,13 +6776,13 @@ impl ChannelState {
         // Its newly available local key makes eligible bodies worth asking for again now.
         self.drive.omitted.clear();
         self.persist_drive(store)?;
-        let before = self.drive.sessions.len();
+        let before = self.drive.news.len();
         self.backfill(store, &skdm.body.author_id, now_ms)?;
         self.render_pending_private(store, now_ms)?;
         // What it opened of Sessions: a key-changed entry is none of theirs.
-        Ok(self.drive.sessions.rows()[before..]
+        Ok(self.drive.news[before..]
             .iter()
-            .filter(|r| !crate::node::drive::is_key_changed(&r.session_id))
+            .filter(|id| !crate::node::drive::is_key_changed(id))
             .count())
     }
 
@@ -7207,12 +7181,10 @@ impl ChannelState {
                     .pending_reads
                     .iter()
                     .any(|(row, _)| row.entry_hash == hash)
-                || self
-                    .drive
-                    .sessions
-                    .rows()
-                    .iter()
-                    .any(|row| row.entry_hash == hash)
+                || writer
+                    .retention(&hash)?
+                    .is_some_and(|r| r.cache_id.is_some())
+                || self.private_contains_in(writer.batch(), &hash)?
                 || self
                     .drive
                     .pending
@@ -7514,7 +7486,6 @@ impl ChannelState {
             if !crate::node::drive::is_key_changed(&row.session_id) {
                 self.drive.news.push(row.session_id.clone());
             }
-            self.drive.sessions.push(row);
         }
         for (row, _) in std::mem::take(&mut self.pending_reads) {
             index_read(&mut self.read_records, &mut self.reads, row);

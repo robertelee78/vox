@@ -592,7 +592,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::AppDial(_) => "reaching a peer for an app stream",
         NetEvent::Status(_) => "reporting status",
         NetEvent::Names(_) => "resolving a .vox name",
-        NetEvent::SessionPage { .. } => "reading a page of a room's Session entries",
+        NetEvent::SessionActivity { .. } => "reading a page of a room's Session entries",
         NetEvent::RoomHistory { .. } => "reading a page of a room's history",
         NetEvent::SessionProjection { .. } => "reading bounded Session metadata",
         NetEvent::SessionFiles { .. } => "reading bounded Session file offers",
@@ -978,22 +978,12 @@ enum NetEvent {
     /// A `.vox` name is being resolved (PRD-001 R20): answer with a snapshot of this
     /// node's rooms and keyring names.
     Names(oneshot::Sender<crate::node::resolver::VoxResolver>),
-    /// One page of the Session entries this node can read in a room (ADR-029 SC-2; ADR-034
-    /// FR-5), or `None` if the room is not open.
-    SessionPage {
-        /// The room.
+    SessionActivity {
         channel_id: Digest32,
-        /// Whose entries.
-        which: crate::node::drive::SessionFilter,
-        /// The page ends before this entry; the newest when `None`.
-        before: Option<Digest32>,
-        /// At most this many rows.
-        max_rows: usize,
-        /// At most this many bytes of body and id.
-        max_bytes: usize,
-        /// Where the answer goes.
-        reply:
-            oneshot::Sender<Option<std::result::Result<crate::node::drive::SessionPage, String>>>,
+        query: crate::node::channel::session_projection::ActivityQuery,
+        reply: oneshot::Sender<
+            std::result::Result<crate::node::channel::session_projection::ActivityReply, String>,
+        >,
     },
     SessionProjection {
         channel_id: Digest32,
@@ -4029,30 +4019,23 @@ impl NodeHandle {
             .map_err(|_| crate::error::Error::Unreachable("the node has stopped"))
     }
 
-    /// One page of the Session entries this node can read in a room (ADR-029 SC-2: its own, and
-    /// each node's that released it its drive key), as
-    /// [`crate::node::drive::SessionLog::page`] gives it; `None` if the room is not open.
-    pub async fn session_page(
+    /// One bounded activity lookup. No transcript or snapshot survives this reply.
+    pub(crate) async fn session_activity(
         &self,
         channel_id: Digest32,
-        which: crate::node::drive::SessionFilter,
-        before: Option<Digest32>,
-        max_rows: usize,
-        max_bytes: usize,
-    ) -> Option<std::result::Result<crate::node::drive::SessionPage, String>> {
+        query: crate::node::channel::session_projection::ActivityQuery,
+    ) -> std::result::Result<crate::node::channel::session_projection::ActivityReply, String> {
         let (reply, rx) = oneshot::channel();
         self.net_tx
-            .send(NetEvent::SessionPage {
+            .send(NetEvent::SessionActivity {
                 channel_id,
-                which,
-                before,
-                max_rows,
-                max_bytes,
+                query,
                 reply,
             })
             .await
-            .ok()?;
-        rx.await.ok()?
+            .map_err(|_| "the node has stopped".to_owned())?;
+        rx.await
+            .map_err(|_| "the node stopped before answering".to_owned())?
     }
 
     pub(crate) async fn session_projection(
@@ -8946,24 +8929,26 @@ impl Node {
             NetEvent::Status(reply) => {
                 let _ = reply.send(self.status_report());
             }
-            NetEvent::SessionPage {
+            NetEvent::SessionActivity {
                 channel_id,
-                which,
-                before,
-                max_rows,
-                max_bytes,
+                query,
                 reply,
             } => {
-                let page = match self.channels.get(&channel_id).map(Arc::clone) {
-                    Some(shared) => Some(
-                        shared
-                            .lock()
-                            .await
-                            .session_page(&which, before, max_rows, max_bytes),
-                    ),
-                    None => None,
+                let result = match (self.channels.get(&channel_id), self.profile.as_ref()) {
+                    (Some(shared), Some(profile)) => {
+                        let mut room = shared.lock().await;
+                        match room.advance_sessions(profile.store(), self.now_ms().get()) {
+                            Ok(_) => room.session_activity_query(
+                                profile.store(),
+                                query,
+                                self.now_ms().get(),
+                            ),
+                            Err(error) => Err(error.to_string()),
+                        }
+                    }
+                    _ => Err("room not open".into()),
                 };
-                let _ = reply.send(page);
+                let _ = reply.send(result);
             }
             NetEvent::SessionProjection {
                 channel_id,

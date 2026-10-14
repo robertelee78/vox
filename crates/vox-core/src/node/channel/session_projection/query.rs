@@ -272,6 +272,14 @@ impl ChannelState {
             h.update([u8::from(read.header.activity.ready)]);
             h.update(&read.header.activity.applied.to_be_bytes());
             h.update(&read.header.activity.invalidated.to_be_bytes());
+            // Raw request cleanup can finish after the incoming resolution was
+            // announced. Wake page readers when its exact pending set is ready.
+            for tree in [
+                super::activity_state::ActivityTree::RawPending,
+                super::activity_state::ActivityTree::RawRetire,
+            ] {
+                h.update(read.header.activity.roots[tree.index()].to_be_bytes());
+            }
             h.update([u8::from(read.header.activity.waiting.ready)]);
             h.update(&read.header.activity.waiting.root.to_be_bytes());
             h.update(&read.header.activity.waiting.metadata.to_be_bytes());

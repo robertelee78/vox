@@ -4291,6 +4291,192 @@ async fn write_found(
     Ok(true)
 }
 
+/// Count and stream just one selected activity page. A legal multipart activity
+/// may cross any number of wire frames; only its fixed origins and one bounded
+/// locator page survive a client wait. No room snapshot crosses an await.
+async fn write_session_activity(
+    stream: &mut UnixStream,
+    handle: &NodeHandle,
+    room: Digest32,
+    mut which: crate::node::drive::SessionFilter,
+    before: Option<Digest32>,
+    whole: bool,
+    writing: &std::sync::atomic::AtomicBool,
+) -> Result<bool> {
+    use crate::node::channel::session_projection::{
+        ActivityCursor as Cursor, ActivityQuery as Query, ActivityReply as Reply,
+    };
+    use crate::node::drive::SessionFilter;
+    macro_rules! answer {
+        ($query:expr) => {{
+            let answer = tokio::select! {
+                result = handle.session_activity(room,$query) => result,
+                () = subscriber_gone(stream) => return Ok(false),
+            };
+            match answer {
+                Ok(reply) => reply,
+                Err(reason) => {
+                    found_frame(stream, &Frame::Error { reason }.to_bytes(), writing).await?;
+                    return Ok(true);
+                }
+            }
+        }};
+    }
+    let mut revision = None;
+    if let SessionFilter::Session(typed) | SessionFilter::SessionRaw(typed) = &which {
+        let typed = typed.clone();
+        let visible = matches!(&which, SessionFilter::Session(_));
+        let (mut after, mut candidate) = (None, None);
+        loop {
+            let Reply::Resolved {
+                candidate: found,
+                next,
+                ambiguous,
+                revision: current,
+            } = answer!(Query::Resolve {
+                typed: typed.clone(),
+                visible,
+                after,
+                candidate,
+                revision,
+            })
+            else {
+                return Err(Error::MalformedIpc(
+                    "unexpected Session activity resolution",
+                ));
+            };
+            revision = Some(current);
+            candidate = found;
+            after = next;
+            if ambiguous || after.is_none() {
+                break;
+            }
+        }
+        let id = candidate.unwrap_or_default();
+        which = if visible {
+            SessionFilter::Session(id)
+        } else {
+            SessionFilter::SessionRaw(id)
+        };
+    }
+    let Reply::Selected(plan) = answer!(Query::Select {
+        which,
+        before,
+        max_rows: SESSION_PAGE_ROWS,
+        max_bytes: session_page_bytes(),
+        revision
+    }) else {
+        return Err(Error::MalformedIpc("unexpected Session activity selection"));
+    };
+    if whole && plan.older != 0 {
+        found_frame(
+            stream,
+            &Frame::Error {
+                reason: "this room's Session entries require SessionPage".into(),
+            }
+            .to_bytes(),
+            writing,
+        )
+        .await?;
+        return Ok(true);
+    }
+    let mut count = 0usize;
+    let mut cursor = Cursor::default();
+    loop {
+        let Reply::Companions { arrivals, next } = answer!(Query::Companions {
+            plan: plan.clone(),
+            cursor
+        }) else {
+            return Err(Error::MalformedIpc("unexpected Session activity locators"));
+        };
+        count = count
+            .checked_add(arrivals.len())
+            .ok_or(Error::SizeLimitExceeded("Session activity row count"))?;
+        match next {
+            Some(next) => cursor = next,
+            None => break,
+        }
+    }
+    let mut prefix = Encoder::new();
+    prefix
+        .array(if whole { 2 } else { 3 })
+        .uint(if whole {
+            T_SESSION_ROWS
+        } else {
+            T_SESSION_PAGE
+        })
+        .array(count);
+    if count == 0 {
+        if !whole {
+            prefix.uint(plan.older);
+        }
+        found_frame(stream, &prefix.finish(), writing).await?;
+        return Ok(true);
+    }
+    let mut offset = 0usize;
+    reply_part(stream, &prefix.finish(), &mut offset, true, writing).await?;
+    cursor = Cursor::default();
+    let mut sent = 0usize;
+    loop {
+        let Reply::Companions { arrivals, next } = answer!(Query::Companions {
+            plan: plan.clone(),
+            cursor
+        }) else {
+            return Err(Error::MalformedIpc("unexpected Session activity locators"));
+        };
+        for arrival in arrivals {
+            let Reply::Row(row) = answer!(Query::Row {
+                plan: plan.clone(),
+                arrival
+            }) else {
+                return Err(Error::MalformedIpc("unexpected Session activity row"));
+            };
+            sent = sent
+                .checked_add(1)
+                .ok_or(Error::SizeLimitExceeded("Session activity row count"))?;
+            if sent > count {
+                return Err(Error::MalformedIpc("Session activity row count changed"));
+            }
+            let mut e = Encoder::new();
+            e.array(5)
+                .bytes(&row.entry_hash)
+                .bytes(&row.author)
+                .uint(row.created_millis)
+                .text(&row.session_id)
+                .text(&row.body);
+            drop(row);
+            let encoded = zeroize::Zeroizing::new(e.finish());
+            for (i, part) in encoded.chunks(rows_budget()).enumerate() {
+                let last_piece = (i + 1).saturating_mul(rows_budget()) >= encoded.len();
+                reply_part(
+                    stream,
+                    part,
+                    &mut offset,
+                    !(whole && sent == count && last_piece),
+                    writing,
+                )
+                .await?;
+            }
+            if whole && sent == count {
+                return Ok(true);
+            }
+        }
+        match next {
+            Some(next) => cursor = next,
+            None => break,
+        }
+    }
+    if sent != count {
+        return Err(Error::MalformedIpc("Session activity row count changed"));
+    }
+    if !whole {
+        let mut e = Encoder::new();
+        e.uint(plan.older);
+        reply_part(stream, &e.finish(), &mut offset, false, writing).await?;
+    }
+    Ok(true)
+}
+
 /// Read an incomplete projection one bounded actor step at a time. This retains
 /// only one request and does not enqueue a waiter for every saved Session.
 async fn session_projection(
@@ -5075,6 +5261,35 @@ async fn serve_requests(
                 r = pump(stream, events) => r,
                 () = node_detached(&mut watch) => Ok(()),
             };
+        }
+        let activity = match &request {
+            Request::SessionPage {
+                channel_id,
+                which,
+                before,
+            } => Some((*channel_id, which.clone(), *before, false)),
+            Request::SessionEntries { channel_id } => Some((
+                *channel_id,
+                crate::node::drive::SessionFilter::All,
+                None,
+                true,
+            )),
+            _ => None,
+        };
+        if let Some((room, which, before, whole)) = activity {
+            let writing = std::sync::atomic::AtomicBool::new(false);
+            tokio::select! {
+                result = write_session_activity(&mut stream,handle,room,which,before,whole,&writing) => {
+                    if !result? { return Ok(()); }
+                },
+                () = node_detached(&mut watch) => {
+                    if !writing.load(std::sync::atomic::Ordering::Relaxed) {
+                        if let Some(body) = gone(&node) { let _ = write_frame(&mut stream,&body).await; }
+                    }
+                    return Ok(());
+                },
+            }
+            continue;
         }
         let sessions = match &request {
             Request::Sessions { channel_id } => Some((*channel_id, None, true, None, None)),
@@ -6100,52 +6315,8 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             Ok(states) => Frame::PullStates { states },
             Err(reason) => Frame::Error { reason },
         },
-        // The previous release's whole read, while the whole fits one reply; never a whole
-        // history past it (ADR-034 FR-4).
-        Request::SessionEntries { channel_id } => match handle
-            .session_page(
-                channel_id,
-                crate::node::drive::SessionFilter::All,
-                None,
-                SESSION_PAGE_ROWS,
-                session_page_bytes(),
-            )
-            .await
-        {
-            Some(Ok(page)) if page.older == 0 => Frame::SessionEntries { rows: page.rows },
-            Some(Ok(_)) => Frame::Error {
-                reason:
-                    "SessionEntries: this room's Session entries are more than one reply holds, and this vox \
-                         reads them a page at a time: update this app or verb to this vox's version"
-                        .into(),
-            },
-            Some(Err(reason)) => Frame::Error { reason },
-            None => Frame::Error {
-                reason: "room not open".into(),
-            },
-        },
-        Request::SessionPage {
-            channel_id,
-            which,
-            before,
-        } => match handle
-            .session_page(
-                channel_id,
-                which,
-                before,
-                SESSION_PAGE_ROWS,
-                session_page_bytes(),
-            )
-            .await
-        {
-            Some(Ok(page)) => Frame::SessionPage {
-                rows: page.rows,
-                older: page.older,
-            },
-            Some(Err(reason)) => Frame::Error { reason },
-            None => Frame::Error {
-                reason: "room not open".into(),
-            },
+        Request::SessionEntries { .. } | Request::SessionPage { .. } => Frame::Error {
+            reason: "Session activity requires the streaming IPC handler".into(),
         },
         // Newest first. The reply envelope carries every event across pages, without a byte cap.
         Request::Decisions { limit } => Frame::Decisions {
