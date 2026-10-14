@@ -1101,7 +1101,9 @@ impl UiState {
                 let given = crate::ident::typed_fingerprint(&p.fields[0]);
                 // **A mismatch is its own outcome** (ADR-028 K-5): nothing is added, and both are
                 // shown, so the person sees that they differ.
-                if given != theirs {
+                if vox_core::node::link::fingerprint_input(&p.fields[0], "fingerprint").ok()
+                    != Some(target)
+                {
                     self.status_message = Some(format!(
                         "not trusted: the fingerprint you were given is not this node's — do not \
                          trust it; ask them for theirs again another way. given: {} · this node: \

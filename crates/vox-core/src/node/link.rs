@@ -153,6 +153,26 @@ pub fn b32_decode(text: &str, ctx: &'static str) -> Result<Digest32> {
     Ok(out)
 }
 
+/// Read a whole fingerprint typed or pasted by a person (ADR-031 PC-2).
+/// Reading separators are ignored, as in the app's comparison field. Wire IDs,
+/// cursors and pairing codes keep their own strict grammar via [`b32_decode`].
+///
+/// # Errors
+/// Not exactly one canonical 32-byte fingerprint after removing separators.
+pub fn fingerprint_input(text: &str, ctx: &'static str) -> Result<Digest32> {
+    let mut bare = String::with_capacity(B32_DIGEST_LEN);
+    for c in text.chars() {
+        if c.is_whitespace() || matches!(c, '-' | '·') {
+            continue;
+        }
+        if !c.is_ascii() || bare.len() == B32_DIGEST_LEN {
+            return Err(Error::MalformedLink(ctx));
+        }
+        bare.push(c);
+    }
+    b32_decode(&bare, ctx)
+}
+
 /// Parse one anchor as a command line or configuration names it:
 /// `<fingerprint-base32>@<multiaddr>` — the identity the node is pinned to when
 /// dialled, and one address to dial. The same fingerprint given more than once
@@ -162,10 +182,9 @@ pub fn parse_anchor_spec(text: &str) -> Result<BootstrapNode> {
     let (id, addr) = text.split_once('@').ok_or(Error::MalformedAnchor(
         "expected <fingerprint>@<host:port>, or @ followed by a multiaddr",
     ))?;
-    // `b32_decode` reports a malformed *link*, which is what it is used for everywhere
-    // else; an anchor is a different input from a different place and a person fixes it
-    // in a different file, so the error is restated as one.
-    let id = b32_decode(id.trim(), "").map_err(|_| {
+    // The fingerprint parser reports a malformed *link*. Restate this as an anchor
+    // error so a person knows which input to fix.
+    let id = fingerprint_input(id, "").map_err(|_| {
         Error::MalformedAnchor("the part before @ is not a 52-character fingerprint")
     })?;
     let addrs = parse_anchor_addrs(addr.trim())?;
@@ -358,7 +377,7 @@ pub fn change_manual_anchor(
         let keep = |line: &String| {
             line.trim()
                 .split_once('@')
-                .and_then(|(fp, _)| b32_decode(fp.trim(), "anchor fingerprint").ok())
+                .and_then(|(fp, _)| fingerprint_input(fp, "anchor fingerprint").ok())
                 != Some(id)
         };
         lines.retain(keep);
@@ -370,8 +389,18 @@ pub fn change_manual_anchor(
         }
     }
     if let Some(spec) = add {
-        if !lines.iter().any(|line| line.trim() == spec) {
-            lines.push(spec.to_owned());
+        let (fp, address) = spec.split_once('@').ok_or(Error::MalformedAnchor(
+            "expected <fingerprint>@<host:port>, or @ followed by a multiaddr",
+        ))?;
+        // A pasted fingerprint may wrap across lines. Save its bare form so the
+        // next reload still reads one complete anchor, preserving the address input.
+        let spec = format!(
+            "{}@{}",
+            b32_encode(&fingerprint_input(fp, "anchor fingerprint")?),
+            address.trim()
+        );
+        if !lines.iter().any(|line| line.trim() == spec.as_str()) {
+            lines.push(spec);
         }
     }
     crate::node::paths::write_private_file(
@@ -620,10 +649,10 @@ pub fn copied_identity(text: &str) -> Result<(Digest32, Option<String>)> {
     if let Some((name, tail)) = text.rsplit_once(" <") {
         if let Some(fp) = tail.strip_suffix('>') {
             if crate::node::presentation::safe_name(name) {
-                return Ok((b32_decode(fp, "fingerprint")?, Some(name.to_owned())));
+                return Ok((fingerprint_input(fp, "fingerprint")?, Some(name.to_owned())));
             }
         }
         return Err(Error::MalformedBundle("copied identity"));
     }
-    Ok((b32_decode(text, "fingerprint")?, None))
+    Ok((fingerprint_input(text, "fingerprint")?, None))
 }

@@ -225,7 +225,8 @@ pub fn resolve_member(
             ))
         }
     }
-    let needle = w.to_ascii_lowercase();
+    let needle = vox_core::node::link::fingerprint_input(w, "fingerprint")
+        .map_or_else(|_| w.to_ascii_lowercase(), |fp| b32_encode(&fp));
     let hits: Vec<Digest32> = members
         .iter()
         .copied()

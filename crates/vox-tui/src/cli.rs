@@ -2632,8 +2632,10 @@ pub fn run() -> ExitCode {
                         fingerprint,
                         account,
                     } => {
-                        let fingerprint =
-                            vox_core::node::link::b32_decode(&fingerprint, "anchor fingerprint")?;
+                        let fingerprint = vox_core::node::link::fingerprint_input(
+                            &fingerprint,
+                            "anchor fingerprint",
+                        )?;
                         crate::anchor_cli::change(
                             &account.as_node_args().account()?,
                             account.listen,

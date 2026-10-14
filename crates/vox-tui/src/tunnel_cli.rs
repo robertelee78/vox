@@ -43,6 +43,18 @@ pub fn resolve_prefix(prefix: &str, among: &[Digest32]) -> Result<Digest32, AppE
     }
 }
 
+/// A whole bare/grouped fingerprint or the existing unique prefix syntax.
+/// Room IDs and other non-fingerprint selectors continue through [`resolve_prefix`].
+///
+/// # Errors
+/// The same missing or ambiguous identity diagnostic as [`resolve_prefix`].
+pub fn resolve_fingerprint(input: &str, among: &[Digest32]) -> Result<Digest32, AppError> {
+    match vox_core::node::link::fingerprint_input(input, "fingerprint") {
+        Ok(fp) => resolve_prefix(&b32_encode(&fp), among),
+        Err(_) => resolve_prefix(input, among),
+    }
+}
+
 /// The text of a passphrase file, or of stdin when the path is `-`: the explicit way to pipe a
 /// passphrase in. Wiped on drop, so only the copy a caller takes outlives the read.
 pub fn passphrase_file_text(
@@ -1100,7 +1112,7 @@ pub const GIVE_ROOM_PASSPHRASE: &str = "Use --passphrase-file <path> (`-` reads 
 /// # Errors
 /// [`AppError::Usage`] if the text is not a whole fingerprint.
 pub fn parse_fingerprint(fingerprint: &str) -> Result<Digest32, AppError> {
-    b32_decode(fingerprint, "trust fingerprint").map_err(|_| {
+    vox_core::node::link::fingerprint_input(fingerprint, "trust fingerprint").map_err(|_| {
         AppError::Usage(format!(
             "{fingerprint:?} is not a whole fingerprint. Paste the 52-character one that \
              `vox id` prints on their machine: a prefix could name the wrong identity, and \

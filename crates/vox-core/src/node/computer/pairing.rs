@@ -703,7 +703,7 @@ impl Management {
         if action == "recover-group" {
             return self.recover_group(expected);
         }
-        let node = crate::node::link::b32_decode(node, "node fingerprint")?;
+        let node = crate::node::link::fingerprint_input(node, "node fingerprint")?;
         let local = self.computer.signer.fingerprint();
         self.computer.change(|s| {
             if frontier(s) != expected { return Err(Error::Profile("computer trust changed; review the binding operation again")); }
@@ -715,7 +715,7 @@ impl Management {
             let (manager, binding) = &bindings[0];
             match action {
                 "release" => {
-                    let destination = crate::node::link::b32_decode(destination, "destination computer fingerprint")?;
+                    let destination = crate::node::link::fingerprint_input(destination, "destination computer fingerprint")?;
                     if *manager != local || destination == local || s.grant(&destination).is_none() {
                         return Err(Error::Profile("release requires this node's current manager and another active destination computer"));
                     }
@@ -801,7 +801,7 @@ impl Management {
 
     /// Confirm removal against the exact displayed signed frontier and affected roster.
     pub fn remove(&self, target: &str, expected: &str) -> Result<ComputerStatus> {
-        let target = crate::node::link::b32_decode(target, "computer fingerprint")?;
+        let target = crate::node::link::fingerprint_input(target, "computer fingerprint")?;
         self.computer.change(|s| {
             if frontier(s) != expected { return Err(Error::Profile("computer trust changed; review the computer and affected nodes again before removing it")); }
             if s.genesis.is_none() { return Err(Error::Profile("computer enrollment must finish before removing a member")); }
