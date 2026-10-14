@@ -2576,12 +2576,12 @@ pub enum Frame {
         /// First known conflicting arrival, retained after its body expires and bounded by the requested horizon.
         conflict_at: Option<u64>,
     },
-    /// The current saved room instance and its newest readable arrival.
     /// Counts and first boundary without unread message bodies.
     UnreadSummary {
         /// Facts from one current room snapshot.
         summary: crate::node::api::UnreadSummary,
     },
+    /// The current saved room instance and its newest readable arrival.
     ArrivalHead {
         /// This cursor has no dependency on retaining the newest message body.
         head: crate::node::api::HistoryCursor,
