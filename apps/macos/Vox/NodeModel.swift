@@ -4,6 +4,7 @@
 
 import AppKit
 import Foundation
+import SQLite3
 import os
 import ServiceManagement
 
@@ -42,6 +43,7 @@ final class NodeModel: ObservableObject {
         /// Other unread messages: new to the room, and coordination traffic.
         var new = 0
         var coordination = 0
+        var unreadScanLimited = false
         /// Approvals and questions waiting on this node in Sessions it may drive here (ADR-029
         /// CL-2).
         var waiting = 0
@@ -145,11 +147,12 @@ final class NodeModel: ObservableObject {
         didSet {
             roomMessageRevision = UUID()
             byID = Dictionary(messages.map { ($0.id, $0) }) { $1 }
-            if let root = openThread { threadRootMessage = byID[root] }
+            if let root = openThread, let visible = byID[root] { threadRootMessage = visible }
 
             var said: [String: NodePlatform] = [:]
             for message in messages { if let p = message.platform { said[message.author] = p } }
             if said != platforms { platforms = said }
+            retireFileFactsOutsideWindows()
             scheduleThreadRefresh()
         }
     }
@@ -157,10 +160,18 @@ final class NodeModel: ObservableObject {
     @Published private(set) var threadSummaries: [String: ThreadSummary] = [:]
     @Published private(set) var threadSummaryErrors: [String: String] = [:]
     @Published private(set) var openThread: String?
-    @Published private(set) var threadRootMessage: RoomMessage?
-    @Published private(set) var threadReplies: [RoomMessage] = []
+    @Published private(set) var threadRootMessage: RoomMessage? {
+        didSet { retireFileFactsOutsideWindows() }
+    }
+    @Published private(set) var threadReplies: [RoomMessage] = [] {
+        didSet { retireFileFactsOutsideWindows() }
+    }
     @Published private(set) var threadLoading = false
     @Published private(set) var threadHasMore = false
+    @Published private(set) var threadHasEarlier = false
+    private var threadInstance: Data?
+    private var threadBefore: String?
+    private var threadAfter: String?
     @Published private(set) var threadError: String?
     private var threadGeneration = UUID()
     private var threadRefreshID = UUID()
@@ -170,13 +181,18 @@ final class NodeModel: ObservableObject {
     private var threadRefreshDirty = false
     private var threadDisplayRevision: String?
     private var threadForcedSummaries: Set<String> = []
-    private var threadPagesLoaded = 1
+    @Published private(set) var threadAuthorsPaged: Set<String> = []
     private var threadRefreshTask: Task<Void, Never>?
     private var threadPageTask: Task<Void, Never>?
 
     @Published private(set) var roomOlder: UInt64 = 0
     private var roomBefore: String?
+    private var roomInstance: Data?
+    @Published private var roomHasNewer = false
+    @Published private(set) var roomReloadNeeded = false
+    private static let roomWindowLimit = 128
     @Published private var roomReadingOlder = false
+    private var roomOlderRead = UUID()
 
     /// The room on screen's messages by id, for what is in view.
     private(set) var byID: [String: RoomMessage] = [:]
@@ -217,6 +233,7 @@ final class NodeModel: ObservableObject {
             timelineFollowingNewest = true
             selectedEarlierRequest = nil
             sessionNote = nil
+            sessionReloadNeeded = false
             sessionLoading = showingSession
             // What was selected was in the other view's rows: Focus Timeline and ↑/↓ start
             // afresh in this one (P14), as on opening another room.
@@ -226,7 +243,12 @@ final class NodeModel: ObservableObject {
             // would centre it, not follow its newest line. openRequest chooses it after this.
             selectedRequest = nil
             selectionAnchor = nil
-            Task { await readSession() }
+            selectedSessionMetadata = nil
+            selectedSessionMetadataKnown = false
+            Task {
+                await readSelectedSessionMetadata()
+                await readSession()
+            }
         }
     }
     /// The Session on screen is being read: its timeline says "Loading…" (D3).
@@ -244,17 +266,27 @@ final class NodeModel: ObservableObject {
     /// The requests waiting on this node already known, by `room/node/session/reference`: one
     /// that is new notifies, once per Session (P1). Taken in silence the first time, so opening
     /// Vox notifies nothing.
-    private var knownWaiting: Set<String> = []
-    private var waitingSeen = false
+    private var waitingLedger: PendingNotificationLedger?
+    private var waitingScanRunning = false
+    private var waitingScanDirty = false
     /// The room on screen's Sessions, open and ended (ADR-029 CL-2).
     @Published private(set) var sessions: [FfiSession] = []
+    @Published private(set) var sessionsOpenNext: String?
+    @Published private(set) var sessionsHistoryNext: String?
+    @Published private(set) var sessionsMetadataLoading = false
+    private var sessionsOpenAfter: String?
+    @Published private var sessionsHistoryAfter: String?
+    var sessionsHistoryPaged: Bool { sessionsHistoryAfter != nil }
+    private var sessionsMetadataRead = UUID()
+    @Published private(set) var selectedSessionMetadata: FfiSession?
+    @Published private(set) var selectedSessionMetadataKnown = false
     /// The Session on screen's entries, oldest first, to a member with drive (SC-1): its newest
     /// page, and the older pages the person scrolled up to (ADR-034 FR-4); never its whole
     /// history.
     /// Scroll position, independent of whether the app's window is foreground.
     @Published var timelineFollowingNewest = true
     private var sessionWindowRevision = UUID()
-    var hasNewerTimeline: Bool { showingSession && sessionPages.hasNewer }
+    var hasNewerTimeline: Bool { showingSession ? sessionPages.hasNewer : roomHasNewer }
     @Published private var sessionPages = SessionPages()
     var sessionEntries: [FfiSessionEntry] { sessionPages.entries }
     /// A notification may point to a request before the newest page. It is shown separately,
@@ -267,6 +299,7 @@ final class NodeModel: ObservableObject {
     var readingOlderTimeline: Bool { showingSession ? sessionReadingOlder : roomReadingOlder }
     /// What the node says of the Session on screen besides its entries: "opening not received yet".
     @Published private(set) var sessionNote: String?
+    @Published private(set) var sessionReloadNeeded = false
     /// What was done to the room on screen (its retention set, its name changed), oldest first.
     @Published private(set) var notices: [RoomNoticeRow] = []
     @Published private(set) var noticesBefore: NoticeCursor?
@@ -490,6 +523,13 @@ final class NodeModel: ObservableObject {
     /// Last-known states are never presented as current while the daemon cannot be reached.
     @Published private(set) var daemonReachable = true
     private var nodeObservationEpoch = UUID()
+    fileprivate var observationToken: UUID { nodeObservationEpoch }
+    fileprivate func acceptsObservation(_ token: UUID, actor: String) -> Bool {
+        token == nodeObservationEpoch && actor == me && ended == nil && !Task.isCancelled
+    }
+    fileprivate func acceptsArrivalInstance(_ instance: Data, room: String) -> Bool {
+        roomOnScreen != room || roomInstance == nil || roomInstance == instance
+    }
     @Published private(set) var machineStateKnown = false
     @Published private(set) var daemonFailure: String?
     var peerWords: String { daemonReachable ? (peers == 1 ? "1 peer" : "\(peers) peers") : "peers unknown" }
@@ -599,33 +639,35 @@ final class NodeModel: ObservableObject {
         }
     }
 
-    /// Each room's newest message read so far, by room: the next read starts after it.
-    private var lastRead: [String: String] = [:]
-
-    /// Read what `room` has after its newest message read so far, for its row's preview.
+    /// Find the latest preview through bounded indexed pages. Coordination-only pages
+    /// are skipped without collecting the intervening history in the window process.
     private func readLast(_ room: String) async {
+        let epoch = nodeObservationEpoch
         do {
-            let rows: [RoomMessage]
-            if let after = lastRead[room] {
-                do {
-                    rows = try await client.read(room: room, after: after, limit: 0)
-                } catch where Self.rejectedForwardMark(error) {
-                    // Retention can remove the last preview row. Retire its mark before the
-                    // bounded read, so a failed recovery never retries that expired mark.
-                    lastRead[room] = nil
-                    rows = try await client.roomRead(room: room).messages
+            var page = try await client.roomRead(room: room)
+            let instance = page.instance
+            while true {
+                guard epoch == nodeObservationEpoch, !Task.isCancelled,
+                      rooms.contains(where: { $0.id == room }) else { return }
+                guard page.instance == instance else {
+                    throw VoxError.Failed(reason: "The saved room changed while reading its preview.")
                 }
-            } else {
-                rows = try await client.roomRead(room: room).messages
+                if let shown = page.messages.last(where: Preview.shows) {
+                    guard let i = rooms.firstIndex(where: { $0.id == room }),
+                          shown.createdMillis >= rooms[i].last?.millis ?? 0 else { return }
+                    let preview = Preview(shown, me: me)
+                    if rooms[i].last != preview { rooms[i].last = preview }
+                    return
+                }
+                guard let before = page.before else { return }
+                let older = try await client.roomReadOlder(room: room, before: before)
+                guard older.before != before else {
+                    throw VoxError.Failed(reason: "The room preview page did not advance.")
+                }
+                page = older
             }
-            guard let newest = rows.last else { return }
-            lastRead[room] = newest.id
-            guard let shown = rows.last(where: Preview.shows),
-                  let i = rooms.firstIndex(where: { $0.id == room }),
-                  shown.createdMillis >= rooms[i].last?.millis ?? 0 else { return }
-            let preview = Preview(shown, me: me)
-            if rooms[i].last != preview { rooms[i].last = preview }
         } catch {
+            guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
             reportBackground(error)
         }
     }
@@ -664,7 +706,11 @@ final class NodeModel: ObservableObject {
                 await self.readFacts()
                 guard self.daemonReachable else { continue }
                 await self.readWaiting()
-                await self.readNewOnScreen()
+                if self.showingSession {
+                    await self.readSelectedSessionMetadata()
+                    await self.readSession()
+                }
+                else { await self.readNewOnScreen() }
             }
         }
     }
@@ -673,65 +719,116 @@ final class NodeModel: ObservableObject {
     /// not bring added as if it had: a missed or dead event stream hides a message for one turn of
     /// this loop at most (the walkthrough's WHERE-15, posted while every peer was offline, never
     /// came as an event to the reopened app).
-    private func readNewOnScreen() async {
-        guard case let .room(id) = selection, ended == nil else { return }
-        let generation = roomReadGeneration
-        let messageRevision = roomMessageRevision
-        let loaded = messages.map(\.id)
+    /// Retained UTF-8/binary payload, separately from SwiftUI/allocator footprint.
+    /// One legal oversized message remains readable instead of truncating its body.
+    private static let roomWindowBytes = 8 * 1024 * 1024
+
+    private static func roomPayloadBytes(_ row: RoomMessage) -> Int {
+        var size = 512 + row.id.utf8.count + row.author.utf8.count + row.authorName.utf8.count
+            + row.kind.utf8.count + row.text.utf8.count + row.re.utf8.count + row.thread.utf8.count
+        for value in row.to + row.tags { size += value.utf8.count }
+        if let file = row.file {
+            size += file.name.utf8.count + file.sha256.utf8.count + file.note.utf8.count
+            for value in file.to { size += value.utf8.count }
+        }
+        if let image = row.image { size += image.thumb.count + image.blurhash.utf8.count }
+        if let card = row.card {
+            size += card.url.utf8.count + card.title.utf8.count + card.description.utf8.count
+                + (card.image?.count ?? 0)
+        }
+        if let platform = row.platform {
+            size += platform.os.utf8.count + platform.osVersion.utf8.count + platform.arch.utf8.count
+        }
+        return size
+    }
+
+    private static func boundedRoomRows(_ rows: [RoomMessage], newest: Bool) -> [RoomMessage] {
+        let ordered = newest ? Array(rows.reversed()) : rows
+        var kept: [RoomMessage] = []
+        var bytes = 0
+        for row in ordered {
+            let cost = roomPayloadBytes(row)
+            if !kept.isEmpty && (kept.count >= roomWindowLimit || cost > roomWindowBytes - bytes) { break }
+            kept.append(row)
+            bytes += cost
+            if bytes >= roomWindowBytes { break }
+        }
+        return newest ? Array(kept.reversed()) : kept
+    }
+
+    private func retainedRoomEntries(room: String, instance: Data, ids: [String],
+                                     current: () -> Bool) async throws -> [RoomMessage] {
+        guard current(), !Task.isCancelled else { throw CancellationError() }
         do {
-            let rows: [RoomMessage]
-            var recovery: FfiRoomRead?
-            if !roomNeedsPage, let after = messages.last?.id, after != rejectedRoomMark {
-                do {
-                    rows = try await client.read(room: id, after: after, limit: 0)
-                } catch where Self.rejectedForwardMark(error) {
-                    guard generation == roomReadGeneration, selection == .room(id), ended == nil else { return }
-                    rejectedRoomMark = after
-                    let page = try await client.roomReadRetaining(room: id, loaded: loaded)
-                    rows = page.messages
-                    recovery = page
-                }
-            } else {
-                let page = try await client.roomReadRetaining(room: id, loaded: loaded)
-                rows = page.messages
-                recovery = page
+            let page = try await client.roomReadRetaining(room: room, node: me,
+                instance: instance, loaded: ids)
+            guard current(), !Task.isCancelled else { throw CancellationError() }
+            guard page.instance == instance else {
+                throw VoxError.Failed(reason: "The saved room changed while refreshing its messages.")
             }
-            guard generation == roomReadGeneration, selection == .room(id), ended == nil else { return }
-            var recoveredMembers: (rows: [MemberRow], trustsMe: Set<String>, presented: [String: String])?
-            if recovery != nil { recoveredMembers = try await memberRows(id) }
-            guard generation == roomReadGeneration, selection == .room(id), ended == nil else { return }
-            // An event may have delivered a new body or row while the page or roster awaited.
-            // Keep that visible result and retry reanchoring instead of replacing it with an
-            // earlier snapshot. IDs alone cannot detect an owed row gaining its body.
-            if recovery != nil && messageRevision != roomMessageRevision { return }
-            let new = rows.filter { byID[$0.id] == nil && !$0.owed }
-            if let page = recovery {
-                // Keep the valid view until this same selection's replacement is ready.
+            return page.messages
+        } catch {
+            guard current(), !Task.isCancelled else { throw CancellationError() }
+            guard ids.count > 1, case let VoxError.Failed(reason) = error,
+                  reason == "The held room selection exceeds one window's byte budget. Refresh fewer messages." else {
+                throw error
+            }
+            let middle = ids.count / 2
+            let left = try await retainedRoomEntries(room: room, instance: instance,
+                ids: Array(ids[..<middle]), current: current)
+            let right = try await retainedRoomEntries(room: room, instance: instance,
+                ids: Array(ids[middle...]), current: current)
+            return left + right
+        }
+    }
+
+    private func readNewOnScreen() async {
+        guard case let .room(id) = selection, ended == nil, !roomReloadNeeded else { return }
+        let generation = roomReadGeneration, epoch = nodeObservationEpoch
+        let revision = roomMessageRevision, follows = timelineFollowingNewest
+        let loaded = messages.map(\.id), instance = roomInstance
+        func current() -> Bool {
+            selection == .room(id) && ended == nil && generation == roomReadGeneration
+                && epoch == nodeObservationEpoch && revision == roomMessageRevision
+                && follows == timelineFollowingNewest
+        }
+        do {
+            if !follows, let instance, !loaded.isEmpty {
+                let rows = try await retainedRoomEntries(room: id, instance: instance,
+                    ids: loaded, current: current)
+                guard current() else { return }
+                let bounded = Self.boundedRoomRows(rows, newest: false)
+                if bounded.count < rows.count { roomHasNewer = true }
+                messages = bounded
+                // Exact selection's zero metadata is not a new history cursor/count.
+            } else {
+                let page = try await client.roomRead(room: id)
+                guard current() else { return }
+                roomInstance = page.instance
                 roomOlder = page.older
                 roomBefore = page.before
-                messages = page.messages
-                if let recoveredMembers {
-                    members = recoveredMembers.rows
-                    trustsMe = recoveredMembers.trustsMe
-                    for (fingerprint, name) in recoveredMembers.presented { rememberPresentation(fingerprint, name) }
-                }
-                rejectedRoomMark = nil
+                let bounded = Self.boundedRoomRows(page.messages, newest: true)
+                roomOlder += UInt64(page.messages.count - bounded.count)
+                if roomOlder > 0 { roomBefore = bounded.first?.id }
+                messages = bounded
+                roomHasNewer = false
                 roomNeedsPage = false
-                lastRead[id] = page.messages.last?.id
+                rejectedRoomMark = nil
                 watchReads(id)
             }
-            for message in new { arrived(message, in: id) }
         } catch {
-            guard generation == roomReadGeneration, selection == .room(id), ended == nil else { return }
+            guard current() else { return }
+            retireRefusedRoomRead(error)
             reportBackground(error)
         }
     }
 
-    /// Only a refused forward history mark warrants reanchoring. A disconnect, permission
-    /// refusal or malformed reply must retain its own error instead of becoming an empty page.
-    private static func rejectedForwardMark(_ error: Error) -> Bool {
-        guard case let VoxError.Failed(reason) = error else { return false }
-        return reason == "page mark not in this room's timeline"
+    private func retireRefusedRoomRead(_ error: Error) {
+        guard case VoxError.Failed = error else { return }
+        messages = []
+        roomOlder = 0
+        roomBefore = nil
+        roomReloadNeeded = true
     }
 
     /// The timeline's previous page is fetched only at the person's scroll position or request.
@@ -741,18 +838,34 @@ final class NodeModel: ObservableObject {
             return
         }
         guard let room = roomOnScreen, let before = roomBefore, !roomReadingOlder, ended == nil else { return }
-        let generation = roomReadGeneration
+        let generation = roomReadGeneration, epoch = nodeObservationEpoch
+        timelineFollowingNewest = false
+        let revision = roomMessageRevision, request = UUID()
+        roomOlderRead = request
         roomReadingOlder = true
-        defer { if generation == roomReadGeneration { roomReadingOlder = false } }
+        func current() -> Bool {
+            generation == roomReadGeneration && epoch == nodeObservationEpoch
+                && revision == roomMessageRevision && roomOlderRead == request
+                && roomOnScreen == room && roomBefore == before
+                && !timelineFollowingNewest && ended == nil
+        }
+        defer { if roomOlderRead == request { roomReadingOlder = false } }
         do {
             let page = try await client.roomReadOlder(room: room, before: before)
-            guard generation == roomReadGeneration, roomOnScreen == room, roomBefore == before, ended == nil else { return }
+            guard current() else { return }
             let held = Set(messages.map(\.id))
-            messages = page.messages.filter { !held.contains($0.id) } + messages
+            guard roomInstance == page.instance else {
+                throw VoxError.Failed(reason: "The saved room changed while loading older messages.")
+            }
+            let joined = page.messages.filter { !held.contains($0.id) } + messages
+            let bounded = Self.boundedRoomRows(joined, newest: false)
+            if bounded.count < joined.count { roomHasNewer = true }
+            messages = bounded
             roomOlder = page.older
             roomBefore = page.before
         } catch {
-            guard generation == roomReadGeneration, roomOnScreen == room, ended == nil else { return }
+            guard current() else { return }
+            retireRefusedRoomRead(error)
             reportBackground(error)
         }
     }
@@ -782,7 +895,7 @@ final class NodeModel: ObservableObject {
                 daemonReachable = true
                 ended = fresh.first(where: { $0.name == node })?.status == "Locked"
                     ? "Node \(node) is Locked." : "Node \(node) is unavailable."
-                clearThreadState()
+                releaseHistoryViews()
                 peers = 0
                 return
             }
@@ -813,7 +926,6 @@ final class NodeModel: ObservableObject {
 
                 try await client.subscribe(listener: Listener(model: self))
                 guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
-                lastRead.removeAll()
                 await refresh()
                 guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
                 await reconcileUnread()
@@ -874,67 +986,78 @@ final class NodeModel: ObservableObject {
     /// Rooms whose unread was counted from what the node recorded as read.
     private var seeded: Set<String> = []
 
-    /// Each open room's unread, the first time it is seen, from what the node recorded as read
-    /// (ADR-028 R-8): what came while the app was closed. The node's events count from there.
+    /// Only scalar facts are retained; unread bodies remain in the node's store.
     func seedUnread() async {
         for room in rooms where room.open && !seeded.contains(room.id) {
-            guard let rows = try? await client.unread(room: room.id) else { continue }
-            seeded.insert(room.id)
-            for message in rows { count(message, in: room.id) }
+            do { _ = try await readUnreadSummary(room.id) }
+            catch is CancellationError {}
+            catch { reportBackground(error) }
         }
     }
 
-    /// Events missed while the daemon was away are reconciled with its current read state.
-    /// This also removes messages another client marked read during the outage.
     private func reconcileUnread() async {
         for room in rooms where room.open {
-            do {
-                let rows = try await client.unread(room: room.id)
-                let ids = Set(rows.map(\.id))
-                for id in Array(counted[room.id]?.keys ?? Dictionary<String, RoomMessage>().keys)
-                    where !ids.contains(id) { uncount(id, in: room.id) }
-                for message in rows { count(message, in: room.id) }
-                seeded.insert(room.id)
-            } catch { reportBackground(error) }
+            do { _ = try await readUnreadSummary(room.id) }
+            catch is CancellationError {}
+            catch { reportBackground(error) }
         }
     }
 
-    /// Each room's unread messages, by id: counted once each, from what the node recorded as
-    /// unread and from what arrives, and no longer counted once drawn in view with the window in
-    /// front ([`drawn`]). Selecting a room reads nothing (ADR-028 R-6; the app panel's D18).
-    private var counted: [String: [String: RoomMessage]] = [:]
+    @discardableResult
+    private func readUnreadSummary(_ room: String) async throws -> RoomUnread {
+        let epoch = nodeObservationEpoch
+        let facts = try await client.unreadSummary(room: room)
+        guard epoch == nodeObservationEpoch, !Task.isCancelled,
+              let i = rooms.firstIndex(where: { $0.id == room && $0.open }) else {
+            throw CancellationError()
+        }
+        rooms[i].addressed = Int(clamping: facts.addressed)
+        rooms[i].urgent = Int(clamping: facts.urgent)
+        rooms[i].new = Int(clamping: facts.new)
+        rooms[i].coordination = Int(clamping: facts.coordination)
+        rooms[i].unreadScanLimited = facts.scanLimited
+        seeded.insert(room)
+        return facts
+    }
 
-    /// `message` counted unread in `room`, once: never this node's own.
+    /// Coalesce live events to one reader, rather than a body cache or a task per message.
+    /// The FIFO contains only identities of currently open rooms, never message IDs.
+    private var unreadDirty: [String] = []
+    private var unreadRefreshing: Task<Void, Never>?
+
+    private func scheduleUnread(_ room: String) {
+        guard rooms.contains(where: { $0.id == room && $0.open }) else { return }
+        if !unreadDirty.contains(room) { unreadDirty.append(room) }
+        guard unreadRefreshing == nil else { return }
+        let epoch = nodeObservationEpoch
+        unreadRefreshing = Task { [weak self] in
+            guard let self else { return }
+            defer { self.unreadRefreshing = nil }
+            while epoch == self.nodeObservationEpoch, !Task.isCancelled,
+                  let id = self.unreadDirty.first {
+                self.unreadDirty.removeFirst()
+                do { _ = try await self.readUnreadSummary(id) }
+                catch {
+                    if epoch == self.nodeObservationEpoch && !Task.isCancelled {
+                        self.reportBackground(error)
+                    }
+                }
+            }
+            if epoch != self.nodeObservationEpoch { self.unreadDirty.removeAll() }
+        }
+    }
+
     private func count(_ message: RoomMessage, in room: String) {
-        guard message.author != me, counted[room]?[message.id] == nil,
-              let i = rooms.firstIndex(where: { $0.id == room }) else { return }
-        counted[room, default: [:]][message.id] = message
-        switch message.level {
-        case .toYou:
-            rooms[i].addressed += 1
-            if message.urgent { rooms[i].urgent += 1 }
-        case .new: rooms[i].new += 1
-        case .coordination: rooms[i].coordination += 1
-        }
-    }
-
-    /// Message `id` seen in `room`: no longer counted.
-    private func uncount(_ id: String, in room: String) {
-        guard let message = counted[room]?.removeValue(forKey: id),
-              let i = rooms.firstIndex(where: { $0.id == room }) else { return }
-        switch message.level {
-        case .toYou:
-            rooms[i].addressed = max(0, rooms[i].addressed - 1)
-            if message.urgent { rooms[i].urgent = max(0, rooms[i].urgent - 1) }
-        case .new: rooms[i].new = max(0, rooms[i].new - 1)
-        case .coordination: rooms[i].coordination = max(0, rooms[i].coordination - 1)
-        }
+        guard message.author != me else { return }
+        scheduleUnread(room)
     }
 
     /// The rooms, the keyring, the nodes on this Mac and the peers, read again.
     func refresh() async {
+        let epoch = nodeObservationEpoch
         do {
             let fresh = try await client.rooms()
+            guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
             let now = fresh.map { r in
                 var room = Room(id: r.id, name: name(of: r), open: r.open)
                 if let held = rooms.first(where: { $0.id == r.id }) {
@@ -942,6 +1065,7 @@ final class NodeModel: ObservableObject {
                     room.urgent = held.urgent
                     room.new = held.new
                     room.coordination = held.coordination
+                    room.unreadScanLimited = held.unreadScanLimited
                     room.waiting = held.waiting
                     room.offered = held.offered
                     room.offerSaid = held.offerSaid
@@ -950,12 +1074,19 @@ final class NodeModel: ObservableObject {
                 return room
             }
             if now != rooms { rooms = now }
-            for room in now { await readLast(room.id) }
+            for room in now {
+                await readLast(room.id)
+                guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
+            }
             await readWaiting()
+            guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
             await readFacts()
+            guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
             let back = await readTrustsBack()
+            guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
             if back != trustsBack { trustsBack = back }
         } catch {
+            guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
             reportBackground(error)
         }
     }
@@ -976,11 +1107,17 @@ final class NodeModel: ObservableObject {
             keyringDid = nil
             keyringFailed = nil
         }
-        guard case .room = selection else { return }
+        guard case .room = selection else {
+            releaseHistoryViews()
+            return
+        }
         messages = []
         roomReadingOlder = false
         roomOlder = 0
         roomBefore = nil
+        roomInstance = nil
+        roomHasNewer = false
+        roomReloadNeeded = false
         unreadFrom = nil
         unreadCount = 0
         readBy = [:]
@@ -1006,6 +1143,12 @@ final class NodeModel: ObservableObject {
         governancePageError = nil
         governanceRead = UUID()
         sessions = []
+        sessionsOpenAfter = nil
+        sessionsHistoryAfter = nil
+        sessionsOpenNext = nil
+        sessionsHistoryNext = nil
+        sessionsMetadataRead = UUID()
+        sessionsMetadataLoading = false
         sessionPages.clear()
         selectedEarlierRequest = nil
         sessionNote = nil
@@ -1035,36 +1178,39 @@ final class NodeModel: ObservableObject {
         guard case let .room(id) = selection, ended == nil else { return }
         let generation = roomReadGeneration
         let messageRevision = roomMessageRevision
+        let metadataToken = sessionsMetadataRead
+        let liveAfter = sessionsOpenAfter, historyAfter = sessionsHistoryAfter
         roomNeedsPage = true
-        if !seeded.contains(id), let rows = try? await client.unread(room: id) {
-            seeded.insert(id)
-            for message in rows { count(message, in: id) }
-        }
         do {
             // Each read lands only if the room is still the one on screen: a quick switch must not
             // draw one room's messages under another.
             // What was unread as the room came on screen, before showing it marks it read: the
             // timeline's unread line goes above the first of it (ADR-028 R-8).
-            let unread = ((try? await client.unread(room: id)) ?? []).filter { $0.author != me }
+            let unread = try await readUnreadSummary(id)
             let page = try await client.roomRead(room: id)
             let read = page.messages
             guard generation == roomReadGeneration, self.selection == .room(id), ended == nil else { return }
-            let unreadIDs = Set(unread.map(\.id))
             let services = try await client.servicesPage(room: id, after: nil, revision: nil)
             let rows = try await memberRows(id)
             let kept = (try? await client.retention(room: id)) ?? ""
             let keptSecs = try? await client.retentionSecs(room: id)
             let done = try await client.noticesPage(room: id, before: nil, revision: nil)
-            let listed = (try? await client.sessions(room: id)) ?? []
+            let livePage = try await client.sessionsOpenPage(room: id, after: liveAfter)
+            let historyPage = try await client.sessionsPage(room: id, after: historyAfter)
             guard generation == roomReadGeneration, self.selection == .room(id), ended == nil else { return }
             guard messageRevision == roomMessageRevision else { return }
             // The page and its inspector replace the prior view together, after both reads
             // have succeeded. An ordinary refresh must not publish a half-empty room.
+            roomInstance = page.instance
+            roomHasNewer = false
             roomOlder = page.older
             roomBefore = page.before
-            unreadFrom = read.first { unreadIDs.contains($0.id) }?.id
-            unreadCount = unread.count
-            messages = read
+            unreadFrom = unread.first
+            unreadCount = Int(clamping: unread.addressed + unread.new + unread.coordination)
+            let bounded = Self.boundedRoomRows(read, newest: true)
+            roomOlder += UInt64(read.count - bounded.count)
+            if roomOlder > 0 { roomBefore = bounded.first?.id }
+            messages = bounded
             roomNeedsPage = false
             roomServices = services.shared
             roomServicesNext = services.next
@@ -1077,7 +1223,12 @@ final class NodeModel: ObservableObject {
             notices = done.rows
             noticesBefore = done.before
             noticesRevision = done.revision
-            sessions = listed
+            if metadataToken == sessionsMetadataRead,
+               liveAfter == sessionsOpenAfter, historyAfter == sessionsHistoryAfter {
+                sessions = livePage.sessions + historyPage.sessions.filter { !$0.open }
+                sessionsOpenNext = livePage.next
+                sessionsHistoryNext = historyPage.next
+            }
             await loadStepRetention()
             guard !Task.isCancelled, generation == roomReadGeneration, selection == .room(id), ended == nil else { return }
             await loadRoomAnchorState()
@@ -1573,15 +1724,22 @@ final class NodeModel: ObservableObject {
     /// checks its SHA-256 before it keeps it, so the card shows a copy only once it is verified.
     /// How it goes is in `pulling`; where it landed, in `pulled`.
     func download(_ message: RoomMessage) async {
-        guard let room = roomOnScreen, let file = message.file else { return }
+        guard let room = roomOnScreen, let file = message.file,
+              displayedFileIDs.contains(message.id), ended == nil else { return }
+        let generation = roomReadGeneration, epoch = nodeObservationEpoch
+        func current() -> Bool {
+            roomOnScreen == room && roomReadGeneration == generation
+                && nodeObservationEpoch == epoch && ended == nil
+                && displayedFileIDs.contains(message.id) && !Task.isCancelled
+        }
         pulling[message.id] = .pulling(bytes: 0, of: file.size)
         do {
             let path = try await client.get(room: room, entry: message.id)
-            guard roomOnScreen == room else { return }
+            guard current() else { return }
             pulled[message.id] = path
             pulling[message.id] = nil
         } catch {
-            guard roomOnScreen == room else { return }
+            guard current() else { return }
             pulling[message.id] = .failed(why: sentence(error))
         }
     }
@@ -1739,8 +1897,10 @@ final class NodeModel: ObservableObject {
     /// Deliberately mark the clicked room's captured received history, not only loaded rows.
     func markRoomRead(_ room: String) async {
         let actor = me, epoch = nodeObservationEpoch
-        guard rooms.contains(where: { $0.id == room }), ended == nil else { return }
-        let operation = "mark-room-read", attempt = begin("mark-room-read")
+        let operation = "mark-room-read"
+        guard progress(of: operation) == nil,
+              rooms.contains(where: { $0.id == room }), ended == nil else { return }
+        let attempt = begin(operation)
         defer { end(attempt) }
         do {
             let count = try await client.markRoomRead(room: room, node: actor)
@@ -2272,43 +2432,96 @@ final class NodeModel: ObservableObject {
     /// The messages drawn on screen are read (R-6): the node is told, as the TUI tells it what it
     /// draws, once each, in batches. This node's own, and those not received yet, are not.
     func drawn(_ message: RoomMessage, in room: String) {
-        guard case .room(room) = selection, byID[message.id] != nil, message.author != me,
-              !message.owed, !marked.contains(message.id) else {
-            readLog.debug("""
-                not drawn: \(message.id, privacy: .public) on screen \(self.roomOnScreen ?? "none", privacy: .public) \
-                known \(self.byID[message.id] != nil) mine \(message.author == self.me) owed \(message.owed) \
-                marked \(self.marked.contains(message.id))
-                """)
-            return
+        if readMarkEpoch != nodeObservationEpoch {
+            // Let a prior actor's in-flight request settle before admitting another batch.
+            guard flushing == nil else { return }
+            marked.removeAll()
+            markedOrder.removeAll()
+            unmarked.removeAll()
+            readRoomOrder.removeAll()
+            pendingReadIDs.removeAll()
+            readMarkEpoch = nodeObservationEpoch
         }
-        readLog.debug("drawn: \(message.id, privacy: .public) in \(room, privacy: .public)")
-        marked.insert(message.id)
-        uncount(message.id, in: room)
-        unmarked[room, default: []].append(message.id)
+        guard case .room(room) = selection, byID[message.id] != nil, message.author != me,
+              !message.owed, let instance = roomInstance else { return }
+        let context = ReadContext(room: room, actor: me, instance: instance)
+        let mark = ReadMark(context: context, id: message.id)
+        guard !marked.contains(mark), !pendingReadIDs.contains(mark) else { return }
+        // Backpressure leaves the row unread. A later visible-row pass retries it;
+        // no unread badge is decremented and no successful mark is claimed here.
+        guard pendingReadIDs.count < Self.pendingReadLimit else { return }
+        pendingReadIDs.insert(mark)
+        if unmarked[context] == nil { readRoomOrder.append(context) }
+        unmarked[context, default: []].append(mark)
         guard flushing == nil else { return }
+        let epoch = nodeObservationEpoch
         flushing = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 300_000_000)
             guard let self else { return }
-            // Batched by room: a switch inside the batch tells each room only its own.
-            let batches = self.unmarked
-            self.unmarked = [:]
-            self.flushing = nil
-            for (room, ids) in batches {
-                do {
-                    try await self.client.markRead(room: room, ids: ids)
-                    readLog.debug("marked read: \(ids.count) in \(room, privacy: .public)")
-                } catch {
-                    readLog.debug("mark read failed in \(room, privacy: .public): \(sentence(error), privacy: .public)")
-                    // Not recorded: drawn again, it is told again.
-                    ids.forEach { self.marked.remove($0) }
-                    self.reportBackground(error)
+            defer {
+                self.flushing = nil
+                if epoch != self.nodeObservationEpoch {
+                    self.unmarked.removeAll()
+                    self.readRoomOrder.removeAll()
+                    self.pendingReadIDs.removeAll()
                 }
+            }
+            // One worker, including its awaited acknowledgement. IDs in flight retain
+            // their slots in the shared 1024 budget, so a slow daemon cannot grow a backlog.
+            while epoch == self.nodeObservationEpoch, !Task.isCancelled,
+                  !self.readRoomOrder.isEmpty {
+                let context = self.readRoomOrder.removeFirst()
+                guard let pending = self.unmarked.removeValue(forKey: context) else { continue }
+                let ids = Array(pending.prefix(Self.roomWindowLimit))
+                if pending.count > ids.count {
+                    self.unmarked[context] = Array(pending.dropFirst(ids.count))
+                    self.readRoomOrder.append(context)
+                }
+                var acknowledged = false
+                do {
+                    try await self.client.markReadAt(room: context.room, node: context.actor,
+                        instance: context.instance, ids: ids.map(\.id))
+                    guard epoch == self.nodeObservationEpoch, !Task.isCancelled else { return }
+                    for id in ids {
+                        if self.marked.insert(id).inserted { self.markedOrder.append(id) }
+                    }
+                    while self.markedOrder.count > Self.recentReadLimit {
+                        self.marked.remove(self.markedOrder.removeFirst())
+                    }
+                    acknowledged = true
+                    self.scheduleUnread(context.room)
+                    readLog.debug("marked read: \(ids.count) in \(context.room, privacy: .public)")
+                } catch {
+                    if epoch == self.nodeObservationEpoch && !Task.isCancelled {
+                        self.reportBackground(error)
+                    }
+                }
+                self.pendingReadIDs.subtract(ids)
+                if acknowledged { self.readMarkRevision = UUID() }
             }
         }
     }
 
-    private var marked: Set<String> = []
-    private var unmarked: [String: [String]] = [:]
+    /// Recent successful deduplication only. Evicted IDs may be marked again idempotently;
+    /// durable read state belongs to the node, not this bounded client cache.
+    @Published private(set) var readMarkRevision = UUID()
+    private static let recentReadLimit = 1024
+    private static let pendingReadLimit = 1024
+    private var readMarkEpoch = UUID()
+    private struct ReadContext: Hashable {
+        let room: String
+        let actor: String
+        let instance: Data
+    }
+    private struct ReadMark: Hashable {
+        let context: ReadContext
+        let id: String
+    }
+    private var marked: Set<ReadMark> = []
+    private var markedOrder: [ReadMark] = []
+    private var pendingReadIDs: Set<ReadMark> = []
+    private var unmarked: [ReadContext: [ReadMark]] = [:]
+    private var readRoomOrder: [ReadContext] = []
     private var flushing: Task<Void, Never>?
 
     /// The members of `room` other than this node, with the trust each has here.
@@ -2335,6 +2548,33 @@ final class NodeModel: ObservableObject {
             .map { ($0.fingerprint, $0.presentedName) }))
     }
 
+    /// General and the independent thread window are the only consumers of these file maps.
+    /// Session files carry their verified local path in their bounded activity entries.
+    private var displayedFileIDs: Set<String> {
+        Set((messages + threadReplies + [threadRootMessage].compactMap { $0 })
+            .filter { $0.file != nil }.map(\.id))
+    }
+
+    private func retireFileFactsOutsideWindows() {
+        let held = displayedFileIDs
+        pulled = pulled.filter { held.contains($0.key) }
+        pulling = pulling.filter { held.contains($0.key) }
+    }
+
+    private func displayedFileFacts(_ room: String, ids: Set<String>) async throws
+        -> (copies: [PulledFile], states: [OfferPull]) {
+        let ordered = ids.sorted()
+        var copies: [PulledFile] = []
+        var states: [OfferPull] = []
+        for offset in stride(from: 0, to: ordered.count, by: 64) {
+            try Task.checkCancellation()
+            let batch = Array(ordered[offset..<min(offset + 64, ordered.count)])
+            copies += try await client.pulledFor(room: room, entries: batch)
+            states += try await client.pullStatesFor(room: room, entries: batch)
+        }
+        return (copies, states)
+    }
+
     /// The room on screen, read again every few seconds while it is there, each part published
     /// only when it changed: who has read this node's messages (read records arrive with the
     /// room's syncs and draw nothing of their own), the pulled copies, the services
@@ -2350,8 +2590,8 @@ final class NodeModel: ObservableObject {
                 let reads = try? await self.client.readBy(room: room)
                 let where_ = try? await self.client.whereabouts(room: room)
                 let pulls = try? await self.client.pulledBy(room: room)
-                let copies = try? await self.client.pulled(room: room)
-                let states = try? await self.client.pullStates(room: room)
+                let fileIDs = self.displayedFileIDs
+                let fileFacts = try? await self.displayedFileFacts(room, ids: fileIDs)
                 let rows = try? await self.memberRows(room)
                 let kept = try? await self.client.retention(room: room)
                 let keptSecs = try? await self.client.retentionSecs(room: room)
@@ -2366,10 +2606,9 @@ final class NodeModel: ObservableObject {
                 await self.loadRoomAnchorState()
                 guard !Task.isCancelled, self.roomReadGeneration == generation,
                       self.selection == .room(room), self.ended == nil else { return }
-                let listed = try? await self.client.sessions(room: room)
+                await self.refreshSessionMetadata()
                 guard !Task.isCancelled, self.roomReadGeneration == generation,
                       self.selection == .room(room), self.ended == nil else { return }
-                if let listed, listed != self.sessions { self.sessions = listed }
                 if let reads {
                     let now = Dictionary(uniqueKeysWithValues: reads.map { ($0.id, $0.names) })
                     if now != self.readBy { self.readBy = now }
@@ -2382,12 +2621,15 @@ final class NodeModel: ObservableObject {
                     let now = Dictionary(pulls.map { ($0.id, $0.names) }) { $1 }
                     if now != self.pulledBy { self.pulledBy = now }
                 }
-                if let copies {
-                    let now = Dictionary(copies.map { ($0.entry, $0.path) }) { $1 }
+                let visibleFiles = self.displayedFileIDs
+                if visibleFiles == fileIDs, let copies = fileFacts?.copies {
+                    let now = Dictionary(copies.filter { visibleFiles.contains($0.entry) }
+                        .map { ($0.entry, $0.path) }) { $1 }
                     if now != self.pulled { self.pulled = now }
                 }
-                if let states {
-                    let now = Dictionary(states.map { ($0.entry, $0.state) }) { $1 }
+                if visibleFiles == fileIDs, let states = fileFacts?.states {
+                    let now = Dictionary(states.filter { visibleFiles.contains($0.entry) }
+                        .map { ($0.entry, $0.state) }) { $1 }
                     if now != self.pulling { self.pulling = now }
                 }
                 if let rows {
@@ -2421,7 +2663,16 @@ final class NodeModel: ObservableObject {
         }
     }
 
-    fileprivate func arrived(_ message: RoomMessage, in room: String) {
+    fileprivate func arrived(_ message: RoomMessage, in room: String, instance: Data,
+                             epoch: UUID, actor: String) async -> Bool {
+        guard acceptsObservation(epoch, actor: actor),
+              acceptsArrivalInstance(instance, room: room) else { return false }
+        if !rooms.contains(where: { $0.id == room }) { await refresh() }
+        // Refresh can suspend while selection, observation or the saved-room instance
+        // changes. Revalidate immediately before the first preview/body/notification write.
+        guard acceptsObservation(epoch, actor: actor),
+              acceptsArrivalInstance(instance, room: room),
+              rooms.contains(where: { $0.id == room }) else { return false }
         // Looked at: the room's own timeline (General or All) on screen in a window in front of
         // the person, following its newest message, so this one is drawn in view as it lands. A
         // room chosen but with a Session shown, scrolled up, or behind another window is not.
@@ -2439,28 +2690,33 @@ final class NodeModel: ObservableObject {
             let preview = Preview(message, me: me)
             if rooms[i].last != preview { rooms[i].last = preview }
         }
-        if case .room(room) = selection {
+        if case .room(room) = selection, !roomReloadNeeded {
             // A message already shown is replaced: one whose body had not arrived ("not received
             // yet", owed) is shown, and read, once it has; before, it stayed owed until the room
             // was opened again, and was never read.
             if let i = messages.firstIndex(where: { $0.id == message.id }) {
-                messages[i] = message
+                var updated = messages
+                updated[i] = message
+                let bounded = Self.boundedRoomRows(updated, newest: timelineFollowingNewest)
+                if timelineFollowingNewest {
+                    roomOlder += UInt64(updated.count - bounded.count)
+                    if roomOlder > 0 { roomBefore = bounded.first?.id }
+                } else if bounded.count < updated.count { roomHasNewer = true }
+                messages = bounded
+            } else if timelineFollowingNewest {
+                let updated = messages + [message]
+                let bounded = Self.boundedRoomRows(updated, newest: true)
+                roomOlder += UInt64(updated.count - bounded.count)
+                if roomOlder > 0 { roomBefore = bounded.first?.id }
+                messages = bounded
             } else {
-                messages.append(message)
+                roomHasNewer = true
             }
         }
         // Unread until drawn in view (this node's own never are), the room on screen too.
-        guard message.author != me, !marked.contains(message.id) else { return }
-        guard rooms.contains(where: { $0.id == room }) else {
-            // A room joined or made since the rooms were read (by `vox room join`, say): read
-            // them again, then count it.
-            Task {
-                await refresh()
-                if rooms.contains(where: { $0.id == room }) { arrived(message, in: room) }
-            }
-            return
-        }
+        guard message.author != me else { return true }
         count(message, in: room)
+        return true
     }
 
     /// The room whose own timeline is in view and following its newest message, in a window in
@@ -2468,11 +2724,12 @@ final class NodeModel: ObservableObject {
     /// seen as it lands, so it is not notified.
     var lookingAt: String?
 
-    fileprivate func noticed(_ text: String) {
-        Task { await refresh() }
+    fileprivate func noticed(_ text: String) async {
+        await refresh()
     }
 
-    fileprivate func stopped(_ text: String) {
+    fileprivate func stopped(_ text: String) async {
+        waitingLedger = nil
         nodeObservationEpoch = UUID()
         roomReadGeneration = UUID()
         invalidateRoomAnchorState(preservingSnapshot: true)
@@ -2480,13 +2737,39 @@ final class NodeModel: ObservableObject {
         roomNeedsPage = false
         // An ended stream does not establish whether a protected node is Locked or a
         // passphraseless node is already Ready again. Display only the fresh snapshot.
-        clearThreadState()
+        releaseHistoryViews()
         ended = "Node \(node) is unavailable."
         machineStateKnown = false
         daemonReachable = text.localizedCaseInsensitiveContains("detached")
             || text.localizedCaseInsensitiveContains("Locked")
         if !daemonReachable { daemonFailure = text }
-        Task { [weak self] in await self?.readFacts() }
+        await readFacts()
+    }
+
+    /// Recoverable history is reloaded from the node after leaving a view or losing its
+    /// owner. Drafts are user working state and are preserved independently of these caches.
+    private func releaseHistoryViews() {
+        clearThreadState()
+        messages = []
+        roomOlder = 0
+        roomBefore = nil
+        roomInstance = nil
+        roomHasNewer = false
+        roomReloadNeeded = false
+        unreadFrom = nil
+        unreadCount = 0
+        sessionPages.clear()
+        sessionWindowRevision = UUID()
+        selectedEarlierRequest = nil
+        selectedSessionMetadata = nil
+        selectedSessionMetadataKnown = false
+        sessionNote = nil
+        sessionReloadNeeded = false
+        sessionLoading = false
+        readBy = [:]
+        whereabouts = [:]
+        pulledBy = [:]
+        pulled = [:]
     }
 
     /// Resume the same window after its owner has unlocked the node. Credentials and
@@ -2527,38 +2810,173 @@ final class NodeModel: ObservableObject {
     }
 }
 
-/// The node's events, handed to the model on the main actor.
-private final class Listener: ClientListener, @unchecked Sendable {
+/// Each delivery is consumed on the main actor before FFI advances its durable arrival
+/// cursor. The Rust observer releases its client lock across these awaited calls.
+@MainActor
+private final class Listener: ClientListener {
     private weak var model: NodeModel?
+    private let epoch: UUID
+    private let actor: String
 
-    init(model: NodeModel) { self.model = model }
+    init(model: NodeModel) {
+        self.model = model
+        epoch = model.observationToken
+        actor = model.me
+    }
 
-    func onMessage(room: String, message: RoomMessage) {
+    private func current() -> NodeModel? {
+        guard let model, model.acceptsObservation(epoch, actor: actor) else { return nil }
+        return model
+    }
+
+    func onMessage(room: String, instance: Data, message: RoomMessage) async -> Bool {
+        guard let model = current() else { return false }
+        guard model.acceptsArrivalInstance(instance, room: room) else {
+            await model.stopped("The saved room changed; refreshing its history and restarting observation.")
+            return false
+        }
         readLog.debug("follow: event message \(message.id, privacy: .public) in \(room, privacy: .public)")
-        Task { @MainActor [weak model] in model?.arrived(message, in: room) }
+        let consumed = await model.arrived(message, in: room, instance: instance,
+                                           epoch: epoch, actor: actor)
+        return consumed && current() != nil
     }
 
-    func onNotice(text: String) {
-        Task { @MainActor [weak model] in model?.noticed(text) }
+    func onNotice(text: String) async -> Bool {
+        guard let model = current() else { return false }
+        await model.noticed(text)
+        return current() != nil
     }
 
-    func onEnded(text: String) {
-        Task { @MainActor [weak model] in model?.stopped(text) }
+    func onEnded(text: String) async {
+        guard let model = current() else { return }
+        await model.stopped(text)
     }
 
-    func onSessions(room: String) {
-        Task { @MainActor [weak model] in await model?.sessionsChanged(in: room) }
-    }
-
-    func onSessionEntry(room: String, node: String, sessionId: String) {
-        Task { @MainActor [weak model] in await model?.sessionEntry(in: room, node: node, session: sessionId) }
+    func onSessions(room: String) async -> Bool {
+        guard let model = current() else { return false }
+        await model.sessionsChanged(in: room)
+        return current() != nil
     }
 }
 
 // A room's Sessions (ADR-029): read when one is shown, and again when the node says it changed.
 extension NodeModel {
+    /// One open page and one history page are retained, never the complete descriptor log.
+    func refreshSessionMetadata() async {
+        guard let room = roomOnScreen else { return }
+        let epoch = nodeObservationEpoch, generation = roomReadGeneration, token = UUID()
+        let liveAfter = sessionsOpenAfter, historyAfter = sessionsHistoryAfter
+        sessionsMetadataRead = token
+        sessionsMetadataLoading = true
+        defer { if sessionsMetadataRead == token { sessionsMetadataLoading = false } }
+        do {
+            let live = try await client.sessionsOpenPage(room: room, after: liveAfter)
+            let history = try await client.sessionsPage(room: room, after: historyAfter)
+            guard token == sessionsMetadataRead, epoch == nodeObservationEpoch,
+                  generation == roomReadGeneration, roomOnScreen == room else { return }
+            sessions = live.sessions + history.sessions.filter { !$0.open }
+            sessionsOpenNext = live.next
+            sessionsHistoryNext = history.next
+        } catch {
+            guard token == sessionsMetadataRead, epoch == nodeObservationEpoch,
+                  generation == roomReadGeneration, roomOnScreen == room else { return }
+            reportBackground(error)
+        }
+    }
+
+    func nextOpenSessions() async {
+        guard !sessionsMetadataLoading, let next = sessionsOpenNext else { return }
+        sessionsOpenAfter = next
+        await refreshSessionMetadata()
+    }
+
+    func firstOpenSessions() async {
+        guard !sessionsMetadataLoading else { return }
+        sessionsOpenAfter = nil
+        await refreshSessionMetadata()
+    }
+
+    func nextSessionHistory() async {
+        guard !sessionsMetadataLoading, let next = sessionsHistoryNext else { return }
+        sessionsHistoryAfter = next
+        await refreshSessionMetadata()
+    }
+
+    func firstSessionHistory() async {
+        guard !sessionsMetadataLoading else { return }
+        sessionsHistoryAfter = nil
+        await refreshSessionMetadata()
+    }
+
+    /// Exact selected metadata stays independent of the bounded tab/history pages.
+    func readSelectedSessionMetadata() async {
+        guard let room = roomOnScreen, case let .session(node, id) = showing else {
+            selectedSessionMetadata = nil
+            selectedSessionMetadataKnown = false
+            return
+        }
+        let epoch = nodeObservationEpoch, generation = roomReadGeneration
+        func current() -> Bool {
+            roomOnScreen == room && showing == .session(node: node, id: id)
+                && epoch == nodeObservationEpoch && generation == roomReadGeneration
+        }
+        do {
+            let found = try await client.session(room: room, node: node, sessionId: id)
+            guard current() else { return }
+            selectedSessionMetadata = found
+            selectedSessionMetadataKnown = true
+            if found == nil {
+                sessionPages.clear()
+                sessionWindowRevision = UUID()
+                selectedEarlierRequest = nil
+                sessionNote = "This Session's opening is no longer available."
+                sessionLoading = false
+            }
+        } catch {
+            guard current() else { return }
+            selectedSessionMetadata = nil
+            selectedSessionMetadataKnown = true
+            sessionLoading = false
+            sessionPages.clear()
+            sessionWindowRevision = UUID()
+            selectedEarlierRequest = nil
+            sessionNote = sentence(error)
+            reportBackground(error)
+        }
+    }
+
+    /// Capacity refusal alone permits splitting an exact selection. Every other error
+    /// propagates; the caller publishes only after all batches have succeeded.
+    private func retainedSessionEntries(room: String, session: FfiSession, instance: Data,
+                                        ids: [String], current: () -> Bool) async throws -> [FfiSessionEntry] {
+        guard current(), !Task.isCancelled else { throw CancellationError() }
+        do {
+            let page = try await client.sessionEntries(room: room, node: session.nodeFingerprint,
+                sessionId: session.sessionId, instance: instance, ids: ids)
+            guard current(), !Task.isCancelled else { throw CancellationError() }
+            guard page.instance == instance else {
+                throw VoxError.Failed(reason: "The saved room changed while refreshing held Session activity.")
+            }
+            return page.entries
+        } catch {
+            guard current(), !Task.isCancelled else { throw CancellationError() }
+            guard ids.count > 1, case let VoxError.Failed(reason) = error,
+                  reason == "stream refused: held Session selection exceeds one page byte budget; refresh fewer IDs" else {
+                throw error
+            }
+            let middle = ids.count / 2
+            let left = try await retainedSessionEntries(room: room, session: session, instance: instance,
+                ids: Array(ids[..<middle]), current: current)
+            let right = try await retainedSessionEntries(room: room, session: session, instance: instance,
+                ids: Array(ids[middle...]), current: current)
+            return left + right
+        }
+    }
+
     /// The Session on screen's entries, to a member with drive; nothing to one without (SC-3).
     func readSession() async {
+        guard !sessionReloadNeeded else { return }
+        if showingSession && selectedSessionMetadataKnown && selectedSessionMetadata == nil { return }
         guard let room = roomOnScreen, let s = shownSession, s.canDrive else {
             sessionPages.clear()
             selectedEarlierRequest = nil
@@ -2568,18 +2986,34 @@ extension NodeModel {
         }
         let revision = sessionWindowRevision
         let follows = timelineFollowingNewest
+        let epoch = nodeObservationEpoch, generation = roomReadGeneration
+        let heldIDs = sessionEntries.map(\.id)
+        let heldInstance = sessionPages.instance
+        func current() -> Bool {
+            roomOnScreen == room && shownSession?.nodeFingerprint == s.nodeFingerprint
+                && shownSession?.sessionId == s.sessionId && shownSession?.canDrive == true
+                && revision == sessionWindowRevision && follows == timelineFollowingNewest
+                && epoch == nodeObservationEpoch && generation == roomReadGeneration
+        }
         do {
-            // Its newest page (ADR-034 FR-4): an older page is read only when the person scrolls
-            // up to it (readOlderSession).
             let read = try await client.sessionRead(room: room, node: s.nodeFingerprint,
                                                     sessionId: s.sessionId)
-            // Drawn only for the destination it was read for, still on screen and still driven
-            // (D3): the room, the Session's node and its id, and drive held.
-            guard roomOnScreen == room, let now = shownSession, now.nodeFingerprint == s.nodeFingerprint,
-                  now.sessionId == s.sessionId, now.canDrive,
-                  revision == sessionWindowRevision,
-                  follows == timelineFollowingNewest else { return }
+            guard current() else { return }
+            var retained: FfiSessionRead?
+            if !follows, !heldIDs.isEmpty, let heldInstance {
+                guard heldInstance == read.instance else {
+                    throw VoxError.Failed(reason: "The saved room changed while its Session window was open.")
+                }
+                let entries = try await retainedSessionEntries(room: room, session: s,
+                    instance: heldInstance, ids: heldIDs, current: current)
+                retained = FfiSessionRead(instance: heldInstance, entries: entries,
+                    note: nil, older: 0, before: nil)
+            }
+            guard current() else { return }
             var pages = sessionPages
+            if let retained, !pages.revalidate(retained) {
+                throw VoxError.Failed(reason: "The saved room changed while refreshing held Session activity.")
+            }
             pages.newest(read, following: follows)
             if pages != sessionPages {
                 sessionPages = pages
@@ -2587,8 +3021,15 @@ extension NodeModel {
             }
             if read.note != sessionNote { sessionNote = read.note }
             sessionLoading = false
-            await refreshSessionRequests(room: room, session: now)
+            if let now = shownSession { await refreshSessionRequests(room: room, session: now) }
         } catch {
+            guard current() else { return }
+            // A failed protected read cannot authorize formerly cached bodies. Preserve
+            // destination identity and report the refusal, so a fresh valid read can recover.
+            sessionPages.clear()
+            sessionWindowRevision = UUID()
+            selectedEarlierRequest = nil
+            sessionNote = sentence(error)
             reportBackground(error)
             sessionLoading = false
         }
@@ -2596,10 +3037,21 @@ extension NodeModel {
 
     /// End on an older Session window reloads the actual newest page from disk.
     func readNewestTimeline() async {
-        guard showingSession else { return }
+        guard let room = roomOnScreen else { return }
+        let destination = showing, epoch = nodeObservationEpoch
+        roomOlderRead = UUID()
+        roomReadingOlder = false
         timelineFollowingNewest = true
-        sessionWindowRevision = UUID()
-        await readSession()
+        if showingSession {
+            sessionReloadNeeded = false
+            sessionWindowRevision = UUID()
+            await readSelectedSessionMetadata()
+            guard roomOnScreen == room, showing == destination, epoch == nodeObservationEpoch else { return }
+            await readSession()
+        } else {
+            roomReloadNeeded = false
+            await readNewOnScreen()
+        }
     }
 
     /// The page of the Session on screen's entries before those held (ADR-034 FR-4): read when
@@ -2609,6 +3061,7 @@ extension NodeModel {
               let before = sessionBefore, !sessionReadingOlder else { return }
         timelineFollowingNewest = false
         let revision = sessionWindowRevision
+        let epoch = nodeObservationEpoch, generation = roomReadGeneration
         sessionReadingOlder = true
         defer { sessionReadingOlder = false }
         do {
@@ -2617,10 +3070,25 @@ extension NodeModel {
             guard roomOnScreen == room, let now = shownSession, now.nodeFingerprint == s.nodeFingerprint,
                   now.sessionId == s.sessionId, now.canDrive, sessionBefore == before,
                   revision == sessionWindowRevision else { return }
-            sessionPages.older(read, asked: before)
+            guard sessionPages.instance == read.instance else {
+                throw VoxError.Failed(reason: "The saved room changed while loading older Session activity.")
+            }
+            guard sessionPages.older(read, asked: before) else { return }
             sessionWindowRevision = UUID()
             await refreshSessionRequests(room: room, session: now)
         } catch {
+            guard revision == sessionWindowRevision, epoch == nodeObservationEpoch,
+                  generation == roomReadGeneration, roomOnScreen == room,
+                  shownSession?.nodeFingerprint == s.nodeFingerprint,
+                  shownSession?.sessionId == s.sessionId else { return }
+            sessionPages.clear()
+            sessionWindowRevision = UUID()
+            selectedEarlierRequest = nil
+            sessionNote = sentence(error)
+            if case let VoxError.Failed(reason) = error,
+               reason == "stream refused: cursor not among these Session entries" {
+                sessionReloadNeeded = true
+            }
             reportBackground(error)
         }
     }
@@ -2629,6 +3097,15 @@ extension NodeModel {
     /// The daemon uses its request index; no transcript history is walked to find them.
     private func refreshSessionRequests(room: String, session s: FfiSession) async {
         let selected = selectedRequest
+        let revision = sessionWindowRevision
+        let epoch = nodeObservationEpoch, generation = roomReadGeneration
+        let instance = sessionPages.instance
+        func currentContext() -> Bool {
+            roomOnScreen == room && shownSession?.nodeFingerprint == s.nodeFingerprint
+                && shownSession?.sessionId == s.sessionId && shownSession?.canDrive == true
+                && selectedRequest == selected && revision == sessionWindowRevision
+                && epoch == nodeObservationEpoch && generation == roomReadGeneration
+        }
         var references = Set(sessionEntries.compactMap { $0.request?.reference })
         if let selected { references.insert(selected) }
         guard !references.isEmpty else {
@@ -2636,15 +3113,33 @@ extension NodeModel {
             return
         }
         do {
-            let current = try await client.sessionRequests(room: room, node: s.nodeFingerprint,
-                sessionId: s.sessionId, references: references.sorted())
-            guard roomOnScreen == room, let now = shownSession, now.nodeFingerprint == s.nodeFingerprint,
-                  now.sessionId == s.sessionId, now.canDrive, selectedRequest == selected else { return }
-            sessionPages.refreshRequests(current)
+            // One indexed newest page per already-held/explicitly-selected reference.
+            // Keep one current request row per reference, never its resolution transcript.
+            var current: [FfiSessionEntry] = []
+            for reference in references.sorted() {
+                let page = try await client.sessionRequestsPage(room: room, node: s.nodeFingerprint,
+                    sessionId: s.sessionId, reference: reference, before: nil)
+                guard currentContext() else { return }
+                if let instance, page.instance != instance {
+                    throw VoxError.Failed(reason: "The saved room changed while refreshing its requests.")
+                }
+                if let row = page.entries.last(where: { $0.request?.reference == reference }) {
+                    current.append(row)
+                }
+            }
+            guard currentContext() else { return }
+            var pages = sessionPages
+            pages.refreshRequests(current)
+            if pages != sessionPages {
+                sessionPages = pages
+                sessionWindowRevision = UUID()
+            }
             selectedEarlierRequest = current.first { entry in
                 entry.request?.reference == selected && !sessionEntries.contains(where: { $0.id == entry.id })
             }
         } catch {
+            guard currentContext() else { return }
+            selectedEarlierRequest = nil
             reportBackground(error)
         }
     }
@@ -2652,66 +3147,95 @@ extension NodeModel {
     /// Each open room's approvals and questions waiting on this node (CL-2), as the TUI counts
     /// them: what its Sessions say waits on this node.
     func readWaiting() async {
+        let epoch = nodeObservationEpoch
         for room in rooms where room.open {
-            guard let listed = try? await client.sessions(room: room.id) else { continue }
-            let n = listed.reduce(0) { $0 + Int($1.pending) }
-            if let i = rooms.firstIndex(where: { $0.id == room.id }), rooms[i].waiting != n {
-                rooms[i].waiting = n
+            do {
+                let count = try await client.sessionsWaiting(room: room.id)
+                guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
+                guard let n = Int(exactly: count) else {
+                    throw VoxError.Failed(reason: "The node's waiting count cannot be displayed accurately.")
+                }
+                if let i = rooms.firstIndex(where: { $0.id == room.id && $0.open }),
+                   rooms[i].waiting != n { rooms[i].waiting = n }
+            } catch {
+                guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
+                reportBackground(error)
             }
         }
+        guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
         await noteWaiting()
     }
 
-    /// The requests open in `room`'s Sessions this node drives, waiting on it, in each Session's
-    /// order: `(node, session, reference, label)`.
-    private func waiting(in room: String) async -> [(node: String, session: String, reference: String, label: String)] {
-        guard let listed = try? await client.sessions(room: room) else { return [] }
-        var found: [(node: String, session: String, reference: String, label: String)] = []
-        for s in listed where s.pending > 0 && s.canDrive && s.open {
-            guard let requests = try? await client.sessionRequests(room: room, node: s.nodeFingerprint,
-                sessionId: s.sessionId, references: []) else { continue }
-            for e in requests {
-                if let r = e.request, r.state == nil {
-                    found.append((s.nodeFingerprint, s.sessionId, r.reference, s.label))
+    /// Current pending targets come from the node's index; ended Session history and
+    /// resolution transcripts are never collected to discover them.
+    private func waiting(in room: String, visit: ((node: String, session: String, reference: String, label: String)) throws -> Void) async throws {
+        let epoch = nodeObservationEpoch
+        var after: String?
+        repeat {
+                let page = try await client.sessionsPendingPage(room: room, after: after)
+                guard epoch == nodeObservationEpoch, !Task.isCancelled else { throw CancellationError() }
+                for target in page.targets {
+                    guard let session = try await client.session(room: room, node: target.node,
+                        sessionId: target.sessionId), session.open, session.canDrive else { continue }
+                    let head = try await client.sessionRead(room: room, node: target.node,
+                        sessionId: target.sessionId)
+                    let held = try await client.sessionEntries(room: room, node: target.node,
+                        sessionId: target.sessionId, instance: head.instance, ids: [target.entry])
+                    guard epoch == nodeObservationEpoch, !Task.isCancelled else { throw CancellationError() }
+                    if let request = held.entries.first(where: { $0.id == target.entry })?.request,
+                       request.state == nil {
+                        try visit((target.node, target.sessionId, request.reference, session.label))
+                    }
                 }
-            }
-        }
-        return found
-    }
-
-    /// The first request waiting in `room`, for ⌘J.
-    private func firstWaiting(in room: String) async -> (node: String, session: String, reference: String)? {
-        guard let w = await waiting(in: room).first else { return nil }
-        return (w.node, w.session, w.reference)
+                if let next = page.next, next == after {
+                    throw VoxError.Failed(reason: "The pending request page did not advance.")
+                }
+                after = page.next
+        } while after != nil
     }
 
     /// A request that is new since the last look notifies, once per Session, replacing that
     /// Session's earlier one; a Session no longer waiting has its notification withdrawn (P1).
     /// Never the request's text (R-10).
     private func noteWaiting() async {
-        var now: Set<String> = []
-        var bySession: [String: (room: String, node: String, session: String, reference: String, label: String)] = [:]
-        for room in rooms where room.open {
-            for w in await waiting(in: room.id) {
-                let key = "\(room.id)/\(w.node)/\(w.session)/\(w.reference)"
-                now.insert(key)
-                if !knownWaiting.contains(key) && waitingSeen {
-                    bySession["\(room.id)/\(w.node)/\(w.session)"] = (room.id, w.node, w.session, w.reference, w.label)
+        guard !waitingScanRunning else { waitingScanDirty = true; return }
+        waitingScanRunning = true
+        defer { waitingScanRunning = false }
+        repeat {
+            waitingScanDirty = false
+            let epoch = nodeObservationEpoch
+            do {
+                if waitingLedger == nil { waitingLedger = try PendingNotificationLedger() }
+                guard let ledger = waitingLedger else { return }
+                try ledger.begin()
+                do {
+                    for room in rooms where room.open {
+                        try await waiting(in: room.id) { w in
+                            try ledger.observe(room: room.id, node: w.node, session: w.session,
+                                               reference: w.reference, label: w.label)
+                        }
+                        guard epoch == nodeObservationEpoch, !Task.isCancelled else {
+                            throw CancellationError()
+                        }
+                    }
+                    try ledger.finish()
+                } catch {
+                    ledger.abort()
+                    throw error
                 }
+                // Both walks are streaming database cursors, after a complete committed scan.
+                try ledger.notifications { room, node, session, reference, label in
+                    let name = rooms.first { $0.id == room }?.name ?? "a room"
+                    notifier.postWaiting(room: room, roomName: name, node: node,
+                                         session: session, reference: reference, label: label)
+                }
+                try ledger.withdrawals { notifier.withdrawWaiting(sessionKey: $0) }
+            } catch {
+                guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
+                reportBackground(error)
+                return
             }
-        }
-        for (_, w) in bySession {
-            let name = rooms.first { $0.id == w.room }?.name ?? "a room"
-            notifier.postWaiting(room: w.room, roomName: name, node: w.node, session: w.session,
-                                 reference: w.reference, label: w.label)
-        }
-        let stillWaiting = Set(now.map { $0.split(separator: "/").prefix(3).joined(separator: "/") })
-        for gone in Set(knownWaiting.map { $0.split(separator: "/").prefix(3).joined(separator: "/") })
-            .subtracting(stillWaiting) {
-            notifier.withdrawWaiting(sessionKey: gone)
-        }
-        knownWaiting = now
-        waitingSeen = true
+        } while waitingScanDirty && !Task.isCancelled
     }
 
     /// Open `room`, its Session `session` of `node`, and select its request `reference`, centred
@@ -2753,28 +3277,24 @@ extension NodeModel {
 
     /// A Session in `room` opened, ended or was renamed, or what waits on this node changed.
     fileprivate func sessionsChanged(in room: String) async {
-        if let listed = try? await client.sessions(room: room),
-           let i = rooms.firstIndex(where: { $0.id == room }) {
-            let n = listed.reduce(0) { $0 + Int($1.pending) }
-            if rooms[i].waiting != n { rooms[i].waiting = n }
+        let epoch = nodeObservationEpoch
+        let count = try? await client.sessionsWaiting(room: room)
+        guard epoch == nodeObservationEpoch, !Task.isCancelled, ended == nil else { return }
+        if let count, let n = Int(exactly: count), let i = rooms.firstIndex(where: { $0.id == room }) {
+            rooms[i].waiting = n
         }
         await noteWaiting()
-        guard roomOnScreen == room, let listed = try? await client.sessions(room: room),
-              roomOnScreen == room else { return }
-        if listed != sessions { sessions = listed }
-        await readSession()
-    }
-
-    /// A Session has a new entry, or a request in it was resolved.
-    fileprivate func sessionEntry(in room: String, node: String, session: String) async {
-        guard roomOnScreen == room, shownSession?.nodeFingerprint == node,
-              shownSession?.sessionId == session else { return }
+        guard epoch == nodeObservationEpoch, !Task.isCancelled, roomOnScreen == room else { return }
+        await refreshSessionMetadata()
+        guard epoch == nodeObservationEpoch, !Task.isCancelled, roomOnScreen == room else { return }
+        await readSelectedSessionMetadata()
+        guard epoch == nodeObservationEpoch, !Task.isCancelled, roomOnScreen == room else { return }
         await readSession()
     }
 
     /// Drive a Session (ADR-029 DR-1), for the Session view's controls (SessionDrive.swift).
-    func drive(room: String, session: String, action: DriveAction) async throws -> DriveAnswer {
-        try await client.drive(room: room, session: session, action: action)
+    func drive(room: String, node: String, session: String, action: DriveAction) async throws -> DriveAnswer {
+        try await client.drive(room: room, node: node, session: session, action: action)
     }
 }
 
@@ -2852,10 +3372,14 @@ extension NodeModel {
         threadRefreshDirty = false
         threadDisplayRevision = nil
         threadForcedSummaries = []
+        threadAuthorsPaged = []
         threadSummaryVersions = [:]
         threadAuthorRequests = [:]
         threadPageDirty = false
-        threadPagesLoaded = 1
+        threadInstance = nil
+        threadBefore = nil
+        threadAfter = nil
+        threadHasEarlier = false
         threadPageTask?.cancel()
         threadSummaries = [:]
         threadSummaryErrors = [:]
@@ -2903,6 +3427,7 @@ extension NodeModel {
                     // A refused revision is not permission to retain formerly readable bodies.
                     self.threadDisplayRevision = nil
                     self.threadSummaries = [:]
+                    self.threadAuthorsPaged = []
                     self.threadSummaryVersions = [:]
                     self.threadAuthorRequests = [:]
                     self.retireThreadSelection()
@@ -2922,10 +3447,15 @@ extension NodeModel {
                 let changed = self.threadDisplayRevision != revision
                 self.threadDisplayRevision = revision
                 if changed { self.refreshOpenThread() }
-                let roots = self.messages.filter { $0.thread.isEmpty && !$0.owed }.map(\.id)
+                var roots = self.messages.filter { $0.thread.isEmpty && !$0.owed }.map(\.id)
+                if let root = self.openThread, self.threadRootMessage != nil, !roots.contains(root) { roots.append(root) }
                 let known = Set(roots)
                 self.threadSummaries = self.threadSummaries.filter { known.contains($0.key) }
                 self.threadSummaryErrors = self.threadSummaryErrors.filter { known.contains($0.key) }
+                self.threadSummaryVersions = self.threadSummaryVersions.filter { known.contains($0.key) }
+                self.threadAuthorRequests = self.threadAuthorRequests.filter { known.contains($0.key) }
+                self.threadForcedSummaries.formIntersection(known)
+                self.threadAuthorsPaged.formIntersection(known)
                 let forced = self.threadForcedSummaries
                 self.threadForcedSummaries = []
                 for root in roots where changed || forced.contains(root)
@@ -2938,6 +3468,7 @@ extension NodeModel {
                             throw VoxError.Failed(reason: "The reply summary belongs to another message.")
                         }
                         self.threadSummaries[root] = summary
+                        self.threadAuthorsPaged.remove(root)
                         self.threadSummaryVersions[root] = UUID()
                         self.threadSummaryErrors[root] = nil
                     } catch {
@@ -2991,7 +3522,10 @@ extension NodeModel {
         threadGeneration = UUID()
         threadPageTask?.cancel()
         threadLoading = false
-        threadPagesLoaded = 1
+        threadInstance = nil
+        threadBefore = nil
+        threadAfter = nil
+        threadHasEarlier = false
         threadPageDirty = false
         openThread = message.id
         threadRootMessage = message
@@ -3010,7 +3544,10 @@ extension NodeModel {
         selectionAnchor = root?.id
         threadGeneration = UUID()
         threadPageTask?.cancel()
-        threadPagesLoaded = 1
+        threadInstance = nil
+        threadBefore = nil
+        threadAfter = nil
+        threadHasEarlier = false
         threadPageDirty = false
         openThread = nil
         threadRootMessage = nil
@@ -3021,7 +3558,7 @@ extension NodeModel {
     }
 
     private func refreshOpenThread() {
-        guard openThread != nil else { return }
+        guard openThread != nil, threadError == nil else { return }
         if threadLoading {
             threadPageDirty = true
             return
@@ -3031,14 +3568,24 @@ extension NodeModel {
     }
 
     func moreThreadReplies() { loadThreadPage(replacing: false) }
-    func retryThread() { loadThreadPage(replacing: true) }
+    func earlierThreadReplies() { loadThreadPage(replacing: false, earlier: true) }
+    func retryThread() {
+        threadInstance = nil
+        threadBefore = nil
+        threadAfter = nil
+        loadThreadPage(replacing: true)
+    }
 
-    private func loadThreadPage(replacing: Bool) {
+    private func loadThreadPage(replacing: Bool, earlier: Bool = false) {
         guard let room = roomOnScreen, let root = openThread, ended == nil, !threadLoading else { return }
         let generation = threadGeneration
         let roomGeneration = roomReadGeneration
         let epoch = nodeObservationEpoch
-        let cursor = replacing ? "" : threadReplies.last?.id ?? ""
+        let instance = threadInstance
+        let before = earlier ? threadBefore : nil
+        let after = !replacing && !earlier ? threadAfter : nil
+        let heldIDs = threadReplies.map(\.id)
+        if !replacing && (earlier ? before == nil : after == nil) { return }
         threadLoading = true
         threadError = nil
         threadPageTask = Task { [weak self] in
@@ -3058,48 +3605,54 @@ extension NodeModel {
                     && self.nodeObservationEpoch == epoch && self.ended == nil
             }
             do {
-                if self.threadRootMessage == nil {
-                    // Recovery revalidates exactly one root through the daemon's indexed
-                    // read; it never walks General or reuses a formerly readable cached body.
-                    let readable = try await self.client.threadRoot(room: room, root: root)
+                let readable = try await self.client.threadRoot(room: room, root: root)
+                guard current() else { return }
+                guard let readable, readable.id == root, !readable.owed, readable.thread.isEmpty else {
+                    throw VoxError.Failed(reason: "The thread's starting message is no longer readable or retained.")
+                }
+                if replacing, let instance, !heldIDs.isEmpty {
+                    let rows = try await self.retainedRoomEntries(room: room, instance: instance,
+                        ids: heldIDs, current: current)
                     guard current() else { return }
-                    guard let readable, readable.id == root, !readable.owed, readable.thread.isEmpty else {
-                        throw VoxError.Failed(reason: "The thread's starting message is no longer readable or retained.")
+                    guard rows.allSatisfy({ !$0.owed && $0.thread == root }) else {
+                        throw VoxError.Failed(reason: "A held reply is no longer readable in this thread.")
                     }
-                    self.threadRootMessage = readable
-                }
-                var next = cursor
-                var result: [RoomMessage] = []
-                let pages = replacing ? self.threadPagesLoaded : 1
-                var more = false
-                var awaitingBodies = false
-                for _ in 0..<pages {
-                    let page = try await self.client.readThreadPage(room: room, root: root, since: next)
+                    let bounded = Self.boundedRoomRows(rows, newest: false)
+                    guard let first = bounded.first, let last = bounded.last else {
+                        throw VoxError.Failed(reason: "The held reply window is no longer retained. Reload the first replies.")
+                    }
+                    // Probe adjacent indexed pages without accumulating or displaying them.
+                    // New replies become reachable while the reader's held window stays pinned.
+                    let prior = try await self.client.threadPage(room: room, root: root,
+                        instance: instance, before: first.id, after: nil)
                     guard current() else { return }
-                    guard page.allSatisfy({ $0.owed || $0.thread == root }),
-                          page.isEmpty || page.last?.id != next else {
-                        throw VoxError.Failed(reason: "The thread page did not belong to this thread or advance its cursor.")
+                    let later = try await self.client.threadPage(room: room, root: root,
+                        instance: instance, before: nil, after: last.id)
+                    guard current() else { return }
+                    guard prior.instance == instance, later.instance == instance else {
+                        throw VoxError.Failed(reason: "The saved room changed while probing thread navigation.")
                     }
-                    result += page
-                    more = !page.isEmpty
-                    if page.isEmpty { break }
-                    guard let mark = page.last, !mark.owed else {
-                        // The current API refuses an owed cursor. Keep that absence honest;
-                        // never drain/replay a page or pretend the thread ended.
-                        awaitingBodies = true
-                        more = false
-                        break
+                    self.threadReplies = bounded
+                    self.threadBefore = prior.messages.isEmpty ? nil : first.id
+                    self.threadAfter = later.messages.isEmpty ? nil : last.id
+                    self.threadHasEarlier = self.threadBefore != nil
+                    self.threadHasMore = self.threadAfter != nil
+                } else {
+                    let page = try await self.client.threadPage(room: room, root: root,
+                        instance: instance, before: before, after: after)
+                    guard current() else { return }
+                    guard page.messages.allSatisfy({ $0.owed || $0.thread == root }),
+                          instance == nil || page.instance == instance else {
+                        throw VoxError.Failed(reason: "The thread page did not match its saved room or root.")
                     }
-                    next = mark.id
+                    self.threadReplies = Self.boundedRoomRows(page.messages, newest: false)
+                    self.threadInstance = page.instance
+                    self.threadBefore = page.before
+                    self.threadAfter = page.after
+                    self.threadHasEarlier = page.before != nil
+                    self.threadHasMore = page.after != nil
                 }
-                if replacing { self.threadReplies = result }
-                else {
-                    let held = Set(self.threadReplies.map(\.id))
-                    self.threadReplies += result.filter { !held.contains($0.id) }
-                    if !result.isEmpty { self.threadPagesLoaded += 1 }
-                }
-                self.threadHasMore = more
-                if awaitingBodies { self.threadError = "Some reply bodies have not been received. Retry when they arrive." }
+                self.threadRootMessage = readable
                 self.threadLoading = false
             } catch {
                 guard current() else { return }
@@ -3128,6 +3681,11 @@ extension NodeModel {
         }
     }
 
+    func firstThreadAuthors(_ root: String) {
+        threadForcedSummaries.insert(root)
+        scheduleThreadRefresh()
+    }
+
     func moreThreadAuthors(_ root: String) async {
         guard let room = roomOnScreen, let held = threadSummaries[root],
               let after = held.nextAuthor, ended == nil else { return }
@@ -3153,21 +3711,154 @@ extension NodeModel {
             guard page.root == root, page.nextAuthor != after else {
                 throw VoxError.Failed(reason: "The thread's author page did not advance.")
             }
-            // Only combine pages from the same authoritative count/time snapshot.
+            // Replace the author window only within the same authoritative count/time snapshot.
             guard page.replyCount == held.replyCount, page.lastReplyMillis == held.lastReplyMillis else {
                 threadForcedSummaries.insert(root)
                 scheduleThreadRefresh()
                 return
             }
-            let known = Set(held.authors.map(\.fingerprint))
             threadSummaries[root] = ThreadSummary(root: root, replyCount: held.replyCount,
                 lastReplyMillis: held.lastReplyMillis,
-                authors: held.authors + page.authors.filter { !known.contains($0.fingerprint) },
+                authors: page.authors,
                 nextAuthor: page.nextAuthor)
+            threadAuthorsPaged.insert(root)
             threadSummaryVersions[root] = UUID()
         } catch {
             guard current() else { return }
             threadSummaryErrors[root] = sentence(error)
         }
+    }
+}
+
+
+/// Ephemeral comparison state for complete pending-request scans. It is never a profile or
+/// authority: the daemon supplies every target again, and an aborted scan keeps its predecessor.
+/// SQLite's page cache is bounded; result rows are stepped individually, never collected.
+@MainActor
+private final class PendingNotificationLedger {
+    private var database: OpaquePointer?
+    private let directory: URL
+    private var hasSnapshot = false
+
+    init() throws {
+        directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("vox-pending-" + UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700])
+        guard sqlite3_open(directory.appendingPathComponent("pending.sqlite").path, &database) == SQLITE_OK else {
+            if let database { sqlite3_close(database) }
+            database = nil
+            try? FileManager.default.removeItem(at: directory)
+            throw VoxError.Failed(reason: "The temporary pending-notification ledger could not open.")
+        }
+        do {
+            try run("PRAGMA cache_size=-256")
+            try run("PRAGMA temp_store=FILE")
+            try run("PRAGMA mmap_size=0")
+            for table in ["known_refs", "known_sessions", "scan_refs", "scan_sessions", "gone"] {
+                try run("CREATE TABLE " + table + " (key TEXT PRIMARY KEY) WITHOUT ROWID")
+            }
+            try run("CREATE TABLE notifications (key TEXT PRIMARY KEY, room TEXT, node TEXT, session TEXT, reference TEXT, label TEXT) WITHOUT ROWID")
+        } catch {
+            sqlite3_close(database)
+            database = nil
+            try? FileManager.default.removeItem(at: directory)
+            throw error
+        }
+    }
+
+    deinit {
+        sqlite3_close(database)
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    private func failure() -> VoxError {
+        VoxError.Failed(reason: "The temporary pending-notification ledger failed: "
+            + String(cString: sqlite3_errmsg(database)))
+    }
+
+    private func statement(_ sql: String, _ values: [String] = []) throws -> OpaquePointer {
+        var result: OpaquePointer?
+        guard sqlite3_prepare_v2(database, sql, -1, &result, nil) == SQLITE_OK,
+              let result else { throw failure() }
+        for (index, value) in values.enumerated() {
+            let code = value.withCString {
+                sqlite3_bind_text(result, Int32(index + 1), $0, -1,
+                    unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+            }
+            guard code == SQLITE_OK else { sqlite3_finalize(result); throw failure() }
+        }
+        return result
+    }
+
+    private func run(_ sql: String, _ values: [String] = []) throws {
+        let query = try statement(sql, values)
+        defer { sqlite3_finalize(query) }
+        var code = sqlite3_step(query)
+        while code == SQLITE_ROW { code = sqlite3_step(query) }
+        guard code == SQLITE_DONE else { throw failure() }
+    }
+
+    private func exists(_ key: String) throws -> Bool {
+        let query = try statement("SELECT 1 FROM known_refs WHERE key=?", [key])
+        defer { sqlite3_finalize(query) }
+        let code = sqlite3_step(query)
+        guard code == SQLITE_ROW || code == SQLITE_DONE else { throw failure() }
+        return code == SQLITE_ROW
+    }
+
+    func begin() throws {
+        try run("BEGIN")
+        do {
+            for table in ["scan_refs", "scan_sessions", "notifications", "gone"] {
+                try run("DELETE FROM " + table)
+            }
+        } catch { abort(); throw error }
+    }
+
+    func observe(room: String, node: String, session: String, reference: String, label: String) throws {
+        let sessionKey = room + "/" + node + "/" + session
+        let key = sessionKey + "/" + reference
+        try run("INSERT OR IGNORE INTO scan_refs VALUES (?)", [key])
+        try run("INSERT OR IGNORE INTO scan_sessions VALUES (?)", [sessionKey])
+        let previouslyKnown = try exists(key)
+        if hasSnapshot && !previouslyKnown {
+            try run("INSERT OR REPLACE INTO notifications VALUES (?,?,?,?,?,?)",
+                    [sessionKey, room, node, session, reference, label])
+        }
+    }
+
+    func finish() throws {
+        try run("INSERT INTO gone SELECT key FROM known_sessions EXCEPT SELECT key FROM scan_sessions")
+        try run("DELETE FROM known_refs")
+        try run("INSERT INTO known_refs SELECT key FROM scan_refs")
+        try run("DELETE FROM known_sessions")
+        try run("INSERT INTO known_sessions SELECT key FROM scan_sessions")
+        try run("COMMIT")
+        hasSnapshot = true
+    }
+
+    func abort() { try? run("ROLLBACK") }
+
+    private func walk(_ sql: String, visit: (OpaquePointer) -> Void) throws {
+        let query = try statement(sql)
+        defer { sqlite3_finalize(query) }
+        while true {
+            let code = sqlite3_step(query)
+            if code == SQLITE_DONE { return }
+            guard code == SQLITE_ROW else { throw failure() }
+            visit(query)
+        }
+    }
+
+    func notifications(_ visit: (String, String, String, String, String) -> Void) throws {
+        try walk("SELECT room,node,session,reference,label FROM notifications") { query in
+            func text(_ column: Int32) -> String { String(cString: sqlite3_column_text(query, column)) }
+            visit(text(0), text(1), text(2), text(3), text(4))
+        }
+    }
+
+    func withdrawals(_ visit: (String) -> Void) throws {
+        try walk("SELECT key FROM gone") { visit(String(cString: sqlite3_column_text($0, 0))) }
     }
 }

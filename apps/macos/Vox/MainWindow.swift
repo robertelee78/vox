@@ -181,20 +181,7 @@ private struct Sidebar: View {
                     RoomRow(room: room, selected: model.selection == .room(room.id), health: model.roomHealth(room.id))
                         .tag(NodeModel.Selection.room(room.id))
                         .sidebarRow(model.selection == .room(room.id))
-                        .contextMenu {
-                            Button("Copy Room Link") {
-                                Task { await model.copyRoomLink(room: room.id) }
-                            }
-                            .keyboardShortcut("c", modifiers: .command)
-                            Button("Mark as Read") {
-                                Task { await model.markRoomRead(room.id) }
-                            }
-                            .disabled(model.busy)
-                            Button("Copy Name") {
-                                NSPasteboard.general.clearContents()
-                                NSPasteboard.general.setString(room.name, forType: .string)
-                            }
-                        }
+                        .contextMenu { roomContextMenu(room) }
                 }
             }
         }
@@ -213,6 +200,21 @@ private struct Sidebar: View {
         OnThisMachine(nodes: model.nodes, known: model.daemonReachable && model.machineStateKnown)
             .frame(maxHeight: available.size.height * 0.4)
         }
+        }
+    }
+    @ViewBuilder
+    private func roomContextMenu(_ room: NodeModel.Room) -> some View {
+        Button("Copy Room Link") {
+            Task { await model.copyRoomLink(room: room.id) }
+        }
+        .keyboardShortcut("c", modifiers: .command)
+        Button("Mark as Read") {
+            Task { await model.markRoomRead(room.id) }
+        }
+        .disabled(model.progress(of: "mark-room-read") != nil)
+        Button("Copy Name") {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(room.name, forType: .string)
         }
     }
 }
@@ -484,6 +486,9 @@ private struct RoomRow: View {
                         .foregroundStyle(waits ? VoxTokens.Colors.bgBase : VoxTokens.Colors.textPrimary)
                         .padding(.horizontal, 6).frame(minWidth: 18, minHeight: 18)
                         .background(Capsule().fill(waits ? VoxTokens.Colors.accent : VoxTokens.Colors.accentDeep))
+                        .help(room.unreadScanLimited
+                              ? "Unread messages in the newest 1,000 rows; older activity has not been counted."
+                              : "Unread messages and waiting requests.")
                         .accessibilityIdentifier("room-badge-\(room.name)")
                 }
             }
@@ -996,6 +1001,18 @@ private struct RoomView: View {
                                 let items = model.timelineItems
                                 let days = TimelineTime.dividers(items)
                                 LazyVStack(alignment: .leading, spacing: Space.s12 * scale) {
+                                    if model.showingSession && model.sessionReloadNeeded {
+                                        Button("Reload newest activity") {
+                                            Task { await model.readNewestTimeline() }
+                                        }
+                                        .accessibilityIdentifier("session-reload-newest")
+                                    }
+                                    if !model.showingSession && model.roomReloadNeeded {
+                                        Button("Reload newest messages") {
+                                            Task { await model.readNewestTimeline() }
+                                        }
+                                        .accessibilityIdentifier("room-reload-newest")
+                                    }
                                     ForEach(items) { item in
                                         // A new day starts above the first line that falls on it.
                                         if let day = days[item.id] {
@@ -1274,6 +1291,7 @@ private struct RoomView: View {
                     .onChange(of: following) { value in model.timelineFollowingNewest = value }
                     .onChange(of: model.timelineFollowingNewest) { value in following = value }
                     .onChange(of: window.seen) { _ in markSeen() }
+                    .onChange(of: model.readMarkRevision) { _ in markSeen() }
                     .onChange(of: model.showing) { _ in updateLooking() }
                     .onDisappear { if model.lookingAt == room { model.lookingAt = nil } }
                     // A row whose body has just arrived is read now, even if its frame is
@@ -1447,7 +1465,7 @@ private struct RoomView: View {
             .accessibilityIdentifier("attach")
             // Who posts (E-4): the node this window acts as, before the field.
             // No label of its own (a selectable Text with one recurses); the field says "as ann".
-            Text("\(model.node) ▸").font(Theme.mono).secondaryText()
+            Text("\(model.node) ▸").font(Theme.text).secondaryText()
                 .accessibilityIdentifier("compose-as")
             // Up to 12 lines, so a long message is read before it goes; Return sends, ⇧↩ (or ⌥↩)
             // adds a line (P19).
@@ -1774,7 +1792,7 @@ private struct MessageRow: View {
                 // No label of its own: a selectable Text with one sends SwiftUI's accessibility into
                 // endless recursion (the detail pane is selectable).
                 Text(TimelineTime.short(message.createdMillis))
-                    .font(Theme.mono).secondaryText()
+                    .voxFont(VoxTokens.Fonts.appSmall).monospacedDigit().secondaryText()
                     .help(TimelineTime.full(message.createdMillis))
                     .accessibilityIdentifier("time-\(message.id)")
                 if message.urgent { StateMark(kind: .attention, words: "urgent") }
@@ -1805,6 +1823,7 @@ private struct MessageRow: View {
             }
             if message.file == nil || !(message.file?.note.isEmpty ?? true) {
                 Text(message.owed ? "not received yet" : shownText)
+                    .voxFont(VoxTokens.Fonts.appText)
                     .textSelection(.enabled)
             }
             if let card = message.card {
@@ -1842,11 +1861,21 @@ private struct MessageRow: View {
                     .accessibilityIdentifier("whereabouts-\(message.id)")
             }
         }
+        .padding(.leading, addressedToMe ? Space.s8 * scale : 0)
+        .overlay(alignment: .leading) {
+            if addressedToMe {
+                Rectangle().fill(VoxTokens.Colors.accent)
+                    .frame(width: 3 * scale)
+                    .allowsHitTesting(false).accessibilityHidden(true)
+            }
+        }
         // VoiceOver reads the row first as one sentence, in the order it is drawn; its parts
         // (the file's buttons, the link) stay reachable inside it (WCAG 1.3.1, 4.1.2).
         .accessibilityElement(children: .contain)
         .accessibilityLabel(spoken)
     }
+
+    private var addressedToMe: Bool { message.to.contains(me) || message.level == .toYou }
 
     /// The row as one sentence: who, to whom, how, what, and what became of it.
     private var spoken: String {
@@ -2131,7 +2160,8 @@ private struct FileCard: View {
                 DisclosureGroup("Details", isExpanded: $details) {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("SHA-256 \(file.sha256)").font(Theme.mono).textSelection(.enabled)
-                        Text("Shared by \(sharer) (\(message.author))").font(Theme.mono)
+                        Text("Shared by \(sharer) (\(Text(message.author).font(Theme.font(VoxTokens.Fonts.appMono, scale: scale))))")
+                            .voxFont(VoxTokens.Fonts.appText)
                             .textSelection(.enabled)
                     }
                     .secondaryText()
@@ -2382,7 +2412,7 @@ private struct FamilyLan: View {
         Text(model.lanOn.contains(room) ? "On" : "Off")
             .accessibilityIdentifier("family-lan-status")
         if let said = model.lanSaid[room] {
-            Text(said).font(Theme.mono).secondaryText().textSelection(.enabled)
+            Text(said).font(Theme.text).secondaryText().textSelection(.enabled)
                 .accessibilityIdentifier("family-lan-said")
         }
         if let failed = model.lanFailed[room] {
@@ -2482,7 +2512,7 @@ private struct StatusBar: View {
                 .accessibilityIdentifier("status-dismiss")
             }
         }
-        .font(Theme.mono)
+        .font(Theme.text)
         .padding(.horizontal, Space.s12)
         .padding(.vertical, Space.s8)
         // A container, so "notifications-off" keeps its identifier; its label says the whole bar.
@@ -2566,6 +2596,11 @@ private struct ThreadSummaryLine: View {
                 .buttonStyle(.plain)
                 .help("Last reply: " + TimelineTime.full(summary.lastReplyMillis))
                 .accessibilityIdentifier("thread-summary-" + message.id)
+                if model.threadAuthorsPaged.contains(message.id) {
+                    Button("First repliers") { model.firstThreadAuthors(message.id) }
+                        .buttonStyle(.plain)
+                        .accessibilityIdentifier("thread-authors-first-" + message.id)
+                }
                 if summary.nextAuthor != nil {
                     Button("More repliers") { Task { await model.moreThreadAuthors(message.id) } }
                         .buttonStyle(.plain)
@@ -2648,10 +2683,14 @@ private struct ThreadPanel: View {
                         } else if let error = model.threadError {
                             Text("Replies unavailable: " + error).secondaryText()
                                 .accessibilityIdentifier("thread-error")
-                            Button("Retry") { model.retryThread() }
+                            Button("Reload first replies") { model.retryThread() }
                         } else if model.threadReplies.isEmpty {
                             Text("No retained replies you can read.").secondaryText()
                                 .accessibilityIdentifier("thread-empty")
+                        }
+                        if model.threadHasEarlier && !model.threadLoading {
+                            Button("Earlier replies") { model.earlierThreadReplies() }
+                                .accessibilityIdentifier("thread-earlier")
                         }
                         if model.threadHasMore && !model.threadLoading {
                             Button("More replies") { model.moreThreadReplies() }
