@@ -181,20 +181,7 @@ private struct Sidebar: View {
                     RoomRow(room: room, selected: model.selection == .room(room.id), health: model.roomHealth(room.id))
                         .tag(NodeModel.Selection.room(room.id))
                         .sidebarRow(model.selection == .room(room.id))
-                        .contextMenu {
-                            Button("Copy Room Link") {
-                                Task { await model.copyRoomLink(room: room.id) }
-                            }
-                            .keyboardShortcut("c", modifiers: .command)
-                            Button("Mark as Read") {
-                                Task { await model.markRoomRead(room.id) }
-                            }
-                            .disabled(model.busy)
-                            Button("Copy Name") {
-                                NSPasteboard.general.clearContents()
-                                NSPasteboard.general.setString(room.name, forType: .string)
-                            }
-                        }
+                        .contextMenu { roomContextMenu(room) }
                 }
             }
         }
@@ -213,6 +200,21 @@ private struct Sidebar: View {
         OnThisMachine(nodes: model.nodes, known: model.daemonReachable && model.machineStateKnown)
             .frame(maxHeight: available.size.height * 0.4)
         }
+        }
+    }
+    @ViewBuilder
+    private func roomContextMenu(_ room: NodeModel.Room) -> some View {
+        Button("Copy Room Link") {
+            Task { await model.copyRoomLink(room: room.id) }
+        }
+        .keyboardShortcut("c", modifiers: .command)
+        Button("Mark as Read") {
+            Task { await model.markRoomRead(room.id) }
+        }
+        .disabled(model.busy)
+        Button("Copy Name") {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(room.name, forType: .string)
         }
     }
 }

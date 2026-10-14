@@ -31,7 +31,7 @@ extension NodeModel {
             return .refused("you cannot drive this Session: \(s.nodeAlias) has not given you drive")
         }
         do {
-            let answer = try await drive(room: room, session: s.sessionId, action: action)
+            let answer = try await drive(room: room, node: s.nodeFingerprint, session: s.sessionId, action: action)
             switch answer.delivery {
             case .answered:
                 return answer.ok ? .taken("\(s.label): \(answer.said)")

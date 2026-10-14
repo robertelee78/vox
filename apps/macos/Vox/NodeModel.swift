@@ -2863,8 +2863,8 @@ extension NodeModel {
     }
 
     /// Drive a Session (ADR-029 DR-1), for the Session view's controls (SessionDrive.swift).
-    func drive(room: String, session: String, action: DriveAction) async throws -> DriveAnswer {
-        try await client.drive(room: room, session: session, action: action)
+    func drive(room: String, node: String, session: String, action: DriveAction) async throws -> DriveAnswer {
+        try await client.drive(room: room, node: node, session: session, action: action)
     }
 }
 
