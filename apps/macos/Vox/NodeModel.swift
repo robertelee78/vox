@@ -1837,19 +1837,30 @@ final class NodeModel: ObservableObject {
         let operation = "create-room", attempt = begin("create-room")
         defer { end(attempt) }
         guard context == anchorChoiceContext, sheet == .newRoom, ended == nil else { secret.wipe(); return false }
+        let editor = sheetInstance, origin = selection
+        // The mutation opens a room, so its ChannelOpened event may restart observation and
+        // retire the old read epoch. That does not retire the person's creation intent.
+        // Keep the exact sheet and navigation fences; reads still use their own fresh epochs.
+        func current(_ expected: Selection?) -> Bool {
+            !Task.isCancelled && sheet == .newRoom && sheetInstance == editor && selection == expected
+        }
         do {
             let passphrase = try secret.passphrase()
             defer { passphrase.wipe() }
             let room = try await client.createRoomWithAnchors(name: name, passphrase: passphrase,
                                                              anchors: anchors, node: me)
-            guard !Task.isCancelled, context == anchorChoiceContext, ended == nil else { return false }
+            guard current(origin) else { return false }
             report(operation: operation, done: "Created the room.")
+            // Publish the successful navigation before yielding to observation recovery.
+            // Neither a cancelled sheet nor a later navigation may be taken over on return.
+            let destination = Selection.room(room)
+            select(destination)
             await refresh()
-            guard !Task.isCancelled, context == anchorChoiceContext, ended == nil else { return false }
-            await show(.room(room))
-            return true
+            guard current(destination) else { return false }
+            await show(destination)
+            return current(destination)
         } catch {
-            guard !Task.isCancelled, context == anchorChoiceContext, ended == nil else { return false }
+            guard current(origin) else { return false }
             report(error, operation: operation)
             return false
         }
