@@ -226,6 +226,12 @@ fn value_text(v: &Value) -> String {
 fn outcome_words(resolved: &Body, names: &dyn Names) -> String {
     let outcome = resolved.str("outcome");
     let what = match outcome {
+        "unobserved" => {
+            return format!(
+                "not answerable from Vox: {}; answer at the terminal",
+                resolved.str("why")
+            )
+        }
         "allowed" => "approved".to_owned(),
         "denied" => "rejected".to_owned(),
         "answered" => resolved

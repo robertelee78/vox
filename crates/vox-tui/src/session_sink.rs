@@ -24,7 +24,7 @@
 //! accepted this limit, 2026-10-06.)
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -215,7 +215,7 @@ struct Ask {
     given: Option<(String, Given)>,
     /// Where the harness records how the request was settled, for a harness that says so only
     /// there (Claude Code). `None` when its adapter reports it ([`Sink::resolved`]).
-    transcript: Option<PathBuf>,
+    transcript: Option<Arc<Mutex<TranscriptScan>>>,
 }
 
 /// Who waits for a request's first answer.
@@ -508,16 +508,8 @@ impl Sink {
                     .filter(|ask| Arc::ptr_eq(&ask.ticket, &ticket))?;
                 s.asks.remove(&id)
             });
-            if let Some(mut ask) = ask {
-                if let Some(Waiter::Hook(h)) = ask.waiter.take() {
-                    let _ = h.send(None);
-                }
-                self.remember(node, session, &id, "the request expired before an answer");
-                entries.push(
-                    json!({"v": crate::session_mirror::VERSION, "session": session,
-                    "kind":"resolved", "ref":id, "of":ask.of, "outcome":"expired"})
-                    .to_string(),
-                );
+            if let Some(ask) = ask {
+                entries.push(self.expire_entry(node, session, &id, ask));
             }
         }
         entries
@@ -748,9 +740,7 @@ impl Sink {
         call: ToolCall,
         transcript: String,
     ) -> Option<String> {
-        if (self.room_of)(node, session).is_none() {
-            return None;
-        }
+        (self.room_of)(node, session)?;
         let Ok(Value::Object(mut entry)) = serde_json::from_str::<Value>(&body) else {
             return None;
         };
@@ -793,7 +783,9 @@ impl Sink {
                             of: of.clone(),
                             waiter: Some(Waiter::Hook(tx)),
                             given: None,
-                            transcript: Some(transcript.clone()),
+                            transcript: Some(Arc::new(Mutex::new(TranscriptScan::new(
+                                transcript.clone(),
+                            )))),
                         },
                     );
                     Ok(id)
@@ -834,28 +826,28 @@ impl Sink {
                     });
                     return None;
                 }
-                self.watch(node, session, &id);
+                self.watch(node, session, &id, ticket);
                 rx.await.ok().flatten()
             }
         }
     }
 
     /// Read the transcript for `id`'s result until it appears or the request is gone.
-    fn watch(self: &Arc<Self>, node: &NodeName, session: &str, id: &str) {
+    fn watch(self: &Arc<Self>, node: &NodeName, session: &str, id: &str, ticket: Arc<()>) {
         let me = Arc::clone(self);
         let (node, session, id) = (node.clone(), session.to_owned(), id.to_owned());
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(TRANSCRIPT_POLL).await;
-                if !me.settle(&node, &session, &id).await {
+                if !me.settle(&node, &session, &id, &ticket).await {
                     return;
                 }
             }
         });
     }
 
-    /// Retire `id`'s request if the transcript records its result. Returns whether it is still
-    /// waiting.
+    /// Retire `id`'s request if the transcript records its result. The boolean means the
+    /// waiter is still held, not that transcript observation is complete; `answer` checks that.
     fn settled_entry(&self, node: &NodeName, session: &str, id: &str) -> (bool, Option<String>) {
         self.settled_entry_if(node, session, id, None)
     }
@@ -867,30 +859,84 @@ impl Sink {
         id: &str,
         ticket: Option<&Arc<()>>,
     ) -> (bool, Option<String>) {
-        let path = self.with(|all| {
+        let current = self.with(|all| {
             all.get(&(node.clone(), session.to_owned()))
                 .and_then(|s| s.asks.get(id))
                 .filter(|ask| ticket.is_none_or(|ticket| Arc::ptr_eq(ticket, &ask.ticket)))
-                .map(|a| a.transcript.clone())
+                .map(|a| (a.transcript.clone(), Arc::clone(&a.ticket)))
         });
-        let Some(path) = path else {
+        let Some((scan, ticket)) = current else {
             return (false, None);
         };
-        let Some(path) = path else {
+        let Some(scan) = scan else {
             return (true, None);
         };
-        let Some(r) = tool_result(&path, id) else {
-            return (true, None);
+        let result = match scan.try_lock() {
+            Ok(mut scan) => scan.read(id),
+            Err(std::sync::TryLockError::WouldBlock) => return (true, None),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                Err("the transcript observer stopped unexpectedly".to_owned())
+            }
+        };
+        let r = match result {
+            Ok(Some(result)) => result,
+            Ok(None) => return (true, None),
+            Err(why) => {
+                return (
+                    false,
+                    self.unobserved_entry(node, session, id, &ticket, &why),
+                );
+            }
         };
         let outcome = if r.is_error { "denied" } else { "" };
         (
             false,
-            self.retired_entry_if(node, session, (id, ticket), outcome, r.answers, &r.text),
+            self.retired_entry_if(
+                node,
+                session,
+                (id, Some(&ticket)),
+                outcome,
+                r.answers,
+                &r.text,
+            ),
         )
     }
 
-    async fn settle(&self, node: &NodeName, session: &str, id: &str) -> bool {
-        let (waiting, entry) = self.settled_entry(node, session, id);
+    /// Observation failed, not the harness action. Retire only this exact waiter and say that
+    /// Vox cannot answer it; never infer approval, rejection, or a terminal answer from a read error.
+    fn unobserved_entry(
+        &self,
+        node: &NodeName,
+        session: &str,
+        id: &str,
+        ticket: &Arc<()>,
+        why: &str,
+    ) -> Option<String> {
+        let ask = self.with(|all| {
+            let s = all.get_mut(&(node.clone(), session.to_owned()))?;
+            s.asks.get(id).filter(|a| Arc::ptr_eq(&a.ticket, ticket))?;
+            s.asks.remove(id)
+        });
+        let mut ask = ask?;
+        if let Some(Waiter::Hook(h)) = ask.waiter.take() {
+            let _ = h.send(None);
+        }
+        self.remember(
+            node,
+            session,
+            id,
+            "Vox cannot observe this request's outcome; answer at the terminal",
+        );
+        Some(
+            json!({"v": crate::session_mirror::VERSION, "session": session,
+            "kind": "resolved", "ref": id, "of": ask.of, "outcome": "unobserved",
+            "why": why})
+            .to_string(),
+        )
+    }
+
+    async fn settle(&self, node: &NodeName, session: &str, id: &str, ticket: &Arc<()>) -> bool {
+        let (waiting, entry) = self.settled_entry_if(node, session, id, Some(ticket));
         if let Some(entry) = entry {
             self.post_numbered(node, session, vec![entry]).await;
         }
@@ -968,7 +1014,11 @@ impl Sink {
 
     fn remember(&self, node: &NodeName, session: &str, id: &str, late: &str) {
         self.with(|all| {
-            let s = all.entry((node.clone(), session.to_owned())).or_default();
+            // A concurrent Session end may have removed it after the exact ask was retired.
+            // Late-answer diagnostics must not recreate state for that ended session.
+            let Some(s) = all.get_mut(&(node.clone(), session.to_owned())) else {
+                return;
+            };
             s.settled.push_back((id.to_owned(), late.to_owned()));
             while s.settled.len() > SETTLED_KEPT {
                 s.settled.pop_front();
@@ -986,9 +1036,7 @@ impl Sink {
         session: &str,
         entry: String,
     ) -> Option<oneshot::Receiver<Given>> {
-        if (self.room_of)(node, session).is_none() {
-            return None;
-        }
+        (self.room_of)(node, session)?;
         let Ok(Value::Object(m)) = serde_json::from_str::<Value>(&entry) else {
             return None;
         };
@@ -1045,33 +1093,60 @@ impl Sink {
     fn expired_entries(&self, node: &NodeName, session: &str) -> Vec<String> {
         let ids: Vec<_> = self.with(|all| {
             all.get(&(node.clone(), session.to_owned()))
-                .map(|s| s.asks.keys().cloned().collect())
+                .map(|s| {
+                    s.asks
+                        .iter()
+                        .map(|(id, ask)| (id.clone(), Arc::clone(&ask.ticket)))
+                        .collect()
+                })
                 .unwrap_or_default()
         });
         let mut entries = Vec::new();
-        for id in ids {
-            let (waiting, settled) = self.settled_entry(node, session, &id);
+        for (id, ticket) in ids {
+            let (waiting, settled) = self.settled_entry_if(node, session, &id, Some(&ticket));
             entries.extend(settled);
             if !waiting {
                 continue;
             }
             let ask = self.with(|all| {
-                all.get_mut(&(node.clone(), session.to_owned()))
-                    .and_then(|s| s.asks.remove(&id))
+                let s = all.get_mut(&(node.clone(), session.to_owned()))?;
+                s.asks
+                    .get(&id)
+                    .filter(|ask| Arc::ptr_eq(&ask.ticket, &ticket))?;
+                s.asks.remove(&id)
             });
-            if let Some(mut ask) = ask {
-                if let Some(Waiter::Hook(h)) = ask.waiter.take() {
-                    let _ = h.send(None);
-                }
-                self.remember(node, session, &id, "the request expired before an answer");
-                entries.push(
-                    json!({"v": crate::session_mirror::VERSION, "session": session,
-                    "kind":"resolved", "ref":id, "of":ask.of, "outcome":"expired"})
-                    .to_string(),
-                );
+            if let Some(ask) = ask {
+                entries.push(self.expire_entry(node, session, &id, ask));
             }
         }
         entries
+    }
+
+    fn expire_entry(&self, node: &NodeName, session: &str, id: &str, mut ask: Ask) -> String {
+        let unknown = ask
+            .transcript
+            .as_ref()
+            .is_some_and(|scan| !scan.try_lock().is_ok_and(|scan| scan.ready_to_answer()));
+        if let Some(Waiter::Hook(h)) = ask.waiter.take() {
+            let _ = h.send(None);
+        }
+        if unknown {
+            self.remember(
+                node,
+                session,
+                id,
+                "the session moved on before Vox could observe this request's outcome",
+            );
+            json!({"v": crate::session_mirror::VERSION, "session": session,
+                "kind": "resolved", "ref": id, "of": ask.of, "outcome": "unobserved",
+                "why": "the session moved on before transcript observation caught up"})
+            .to_string()
+        } else {
+            self.remember(node, session, id, "the request expired before an answer");
+            json!({"v": crate::session_mirror::VERSION, "session": session,
+                "kind": "resolved", "ref": id, "of": ask.of, "outcome": "expired"})
+            .to_string()
+        }
     }
 
     async fn expire_all(&self, node: &NodeName, session: &str) {
@@ -1104,6 +1179,13 @@ impl Sink {
                     .map_or(NOT_WAITING, |(_, why)| why.as_str());
                 return Handed::Refused(late.to_owned());
             };
+            if ask.transcript.as_ref().is_some_and(|scan| {
+                !scan.try_lock().is_ok_and(|scan| scan.ready_to_answer())
+            }) {
+                return Handed::Refused(
+                    "Vox has not finished checking this request's transcript; answer at the terminal or retry when observation catches up".into(),
+                );
+            }
             let Some(waiter) = ask.waiter.take() else {
                 return Handed::Refused("another answer was already given".into());
             };
@@ -1153,44 +1235,263 @@ struct ToolResult {
     answers: Option<Value>,
 }
 
-/// The `tool_result` for `id` in the transcript at `path`, if it is there yet.
-fn tool_result(path: &Path, id: &str) -> Option<ToolResult> {
-    let text = std::fs::read_to_string(path).ok()?;
-    for line in text.lines().rev() {
-        if !line.contains(id) {
-            continue;
-        }
-        let Ok(v) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        let content = v
-            .pointer("/message/content")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten();
-        for c in content {
-            if c.get("type").and_then(Value::as_str) != Some("tool_result")
-                || c.get("tool_use_id").and_then(Value::as_str) != Some(id)
-            {
-                continue;
-            }
-            let text = match c.get("content") {
-                Some(Value::String(s)) => s.clone(),
-                Some(Value::Array(parts)) => parts
-                    .iter()
-                    .filter_map(|p| p.get("text").and_then(Value::as_str))
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-                _ => String::new(),
-            };
-            return Some(ToolResult {
-                is_error: c.get("is_error").and_then(Value::as_bool) == Some(true),
-                text,
-                answers: v.pointer("/toolUseResult/answers").cloned(),
-            });
+/// One live request's cursor, never a copy of its lifetime transcript. Search work is bounded
+/// to 256 KiB / 64 records per turn. One completed record may additionally read/parse at most
+/// 4 MiB; partial records stay on disk, and exceeding that bound explicitly disables Vox answers.
+const TRANSCRIPT_SEARCH_BYTES: usize = 256 * 1024;
+const TRANSCRIPT_RECORD_BYTES: u64 = 4 * 1024 * 1024;
+const TRANSCRIPT_RECORDS: usize = 64;
+
+struct TranscriptScan {
+    path: PathBuf,
+    identity: Option<(u64, u64)>,
+    observed_len: u64,
+    offset: u64,
+    /// End of the next record while searching backward, start while following forward.
+    boundary: u64,
+    forward_start: u64,
+    backward: bool,
+    skip_partial: bool,
+    ready: bool,
+}
+
+enum TranscriptRecord {
+    Other,
+    Opening,
+    Result(ToolResult),
+}
+
+impl TranscriptScan {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            identity: None,
+            observed_len: 0,
+            offset: 0,
+            boundary: 0,
+            forward_start: 0,
+            backward: true,
+            skip_partial: false,
+            ready: false,
         }
     }
-    None
+
+    fn tail(&mut self) {
+        self.backward = false;
+        self.offset = self.forward_start;
+        self.boundary = self.forward_start;
+        self.skip_partial = false;
+    }
+
+    /// An incomplete initial/backlog scan is not evidence that the request still waits. Check
+    /// the current file size too: an answer cannot leap ahead of bytes the observer has not read.
+    fn ready_to_answer(&self) -> bool {
+        use std::os::unix::fs::MetadataExt as _;
+        self.ready
+            && std::fs::metadata(&self.path).is_ok_and(|meta| {
+                meta.is_file()
+                    && self.identity == Some((meta.dev(), meta.ino()))
+                    && meta.len() == self.observed_len
+            })
+    }
+
+    fn read(&mut self, id: &str) -> Result<Option<ToolResult>, String> {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+        use std::os::unix::fs::MetadataExt as _;
+        self.ready = false;
+        let mut file = std::fs::File::open(&self.path)
+            .map_err(|e| format!("cannot open the request's transcript: {e}"))?;
+        let meta = file
+            .metadata()
+            .map_err(|e| format!("cannot read transcript metadata: {e}"))?;
+        if !meta.is_file() {
+            return Err("the request's transcript is not a regular file".into());
+        }
+        let identity = (meta.dev(), meta.ino());
+        let end = meta.len();
+        if let Some(prior) = self.identity {
+            if identity != prior || end < self.observed_len {
+                return Err("the request's transcript was replaced or truncated".into());
+            }
+        } else {
+            self.identity = Some(identity);
+            self.forward_start = end;
+            self.offset = end;
+            self.boundary = end;
+            if end == 0 {
+                self.tail();
+            } else {
+                file.seek(SeekFrom::Start(end - 1)).map_err(transcript_io)?;
+                let mut last = [0];
+                file.read_exact(&mut last).map_err(transcript_io)?;
+                if last[0] == b'\n' {
+                    self.offset -= 1;
+                    self.boundary -= 1;
+                } else {
+                    // Do not parse a partially written JSON record. Once its start is known,
+                    // forward following will wait for its newline, without retaining its bytes.
+                    self.skip_partial = true;
+                }
+            }
+        }
+        self.observed_len = end;
+        let mut remaining = TRANSCRIPT_SEARCH_BYTES;
+        let mut records = 0;
+        let mut buffer = [0_u8; 8192];
+        while remaining > 0 && records < TRANSCRIPT_RECORDS {
+            if self.backward {
+                if self.offset == 0 {
+                    if self.skip_partial {
+                        self.forward_start = 0;
+                    } else if self.boundary > 0 {
+                        if let TranscriptRecord::Result(result) =
+                            transcript_record(&mut file, 0, self.boundary, id)?
+                        {
+                            return Ok(Some(result));
+                        }
+                        records += 1;
+                    }
+                    self.tail();
+                    continue;
+                }
+                let take = buffer
+                    .len()
+                    .min(remaining)
+                    .min(usize::try_from(self.offset).unwrap_or(usize::MAX));
+                let start = self.offset - take as u64;
+                file.seek(SeekFrom::Start(start)).map_err(transcript_io)?;
+                file.read_exact(&mut buffer[..take])
+                    .map_err(transcript_io)?;
+                remaining -= take;
+                for byte in buffer[..take].iter().rev() {
+                    self.offset -= 1;
+                    if *byte != b'\n' {
+                        if self.boundary - self.offset > TRANSCRIPT_RECORD_BYTES {
+                            return Err(
+                                "a transcript record exceeds the 4 MiB observation bound".into()
+                            );
+                        }
+                        continue;
+                    }
+                    if self.skip_partial {
+                        self.forward_start = self.offset + 1;
+                        self.skip_partial = false;
+                    } else {
+                        let record =
+                            transcript_record(&mut file, self.offset + 1, self.boundary, id)?;
+                        records += 1;
+                        match record {
+                            TranscriptRecord::Result(result) => return Ok(Some(result)),
+                            TranscriptRecord::Opening => {
+                                // Everything newer than this exact call was checked. Only new
+                                // complete lines can now settle it; do not rescan older history.
+                                self.tail();
+                                break;
+                            }
+                            TranscriptRecord::Other => {}
+                        }
+                    }
+                    self.boundary = self.offset;
+                    if records == TRANSCRIPT_RECORDS {
+                        break;
+                    }
+                }
+            } else {
+                if self.offset == end {
+                    self.ready = self.boundary == end;
+                    return Ok(None);
+                }
+                let take = buffer
+                    .len()
+                    .min(remaining)
+                    .min(usize::try_from(end - self.offset).unwrap_or(usize::MAX));
+                file.seek(SeekFrom::Start(self.offset))
+                    .map_err(transcript_io)?;
+                file.read_exact(&mut buffer[..take])
+                    .map_err(transcript_io)?;
+                remaining -= take;
+                for byte in &buffer[..take] {
+                    self.offset += 1;
+                    if *byte != b'\n' {
+                        if self.offset - self.boundary > TRANSCRIPT_RECORD_BYTES {
+                            return Err(
+                                "a transcript record exceeds the 4 MiB observation bound".into()
+                            );
+                        }
+                        continue;
+                    }
+                    let record = transcript_record(&mut file, self.boundary, self.offset - 1, id)?;
+                    self.boundary = self.offset;
+                    records += 1;
+                    if let TranscriptRecord::Result(result) = record {
+                        return Ok(Some(result));
+                    }
+                    if records == TRANSCRIPT_RECORDS {
+                        break;
+                    }
+                }
+            }
+        }
+        self.ready = !self.backward && self.offset == end && self.boundary == end;
+        Ok(None)
+    }
+}
+
+fn transcript_io(error: std::io::Error) -> String {
+    format!("cannot observe the request's transcript: {error}")
+}
+
+fn transcript_record(
+    file: &mut std::fs::File,
+    start: u64,
+    end: u64,
+    id: &str,
+) -> Result<TranscriptRecord, String> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    if end == start {
+        return Ok(TranscriptRecord::Other);
+    }
+    let bytes = end - start;
+    if bytes > TRANSCRIPT_RECORD_BYTES {
+        return Err("a transcript record exceeds the 4 MiB observation bound".into());
+    }
+    file.seek(SeekFrom::Start(start)).map_err(transcript_io)?;
+    let v: Value = serde_json::from_reader(std::io::BufReader::new(file.take(bytes)))
+        .map_err(|e| format!("cannot decode a complete transcript record: {e}"))?;
+    let mut opening = false;
+    for c in v
+        .pointer("/message/content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        opening |= c.get("type").and_then(Value::as_str) == Some("tool_use")
+            && c.get("id").and_then(Value::as_str) == Some(id);
+        if c.get("type").and_then(Value::as_str) != Some("tool_result")
+            || c.get("tool_use_id").and_then(Value::as_str) != Some(id)
+        {
+            continue;
+        }
+        let text = match c.get("content") {
+            Some(Value::String(s)) => s.clone(),
+            Some(Value::Array(parts)) => parts
+                .iter()
+                .filter_map(|p| p.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => String::new(),
+        };
+        return Ok(TranscriptRecord::Result(ToolResult {
+            is_error: c.get("is_error").and_then(Value::as_bool) == Some(true),
+            text,
+            answers: v.pointer("/toolUseResult/answers").cloned(),
+        }));
+    }
+    Ok(if opening {
+        TranscriptRecord::Opening
+    } else {
+        TranscriptRecord::Other
+    })
 }
 
 /// Who settled `ask`, by the harness's own record of it: the member whose answer Vox handed
