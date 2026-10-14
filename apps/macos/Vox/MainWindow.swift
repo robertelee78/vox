@@ -65,7 +65,7 @@ struct MainWindow: View {
                 switch model.selection {
                 case let .room(id):
                     // One view per room: its draft, To:, urgent and attachment do not carry over.
-                    RoomView(model: model, room: id).id(id)
+                    RoomTimelineView(model: model, room: id).id(id)
                 case .keyring:
                     KeyringView(model: model)
                 case .decisions:
@@ -871,7 +871,7 @@ private enum TimelineEnd {
 }
 
 /// The room on screen: its timeline and a field to post, with its members beside it.
-private struct RoomView: View {
+private struct RoomTimelineView: View {
     /// The conversation's text size, for its spacing (L-1a): this view sets it on the timeline and
     /// the composer, so it reads it from Theme rather than from its own environment.
     private var scale: Double { Theme.scale }
