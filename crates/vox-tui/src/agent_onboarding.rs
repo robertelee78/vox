@@ -321,9 +321,11 @@ pub(crate) fn light_words(
     if !crate::agent_hook::first_in_session(account, &format!("light-{harness}"), session) {
         return None;
     }
+    let name = crate::setup::suggested_name(harness, &crate::setup::host_name());
+    let setup = vox_text::shell::node_command(&["vox", "agent", "setup", harness], &name);
     Some(if local_app(account).is_some() {
-        format!("{harness} has no Vox node on this machine; Vox offers Set Up, and you may start it with `vox agent setup {harness}`.")
+        format!("{harness} has no Vox node on this machine; Vox offers Set Up, and you may start it with `{setup}`.")
     } else {
-        format!("{harness} has no Vox node on this machine; ask the operator to run `vox agent setup {harness}` in a terminal outside this session.")
+        format!("{harness} has no Vox node on this machine; ask the operator to run `{setup}` in a terminal outside this session.")
     })
 }

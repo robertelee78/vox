@@ -1,7 +1,7 @@
 # Identity and keyring
 
 This page shows how to manage your nodes and decide whom each one trusts. The examples act as
-`robertgpt`, whose keyring holds `ann`. With more than one node Ready, add `--node robertgpt`.
+`robertgpt`, whose keyring holds `ann`; commands name their acting node explicitly.
 
 ## Your nodes
 
@@ -63,13 +63,9 @@ open, any program running as you, an agent included, can change it. `vox status`
 on its second line: `keyring asks for the passphrase`, or `keyring open 30m` with the minutes left.
 
 A keyring change takes the passphrase only from a terminal. It never reads a file or
-`VOX_IDENTITY_PASSPHRASE`. Without a terminal, the change is refused and Vox prints the command to
-run in one:
-
-```text
-vox: changing who you trust needs your identity passphrase: it was not entered for a keyring change in the last 30 minutes
-       it is typed at a terminal, and taken from nothing else (not VOX_IDENTITY_PASSPHRASE, not a file). Run it in a terminal: vox trust add f7l2q44g56mzd62nsvck7mofibuj4l57uchhi446s32w3cg5arrq --name ann
-```
+`VOX_IDENTITY_PASSPHRASE`. Without a terminal, the change is refused and Vox prints the complete
+command to run in one. That command carries the actual fingerprint, chosen name and acting node. Copy it
+from the refusal only if it describes the change you intend.
 
 ## An agent's node
 
@@ -78,8 +74,11 @@ outside the agent's session:
 
 ```sh
 vox node unlock claude-mac
-vox trust add f7l2q44g56mzd62nsvck7mofibuj4l57uchhi446s32w3cg5arrq --name ann --node claude-mac
 ```
+
+For a trust change on `claude-mac`, use the actual fingerprint compared with its owner, the
+chosen local name and `--node claude-mac`. The [offers](#offers-nodes-waiting-for-your-trust) output
+provides complete commands for actual offered nodes.
 
 The agent's hook never asks for a passphrase. A passphrase-free node becomes Ready by itself;
 for a Locked node the agent gets the command for you:
@@ -90,8 +89,8 @@ Vox node claude-mac is Locked; ask the operator to run `vox node unlock claude-m
 
 ## Compare before trusting
 
-`vox id` prints your node's whole fingerprint. Get the other person's whole fingerprint through a
-way you already trust, such as in person or a call, and compare every character. A short prefix is
+`vox id --node robertgpt` prints your node's whole fingerprint. Get the other person's whole
+fingerprint through a way you already trust, such as in person or a call, and compare every character. A short prefix is
 not proof. A different key is a different node: if someone replaces their machine, compare the new
 fingerprint before you trust it, whatever name it claims.
 
@@ -102,21 +101,11 @@ does a node that trusts you. An offer waits until you accept it, dismiss it, or 
 Nothing is posted to the room either way. To list offers, run:
 
 ```sh
-vox trust offers
+vox trust offers --node robertgpt
 ```
 
-```text
-◣◣◢◢◣◣◥◥◤◤  f7l2 q44g 56mz d62n svck
-◣◣◢◢◣◣◣◣◣◣  7mof ibuj 4l57 uchh i446
-◥◥◥◥◣◣◣◣◣◣  s32w 3cg5 arrq
-◤◤◤◤◣◣◤◤◥◥
-◥◥◥◥◥◥◢◢◢◢
-  f7l2q44g56mzd62nsvck7mofib (not in keyring) joined. No one you trust trusts it yet.
-  in "family"
-  accept (read): vox trust add f7l2q44g56mzd62nsvck7mofibuj4l57uchhi446s32w3cg5arrq --node robertgpt
-  accept (read + drive): vox trust add f7l2q44g56mzd62nsvck7mofibuj4l57uchhi446s32w3cg5arrq --node robertgpt --drive
-  dismiss: vox trust dismiss f7l2q44g56mz --node robertgpt
-```
+The offer contains complete accept and dismiss commands for the actual node. Use those from
+your terminal output, keeping `--node robertgpt`.
 
 Each offer shows the fingerprint beside a picture drawn from it, for a quick visual check, why it is offered (`joined`, `trusts you`, or
 both), which of the nodes you trust already trust it, and the rooms you share. Check the
@@ -135,11 +124,13 @@ outside its session. Only you accept one.
 
 ## Trust a node
 
-With the fingerprint compared, run:
+After comparing the actual fingerprint, copy its `accept (read)` command from the offers output.
+If the node is not offered, construct `vox trust add` with the fingerprint you compared,
+`--name ann` and `--node robertgpt`. [Quote each argument](reference.md#commands-you-can-paste).
+Then inspect the result:
 
 ```sh
-vox trust add f7l2q44g56mzd62nsvck7mofibuj4l57uchhi446s32w3cg5arrq --name ann
-vox trust list
+vox trust list --node robertgpt
 ```
 
 The name is yours alone. Without `--name`, Vox asks for one at a terminal. Before and after it
@@ -171,11 +162,9 @@ and answering. `vox trust list` shows which, after the name:
 f7l2q44g56mzd62nsvck7mofibuj4l57uchhi446s32w3cg5arrq  ann  read + drive
 ```
 
-```sh
-vox trust add f7l2q44g56mzd62nsvck7mofibuj4l57uchhi446s32w3cg5arrq --name ann --drive
-vox trust drive f7l2q44g56mzd62nsvck7mofibuj4l57uchhi446s32w3cg5arrq
-vox trust read f7l2q44g56mzd62nsvck7mofibuj4l57uchhi446s32w3cg5arrq
-```
+For an initial drive grant, add `--drive` to the actual trust-add command. For an existing
+entry, use `vox trust drive` with its full fingerprint from your keyring and `--node robertgpt`.
+To withdraw drive, use `vox trust read` with that same fingerprint and acting node.
 
 `vox trust add --drive` grants read + drive from the start. `vox trust drive` adds drive to a node
 you trust. `vox trust read` takes drive back: the node keeps what it already read inside your
@@ -183,9 +172,8 @@ Sessions and reads nothing written there afterwards.
 
 ## Rename a node in your keyring
 
-```sh
-vox trust rename f7l2q44g56mzd62nsvck7mofibuj4l57uchhi446s32w3cg5arrq annie
-```
+Use `vox trust rename` with ann's actual fingerprint from `vox trust list --node robertgpt`,
+the new name `annie`, and `--node robertgpt`. Quote the actual arguments when constructing it.
 
 Vox prints the new name and the addresses its services now have, such as
 `<service>.annie.<room>.vox`. Renaming grants and removes nothing. To change a name, rename. Do
@@ -196,10 +184,8 @@ not remove and add again, because removing rotates keys.
 Removing a node withdraws its reading and its service access in every room you share. It keeps
 what it already read.
 
-```sh
-vox trust remove f7l2q44g56mzd62nsvck7mofibuj4l57uchhi446s32w3cg5arrq
-vox trust list
-```
+Use `vox trust remove` with the intended node's actual fingerprint from your keyring and
+`--node robertgpt`. Afterwards, `vox trust list --node robertgpt` shows the remaining grants.
 
 Before it acts, Vox says what the node is to lose and which of its live sessions into your
 services it is to cut. Afterwards it reports:
@@ -214,9 +200,10 @@ vox: removed f7l2q44g56mzd62nsvck7mofib from your keyring
 ## My computers
 
 Computer trust is an operator choice shared by the enrolled daemons. Add Computer in Vox.app,
-or `vox computer invite` on one computer and `vox computer pair LINK --preview` on the other,
-shows the exact computers and operation for approval on both sides. Use
-`vox computer approve OPERATION` on each. Pairing grants no room membership.
+or `vox computer invite` on one computer followed by `vox computer pair` on the other with
+the actual invitation and `--preview`, shows the exact computers and operation for approval on
+both sides. To approve, use `vox computer approve` with the operation printed by that preview
+on each computer. Pairing grants no room membership.
 
 Every managed node can read the other managed nodes. A computer's selected personal node can
 drive nonpersonal nodes; personal nodes cannot drive each other. The daemon saves the app's
@@ -236,9 +223,9 @@ reconnects and applies the signed update. A Locked local node must be unlocked t
 To remove a computer, review its full fingerprint and nodes in `vox computer status`, then use
 the exact displayed frontier:
 
-```sh
-vox computer remove COMPUTER_FINGERPRINT --confirm FRONTIER
-```
+Construct `vox computer remove` with the intended computer's full fingerprint from that
+status, and its current frontier in `--confirm`. Both values come from the actual status;
+neither is a reusable example.
 
 This withdraws all trust in that computer's nodes, including individual grants made before
 pairing. Remaining computers apply the removal when they receive it; pending does not mean
@@ -249,21 +236,21 @@ After removal you can instead make a deliberate new individual grant with `vox t
 Copying a node folder does not transfer management. For an intentional move, the existing
 manager releases the exact node to one enrolled destination, then the destination approves:
 
-```sh
-# On the existing manager, after reviewing status:
-vox computer binding release NODE_FINGERPRINT --destination COMPUTER_FINGERPRINT --confirm FRONTIER
-# On that destination, after reviewing its updated status:
-vox computer binding transfer NODE_FINGERPRINT --confirm FRONTIER
-```
+On the existing manager, use `vox computer binding release` with the actual node fingerprint,
+the destination computer's fingerprint in `--destination` and the reviewed current frontier in
+`--confirm`. On the destination, read its updated `vox computer status`, then use
+`vox computer binding transfer` with the same node fingerprint and that destination's current
+frontier in `--confirm`.
 
 The node's protected vault must be available and unlocked on the destination to sign its new
 binding. No command guesses ownership from a name or copied fingerprint. If the previous
 manager is lost, remove it first, then explicitly approve recovery on the destination with
-`vox computer binding recover NODE_FINGERPRINT --confirm FRONTIER`. Recovery retains the old
-binding and removal evidence. If a node key was compromised, use a new node identity instead.
+`vox computer binding recover` with the actual node fingerprint and the current destination
+frontier in `--confirm`. Recovery retains the old binding and removal evidence. If a node key was compromised, use a new node identity instead.
 
 If this computer has been removed and the old group cannot be continued, explicitly abandon
-that group locally with `vox computer binding recover-group group --confirm FRONTIER`.
+that group locally with `vox computer binding recover-group`, the literal argument `group`,
+and the current frontier from `vox computer status` in `--confirm`.
 This retires its old authority and removes covered grants before any fresh pairing. It does
 not erase other computers' data or silently recreate the old membership.
 

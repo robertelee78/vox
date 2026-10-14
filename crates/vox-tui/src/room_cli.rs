@@ -591,7 +591,7 @@ pub(crate) async fn post_structured(
     }
     if coord::is_claim_type(&kind, &serde_json::Value::Object(data.clone())) {
         return Err(AppError::Usage(format!(
-            "`{kind}` is a claim-protocol operation; use `vox room {kind}`"
+            "`{kind}` is a claim-protocol operation; use its room subcommand with the room, work key and acting node"
         )));
     }
     if body.trim().is_empty() && data.is_empty() {
@@ -1734,9 +1734,23 @@ async fn rows_of(
                 vox_core::node::ipc::Frame::RoomPage { rows, older } => {
                     if let Some(first) = rows.first().filter(|_| older > 0) {
                         eprintln!(
-                            "{older} older messages not shown: vox room read {} --before {}",
-                            id(&channel_id),
-                            id(&first.entry_hash)
+                            "{older} older messages not shown: {}",
+                            vox_text::shell::node_command(
+                                &[
+                                    "vox",
+                                    "room",
+                                    "read",
+                                    &id(&channel_id),
+                                    "--before",
+                                    &id(&first.entry_hash)
+                                ],
+                                client
+                                    .node_name()
+                                    .ok_or_else(|| AppError::Usage(
+                                        "the room reader has no acting node".into()
+                                    ))?
+                                    .as_str()
+                            )
                         );
                     }
                     Ok(Some(rows))
@@ -1757,9 +1771,23 @@ async fn rows_of(
             .and_then(|r| r.last())
         {
             eprintln!(
-                "For the next page: vox room read {} --since {}",
-                id(&channel_id),
-                id(&last.entry_hash)
+                "For the next page: {}",
+                vox_text::shell::node_command(
+                    &[
+                        "vox",
+                        "room",
+                        "read",
+                        &id(&channel_id),
+                        "--since",
+                        &id(&last.entry_hash)
+                    ],
+                    client
+                        .node_name()
+                        .ok_or_else(|| AppError::Usage(
+                            "the room reader has no acting node".into()
+                        ))?
+                        .as_str()
+                )
             );
         }
         return Ok(rows);
@@ -2382,7 +2410,7 @@ pub async fn tail(
                     after: cursor,
                 })
                 .await
-                .map_err(|e| tail_stopped(room, shown.last, json, &e.to_string()))?
+                .map_err(|e| tail_stopped(paths, room, shown.last, json, &e.to_string()))?
             {
                 Frame::ArrivalPage {
                     rows,
@@ -2390,7 +2418,7 @@ pub async fn tail(
                     next,
                 } => (rows, instance, next),
                 Frame::Error { reason } => {
-                    return Err(tail_stopped(room, shown.last, json, &reason))
+                    return Err(tail_stopped(paths, room, shown.last, json, &reason))
                 }
                 other => return Err(crate::client::unexpected(&other)),
             };
@@ -2426,7 +2454,7 @@ pub async fn tail(
                         json,
                     )
                     .await
-                    .map_err(|e| tail_stopped(room, shown.last, json, &e.to_string()))?;
+                    .map_err(|e| tail_stopped(paths, room, shown.last, json, &e.to_string()))?;
                 cursor.arrival = arrival;
             }
             if let Some(next) = next {
@@ -2449,6 +2477,7 @@ pub async fn tail(
                     if c == channel_id =>
                 {
                     return Err(tail_stopped(
+                        paths,
                         room,
                         shown.last,
                         json,
@@ -2467,8 +2496,16 @@ pub async fn tail(
                     break;
                 }
                 Ok(Some(_)) => {}
-                Ok(None) => return Err(tail_stopped(room, shown.last, json, "the node stopped")),
-                Err(e) => return Err(tail_stopped(room, shown.last, json, &e.to_string())),
+                Ok(None) => {
+                    return Err(tail_stopped(
+                        paths,
+                        room,
+                        shown.last,
+                        json,
+                        "the node stopped",
+                    ))
+                }
+                Err(e) => return Err(tail_stopped(paths, room, shown.last, json, &e.to_string())),
             }
         }
     }
@@ -2489,13 +2526,32 @@ async fn tail_head(
     }
 }
 
-fn tail_stopped(room: &str, last: Option<Digest32>, json: bool, reason: &str) -> AppError {
-    let resume = match last {
-        Some(hash) => format!("vox room tail {room} --since {}", b32_encode(&hash)),
-        None => format!("vox room tail {room}"),
-    };
-    let mode = if json { " --json" } else { "" };
-    AppError::Usage(format!("{reason}, so this tail stopped\n       restore the node and room, then resume with `{resume}{mode}`"))
+fn tail_stopped(
+    paths: &Paths,
+    room: &str,
+    last: Option<Digest32>,
+    json: bool,
+    reason: &str,
+) -> AppError {
+    let node = paths
+        .profile_dir
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy();
+    let mut words = vec![
+        "vox".to_owned(),
+        "room".to_owned(),
+        "tail".to_owned(),
+        room.to_owned(),
+    ];
+    if let Some(hash) = last {
+        words.extend(["--since".to_owned(), b32_encode(&hash)]);
+    }
+    if json {
+        words.push("--json".to_owned());
+    }
+    let resume = vox_text::shell::node_command(&words, &node);
+    AppError::Usage(format!("{reason}, so this tail stopped\n       restore the node and room, then resume with `{resume}`"))
 }
 
 /// Only a resume hint survives delivery. Operation context is bounded and scoped to one
@@ -3562,7 +3618,7 @@ pub async fn service_add(
             );
             if reach.is_empty() {
                 println!(
-                    "     it is dark until you `vox trust add` someone — and they join this room"
+                    "     it is dark until you trust a member from the room's trust offers — and they join this room"
                 );
             } else {
                 println!("     {} can reach it now", listed(&reach, ""));
@@ -3646,7 +3702,12 @@ pub async fn service_list(paths: &Paths, room: &str, json: bool) -> Result<(), A
             .map_err(|e| e.to_string()),
         Err(e) => Err(e.to_string()),
     };
-    let mut printer = crate::tunnel_cli::ServiceListPrinter::new(channel_id, proxy, json);
+    let mut printer = crate::tunnel_cli::ServiceListPrinter::new(
+        channel_id,
+        proxy,
+        json,
+        crate::client::name_of(paths)?.to_string(),
+    );
     let mut after = None;
     let mut revision = None;
     loop {
@@ -4341,8 +4402,11 @@ pub async fn get_file(
     }
     if offers.is_empty() {
         return Err(AppError::Usage(format!(
-            "no offer in this room matches {selector:?} — `vox room read` shows what was \
-             announced"
+            "no offer in this room matches {selector:?} — `{}` shows what was announced",
+            vox_text::shell::node_command(
+                &["vox", "room", "read", &id(&channel_id)],
+                crate::client::name_of(paths)?.as_str()
+            )
         )));
     }
 
@@ -4407,7 +4471,10 @@ pub async fn get_file(
             let _ = write!(
                 said,
                 "\n       the same file is also offered by {who}: `{}`",
-                vox_text::shell::command(&["vox", "room", "get", room, &o.tag])
+                vox_text::shell::node_command(
+                    &["vox", "room", "get", room, &o.tag],
+                    crate::client::name_of(paths)?.as_str()
+                )
             );
         } else {
             let _ = write!(
@@ -5299,9 +5366,14 @@ pub async fn join(
                     None => println!("vox: bound {}", dir.display()),
                 }
             }
-            println!("     you read a member once you trust it and it trusts you: `vox trust add`");
+            println!("     you read a member once you trust it and it trusts you:");
             if let Ok(parsed) = vox_core::node::link::InviteLink::parse(link) {
-                who_reads_whom(&mut client, parsed.channel_id).await;
+                who_reads_whom(
+                    &mut client,
+                    parsed.channel_id,
+                    crate::client::name_of(paths)?.as_str(),
+                )
+                .await;
             }
             Ok(())
         }
@@ -5330,7 +5402,7 @@ const CONSENT_SETTLES: std::time::Duration = std::time::Duration::from_secs(1);
 /// member, by this node's name for it, trusted both ways, waiting for the other side, or not in
 /// keyring, with what is still to do ([`crate::ident::Reading`]). Best effort: a node that does not
 /// say leaves the join's own lines standing.
-async fn who_reads_whom(client: &mut IpcClient, channel_id: Digest32) {
+async fn who_reads_whom(client: &mut IpcClient, channel_id: Digest32, node: &str) {
     let Ok(Frame::Members { members }) = client.request(&Request::Roster { channel_id }).await
     else {
         return;
@@ -5373,7 +5445,7 @@ async fn who_reads_whom(client: &mut IpcClient, channel_id: Digest32) {
         println!(
             "     {} {name} — {}",
             reading.glyph(),
-            reading.say(&name, &b32_encode(&m), &me_fp)
+            reading.say(&name, &b32_encode(&m), &me_fp, node)
         );
     }
 }
@@ -5522,7 +5594,13 @@ pub async fn create(
                     Err(e) => return Err(AppError::Usage(e.to_string())),
                 }
             }
-            println!("     `vox room list` shows its id; that id is what agents pass as --room");
+            println!(
+                "     `{}` shows its id; that id is what agents pass as --room",
+                vox_text::shell::node_command(
+                    &["vox", "room", "list"],
+                    crate::client::name_of(paths)?.as_str()
+                )
+            );
             Ok(())
         }
         Ok(Frame::Error { reason }) => Err(AppError::Usage(format!("cannot create: {reason}"))),
@@ -5851,7 +5929,9 @@ pub async fn link(paths: &Paths, room: &str) -> Result<(), AppError> {
                 eprintln!("vox: {note}");
             }
             eprintln!("vox: send the passphrase another way than this address (in person, a call, a different app)");
-            eprintln!("     joining grants nothing — use `vox trust add` to decide who reads you");
+            eprintln!(
+                "     joining grants nothing — choose who reads you from this room's trust offers"
+            );
             Ok(())
         }
         Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
@@ -5882,7 +5962,15 @@ async fn keyring_change(
                 return Err(AppError::Usage(format!(
                     "{}\n       {}",
                     reason.lines().next().unwrap_or_default(),
-                    typed_only()
+                    typed_only(
+                        client
+                            .node_name()
+                            .ok_or_else(|| AppError::Usage(
+                                "the acting node is unknown; select its node before changing trust"
+                                    .into()
+                            ))?
+                            .as_str()
+                    )
                 )));
             }
             if std::env::var_os("VOX_IDENTITY_PASSPHRASE").is_some() {
@@ -5904,7 +5992,7 @@ async fn keyring_change(
 
 /// What a keyring change that needs the passphrase says with no terminal to type it at: the
 /// command, to run in a terminal (ADR-028 K-13).
-pub(crate) fn typed_only() -> String {
+pub(crate) fn typed_only(node: &str) -> String {
     let command: Vec<String> = std::iter::once("vox".to_owned())
         .chain(std::env::args().skip(1))
         .collect();
@@ -5912,7 +6000,14 @@ pub(crate) fn typed_only() -> String {
         "it is typed at a terminal, and taken from nothing else (not VOX_IDENTITY_PASSPHRASE, not \
          a file). Run it in a terminal: {}",
         // Each argument as one shell word: a name like "Ben's Mac & co" pastes whole.
-        vox_text::shell::command(&command)
+        if command
+            .iter()
+            .any(|word| word == "--node" || word.starts_with("--node="))
+        {
+            vox_text::shell::command(&command)
+        } else {
+            vox_text::shell::node_command(&command, node)
+        }
     )
 }
 
@@ -6155,7 +6250,13 @@ pub async fn trust_add(
                     "every service you bind to a room you are both in"
                 )
             );
-            println!("     `vox trust remove` undoes it and changes the lock everywhere");
+            println!(
+                "     `{}` undoes it and changes the lock everywhere",
+                vox_text::shell::node_command(
+                    &["vox", "trust", "remove", &id(&target)],
+                    crate::client::name_of(paths)?.as_str()
+                )
+            );
             if drive {
                 println!(
                     "Next: from node {petname:?}, vox room sessions with the id of a room you share \
@@ -6163,8 +6264,12 @@ pub async fn trust_add(
                 );
             } else {
                 println!(
-                    "Next: send {petname:?} this node's fingerprint (`vox id`), so it trusts you \
-                     too and you read what it writes"
+                    "Next: send {petname:?} this node's fingerprint (`{}`), so it trusts you \
+                     too and you read what it writes",
+                    vox_text::shell::node_command(
+                        &["vox", "id"],
+                        crate::client::name_of(paths)?.as_str()
+                    )
                 );
             }
             Ok(())
@@ -6429,9 +6534,14 @@ pub async fn trust_dismiss(paths: &Paths, fingerprint: &str) -> Result<(), AppEr
     let mut client = attach(paths).await?;
     let offers = offers_of(&mut client).await?;
     let ids: Vec<Digest32> = offers.iter().map(|o| o.member).collect();
+    let offers_command = vox_text::shell::node_command(
+        &["vox", "trust", "offers"],
+        crate::client::name_of(paths)?.as_str(),
+    );
     let member = resolve_fingerprint(fingerprint, &ids).map_err(|_| {
         AppError::Usage(format!(
-            "no offer matches {fingerprint:?}; `vox trust offers` lists them"
+            "no offer matches {fingerprint:?}; `{}` lists them",
+            offers_command
         ))
     })?;
     println!(
@@ -6460,7 +6570,7 @@ pub async fn trust_list(paths: &Paths) -> Result<(), AppError> {
         Ok(Frame::Trusted { entries }) => {
             if entries.is_empty() {
                 println!("no trusted identities");
-                println!("     nobody can read what you write until you `vox trust add` them");
+                println!("     nobody can read what you write until you trust them; choose members from this room's trust offers");
                 return Ok(());
             }
             // What each entry grants, read or read + drive (ADR-028 K-14).
@@ -6704,7 +6814,11 @@ pub async fn admin(
     };
     let Some(member) = member else {
         return Err(AppError::Usage(format!(
-            "`vox room admin {action}` needs the member's fingerprint (`vox room roster` lists them)"
+            "the room admin {action} action needs the member's fingerprint (`{}` lists them)",
+            vox_text::shell::node_command(
+                &["vox", "room", "roster", &id(&channel_id)],
+                crate::client::name_of(paths)?.as_str()
+            )
         )));
     };
     let members = match client.request(&Request::Roster { channel_id }).await {

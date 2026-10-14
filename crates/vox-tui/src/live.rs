@@ -1527,6 +1527,7 @@ impl DaemonCore {
                 anchors: Vec::new(),
             },
             waiting: None,
+            expected_identity: None,
         };
         let asked = until_stopped(&self.rt, &self.stop, vox_core::node::nameipc::proxy(&at));
         if let Some(asked) = asked {
@@ -2952,11 +2953,14 @@ impl DaemonCore {
                                 };
                                 crate::viewmodel::SharedView {
                                     line,
-                                    copy: crate::tunnel_cli::service_commands(&svc)
-                                        .into_iter()
-                                        .next()
-                                        .map(|(_, c)| c)
-                                        .unwrap_or_default(),
+                                    copy: crate::tunnel_cli::service_commands(
+                                        &svc,
+                                        self.node.as_str(),
+                                    )
+                                    .into_iter()
+                                    .next()
+                                    .map(|(_, c)| c)
+                                    .unwrap_or_default(),
                                     ready: crate::tunnel_cli::service_needs(
                                         &svc,
                                         self.proxy.as_ref(),

@@ -31,8 +31,13 @@ A node is your identity in Vox: its own keys, rooms and keyring. On your machine
 vox node create robertgpt
 ```
 
-The other person runs the same command with their name, `ann`. Use lower-case letters, digits,
-`.`, `_` and `-`.
+On the other person's machine:
+
+```sh
+vox node create ann
+```
+
+Node names use lower-case letters, digits, `.`, `_` and `-`.
 
 Vox asks for an identity passphrase twice. It unlocks the node on this machine. You see, among
 other lines:
@@ -50,10 +55,16 @@ after a restart.
 
 ## 3. Both of you compare fingerprints
 
-Each of you runs:
+On your machine:
 
 ```sh
-vox id
+vox id --node robertgpt
+```
+
+On the other person's machine:
+
+```sh
+vox id --node ann
 ```
 
 You see your node's fingerprint on one line. Read it to the other person over the call, and
@@ -64,7 +75,7 @@ write down theirs. You check it in step 6.
 On your machine, run:
 
 ```sh
-vox room create --name family
+vox room create --name family --node robertgpt
 ```
 
 Vox asks for a room passphrase twice. This is a second secret, separate from your identity
@@ -73,7 +84,7 @@ passphrase. You see `vox: created family`.
 Now print the room's link:
 
 ```sh
-vox room link family
+vox room link family --node robertgpt
 ```
 
 You see the link, one line that starts with `vox://`, and these notes:
@@ -94,15 +105,13 @@ none, you need an anchor, a node on a host both machines reach
 
 ## 5. The other person joins
 
-On their machine, the other person types `vox room join '`, pastes the link, types `'`, and
-presses Return. With the link from step 4 the command reads:
+On their machine, the other person uses **Join Room** in Vox with the actual link from step 4,
+or constructs a `vox room join` command with that entire link as its argument and `--node ann`.
+The link is unique to your room; there is no reusable link in this manual. Single-quote the link
+so the shell does not split it at `&` or interpret `?`. If an argument contains an apostrophe,
+use the [shell-quoting rule](reference.md#commands-you-can-paste).
 
-```sh
-vox room join 'vox://gkpeyuly4m4ezlidyid3vocosfzpec2o7um5dleicv2aacz6z2ja?a=ek46r5zf3r7m6fevgu6ghilzamowcaj66qdmw27zxvozxr4m2z4a&b=/ip4/203.0.113.7/udp/53213&m=ek46r5zf3r7m6fevgu6ghilzamowcaj66qdmw27zxvozxr4m2z4a&r=ek46r5zf3r7m6fevgu6ghilzamowcaj66qdmw27zxvozxr4m2z4a'
-```
-
-The single quotes matter: without them the shell cuts the link at its first `&`. Vox asks for the
-room passphrase. They see, first:
+Vox asks for the room passphrase. They see, first:
 
 ```text
 vox: joined family
@@ -118,32 +127,20 @@ Your **keyring** is the list of nodes you trust. You go first. On your machine, 
 waiting for your trust:
 
 ```sh
-vox trust offers
+vox trust offers --node robertgpt
 ```
 
-You see the other person's node:
-
-```text
-  f7l2q44g56mzd62nsvck7mofib (not in keyring) joined. No one you trust trusts it yet.
-  in "family"
-  accept (read): vox trust add f7l2q44g56mzd62nsvck7mofibuj4l57uchhi446s32w3cg5arrq --node robertgpt
-  accept (read + drive): vox trust add f7l2q44g56mzd62nsvck7mofibuj4l57uchhi446s32w3cg5arrq --node robertgpt --drive
-  dismiss: vox trust dismiss f7l2q44g56mz --node robertgpt
-```
-
-Check that the fingerprint matches the one you wrote down in step 3. Then copy the
-`accept (read)` command and run it. (`read + drive` is for agents; see [Sessions](sessions.md).)
-
-```sh
-vox trust add f7l2q44g56mzd62nsvck7mofibuj4l57uchhi446s32w3cg5arrq --node robertgpt
-```
+The offer names the other person's actual fingerprint, why it is offered, and the room you
+share. Check every character against the fingerprint from step 3. Then copy the complete
+`accept (read)` command from **your terminal's output**, including `--node robertgpt`, and run
+it unchanged. `read + drive` is for letting that node drive your agents; see [Sessions](sessions.md).
 
 Vox asks for your own name for the other person's node. It is a local label that only you see,
-and it may have capital letters. Type `ann`. Then Vox asks for your identity passphrase. You see
-`vox: trusting f7l2q44g56mzd62nsvck7mofib as "ann": read`, and what that lets ann do.
+and it may have capital letters. Type `ann`. Then Vox asks for your identity passphrase. Vox
+prints the accepted fingerprint, the name `ann`, the `read` grant and what that lets ann do.
 
-Now the other person runs `vox trust offers` on their machine. Because you trust them, your node
-is offered there, marked `trusts you`. They run its `accept (read)` command the same way, and
+Now the other person runs `vox trust offers --node ann` on their machine. Because you trust them,
+your node is offered there, marked `trusts you`. They run its `accept (read)` command the same way, and
 name your node `robertGPT`.
 
 If `vox trust offers` says `no offers`, wait a few seconds for the two nodes to sync, and run it
@@ -154,21 +151,21 @@ again.
 On your machine, post:
 
 ```sh
-vox room post family 'hello from robertGPT'
+vox room post family 'hello from robertGPT' --node robertgpt
 ```
 
 On their machine, the other person reads the room and replies:
 
 ```sh
-vox room read family
-vox room post family 'hello back from ann'
+vox room read family --node ann
+vox room post family 'hello back from ann' --node ann
 ```
 
 They see your message. Each row is the message's entry hash (its ID), its author by their name
 for it, and the text. If a row says `(not received yet)`, wait a few seconds and read again. Back on your machine, read the room:
 
 ```sh
-vox room read family
+vox room read family --node robertgpt
 ```
 
 You see both messages:

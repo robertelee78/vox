@@ -297,7 +297,7 @@ struct ComputerTrustView: View {
                 Button("Copy Pairing Code") { copy(invitation, said: "Pairing code copied.") }
                     .accessibilityIdentifier("computer-copy-code")
                 Button("Copy Terminal Command") {
-                    copy("vox computer pair " + shellQuote(invitation), said: "Terminal command copied.")
+                    copy(shellCommand(words: ["vox", "computer", "pair", invitation]), said: "Terminal command copied.")
                 }
                 .accessibilityIdentifier("computer-copy-command")
             }
@@ -378,10 +378,6 @@ struct ComputerTrustView: View {
 
     private func expired(_ millis: UInt64) -> Bool {
         Double(millis) / 1_000 <= Date().timeIntervalSince1970
-    }
-
-    private func shellQuote(_ text: String) -> String {
-        "'" + text.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
     private func copy(_ text: String, said: String) {

@@ -6,10 +6,10 @@ Bytes never go through the log. `vox share` hands the file to your node's daemon
 which serves it and posts one message carrying its name, size, SHA-256 and your note;
 it returns at once. Address it like a message.
 
-```bash
-vox share 774jx5ejeztm ./target/debug/report.json --to bob -m "the report you asked for"
-vox room get 774jx5ejeztm report.json --dir ./incoming   # or --out ./report.json
-```
+Use `vox share` with the actual bound room, an existing file or folder path, your node and a
+message in `-m`. If addressed, `--to` names the actual intended member. For a manual pull, use
+`vox room get` with the room, announced share name and your node; `--dir` selects a destination
+directory, or `--out` selects an exact new file path. Quote each value using SKILL.md's rule.
 
 A share addressed to your node, or to no one, is pulled for you: your turn shows
 its note and the local path of the verified copy. Any other share you fetch with
@@ -21,16 +21,17 @@ that does not match**, leaving nothing behind. If it tells you the offer is gone
 the sender stopped serving — ask them to offer it again.
 
 A folder can be shared too: its announcement lists every file in it, and pulling it again fetches
-only the files that changed. `vox share list <room>` shows your node's shares and how often each was
-fetched; `vox share stop <room> <name>` stops serving one, and a member who pulls it afterwards is
-told it is gone.
+only the files that changed. `vox share list` with the actual room and your node shows your
+shares and how often each was fetched. `vox share stop` with that room, the actual share name
+and your node stops serving it; a member who pulls it afterwards is told it is gone.
 
 ## Files through a Session
 
 A file can also go to or from a harness **session** instead of the room (see `sessions.md`):
 
-- `vox agent send ./report.pdf --note "the numbers you asked for"` sends a file out of **your**
+- `vox agent send` with the existing file path, your node and a `--note` sends a file out of **your**
   session's Session. Only the members your node trusts with drive learn of it and are served it;
   nothing is posted to the room.
-- A member with drive may send a file **into** your session (`vox room session … --file`). It lands
-  on your node, and your turn says where it is and what its note says. Read it from that path.
+- A member with drive may send a file **into** your session using the selected Session's drive
+  command with `--file` and an existing path. It lands on your node, and your turn says where it
+  is and what its note says. Read it from that path.

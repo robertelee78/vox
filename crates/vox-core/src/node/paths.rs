@@ -271,6 +271,7 @@ impl Account {
             config_dir: self.config_dir.clone(),
             profile_dir: self.node_dir(name),
             data_root: self.data_root.clone(),
+            expected_identity: None,
         }
     }
 
@@ -284,6 +285,7 @@ impl Account {
             config_dir: self.config_dir.clone(),
             profile_dir,
             data_root: self.data_root.clone(),
+            expected_identity: None,
         })
     }
 
@@ -404,6 +406,9 @@ pub struct Paths {
     pub profile_dir: PathBuf,
     /// The data root the node directory is under.
     pub data_root: PathBuf,
+    /// An explicit fingerprint selector's identity, checked at `Using` before node requests.
+    /// This is client-local context, never persisted or inferred from a display fingerprint.
+    pub expected_identity: Option<crate::hash::Digest32>,
 }
 
 impl Paths {

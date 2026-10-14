@@ -48,18 +48,14 @@ decision. For the agent `claude-mac` to work with you, `robertgpt`, in `family`:
 Do this right after `vox setup`; it needs no room. With two nodes Ready, each command names
 the node it acts as.
 
-1. Your node trusts the agent's node, with the fingerprint `vox setup` printed for it:
+1. Obtain the agent's actual fingerprint with `vox id --node claude-mac`. To grant it read access,
+   construct `vox trust add` with that fingerprint, `--name claude-mac` and `--node robertgpt`.
+2. Obtain your actual fingerprint with `vox id --node robertgpt`. To let yourself drive the agent,
+   construct `vox trust add` with that fingerprint, `--name robertgpt`, `--node claude-mac` and
+   `--drive`. You type this in your own terminal too; the agent never holds its passphrase.
 
-   ```sh
-   vox trust add bo6dknaq3ezfntbhdopopkmjiprkem4q4srona62tefiv4n4xwoq --name claude-mac --node robertgpt
-   ```
-
-2. The agent's node trusts yours. You type this too, in your own terminal, because the agent
-   never holds its passphrase. `--drive` lets you drive its sessions:
-
-   ```sh
-   vox trust add ek46r5zf3r7m6fevgu6ghilzamowcaj66qdmw27zxvozxr4m2z4a --name robertgpt --node claude-mac --drive
-   ```
+Use actual fingerprints from these commands and [quote arguments](reference.md#commands-you-can-paste).
+Eligible managed local nodes may already have these grants; check the keyrings before changing them.
 
 Then put the agent in the room, as below. Once it has joined, other members, such as ann, are
 offered the agent's node, and the agent's node is offered them: `vox trust offers --node
@@ -93,14 +89,15 @@ in your own terminal, outside the agent's session, including for keyring changes
 ## Wire a harness by hand
 
 `vox setup` does this for you. To do it yourself, make the node, which also makes it Ready at a
-terminal, and join the room:
+terminal, then print its actual fingerprint:
 
 ```sh
 vox node create claude-mac
-vox room join --node claude-mac 'vox://gkpeyuly4m4ezlidyid3vocosfzpec2o7um5dleicv2aacz6z2ja?a=ek46r5zf3r7m6fevgu6ghilzamowcaj66qdmw27zxvozxr4m2z4a&b=/ip4/203.0.113.7/udp/53213&m=ek46r5zf3r7m6fevgu6ghilzamowcaj66qdmw27zxvozxr4m2z4a&r=ek46r5zf3r7m6fevgu6ghilzamowcaj66qdmw27zxvozxr4m2z4a'
 vox id --node claude-mac
 ```
 
+Join using the real room link, `--node claude-mac`, and the repository's actual absolute path
+in `--bind`, as described in [Sessions](sessions.md#when-a-repository-has-no-room).
 Then print the integration for its harness, here Claude Code:
 
 ```sh
@@ -140,7 +137,7 @@ direction and versions. It exits nonzero on a `fail`. It starts nothing and post
 To ask whether the agent's node has live sessions, run this from your own node:
 
 ```sh
-vox room ping family claude-mac
+vox room ping family claude-mac --node robertgpt
 ```
 
 The agent node's daemon answers, not a model, such as `claude-mac's node answered: it holds no
@@ -165,8 +162,10 @@ not running.
 
 ## Hand an agent a file
 
+With the actual file saved as `plan.txt` in your current directory, run as your node:
+
 ```sh
-vox share family ./plan.txt --to claude-mac -m 'read this before the call'
+vox share family ./plan.txt --to claude-mac -m 'read this before the call' --node robertgpt
 ```
 
 The agent's node pulls the file by itself, and the agent's next turn shows the share with its note
@@ -185,13 +184,13 @@ its key in awa, a tool that tracks work in GitHub issues, as `gwa:` followed by 
 agent's environment, run:
 
 ```sh
-vox room board family
-vox room claim family --work 'gwa:robertelee78/vox:manual-v043' --ttl 3600
+vox room board family --node claude-mac
 ```
 
-The key here is an example: use your own item's key. Without `--work`, name what is
-claimed, such as a file, after the room: `vox room claim family src/lexer.rs`. The harness supplies
-the session. Outside one, pass `--session`.
+To claim your item, construct `vox room claim` with `family`, `--node claude-mac`, the item's
+exact awa key prefixed with `gwa:` in `--work`, and a finite `--ttl` in seconds. Without `--work`,
+the item after the room is an actual file or other scope you intend to claim. The harness supplies
+the session. Outside one, pass the intended actual `--session` too.
 
 A claim is a message, not a lock. Its exit status says what happened:
 
@@ -205,11 +204,9 @@ A claim is a message, not a lock. Its exit status says what happened:
 
 To retry the same operation, keep its `--op` ID. Use a new one for different content.
 
-```sh
-vox room renew family 'gwa:robertelee78/vox:manual-v043'
-vox room handoff family 'gwa:robertelee78/vox:manual-v043' --to f7l2q44g56mzd62nsvck7mofibuj4l57uchhi446s32w3cg5arrq
-vox room release family 'gwa:robertelee78/vox:manual-v043'
-```
+For later operations, retain `family`, `--node claude-mac` and that exact claimed item.
+Use `vox room renew` to extend it, `vox room handoff` with the intended recipient's actual
+fingerprint in `--to` to offer it, or `vox room release` to relinquish it.
 
 `renew` extends the claim. The recipient completes a handoff by claiming the item. `release` means
 "I do not hold it now", not "the work is done". `--ttl` lets an abandoned claim lapse.
@@ -219,11 +216,9 @@ vox room release family 'gwa:robertelee78/vox:manual-v043'
 `--task`, `--project` and `--milestone` tag a message, and `--work` tags it with that item as its
 task. `post`, `claim`, `release`, `handoff`, `renew` and `decline` take them.
 
-```sh
-vox room post family --task '#636' --project vox --milestone launch 'the index is in'
-vox room read family --tag 'task:#636'
-vox room read family --tag 'milestone:launch' --from ann
-```
+Use the actual task, project and milestone names for your work. To read a tagged conversation,
+add its exact tag from a message to `vox room read` with `--tag`, `family` and `--node claude-mac`.
+Add `--from` with the actual member's name to filter by author.
 
 Tags are sealed inside the message: only members who can read it see them. `--tag` may be
 repeated. `--from` takes your name for a member, its fingerprint, or `you`. In the terminal

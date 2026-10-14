@@ -246,11 +246,14 @@ pub async fn share(
     }
     println!(
         "     collect it with: {}",
-        vox_text::shell::command(&["vox", "room", "get", room, &s.name])
+        vox_text::shell::node_command(
+            &["vox", "room", "get", room, &s.name],
+            crate::client::name_of(paths)?.as_str()
+        )
     );
     // Each member names this node its own way, so no one address fits all: said in words.
     println!(
-        "     or a member fetches {} through the proxy `vox up` names, at the service {} of this \
+        "     or a member fetches {} through their node's proxy, at the service {} of this \
          node in this room",
         if s.files > 0 { "one file of it" } else { "it" },
         s.tag
@@ -262,7 +265,10 @@ pub async fn share(
     }
     println!(
         "     served until its message expires, `{}`, you leave the room, or it ends",
-        vox_text::shell::command(&["vox", "share", "stop", room, &s.name])
+        vox_text::shell::node_command(
+            &["vox", "share", "stop", room, &s.name],
+            crate::client::name_of(paths)?.as_str()
+        )
     );
     Ok(())
 }
@@ -288,8 +294,11 @@ pub async fn stop(paths: &Paths, room: &str, selector: &str) -> Result<(), AppEr
     )?;
     if stopped.is_empty() {
         return Err(AppError::Usage(format!(
-            "no share of this node's in the room matches {selector:?} — `vox share list {room}` \
-             shows them"
+            "no share of this node's in the room matches {selector:?} — `{}` shows them",
+            vox_text::shell::node_command(
+                &["vox", "share", "list", room],
+                crate::client::name_of(paths)?.as_str()
+            )
         )));
     }
     for s in stopped {

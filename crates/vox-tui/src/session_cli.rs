@@ -67,6 +67,8 @@ pub async fn show(
     use vox_core::node::ipc::Frame;
     let mut client = crate::room_cli::attach(paths).await?;
     let channel_id = crate::room_cli::room_of(&mut client, room).await?;
+    let room_id = vox_core::node::link::b32_encode(&channel_id);
+    let acting_node = crate::client::name_of(paths)?;
     let label_of = |s: &vox_core::node::sessions::SessionRow| {
         vox_agentcomms::envelope::session_label(
             &crate::ident::name_of(&s.node),
@@ -110,8 +112,16 @@ pub async fn show(
         .map(|r| vox_core::node::link::b32_encode(&r.entry_hash));
     if raw {
         if let (Some(first), true) = (&first, older > 0) {
-            eprintln!("{older} older raw records not shown: vox room session {} {} --raw{} --before {first}",
-                room.trim(), named, if json { " --json" } else { "" });
+            let mut words = vec![
+                "vox", "room", "session", &room_id, &named, "--raw", "--before", first,
+            ];
+            if json {
+                words.push("--json");
+            }
+            eprintln!(
+                "{older} older raw records not shown: {}",
+                vox_text::shell::node_command(&words, acting_node.as_str())
+            );
         }
         use std::io::Write as _;
         let mut out = std::io::stdout().lock();
@@ -140,11 +150,19 @@ pub async fn show(
             .map_err(AppError::Usage)?;
     // What is not shown, and how to show it, on stderr: stdout stays the page.
     if let (Some(first), true) = (&first, older > 0 && read.hidden.is_none()) {
+        let mut words = vec![
+            "vox", "room", "session", &room_id, &read.id, "--before", first,
+        ];
+        if details {
+            words.push("--details");
+        }
+        if json {
+            words.push("--json");
+        }
         eprintln!(
-            "{older} older {} not shown: vox room session {} {} --before {first}",
+            "{older} older {} not shown: {}",
             if older == 1 { "entry" } else { "entries" },
-            room.trim(),
-            read.id
+            vox_text::shell::node_command(&words, acting_node.as_str())
         );
     }
     use std::io::Write as _;
@@ -173,7 +191,10 @@ pub async fn show(
         }
     } else {
         let _ = writeln!(out, "{} · {}", read.label, read.state);
-        let answer_with = format!("vox room session {} {}", room.trim(), read.id);
+        let answer_with = vox_text::shell::node_command(
+            &["vox", "room", "session", &room_id, &read.id],
+            acting_node.as_str(),
+        );
         let _ = write!(out, "{}", render(&read.lines, details, &answer_with));
     }
     Ok(())
