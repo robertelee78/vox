@@ -2475,6 +2475,10 @@ private struct Inspector: View {
     private func workRow(_ row: MemberWork) -> some View {
         VStack(alignment: .leading, spacing: Space.s4) {
             Text("\(row.kind.capitalized)\(row.session.isEmpty ? "" : " · " + row.session)").fontWeight(.semibold)
+            if ["ask", "assign", "handoff"].contains(row.kind) {
+                Text("From \(model.nodeName(row.author))\(row.from.isEmpty ? "" : " · " + row.from)")
+                    .textSelection(.enabled)
+            }
             if !row.resource.isEmpty { Text(row.resource).textSelection(.enabled) }
             if !row.text.isEmpty { Text(row.text).fixedSize(horizontal: false, vertical: true) }
             if !row.work.isEmpty { Text(row.work).textSelection(.enabled) }

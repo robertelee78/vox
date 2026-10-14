@@ -113,6 +113,7 @@ pub(crate) enum Reply {
         next: Option<(u64, Digest32)>,
         revision: u64,
         conflict_at: Option<u64>,
+        examined: usize,
     },
     NoticeState(NoticeState),
     NoticeExact(Option<NoticeRow>),
@@ -785,6 +786,7 @@ impl View<'_> {
                 let mut cursor = after;
                 let mut rows = Vec::new();
                 let mut used = 0usize;
+                let mut examined = 0;
                 // Direct created/hash order, with a bounded examined budget even for rows
                 // beyond the fixed arrival horizon. No query scans unrelated room history.
                 for _ in 0..256 {
@@ -794,6 +796,7 @@ impl View<'_> {
                             next: cursor,
                             revision: current,
                             conflict_at,
+                            examined,
                         });
                     }
                     let Some((key, fact)) = self.rendered.operation_next(current, cursor)? else {
@@ -802,8 +805,10 @@ impl View<'_> {
                             next: None,
                             revision: current,
                             conflict_at,
+                            examined,
                         });
                     };
+                    examined += 1;
                     if fact.cache <= through.arrival {
                         let row = self
                             .row(&key.1)?
@@ -828,6 +833,7 @@ impl View<'_> {
                                 next: cursor,
                                 revision: current,
                                 conflict_at,
+                                examined,
                             });
                         }
                         used = used.saturating_add(cost);
@@ -840,6 +846,7 @@ impl View<'_> {
                     next: cursor,
                     revision: current,
                     conflict_at,
+                    examined,
                 })
             }
             Query::NoticeState => Ok(Reply::NoticeState(self.notice_state()?)),

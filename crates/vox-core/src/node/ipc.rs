@@ -7100,6 +7100,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                     next,
                     revision,
                     conflict_at,
+                    ..
                 }) => Frame::OperationPage {
                     rows,
                     next,

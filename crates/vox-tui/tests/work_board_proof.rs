@@ -252,12 +252,21 @@ fn member_work_roundtrip(alice: &Worker, bob: &Worker, room: &str) {
         ],
     );
     claim.expect_ok("claim the member-panel work item");
-    until(
+    let claim_id = claim.json()["entry_hash"]
+        .as_str()
+        .expect("PRODUCT: claim has no hash")
+        .to_owned();
+    stage_work_row(
         bob,
-        None,
-        "the tagged claim's public row",
-        &["room", "read", room, "--json"],
-        |o| o.ok && o.stdout.contains(WORK),
+        room,
+        ReadableWorkRow {
+            id: &claim_id,
+            author: &alice.b32(),
+            session: "alice",
+            kind: "claim",
+            body: &format!("claiming {WORK}"),
+            re: None,
+        },
     );
     let board = bob.vox(Some("bob"), &["room", "board", room, "--json"]);
     board.expect_ok("read the member work board");
@@ -282,19 +291,28 @@ fn member_work_roundtrip(alice: &Worker, bob: &Worker, room: &str) {
         .as_str()
         .expect("PRODUCT: posted ask has no hash")
         .to_owned();
-    until(
+    stage_work_row(
         bob,
-        None,
-        "the addressed ask's public row",
-        &["room", "read", room, "--json"],
-        |o| o.ok && o.stdout.contains(&ask_id),
+        room,
+        ReadableWorkRow {
+            id: &ask_id,
+            author: &alice.b32(),
+            session: "alice",
+            kind: "ask",
+            body: "WD_ASK",
+            re: None,
+        },
     );
     let unread = bob.vox(Some("bob"), &["room", "board", room, "--json"]);
     unread.expect_ok("read the unanswered ask");
     assert!(
-        unread.json()["work"].as_array().is_some_and(|rs| rs
-            .iter()
-            .any(|r| r["type"] == "ask" && r["entry_hash"] == ask_id && r["member"] == bob.b32())),
+        unread.json()["work"]
+            .as_array()
+            .is_some_and(|rs| rs.iter().any(|r| r["type"] == "ask"
+                && r["entry_hash"] == ask_id
+                && r["member"] == bob.b32()
+                && r["author"] == alice.b32()
+                && r["from"] == "alice")),
         "PRODUCT: the addressed, unanswered ask is absent from bob's board: {unread:?}"
     );
     let unrelated = alice.vox(
@@ -337,12 +355,17 @@ fn member_work_roundtrip(alice: &Worker, bob: &Worker, room: &str) {
         .as_str()
         .expect("PRODUCT: answer has no hash")
         .to_owned();
-    until(
+    stage_work_row(
         alice,
-        None,
-        "bob's answer's public row",
-        &["room", "read", room, "--json"],
-        |o| o.ok && o.stdout.contains(&answer_id),
+        room,
+        ReadableWorkRow {
+            id: &answer_id,
+            author: &bob.b32(),
+            session: "bob",
+            kind: "answer",
+            body: "WD_ANSWER",
+            re: Some(&ask_id),
+        },
     );
     let answered = alice.vox(Some("alice"), &["room", "board", room, "--json"]);
     answered.expect_ok("read the answered work board");
@@ -402,10 +425,65 @@ fn member_work_roundtrip(alice: &Worker, bob: &Worker, room: &str) {
             .any(|r| r["type"] == "blocked" && r["work"] == WORK)),
         "PRODUCT: owner's working post did not clear blocked work: {resumed:?}"
     );
-    alice
-        .vox(Some("alice"), &["room", "release", room, WORK, "--json"])
+    let handoff = alice.vox(
+        Some("alice"),
+        &[
+            "room",
+            "handoff",
+            room,
+            WORK,
+            "--to",
+            "bob",
+            "--to-session",
+            "bob",
+            "--ttl",
+            "60",
+            "--json",
+        ],
+    );
+    handoff.expect_ok("hand member-panel work to bob's exact Session");
+    let handoff_id = handoff.json()["entry_hash"]
+        .as_str()
+        .expect("PRODUCT: handoff has no hash")
+        .to_owned();
+    stage_work_row(
+        bob,
+        room,
+        ReadableWorkRow {
+            id: &handoff_id,
+            author: &alice.b32(),
+            session: "alice",
+            kind: "handoff",
+            body: &format!("handing {WORK} to bob"),
+            re: None,
+        },
+    );
+    let pending = bob.vox(Some("bob"), &["room", "board", room, "--json"]);
+    pending.expect_ok("read the pending handoff");
+    assert!(pending.json()["work"].as_array().is_some_and(|rows| rows.iter().any(|r|
+        r["type"] == "handoff" && r["entry_hash"] == handoff_id && r["member"] == bob.b32()
+            && r["session"] == "bob" && r["author"] == alice.b32() && r["from"] == "alice"
+            && r["resource"] == WORK)),
+        "PRODUCT: pending handoff omitted the exact recipient or authenticated sender/Session: {pending:?}");
+    let accepted = bob.vox(
+        Some("bob"),
+        &[
+            "room", "claim", room, "--work", WORK, "--task", "#769", "--json",
+        ],
+    );
+    accepted.expect_ok("bob accepts the exact handoff by claiming");
+    let accepted_board = bob.vox(Some("bob"), &["room", "board", room, "--json"]);
+    accepted_board.expect_ok("read the accepted handoff");
+    let accepted_json = accepted_board.json();
+    let accepted_work = accepted_json["work"]
+        .as_array()
+        .expect("PRODUCT: board omitted its work rows");
+    assert!(accepted_work.iter().any(|r| r["type"] == "claim" && r["work"] == WORK && r["member"] == bob.b32()
+        && r["session"] == "bob") && !accepted_work.iter().any(|r| r["entry_hash"] == handoff_id),
+        "PRODUCT: handoff did not become bob's claim or remained pending after acceptance: {accepted_board:?}");
+    bob.vox(Some("bob"), &["room", "release", room, WORK, "--json"])
         .expect_ok("release member-panel work");
-    let fresh = alice.vox(Some("alice"), &["room", "board", room, "--json"]);
+    let fresh = bob.vox(Some("bob"), &["room", "board", room, "--json"]);
     fresh.expect_ok("reopen the work board after release");
     assert!(
         fresh.json()["work"]
@@ -413,4 +491,61 @@ fn member_work_roundtrip(alice: &Worker, bob: &Worker, room: &str) {
             .is_some_and(|rs| !rs.iter().any(|r| r["type"] == "claim" && r["work"] == WORK)),
         "PRODUCT: a fresh board retained the released claim: {fresh:?}"
     );
+}
+
+/// The public row must be readable, not merely an owed hash or a parent reference.
+struct ReadableWorkRow<'a> {
+    id: &'a str,
+    author: &'a str,
+    session: &'a str,
+    kind: &'a str,
+    body: &'a str,
+    re: Option<&'a str>,
+}
+
+fn stage_work_row(reader: &Worker, room: &str, expected: ReadableWorkRow<'_>) {
+    let deadline = std::time::Instant::now() + support::TIMEOUT;
+    let mut last = None;
+    while std::time::Instant::now() < deadline {
+        let out = reader.vox(None, &["room", "read", room, "--json"]);
+        println!("[work staging] {out:?}");
+        if out.code.is_none() {
+            panic!("APPARATUS: public-row staging command did not finish: {out:?}");
+        }
+        if !out.ok {
+            let refreshing = out.code == Some(1)
+                && out.stdout.is_empty()
+                && matches!(
+                    out.stderr.trim(),
+                    "vox: room governance is refreshing; try again when it is ready"
+                        | "vox: the room is refreshing saved history; retry"
+                        | "vox: the room is removing expired saved history; retry"
+                );
+            assert!(
+                refreshing,
+                "PRODUCT: unexpected public staging-read refusal: {out:?}"
+            );
+        } else {
+            for row in out.ndjson() {
+                let env = &row["envelope"];
+                if row["entry_hash"] == expected.id
+                    && row["owed"].as_bool() == Some(false)
+                    && row["author"] == expected.author
+                    && env["from"] == expected.session
+                    && env["type"] == expected.kind
+                    && env["body"] == expected.body
+                    && match expected.re {
+                        Some(re) => env["re"] == re,
+                        None => env["re"].is_null(),
+                    }
+                {
+                    return;
+                }
+            }
+        }
+        last = Some(out);
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    panic!("APPARATUS: exact readable {} row {} from {}/{} was not staged; no board consequence measured; last={last:?}",
+        expected.kind, expected.id, expected.author, expected.session);
 }

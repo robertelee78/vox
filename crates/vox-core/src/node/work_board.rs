@@ -5,6 +5,7 @@
 
 use super::{
     actor::NodeHandle,
+    api::{HistoryCursor, MessageRow},
     channel::history::{Filter, Query as HistoryQuery, Reply, Selection},
 };
 use crate::hash::Digest32;
@@ -13,6 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use vox_agentcomms::{
     claim::{self, Owner, Posted, State},
     envelope::{self, Envelope},
+    ops::{self, OpIndex, Verdict},
     version,
 };
 
@@ -217,9 +219,8 @@ pub async fn page(handle: &NodeHandle, room: Digest32, query: Query) -> Result<P
     }
     let at = query.after.as_ref().map_or(clock, |c| c.now_millis);
     let (me, members) = roster(handle, room)?;
-    let mut posted = Vec::new();
-    let mut bytes = 0usize;
-    let mut examined = 0usize;
+    let through = handle.history_reader().arrival_head(room).await?;
+    let mut input = Input::default();
     let mut after = None;
     let mut instance = None;
     loop {
@@ -241,35 +242,21 @@ pub async fn page(handle: &NodeHandle, room: Digest32, query: Query) -> Result<P
         else {
             return Err("unexpected work board input".into());
         };
-        if instance.is_some_and(|i| i != page.instance) {
+        if page.instance != through.instance || instance.is_some_and(|i| i != page.instance) {
             return Err(CHANGED.into());
         }
         instance = Some(page.instance);
         for row in page.rows {
-            let charge = row.text.len().saturating_add(std::mem::size_of::<Posted>());
-            if examined == POSTS || bytes.saturating_add(charge) > BYTES {
-                return Err(format!("coordination history exceeds this reader's capacity ({POSTS} posts / 64 MiB); no partial board or ownership verdict was produced. Saved messages remain available through paged room reads"));
-            }
-            // Invalid indexed bodies still consume examined work and the input budget.
-            examined += 1;
-            bytes += charge;
-            if row.owed {
-                continue;
-            }
-            if let Ok(envelope) = Envelope::parse(&row.text) {
-                posted.push(Posted {
-                    entry_hash: row.entry_hash,
-                    author: row.author,
-                    created_millis: row.created_millis,
-                    envelope,
-                });
-            }
+            input.admit(row)?;
         }
         match page.next {
             Some(next) if after != Some(next) => after = Some(next),
             Some(_) => return Err("work board input did not advance".into()),
             None => break,
         }
+    }
+    if query.section == Section::Work {
+        input.expand_operations(handle, room, through).await?;
     }
     let Reply::Count { n: entries, last } = handle
         .room_history(room, HistoryQuery::Count { since: None })
@@ -283,7 +270,7 @@ pub async fn page(handle: &NodeHandle, room: Digest32, query: Query) -> Result<P
     // The permit travels into blocking work: cancellation cannot admit an unbounded queue of folds.
     let result = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        project(posted, members, me, (entries, last), revision, at, query)
+        project(input, members, me, (entries, last), revision, at, query)
     })
     .await
     .map_err(|_| "work board reader stopped")??;
@@ -291,6 +278,141 @@ pub async fn page(handle: &NodeHandle, room: Digest32, query: Query) -> Result<P
         return Err(CHANGED.into());
     }
     Ok(result)
+}
+
+#[derive(Default)]
+struct Input {
+    posts: Vec<Posted>,
+    seen: BTreeSet<Digest32>,
+    examined: usize,
+    bytes: usize,
+    // A conflict already witnessed by the sealed index stays void after a body is pruned.
+    void_ops: BTreeSet<(Digest32, String)>,
+}
+impl Input {
+    fn capacity() -> String {
+        format!("coordination history exceeds this reader's capacity ({POSTS} examined posts / 64 MiB, including operation expansion); no partial board or ownership verdict was produced. Saved messages remain available through paged room reads")
+    }
+
+    fn examine(&mut self, count: usize) -> Result<(), String> {
+        let examined = self.examined.saturating_add(count);
+        if examined > POSTS {
+            return Err(Self::capacity());
+        }
+        self.examined = examined;
+        Ok(())
+    }
+
+    fn admit(&mut self, row: MessageRow) -> Result<(), String> {
+        let charge = row.text.len().saturating_add(std::mem::size_of::<Posted>());
+        self.examine(1)?;
+        if self.bytes.saturating_add(charge) > BYTES {
+            return Err(Self::capacity());
+        }
+        // Reads of already selected group members and malformed rows consume work too.
+        self.bytes += charge;
+        if row.owed || !self.seen.insert(row.entry_hash) {
+            return Ok(());
+        }
+        if let Ok(envelope) = Envelope::parse(&row.text) {
+            self.posts.push(Posted {
+                entry_hash: row.entry_hash,
+                author: row.author,
+                created_millis: row.created_millis,
+                envelope,
+            });
+        }
+        Ok(())
+    }
+
+    async fn expand_operations(
+        &mut self,
+        handle: &NodeHandle,
+        room: Digest32,
+        through: HistoryCursor,
+    ) -> Result<(), String> {
+        let groups: BTreeSet<_> = self
+            .posts
+            .iter()
+            .filter_map(|p| ops::op_of(&p.envelope).map(|op| (p.author, op.to_owned())))
+            .collect();
+        for (author, op) in groups {
+            let mut after = None;
+            let mut revision = None;
+            loop {
+                let Reply::OperationPage {
+                    rows,
+                    next,
+                    revision: current,
+                    conflict_at,
+                    examined,
+                } = handle
+                    .room_history(
+                        room,
+                        HistoryQuery::OperationPage {
+                            author,
+                            op: op.clone(),
+                            through,
+                            after,
+                            revision,
+                        },
+                    )
+                    .await?
+                else {
+                    return Err("unexpected work-board operation answer".into());
+                };
+                revision = Some(current);
+                if conflict_at.is_some() {
+                    self.void_ops.insert((author, op.clone()));
+                }
+                // Rows outside the fixed horizon and a row deferred by the byte limit
+                // consumed indexed work too. Returned rows are charged by admit below.
+                self.examine(examined.saturating_sub(rows.len()))?;
+                for row in rows {
+                    self.admit(row)?;
+                }
+                match next {
+                    Some(next) if after != Some(next) => after = Some(next),
+                    Some(_) => return Err("work-board operation page did not advance".into()),
+                    None => break,
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Canonical effective identity for each readable row. One verdict per operation avoids
+/// repeatedly copying a large conflict group. A reply naming a retry refers to its effective
+/// request; a void request or void reply has no effect. `None` is explicitly void, not missing.
+fn effective_posts(
+    posts: &[Posted],
+    void_ops: &BTreeSet<(Digest32, String)>,
+) -> BTreeMap<Digest32, Option<Digest32>> {
+    let mut index = OpIndex::new();
+    for p in posts {
+        index.insert(p.entry_hash, p.author, p.created_millis, &p.envelope);
+    }
+    let mut groups = BTreeMap::new();
+    posts
+        .iter()
+        .map(|p| {
+            let effective = match ops::op_of(&p.envelope) {
+                None => Some(p.entry_hash),
+                Some(op) => *groups.entry((p.author, op.to_owned())).or_insert_with(|| {
+                    if void_ops.contains(&(p.author, op.to_owned())) {
+                        return None;
+                    }
+                    match index.verdict(p.author, &p.envelope, p.entry_hash) {
+                        Some(Verdict::Conflict { .. }) => None,
+                        Some(Verdict::Duplicate { of }) => Some(of),
+                        Some(Verdict::Effective) | None => Some(p.entry_hash),
+                    }
+                }),
+            };
+            (p.entry_hash, effective)
+        })
+        .collect()
 }
 
 struct Output {
@@ -360,7 +482,7 @@ fn matched(q: &Query, row: &Work) -> bool {
     q.member.is_none_or(|m| m == row.member)
 }
 fn project(
-    mut posts: Vec<Posted>,
+    input: Input,
     members: Vec<Digest32>,
     me: Digest32,
     position: (u64, Option<Digest32>),
@@ -369,6 +491,11 @@ fn project(
     query: Query,
 ) -> Result<Page, String> {
     let (entries, last) = position;
+    let Input {
+        mut posts,
+        void_ops,
+        ..
+    } = input;
     posts.sort_by_key(|p| (p.created_millis, p.entry_hash));
     // Keep the established board's version participation input exactly as before. Work replies
     // are additional read evidence, not a new coordination/version authority model.
@@ -448,15 +575,19 @@ fn project(
             }
         }
         Section::Work => {
+            let effective = effective_posts(&posts, &void_ops);
+            let takes_effect =
+                |p: &&Posted| effective.get(&p.entry_hash) == Some(&Some(p.entry_hash));
             // Reply closure uses the signed responder and exact addressed Session, not a name
             // or a reply from an unrelated room participant. Partial multi-target asks stay open.
             let mut replies: BTreeMap<Digest32, BTreeSet<Owner>> = BTreeMap::new();
             let mut blocked: BTreeMap<(Owner, String), &Posted> = BTreeMap::new();
-            for p in &posts {
+            for p in posts.iter().filter(takes_effect) {
                 let e = &p.envelope;
                 if let Some(parent) =
                     e.re.as_ref()
                         .and_then(|s| super::link::b32_decode(s, "reply").ok())
+                        .and_then(|parent| effective.get(&parent).copied().flatten())
                 {
                     // Exact re identity binds the answer even when the recipient's clock
                     // sorts its reply before the ask. Sender timestamps are not causality.
@@ -515,7 +646,7 @@ fn project(
                     }
                 }
             }
-            for p in &posts {
+            for p in posts.iter().filter(takes_effect) {
                 if ![envelope::work::ASK, envelope::work::ASSIGN]
                     .contains(&p.envelope.kind.as_str())
                 {
