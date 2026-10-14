@@ -909,14 +909,6 @@ private struct RoomView: View {
             VStack(spacing: 0) {
                 RoomHeader(model: model, room: room)
                 Divider()
-                // A trust offer from one of its members, at the top of its conversation (the
-                // decider, v0.4.3: offers are in the room they concern, not a sidebar section).
-                if model.showing == .general {
-                    ForEach(model.offers.filter { $0.rooms.contains { $0.id == room } }, id: \.fingerprint) { offer in
-                        OfferBanner(model: model, offer: offer)
-                        Divider()
-                    }
-                }
                 if !model.roomServices.isEmpty {
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: Space.s8 * scale) {
@@ -2252,6 +2244,7 @@ private struct Inspector: View {
                         TrustMark(name: member.name, trust: member.trust)
                             .nodeCard(model, member.id, name: member.name)
                             .accessibilityIdentifier("member-\(member.name)")
+                        MemberTrustActions(model: model, fingerprint: member.id, name: member.name, room: room)
                         // What this node's keyring grants it (K-14), once it is in the keyring.
                         if member.trust.inKeyring {
                             Text(Capability.words(member.drive)).eyebrow().secondaryText()

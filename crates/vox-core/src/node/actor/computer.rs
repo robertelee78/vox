@@ -4,6 +4,51 @@ use crate::identity::composite::RootSigner;
 use crate::node::trust::HistoryGrant;
 
 impl NodeHandle {
+    /// Current daemon policy for rendering individual Trust actions. This is an observation,
+    /// never an authorization token: every mutation reconciles and checks policy again.
+    pub fn individual_trust_eligibility(&self, peer: Digest32) -> (bool, String) {
+        let view = self.view();
+        let Some(me) = view.identity.as_ref().map(|id| id.fingerprint) else {
+            return (
+                false,
+                "make this node Ready before changing individual trust".into(),
+            );
+        };
+        if self.cmd_tx.is_closed() || view.locked || view.locking {
+            return (
+                false,
+                "make this node Ready before changing individual trust".into(),
+            );
+        }
+        if me == peer {
+            return (false, "a node does not grant trust to itself".into());
+        }
+        let Some(computer) = &self.computer else {
+            return (true, String::new());
+        };
+        let applied = self
+            .computer_revision
+            .load(std::sync::atomic::Ordering::Acquire);
+        if !computer.policy_current(applied) {
+            return (
+                false,
+                "computer policy is pending application on this node".into(),
+            );
+        }
+        let result = match computer.capability(me, &peer) {
+            Ok(Some(_)) => (false, "this node's trust is managed by My computers".into()),
+            Ok(None) => (true, String::new()),
+            Err(e) => (false, e.to_string()),
+        };
+        if !computer.policy_current(applied) {
+            return (
+                false,
+                "computer policy changed; refresh before changing individual trust".into(),
+            );
+        }
+        result
+    }
+
     /// Ask the already attached node to sign its management binding and durably apply policy.
     pub async fn reconcile_computer(&self) -> crate::error::Result<()> {
         let (reply, rx) = oneshot::channel();
@@ -30,16 +75,13 @@ impl Node {
             .file_name()
             .and_then(|n| n.to_str())
             .ok_or(Error::Profile("managed node name is unreadable"))?;
-        let personal = std::fs::read_to_string(self.paths.account().config_dir.join("app/node"))
-            .ok()
-            .is_some_and(|s| s.trim() == name);
         if let Some(p) = &self.profile {
             if p.is_unlocked() {
-                return computer.bind_node(p.signer()?, name, personal);
+                return computer.bind_node(p.signer()?, name);
             }
         }
         if let Some(s) = &self.headless {
-            return computer.bind_node(s.as_ref(), name, false);
+            return computer.bind_node(s.as_ref(), name);
         }
         Err(Error::Profile(
             "managed node needs its passphrase to become Ready",
@@ -142,6 +184,15 @@ impl Node {
             .map(|(id, _, _)| *id)
             .chain(plan.denied.iter().copied())
             .collect();
+        let aliases: Vec<_> = covered
+            .iter()
+            .filter_map(|peer| {
+                self.trust
+                    .petname(peer)
+                    .map(|name| (*peer, name.to_owned()))
+            })
+            .collect();
+        computer.retain_aliases(me, &aliases)?;
         let mut next = self.trust.clone();
         let mut newly = Vec::new();
         let mut changed_drive = Vec::new();
@@ -179,7 +230,12 @@ impl Node {
                 newly.push(id);
             }
             changed_drive.push((id, self.trust.has_drive(&id)));
-            let name = self.trust.petname(&id).unwrap_or(&name).to_owned();
+            let name = self
+                .trust
+                .petname(&id)
+                .map(str::to_owned)
+                .or_else(|| computer.alias(&me, &id))
+                .unwrap_or(name);
             let history = if self.trust.is_trusted(&id) {
                 self.trust.history(&id)
             } else {

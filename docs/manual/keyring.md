@@ -211,6 +211,62 @@ vox: removed f7l2q44g56mzd62nsvck7mofib from your keyring
      your sessions into its services are untouched
 ```
 
+## My computers
+
+Computer trust is an operator choice shared by the enrolled daemons. Add Computer in Vox.app,
+or `vox computer invite` on one computer and `vox computer pair LINK --preview` on the other,
+shows the exact computers and operation for approval on both sides. Use
+`vox computer approve OPERATION` on each. Pairing grants no room membership.
+
+Every managed node can read the other managed nodes. A computer's selected personal node can
+drive nonpersonal nodes; personal nodes cannot drive each other. The daemon saves the app's
+selection, including when the app is closed. A headless computer can use the same commands:
+
+```sh
+vox computer status
+vox computer personal robertgpt
+vox computer personal --clear
+```
+
+The roster follows node creation, rename and removal. Fingerprints establish identity; names
+only label it. Local aliases survive presented-name changes. Status shows the current policy and
+which computers have confirmed applying it. An offline computer remains pending until it
+reconnects and applies the signed update. A Locked local node must be unlocked to apply it.
+
+To remove a computer, review its full fingerprint and nodes in `vox computer status`, then use
+the exact displayed frontier:
+
+```sh
+vox computer remove COMPUTER_FINGERPRINT --confirm FRONTIER
+```
+
+This withdraws all trust in that computer's nodes, including individual grants made before
+pairing. Remaining computers apply the removal when they receive it; pending does not mean
+confirmed. This cannot erase messages or files the removed computer already received. Restart
+or an old roster cannot restore it. Bringing it back requires a fresh two-sided enrollment.
+After removal you can instead make a deliberate new individual grant with `vox trust add`.
+
+Copying a node folder does not transfer management. For an intentional move, the existing
+manager releases the exact node to one enrolled destination, then the destination approves:
+
+```sh
+# On the existing manager, after reviewing status:
+vox computer binding release NODE_FINGERPRINT --destination COMPUTER_FINGERPRINT --confirm FRONTIER
+# On that destination, after reviewing its updated status:
+vox computer binding transfer NODE_FINGERPRINT --confirm FRONTIER
+```
+
+The node's protected vault must be available and unlocked on the destination to sign its new
+binding. No command guesses ownership from a name or copied fingerprint. If the previous
+manager is lost, remove it first, then explicitly approve recovery on the destination with
+`vox computer binding recover NODE_FINGERPRINT --confirm FRONTIER`. Recovery retains the old
+binding and removal evidence. If a node key was compromised, use a new node identity instead.
+
+If this computer has been removed and the old group cannot be continued, explicitly abandon
+that group locally with `vox computer binding recover-group group --confirm FRONTIER`.
+This retires its old authority and removes covered grants before any fresh pairing. It does
+not erase other computers' data or silently recreate the old membership.
+
 ## Trust from the TUI
 
 In the terminal interface, the members pane shows trust in glyphs and words:
