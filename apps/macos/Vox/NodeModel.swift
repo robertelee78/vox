@@ -2740,6 +2740,34 @@ extension NodeModel {
         }
     }
 
+    /// Capacity refusal alone permits splitting an exact selection. Every other error
+    /// propagates; the caller publishes only after all batches have succeeded.
+    private func retainedSessionEntries(room: String, session: FfiSession, instance: Data,
+                                        ids: [String], current: () -> Bool) async throws -> [FfiSessionEntry] {
+        guard current(), !Task.isCancelled else { throw CancellationError() }
+        do {
+            let page = try await client.sessionEntries(room: room, node: session.nodeFingerprint,
+                sessionId: session.sessionId, instance: instance, ids: ids)
+            guard current(), !Task.isCancelled else { throw CancellationError() }
+            guard page.instance == instance else {
+                throw VoxError.Failed(reason: "The saved room changed while refreshing held Session activity.")
+            }
+            return page.entries
+        } catch {
+            guard current(), !Task.isCancelled else { throw CancellationError() }
+            guard ids.count > 1, case let VoxError.Failed(reason) = error,
+                  reason == "stream refused: held Session selection exceeds one page byte budget; refresh fewer IDs" else {
+                throw error
+            }
+            let middle = ids.count / 2
+            let left = try await retainedSessionEntries(room: room, session: session, instance: instance,
+                ids: Array(ids[..<middle]), current: current)
+            let right = try await retainedSessionEntries(room: room, session: session, instance: instance,
+                ids: Array(ids[middle...]), current: current)
+            return left + right
+        }
+    }
+
     /// The Session on screen's entries, to a member with drive; nothing to one without (SC-3).
     func readSession() async {
         if showingSession && selectedSessionMetadataKnown && selectedSessionMetadata == nil { return }
@@ -2770,8 +2798,10 @@ extension NodeModel {
                 guard heldInstance == read.instance else {
                     throw VoxError.Failed(reason: "The saved room changed while its Session window was open.")
                 }
-                retained = try await client.sessionEntries(room: room, node: s.nodeFingerprint,
-                    sessionId: s.sessionId, instance: heldInstance, ids: heldIDs)
+                let entries = try await retainedSessionEntries(room: room, session: s,
+                    instance: heldInstance, ids: heldIDs, current: current)
+                retained = FfiSessionRead(instance: heldInstance, entries: entries,
+                    note: nil, older: 0, before: nil)
             }
             guard current() else { return }
             var pages = sessionPages
