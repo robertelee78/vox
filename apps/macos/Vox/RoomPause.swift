@@ -104,9 +104,9 @@ struct RoomPauseSheet: View {
                     outcome.phase = "Not sent: the room or node selection changed"
                 } else if outcome.phase == "Pausing" || outcome.phase == "Resuming" {
                     outcome.phase = "Outcome unknown: the room or node selection changed during the request"
-                } else if outcome.phase == "Pause saved" {
+                } else if let state = outcome.state {
                     outcome.incomplete = true
-                    outcome.phase = "Pause was saved; the room or node selection changed before completion was confirmed"
+                    outcome.phase = "\(state.paused ? "Pause" : "Resume") was saved; the room or node selection changed before completion was confirmed"
                 }
                 outcomes[member] = outcome
             }
