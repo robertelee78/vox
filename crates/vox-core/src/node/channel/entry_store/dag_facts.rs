@@ -321,6 +321,20 @@ impl Source<'_> {
 }
 
 impl Read<'_> {
+    /// One reverse edge from the same published roots as this entry read.
+    pub(crate) fn child_after(
+        &self,
+        parent: &Digest32,
+        after: Option<Digest32>,
+    ) -> Result<Option<Digest32>> {
+        self.source().child_after(
+            self.sek,
+            self.channel,
+            self.directory.active.children,
+            parent,
+            after,
+        )
+    }
     pub(crate) fn order_revision(&self) -> u64 {
         self.directory.order_revision
     }

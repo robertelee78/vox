@@ -85,6 +85,8 @@ pub enum SegmentKind {
     EntryIndex,
     /// Unpublished wire entries, including unsigned checkpoint suffixes.
     ProvisionalLog,
+    /// Sealed governance locators, causal facts and checked evaluation work.
+    GovernanceIndex,
 }
 
 impl SegmentKind {
@@ -101,6 +103,7 @@ impl SegmentKind {
             SegmentKind::PrivateSession => b"vox/seg/private-session/v1",
             SegmentKind::EntryIndex => b"vox/seg/entry-index/v1",
             SegmentKind::ProvisionalLog => b"vox/seg/provisional-log/v1",
+            SegmentKind::GovernanceIndex => b"vox/seg/governance-index/v1",
         }
     }
 }
