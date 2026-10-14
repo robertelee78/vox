@@ -879,6 +879,7 @@ final class NodeModel: ObservableObject {
     func seedUnread() async {
         for room in rooms where room.open && !seeded.contains(room.id) {
             do { _ = try await readUnreadSummary(room.id) }
+            catch is CancellationError {}
             catch { reportBackground(error) }
         }
     }
@@ -886,6 +887,7 @@ final class NodeModel: ObservableObject {
     private func reconcileUnread() async {
         for room in rooms where room.open {
             do { _ = try await readUnreadSummary(room.id) }
+            catch is CancellationError {}
             catch { reportBackground(error) }
         }
     }
@@ -908,13 +910,13 @@ final class NodeModel: ObservableObject {
     }
 
     /// Coalesce live events to one reader, rather than a body cache or a task per message.
-    /// The pending set contains only identities of currently open rooms, never message IDs.
-    private var unreadDirty: Set<String> = []
+    /// The FIFO contains only identities of currently open rooms, never message IDs.
+    private var unreadDirty: [String] = []
     private var unreadRefreshing: Task<Void, Never>?
 
     private func scheduleUnread(_ room: String) {
         guard rooms.contains(where: { $0.id == room && $0.open }) else { return }
-        unreadDirty.insert(room)
+        if !unreadDirty.contains(room) { unreadDirty.append(room) }
         guard unreadRefreshing == nil else { return }
         let epoch = nodeObservationEpoch
         unreadRefreshing = Task { [weak self] in
@@ -922,7 +924,7 @@ final class NodeModel: ObservableObject {
             defer { self.unreadRefreshing = nil }
             while epoch == self.nodeObservationEpoch, !Task.isCancelled,
                   let id = self.unreadDirty.first {
-                self.unreadDirty.remove(id)
+                self.unreadDirty.removeFirst()
                 do { _ = try await self.readUnreadSummary(id) }
                 catch {
                     if epoch == self.nodeObservationEpoch && !Task.isCancelled {
