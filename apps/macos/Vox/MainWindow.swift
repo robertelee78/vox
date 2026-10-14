@@ -893,6 +893,8 @@ private struct RoomTimelineView: View {
     @ObservedObject var model: NodeModel
     let room: String
     @State private var draft = ""
+    @State private var draftRevision = UUID()
+    @State private var urgencyRevision = UUID()
     /// Whether the composer has the keyboard: ⇧↩ adds a line only then (P19).
     @FocusState private var composing: Bool
     @StateObject private var window = WindowSeen()
@@ -906,7 +908,7 @@ private struct RoomTimelineView: View {
     /// takes them, and would keep them (WCAG 2.1.2).
     @State private var previewKeys: Any?
 
-/// What the composer posts is addressed to, and whether it is urgent (M-15).
+    /// What the composer posts is addressed to, and whether it is urgent (M-15).
     @State private var to: Set<String> = []
     @State private var urgent = false
     /// A send under way: Return again does nothing until it is answered (D11).
@@ -1378,7 +1380,7 @@ private struct RoomTimelineView: View {
             // The conversation, the timeline and the composer, at the text size View > Bigger and
             // Smaller set (the decider, v0.4.1); the inspector beside it keeps a steady size.
             .conversationScale(Theme.scale)
-            // At least wide enough for the composer's field beside its To: and Urgent.
+            // At least wide enough for the slim composer and its visible Send action.
             .frame(minWidth: Theme.scaled(400), maxWidth: .infinity)
             if model.inspectorShown {
                 ColumnDivider(width: $inspectorWidth, side: .inspector)
@@ -1406,6 +1408,7 @@ private struct RoomTimelineView: View {
             // not open (⌘O, seen in the QE pass). The room's sheet only while the room is shown.
             guard !model.showingSession else { return }
             DispatchQueue.main.async {
+                tokenizeDraft(finish: true)
                 if let url = chooseFile() { attaching = Attaching(url: url) }
             }
         }
@@ -1417,20 +1420,23 @@ private struct RoomTimelineView: View {
         .onAppear {
             let kept = model.roomDrafts[room] ?? RoomDraft()
             draft = kept.text
+            draftRevision = kept.textRevision
             to = kept.to
             urgent = kept.urgent
+            urgencyRevision = kept.urgencyRevision
+            model.roomDrafts[room] = kept
         }
-        .onChange(of: draft) { model.roomDrafts[room, default: RoomDraft()].text = $0 }
         .onChange(of: to) { model.roomDrafts[room, default: RoomDraft()].to = $0 }
-        .onChange(of: urgent) { model.roomDrafts[room, default: RoomDraft()].urgent = $0 }
         .onChange(of: model.incoming) { url in
             if let url {
+                tokenizeDraft(finish: true)
                 attaching = Attaching(url: url)
                 model.incoming = nil
             }
         }
         .onAppear {
             if let url = model.incoming {
+                tokenizeDraft(finish: true)
                 attaching = Attaching(url: url)
                 model.incoming = nil
             }
@@ -1470,6 +1476,7 @@ private struct RoomTimelineView: View {
         }
         HStack(spacing: Space.s8 * scale) {
             Button {
+                tokenizeDraft(finish: true)
                 if let url = chooseFile() { attaching = Attaching(url: url) }
             } label: {
                 Image(systemName: "paperclip")
@@ -1478,24 +1485,38 @@ private struct RoomTimelineView: View {
             .help("Attach a file or folder")
             .accessibilityLabel("Attach a file or folder")
             .accessibilityIdentifier("attach")
-            // Who posts (E-4): the node this window acts as, before the field.
-            // No label of its own (a selectable Text with one recurses); the field says "as ann".
-            Text("\(model.node) ▸").font(Theme.text).secondaryText()
-                .accessibilityIdentifier("compose-as")
-            // Up to 12 lines, so a long message is read before it goes; Return sends, ⇧↩ (or ⌥↩)
-            // adds a line (P19).
-            TextField("Message \(model.roomName(room))…", text: $draft, axis: .vertical)
-                .lineLimit(1...12)
-                .focused($composing)
-                .shiftReturnAddsLine(composing)
-                .help("Return sends; ⇧Return starts a new line")
-                .accessibilityLabel("Message \(model.roomName(room)), as \(model.node)")
-                .textFieldStyle(.plain)
-                .frame(minWidth: Theme.scaled(160), maxWidth: .infinity)
-                .layoutPriority(1)
-                .onSubmit { send(urgent: urgent) }
-                .accessibilityIdentifier("compose")
-            ComposerAddress(model: model, to: $to, urgent: $urgent)
+            HStack(spacing: Space.s8 * scale) {
+                Text("\(model.node) ▸").font(Theme.text).secondaryText()
+                    .lineLimit(1).truncationMode(.middle)
+                    .frame(maxWidth: 80 * scale)
+                    .help("Posting as \(model.node)")
+                    .accessibilityIdentifier("compose-as")
+                ComposerTokens(model: model, to: $to, urgent: urgency)
+                // One line until the person types more; Return sends, ⇧↩ (or ⌥↩) adds a line.
+                TextField("Message \(model.roomName(room))…", text: input, axis: .vertical)
+                    .lineLimit(1...12)
+                    .focused($composing)
+                    .shiftReturnAddsLine(composing)
+                    .help("Return sends; ⇧Return starts a new line; @name addresses; ! marks urgent")
+                    .accessibilityLabel("Message \(model.roomName(room)), as \(model.node)")
+                    .textFieldStyle(.plain)
+                    .frame(minWidth: 80 * scale, maxWidth: .infinity)
+                    .layoutPriority(1)
+                    .onSubmit { send(urgent: urgent) }
+                    .accessibilityIdentifier("compose")
+                ComposerAddress(model: model, to: $to, urgent: urgency)
+            }
+            .voxPadding(.horizontal, Space.s8)
+            .voxPadding(.vertical, Space.s8)
+            // Always present, including empty, unfocused, and with the pointer elsewhere.
+            .background(RoundedRectangle(cornerRadius: Radius.control * scale).fill(VoxTokens.Colors.bgOverlay))
+            .cardOutline()
+            .accessibilityElement(children: .contain)
+            .accessibilityIdentifier("compose-field")
+            Button("Send") { send(urgent: urgent) }
+                .buttonStyle(.voxPrimary)
+                .disabled(sending || model.ended != nil || draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .accessibilityIdentifier("compose-send")
         }
         .voxPadding(Space.s12)
     }
@@ -1506,22 +1527,26 @@ private struct RoomTimelineView: View {
     /// cleared before the post, so one the node refused lost its text. They are cleared once the
     /// post is answered, and only the draft that was sent: anything typed meanwhile stays.
     private func send(urgent now: Bool) {
-        // An @alias typed in full addresses that member, as ticking it in To: does (K-4).
-        let named = draft.split(whereSeparator: \.isWhitespace).compactMap { word -> String? in
-            guard word.hasPrefix("@") else { return nil }
-            let alias = word.dropFirst().trimmingCharacters(in: .punctuationCharacters.subtracting(["#"]))
-            return mentionable.first { $0.name == alias }?.id
-        }
-        let (text, recipients, re) = (draft, Array(to.union(named)), model.replyTo?.id ?? "")
+        guard !sending else { return }
+        tokenizeDraft(finish: true)
+        let (text, recipients, re) = (draft, Array(to), model.replyTo?.id ?? "")
         guard !sending, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         // A detached node posts nothing: the draft stays until it is attached again.
         guard model.ended == nil else { return }
+        let context = model.roomPostContext
+        let sentDraft = draftRevision, sentUrgency = urgencyRevision, urgentPost = now || urgent
         sending = true
         Task {
-            if await model.post(text, to: recipients, urgent: now, re: re) {
-                if draft == text { draft = "" }
-                urgent = false
-                if model.replyTo?.id == re { model.replyTo = nil }
+            if await model.post(text, in: room, context: context, to: recipients, urgent: urgentPost, re: re) {
+                if draftRevision == sentDraft { draft = "" }
+                if urgencyRevision == sentUrgency { urgent = false }
+                // The view may have left while the daemon answered. Clear only the saved
+                // draft revision sent, never a later edit made on returning to this room.
+                if model.roomDrafts[room]?.textRevision == sentDraft { model.roomDrafts[room]?.text = "" }
+                if model.roomDrafts[room]?.urgencyRevision == sentUrgency { model.roomDrafts[room]?.urgent = false }
+                if model.roomOnScreen == room, model.roomPostContext == context, model.replyTo?.id == re {
+                    model.replyTo = nil
+                }
             }
             sending = false
         }
@@ -1529,7 +1554,37 @@ private struct RoomTimelineView: View {
 
     /// The members an @alias can name (ADR-028 K-4): those in the keyring, by the names the node
     /// gives them (an alias the same as another but for case carries its fingerprint's start).
-    private var mentionable: [NodeModel.MemberRow] { model.members.filter { $0.trust != .none } }
+    private var mentionable: [NodeModel.MemberRow] { model.members.filter { $0.trust.inKeyring } }
+
+    private var input: Binding<String> {
+        Binding(get: { draft }, set: { value in
+            editDraft(value)
+            tokenizeDraft(finish: false)
+        })
+    }
+
+    private func editDraft(_ value: String) {
+        draftRevision = UUID()
+        draft = value
+        model.roomDrafts[room, default: RoomDraft()].text = value
+        model.roomDrafts[room, default: RoomDraft()].textRevision = draftRevision
+    }
+
+    private var urgency: Binding<Bool> {
+        Binding(get: { urgent }, set: { value in
+            urgencyRevision = UUID()
+            urgent = value
+            model.roomDrafts[room, default: RoomDraft()].urgent = value
+            model.roomDrafts[room, default: RoomDraft()].urgencyRevision = urgencyRevision
+        })
+    }
+
+    private func tokenizeDraft(finish: Bool) {
+        let parsed = ComposerInput.tokens(draft, members: mentionable, finish: finish)
+        if parsed.text != draft { editDraft(parsed.text) }
+        to.formUnion(parsed.to)
+        if parsed.urgent { urgency.wrappedValue = true }
+    }
 
     /// The @word being typed at the end of the draft: what follows "@", or nil.
     private var mentioning: String? {
@@ -1545,11 +1600,12 @@ private struct RoomTimelineView: View {
         return mentionable.filter { $0.name.lowercased().hasPrefix(typed) }
     }
 
-    /// `member` picked for the @word being typed: written in full, and addressed (K-4).
+    /// Replace the typed alias with its removable token, storing the full fingerprint (K-4).
     private func mention(_ member: NodeModel.MemberRow) {
         guard let at = draft.lastIndex(of: "@") else { return }
-        draft = String(draft[..<at]) + "@\(member.name) "
+        editDraft(String(draft[..<at]))
         to.insert(member.id)
+        composing = true
     }
 
     /// ↑/↓ on the timeline: the selection moves to the message before or after it, scrolled into
