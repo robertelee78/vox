@@ -24,12 +24,14 @@ pub(crate) struct Revision {
     incarnation: Arc<std::sync::atomic::AtomicU64>,
     inputs: (u64, u64),
     drive: Digest32,
+    member: Option<Digest32>,
 }
 
 #[derive(Clone, Copy)]
 pub(crate) enum FieldKind {
     Name,
     Harness,
+    Cwd,
 }
 
 /// A field's compact length/hash. The referenced value is never copied into a
@@ -46,6 +48,7 @@ pub(crate) struct Row {
     pub id: String,
     pub name: Option<Text>,
     pub harness: Option<Text>,
+    pub cwd: Option<Text>,
     pub open: bool,
     pub opened_millis: u64,
     pub ended_millis: Option<u64>,
@@ -64,6 +67,7 @@ impl From<Descriptor> for Row {
             id: row.id,
             name: row.name.map(text),
             harness: row.harness.map(text),
+            cwd: row.cwd.map(text),
             open: row.ended.is_none(),
             opened_millis: row.position.created,
             ended_millis: row.ended.map(|end| end.position.created),
@@ -94,6 +98,9 @@ pub(crate) enum Query {
         limit: usize,
     },
     HasOpen {
+        node: Digest32,
+    },
+    Join {
         node: Digest32,
     },
     Page {
@@ -341,11 +348,13 @@ impl ChannelState {
                 incarnation: self.gen.clone(),
                 inputs,
                 drive: hash.finalize().into(),
+                member: None,
             };
             let check = |previous: &Revision| -> Answer<()> {
                 if !Arc::ptr_eq(&previous.incarnation, &revision.incarnation)
                     || previous.inputs != revision.inputs
                     || previous.drive != revision.drive
+                    || previous.member.is_some_and(|node| !self.is_member(&node))
                 {
                     return Err(Failure::Request(CHANGED));
                 }
@@ -552,7 +561,8 @@ impl ChannelState {
                         }
                         let cost = 256u64
                             .saturating_add(row.name.map_or(0, |f| f.bytes))
-                            .saturating_add(row.harness.map_or(0, |f| f.bytes));
+                            .saturating_add(row.harness.map_or(0, |f| f.bytes))
+                            .saturating_add(row.cwd.map_or(0, |f| f.bytes));
                         if !rows.is_empty()
                             && (rows.len() >= limit.clamp(1, PAGE_ROWS)
                                 || bytes.saturating_add(cost) > max_bytes as u64)
@@ -584,6 +594,32 @@ impl ChannelState {
                         read.find(Tree::OpenCounts, &hash_key(&node))?.unwrap_or(0) != 0,
                     ))
                 }
+                Query::Join { node } => {
+                    // One deterministic current opening, directly from the existing author
+                    // index. Read-only members get the same empty answer as no opening.
+                    let row = if authors.contains(&node) && self.is_member(&node) {
+                        next(&read, &[node], 0, true)?.map(|(_, row)| row)
+                    } else {
+                        None
+                    };
+                    if row.as_ref().is_some_and(|row| {
+                        256u64
+                            .saturating_add(row.name.map_or(0, |f| f.bytes))
+                            .saturating_add(row.harness.map_or(0, |f| f.bytes))
+                            .saturating_add(row.cwd.map_or(0, |f| f.bytes))
+                            > max_bytes as u64
+                    }) {
+                        return Err(Failure::Request("Session join metadata exceeds one page"));
+                    }
+                    Ok(Reply::Page {
+                        rows: row.map(Row::from).into_iter().collect(),
+                        more: false,
+                        revision: Revision {
+                            member: Some(node),
+                            ..revision
+                        },
+                    })
+                }
                 Query::Page {
                     open_only,
                     after,
@@ -611,7 +647,8 @@ impl ChannelState {
                     while let Some((id, row)) = candidate {
                         let cost = 256u64
                             .saturating_add(row.name.map_or(0, |f| f.bytes))
-                            .saturating_add(row.harness.map_or(0, |f| f.bytes));
+                            .saturating_add(row.harness.map_or(0, |f| f.bytes))
+                            .saturating_add(row.cwd.map_or(0, |f| f.bytes));
                         if !rows.is_empty()
                             && (rows.len() >= limit.clamp(1, PAGE_ROWS)
                                 || bytes.saturating_add(cost) > max_bytes as u64)
@@ -684,6 +721,7 @@ impl ChannelState {
                     let field = match field {
                         FieldKind::Name => row.name,
                         FieldKind::Harness => row.harness,
+                        FieldKind::Cwd => row.cwd,
                     };
                     let Some(field) = field else {
                         return Ok(Reply::Text(TextPage {

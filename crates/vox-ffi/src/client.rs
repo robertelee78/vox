@@ -6271,28 +6271,108 @@ impl VoxClient {
     /// What a member's client says when `member` joins `room` (ADR-028 K-7), word for word as the
     /// TUI says it: its name (alias, else its fingerprint marked "(not in keyring)"), "joined.",
     /// and which nodes in this node's keyring trust it, from the consent grants on the room's log.
-    /// It adds nothing to any keyring.
+    /// It adds nothing to any keyring. A current drive-readable opening can enrich that same
+    /// line with its registered directory; no Session history or new notice is produced.
     ///
     /// # Errors
-    /// A malformed id, the room not open here, or the daemon's refusal.
+    /// A malformed id, the room not open here, changed authority or oversized join metadata.
+    /// A caller must remove any prior private caption on failure.
     pub async fn join_said(&self, room: String, member: String) -> Result<String, VoxError> {
         let who = input_fingerprint(&member)?;
-        let (open, names) = self.open_snap(&room).await?;
-        let Some(open) = open else {
-            return Err(failed("the room is not open on this node"));
-        };
-        let mut trusters: Vec<String> = open
-            .trusted_by
-            .iter()
-            .find(|(m, _)| *m == who)
-            .map(|(_, by)| by.iter().filter_map(|fp| names.get(fp).cloned()).collect())
-            .unwrap_or_default();
-        trusters.sort();
-        let name = vox_text::offer::name(names.get(&who).map(String::as_str), &b32_encode(&who));
-        Ok(format!(
-            "{name} joined. {}",
-            vox_text::offer::trusted_by(&trusters)
-        ))
+        let channel_id = digest(&room, "room id")?;
+        // Only the daemon's inventory proves that an author is on this Mac. A harness,
+        // claimed hostname or a reader's alias cannot establish that fact.
+        let local = self
+            .nodes()
+            .await?
+            .into_iter()
+            .find(|n| n.fingerprint == b32_encode(&who));
+        on_held!(self, |c| {
+            let before = match ask(c, &Request::ArrivalHead { channel_id }).await? {
+                Frame::ArrivalHead { head } => head.instance,
+                other => return Err(unexpected(&other)),
+            };
+            let names = names(c).await?;
+            let bytes = c
+                .exchange(&vox_core::node::snapshot::request_body())
+                .await
+                .map_err(|e| {
+                    read_interrupted(e, |e| format!("the vox daemon stopped answering: {e}"))
+                })?;
+            let snap = vox_core::node::snapshot::NodeSnapshot::from_bytes(&bytes)
+                .map_err(|e| failed(e.to_string()))?
+                .ok_or_else(|| failed("the vox daemon did not answer with the node's state"))?;
+            let open = snap
+                .open
+                .into_iter()
+                .find(|o| o.channel_id == channel_id)
+                .ok_or_else(|| failed("the room is not open on this node"))?;
+            if !open.members.contains(&who) {
+                return Err(failed("the node is no longer a member of this room"));
+            }
+            let mut trusters: Vec<String> = open
+                .trusted_by
+                .iter()
+                .find(|(m, _)| *m == who)
+                .map(|(_, by)| by.iter().filter_map(|fp| names.get(fp).cloned()).collect())
+                .unwrap_or_default();
+            trusters.sort();
+            let name =
+                vox_text::offer::name(names.get(&who).map(String::as_str), &b32_encode(&who));
+            let ordinary = format!("{name} joined. {}", vox_text::offer::trusted_by(&trusters));
+            let session = match ask(
+                c,
+                &Request::SessionJoin {
+                    channel_id,
+                    node: who,
+                },
+            )
+            .await?
+            {
+                Frame::SessionsPage {
+                    mut sessions,
+                    summaries,
+                    more: false,
+                } if sessions.len() <= 1
+                    && sessions.len() == summaries.len()
+                    && sessions
+                        .iter()
+                        .all(|s| s.node == who && s.open && s.can_drive) =>
+                {
+                    sessions.pop()
+                }
+                other => return Err(unexpected(&other)),
+            };
+            let after = match ask(c, &Request::ArrivalHead { channel_id }).await? {
+                Frame::ArrivalHead { head } => head.instance,
+                other => return Err(unexpected(&other)),
+            };
+            if before != after {
+                return Err(failed("the saved room changed; refresh its join line"));
+            }
+            let Some(cwd) = session.and_then(|s| s.cwd).filter(|cwd| !cwd.is_empty()) else {
+                return Ok(ordinary);
+            };
+            let label = names
+                .get(&who)
+                .cloned()
+                .or_else(|| local.as_ref().map(|n| shown_name(&n.name)))
+                .unwrap_or(name);
+            let location = if local.is_some() {
+                " (on this Mac)"
+            } else {
+                ""
+            };
+            let room = open
+                .name
+                .map(|name| shown_name(&name))
+                .unwrap_or_else(|| b32_encode(&channel_id));
+            Ok(format!(
+                "{label}{location} joined {room} and is working in {}. {}",
+                shown_name(&cwd),
+                vox_text::offer::trusted_by(&trusters)
+            ))
+        })
     }
 
     /// Where each of this node's own recent messages in `room` is (ADR-028 R-6), from how many of
