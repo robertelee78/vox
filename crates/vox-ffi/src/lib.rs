@@ -40,9 +40,10 @@ mod computer;
 pub use client::{
     config_dir, room_group, room_group_words, AnchorReachSummary, AnchorSourceSummary,
     AnchorSummary, ClientListener, DecisionEvent, FileOffer, FileShare, Member, NodeSummary,
-    NodeView, OfferedService, Passphrase, PulledFile, ReadBy, RoomConsents, RoomGroup, RoomLink,
-    RoomMessage, RoomServices, RoomSummary, SharedService, ThreadAuthor, ThreadSummary,
-    TrustedNode, UnreadLevel, VoxClient,
+    NodeView, NoticeCursor, OfferedService, Passphrase, PulledFile, ReadBy, RoomAdmins,
+    RoomConsentPage, RoomConsents, RoomGroup, RoomLink, RoomMessage, RoomNotices, RoomServices,
+    RoomSummary, ServiceCursor, SharedService, ThreadAuthor, ThreadSummary, TrustedNode,
+    UnreadLevel, VoxClient,
 };
 pub use computer::{ComputerApplication, ComputerIdentity, ComputerStatus, PairingPreview};
 

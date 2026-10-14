@@ -1,7 +1,7 @@
 //! Output-specific authority queries over sealed facts. No complete causal scope
 //! or recursive authority map is materialized, including while deciding revokes.
 
-use super::facts::{Table, Write, hash_key, position};
+use super::facts::{hash_key, position, Table, Write};
 use crate::cbor::{Decoder, Encoder};
 use crate::error::{Error, Result};
 use crate::governance::capability::{Capability, CapabilitySet};
@@ -18,7 +18,7 @@ fn invalid(why: &'static str) -> Error {
 pub(super) struct Scope(pub Option<Digest32>);
 
 impl Scope {
-    pub(super) fn contains(self, writer: &Write<'_>, entry: &Entry) -> Result<bool> {
+    pub(super) fn contains(self, writer: &Write<'_, '_>, entry: &Entry) -> Result<bool> {
         match self.0 {
             None => Ok(true),
             Some(scope) => Ok(scope != entry.entry_hash()
@@ -188,7 +188,7 @@ impl Query {
     /// separate stable-denial classification; they are not silently made valid.
     pub(super) fn advance(
         &mut self,
-        writer: &Write<'_>,
+        writer: &Write<'_, '_>,
         root: &Digest32,
         now_ms: u64,
         generation: u64,
@@ -287,7 +287,7 @@ impl Query {
 }
 
 pub(super) fn next_revocation(
-    writer: &Write<'_>,
+    writer: &Write<'_, '_>,
     target: &Digest32,
     after: Option<Digest32>,
 ) -> Result<Option<(Digest32, u64)>> {
@@ -312,7 +312,7 @@ pub(super) fn next_revocation(
 }
 
 pub(super) fn authorized_revoke(
-    writer: &Write<'_>,
+    writer: &Write<'_, '_>,
     hash: &Digest32,
     generation: u64,
 ) -> Result<bool> {
@@ -334,7 +334,7 @@ pub(super) fn authorized_revoke(
 }
 
 pub(super) fn save_revocation(
-    writer: &mut Write<'_>,
+    writer: &mut Write<'_, '_>,
     hash: &Digest32,
     generation: u64,
     authorized: bool,

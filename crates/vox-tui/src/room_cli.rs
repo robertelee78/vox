@@ -741,9 +741,11 @@ pub(crate) async fn post_structured(
     let reach = if others.is_empty() {
         Vec::new()
     } else {
-        let (outbound, inbound) = match client.request(&Request::Consents { channel_id: cid }).await
+        let (outbound, inbound) = match client
+            .request(&Request::MemberConsents { channel_id: cid })
+            .await
         {
-            Ok(Frame::Consents { outbound, inbound }) => (outbound, inbound),
+            Ok(Frame::MemberConsents { outbound, inbound }) => (outbound, inbound),
             Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
             Ok(other) => return Err(crate::client::unexpected(&other)),
             Err(e) => return Err(AppError::Usage(e.to_string())),
@@ -1336,22 +1338,49 @@ async fn own_in(
 
 /// What was done to `room` (its retention set, its name changed), in the room's order, each with
 /// the row it follows (ADR-028 R-1, R-7): from the node's view; none when it does not answer.
-async fn notices_in(
+async fn write_notices_after(
     client: &mut IpcClient,
-    room: &Digest32,
-) -> Vec<vox_core::node::channel::RoomNotice> {
-    let body = vox_core::node::snapshot::request_body();
-    let Ok(reply) = client.exchange(&body).await else {
-        return Vec::new();
-    };
-    let Ok(Some(snap)) = vox_core::node::snapshot::NodeSnapshot::from_bytes(&reply) else {
-        return Vec::new();
-    };
-    snap.open
-        .into_iter()
-        .find(|o| o.channel_id == *room)
-        .map(|o| o.notices)
-        .unwrap_or_default()
+    room: Digest32,
+    room_key: &str,
+    entry: Option<Digest32>,
+    revision: &mut Option<u64>,
+    out: &mut impl std::io::Write,
+) -> Result<(), AppError> {
+    use vox_core::node::api::{GovernancePage, GovernanceQuery};
+    let mut after = None;
+    loop {
+        match client
+            .request(&Request::GovernancePage {
+                channel_id: room,
+                query: GovernanceQuery::NoticesAfter {
+                    entry,
+                    after,
+                    revision: *revision,
+                },
+            })
+            .await?
+        {
+            Frame::GovernancePage {
+                page:
+                    GovernancePage::NoticesAfter {
+                        rows,
+                        next,
+                        revision: current,
+                    },
+            } => {
+                *revision = Some(current);
+                for notice in rows {
+                    writeln!(out, "{}", notice_value(room_key, &notice)).map_err(AppError::Io)?;
+                }
+                match next {
+                    Some(next) => after = Some(next),
+                    None => return Ok(()),
+                }
+            }
+            Frame::Error { reason } => return Err(AppError::Usage(reason)),
+            other => return Err(crate::client::unexpected(&other)),
+        }
+    }
 }
 
 /// A notice as `vox room read --json` gives it, among the rows: its own schema, so a program that
@@ -1735,7 +1764,30 @@ pub async fn read(
             .filter(|r| !crate::agent_hook::is_session_record(r))
             .take(take)
         {
-            let _ = writeln!(out, "{}", names.readable_in(&plain_row(r)));
+            let text = plain_row(r);
+            let mut selected_names = names.clone();
+            for (room, host, selector) in vox_core::node::resolver::canonical_services(&text) {
+                match client
+                    .request(&Request::GovernancePage {
+                        channel_id: room,
+                        query: vox_core::node::api::GovernanceQuery::Service { host, selector },
+                    })
+                    .await?
+                {
+                    Frame::GovernancePage {
+                        page:
+                            vox_core::node::api::GovernancePage::Service {
+                                share: Some(share), ..
+                            },
+                    } => selected_names.add_share(room, share.host, &share.name, share.udp),
+                    Frame::GovernancePage {
+                        page: vox_core::node::api::GovernancePage::Service { share: None, .. },
+                    } => {}
+                    Frame::Error { reason } => return Err(AppError::Usage(reason)),
+                    other => return Err(crate::client::unexpected(&other)),
+                }
+            }
+            let _ = writeln!(out, "{}", selected_names.readable_in(&text));
             // Under a share this node sent, who has pulled it whole (ADR-028 F-7).
             if let Some(line) = pulled_by.get(&r.entry_hash).and_then(|w| pulled_by_line(w)) {
                 let _ = writeln!(out, "  {line}");
@@ -1787,16 +1839,18 @@ pub async fn read(
     // Asked for (`--notices`), what was done to the room, each right after the row it follows in
     // the room's order (a notice before every row only when reading from the start; one after a
     // row not read here is not this page's).
-    let notices = if with_notices {
-        notices_in(&mut client, &channel_id).await
-    } else {
-        Vec::new()
-    };
+    let mut notice_revision = None;
     let mut out = std::io::stdout().lock();
-    if since.is_none() {
-        for n in notices.iter().filter(|n| n.after.is_none()) {
-            let _ = writeln!(out, "{}", notice_value(&room_key, n));
-        }
+    if with_notices && since.is_none() {
+        write_notices_after(
+            &mut client,
+            channel_id,
+            &room_key,
+            None,
+            &mut notice_revision,
+            &mut out,
+        )
+        .await?;
     }
     for r in &shown {
         let mut row = row_value(&room_key, r, &ops, None);
@@ -1813,8 +1867,16 @@ pub async fn read(
             row["read_by"] = names.into();
         }
         let _ = writeln!(out, "{row}");
-        for n in notices.iter().filter(|n| n.after == Some(r.entry_hash)) {
-            let _ = writeln!(out, "{}", notice_value(&room_key, n));
+        if with_notices && !r.owed {
+            write_notices_after(
+                &mut client,
+                channel_id,
+                &room_key,
+                Some(r.entry_hash),
+                &mut notice_revision,
+                &mut out,
+            )
+            .await?;
         }
     }
     Ok(())
@@ -3172,31 +3234,48 @@ pub async fn service_remove(paths: &Paths, room: &str, tag: &str) -> Result<(), 
 pub async fn service_list(paths: &Paths, room: &str, json: bool) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
     let channel_id = room_of(&mut client, room).await?;
-    match client.request(&Request::Services { channel_id }).await {
-        Ok(Frame::Services {
-            room,
-            services,
-            shared,
-        }) => {
-            // Whether the `.vox` proxy runs, for the needs of ssh by address and of a URL.
-            let proxy = match crate::client::one_shot(paths) {
-                Ok(at) => vox_core::node::nameipc::proxy(&at)
-                    .await
-                    .map_err(|e| match e {
-                        vox_core::error::Error::AppRefused(reason) => reason,
-                        other => other.to_string(),
-                    }),
-                Err(e) => Err(e.to_string()),
-            };
-            crate::tunnel_cli::print_services(&room, &channel_id, &services, &shared, &proxy, json);
-            Ok(())
+    let proxy = match crate::client::one_shot(paths) {
+        Ok(at) => vox_core::node::nameipc::proxy(&at)
+            .await
+            .map_err(|e| e.to_string()),
+        Err(e) => Err(e.to_string()),
+    };
+    let mut printer = crate::tunnel_cli::ServiceListPrinter::new(channel_id, proxy, json);
+    let mut after = None;
+    let mut revision = None;
+    loop {
+        match client
+            .request(&Request::Services {
+                channel_id,
+                after,
+                revision,
+            })
+            .await?
+        {
+            Frame::Services {
+                room,
+                services,
+                shared,
+                next,
+                revision: current,
+            } => {
+                printer.page(&room, &services, &shared);
+                revision = Some(current);
+                match next {
+                    Some(next) => after = Some(next),
+                    None => {
+                        printer.finish();
+                        return Ok(());
+                    }
+                }
+            }
+            Frame::Error { reason } => {
+                return Err(AppError::Usage(format!(
+                    "cannot list that room's services: {reason}"
+                )))
+            }
+            other => return Err(crate::client::unexpected(&other)),
         }
-        // The node's reason, as `vox service list` without a daemon gives it.
-        Ok(Frame::Error { reason }) => Err(AppError::Usage(format!(
-            "cannot list that room's services: {reason}"
-        ))),
-        Ok(other) => Err(crate::client::unexpected(&other)),
-        Err(e) => Err(AppError::Usage(e.to_string())),
     }
 }
 
@@ -4791,8 +4870,9 @@ async fn who_reads_whom(client: &mut IpcClient, channel_id: Digest32) {
     // node trusts has not; after that, what is missing is said as not having reached this node.
     let deadline = std::time::Instant::now() + CONSENT_SETTLES;
     let inbound = loop {
-        let Ok(Frame::Consents { inbound, .. }) =
-            client.request(&Request::Consents { channel_id }).await
+        let Ok(Frame::MemberConsents { inbound, .. }) = client
+            .request(&Request::MemberConsents { channel_id })
+            .await
         else {
             return;
         };
@@ -5307,7 +5387,14 @@ pub(crate) async fn trusted_in(client: &mut IpcClient, channel_id: Digest32) -> 
 
 /// The services this node offers in `channel_id`, by tag, as `vox service list` names them.
 async fn offered_in(client: &mut IpcClient, channel_id: Digest32) -> Vec<String> {
-    match client.request(&Request::Services { channel_id }).await {
+    match client
+        .request(&Request::Services {
+            channel_id,
+            after: None,
+            revision: None,
+        })
+        .await
+    {
         Ok(Frame::Services { services, .. }) => services.into_iter().map(|(tag, _)| tag).collect(),
         _ => Vec::new(),
     }
@@ -5977,17 +6064,42 @@ pub async fn admin(
     let mut client = attach(paths).await?;
     let channel_id = room_of(&mut client, room).await?;
     if action == "list" {
-        return match client.request(&Request::Admins { channel_id }).await {
-            Ok(Frame::Members { members }) => {
-                for (i, m) in members.iter().enumerate() {
-                    println!("{}{}", id(m), if i == 0 { "  (creator)" } else { "" });
+        use vox_core::node::api::{GovernancePage, GovernanceQuery};
+        let mut after = None;
+        let mut revision = None;
+        loop {
+            match client
+                .request(&Request::GovernancePage {
+                    channel_id,
+                    query: GovernanceQuery::Admins { after, revision },
+                })
+                .await?
+            {
+                Frame::GovernancePage {
+                    page:
+                        GovernancePage::Admins {
+                            creator,
+                            members,
+                            next,
+                            revision: current,
+                        },
+                } => {
+                    if revision.is_none() {
+                        println!("{}  (creator)", id(&creator));
+                    }
+                    for member in members {
+                        println!("{}", id(&member));
+                    }
+                    revision = Some(current);
+                    match next {
+                        Some(next) => after = Some(next),
+                        None => return Ok(()),
+                    }
                 }
-                Ok(())
+                Frame::Error { reason } => return Err(AppError::Usage(reason)),
+                other => return Err(crate::client::unexpected(&other)),
             }
-            Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
-            Ok(other) => Err(crate::client::unexpected(&other)),
-            Err(e) => Err(AppError::Usage(e.to_string())),
-        };
+        }
     }
     let add = match action {
         "add" => true,

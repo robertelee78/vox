@@ -4,7 +4,7 @@
 use super::authority::{self, Grant, Scope};
 use super::canonical::{rank_from, rank_key};
 use super::context::CachedQuery;
-use super::facts::{Cursor, Table, Write, hash_key};
+use super::facts::{hash_key, Cursor, Table, Write};
 use crate::cbor::{Decoder, Encoder};
 use crate::error::{Error, Result};
 use crate::governance::entry::{GovBody, GovEntry};
@@ -85,7 +85,7 @@ struct State {
     head_grant: Option<Grant>,
 }
 impl State {
-    fn new(writer: &Write<'_>, now: u64) -> Self {
+    fn new(writer: &Write<'_, '_>, now: u64) -> Self {
         let auth = writer.authority_generation() != writer.authority_folded();
         Self {
             phase: if auth { AUTHORITY } else { CLEAR },
@@ -109,7 +109,7 @@ impl State {
             head_grant: None,
         }
     }
-    fn load(writer: &Write<'_>) -> Result<Option<Self>> {
+    fn load(writer: &Write<'_, '_>) -> Result<Option<Self>> {
         let Some(bytes) = writer.cursor(Cursor::Evaluation)? else {
             return Ok(None);
         };
@@ -158,7 +158,7 @@ impl State {
             head_grant,
         }))
     }
-    fn save(&self, writer: &mut Write<'_>) -> Result<()> {
+    fn save(&self, writer: &mut Write<'_, '_>) -> Result<()> {
         let mut e = Encoder::new();
         e.array(16)
             .uint(1)
@@ -195,7 +195,7 @@ impl State {
     }
     fn query(
         &mut self,
-        writer: &mut Write<'_>,
+        writer: &mut Write<'_, '_>,
         root: &Digest32,
         scope: Scope,
         target: Digest32,
@@ -234,12 +234,12 @@ fn read_grant(d: &mut Decoder<'_>) -> Result<Option<Grant>> {
 }
 
 pub(super) fn advance(
-    writer: &mut Write<'_>,
+    writer: &mut Write<'_, '_>,
     input: &super::super::entry_store::Read<'_>,
     root: &Digest32,
     now: u64,
 ) -> Result<bool> {
-    if !writer.causal_settled() || !writer.order_ready() {
+    if !writer.causal_settled()? || !writer.order_ready() {
         return Ok(false);
     }
     writer.expire_authority(now)?;
@@ -270,7 +270,7 @@ pub(super) fn advance(
     Ok(state.phase == DONE)
 }
 
-fn authority_step(writer: &mut Write<'_>, root: &Digest32, state: &mut State) -> Result<()> {
+fn authority_step(writer: &mut Write<'_, '_>, root: &Digest32, state: &mut State) -> Result<()> {
     if state.log == 0 {
         let Some((key, log)) =
             writer.first(Table::AuthorityOrder, Some(rank_key(state.after_rank)))?
@@ -325,6 +325,16 @@ fn authority_step(writer: &mut Write<'_>, root: &Digest32, state: &mut State) ->
             {
                 let named = writer.entry(named_log)?;
                 if let GovBody::AdminCert(cert) = GovEntry::body_bound_to(&named)? {
+                    // Only an authorized revocation outside the named certificate's
+                    // strict past takes that certificate away. Keep a generation stamp:
+                    // replay/expiry can change the issuer's historical authority.
+                    if authorized && !Scope(Some(named.entry_hash())).contains(writer, &entry)? {
+                        writer.put(
+                            Table::NamedRevoked,
+                            hash_key(&named.entry_hash()),
+                            Some(state.generation),
+                        )?;
+                    }
                     writer.put(
                         Table::Revocations,
                         pair(&cert.body.delegate_id(), &hash),
@@ -354,7 +364,7 @@ fn effect_kind(body: &GovBody) -> Option<u64> {
     }
 }
 
-fn clear_step(writer: &mut Write<'_>, state: &mut State) -> Result<()> {
+fn clear_step(writer: &mut Write<'_, '_>, state: &mut State) -> Result<()> {
     let Some((key, log)) = writer.at_or_after(Table::Effects, rank_key(state.from))? else {
         state.phase = ACTIONS;
         state.after_rank = state.from - 1;
@@ -382,7 +392,7 @@ fn clear_step(writer: &mut Write<'_>, state: &mut State) -> Result<()> {
 }
 
 fn action_step(
-    writer: &mut Write<'_>,
+    writer: &mut Write<'_, '_>,
     input: &super::super::entry_store::Read<'_>,
     root: &Digest32,
     state: &mut State,
@@ -469,7 +479,7 @@ enum Concurrent {
     Revoked,
 }
 fn next_concurrent_revoke(
-    writer: &Write<'_>,
+    writer: &Write<'_, '_>,
     entry: &Entry,
     after: Option<Digest32>,
     generation: u64,
@@ -488,7 +498,7 @@ fn next_concurrent_revoke(
     Ok(Concurrent::Pending(hash))
 }
 
-fn head_step(writer: &mut Write<'_>, root: &Digest32, state: &mut State) -> Result<()> {
+fn head_step(writer: &mut Write<'_, '_>, root: &Digest32, state: &mut State) -> Result<()> {
     if state.target.is_none() {
         let Some((key, _)) = writer.first(Table::AllCerts, None)? else {
             writer.head_published(state.generation)?;
@@ -522,6 +532,11 @@ fn head_step(writer: &mut Write<'_>, root: &Digest32, state: &mut State) -> Resu
     e.uint(state.deny);
     let record = writer.save_record(old, &e.finish())?;
     writer.put(Table::CurrentAuthority, key, Some(record))?;
+    writer.put(
+        Table::ActiveAdmins,
+        key,
+        (grant.present && target != *root).then_some(record),
+    )?;
     let mut after = hash_key(&target);
     after[32..].fill(u8::MAX);
     match writer.first(Table::AllCerts, Some(after))? {
@@ -545,7 +560,7 @@ fn head_step(writer: &mut Write<'_>, root: &Digest32, state: &mut State) -> Resu
     Ok(())
 }
 
-fn classify_denial(writer: &Write<'_>, state: &mut State, target: &Digest32) -> Result<bool> {
+fn classify_denial(writer: &Write<'_, '_>, state: &mut State, target: &Digest32) -> Result<bool> {
     if state.log == 0 {
         let row = match state.after_cert {
             Some(hash) => writer.first(Table::AllCerts, Some(pair(target, &hash)))?,

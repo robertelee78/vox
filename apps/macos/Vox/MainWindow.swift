@@ -917,7 +917,7 @@ private struct RoomView: View {
                         Divider()
                     }
                 }
-                if !model.roomServices.isEmpty {
+                if !model.roomServices.isEmpty || model.roomServicesNext != nil {
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: Space.s8 * scale) {
                             ForEach(model.roomServices, id: \.address) { service in
@@ -939,6 +939,32 @@ private struct RoomView: View {
                         .voxPadding(Space.s8)
                     }
                     Hairline()
+                }
+                HStack {
+                    Button("First Services") { Task { await model.readGovernancePages(first: true) } }
+                    if model.roomServicesNext != nil {
+                        Button("Next Services") { Task { await model.readGovernancePages(nextServices: true) } }
+                    }
+                }.voxPadding(.horizontal, Space.s12)
+                DisclosureGroup("Room Activity") {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: Space.s4) {
+                            ForEach(model.notices, id: \.id) { notice in
+                                Text("\(notice.authorName.isEmpty ? String(notice.author.prefix(12)) : notice.authorName) \(notice.what)")
+                                    .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                        }
+                    }.frame(maxHeight: Theme.scaled(180))
+                    HStack {
+                        Button("Latest Activity") { Task { await model.readGovernancePages(first: true) } }
+                        if model.noticesBefore != nil {
+                            Button("Older Activity") { Task { await model.readGovernancePages(olderNotices: true) } }
+                        }
+                    }
+                }.voxPadding(.horizontal, Space.s12)
+                if let failure = model.governancePageError {
+                    StateMark(kind: .danger, words: failure)
+                    Button("Reload Services and Activity") { Task { await model.readGovernancePages(first: true) } }
                 }
                 Text(model.timelineTitle)
                     .secondaryText()

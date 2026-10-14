@@ -179,6 +179,25 @@ fn nothing(hostname: &str) -> String {
     format!("{hostname} resolves to nothing: a .vox address is <service>.<node>.<room>.vox")
 }
 
+/// Exact canonical service selectors in one caller-selected text window.
+/// This iterator retains no text or service history.
+pub fn canonical_services(text: &str) -> impl Iterator<Item = (Digest32, Digest32, String)> + '_ {
+    const ADDRESS: usize = 3 * (crate::node::link::B32_DIGEST_LEN + 1) + 3;
+    text.split_inclusive(".vox").filter_map(|part| {
+        let start = part.len().checked_sub(ADDRESS)?;
+        let address = part.get(start..)?.strip_suffix(".vox")?;
+        let mut labels = address.split('.');
+        let service = labels.next()?;
+        let host = b32_decode(labels.next()?, "vox node").ok()?;
+        let room = b32_decode(labels.next()?, "vox room").ok()?;
+        b32_decode(service, "vox service").ok()?;
+        if labels.next().is_some() {
+            return None;
+        }
+        Some((room, host, service.to_owned()))
+    })
+}
+
 impl VoxResolver {
     /// An empty resolver: every name resolves to nothing.
     #[must_use]
@@ -187,15 +206,12 @@ impl VoxResolver {
     }
 
     /// The names a client of the node can render with: the open rooms in `snap`, with their
-    /// members and shares, and the keyring's names. It resolves nothing the node would not.
+    /// members and the keyring's names. Selected service pages supply service names.
     #[must_use]
     pub fn of_snapshot(snap: &crate::node::snapshot::NodeSnapshot) -> Self {
         let mut names = Self::new();
         for o in &snap.open {
             names.add_room(o.channel_id, o.name.as_deref(), &o.members);
-            for s in &o.shares {
-                names.add_share(o.channel_id, s.host, &s.name, s.udp);
-            }
         }
         for (fp, petname) in &snap.trusted {
             names.name(*fp, petname);

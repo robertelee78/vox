@@ -5,7 +5,7 @@
 //! Old canonical prefixes remain usable for the calculation, but no authority
 //! reader may use a partially rewritten suffix.
 
-use super::facts::{Cursor, Table, Write, hash_key, position};
+use super::facts::{hash_key, position, Cursor, Table, Write};
 use crate::cbor::{Decoder, Encoder};
 use crate::error::{Error, Result};
 use crate::hash::Digest32;
@@ -97,7 +97,7 @@ struct State {
 }
 
 impl State {
-    fn load(writer: &Write<'_>) -> Result<Self> {
+    fn load(writer: &Write<'_, '_>) -> Result<Self> {
         let Some(bytes) = writer.cursor(Cursor::Canonical)? else {
             return Ok(Self::default());
         };
@@ -123,7 +123,7 @@ impl State {
         Ok(state)
     }
 
-    fn save(&self, writer: &mut Write<'_>) -> Result<()> {
+    fn save(&self, writer: &mut Write<'_, '_>) -> Result<()> {
         let mut e = Encoder::new();
         e.array(9)
             .uint(1)
@@ -154,7 +154,7 @@ impl State {
 /// A locator belongs to the retained prefix only when both directions agree.
 /// A suffix overwrite can leave an old hash rank until bounded trimming reaches
 /// it; that old mapping must never look like an emitted predecessor.
-fn held_rank(writer: &Write<'_>, hash: &Digest32, log: u64) -> Result<Option<u64>> {
+fn held_rank(writer: &Write<'_, '_>, hash: &Digest32, log: u64) -> Result<Option<u64>> {
     let Some(rank) = writer.get(Table::Ranks, &hash_key(hash))? else {
         return Ok(None);
     };
@@ -163,7 +163,12 @@ fn held_rank(writer: &Write<'_>, hash: &Digest32, log: u64) -> Result<Option<u64
 
 /// Greatest governance sequence in a frontier. The entry's own position is
 /// excluded, even though its inclusive causal vector contains that position.
-fn predecessor(writer: &Write<'_>, author: &Digest32, seq: u64, own: bool) -> Result<Option<u64>> {
+fn predecessor(
+    writer: &Write<'_, '_>,
+    author: &Digest32,
+    seq: u64,
+    own: bool,
+) -> Result<Option<u64>> {
     let mut before = position(author, seq);
     if !own {
         before[40] = 1;
@@ -174,22 +179,22 @@ fn predecessor(writer: &Write<'_>, author: &Digest32, seq: u64, own: bool) -> Re
         .map(|(_, log)| log))
 }
 
-fn next_author_entry(writer: &Write<'_>, author: &Digest32, seq: u64) -> Result<Option<u64>> {
+fn next_author_entry(writer: &Write<'_, '_>, author: &Digest32, seq: u64) -> Result<Option<u64>> {
     Ok(writer
         .first(Table::Positions, Some(position(author, seq)))?
         .filter(|(key, _)| key[..32] == author[..])
         .map(|(_, log)| log))
 }
 
-fn queue_check(writer: &mut Write<'_>, log: u64) -> Result<()> {
+fn queue_check(writer: &mut Write<'_, '_>, log: u64) -> Result<()> {
     let entry = writer.entry(log)?;
     writer.put(Table::Checks, hash_key(&entry.entry_hash()), Some(log))
 }
 
 /// One bounded continuation. `true` means the complete current Kahn order is
 /// published; the evaluator must still finish its separate checked fold.
-pub(super) fn advance(writer: &mut Write<'_>) -> Result<bool> {
-    if !writer.causal_settled() {
+pub(super) fn advance(writer: &mut Write<'_, '_>) -> Result<bool> {
+    if !writer.causal_settled()? {
         return Ok(false);
     }
     let mut state = State::load(writer)?;
@@ -215,7 +220,10 @@ pub(super) fn advance(writer: &mut Write<'_>) -> Result<bool> {
         state.revision = writer.revision();
     }
     match state.phase {
-        IDLE => return Ok(true),
+        IDLE => {
+            writer.order_unblocked()?;
+            return Ok(true);
+        }
         PLAN => plan(writer, &mut state)?,
         CLEAR => clear(writer, &mut state)?,
         INIT => initialize(writer, &mut state)?,
@@ -228,7 +236,7 @@ pub(super) fn advance(writer: &mut Write<'_>) -> Result<bool> {
     Ok(state.phase == IDLE)
 }
 
-fn plan(writer: &mut Write<'_>, state: &mut State) -> Result<()> {
+fn plan(writer: &mut Write<'_, '_>, state: &mut State) -> Result<()> {
     if state.item.is_none() {
         let Some((key, log)) = writer.first(Table::Dirty, None)? else {
             if state.cut == 0 {
@@ -281,7 +289,7 @@ fn plan(writer: &mut Write<'_>, state: &mut State) -> Result<()> {
     Ok(())
 }
 
-fn clear(writer: &mut Write<'_>, state: &mut State) -> Result<()> {
+fn clear(writer: &mut Write<'_, '_>, state: &mut State) -> Result<()> {
     // At most one candidate per author, plus one blocker per candidate. Clearing
     // is paged too; a reset never collects their keys into an unbounded vector.
     for table in [Table::Checks, Table::Ready, Table::Blocked] {
@@ -296,7 +304,7 @@ fn clear(writer: &mut Write<'_>, state: &mut State) -> Result<()> {
     Ok(())
 }
 
-fn initialize(writer: &mut Write<'_>, state: &mut State) -> Result<()> {
+fn initialize(writer: &mut Write<'_, '_>, state: &mut State) -> Result<()> {
     let after = state.author.map(|author| {
         let mut key = hash_key(&author);
         key[32..].fill(u8::MAX);
@@ -322,7 +330,7 @@ fn initialize(writer: &mut Write<'_>, state: &mut State) -> Result<()> {
     Ok(())
 }
 
-fn check(writer: &mut Write<'_>, state: &mut State) -> Result<()> {
+fn check(writer: &mut Write<'_, '_>, state: &mut State) -> Result<()> {
     if state.item.is_none() {
         match writer.first(Table::Checks, None)? {
             Some((key, _)) => state.item = Some(hash_from(&key)?),
@@ -360,7 +368,7 @@ fn check(writer: &mut Write<'_>, state: &mut State) -> Result<()> {
     Ok(())
 }
 
-fn remove_old_rank(writer: &mut Write<'_>, rank: u64) -> Result<()> {
+fn remove_old_rank(writer: &mut Write<'_, '_>, rank: u64) -> Result<()> {
     let Some(log) = writer.get(Table::Order, &rank_key(rank))? else {
         return Ok(());
     };
@@ -379,7 +387,7 @@ fn remove_old_rank(writer: &mut Write<'_>, rank: u64) -> Result<()> {
     writer.put(Table::Order, rank_key(rank), None)
 }
 
-fn emit(writer: &mut Write<'_>, state: &mut State) -> Result<()> {
+fn emit(writer: &mut Write<'_, '_>, state: &mut State) -> Result<()> {
     let Some((key, log)) = writer.first(Table::Ready, None)? else {
         if writer.first(Table::Blocked, None)?.is_some() {
             return Err(Error::GovernanceCycle);
@@ -425,7 +433,7 @@ fn emit(writer: &mut Write<'_>, state: &mut State) -> Result<()> {
     Ok(())
 }
 
-fn wake(writer: &mut Write<'_>, state: &mut State) -> Result<()> {
+fn wake(writer: &mut Write<'_, '_>, state: &mut State) -> Result<()> {
     let hash = state.item.ok_or(invalid("governance wake entry"))?;
     let row = writer
         .at_or_after(Table::Blocked, hash_key(&hash))?
@@ -443,7 +451,7 @@ fn wake(writer: &mut Write<'_>, state: &mut State) -> Result<()> {
     Ok(())
 }
 
-fn trim(writer: &mut Write<'_>, state: &mut State) -> Result<()> {
+fn trim(writer: &mut Write<'_, '_>, state: &mut State) -> Result<()> {
     match writer.at_or_after(Table::Order, rank_key(state.next))? {
         Some((key, _)) => remove_old_rank(writer, rank_from(&key)?)?,
         None => {

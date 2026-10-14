@@ -2,10 +2,10 @@
 //! do not create new authority scopes when their cert/revoke inputs are the same.
 
 use super::authority::{Grant, Query, Scope};
-use super::facts::{Table, Write, hash_key, position};
+use super::facts::{hash_key, position, Table, Write};
 use crate::cbor::{Decoder, Encoder};
 use crate::error::{Error, Result};
-use crate::hash::{Digest32, sha256};
+use crate::hash::{sha256, Digest32};
 
 fn invalid(why: &'static str) -> Error {
     Error::MalformedAtRest(why)
@@ -110,7 +110,7 @@ impl CachedQuery {
 
     pub(super) fn advance(
         &mut self,
-        writer: &mut Write<'_>,
+        writer: &mut Write<'_, '_>,
         root: &Digest32,
         now_ms: u64,
         generation: u64,
@@ -159,7 +159,7 @@ impl CachedQuery {
         Ok(Some(grant))
     }
 
-    fn normalize(&mut self, writer: &Write<'_>) -> Result<()> {
+    fn normalize(&mut self, writer: &Write<'_, '_>) -> Result<()> {
         let coordinate = match self.scope.0 {
             Some(scope) => writer.frontier_after(&scope, self.author)?,
             None => {

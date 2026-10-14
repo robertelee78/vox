@@ -10,6 +10,11 @@ use crate::node::api::{
 };
 
 pub(crate) enum Query {
+    Governance(crate::node::api::GovernanceQuery),
+    SharedService {
+        host: Digest32,
+        name: String,
+    },
     ArrivalHead,
     NoticeState,
     NoticeExact {
@@ -75,6 +80,8 @@ pub(crate) enum Query {
 }
 
 pub(crate) enum Reply {
+    Governance(crate::node::api::GovernancePage),
+    SharedService(Option<Share>),
     ArrivalHead(HistoryCursor),
     NoticeState(NoticeState),
     NoticeExact(Option<NoticeRow>),
@@ -482,6 +489,12 @@ impl View<'_> {
     fn answer(&self, query: Query, bytes: usize) -> Answer<Reply> {
         let cursor_error = "cursor not in this room's timeline";
         match query {
+            Query::Governance(query) => Ok(Reply::Governance(
+                self.ch.governance_page(self.store, query)?,
+            )),
+            Query::SharedService { host, name } => Ok(Reply::SharedService(
+                self.ch.shared_service(self.store, &host, &name)?,
+            )),
             Query::SessionCandidates {
                 after,
                 revision,
@@ -832,6 +845,27 @@ impl ChannelState {
             return Err(self.save_failure().to_string());
         }
         let result = (|| -> Answer<Reply> {
+            let query = match query {
+                Query::Governance(query) => {
+                    return self
+                        .governance_page(store, query)
+                        .map(Reply::Governance)
+                        .map_err(|e| match e {
+                            Error::Profile(why) => Failure::Request(why),
+                            e => Failure::Storage(e),
+                        })
+                }
+                Query::SharedService { host, name } => {
+                    return self
+                        .shared_service(store, &host, &name)
+                        .map(Reply::SharedService)
+                        .map_err(|e| match e {
+                            Error::Profile(why) => Failure::Request(why),
+                            e => Failure::Storage(e),
+                        })
+                }
+                query => query,
+            };
             if !self.refresh_projection(store)? {
                 return Err(Failure::Request(
                     "the room is refreshing saved history; retry",

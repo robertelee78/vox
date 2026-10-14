@@ -3,6 +3,7 @@
 
 mod authority;
 mod canonical;
+mod channel;
 mod context;
 mod facts;
 mod fold;
@@ -27,9 +28,9 @@ fn advance_frontiers(
     sek: &Sek,
     room: &Digest32,
 ) -> Result<bool> {
-    let mut writer = facts::Write::open(store, sek, room)?;
+    let mut batch = store.batch()?;
+    let mut writer = facts::Write::open(&mut batch, sek, room)?;
     let Some(mut work) = writer.work()?.cloned() else {
-        writer.commit()?;
         return Ok(true);
     };
     let hash = work
@@ -40,11 +41,16 @@ fn advance_frontiers(
         .get_by_hash(&hash)?
         .filter(|entry| entry.entry_hash() == hash)
         .ok_or(Error::MalformedAtRest("governance causal entry missing"))?;
-    if input.clock(&hash)?.is_none() {
+    let clock = input.clock(&hash)?;
+    if clock.is_none() {
         return Err(Error::MalformedAtRest(
             "governance causal entry unpublished",
         ));
     }
+    writer.observe_clock(
+        &hash,
+        clock.ok_or(Error::MalformedAtRest("governance clock missing"))?,
+    )?;
     work.changed |= writer.raise(&hash, &entry.skeleton.author_id, entry.skeleton.seq)?;
     let own_parent = usize::from(entry.skeleton.seq > 1);
     let parent_count = own_parent + entry.skeleton.seen.len();
@@ -88,7 +94,10 @@ fn advance_frontiers(
         }
         match input.child_after(&hash, work.child)? {
             Some(child) => {
-                writer.enqueue(&child)?;
+                let log = input
+                    .log_id(&child)?
+                    .ok_or(Error::MalformedAtRest("governance child locator missing"))?;
+                writer.enqueue(&child, log)?;
                 work.child = Some(child);
             }
             None => {
@@ -101,7 +110,8 @@ fn advance_frontiers(
     if complete {
         writer.finish_work()?;
     }
-    writer.commit()?;
+    writer.seal()?;
+    batch.commit()?;
     // A caller spends another turn checking the queue rather than draining it
     // here and monopolizing the room lock on a large late-parent fan-out.
     Ok(false)
@@ -110,9 +120,10 @@ fn advance_frontiers(
 /// Observe a source entry only after the existing EntryIndex has published it.
 /// This does not acknowledge an unsigned/staged suffix or invent causal edges.
 fn observe(
-    writer: &mut facts::Write<'_>,
-    published: &super::entry_store::Read<'_>,
+    writer: &mut facts::Write<'_, '_>,
     log: u64,
+    clock: u64,
+    late: bool,
     entry: &crate::log::entry::Entry,
     authors: &std::collections::BTreeMap<Digest32, crate::identity::composite::CompositePublicKey>,
     root: &Digest32,
@@ -121,10 +132,8 @@ fn observe(
     use crate::governance::entry::GovEntry;
     use crate::log::entry::EntryKind;
     let hash = entry.entry_hash();
-    if published.log_id(&hash)? != Some(log) || published.clock(&hash)?.is_none() {
-        return Err(Error::MalformedAtRest(
-            "governance source entry unpublished",
-        ));
+    if late {
+        writer.barrier(log);
     }
     if writer
         .get(facts::Table::Complete, &facts::hash_key(&hash))?
@@ -133,7 +142,7 @@ fn observe(
             .get(facts::Table::Pending, &facts::hash_key(&hash))?
             .is_none()
     {
-        writer.enqueue(&hash)?;
+        writer.enqueue(&hash, log)?;
     }
     let Some(payload) = entry.payload.as_deref() else {
         return Ok(());
@@ -161,6 +170,7 @@ fn observe(
     if body.verify(key).is_err() {
         return Ok(());
     }
+    writer.barrier(log);
     writer.verified(&hash, &entry.skeleton.author_id, entry.skeleton.seq, log)?;
     writer.authority_input(
         &hash,
@@ -170,6 +180,7 @@ fn observe(
         root,
         &body,
     )?;
+    writer.observe_clock(&hash, clock)?;
     writer.current_input(&entry.skeleton.author_id, entry.skeleton.seq, log, &body)
 }
 
@@ -183,20 +194,171 @@ fn advance_source(
     room: &Digest32,
     authors: &std::collections::BTreeMap<Digest32, crate::identity::composite::CompositePublicKey>,
     root: &Digest32,
+    me: &Digest32,
 ) -> Result<bool> {
     let input = entries.read(store, sek, room)?;
-    let mut writer = facts::Write::open(store, sek, room)?;
+    let mut batch = store.batch()?;
+    let mut writer = facts::Write::open(&mut batch, sek, room)?;
+    writer.discover_source()?;
     match writer.source_after()? {
         Some((id, entry)) => {
-            observe(&mut writer, &input, id, &entry, authors, root)?;
+            let hash = entry.entry_hash();
+            let published = input.log_id(&hash)? == Some(id) && input.clock(&hash)?.is_some();
+            let mut backfill = false;
+            if published {
+                let clock = published_clock(input.log_id(&hash)?, input.clock(&hash)?, id)?;
+                let late = input.child_after(&hash, None)?.is_some();
+                observe(&mut writer, id, clock, late, &entry, authors, root)?;
+                backfill = writer
+                    .get(facts::Table::Hashes, &facts::hash_key(&hash))?
+                    .is_some()
+                    && grants_this_reader(&entry, me);
+            }
             writer.observed_through(id)?;
-            writer.commit()?;
+            writer.seal()?;
+            if backfill {
+                queue_backfill(&mut batch, entries, sek, room, entry.skeleton.author_id)?;
+            }
+            batch.commit()?;
             Ok(false)
         }
         None => {
+            if writer.initialized() {
+                return Ok(true);
+            }
             writer.source_caught_up();
-            writer.commit()?;
+            writer.seal()?;
+            batch.commit()?;
             Ok(true)
         }
     }
+}
+
+pub(super) use channel::{remember_presence, Presence};
+pub use channel::{GovernanceNotices, GovernanceProgress, GovernanceShares, GovernanceTargets};
+pub(super) use view::{Display, View};
+
+/// Readiness and remaining background work are different: later ordinary chat
+/// must not withhold a governance projection whose causal barrier is complete.
+#[derive(Clone, Copy)]
+pub(super) struct Progress {
+    pub ready: bool,
+    pub pending: bool,
+}
+
+/// Initialize only the derived directory. Authoritative source rows are neither
+/// removed nor treated as empty; the persisted receipt cursor discovers them.
+pub(super) fn prepare(store: &Store, sek: &Sek, room: &Digest32) -> Result<()> {
+    if store
+        .get_segment(room, crate::atrest::store::SegmentKind::GovernanceIndex, 0)?
+        .is_none()
+    {
+        let mut batch = store.batch()?;
+        facts::Write::open(&mut batch, sek, room)?.seal()?;
+        batch.commit()?;
+    }
+    Ok(())
+}
+
+pub(super) fn progress(store: &Store, sek: &Sek, room: &Digest32, now: u64) -> Result<Progress> {
+    let read = facts::Read::open(store, sek, room)?;
+    Ok(Progress {
+        ready: read.ready(now)?,
+        pending: read.pending() || !read.current_ready()?,
+    })
+}
+
+/// Seal accepted input facts and replay obligations in the exact transaction
+/// publishing that source entry, including a body filled at an old receipt id.
+/// The caller alone commits or rolls back the Batch.
+pub(super) fn accepted_into(
+    batch: &mut crate::node::store::Batch<'_>,
+    entries: &EntryIndex,
+    sek: &Sek,
+    room: &Digest32,
+    authors: &std::collections::BTreeMap<Digest32, crate::identity::composite::CompositePublicKey>,
+    root: &Digest32,
+    me: &Digest32,
+    log: u64,
+    entry: &crate::log::entry::Entry,
+    late: bool,
+) -> Result<()> {
+    let clock = {
+        let input = entries.in_batch(batch, sek, room)?;
+        let hash = entry.entry_hash();
+        published_clock(input.log_id(&hash)?, input.clock(&hash)?, log)?
+    };
+    let mut writer = facts::Write::open(batch, sek, room)?;
+    observe(&mut writer, log, clock, late, entry, authors, root)?;
+    writer.live_receipt(log)?;
+    let backfill = writer
+        .get(facts::Table::Hashes, &facts::hash_key(&entry.entry_hash()))?
+        .is_some()
+        && grants_this_reader(entry, me);
+    writer.seal()?;
+    if backfill {
+        queue_backfill(batch, entries, sek, room, entry.skeleton.author_id)?;
+    }
+    Ok(())
+}
+
+fn grants_this_reader(entry: &crate::log::entry::Entry, me: &Digest32) -> bool {
+    matches!(crate::governance::entry::GovEntry::body_bound_to(entry),
+        Ok(crate::governance::entry::GovBody::ConsentGrant(grant)) if grant.body.epoch == 0 && grant.body.target_id == *me)
+}
+fn queue_backfill(
+    batch: &mut crate::node::store::Batch<'_>,
+    entries: &EntryIndex,
+    sek: &Sek,
+    room: &Digest32,
+    author: Digest32,
+) -> Result<()> {
+    let mut writer = entries.write(batch, sek, room)?;
+    writer.queue_backfill(author, Some(1))?;
+    writer.seal()
+}
+
+pub(super) fn refreshing(error: &Error) -> bool {
+    matches!(error, Error::Profile(why) if *why == view::REFRESHING)
+}
+
+fn published_clock(found: Option<u64>, clock: Option<u64>, expected: u64) -> Result<u64> {
+    if found != Some(expected) {
+        return Err(Error::MalformedAtRest(
+            "governance source locator unpublished",
+        ));
+    }
+    clock.ok_or(Error::MalformedAtRest(
+        "governance source clock unpublished",
+    ))
+}
+
+/// One actor turn of work. Source and causal work both progress before ordering,
+/// rather than draining all newly received rows while starving older obligations.
+/// No future complete-page vector or borrowed snapshot survives this function.
+pub(super) fn advance(
+    store: &Store,
+    entries: &EntryIndex,
+    sek: &Sek,
+    room: &Digest32,
+    authors: &std::collections::BTreeMap<Digest32, crate::identity::composite::CompositePublicKey>,
+    root: &Digest32,
+    me: &Digest32,
+    now: u64,
+) -> Result<Progress> {
+    let current = progress(store, sek, room, now)?;
+    if current.ready && !current.pending {
+        return Ok(current);
+    }
+    advance_source(store, entries, sek, room, authors, root, me)?;
+    advance_frontiers(store, entries, sek, room)?;
+    let input = entries.read(store, sek, room)?;
+    let mut batch = store.batch()?;
+    let mut writer = facts::Write::open(&mut batch, sek, room)?;
+    if canonical::advance(&mut writer)? {
+        fold::advance(&mut writer, &input, root, now)?;
+    }
+    writer.seal()?;
+    batch.commit()?;
+    progress(store, sek, room, now)
 }
