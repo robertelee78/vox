@@ -1400,6 +1400,32 @@ async fn exact_session(
     }
 }
 
+/// Bound a pause observation to the exact currently authorized Session opening and saved room.
+async fn pause_session_context(
+    client: &mut IpcClient,
+    room: Digest32,
+    node: Digest32,
+    id: &str,
+) -> Result<([u8; 16], Digest32), VoxError> {
+    let before = match ask(client, &Request::ArrivalHead { channel_id: room }).await? {
+        Frame::ArrivalHead { head } => head.instance,
+        other => return Err(unexpected(&other)),
+    };
+    let (sessions, _) = exact_session(client, room, node, id).await?;
+    let opening = sessions
+        .first()
+        .filter(|s| s.can_drive)
+        .ok_or_else(|| failed("The selected Session is no longer readable."))?
+        .opening;
+    match ask(client, &Request::ArrivalHead { channel_id: room }).await? {
+        Frame::ArrivalHead { head } if head.instance == before => Ok((before, opening)),
+        Frame::ArrivalHead { .. } => Err(failed(
+            "The saved room changed while reading Session pause.",
+        )),
+        other => Err(unexpected(&other)),
+    }
+}
+
 /// A paged listing whose answer did not come, or could not be read: not known to be whole, so
 /// not shown.
 fn listing_failed(what: &str, e: Error) -> VoxError {
@@ -1815,6 +1841,8 @@ pub struct VoxClient {
     held: Slot,
     /// At most one observer; release, detach and replacement cancel it, including UI waits.
     following: FollowSlot,
+    /// One selected-owner pause read, with no waiting queue or per-history state.
+    session_pause_read: Arc<tokio::sync::Semaphore>,
     /// A connection to the daemon, kept while the client lives: a daemon a client started exits
     /// once no node is attached and no client is connected (ADR-026 L-8), and the app is its
     /// client from the moment it opens, before any node is attached.
@@ -2993,6 +3021,7 @@ impl VoxClient {
             config_dir: account.config_dir.clone(),
             held: Arc::new(tokio::sync::Mutex::new(None)),
             following: Arc::new(Mutex::new(None)),
+            session_pause_read: Arc::new(tokio::sync::Semaphore::new(1)),
             daemon_hold: Mutex::new(Some(hold)),
         }))
     }
@@ -5479,6 +5508,84 @@ impl VoxClient {
                 before: next.filter(|_| older > 0).map(|id| b32_encode(&id)),
             })
         })
+    }
+
+    /// The selected Session owner's current saved pause. Only one such background read is
+    /// admitted per client; it never holds Slot while waiting for the remote owner. Cancellation
+    /// aborts the owned read. The existing FFI request bound also covers an unreachable owner.
+    ///
+    /// # Errors
+    /// The actor, attachment, room or authorized Session opening changed, or status is unknown.
+    pub async fn session_pause_status(
+        &self,
+        room: String,
+        actor: String,
+        node: String,
+        session_id: String,
+        instance: Vec<u8>,
+    ) -> Result<RoomPauseState, VoxError> {
+        let room = digest(&room, "room id")?;
+        let actor = input_fingerprint(&actor)?;
+        let node = input_fingerprint(&node)?;
+        let expected_instance: [u8; 16] = instance
+            .try_into()
+            .map_err(|_| failed("The selected Session has no saved room instance."))?;
+        let permit = Arc::clone(&self.session_pause_read)
+            .try_acquire_owned()
+            .map_err(|_| failed("The selected Session's pause is still being read."))?;
+        let held = Arc::clone(&self.held);
+        let task = self.rt.spawn(async move {
+            let _permit = permit;
+            tokio::time::timeout(REQUEST_WITHIN, async {
+                let (at, attachment) = {
+                    let slot = held.lock().await;
+                    let h = slot.as_ref().ok_or_else(not_attached)?;
+                    if h.client.me() != Some(actor) {
+                        return Err(failed("The acting node changed while reading Session pause."));
+                    }
+                    (h.at.clone(), Arc::clone(&h.attachment))
+                };
+                // An independent control connection keeps even local readiness/authorization
+                // waits outside the shared Slot used by room reads and message delivery.
+                let mut client = IpcClient::open_at(&at).await
+                    .map_err(|e| listing_failed("Session pause", e))?;
+                if client.me() != Some(actor) {
+                    return Err(failed("The acting node changed while reading Session pause."));
+                }
+                let (instance, opening) =
+                    pause_session_context(&mut client, room, node, &session_id).await?;
+                if instance != expected_instance {
+                    return Err(failed("The saved room changed while reading Session pause."));
+                }
+                let state = vox_core::node::room_pause::status_checked(
+                    &at, room, node, actor, instance,
+                ).await.map_err(|e| failed(e.to_string()))?;
+                if pause_session_context(&mut client, room, node, &session_id).await?
+                    != (instance, opening)
+                {
+                    return Err(failed("The selected Session changed while reading its pause."));
+                }
+                let slot = held.lock().await;
+                let h = slot.as_ref().ok_or_else(not_attached)?;
+                if !Arc::ptr_eq(&attachment, &h.attachment) || h.client.me() != Some(actor) {
+                    return Err(failed("The acting node attachment changed while reading Session pause."));
+                }
+                Ok(state.into())
+            }).await.unwrap_or_else(|_| Err(failed(
+                "Pause status is unknown: the Session's owner or local node did not answer within 60 seconds.",
+            )))
+        });
+        // Unlike the general mutation wrapper, this read has no uncertain write to preserve.
+        // Dropping the foreign future cancels its task instead of leaving a detached poll.
+        struct CancelRead(tokio::task::AbortHandle);
+        impl Drop for CancelRead {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let _cancel = CancelRead(task.abort_handle());
+        task.await
+            .map_err(|_| failed("The Session pause read was cancelled."))?
     }
 
     /// Capture the current room roster without collecting Session history.

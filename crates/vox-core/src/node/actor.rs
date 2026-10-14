@@ -4222,6 +4222,9 @@ impl NodeHandle {
             &self.display_incarnation,
             &detail.channel_id,
             &detail.session_revision,
+            &[u8::from(detail.pause.paused)],
+            &detail.pause.by,
+            &detail.pause.at_millis.to_be_bytes(),
             &[u8::from(current)],
         ])
     }

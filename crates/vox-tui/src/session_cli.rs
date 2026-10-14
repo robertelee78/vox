@@ -67,6 +67,9 @@ pub async fn show(
     use vox_core::node::ipc::Frame;
     let mut client = crate::room_cli::attach(paths).await?;
     let channel_id = crate::room_cli::room_of(&mut client, room).await?;
+    let actor = client
+        .me()
+        .ok_or_else(|| AppError::Usage("the selected node is locked".into()))?;
     let label_of = |s: &vox_core::node::sessions::SessionRow| {
         vox_agentcomms::envelope::session_label(
             &crate::ident::name_of(&s.node),
@@ -99,8 +102,12 @@ pub async fn show(
     } else {
         vox_core::node::drive::SessionFilter::Session(named.clone())
     };
-    let (rows, older) = match client.session_page(channel_id, which, before).await {
-        Ok(Frame::SessionPage { rows, older, .. }) => (rows, older),
+    let (rows, older, instance) = match client.session_page(channel_id, which, before).await {
+        Ok(Frame::SessionPage {
+            rows,
+            older,
+            instance,
+        }) => (rows, older, instance),
         Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
         Ok(other) => return Err(crate::client::unexpected(&other)),
         Err(e) => return Err(AppError::Usage(e.to_string())),
@@ -138,6 +145,33 @@ pub async fn show(
     let read =
         vox_core::node::session_view::read(&sessions, rows, session, None, &label_of, &ByIdent)
             .map_err(AppError::Usage)?;
+    // This is the owner's durable room state, not a flag inferred from the saved transcript.
+    // A disconnected owner does not prevent reading history, and never implies Resume.
+    let pause = if read.hidden.is_none() {
+        let at = crate::client::one_shot(paths)?;
+        Some(
+            vox_core::node::room_pause::status_checked(&at, channel_id, read.node, actor, instance)
+                .await,
+        )
+    } else {
+        None
+    };
+    // Preserve NDJSON activity records; status is metadata on stderr in --json mode.
+    let pause_words = match pause {
+        Some(Ok(state)) if state.paused => {
+            let when = if state.at_millis < 253_402_300_800_000 {
+                crate::room_cli::millis_as_time(state.at_millis)
+            } else {
+                format!("{} ms since Unix epoch", state.at_millis)
+            };
+            Some(format!(
+                "Paused by {} at {when}",
+                crate::ident::name_of(&state.by)
+            ))
+        }
+        Some(Err(why)) => Some(format!("Pause status unknown: {why}")),
+        _ => None,
+    };
     // What is not shown, and how to show it, on stderr: stdout stays the page.
     if let (Some(first), true) = (&first, older > 0 && read.hidden.is_none()) {
         eprintln!(
@@ -155,6 +189,9 @@ pub async fn show(
         return Ok(());
     }
     if json {
+        if let Some(pause) = &pause_words {
+            eprintln!("{pause}");
+        }
         for l in &read.lines {
             let d: serde_json::Map<String, Value> = l
                 .details
@@ -173,6 +210,9 @@ pub async fn show(
         }
     } else {
         let _ = writeln!(out, "{} · {}", read.label, read.state);
+        if let Some(pause) = &pause_words {
+            let _ = writeln!(out, "{pause}");
+        }
         let answer_with = format!("vox room session {} {}", room.trim(), read.id);
         let _ = write!(out, "{}", render(&read.lines, details, &answer_with));
     }

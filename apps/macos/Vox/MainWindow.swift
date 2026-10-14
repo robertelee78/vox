@@ -1012,6 +1012,13 @@ private struct RoomTimelineView: View {
                         .voxPadding(.horizontal, Space.s12).voxPadding(.top, Space.s4)
                         .accessibilityIdentifier("session-header")
                 }
+                if let pause = model.sessionPauseWords {
+                    Text(pause).secondaryText()
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .voxPadding(.horizontal, Space.s12).voxPadding(.top, Space.s4)
+                        .accessibilityIdentifier("session-pause-status")
+                }
                 Group {
                     GeometryReader { viewport in
                         ScrollViewReader { scroller in
