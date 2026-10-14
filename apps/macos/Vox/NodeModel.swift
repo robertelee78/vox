@@ -1072,6 +1072,8 @@ final class NodeModel: ObservableObject {
         guard case let .room(id) = selection, ended == nil else { return }
         let generation = roomReadGeneration
         let messageRevision = roomMessageRevision
+        let metadataToken = sessionsMetadataRead
+        let liveAfter = sessionsOpenAfter, historyAfter = sessionsHistoryAfter
         roomNeedsPage = true
         do {
             // Each read lands only if the room is still the one on screen: a quick switch must not
@@ -1087,8 +1089,8 @@ final class NodeModel: ObservableObject {
             let kept = (try? await client.retention(room: id)) ?? ""
             let keptSecs = try? await client.retentionSecs(room: id)
             let done = try await client.noticesPage(room: id, before: nil, revision: nil)
-            let livePage = try await client.sessionsOpenPage(room: id, after: nil)
-            let historyPage = try await client.sessionsPage(room: id, after: nil)
+            let livePage = try await client.sessionsOpenPage(room: id, after: liveAfter)
+            let historyPage = try await client.sessionsPage(room: id, after: historyAfter)
             guard generation == roomReadGeneration, self.selection == .room(id), ended == nil else { return }
             guard messageRevision == roomMessageRevision else { return }
             // The page and its inspector replace the prior view together, after both reads
@@ -1110,9 +1112,12 @@ final class NodeModel: ObservableObject {
             notices = done.rows
             noticesBefore = done.before
             noticesRevision = done.revision
-            sessions = livePage.sessions + historyPage.sessions.filter { !$0.open }
-            sessionsOpenNext = livePage.next
-            sessionsHistoryNext = historyPage.next
+            if metadataToken == sessionsMetadataRead,
+               liveAfter == sessionsOpenAfter, historyAfter == sessionsHistoryAfter {
+                sessions = livePage.sessions + historyPage.sessions.filter { !$0.open }
+                sessionsOpenNext = livePage.next
+                sessionsHistoryNext = historyPage.next
+            }
             await loadStepRetention()
             guard !Task.isCancelled, generation == roomReadGeneration, selection == .room(id), ended == nil else { return }
             await loadRoomAnchorState()
