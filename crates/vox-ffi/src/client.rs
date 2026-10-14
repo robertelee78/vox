@@ -601,6 +601,16 @@ pub struct Member {
     pub key_waits: Option<String>,
 }
 
+/// Current daemon-derived eligibility for individual Trust controls. Refresh when policy
+/// changes; the daemon separately rechecks authorization when the person performs the action.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct IndividualTrustEligibility {
+    /// False for managed group grants, quarantine, or policy still applying locally.
+    pub can_manage_individual_trust: bool,
+    /// User-facing reason when false; empty when eligible.
+    pub reason: String,
+}
+
 /// An entry of the trust keyring.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct TrustedNode {
@@ -2043,6 +2053,42 @@ impl VoxClient {
     pub async fn computer_status(&self) -> Result<crate::ComputerStatus, VoxError> {
         self.computer_request(DaemonRequest::ComputerStatus).await
     }
+    /// Explicit operator release, destination transfer approval, or recovery after removal/fault.
+    pub async fn change_computer_binding(
+        &self,
+        action: String,
+        node: String,
+        destination: String,
+        frontier: String,
+    ) -> Result<crate::ComputerStatus, VoxError> {
+        vox_core::node::computer::operator_only().map_err(|e| failed(e.to_string()))?;
+        self.computer_request(DaemonRequest::ComputerBinding {
+            action,
+            node,
+            destination,
+            frontier,
+        })
+        .await
+    }
+    /// Save the personal selection using a Ready node's authenticated local identity.
+    pub async fn select_personal_node(
+        &self,
+        node: String,
+    ) -> Result<crate::ComputerStatus, VoxError> {
+        vox_core::node::computer::operator_only().map_err(|e| failed(e.to_string()))?;
+        self.computer_request(DaemonRequest::ComputerPersonal { node })
+            .await
+    }
+    /// Remove the exact displayed computer and policy frontier after operator confirmation.
+    pub async fn remove_computer(
+        &self,
+        computer: String,
+        frontier: String,
+    ) -> Result<crate::ComputerStatus, VoxError> {
+        vox_core::node::computer::operator_only().map_err(|e| failed(e.to_string()))?;
+        self.computer_request(DaemonRequest::ComputerRemove { computer, frontier })
+            .await
+    }
     /// Produce one expiring invitation for an operator.
     pub async fn begin_computer_pairing(&self) -> Result<crate::ComputerStatus, VoxError> {
         vox_core::node::computer::operator_only().map_err(|e| failed(e.to_string()))?;
@@ -3034,8 +3080,33 @@ impl VoxClient {
         Ok(list)
     }
 
-    /// The nodes offered to the keyring (ADR-028 K-15 – K-18), in fingerprint order: as the node
-    /// keeps them, so the TUI and the app always agree, dismissals included.
+    /// Whether current daemon policy permits individual Trust controls for this fingerprint.
+    /// This is a current observation; mutations check policy again when performed.
+    ///
+    /// # Errors
+    /// Invalid fingerprint, unavailable node, or daemon refusal.
+    pub async fn individual_trust_eligibility(
+        &self,
+        fingerprint: String,
+    ) -> Result<IndividualTrustEligibility, VoxError> {
+        let member = digest(&fingerprint, "node fingerprint")?;
+        on_held!(self, |c| {
+            match ask(c, &Request::IndividualTrustEligibility { member }).await? {
+                Frame::IndividualTrustEligibility { can_manage, reason } => {
+                    Ok(IndividualTrustEligibility {
+                        can_manage_individual_trust: can_manage,
+                        reason,
+                    })
+                }
+                _ => Err(failed(
+                    "the node did not report individual trust eligibility",
+                )),
+            }
+        })
+    }
+
+    /// The current keyring offers in fingerprint order, including local dismissals.
+    /// Presence alone is not individual-trust eligibility.
     ///
     /// # Errors
     /// The node's refusal.

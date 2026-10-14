@@ -434,6 +434,8 @@ pub enum SessionTo {
     /// Into a Session on this node: the Session's node.
     Node(Digest32),
 }
+const T_INDIVIDUAL_TRUST_REQ: u64 = 8011;
+const T_INDIVIDUAL_TRUST: u64 = 8012;
 const T_OFFERS_REQ: u64 = 4950;
 const T_DISMISS_OFFER: u64 = 4951;
 const T_OFFERS: u64 = 4952;
@@ -660,6 +662,11 @@ pub enum Request {
     /// The members offered to this node's keyring (ADR-028 K-15 – K-18), answered with
     /// [`Frame::Offers`].
     Offers,
+    /// Current signed computer-policy eligibility, independent of a stale offers snapshot.
+    IndividualTrustEligibility {
+        /// The complete node fingerprint whose individual trust the client would manage.
+        member: Digest32,
+    },
     /// Dismiss the offer of `member` (ADR-028 K-18): on this node alone, and silently.
     DismissOffer {
         /// The member offered.
@@ -1172,6 +1179,9 @@ impl Request {
             }
             Request::Decisions { limit } => {
                 e.array(2).uint(T_DECISIONS_REQ).uint(*limit);
+            }
+            Request::IndividualTrustEligibility { member } => {
+                e.array(2).uint(T_INDIVIDUAL_TRUST_REQ).bytes(member);
             }
             Request::Offers => {
                 e.array(1).uint(T_OFFERS_REQ);
@@ -1957,6 +1967,12 @@ impl Request {
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Decisions { limit })
             }
+            (T_INDIVIDUAL_TRUST_REQ, 2) => {
+                let member = digest(&mut d)?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::IndividualTrustEligibility { member })
+            }
             (T_OFFERS_REQ, 1) => {
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
@@ -2335,6 +2351,13 @@ pub enum Frame {
         /// Each event, newest first.
         events: Vec<crate::node::decisions::Event>,
     },
+    /// Current eligibility for individual Trust controls, not a mutation authorization token.
+    IndividualTrustEligibility {
+        /// Whether ordinary individual trust is outside the current computer policy.
+        can_manage: bool,
+        /// A user-facing reason when unavailable; empty when eligible.
+        reason: String,
+    },
     /// The members offered to the keyring, as a [`Request::Offers`] asked for.
     Offers {
         /// Each offer, in fingerprint order.
@@ -2597,6 +2620,12 @@ impl Frame {
                         }
                     }
                 }
+            }
+            Frame::IndividualTrustEligibility { can_manage, reason } => {
+                e.array(3)
+                    .uint(T_INDIVIDUAL_TRUST)
+                    .uint(u64::from(*can_manage))
+                    .text(reason);
             }
             Frame::Offers { offers } => {
                 e.array(2).uint(T_OFFERS);
@@ -3414,6 +3443,12 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 });
             }
             return Ok(Frame::Decisions { events });
+        }
+        (T_INDIVIDUAL_TRUST, 3) => {
+            return Ok(Frame::IndividualTrustEligibility {
+                can_manage: flag(d, "ipc individual trust eligibility")?,
+                reason: text(d, "ipc individual trust reason")?,
+            });
         }
         (T_OFFERS, 2) => {
             let offers = crate::node::offers::read_offers(d)?;
@@ -5751,6 +5786,10 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 None,
             ),
         },
+        Request::IndividualTrustEligibility { member } => {
+            let (can_manage, reason) = handle.individual_trust_eligibility(member);
+            Frame::IndividualTrustEligibility { can_manage, reason }
+        }
         Request::Offers => Frame::Offers {
             offers: handle.view().offers.clone(),
         },
