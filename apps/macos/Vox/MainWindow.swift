@@ -2622,6 +2622,7 @@ private struct ThreadPanel: View {
                         }
                     }
                 }
+                .accessibilityIdentifier("thread-replies")
                 .background(TimelineKeys(focused: $focused, focusNotification: focusNotification,
                     key: { key in handle(key, reader, root: root, generation: generation) },
                     copied: {

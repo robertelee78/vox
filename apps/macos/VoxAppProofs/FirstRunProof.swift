@@ -4334,7 +4334,7 @@ final class FirstRunProof: XCTestCase {
         guard tap(ui, Key.id("thread-close"), "close the earlier quote thread") else { return }
         guard tap(ui, Key.id("thread-summary-" + taggedRoot), "open the real tagged thread") else { return }
         let middleKey = Key.id("thread-message-" + fromBob)
-        guard let panel = locate(ui, Key.id("thread-panel")),
+        guard let panel = locate(ui, Key.id("thread-replies")),
               panel.frame.width.isFinite, panel.frame.height.isFinite,
               panel.frame.width > 0, panel.frame.height > 0 else {
             throw Apparatus("the tagged thread has no finite visible viewport")
@@ -4351,9 +4351,7 @@ final class FirstRunProof: XCTestCase {
         let panelUntil = Date().addingTimeInterval(20)
         while Date() < panelUntil {
             if let row = locate(ui, middleKey), visibleMiddle(row) { break }
-            if let scroll = panel.descendants(matching: .scrollView).allElementsBoundByIndex.first(where: { $0.exists && $0.frame.width > 0 && $0.frame.height > 0 }) {
-                scroll.scroll(byDeltaX: 0, deltaY: -100)
-            }
+            panel.scroll(byDeltaX: 0, deltaY: -100)
             Thread.sleep(forTimeInterval: 0.25)
         }
         guard let middle = locate(ui, middleKey), visibleMiddle(middle) else {
