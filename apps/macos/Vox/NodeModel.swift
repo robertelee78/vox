@@ -213,6 +213,8 @@ final class NodeModel: ObservableObject {
             // Another Session's entries are never drawn, nor acted on, under this one's header
             // while it loads (D3): cleared, and said to be loading.
             sessionPages.clear()
+            sessionWindowRevision = UUID()
+            timelineFollowingNewest = true
             selectedEarlierRequest = nil
             sessionNote = nil
             sessionLoading = showingSession
@@ -249,6 +251,10 @@ final class NodeModel: ObservableObject {
     /// The Session on screen's entries, oldest first, to a member with drive (SC-1): its newest
     /// page, and the older pages the person scrolled up to (ADR-034 FR-4); never its whole
     /// history.
+    /// Scroll position, independent of whether the app's window is foreground.
+    @Published var timelineFollowingNewest = true
+    private var sessionWindowRevision = UUID()
+    var hasNewerTimeline: Bool { showingSession && sessionPages.hasNewer }
     @Published private var sessionPages = SessionPages()
     var sessionEntries: [FfiSessionEntry] { sessionPages.entries }
     /// A notification may point to a request before the newest page. It is shown separately,
@@ -2567,6 +2573,8 @@ extension NodeModel {
             sessionLoading = false
             return
         }
+        let revision = sessionWindowRevision
+        let follows = timelineFollowingNewest
         do {
             // Its newest page (ADR-034 FR-4): an older page is read only when the person scrolls
             // up to it (readOlderSession).
@@ -2575,10 +2583,15 @@ extension NodeModel {
             // Drawn only for the destination it was read for, still on screen and still driven
             // (D3): the room, the Session's node and its id, and drive held.
             guard roomOnScreen == room, let now = shownSession, now.nodeFingerprint == s.nodeFingerprint,
-                  now.sessionId == s.sessionId, now.canDrive else { return }
+                  now.sessionId == s.sessionId, now.canDrive,
+                  revision == sessionWindowRevision,
+                  follows == timelineFollowingNewest else { return }
             var pages = sessionPages
-            pages.newest(read)
-            if pages != sessionPages { sessionPages = pages }
+            pages.newest(read, following: follows)
+            if pages != sessionPages {
+                sessionPages = pages
+                sessionWindowRevision = UUID()
+            }
             if read.note != sessionNote { sessionNote = read.note }
             sessionLoading = false
             await refreshSessionRequests(room: room, session: now)
@@ -2588,19 +2601,31 @@ extension NodeModel {
         }
     }
 
+    /// End on an older Session window reloads the actual newest page from disk.
+    func readNewestTimeline() async {
+        guard showingSession else { return }
+        timelineFollowingNewest = true
+        sessionWindowRevision = UUID()
+        await readSession()
+    }
+
     /// The page of the Session on screen's entries before those held (ADR-034 FR-4): read when
     /// the person scrolls up to the top, or asks, and put before them. One page at a time.
     func readOlderSession() async {
         guard let room = roomOnScreen, let s = shownSession, s.canDrive,
               let before = sessionBefore, !sessionReadingOlder else { return }
+        timelineFollowingNewest = false
+        let revision = sessionWindowRevision
         sessionReadingOlder = true
         defer { sessionReadingOlder = false }
         do {
             let read = try await client.sessionReadOlder(room: room, node: s.nodeFingerprint,
                                                          sessionId: s.sessionId, before: before)
             guard roomOnScreen == room, let now = shownSession, now.nodeFingerprint == s.nodeFingerprint,
-                  now.sessionId == s.sessionId, now.canDrive, sessionBefore == before else { return }
+                  now.sessionId == s.sessionId, now.canDrive, sessionBefore == before,
+                  revision == sessionWindowRevision else { return }
             sessionPages.older(read, asked: before)
+            sessionWindowRevision = UUID()
             await refreshSessionRequests(room: room, session: now)
         } catch {
             reportBackground(error)

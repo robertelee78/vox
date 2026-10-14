@@ -1096,10 +1096,10 @@ private struct RoomView: View {
                                         following = false
                                         readLog.debug("follow in \(room, privacy: .public): following false, why: scrolled by hand")
                                     }, ended: {
-                                        following = model.followItem.map { inView.contains($0) } ?? true
+                                        following = !model.hasNewerTimeline && (model.followItem.map { inView.contains($0) } ?? true)
                                         readLog.debug("follow in \(room, privacy: .public): following \(following), why: scroll by hand ended")
                                     }, toward: {
-                                        guard !following, let last = model.followItem,
+                                        guard !following, !model.hasNewerTimeline, let last = model.followItem,
                                               inView.contains(last) else { return }
                                         following = true
                                         readLog.debug("follow in \(room, privacy: .public): following true, why: scrolled down to the newest line")
@@ -1271,6 +1271,8 @@ private struct RoomView: View {
                         }
                     }
                     .background(WindowReader(seen: window))
+                    .onChange(of: following) { value in model.timelineFollowingNewest = value }
+                    .onChange(of: model.timelineFollowingNewest) { value in following = value }
                     .onChange(of: window.seen) { _ in markSeen() }
                     .onChange(of: model.showing) { _ in updateLooking() }
                     .onDisappear { if model.lookingAt == room { model.lookingAt = nil } }
@@ -1550,14 +1552,17 @@ private struct RoomView: View {
             scroller.scrollTo(first, anchor: .top)
         case .end:
             following = true
-            scroller.scrollTo(TimelineEnd.id, anchor: .bottom)
+            Task {
+                await model.readNewestTimeline()
+                DispatchQueue.main.async { scroller.scrollTo(TimelineEnd.id, anchor: .bottom) }
+            }
         case .pageUp:
             guard let top = shown.min(by: { $0.value.minY < $1.value.minY })?.key else { return false }
             following = false
             scroller.scrollTo(top, anchor: .bottom)
         case .pageDown:
             guard let bottom = shown.max(by: { $0.value.maxY < $1.value.maxY })?.key else { return false }
-            if bottom == model.followItem {
+            if bottom == model.followItem && !model.hasNewerTimeline {
                 following = true
                 scroller.scrollTo(TimelineEnd.id, anchor: .bottom)
             } else {
