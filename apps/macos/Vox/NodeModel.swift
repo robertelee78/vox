@@ -309,7 +309,10 @@ final class NodeModel: ObservableObject {
             && roomAnchorAuthorityGeneration == roomReadGeneration
     }
 
-    @Published var sheet: NodeSheet?
+    private var sheetInstance = UUID()
+    @Published var sheet: NodeSheet? {
+        didSet { if oldValue != sheet { sheetInstance = UUID() } }
+    }
     /// Whether the room's inspector shows (View > Hide Inspector, ⌥⌘I), kept across launches.
     @Published var inspectorShown = Columns.inspectorShown {
         didSet { UserDefaults.standard.set(inspectorShown, forKey: Columns.inspectorShownKey) }
@@ -1608,6 +1611,53 @@ final class NodeModel: ObservableObject {
         return nil
     }
 
+    /// A sheet's search results belong to this exact actor, room generation and sheet.
+    var anchorChoiceContext: String {
+        me + "/" + nodeObservationEpoch.uuidString + "/" + roomReadGeneration.uuidString
+            + "/" + (sheet?.rawValue ?? "closed") + "/" + sheetInstance.uuidString
+    }
+
+    func searchRoomAnchorChoices(context: String) async throws -> [RoomAnchorEndpoint] {
+        guard context == anchorChoiceContext, ended == nil,
+              sheet == .newRoom || sheet == .roomAnchors else { throw CancellationError() }
+        let found = try await client.searchAnchors()
+        guard !Task.isCancelled, context == anchorChoiceContext, ended == nil else { throw CancellationError() }
+        return found
+    }
+
+    func resolveRoomAnchorChoice(_ input: String, context: String) async throws -> RoomAnchorEndpoint {
+        guard context == anchorChoiceContext, ended == nil,
+              sheet == .newRoom || sheet == .roomAnchors else { throw CancellationError() }
+        let found = try await client.resolveAnchorEndpoint(input: input)
+        guard !Task.isCancelled, context == anchorChoiceContext, ended == nil else { throw CancellationError() }
+        return found
+    }
+
+    /// Create from a snapshot of explicitly kept, already numeric endpoints. Search and DNS
+    /// never hold this mutation, and closing/changing the sheet retires its UI publication.
+    func createRoom(_ name: String, passphrase secret: Secret, anchors: [RoomAnchorEndpoint],
+                    context: String) async -> Bool {
+        let operation = "create-room", attempt = begin("create-room")
+        defer { end(attempt) }
+        guard context == anchorChoiceContext, sheet == .newRoom, ended == nil else { secret.wipe(); return false }
+        do {
+            let passphrase = try secret.passphrase()
+            defer { passphrase.wipe() }
+            let room = try await client.createRoomWithAnchors(name: name, passphrase: passphrase,
+                                                             anchors: anchors, node: me)
+            guard !Task.isCancelled, context == anchorChoiceContext, ended == nil else { return false }
+            report(operation: operation, done: "Created the room.")
+            await refresh()
+            guard !Task.isCancelled, context == anchorChoiceContext, ended == nil else { return false }
+            await show(.room(room))
+            return true
+        } catch {
+            guard !Task.isCancelled, context == anchorChoiceContext, ended == nil else { return false }
+            report(error, operation: operation)
+            return false
+        }
+    }
+
     /// Create a room named `name` under `passphrase`, and show it.
     func createRoom(_ name: String, passphrase secret: Secret) async -> Bool {
         let operation = "create-room"
@@ -1781,16 +1831,18 @@ final class NodeModel: ObservableObject {
     /// Resolve input without a manual write; only the held actor signs this room's change.
     @discardableResult
     func changeRoomAnchor(input: String? = nil, removing: String? = nil) async -> Bool {
-        guard let room = roomOnScreen, ended == nil, !roomAnchorChanging,
+        guard let room = roomOnScreen, ended == nil, !roomAnchorChanging, sheet == .roomAnchors,
               (input != nil) != (removing != nil) else { return false }
         let generation = roomReadGeneration, epoch = nodeObservationEpoch, request = UUID()
+        let editor = sheetInstance
         roomAnchorAction = request
         roomAnchorChanging = true
         roomAnchorAuthority = nil
         roomAnchorError = nil
         defer { if roomAnchorAction == request { roomAnchorChanging = false } }
         @MainActor func current() -> Bool {
-            !Task.isCancelled && roomAnchorAction == request && roomReadGeneration == generation
+            !Task.isCancelled && sheet == .roomAnchors && sheetInstance == editor
+                && roomAnchorAction == request && roomReadGeneration == generation
                 && nodeObservationEpoch == epoch && roomOnScreen == room && ended == nil
         }
         do {
