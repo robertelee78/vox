@@ -5,7 +5,7 @@
 //! what the daemon says of that node into the TUI's [`ViewModel`] and maps each UI [`Command`] onto
 //! a request, blocking the (synchronous, crossterm-owning) UI thread on the daemon's answer.
 //! UI-local state that is not the node's business lives here: which room is on screen, and unread
-//! counts (driven by the node's ordered events).
+//! counts (read as scalar facts when the node's events say they changed).
 //!
 //! - **What is drawn** comes from a [`NodeSnapshot`] (rooms, members, consents, shares, keyring,
 //!   connected peers, this node's tunnels), asked again when an event says something changed and
@@ -53,6 +53,10 @@ use vox_agentcomms::attention::{group, RoomGroup};
 /// How often the snapshot is asked again when no event has said anything changed: connections,
 /// tunnels and their last moved byte change without a room event.
 const SNAPSHOT_EVERY: Duration = Duration::from_secs(1);
+
+/// Events retained while the UI is busy. Producers await space without blocking the runtime;
+/// upstream broadcast lag remains an explicit event and causes authoritative rereads.
+const EVENT_QUEUE: usize = 256;
 
 /// What one check of a pulled image found: its announcement, and where it stands.
 type ImageCheck = (Digest32, crate::viewmodel::ImageState);
@@ -147,8 +151,8 @@ pub struct DaemonCore {
     attached: Vec<String>,
     /// Every node on this machine's disk, by name, read with each snapshot (ADR-028 W-1, #511).
     machine_nodes: Vec<(String, Option<String>)>,
-    tx: mpsc::Sender<Ev>,
-    rx: mpsc::Receiver<Ev>,
+    tx: tokio::sync::mpsc::Sender<Ev>,
+    rx: tokio::sync::mpsc::Receiver<Ev>,
     /// The daemon's event task.
     daemon_events: tokio::task::JoinHandle<()>,
     snapshot: NodeSnapshot,
@@ -200,8 +204,8 @@ pub struct DaemonCore {
     waiting_of: Vec<(Digest32, Digest32)>,
     /// Unread per room off screen, at three levels (ADR-028 R-8, #484).
     unread: BTreeMap<Digest32, RoomUnread>,
-    /// Rooms whose unread was counted, when the TUI first saw them open, from what the node
-    /// recorded as read (`Request::Unread`): before that, only the node's events count.
+    /// Rooms whose unread was counted from the node's durable read state. Events make an
+    /// existing count dirty; a lost event invalidates all counts.
     seeded: BTreeSet<Digest32>,
     /// Rooms off screen that rows have arrived in since the last frame, and how many rows: each
     /// is a notification to raise, once per room (ADR-028 R-10).
@@ -264,19 +268,17 @@ pub struct DaemonCore {
 
 /// **A room's unread, at three levels** (ADR-028 R-8, #484), for a room off screen.
 ///
-/// Events say only how many rows came (`pending`); the rows since `cursor` are then read and each
-/// is counted as addressed to this node, new, or coordination ([`vox_agentcomms::attention::unread_level`]).
-/// With no cursor yet (a room not opened this session), only the newest `pending` rows count: the
-/// room's history is not unread.
+/// Events only mark these counts dirty. The node computes their levels from its durable read
+/// state under the newest-1,000-rows, until-first-read rule; a limited scan is shown explicitly.
 #[derive(Debug, Default)]
 struct RoomUnread {
     to_you: usize,
     new: usize,
     coordination: usize,
-    /// The newest row counted or seen, by entry hash.
-    cursor: Option<Digest32>,
-    /// Rows the events announced and not yet read and counted.
-    pending: usize,
+    /// Rows arrived since the last authoritative count. Multiple events coalesce.
+    dirty: bool,
+    /// The authoritative recovery examined only the newest 1,000 rows.
+    scan_limited: bool,
 }
 
 /// One selected governance page per kind, with revision-bound continuations.
@@ -542,7 +544,7 @@ impl DaemonCore {
         anchors: Vec<String>,
         stop: tokio_util::sync::CancellationToken,
     ) -> Result<Self, crate::app::AppError> {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = tokio::sync::mpsc::channel(EVENT_QUEUE);
         let socket = account.socket();
         let (attached, daemon_events) = rt.block_on(async {
             let mut daemon = DaemonClient::open(&socket).await?;
@@ -564,13 +566,13 @@ impl DaemonCore {
                 loop {
                     match daemon.next().await {
                         Ok(Some(DaemonFrame::Event(ev))) => {
-                            if tx.send(Ev::Daemon(ev)).is_err() {
+                            if tx.send(Ev::Daemon(ev)).await.is_err() {
                                 return;
                             }
                         }
                         Ok(Some(_)) => {}
                         Ok(None) | Err(_) => {
-                            let _ = tx.send(Ev::DaemonGone);
+                            let _ = tx.send(Ev::DaemonGone).await;
                             return;
                         }
                     }
@@ -751,7 +753,7 @@ impl DaemonCore {
                         Ok(None) | Err(_) => Ev::DaemonGone,
                     };
                     let last = matches!(ev, Ev::Detached | Ev::DaemonGone);
-                    if tx.send(ev).is_err() || last {
+                    if tx.send(ev).await.is_err() || last {
                         return;
                     }
                 }
@@ -969,6 +971,10 @@ impl DaemonCore {
         self.session_lines.clear();
         self.waiting.clear();
         self.waiting_of.clear();
+        self.unread.clear();
+        self.seeded.clear();
+        self.arrived.clear();
+        self.notified.clear();
         self.room_save_errors.clear();
         self.recovered_rooms.clear();
         self.notice = Some(format!(
@@ -1041,12 +1047,21 @@ impl DaemonCore {
     }
 
     fn drain_queued(&mut self) {
-        while let Ok(ev) = self.rx.try_recv() {
+        let mut lagged = false;
+        // A busy producer must not keep one UI refresh draining forever.
+        for _ in 0..EVENT_QUEUE {
+            let Ok(ev) = self.rx.try_recv() else {
+                break;
+            };
             match ev {
                 Ev::Node(ev) => self.on_node_event(ev),
                 Ev::Lagged => {
+                    lagged = true;
                     self.threads_stale = true;
                     self.asked = None;
+                    self.unread.clear();
+                    self.seeded.clear();
+                    self.arrived.clear();
                     // Events were lost: a Session's news among them, maybe.
                     self.session_stale = true;
                     self.waiting_stale = true;
@@ -1085,6 +1100,12 @@ impl DaemonCore {
                 }
             }
         }
+        if lagged {
+            self.notice = Some(
+                "some live notices were missed; room state and unread counts are being refreshed"
+                    .into(),
+            );
+        }
     }
 
     fn on_node_event(&mut self, ev: NodeEvent) {
@@ -1097,7 +1118,7 @@ impl DaemonCore {
                     t.stale = true;
                 }
             } else if n > 0 {
-                me.unread.entry(channel_id).or_default().pending += n;
+                me.unread.entry(channel_id).or_default().dirty = true;
                 *me.arrived.entry(channel_id).or_insert(0) += n;
             }
         };
@@ -1262,6 +1283,14 @@ impl DaemonCore {
         });
         match listed {
             Some(Ok(DaemonFrame::Nodes(nodes))) => {
+                // Use the same attached state as the daemon's hello, including an attached
+                // node whose displayed status is Locked. Broadcast notices can lag.
+                self.attached = nodes
+                    .iter()
+                    .filter(|n| n.state == vox_core::node::daemonipc::NodeState::Attached)
+                    .map(|n| n.name.to_string())
+                    .collect();
+                self.attached.sort();
                 self.machine_nodes = nodes
                     .into_iter()
                     .map(|n| (n.name.to_string(), n.status.map(|s| s.as_str().to_owned())))
@@ -1411,114 +1440,66 @@ impl DaemonCore {
         }
     }
 
-    /// **Count what came to each room off screen, by level** (ADR-028 R-8, #484): read the rows
-    /// since its cursor and count each as addressed to this node, new, or coordination. This
-    /// node's own posts are not unread.
+    /// Read only unseeded or dirty off-screen rooms. Only scalar facts per currently open room
+    /// survive the request, including its scan limit; no unread message bodies are collected.
     fn count_unread(&mut self) {
-        use vox_agentcomms::attention::{unread_level, UnreadLevel};
-        let me = self.snapshot.me;
-        let me_fp = me.map(|m| vox_core::node::link::b32_encode(&m));
-        // **What was unread before the TUI opened** (ADR-028 R-8): each room, the first time it is
-        // seen open off screen, is counted from the node's own record of what its person read.
-        // Without it, a message that came while the TUI was closed was never counted at all.
-        let unseeded: Vec<Digest32> = self
+        self.unread.retain(|cid, _| {
+            self.snapshot
+                .open
+                .iter()
+                .any(|room| room.channel_id == *cid)
+        });
+        self.seeded.retain(|cid| {
+            self.snapshot
+                .open
+                .iter()
+                .any(|room| room.channel_id == *cid)
+        });
+        self.notified.retain(|cid| {
+            self.snapshot
+                .open
+                .iter()
+                .any(|room| room.channel_id == *cid)
+        });
+        let due: Vec<_> = self
             .snapshot
             .open
             .iter()
-            .map(|o| o.channel_id)
-            .filter(|cid| !self.seeded.contains(cid) && Some(*cid) != self.active)
-            .collect();
-        for cid in unseeded {
-            let Some(conn) = self.conn.as_mut() else {
-                return;
-            };
-            let asked = until_stopped(
-                &self.rt,
-                &self.stop,
-                conn.client.request(&Request::Unread { channel_id: cid }),
-            );
-            let Some(Ok(Frame::Rows { rows })) = asked else {
-                continue;
-            };
-            self.seeded.insert(cid);
-            let u = self.unread.entry(cid).or_default();
-            for r in &rows {
-                match unread_level(&r.text, me_fp.as_deref()) {
-                    UnreadLevel::ToYou => u.to_you += 1,
-                    UnreadLevel::New => u.new += 1,
-                    UnreadLevel::Coordination => u.coordination += 1,
-                }
-            }
-            if let Some(newest) = rows.last() {
-                u.cursor = Some(newest.entry_hash);
-            }
-        }
-        let due: Vec<Digest32> = self
-            .unread
-            .iter()
-            .filter(|(cid, u)| {
-                u.pending > 0
-                    && Some(**cid) != self.active
-                    && self.snapshot.open.iter().any(|o| o.channel_id == **cid)
+            .map(|room| room.channel_id)
+            .filter(|cid| {
+                Some(*cid) != self.active
+                    && (!self.seeded.contains(cid) || self.unread.get(cid).is_some_and(|u| u.dirty))
             })
-            .map(|(cid, _)| *cid)
             .collect();
         for cid in due {
-            let Some(cursor) = self.unread.get(&cid).map(|u| u.cursor) else {
-                continue;
-            };
             let Some(conn) = self.conn.as_mut() else {
                 return;
             };
-            let request = match cursor {
-                Some(_) => Request::Read {
-                    channel_id: cid,
-                    since: cursor,
-                    after: None,
-                    limit: 200,
-                },
-                None => Request::Unread { channel_id: cid },
-            };
-            let read = until_stopped(&self.rt, &self.stop, conn.client.request(&request));
-            let Some(u) = self.unread.get_mut(&cid) else {
-                continue;
-            };
-            let mut rows = match read {
-                Some(Ok(Frame::Rows { rows })) => rows,
-                // A cursor the node no longer knows (the row expired): counted from the newest
-                // `pending` rows instead, on the next frame.
-                Some(Ok(_)) if cursor.is_some() => {
-                    u.cursor = None;
+            let answer = until_stopped(
+                &self.rt,
+                &self.stop,
+                conn.client
+                    .request(&Request::UnreadSummary { channel_id: cid }),
+            );
+            let summary = match answer {
+                Some(Ok(Frame::UnreadSummary { summary })) => summary,
+                Some(Ok(Frame::Error { reason })) => {
+                    self.notice = Some(reason);
                     continue;
                 }
                 _ => continue,
             };
-            rows.sort_by_key(|r| r.arrival);
-            if cursor.is_none() {
-                // A room not seen this session: only what the events announced is unread.
-                let keep = u.pending.min(rows.len());
-                rows.drain(..rows.len() - keep);
-            }
-            for r in rows.iter().filter(|r| Some(r.author) != me) {
-                match unread_level(&r.text, me_fp.as_deref()) {
-                    UnreadLevel::ToYou => u.to_you += 1,
-                    UnreadLevel::New => u.new += 1,
-                    UnreadLevel::Coordination => u.coordination += 1,
-                }
-            }
-            if let Some(newest) = rows
-                .iter()
-                .filter(|r| !r.owed)
-                .map(|r| r.entry_hash)
-                .next_back()
-            {
-                u.cursor = Some(newest);
-            }
-            u.pending = if cursor.is_none() || rows.is_empty() {
-                0
-            } else {
-                u.pending.saturating_sub(rows.len())
-            };
+            self.unread.insert(
+                cid,
+                RoomUnread {
+                    to_you: usize::try_from(summary.addressed).unwrap_or(usize::MAX),
+                    new: usize::try_from(summary.new).unwrap_or(usize::MAX),
+                    coordination: usize::try_from(summary.coordination).unwrap_or(usize::MAX),
+                    scan_limited: summary.scan_limited,
+                    ..RoomUnread::default()
+                },
+            );
+            self.seeded.insert(cid);
         }
     }
 
@@ -2966,15 +2947,23 @@ impl DaemonCore {
                     reachability: reachability(&cid),
                 })
         });
+        // Health and a bounded unread scan remain visible when action notices are dismissed.
+        let mut notice = self
+            .room_save_errors
+            .values()
+            .next()
+            .cloned()
+            .or_else(|| self.notice.clone());
+        if self.unread.values().any(|u| u.scan_limited) {
+            const LIMIT: &str =
+                "unread counts are lower bounds: only the newest 1,000 rows were examined";
+            notice = Some(match notice {
+                Some(current) => format!("{current}; {LIMIT}"),
+                None => LIMIT.into(),
+            });
+        }
         ViewModel {
-            // Health is persistent, unlike action notices dismissed by Enter. Keep the full
-            // OS cause visible even when the sidebar truncates it or the timeline is scrolled.
-            notice: self
-                .room_save_errors
-                .values()
-                .next()
-                .cloned()
-                .or_else(|| self.notice.clone()),
+            notice,
             channels,
             active,
             sync: match snap.connected_peers.len() {
@@ -3198,6 +3187,7 @@ impl DaemonCore {
 
 impl Drop for DaemonCore {
     fn drop(&mut self) {
+        self.rx.close();
         self.daemon_events.abort();
     }
 }
@@ -3697,7 +3687,8 @@ impl CoreHandle for DaemonCore {
                     self.thread_roots.clear();
                     self.threads_stale = true;
                 }
-                // The room left counts from the newest row it showed: nothing seen is unread.
+                // Leaving an older window does not imply the entire room was read. Recount
+                // from durable read state, including any marks the node refused to save.
                 if let Some(t) = self
                     .timeline
                     .as_ref()
@@ -3706,7 +3697,7 @@ impl CoreHandle for DaemonCore {
                     self.unread.insert(
                         t.channel_id,
                         RoomUnread {
-                            cursor: t.cursor,
+                            dirty: true,
                             ..RoomUnread::default()
                         },
                     );
