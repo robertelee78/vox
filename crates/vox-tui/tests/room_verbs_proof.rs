@@ -1289,8 +1289,8 @@ fn a_link_card_is_fetched_by_the_senders_node_alone() {
         "PRODUCT: a known reply cannot be put in a different explicit thread: {contradiction:?}"
     );
 
-    // A reply queued while its parent is unavailable keeps its operation's original meaning
-    // when the parent arrives. Freeze only this fixture's peers while Bob comes back online.
+    // An unavailable parent cannot establish a thread. Freeze only this fixture's peers while
+    // Bob comes back online, then let the readable parent establish the root before posting.
     r.stop(1);
     let late_root = thread_post(&r.workers[0], &["THREAD-LATE-ROOT"]);
     let late_parent = thread_post(&r.workers[0], &["--re", &late_root, "THREAD-LATE-PARENT"]);
@@ -1342,17 +1342,24 @@ fn a_link_card_is_fetched_by_the_senders_node_alone() {
         "thread-late-retry-753",
         "THREAD-LATE-REPLY",
     ];
-    let queued = thread_post(bob, &args);
     let explicit_args = [
         "--re",
         &late_parent,
         "--thread",
-        &late_parent,
+        &late_root,
         "--op",
         "thread-explicit-retry-753",
         "THREAD-EXPLICIT-LATE-REPLY",
     ];
-    let explicit_queued = thread_post(bob, &explicit_args);
+    for flags in [&args[..], &explicit_args[..]] {
+        let mut argv = vec!["room", "post", &room, "--json"];
+        argv.extend_from_slice(flags);
+        let refused = bob.vox(None, &argv);
+        assert!(
+            !refused.ok && refused.stderr.contains("cannot read that message"),
+            "PRODUCT: an unreadable parent must refuse a new reply, even with an explicit root: {refused:?}"
+        );
+    }
     drop(frozen);
     support::until(
         bob,
@@ -1362,16 +1369,21 @@ fn a_link_card_is_fetched_by_the_senders_node_alone() {
         |o| {
             o.ndjson()
                 .iter()
-                .any(|row| row["entry_hash"] == late_parent)
+                .any(|row| row["entry_hash"] == late_parent && row["owed"] == false)
         },
     );
+    let queued = thread_post(bob, &args);
+    let explicit_queued = thread_post(bob, &explicit_args);
     assert_eq!(
         thread_post(bob, &args),
         queued,
-        "PRODUCT: the same --op reply must stay a retry when its previously missing parent arrives"
+        "PRODUCT: a reply first posted after its parent arrives must retry the same entry"
     );
-    assert_eq!(thread_post(bob, &explicit_args), explicit_queued,
-               "PRODUCT: an identical explicit --thread retry must keep its original entry after the parent arrives");
+    assert_eq!(
+        thread_post(bob, &explicit_args),
+        explicit_queued,
+        "PRODUCT: an identical explicit --thread retry must keep its entry"
+    );
     let after = bob.vox(None, &["room", "read", &room, "--json"]);
     let rows = after.expect_ok("read the retried reply").ndjson();
     let replies: Vec<_> = rows
@@ -1379,10 +1391,10 @@ fn a_link_card_is_fetched_by_the_senders_node_alone() {
         .filter(|row| row["entry_hash"] == queued)
         .collect();
     assert!(
-        replies.len() == 1 && replies[0]["envelope"]["thread"] == late_parent,
+        replies.len() == 1 && replies[0]["envelope"]["thread"] == late_root,
         "PRODUCT: the retried reply must appear once with its original root: {replies:?}"
     );
-    eprintln!("[proof] a missing parent arrived; retry kept the original entry and thread");
+    eprintln!("[proof] missing parent refused; after receipt the reply and retry kept its canonical thread");
 }
 
 /// The room the fixture holds, as `vox` at integrate 48b1c743 made it: its id is its genesis hash.

@@ -689,8 +689,8 @@ fn a_work_reference_has_one_shape_and_an_attempt_id_is_seeded_from_the_log() {
         "PRODUCT: a pasted inheritance snapshot must be refused: {spoof:?}"
     );
 
-    // Reuse the existing room-verbs journey's offline-peer apparatus: the binary queues a
-    // reply while its starting message is missing, then retries after that message arrives.
+    // Reuse the existing offline-peer apparatus: a missing parent refuses --re, while a
+    // caller-named --thread keeps its recorded inheritance when that root later arrives.
     room.stop(1);
     let late = post_as(
         &room.workers[0],
@@ -756,7 +756,11 @@ fn a_work_reference_has_one_shape_and_an_attempt_id_is_seeded_from_the_log() {
         "--project",
         "explicit",
     ];
-    let queued = post_as(bob, "retrying", r, "say", &late_flags, "LATE-TAG-REPLY");
+    let refused = post_as(bob, "retrying", r, "say", &late_flags, "LATE-TAG-REPLY");
+    assert!(
+        !refused.ok && refused.stderr.contains("cannot read that message"),
+        "PRODUCT: a missing reply parent must be refused: {refused:?}"
+    );
     let thread_queued = post_as(
         bob,
         "retrying",
@@ -766,12 +770,12 @@ fn a_work_reference_has_one_shape_and_an_attempt_id_is_seeded_from_the_log() {
         "LATE-THREAD-REPLY",
     );
     assert!(
-        queued.ok && thread_queued.ok,
-        "PRODUCT: offline replies refused: {queued:?}; {thread_queued:?}"
+        thread_queued.ok,
+        "PRODUCT: a caller-named thread was refused: {thread_queued:?}"
     );
     let queued_row = rows(bob, r)
         .into_iter()
-        .find(|row| row["entry_hash"] == queued.json()["entry_hash"])
+        .find(|row| row["entry_hash"] == thread_queued.json()["entry_hash"])
         .expect("PRODUCT: queued reply absent");
     assert!(
         queued_row["envelope"]["data"]["thread_tags"] == serde_json::json!([]),
@@ -786,8 +790,13 @@ fn a_work_reference_has_one_shape_and_an_attempt_id_is_seeded_from_the_log() {
         |out| {
             out.ndjson()
                 .iter()
-                .any(|row| row["entry_hash"] == late_hash)
+                .any(|row| row["entry_hash"] == late_hash && row["owed"] == false)
         },
+    );
+    let queued = post_as(bob, "retrying", r, "say", &late_flags, "LATE-TAG-REPLY");
+    assert!(
+        queued.ok,
+        "PRODUCT: a now-readable parent refused: {queued:?}"
     );
     for (flags, original) in [
         (&late_flags[..], &queued),
