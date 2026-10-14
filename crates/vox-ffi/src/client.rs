@@ -1723,6 +1723,38 @@ fn stop_follow(following: &FollowSlot) {
     );
 }
 
+/// Explicit cancellation for one selected-Session status read. UniFFI's Swift async adapter
+/// does not forward Task.cancel, so the native owner cancels this handle as well as its Task.
+/// A handle is single-use: cancellation before start wins, and an old handle owns no later read.
+#[derive(uniffi::Object)]
+pub struct SessionPauseRead {
+    control: Mutex<SessionPauseReadControl>,
+}
+#[derive(Default)]
+struct SessionPauseReadControl {
+    started: bool,
+    cancelled: bool,
+    task: Option<tokio::task::AbortHandle>,
+}
+#[uniffi::export]
+impl SessionPauseRead {
+    #[uniffi::constructor]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            control: Mutex::new(SessionPauseReadControl::default()),
+        })
+    }
+
+    /// Idempotently stop only this read, including when called before it starts.
+    pub fn cancel(&self) {
+        let mut control = self.control.lock().unwrap_or_else(PoisonError::into_inner);
+        control.cancelled = true;
+        if let Some(task) = control.task.take() {
+            task.abort();
+        }
+    }
+}
+
 /// One captured pause selection. Its roster is bounded by the room's existing member limit;
 /// release/replacement of the app's attachment invalidates it even if the fingerprint is reused.
 #[derive(uniffi::Object)]
@@ -5523,6 +5555,7 @@ impl VoxClient {
         node: String,
         session_id: String,
         instance: Vec<u8>,
+        read: Arc<SessionPauseRead>,
     ) -> Result<RoomPauseState, VoxError> {
         let room = digest(&room, "room id")?;
         let actor = input_fingerprint(&actor)?;
@@ -5534,7 +5567,17 @@ impl VoxClient {
             .try_acquire_owned()
             .map_err(|_| failed("The selected Session's pause is still being read."))?;
         let held = Arc::clone(&self.held);
-        let task = self.rt.spawn(async move {
+        let task = {
+            let mut control = read.control.lock().unwrap_or_else(PoisonError::into_inner);
+            if control.cancelled || control.started {
+                return Err(failed(
+                    "The Session pause read was cancelled or already used.",
+                ));
+            }
+            control.started = true;
+            // Registration and cancellation share this short lock. No cancellation can land
+            // between checking the flag and retaining the task's exact abort handle.
+            let task = self.rt.spawn(async move {
             let _permit = permit;
             tokio::time::timeout(REQUEST_WITHIN, async {
                 let (at, attachment) = {
@@ -5574,16 +5617,19 @@ impl VoxClient {
             }).await.unwrap_or_else(|_| Err(failed(
                 "Pause status is unknown: the Session's owner or local node did not answer within 60 seconds.",
             )))
-        });
+            });
+            control.task = Some(task.abort_handle());
+            task
+        };
         // Unlike the general mutation wrapper, this read has no uncertain write to preserve.
         // Dropping the foreign future cancels its task instead of leaving a detached poll.
-        struct CancelRead(tokio::task::AbortHandle);
+        struct CancelRead(Arc<SessionPauseRead>);
         impl Drop for CancelRead {
             fn drop(&mut self) {
-                self.0.abort();
+                self.0.cancel();
             }
         }
-        let _cancel = CancelRead(task.abort_handle());
+        let _cancel = CancelRead(read);
         task.await
             .map_err(|_| failed("The Session pause read was cancelled."))?
     }

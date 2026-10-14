@@ -316,6 +316,7 @@ final class NodeModel: ObservableObject {
     @Published private(set) var sessionPause: RoomPauseState?
     @Published private(set) var sessionPauseError: String?
     private var sessionPauseTask: Task<Void, Never>?
+    private var sessionPauseRequest: SessionPauseRead?
     private var sessionPauseRead = UUID()
     private struct SessionPauseContext: Equatable {
         let room: String
@@ -338,6 +339,8 @@ final class NodeModel: ObservableObject {
     }
 
     private func invalidateSessionPause() {
+        sessionPauseRequest?.cancel()
+        sessionPauseRequest = nil
         sessionPauseTask?.cancel()
         sessionPauseTask = nil
         sessionPauseRead = UUID()
@@ -355,15 +358,20 @@ final class NodeModel: ObservableObject {
         observedSessionPause = context
         let token = UUID(), client = client, actor = me
         sessionPauseRead = token
+        let request = SessionPauseRead()
+        sessionPauseRequest = request
         sessionPauseTask = Task { [weak self] in
+            guard !Task.isCancelled else { request.cancel(); return }
             let result: Result<RoomPauseState, Error>
             do {
                 result = .success(try await client.sessionPauseStatus(room: context.room,
-                    actor: actor, node: context.owner, sessionId: context.session, instance: context.instance))
+                    actor: actor, node: context.owner, sessionId: context.session,
+                    instance: context.instance, read: request))
             } catch { result = .failure(error) }
             guard !Task.isCancelled, let self, self.sessionPauseRead == token,
                   self.sessionPauseContext == context else { return }
             self.sessionPauseTask = nil
+            self.sessionPauseRequest = nil
             switch result {
             case let .success(state):
                 self.sessionPause = state
@@ -783,7 +791,10 @@ final class NodeModel: ObservableObject {
         notifier.ask()
     }
 
-    deinit { sessionPauseTask?.cancel() }
+    deinit {
+        sessionPauseRequest?.cancel()
+        sessionPauseTask?.cancel()
+    }
 
     /// The rooms in `need`, urgent first, then by name.
     /// The rooms as the sidebar lists them (the decider, v0.4.3, "more like" a chat list): the
