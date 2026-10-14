@@ -253,7 +253,7 @@ impl ChannelState {
             through: scanned,
             readers,
         });
-        if let Some((hash, id)) = posted {
+        if let Some((_, id)) = posted {
             self.entries.committed();
             self.next_log_id = id.saturating_add(1);
 
