@@ -2736,6 +2736,14 @@ extension NodeModel {
     private func refreshSessionRequests(room: String, session s: FfiSession) async {
         let selected = selectedRequest
         let revision = sessionWindowRevision
+        let epoch = nodeObservationEpoch, generation = roomReadGeneration
+        let instance = sessionPages.instance
+        func currentContext() -> Bool {
+            roomOnScreen == room && shownSession?.nodeFingerprint == s.nodeFingerprint
+                && shownSession?.sessionId == s.sessionId && shownSession?.canDrive == true
+                && selectedRequest == selected && revision == sessionWindowRevision
+                && epoch == nodeObservationEpoch && generation == roomReadGeneration
+        }
         var references = Set(sessionEntries.compactMap { $0.request?.reference })
         if let selected { references.insert(selected) }
         guard !references.isEmpty else {
@@ -2743,11 +2751,21 @@ extension NodeModel {
             return
         }
         do {
-            let current = try await client.sessionRequests(room: room, node: s.nodeFingerprint,
-                sessionId: s.sessionId, references: references.sorted())
-            guard roomOnScreen == room, let now = shownSession, now.nodeFingerprint == s.nodeFingerprint,
-                  now.sessionId == s.sessionId, now.canDrive, selectedRequest == selected,
-                  revision == sessionWindowRevision else { return }
+            // One indexed newest page per already-held/explicitly-selected reference.
+            // Keep one current request row per reference, never its resolution transcript.
+            var current: [FfiSessionEntry] = []
+            for reference in references.sorted() {
+                let page = try await client.sessionRequestsPage(room: room, node: s.nodeFingerprint,
+                    sessionId: s.sessionId, reference: reference, before: nil)
+                guard currentContext() else { return }
+                if let instance, page.instance != instance {
+                    throw VoxError.Failed(reason: "The saved room changed while refreshing its requests.")
+                }
+                if let row = page.entries.last(where: { $0.request?.reference == reference }) {
+                    current.append(row)
+                }
+            }
+            guard currentContext() else { return }
             var pages = sessionPages
             pages.refreshRequests(current)
             if pages != sessionPages {
@@ -2758,6 +2776,8 @@ extension NodeModel {
                 entry.request?.reference == selected && !sessionEntries.contains(where: { $0.id == entry.id })
             }
         } catch {
+            guard currentContext() else { return }
+            selectedEarlierRequest = nil
             reportBackground(error)
         }
     }
