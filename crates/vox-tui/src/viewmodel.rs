@@ -235,6 +235,15 @@ pub struct ChannelSummary {
     pub reachability: Reachability,
 }
 
+/// The bounded ordinary/All page currently published, independent of changing row contents.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct RoomPagePosition {
+    /// Exclusive ordinary display-order boundary.
+    pub before: Option<Digest32>,
+    /// Exclusive lifecycle boundary for All, in the daemon's total order.
+    pub lifecycle: Option<vox_core::node::sessions::LifecycleCursor>,
+}
+
 /// The fully-rendered active-channel view.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct ChannelView {
@@ -256,6 +265,8 @@ pub struct ChannelView {
     pub timeline: std::sync::Arc<Vec<MessageView>>,
     /// Messages before the oldest room page on screen; Up at the first loads another page.
     pub room_older: u64,
+    /// Published page position; navigation changes only after a successful read.
+    pub page: RoomPagePosition,
     /// Authoritative summaries for the General messages loaded here.
     pub threads: std::collections::BTreeMap<Digest32, ThreadSummaryView>,
     /// At most one thread's bounded reply page.
@@ -265,14 +276,26 @@ pub struct ChannelView {
     pub held_back: Vec<String>,
     /// The services shared in the room (V030-25, ADR-028 S-3).
     pub shared: Vec<SharedView>,
-    /// The room's Sessions, open and ended, newest opening first (ADR-029 CL-2).
+    /// The displayed bounded metadata page, in daemon opening order (ADR-029 CL-2).
     pub sessions: Vec<SessionView>,
+    /// This is a later metadata page; the first page remains directly reachable.
+    pub sessions_first: bool,
+    /// More metadata follows this displayed page.
+    pub sessions_more: bool,
+    /// Exact selected identity, independent of the displayed metadata page.
+    pub selected_session: Option<SessionView>,
+    /// Session opening/end notices for the loaded All range.
+    pub session_lifecycle: Vec<NoticeView>,
+    /// More lifecycle notices remain in the current ordinary-page range.
+    pub lifecycle_older: bool,
     /// The lines of the Session on screen, for a member with drive (ADR-029 SC-1): one per
     /// activity, in the words `vox room session` prints. Empty while none is shown.
     pub session_lines: Vec<SessionLineView>,
     /// How many older entries the Session on screen has before its lines (ADR-034 FR-4): a page
     /// of them loads when the person goes up past the oldest line shown.
     pub session_older: u64,
+    /// Exclusive boundary of the currently published selected-Session activity page.
+    pub session_before: Option<Digest32>,
     /// This channel's reachability.
     pub reachability: Reachability,
 }
@@ -501,6 +524,15 @@ impl std::fmt::Display for UiError {
 pub enum CommandStatus {
     /// The command succeeded.
     Done,
+    /// A typed Session selection resolved across the room's pages.
+    SessionShown {
+        /// Its room.
+        room: Digest32,
+        /// Its node.
+        node: Digest32,
+        /// Its exact Session id.
+        id: String,
+    },
     /// The action needs a running node that is not attached.
     NeedsNode,
     /// Not connected; the action could not be performed.
@@ -520,7 +552,7 @@ impl CommandStatus {
     #[must_use]
     pub fn message(&self) -> String {
         match self {
-            CommandStatus::Done => "done".to_owned(),
+            CommandStatus::Done | CommandStatus::SessionShown { .. } => "done".to_owned(),
             CommandStatus::NeedsNode => "needs a Ready node (unlock one to proceed)".to_owned(),
             CommandStatus::NotConnected => "not connected: action not performed".to_owned(),
             CommandStatus::Queued => "queued".to_owned(),
@@ -596,6 +628,27 @@ pub enum Command {
         channel_id: Digest32,
         /// The Session's node and the harness's session id.
         session: Option<(Digest32, String)>,
+        /// Include the bounded lifecycle page in All.
+        all: bool,
+    },
+    /// Resolve an explicit typed Session name/id across bounded pages before showing it.
+    FindSession {
+        /// The current room.
+        channel_id: Digest32,
+        /// Name, whole id or an id prefix.
+        typed: String,
+    },
+    /// Replace the displayed Session metadata page, returning to first or continuing next.
+    SessionsPage {
+        /// The room.
+        channel_id: Digest32,
+        /// Start at the first page instead of following the next cursor.
+        first: bool,
+    },
+    /// Return the selected Session to its latest activity page.
+    LatestSession {
+        /// The selected room.
+        channel_id: Digest32,
     },
     /// Load the page of the shown Session's entries before the oldest it shows (ADR-034 FR-4):
     /// the person went up past it.
@@ -604,6 +657,11 @@ pub enum Command {
         channel_id: Digest32,
         /// The Session's node and the harness's session id.
         session: (Digest32, String),
+    },
+    /// Return the ordinary/All timeline to its newest page.
+    LatestRoom {
+        /// The room on screen.
+        channel_id: Digest32,
     },
     /// Load the room page before its oldest shown message.
     OlderRoom {

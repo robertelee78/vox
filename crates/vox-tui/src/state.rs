@@ -327,12 +327,17 @@ pub enum SessionRow {
     Session(usize),
     /// The ended Sessions, apart (SE-5): this many; Enter shows or hides them.
     Ended(usize),
+    /// Replace the page with the first metadata page.
+    First,
+    /// Replace the page with the following metadata page.
+    Next,
 }
 
 /// The Sessions pane's rows: General, All, the open Sessions, then "Ended (N)" when any has
 /// ended, with the ended ones under it while `ended_open`.
 #[must_use]
-pub fn session_rows(sessions: &[SessionView], ended_open: bool) -> Vec<SessionRow> {
+pub fn session_rows(channel: &crate::viewmodel::ChannelView, ended_open: bool) -> Vec<SessionRow> {
+    let sessions = &channel.sessions;
     let mut rows = vec![SessionRow::General, SessionRow::All];
     rows.extend(
         sessions
@@ -352,6 +357,12 @@ pub fn session_rows(sessions: &[SessionView], ended_open: bool) -> Vec<SessionRo
         if ended_open {
             rows.extend(ended.into_iter().map(SessionRow::Session));
         }
+    }
+    if channel.sessions_first {
+        rows.push(SessionRow::First);
+    }
+    if channel.sessions_more {
+        rows.push(SessionRow::Next);
     }
     rows
 }
@@ -382,6 +393,10 @@ pub struct UiState {
     pub selected_member: Option<Digest32>,
     /// How many lines the timeline is scrolled up from its newest; 0 follows new messages.
     pub timeline_scroll: usize,
+    /// The last draw reached the oldest line of this bounded page (including lifecycle notices).
+    pub timeline_at_top: bool,
+    room_page: Option<crate::viewmodel::RoomPagePosition>,
+    session_before: Option<Digest32>,
     /// The message selected in the timeline, **by entry** (ADR-028 R-9, #485): what `r` replies
     /// to, and whose quote Enter jumps to. `None` follows the newest.
     pub selected_message: Option<Digest32>,
@@ -437,6 +452,9 @@ impl Default for UiState {
             selected_share: 0,
             selected_member: None,
             timeline_scroll: 0,
+            timeline_at_top: false,
+            room_page: None,
+            session_before: None,
             selected_message: None,
             reveal_selected: false,
             replying: None,
@@ -482,6 +500,22 @@ impl UiState {
             self.ended_open = false;
             self.selected_session_line = None;
             self.details_open = false;
+            self.room_page = None;
+            self.session_before = None;
+        }
+        if let Some(active) = vm.active.as_ref() {
+            if self.room_page != Some(active.page) {
+                self.room_page = Some(active.page);
+                self.timeline_scroll = 0;
+                self.timeline_at_top = false;
+                self.selected_message = None;
+                self.reveal_selected = false;
+            }
+            if self.session_before != active.session_before {
+                self.session_before = active.session_before;
+                self.selected_session_line = None;
+                self.details_open = false;
+            }
         }
         match self
             .selected_room
@@ -718,7 +752,7 @@ impl UiState {
                 let rows = vm
                     .active
                     .as_ref()
-                    .map(|c| session_rows(&c.sessions, self.ended_open))
+                    .map(|c| session_rows(c, self.ended_open))
                     .unwrap_or_default();
                 match rows.get(self.selected_session_row) {
                     Some(SessionRow::General) => self.show(Showing::General, vm),
@@ -732,6 +766,17 @@ impl UiState {
                     Some(SessionRow::Ended(_)) => {
                         self.ended_open = !self.ended_open;
                         Action::Redraw
+                    }
+                    Some(SessionRow::First | SessionRow::Next) => {
+                        let first =
+                            matches!(rows.get(self.selected_session_row), Some(SessionRow::First));
+                        self.selected_session_row = 0;
+                        match self.active_channel_id(vm) {
+                            Some(channel_id) => {
+                                Action::Dispatch(Command::SessionsPage { channel_id, first })
+                            }
+                            None => Action::Redraw,
+                        }
                     }
                     None => Action::Redraw,
                 }
@@ -898,9 +943,16 @@ impl UiState {
                     && self.focus == Focus::Timeline
                     && !matches!(self.showing, Showing::Session(..))
                 {
-                    if let Some(active) = vm.active.as_ref().filter(|c| c.room_older > 0) {
+                    if let Some(active) = vm.active.as_ref().filter(|c| {
+                        c.room_older > 0
+                            || (matches!(self.showing, Showing::All) && c.lifecycle_older)
+                    }) {
                         let first = room_messages(active, &self.showing).next();
                         if first.is_none_or(|row| self.selected_message == Some(row.entry_hash)) {
+                            if matches!(self.showing, Showing::All) && !self.timeline_at_top {
+                                self.timeline_scroll = self.timeline_scroll.saturating_add(1);
+                                return Action::Redraw;
+                            }
                             if let Some(channel_id) = self.active_channel_id(vm) {
                                 return Action::Dispatch(Command::OlderRoom { channel_id });
                             }
@@ -929,9 +981,16 @@ impl UiState {
                             .saturating_sub(TIMELINE_PAGE),
                     );
                 } else {
-                    if let Some(active) = vm.active.as_ref().filter(|c| c.room_older > 0) {
+                    if let Some(active) = vm.active.as_ref().filter(|c| {
+                        c.room_older > 0
+                            || (matches!(self.showing, Showing::All) && c.lifecycle_older)
+                    }) {
                         let first = room_messages(active, &self.showing).next();
-                        if first.is_none_or(|row| self.on_screen.contains(&row.entry_hash)) {
+                        if if matches!(self.showing, Showing::All) {
+                            self.timeline_at_top
+                        } else {
+                            first.is_none_or(|row| self.on_screen.contains(&row.entry_hash))
+                        } {
                             if let Some(channel_id) = self.active_channel_id(vm) {
                                 return Action::Dispatch(Command::OlderRoom { channel_id });
                             }
@@ -962,6 +1021,13 @@ impl UiState {
                 self.timeline_scroll = 0;
                 self.selected_message = None;
                 self.selected_session_line = None;
+                if matches!(self.showing, Showing::Session(..)) {
+                    if let Some(channel_id) = self.active_channel_id(vm) {
+                        return Action::Dispatch(Command::LatestSession { channel_id });
+                    }
+                } else if let Some(channel_id) = self.active_channel_id(vm) {
+                    return Action::Dispatch(Command::LatestRoom { channel_id });
+                }
                 Action::Redraw
             }
             _ => Action::Redraw,
@@ -1373,7 +1439,7 @@ impl UiState {
                 let len = vm
                     .active
                     .as_ref()
-                    .map_or(0, |c| session_rows(&c.sessions, self.ended_open).len());
+                    .map_or(0, |c| session_rows(c, self.ended_open).len());
                 if len > 0 {
                     self.selected_session_row = step(self.selected_session_row.min(len - 1), len);
                 }
@@ -1596,7 +1662,7 @@ impl UiState {
     }
 
     /// Show General, All or one Session; the composer is not a Session's (ADR-029 DR-1).
-    fn show(&mut self, showing: Showing, vm: &ViewModel) -> Action {
+    pub(crate) fn show(&mut self, showing: Showing, vm: &ViewModel) -> Action {
         if matches!(showing, Showing::Session(..)) && self.focus == Focus::Composer {
             self.focus = Focus::Timeline;
         }
@@ -1616,6 +1682,7 @@ impl UiState {
             Some(channel_id) => Action::Dispatch(Command::ShowSession {
                 channel_id,
                 session,
+                all: matches!(self.showing, Showing::All),
             }),
             None => Action::Redraw,
         }
@@ -1777,42 +1844,17 @@ pub fn showing_session<'a>(ui: &UiState, vm: &'a ViewModel) -> Option<&'a Sessio
     let Showing::Session(node, id) = &ui.showing else {
         return None;
     };
-    vm.active
-        .as_ref()?
-        .sessions
-        .iter()
-        .find(|x| x.node == *node && x.id == *id)
-}
-
-/// The one Session `name` names: its whole id, the first 8 or more characters of it, or its
-/// name. One that names none, or more than one, is refused, never guessed (ADR-029 DR-5).
-fn find_session<'a>(sessions: &'a [SessionView], name: &str) -> Result<&'a SessionView, String> {
-    if name.is_empty() {
-        return Err("which Session? :session <name or short id>".into());
-    }
-    let by_id: Vec<&SessionView> = sessions
-        .iter()
-        .filter(|x| x.id == name || (name.len() >= 8 && x.id.starts_with(name)))
-        .collect();
-    let found = if by_id.is_empty() {
-        sessions
-            .iter()
-            .filter(|x| x.name.as_deref() == Some(name))
-            .collect()
-    } else {
-        by_id
-    };
-    match found.as_slice() {
-        [one] => Ok(one),
-        [] => Err(format!("no Session in this room is named {name}")),
-        many => Err(format!(
-            "more than one Session is named {name}: {}",
-            many.iter()
-                .map(|x| x.label.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )),
-    }
+    let channel = vm.active.as_ref()?;
+    channel
+        .selected_session
+        .as_ref()
+        .filter(|x| x.node == *node && x.id == *id)
+        .or_else(|| {
+            channel
+                .sessions
+                .iter()
+                .find(|x| x.node == *node && x.id == *id)
+        })
 }
 
 /// Parse a `:`-command line, resolving selection-relative targets from `ui`/`vm`.
@@ -2013,11 +2055,40 @@ pub fn parse_command(line: &str, ui: &UiState, vm: &ViewModel) -> Option<Parsed>
         }
         "tag" => return Some(Parsed::Show(Showing::Tag(rest.to_owned()))),
         "session" => {
-            let sessions = vm.active.as_ref().map_or(&[][..], |c| &c.sessions[..]);
-            return Some(match find_session(sessions, rest) {
-                Ok(x) => Parsed::Show(Showing::Session(x.node, x.id.clone())),
-                Err(why) => Parsed::Refused(why),
-            });
+            return Some(Parsed::Core(Command::FindSession {
+                channel_id: channel,
+                typed: rest.to_owned(),
+            }))
+        }
+        "latest" => {
+            return Some(Parsed::Core(
+                if matches!(ui.showing, Showing::Session(..)) {
+                    Command::LatestSession {
+                        channel_id: channel,
+                    }
+                } else {
+                    Command::LatestRoom {
+                        channel_id: channel,
+                    }
+                },
+            ));
+        }
+        "sessions-first" => {
+            return Some(Parsed::Core(Command::SessionsPage {
+                channel_id: channel,
+                first: true,
+            }))
+        }
+        "sessions-next" => {
+            return Some(Parsed::Core(Command::SessionsPage {
+                channel_id: channel,
+                first: false,
+            }))
+        }
+        "session-latest" => {
+            return Some(Parsed::Core(Command::LatestSession {
+                channel_id: channel,
+            }))
         }
         "send" if !rest.is_empty() => return Some(Parsed::Send(channel, rest.to_owned())),
         // Share a file or folder here, from the composer (F-1): its words the note. `share`, as

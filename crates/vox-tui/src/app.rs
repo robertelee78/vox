@@ -1650,6 +1650,11 @@ fn event_loop(io: &mut impl TerminalIo, core: &mut impl CoreHandle) -> Result<()
                     Command::SelectChannel { .. }
                         | Command::ShowSession { .. }
                         | Command::OlderSession { .. }
+                        | Command::LatestSession { .. }
+                        | Command::LatestRoom { .. }
+                        | Command::OlderRoom { .. }
+                        | Command::SessionsPage { .. }
+                        | Command::FindSession { .. }
                 );
                 // **Waiting is said in the status line** (V210-100), never on stderr: stderr is
                 // this terminal, and a line written there lands inside the screen.
@@ -1657,7 +1662,16 @@ fn event_loop(io: &mut impl TerminalIo, core: &mut impl CoreHandle) -> Result<()
                     ui.status_message = Some(WAITING_FOR_PROFILE_TUI.into());
                     let _ = io.draw(&mut |f| render(f, &vm, &mut ui));
                 });
-                ui.status_message = if moving && matches!(status, CommandStatus::Done) {
+                if let CommandStatus::SessionShown { room, node, id } = &status {
+                    if ui.active_channel_id(&vm) == Some(*room) {
+                        let _ = ui.show(crate::state::Showing::Session(*node, id.clone()), &vm);
+                    }
+                }
+                ui.status_message = if moving
+                    && matches!(
+                        status,
+                        CommandStatus::Done | CommandStatus::SessionShown { .. }
+                    ) {
                     None
                 } else {
                     Some(status.message())
