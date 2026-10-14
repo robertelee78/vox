@@ -229,18 +229,22 @@ struct RequestView: View {
     let request: FfiRequest
     /// What the request asks, as its entry's line says it: its buttons name it to VoiceOver.
     let about: String
+    /// False when the containing row already shows every question and option description.
+    let showsQuestionText: Bool
     @State private var why = ""
     /// Each part's chosen option, by its index, for a question of several parts.
     @State private var chosen: [Int: String] = [:]
     @State private var said = ""
     @State private var busy = false
 
-    init(model: NodeModel, room: String, session: FfiSession, request: FfiRequest, about: String = "") {
+    init(model: NodeModel, room: String, session: FfiSession, request: FfiRequest, about: String = "",
+         showsQuestionText: Bool = true) {
         self.model = model
         self.room = room
         self.session = session
         self.request = request
         self.about = about
+        self.showsQuestionText = showsQuestionText
     }
 
     var body: some View {
@@ -288,7 +292,7 @@ struct RequestView: View {
         return VStack(alignment: .leading, spacing: Space.s8 * scale) {
             ForEach(parts.indices, id: \.self) { i in
                 VStack(alignment: .leading, spacing: Space.s4 * scale) {
-                    Text(parts[i].text)
+                    if showsQuestionText { Text(parts[i].text) }
                     HStack(spacing: Space.s8 * scale) {
                         ForEach(parts[i].options.indices, id: \.self) { n in
                             let option = parts[i].options[n]

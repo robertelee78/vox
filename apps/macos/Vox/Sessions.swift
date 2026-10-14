@@ -180,9 +180,9 @@ struct RoomTabs: View {
     }
 }
 
-/// One entry of a Session, to a member with drive (CL-1): its one line, word for word as `vox room
-/// session` prints it, and its Details (the full input and output) when asked; an open request's
-/// answers (SessionDrive.swift), or its state once it is resolved or not answerable.
+/// One entry of a Session, to a member with drive (CL-1, LY-5): a tool step folds to one line
+/// with expandable Details. Replies, questions and approvals keep their full content visible,
+/// with an open request's answers or its state once it is resolved or not answerable.
 struct SessionEntryRow: View {
     @Environment(\.voxTextScale) private var scale
     @ObservedObject var model: NodeModel
@@ -194,6 +194,10 @@ struct SessionEntryRow: View {
     let look: (URL) -> Void
     @State private var details = false
 
+    private var fullContent: Bool {
+        ["reply", "question", "approval"].contains(entry.kind)
+    }
+
     var body: some View {
         let reference = entry.request?.reference
         VStack(alignment: .leading, spacing: Space.s4 * scale) {
@@ -201,11 +205,26 @@ struct SessionEntryRow: View {
             // the row is selected like a message (P14), the request as the one ⌥⌘Y and ⌥⌘N act
             // on (P1), and neither takes the other's place.
             VStack(alignment: .leading, spacing: Space.s4 * scale) {
-                Text(entry.line).voxFont(VoxTokens.Fonts.appMono).textSelection(.enabled)
-                    .accessibilityIdentifier("entry-line-\(entry.id)")
+                if entry.kind == "tool" {
+                    HStack(alignment: .firstTextBaseline, spacing: Space.s8 * scale) {
+                        summary.lineLimit(1)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        if !entry.details.isEmpty { detailsButton }
+                    }
+                } else {
+                    summary
+                }
+                if fullContent && !entry.details.isEmpty {
+                    // Approval Details are the tool's input; replies and questions are prose.
+                    Text(entry.details).voxFont(entry.kind == "approval"
+                        ? VoxTokens.Fonts.appMono : VoxTokens.Fonts.appText)
+                        .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
+                        .accessibilityIdentifier("entry-content-\(entry.id)")
+                }
                 if let request = entry.request {
                     RequestView(model: model, room: room, session: session, request: request,
-                                about: entry.line)
+                                about: entry.line,
+                                showsQuestionText: !(fullContent && !entry.details.isEmpty))
                 }
             }
             // A request is selected by clicking it: what ⌥⌘Y and ⌥⌘N act on (P1).
@@ -220,17 +239,28 @@ struct SessionEntryRow: View {
                     }
                 }
             }
-            if !entry.details.isEmpty {
-                Button(details ? "Hide details" : "Details") { details.toggle() }
-                    .buttonStyle(.borderless)
-                    .accessibilityIdentifier("entry-details-\(entry.id)")
+            if !fullContent && !entry.details.isEmpty {
+                if entry.kind != "tool" { detailsButton }
                 if details {
                     Text(entry.details).voxFont(VoxTokens.Fonts.appMono).secondaryText().textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
                         .accessibilityIdentifier("entry-details-text-\(entry.id)")
                 }
             }
         }
         .voxPadding(.horizontal, Space.s4)
+    }
+
+    private var summary: some View {
+        Text(entry.line).voxFont(fullContent ? VoxTokens.Fonts.appText : VoxTokens.Fonts.appMono)
+            .textSelection(.enabled)
+            .accessibilityIdentifier("entry-line-\(entry.id)")
+    }
+
+    private var detailsButton: some View {
+        Button(details ? "Hide details" : "Details") { details.toggle() }
+            .buttonStyle(.borderless).fixedSize()
+            .accessibilityIdentifier("entry-details-\(entry.id)")
     }
 }
 
