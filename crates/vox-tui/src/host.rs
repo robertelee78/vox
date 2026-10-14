@@ -4217,47 +4217,106 @@ const TITLE_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
 /// Claude Code's own title only while there is none, as the hooks read them
 /// (`agent_hook::session_name`).
 ///
-/// Nothing else of the transcript is kept: each read's lines are dropped once their titles are
-/// taken, and only a line not yet ended is held until the next read ends it.
+/// Nothing else of the transcript is kept. The scanner retains offsets and a tiny marker
+/// match, including across incomplete lines. A complete title line is parsed from the file;
+/// unrelated JSON values are skipped, never collected as a transcript body.
 #[derive(Default)]
 struct Titles {
-    /// Bytes read so far.
+    /// Bytes scanned so far, including a line not yet ended.
     offset: u64,
-    /// A line read only in part, finished by the next read.
-    partial: String,
+    /// Start of the unfinished line. Its bytes remain in the transcript, not in memory.
+    line_start: u64,
+    marker_match: usize,
+    has_title: bool,
     custom: Option<String>,
+    made: Option<String>,
+}
+
+/// Deserialize just the current name fields. Unknown fields use Serde's streaming skip path,
+/// so even a title record beside a large tool result does not allocate that result.
+#[derive(serde::Deserialize)]
+struct TranscriptTitle {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default, rename = "customTitle")]
+    custom: Option<String>,
+    #[serde(default, rename = "aiTitle")]
     made: Option<String>,
 }
 
 impl Titles {
     fn read(mut self, path: &std::path::Path) -> Self {
         use std::io::{Read as _, Seek as _, SeekFrom};
+        const MARKER: &[u8] = b"-title\"";
         let Ok(mut file) = std::fs::File::open(path) else {
             return self;
         };
-        // A transcript that got shorter was written anew: read from its start.
-        if file.metadata().is_ok_and(|m| m.len() < self.offset) {
-            self = Self::default();
-        }
-        if file.seek(SeekFrom::Start(self.offset)).is_err() {
-            return self;
-        }
-        let mut bytes = Vec::new();
-        let Ok(n) = file.read_to_end(&mut bytes) else {
+        let Ok(metadata) = file.metadata() else {
             return self;
         };
-        self.offset += n as u64;
-        self.partial.push_str(&String::from_utf8_lossy(&bytes));
-        let done = self.partial.rfind('\n').map_or(0, |i| i + 1);
-        let lines: String = self.partial.drain(..done).collect();
-        for line in lines.lines().filter(|l| l.contains("-title\"")) {
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-                continue;
+        // A transcript that got shorter was written anew: read from its start.
+        if metadata.len() < self.offset {
+            self = Self::default();
+        }
+        // A fixed end avoids following a busy writer forever during this blocking read.
+        let end = metadata.len();
+        let mut bytes = [0_u8; 8192];
+        while self.offset < end {
+            if file.seek(SeekFrom::Start(self.offset)).is_err() {
+                break;
+            }
+            let take = usize::try_from((end - self.offset).min(bytes.len() as u64))
+                .expect("a transcript chunk fits usize");
+            let n = match file.read(&mut bytes[..take]) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
             };
-            match v["type"].as_str() {
-                Some("custom-title") => self.custom = v["customTitle"].as_str().map(str::to_owned),
-                Some("ai-title") => self.made = v["aiTitle"].as_str().map(str::to_owned),
-                _ => {}
+            for byte in &bytes[..n] {
+                self.offset += 1;
+                if *byte != b'\n' {
+                    if !self.has_title {
+                        if *byte == MARKER[self.marker_match] {
+                            self.marker_match += 1;
+                            self.has_title = self.marker_match == MARKER.len();
+                        } else {
+                            // The marker has no '-' after its first byte, so this is also its
+                            // only possible overlapping start.
+                            self.marker_match = usize::from(*byte == MARKER[0]);
+                        }
+                    }
+                    continue;
+                }
+                if self.has_title {
+                    // Reread only a complete candidate, with fixed-size I/O buffers. There is
+                    // no maximum line length that could silently discard a valid rename.
+                    if file.seek(SeekFrom::Start(self.line_start)).is_err() {
+                        self.offset = self.line_start;
+                        self.marker_match = 0;
+                        self.has_title = false;
+                        return self;
+                    }
+                    let line = (&mut file).take(self.offset - self.line_start);
+                    match serde_json::from_reader::<_, TranscriptTitle>(std::io::BufReader::new(
+                        line,
+                    )) {
+                        Ok(title) => match title.kind.as_str() {
+                            "custom-title" => self.custom = title.custom,
+                            "ai-title" => self.made = title.made,
+                            _ => {}
+                        },
+                        // Retry an I/O failure from this line's beginning on the next read.
+                        Err(e) if e.is_io() => {
+                            self.offset = self.line_start;
+                            self.marker_match = 0;
+                            self.has_title = false;
+                            return self;
+                        }
+                        Err(_) => {}
+                    }
+                }
+                self.line_start = self.offset;
+                self.marker_match = 0;
+                self.has_title = false;
             }
         }
         self
