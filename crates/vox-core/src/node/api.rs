@@ -1181,6 +1181,8 @@ pub enum Fault {
     /// Not [`Fault::Internal`], which is how an unlock that met one was reported (V210-100):
     /// nothing was wrong with vox or the profile, and stopping the other one is the remedy.
     ProfileBusy,
+    /// Local pairwise delivery capacity is occupied; no new key was sealed or grant recorded.
+    DeliveryBusy,
     /// Making an identity, its file (`vault.cbor`) could not be written. Not [`Fault::Storage`],
     /// which named the store when the store was fine (V210-77).
     IdentityFileUnwritable,
@@ -1400,6 +1402,9 @@ impl Fault {
             Fault::ProfileBusy => {
                 "another vox holds this node open, and only one at a time may write it\n       run this again once that one is done; a `vox daemon` or `vox tui` holds it until stopped, and the `vox room …` verbs ask it instead"
             }
+            Fault::DeliveryBusy => {
+                "this node's key-delivery capacity is busy; the key waits locally\n       existing deliveries are retried; no new grant was recorded by this attempt"
+            }
             Fault::RetentionFileUnwritable => {
                 "your retention for this room could not be saved: the node's retention file (`retention`, in its configuration directory) could not be written\n       check free disk space, and that the configuration directory is writable; then run it again"
             }
@@ -1614,6 +1619,7 @@ fault_names!(
     KeyringFull,
     Storage,
     ProfileBusy,
+    DeliveryBusy,
     IdentityFileUnwritable,
     RetentionFileUnwritable,
     SealedUnreadable,

@@ -363,6 +363,10 @@ const T_ADMINS: u64 = 35;
 const T_RENAME_ROOM: u64 = 36;
 /// Room anchor governance (ADR-032 AN-5); no identity-passphrase gate.
 const T_ROOM_ANCHORS: u64 = 781;
+/// Read one room's signed anchor configuration, without machine/other-room sources.
+const T_ROOM_ANCHORS_READ: u64 = 782;
+/// The exact room-owned anchors returned by [`Request::RoomAnchors`].
+const T_ROOM_ANCHORS_CONFIG: u64 = 783;
 /// `NodeEvent::RoomEnded` and `NodeEvent::RoomRemoved` (V030-08). Additive.
 const T_ROOM_ENDED: u64 = 2440;
 const T_ROOM_REMOVED: u64 = 2441;
@@ -792,6 +796,12 @@ pub enum Request {
         channel_id: Digest32,
         /// Seconds a Session step is kept; zero means forever, still bounded by messages.
         seconds: u64,
+    },
+    /// Read an open room's own signed anchors, answered as [`Frame::RoomAnchors`].
+    /// Stale or unavailable observations are errors, never an empty configuration.
+    RoomAnchors {
+        /// The room.
+        channel_id: Digest32,
     },
     /// Add/remove room anchors by appending the resulting complete signed set (ADR-032 AN-5).
     ChangeRoomAnchors {
@@ -1311,6 +1321,9 @@ impl Request {
             Request::Create { name, passphrase } => {
                 e.array(3).uint(T_CREATE).text(name).text(passphrase);
             }
+            Request::RoomAnchors { channel_id } => {
+                e.array(2).uint(T_ROOM_ANCHORS_READ).bytes(channel_id);
+            }
             Request::ChangeRoomAnchors {
                 channel_id,
                 add,
@@ -1747,6 +1760,12 @@ impl Request {
                     petname,
                     identity_passphrase,
                 })
+            }
+            (T_ROOM_ANCHORS_READ, 2) => {
+                let channel_id = digest(&mut d)?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::RoomAnchors { channel_id })
             }
             (T_ROOM_ANCHORS, 4) => {
                 let channel_id = digest(&mut d)?;
@@ -2263,6 +2282,11 @@ pub enum Frame {
         /// The bound local address.
         local: String,
     },
+    /// One room's signed anchor configuration, with no machine or other-room union.
+    RoomAnchors {
+        /// The room-owned fingerprints and their exact addresses.
+        anchors: crate::nat::bootstrap::BootstrapSet,
+    },
     /// The invite link a [`Request::Invite`] asked for.
     Link {
         /// The `vox://` address.
@@ -2447,6 +2471,11 @@ impl Frame {
                 for (h, clock) in entries {
                     e.array(2).bytes(h).uint(*clock);
                 }
+            }
+            Frame::RoomAnchors { anchors } => {
+                e.array(2)
+                    .uint(T_ROOM_ANCHORS_CONFIG)
+                    .bytes(&anchors.to_bytes());
             }
             Frame::Members { members } => {
                 e.array(2).uint(T_MEMBERS).array(members.len());
@@ -3141,6 +3170,11 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 entries.push((h, clock));
             }
             return Ok(Frame::Order { entries });
+        }
+        (T_ROOM_ANCHORS_CONFIG, 2) => {
+            return Ok(Frame::RoomAnchors {
+                anchors: crate::nat::bootstrap::BootstrapSet::from_bytes(d.bytes()?)?,
+            });
         }
         (T_MEMBERS, 2) => {
             let n = d.array().map_err(|_| Error::MalformedIpc("ipc members"))?;
@@ -5030,6 +5064,20 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 },
             },
         },
+        Request::RoomAnchors { channel_id } => {
+            let view = handle.view();
+            if !view.open_channels.iter().any(|room| room.channel_id == channel_id) {
+                return Frame::Error { reason: "room not open".into() };
+            }
+            if let Some(error) = view.anchor_inventory_error {
+                return Frame::Error { reason: format!("room anchors could not be read: {error}") };
+            }
+            match view.room_anchors.iter().find(|room| room.room == channel_id) {
+                Some(room) if !room.stale => Frame::RoomAnchors { anchors: room.anchors.clone() },
+                Some(_) => Frame::Error { reason: "room anchors have not refreshed yet; try again".into() },
+                None => Frame::Error { reason: "room anchors are not available yet; try again".into() },
+            }
+        }
         Request::ChangeRoomAnchors { channel_id, add, remove } => match handle
             .apply(crate::node::api::NodeCommand::ChangeRoomAnchors { channel_id, add, remove })
             .await

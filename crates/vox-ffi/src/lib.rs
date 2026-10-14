@@ -41,8 +41,9 @@ pub use client::{
     config_dir, room_group, room_group_words, AnchorReachSummary, AnchorSourceSummary,
     AnchorSummary, ClientListener, DecisionEvent, FileOffer, FileShare, IndividualTrustEligibility,
     Member, NodeSummary, NodeView, OfferedService, Passphrase, PulledFile, ReadBy,
-    RoomAnchorAuthority, RoomConsents, RoomGroup, RoomLink, RoomMessage, RoomServices, RoomSummary,
-    SharedService, ThreadAuthor, ThreadSummary, TrustedNode, UnreadLevel, VoxClient,
+    RoomAnchorAuthority, RoomAnchorConfiguration, RoomAnchorEndpoint, RoomConsents, RoomGroup,
+    RoomLink, RoomMessage, RoomServices, RoomSummary, SharedService, ThreadAuthor, ThreadSummary,
+    TrustedNode, UnreadLevel, VoxClient,
 };
 pub use computer::{
     ComputerApplication, ComputerBindingAction, ComputerIdentity, ComputerNode, ComputerStatus,
