@@ -1,5 +1,6 @@
 // The daemon owns the machine's anchors. Settings changes only manual sources; a room's
-// inspector reads its source from that same inventory and never grants dialing authority.
+// inspector reads its signed room endpoints separately from machine-wide identity reach.
+// Neither presentation grants dialing authority.
 import SwiftUI
 
 @MainActor
@@ -131,25 +132,147 @@ struct NetworkSettingsView: View {
     }
 }
 
-/// The selected room's source in the same machine list, including its honest stale/unknown state.
+/// The selected room's signed endpoints, with separately labelled machine identity reach
+/// and honest last-known configuration when an authoritative refresh is unavailable.
 struct RoomAnchorsView: View {
+    @ObservedObject var model: NodeModel
     let room: String
-    @StateObject private var model = AnchorNetworkModel()
 
     var body: some View {
-        let anchors = model.anchors.filter { $0.sources.contains { $0.room == room } }
         VStack(alignment: .leading, spacing: Space.s8) {
-            if !model.loaded && model.busy { ProgressView("Reading anchors…") }
-            if model.loaded && model.reachable && anchors.isEmpty { Text("This room has no anchors.").secondaryText() }
-            ForEach(anchors, id: \.fingerprint) { anchor in
-                AnchorNetworkRow(anchor: anchor, reachable: model.reachable)
-            }
-            if let problem = model.actionProblem ?? model.problem {
-                Text(problem).secondaryText().fixedSize(horizontal: false, vertical: true)
-                    .accessibilityIdentifier("room-anchors-problem")
+            if model.roomOnScreen == room {
+                if model.roomAnchorLoading { ProgressView("Reading anchors…") }
+                if model.roomAnchorSnapshotCurrent, !model.roomAnchorLoading,
+                   model.roomAnchorEntries.isEmpty {
+                    Text("This room has no anchors.").secondaryText()
+                }
+                ForEach(model.roomAnchorSnapshotKnown ? model.roomAnchorEntries : [], id: \.fingerprint) { anchor in
+                    VStack(alignment: .leading, spacing: Space.s4) {
+                        Text(String(anchor.fingerprint.prefix(12))).font(Theme.mono)
+                        // Addresses come only from this room's authenticated configuration;
+                        // the machine inventory's union is never presented as its endpoints.
+                        Text(anchor.addresses.joined(separator: ", ")).font(Theme.mono)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Text("from room " + model.roomName(room)
+                             + (model.roomAnchorSnapshotCurrent ? "" : " (last known configuration)"))
+                            .secondaryText()
+                        Text("Identity reach across this machine's sources: "
+                             + (model.roomAnchorSnapshotCurrent && model.roomAnchorReachError == nil
+                                ? (model.roomAnchorReach[anchor.fingerprint] ?? "No current observation.")
+                                : "unavailable; last known: " + (model.roomAnchorReach[anchor.fingerprint] ?? "none")))
+                            .secondaryText().accessibilityIdentifier("anchor-reach-" + anchor.fingerprint)
+                    }
+                    .textSelection(.enabled)
+                    .accessibilityElement(children: .contain)
+                    .accessibilityIdentifier("anchor-row-" + anchor.fingerprint)
+                }
+                if !model.roomAnchorSnapshotCurrent && model.roomAnchorSnapshotKnown {
+                    Text("Room configuration unavailable; showing last known configuration.").secondaryText()
+                }
+                if !model.roomAnchorSnapshotKnown && !model.roomAnchorLoading,
+                   (!model.daemonReachable || model.ended != nil) {
+                    Text("Room configuration unavailable; no saved snapshot for this room.").secondaryText()
+                }
+                if let problem = model.roomAnchorError ?? model.roomAnchorReachError {
+                    Text(problem).secondaryText().fixedSize(horizontal: false, vertical: true)
+                        .accessibilityIdentifier("room-anchors-problem")
+                }
             }
         }
         .accessibilityIdentifier("room-anchors")
-        .task { await model.follow() }
+        .task(id: model.me + "/" + room) {
+            // Use the selected node's held client and its room/actor/request fences. No
+            // independent account client can leak another actor's inventory into this room.
+            while !Task.isCancelled, model.roomOnScreen == room, model.ended == nil {
+                await model.loadRoomAnchorState()
+                do { try await Task.sleep(for: .seconds(3)) }
+                catch { return }
+            }
+        }
+    }
+}
+
+
+/// One explicit input field is reusable by New Room once its authenticated search/creation
+/// handoff (#782) exists. Typing here alone never dials or writes a manual anchor.
+struct RoomAnchorInput: View {
+    @Binding var input: String
+    let busy: Bool
+    let allowed: Bool
+    let add: () -> Void
+    var body: some View {
+        HStack {
+            TextField("fingerprint@address or host:port", text: $input)
+                .disabled(busy)
+                .accessibilityIdentifier("room-anchor-input")
+                .onSubmit { if allowed && !busy { add() } }
+            Button("Add Anchor", action: add)
+                .disabled(!allowed || busy || input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .accessibilityIdentifier("room-anchor-add")
+        }
+    }
+}
+
+/// Only selected-room signed governance is changed; machine manual sources remain independent.
+struct RoomAnchorEditor: View {
+    @ObservedObject var model: NodeModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var input = ""
+    var body: some View {
+        VStack(alignment: .leading, spacing: Space.s16) {
+            Text("Room Anchors").font(.title2)
+            Text("Anchors bridge peers that cannot connect directly. Changes apply to this room's members only; direct connections do not need one.")
+                .secondaryText().fixedSize(horizontal: false, vertical: true)
+            RoomAnchorInput(input: $input, busy: model.roomAnchorChanging,
+                            allowed: model.canManageRoomAnchors) {
+                let value = input.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !value.isEmpty else { return }
+                Task { if await model.changeRoomAnchor(input: value) { input = "" } }
+            }
+            ScrollView {
+                VStack(alignment: .leading, spacing: Space.s16) {
+                    if model.roomAnchorEntries.isEmpty && model.roomAnchorError == nil && !model.roomAnchorLoading {
+                        Text("This room has no anchors.").secondaryText()
+                    }
+                    ForEach(model.roomAnchorEntries, id: \.fingerprint) { anchor in
+                        HStack(alignment: .top) {
+                            VStack(alignment: .leading, spacing: Space.s4) {
+                                Text(anchor.fingerprint).font(Theme.mono).textSelection(.enabled)
+                                Text(anchor.addresses.joined(separator: ", ")).font(Theme.mono)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                Text(model.roomAnchorError == nil
+                                     ? "From this room's configuration."
+                                     : "Room configuration unavailable; showing last known configuration.")
+                                    .secondaryText()
+                                Text("Identity reach across this machine's sources: "
+                                     + (model.roomAnchorReachError == nil
+                                        ? (model.roomAnchorReach[anchor.fingerprint] ?? "No current observation.")
+                                        : "unavailable; last known: " + (model.roomAnchorReach[anchor.fingerprint] ?? "none")))
+                                    .secondaryText()
+                                    .accessibilityIdentifier("room-anchor-reach-" + anchor.fingerprint)
+                            }
+                            Spacer()
+                            Button("Remove from Room") {
+                                Task { await model.changeRoomAnchor(removing: anchor.fingerprint) }
+                            }
+                            .disabled(!model.canManageRoomAnchors || model.roomAnchorChanging)
+                            .accessibilityIdentifier("room-anchor-remove-" + anchor.fingerprint)
+                        }
+                    }
+                }.frame(maxWidth: .infinity, alignment: .leading)
+            }
+            if model.roomAnchorChanging || model.roomAnchorLoading { ProgressView("Checking with Vox…") }
+            if let problem = model.roomAnchorError {
+                Text(problem).foregroundStyle(VoxTokens.Colors.danger)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("room-anchor-problem")
+            }
+            HStack { Spacer(); Button("Done") { dismiss() }.keyboardShortcut(.defaultAction) }
+        }
+        .padding(Space.s24)
+        .frame(width: Theme.scaled(600), height: Theme.scaled(480))
+        .contentSurface()
+        .accessibilityIdentifier("room-anchor-editor")
+        .task { await model.loadRoomAnchorState() }
     }
 }
