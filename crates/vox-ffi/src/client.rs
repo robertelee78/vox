@@ -1373,12 +1373,25 @@ impl Held {
         again.using.attach = AttachMode::Hold;
         self.client = IpcClient::open_at(&again)
             .await
-            .map_err(|e| VoxError::Unreachable {
-                reason: format!(
+            .map_err(|e| {
+                let contextual = |reason| {
+                    format!(
                     "the app's connection to node {} broke, and a new one could not be opened: {}",
-                    self.node,
-                    said(&self.at.path, e)
-                ),
+                    self.node, reason
+                )
+                };
+                match said(&self.at.path, e) {
+                    VoxError::Unreachable { reason } => VoxError::Unreachable {
+                        reason: contextual(reason),
+                    },
+                    VoxError::Unknown { reason } => VoxError::Unknown {
+                        reason: contextual(reason),
+                    },
+                    VoxError::Failed { reason } => VoxError::Failed {
+                        reason: contextual(reason),
+                    },
+                    other => other,
+                }
             })?
             .with_answer_bound(REQUEST_WITHIN);
         Ok(())
@@ -1409,8 +1422,16 @@ pub struct VoxClient {
 /// A failure to reach the daemon, said for a person.
 /// The sentence vox-core writes for it, which the CLI shows too (ADR-028 E-7).
 fn said(socket: &std::path::Path, e: Error) -> VoxError {
-    VoxError::Unreachable {
-        reason: vox_core::node::daemonipc::unreached(socket, None, e),
+    use vox_core::error::IpcHandshake;
+    let unreachable = matches!(&e, Error::Ipc(IpcHandshake::Unreachable { .. }));
+    let uncertain = matches!(&e, Error::Ipc(IpcHandshake::RequestTimedOut { .. }));
+    let reason = vox_core::node::daemonipc::unreached(socket, None, e);
+    if unreachable {
+        VoxError::Unreachable { reason }
+    } else if uncertain {
+        VoxError::Unknown { reason }
+    } else {
+        VoxError::Failed { reason }
     }
 }
 
