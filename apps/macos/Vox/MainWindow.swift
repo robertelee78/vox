@@ -2596,6 +2596,11 @@ private struct ThreadSummaryLine: View {
                 .buttonStyle(.plain)
                 .help("Last reply: " + TimelineTime.full(summary.lastReplyMillis))
                 .accessibilityIdentifier("thread-summary-" + message.id)
+                if model.threadAuthorsPaged.contains(message.id) {
+                    Button("First repliers") { model.firstThreadAuthors(message.id) }
+                        .buttonStyle(.plain)
+                        .accessibilityIdentifier("thread-authors-first-" + message.id)
+                }
                 if summary.nextAuthor != nil {
                     Button("More repliers") { Task { await model.moreThreadAuthors(message.id) } }
                         .buttonStyle(.plain)

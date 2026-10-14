@@ -175,6 +175,7 @@ final class NodeModel: ObservableObject {
     private var threadRefreshDirty = false
     private var threadDisplayRevision: String?
     private var threadForcedSummaries: Set<String> = []
+    @Published private(set) var threadAuthorsPaged: Set<String> = []
     private var threadRefreshTask: Task<Void, Never>?
     private var threadPageTask: Task<Void, Never>?
 
@@ -3287,6 +3288,7 @@ extension NodeModel {
         threadRefreshDirty = false
         threadDisplayRevision = nil
         threadForcedSummaries = []
+        threadAuthorsPaged = []
         threadSummaryVersions = [:]
         threadAuthorRequests = [:]
         threadPageDirty = false
@@ -3341,6 +3343,7 @@ extension NodeModel {
                     // A refused revision is not permission to retain formerly readable bodies.
                     self.threadDisplayRevision = nil
                     self.threadSummaries = [:]
+                    self.threadAuthorsPaged = []
                     self.threadSummaryVersions = [:]
                     self.threadAuthorRequests = [:]
                     self.retireThreadSelection()
@@ -3368,6 +3371,7 @@ extension NodeModel {
                 self.threadSummaryVersions = self.threadSummaryVersions.filter { known.contains($0.key) }
                 self.threadAuthorRequests = self.threadAuthorRequests.filter { known.contains($0.key) }
                 self.threadForcedSummaries.formIntersection(known)
+                self.threadAuthorsPaged.formIntersection(known)
                 let forced = self.threadForcedSummaries
                 self.threadForcedSummaries = []
                 for root in roots where changed || forced.contains(root)
@@ -3380,6 +3384,7 @@ extension NodeModel {
                             throw VoxError.Failed(reason: "The reply summary belongs to another message.")
                         }
                         self.threadSummaries[root] = summary
+                        self.threadAuthorsPaged.remove(root)
                         self.threadSummaryVersions[root] = UUID()
                         self.threadSummaryErrors[root] = nil
                     } catch {
@@ -3592,6 +3597,11 @@ extension NodeModel {
         }
     }
 
+    func firstThreadAuthors(_ root: String) {
+        threadForcedSummaries.insert(root)
+        scheduleThreadRefresh()
+    }
+
     func moreThreadAuthors(_ root: String) async {
         guard let room = roomOnScreen, let held = threadSummaries[root],
               let after = held.nextAuthor, ended == nil else { return }
@@ -3617,17 +3627,17 @@ extension NodeModel {
             guard page.root == root, page.nextAuthor != after else {
                 throw VoxError.Failed(reason: "The thread's author page did not advance.")
             }
-            // Only combine pages from the same authoritative count/time snapshot.
+            // Replace the author window only within the same authoritative count/time snapshot.
             guard page.replyCount == held.replyCount, page.lastReplyMillis == held.lastReplyMillis else {
                 threadForcedSummaries.insert(root)
                 scheduleThreadRefresh()
                 return
             }
-            let known = Set(held.authors.map(\.fingerprint))
             threadSummaries[root] = ThreadSummary(root: root, replyCount: held.replyCount,
                 lastReplyMillis: held.lastReplyMillis,
-                authors: held.authors + page.authors.filter { !known.contains($0.fingerprint) },
+                authors: page.authors,
                 nextAuthor: page.nextAuthor)
+            threadAuthorsPaged.insert(root)
             threadSummaryVersions[root] = UUID()
         } catch {
             guard current() else { return }
