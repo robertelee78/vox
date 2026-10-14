@@ -485,7 +485,11 @@ impl ChannelState {
         self.private_sessions.pending_active = true;
         self.private_sessions.pending_after = None;
         self.private_sessions.pending_through = self.private_sessions.next;
-        if !self.private_sessions.upgrading && !self.private_sessions.restoring {
+        if !self.private_sessions.upgrading
+            && !self.private_sessions.restoring
+            && self.private_sessions.legacy_work.is_none()
+            && self.private_sessions.legacy_pending.is_empty()
+        {
             let result = self.advance_pending_private(store, now).map(|_| ());
             if let Err(error) = &result {
                 self.private_save_failed(error);
