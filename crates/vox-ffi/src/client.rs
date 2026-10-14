@@ -2560,6 +2560,41 @@ impl VoxClient {
         })
     }
 
+    /// Read the exact retained, readable thread root without paging General history.
+    /// Missing, expired or opaque roots return none. Authorization is the existing Find
+    /// boundary of this selected node; no cached body is used for recovery.
+    ///
+    /// # Errors
+    /// A malformed room/root id, a closed room, or the node's refusal.
+    pub async fn thread_root(
+        &self,
+        room: String,
+        root: String,
+    ) -> Result<Option<RoomMessage>, VoxError> {
+        let channel_id = digest(&room, "room id")?;
+        let root = digest(&root, "thread root")?;
+        on_held!(self, |c| {
+            let names = names(c).await?;
+            let me = c.me().map(|fingerprint| b32_encode(&fingerprint));
+            match ask(
+                c,
+                &Request::Find {
+                    channel_id,
+                    entries: vec![root],
+                },
+            )
+            .await?
+            {
+                Frame::Rows { rows } => Ok(rows
+                    .iter()
+                    .find(|row| row.entry_hash == root && !row.owed)
+                    .map(|row| rendered(row, &names, me.as_deref()))
+                    .filter(|message| message.thread.is_empty())),
+                other => Err(unexpected(&other)),
+            }
+        })
+    }
+
     /// Opaque equality token for the selected room's published display. It changes when the
     /// readable timeline changes (including late fills and expiry), on room reopen, or when
     /// display names change. Actor restart changes the token even when this client repairs its
