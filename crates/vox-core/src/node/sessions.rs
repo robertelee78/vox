@@ -275,6 +275,40 @@ pub fn of_room(handle: &NodeHandle, room: &Digest32) -> Vec<SessionRow> {
         .unwrap_or_default()
 }
 
+/// Exact own/current-author lookup. Each retry advances one bounded storage page;
+/// neither the actor nor a waiting client retains all Session metadata.
+pub(crate) async fn lookup(
+    handle: &NodeHandle,
+    room: Digest32,
+    node: Digest32,
+    id: &str,
+) -> Result<Option<crate::node::channel::session_projection::Row>, String> {
+    use crate::node::channel::session_projection::{Query, Reply};
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        match handle
+            .session_projection(
+                room,
+                Query::Lookup {
+                    node,
+                    id: id.to_owned(),
+                },
+            )
+            .await
+        {
+            Ok(Reply::Lookup(row)) => return Ok(row),
+            Ok(_) => return Err("unexpected Session lookup answer".into()),
+            Err(reason)
+                if reason == "the room is refreshing saved Sessions; retry"
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::task::yield_now().await
+            }
+            Err(reason) => return Err(reason),
+        }
+    }
+}
+
 /// What a session tells its node about itself, for its Session's records.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Opening {
@@ -304,14 +338,19 @@ pub async fn open_when_member(
         .as_ref()
         .map(|i| i.fingerprint)
         .ok_or_else(|| "the node is locked".to_owned())?;
-    let rows = of_room(handle, &room);
-    let open = rows
-        .iter()
-        .find(|s| s.node == me && s.id == session.id && s.open);
+    let open = lookup(handle, room, me, &session.id)
+        .await?
+        .filter(|row| row.open);
     // **A rename is said at once** (ADR-029 MD-1): the harness renamed its session, and a Session
     // that posts nothing would otherwise keep its old name until its next message. A Session record
     // for one already open names it again (`fold` reads it as the name from then on).
-    if open.is_some_and(|row| session.name.is_none() || row.name == session.name) {
+    if open.is_some_and(|row| {
+        session.name.as_ref().is_none_or(|name| {
+            row.name.is_some_and(|held| {
+                held.bytes == name.len() as u64 && held.hash == crate::hash::sha256(name.as_bytes())
+            })
+        })
+    }) {
         return Ok(());
     }
     for part in opening_parts(session) {
@@ -369,9 +408,9 @@ pub async fn end(
         .as_ref()
         .map(|i| i.fingerprint)
         .ok_or_else(|| "the node is locked".to_owned())?;
-    let open = of_room(handle, &room)
-        .iter()
-        .any(|s| s.node == me && s.id == session && s.open);
+    let open = lookup(handle, room, me, session)
+        .await?
+        .is_some_and(|row| row.open);
     if !open {
         return Ok(());
     }

@@ -614,6 +614,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::Names(_) => "resolving a .vox name",
         NetEvent::SessionPage { .. } => "reading a page of a room's Session entries",
         NetEvent::RoomHistory { .. } => "reading a page of a room's history",
+        NetEvent::SessionProjection { .. } => "reading bounded Session metadata",
         NetEvent::MemberDialer(_) => "lending the proxy its dialer",
         NetEvent::ComputerPolicy(_) => "applying computer trust",
         NetEvent::LocalTrustBlacklist(_) => "reading local trust removal decisions",
@@ -1012,6 +1013,13 @@ enum NetEvent {
         /// Where the answer goes.
         reply:
             oneshot::Sender<Option<std::result::Result<crate::node::drive::SessionPage, String>>>,
+    },
+    SessionProjection {
+        channel_id: Digest32,
+        query: crate::node::channel::session_projection::Query,
+        reply: oneshot::Sender<
+            std::result::Result<crate::node::channel::session_projection::Reply, String>,
+        >,
     },
     RoomHistory {
         channel_id: Digest32,
@@ -4055,6 +4063,42 @@ impl NodeHandle {
             .await
             .ok()?;
         rx.await.ok()?
+    }
+
+    pub(crate) async fn session_projection(
+        &self,
+        channel_id: Digest32,
+        query: crate::node::channel::session_projection::Query,
+    ) -> std::result::Result<crate::node::channel::session_projection::Reply, String> {
+        let (reply, rx) = oneshot::channel();
+        self.net_tx
+            .send(NetEvent::SessionProjection {
+                channel_id,
+                query,
+                reply,
+            })
+            .await
+            .map_err(|_| "the node has stopped".to_owned())?;
+        rx.await
+            .map_err(|_| "the node stopped before answering".to_owned())?
+    }
+
+    /// Whether this node already retains the named own Session in this room.
+    /// A failed or incomplete read is an error, never proof of absence.
+    pub async fn session_seen(
+        &self,
+        room: Digest32,
+        id: &str,
+    ) -> std::result::Result<bool, String> {
+        let me = self
+            .view()
+            .identity
+            .as_ref()
+            .map(|i| i.fingerprint)
+            .ok_or_else(|| "the node is locked".to_owned())?;
+        crate::node::sessions::lookup(self, room, me, id)
+            .await
+            .map(|row| row.is_some())
     }
 
     /// A bounded history reader that does not hold this node alive.
@@ -8913,6 +8957,27 @@ impl Node {
                     None => None,
                 };
                 let _ = reply.send(page);
+            }
+            NetEvent::SessionProjection {
+                channel_id,
+                query,
+                reply,
+            } => {
+                let result = match (self.channels.get(&channel_id), self.profile.as_ref()) {
+                    (Some(shared), Some(profile)) => {
+                        let mut room = shared.lock().await;
+                        match room.advance_sessions(profile.store()) {
+                            Ok(_) => room.session_query(
+                                profile.store(),
+                                query,
+                                crate::node::ipc::rows_budget(),
+                            ),
+                            Err(error) => Err(error.to_string()),
+                        }
+                    }
+                    _ => Err("room not open".into()),
+                };
+                let _ = reply.send(result);
             }
             NetEvent::RoomHistory {
                 channel_id,
