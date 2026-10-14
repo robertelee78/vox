@@ -31,6 +31,9 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use crate::hash::Digest32;
 
+/// Explicit room-independent LAN anchor discovery.
+pub mod anchors;
+
 /// The multicast group: in the organization-local scope (RFC 2365), so routers do not carry it
 /// off the site, and the TTL of 1 keeps it to the local network.
 pub const GROUP: Ipv4Addr = Ipv4Addr::new(239, 255, 86, 88);

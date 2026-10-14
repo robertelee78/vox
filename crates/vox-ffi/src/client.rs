@@ -1677,6 +1677,63 @@ async fn keyring(client: &mut IpcClient) -> Result<Vec<(Digest32, String, bool)>
     }
 }
 
+fn anchor_endpoints(anchors: &vox_core::nat::bootstrap::BootstrapSet) -> Vec<RoomAnchorEndpoint> {
+    anchors
+        .nodes()
+        .iter()
+        .map(|a| RoomAnchorEndpoint {
+            fingerprint: b32_encode(&a.id),
+            addresses: a
+                .endpoints
+                .addrs()
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+        })
+        .collect()
+}
+
+fn pinned_anchor_set(
+    anchors: Vec<RoomAnchorEndpoint>,
+) -> Result<vox_core::nat::bootstrap::BootstrapSet, VoxError> {
+    use vox_core::nat::bootstrap::{BootstrapSet, MAX_BOOTSTRAP_NODES};
+    use vox_core::nat::multiaddr::{Multiaddr, MAX_ENDPOINTS};
+    if anchors.len() > MAX_BOOTSTRAP_NODES {
+        return Err(failed("at most 64 room anchors can be kept"));
+    }
+    let mut set = BootstrapSet::new();
+    for anchor in anchors {
+        if anchor.addresses.len() > MAX_ENDPOINTS {
+            return Err(failed("an anchor has more than 8 endpoints"));
+        }
+        let id = digest(&anchor.fingerprint, "anchor fingerprint")?;
+        let mut endpoints = Vec::new();
+        for text in anchor.addresses {
+            let address = Multiaddr::parse(&text)
+                .map_err(|e| failed(format!("invalid resolved anchor address: {e}")))?;
+            if address
+                .socket_addr()
+                .is_none_or(|s| s.port() == 0 || s.ip().is_unspecified() || s.ip().is_multicast())
+            {
+                return Err(failed("an anchor must name a concrete served address"));
+            }
+            if !endpoints.contains(&address) {
+                endpoints.push(address);
+            }
+        }
+        if endpoints.is_empty() {
+            return Err(failed("an anchor has no endpoint"));
+        }
+        // Repeated chips for one identity combine their explicitly kept addresses.
+        for endpoint in endpoints {
+            let spec = format!("{}@{endpoint}", b32_encode(&id));
+            vox_core::node::link::merge_anchor_spec(&mut set, &spec)
+                .map_err(|e| failed(e.to_string()))?;
+        }
+    }
+    Ok(set)
+}
+
 async fn room_ids(
     client: &mut IpcClient,
 ) -> Result<Vec<(Digest32, String, bool, String)>, VoxError> {
@@ -2175,6 +2232,40 @@ impl VoxClient {
             DaemonFrame::AnchorFailed(why) => Err(failed(why)),
             _ => Err(failed("the daemon did not return the resolved anchor")),
         }
+    }
+
+    /// Search only when explicitly chosen. This uses a separate daemon connection, names no
+    /// room, persists nothing, and holds no selected-node lock. Callers discard results after
+    /// their sheet/search generation changes; cancellation can never change a room.
+    pub async fn search_anchors(&self) -> Result<Vec<RoomAnchorEndpoint>, VoxError> {
+        match self.daemon(DaemonRequest::AnchorSearch).await? {
+            DaemonFrame::AnchorsFound(anchors) => Ok(anchor_endpoints(&anchors)),
+            DaemonFrame::AnchorFailed(why) => Err(failed(why)),
+            _ => Err(failed("the daemon did not answer the anchor search")),
+        }
+    }
+
+    /// Resolve a manually entered chip before creation, producing numeric pinned endpoints.
+    /// Hostname lookup happens here, never in create_room_with_anchors.
+    pub async fn resolve_anchor_endpoint(
+        &self,
+        input: String,
+    ) -> Result<RoomAnchorEndpoint, VoxError> {
+        let spec = self.resolve_anchor(input).await?;
+        self.on_rt(async move {
+            tokio::task::spawn_blocking(move || {
+                let mut set = vox_core::nat::bootstrap::BootstrapSet::new();
+                vox_core::node::link::merge_anchor_spec(&mut set, &spec)
+                    .map_err(|e| failed(e.to_string()))?;
+                anchor_endpoints(&set)
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| failed("the anchor has no endpoint"))
+            })
+            .await
+            .map_err(|e| failed(e.to_string()))?
+        })
+        .await
     }
 
     /// Add fingerprint@address or host:port; host lookup proves the returned fingerprint.
@@ -2903,9 +2994,49 @@ impl VoxClient {
         let req = Request::Create {
             name,
             passphrase: passphrase.copy(),
+            anchors: vox_core::nat::bootstrap::BootstrapSet::new(),
         };
         on_held!(self, |c| done(c, &req).await)?;
         self.new_room(before, "the room was created").await
+    }
+
+    /// Create using only the already resolved anchors the person kept. Check the full expected
+    /// node fingerprint before mutation and keep its connection locked through the result read.
+    /// Pending searches do not hold this lock. An empty set creates a room without an anchor.
+    pub async fn create_room_with_anchors(
+        &self,
+        name: String,
+        passphrase: Arc<Passphrase>,
+        anchors: Vec<RoomAnchorEndpoint>,
+        node: String,
+    ) -> Result<String, VoxError> {
+        let expected = digest(&node, "creating node")?;
+        let anchors = pinned_anchor_set(anchors)?;
+        on_held!(self, |c| {
+            if c.me() != Some(expected) {
+                return Err(failed(
+                    "the selected node changed; review the room before creating it",
+                ));
+            }
+            let before = room_ids(c).await?;
+            done(
+                c,
+                &Request::Create {
+                    name: name.clone(),
+                    passphrase: passphrase.copy(),
+                    anchors,
+                },
+            )
+            .await?;
+            room_ids(c)
+                .await?
+                .into_iter()
+                .find(|(id, held, _, _)| held == &name && !before.iter().any(|(old, ..)| old == id))
+                .map(|(id, ..)| b32_encode(&id))
+                .ok_or_else(|| {
+                    failed("the room was created, but it is not listed on the creating node")
+                })
+        })
     }
 
     /// Join a room from its `vox://` link with its passphrase; returns its id. The room keeps the

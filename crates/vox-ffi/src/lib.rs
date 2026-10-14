@@ -371,6 +371,7 @@ impl VoxNode {
             "creating the room",
             NodeCommand::CreateChannel {
                 name,
+                anchors: vox_core::nat::bootstrap::BootstrapSet::new(),
                 passphrase: Secret::new(passphrase.into_bytes()),
             },
         )

@@ -24,6 +24,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+mod anchor_discovery;
 mod computer;
 mod local_trust;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -94,6 +95,8 @@ struct Inner {
     metrics: Arc<DaemonMetrics>,
     stopping: AtomicBool,
     next_generation: AtomicU64,
+    /// One search at a time; concurrent clients do not multiply sockets or network traffic.
+    anchor_search: tokio::sync::Mutex<()>,
     stop_asked: tokio::sync::Notify,
     /// A node's stop that did not finish within the patience: the daemon's stop then says so.
     unfinished_stop: AtomicBool,
@@ -177,6 +180,8 @@ struct Attached {
     /// Drains bounded room-retirement notifications before a replacement actor may attach.
     session_retirements: Option<tokio::task::JoinHandle<()>>,
     fingerprint: Option<Digest32>,
+    /// Only headless anchor roles answer an explicit LAN anchor search.
+    anchor: bool,
 }
 
 /// How a node is wanted, and so how its attach counts.
@@ -336,6 +341,7 @@ impl Router {
                     metrics: Arc::new(DaemonMetrics::default()),
                     stopping: AtomicBool::new(false),
                     next_generation: AtomicU64::new(1),
+                    anchor_search: tokio::sync::Mutex::new(()),
                     stop_asked: tokio::sync::Notify::new(),
                     serve_only: Mutex::default(),
                     unfinished_stop: AtomicBool::new(false),
@@ -353,6 +359,7 @@ impl Router {
         };
         router.follow_attached_with_the_proxy();
         router.follow_machine_anchors();
+        router.answer_anchor_searches();
         router.follow_local_trust();
         router.follow_computer_trust();
         router.follow_session_holds();
@@ -3089,6 +3096,7 @@ impl Router {
             ended,
             session_retirements: Some(session_retirements),
             fingerprint,
+            anchor: anchor.is_some(),
         }))
     }
 
@@ -3520,6 +3528,19 @@ impl Dispatch for Router {
                 Ok(anchors) => DaemonFrame::Anchors(anchors),
                 Err(why) => refused(why),
             },
+            DaemonRequest::AnchorSearch => {
+                let Ok(_search) = self.inner.anchor_search.try_lock() else {
+                    return DaemonFrame::AnchorFailed(
+                        "an anchor search is already running; try again when it finishes".into(),
+                    );
+                };
+                match vox_core::node::nearby::anchors::search().await {
+                    Ok(anchors) => DaemonFrame::AnchorsFound(anchors),
+                    Err(e) => DaemonFrame::AnchorFailed(format!(
+                        "the local anchor search could not finish: {e}"
+                    )),
+                }
+            }
             DaemonRequest::AnchorResolve { input } => {
                 match self.resolve_anchor_input(&input).await {
                     Ok(spec) => DaemonFrame::AnchorResolved(spec),

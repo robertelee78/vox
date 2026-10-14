@@ -60,6 +60,7 @@ const T_ROOM_ANSWER: u64 = 4013;
 const T_ANCHORS: u64 = 4014;
 const T_ANCHOR_FAILED: u64 = 4015;
 const T_ANCHOR_RESOLVED: u64 = 4016;
+const T_ANCHORS_FOUND: u64 = 4017;
 /// 4020–4029: the Session activity sink (ADR-029 §2, §3).
 const T_SESSION_ANSWER: u64 = 4020;
 const T_SESSION_ACTIVITY: u64 = 4021;
@@ -85,6 +86,7 @@ const T_REQ_ANCHORS: u64 = 4116;
 const T_REQ_ANCHOR_ADD: u64 = 4117;
 const T_REQ_ANCHOR_REMOVE: u64 = 4118;
 const T_REQ_ANCHOR_RESOLVE: u64 = 4119;
+const T_REQ_ANCHOR_SEARCH: u64 = 4130;
 /// 4120–4129: the Session activity sink (ADR-029 §2, §3).
 const T_REQ_SESSION_ACTIVITY: u64 = 4120;
 const T_REQ_SESSION_ASK: u64 = 4121;
@@ -219,6 +221,8 @@ pub enum KeepSource {
 pub enum DaemonRequest {
     /// The daemon's manual and saved-room anchor list, with provenance. Needs no node.
     Anchors,
+    /// Explicit TTL-one LAN search; no room identity or persistent source.
+    AnchorSearch,
     /// Resolve an anchor input without adding a machine or room source.
     AnchorResolve {
         /// Explicit fingerprint@address, or host:port for authenticated lookup.
@@ -788,6 +792,8 @@ pub enum DaemonFrame {
     AnchorFailed(String),
     /// A pinned spec. Bare-address lookup proves its fingerprint; explicit pins are checked syntax.
     AnchorResolved(String),
+    /// Concrete pinned endpoints found in one explicit LAN search; empty is a completed search.
+    AnchorsFound(crate::nat::bootstrap::BootstrapSet),
     /// Typed computer status encoded as public JSON, including the local one-time link.
     ComputerStatus(String),
     /// A computer operation failed; no node identity is involved.
@@ -1247,6 +1253,9 @@ impl Opening {
                 DaemonRequest::Anchors => {
                     e.array(1).uint(T_REQ_ANCHORS);
                 }
+                DaemonRequest::AnchorSearch => {
+                    e.array(1).uint(T_REQ_ANCHOR_SEARCH);
+                }
                 DaemonRequest::Metrics => {
                     e.array(1).uint(T_REQ_METRICS);
                 }
@@ -1438,6 +1447,7 @@ impl Opening {
             }),
             (T_REQ_STATUS, 1) => Opening::Daemon(DaemonRequest::Status),
             (T_REQ_ANCHORS, 1) => Opening::Daemon(DaemonRequest::Anchors),
+            (T_REQ_ANCHOR_SEARCH, 1) => Opening::Daemon(DaemonRequest::AnchorSearch),
             (T_REQ_ANCHOR_ADD, 2) => Opening::Daemon(DaemonRequest::AnchorAdd {
                 input: text(&mut d, "ipc anchor input")?,
             }),
@@ -1682,6 +1692,9 @@ impl DaemonFrame {
             DaemonFrame::AnchorResolved(spec) => {
                 e.array(2).uint(T_ANCHOR_RESOLVED).text(spec);
             }
+            DaemonFrame::AnchorsFound(anchors) => {
+                e.array(2).uint(T_ANCHORS_FOUND).bytes(&anchors.to_bytes());
+            }
             DaemonFrame::Metrics(text) => {
                 e.array(2).uint(T_METRICS).text(text);
             }
@@ -1801,6 +1814,9 @@ impl DaemonFrame {
             }
             (T_ANCHOR_FAILED, 2) => DaemonFrame::AnchorFailed(text(&mut d, "anchor failure")?),
             (T_ANCHOR_RESOLVED, 2) => DaemonFrame::AnchorResolved(text(&mut d, "resolved anchor")?),
+            (T_ANCHORS_FOUND, 2) => DaemonFrame::AnchorsFound(
+                crate::nat::bootstrap::BootstrapSet::from_bytes(d.bytes()?)?,
+            ),
             (T_COMPUTER_STATUS, 2) => DaemonFrame::ComputerStatus(text(&mut d, "computer status")?),
             (T_COMPUTER_FAILED, 2) => {
                 DaemonFrame::ComputerFailed(text(&mut d, "computer refusal")?)

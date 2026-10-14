@@ -1684,7 +1684,16 @@ impl ChannelState {
         let signer = profile.signer()?;
         let factor = SignatureIdentityFactor::new(signer);
         let wrap = sek.seal(&factor, &genesis.channel_id(), channel_passphrase, argon2)?;
-        Self::create_from_sealed(profile, name, channel_passphrase, genesis, sek, &wrap, now)
+        Self::create_from_sealed(
+            profile,
+            name,
+            channel_passphrase,
+            genesis,
+            sek,
+            &wrap,
+            now,
+            &BootstrapSet::new(),
+        )
     }
 
     /// The fast first step of creating a room: its genesis and a fresh room key.
@@ -1720,6 +1729,7 @@ impl ChannelState {
     ///
     /// # Errors
     /// No unlocked signer, a segment that cannot be sealed, or a store write that fails.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_from_sealed(
         profile: &Profile,
         name: &str,
@@ -1728,6 +1738,7 @@ impl ChannelState {
         sek: Sek,
         wrap: &crate::atrest::SekWrap,
         now: crate::time::Ms,
+        anchors: &BootstrapSet,
     ) -> Result<Self> {
         let now_ms = now.get();
         let signer = profile.signer()?;
@@ -1876,9 +1887,9 @@ impl ChannelState {
         // member that joins reads it there (ADR-028 R-1).
         let statement = crate::governance::name::RoomName::build(signer, &channel_id, epoch, name)?;
         room.append_governance(profile, &statement.to_wire(), now_ms)?;
-        // A fresh room chooses no anchors until its creator or an admin says otherwise.
+        // Sign only the anchors its creator explicitly chose, including an empty set.
         // Machine configuration and join-link hints never supply room authority (AN-5/AN-9).
-        room.set_anchors(profile, &BootstrapSet::new(), now)?;
+        room.set_anchors(profile, anchors, now)?;
         Ok(room)
     }
 
