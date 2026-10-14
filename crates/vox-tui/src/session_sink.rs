@@ -30,7 +30,7 @@ use std::time::Duration;
 
 use serde_json::{json, Map, Value};
 use tokio::sync::oneshot;
-use vox_core::node::daemonipc::{NodeName, ToolCall};
+use vox_core::node::daemonipc::{NodeName, SessionAdmission, ToolCall};
 
 /// How long text a driver typed into a session is remembered, so the harness's prompt event for
 /// it is not also shown as typed at the terminal.
@@ -43,8 +43,20 @@ const TRANSCRIPT_POLL: Duration = Duration::from_millis(250);
 /// rejection at the terminal.
 pub const REJECTED_IN_VOX: &str = "rejected in Vox by";
 
-/// Where entries go once numbered: the node's Session append (reads2's `AppendSession`).
-pub type Poster = Arc<dyn Fn(&NodeName, &str, Vec<String>) + Send + Sync>;
+/// Commit a bounded batch into the node's sealed inbox, returning its durable receipt.
+pub type Poster = Arc<
+    dyn Fn(
+            NodeName,
+            String,
+            vox_core::hash::Digest32,
+            Vec<String>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = SessionAdmission> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Capture one activity's destination before its bounded parts are admitted.
+pub type RoomOf = Arc<dyn Fn(&NodeName, &str) -> Option<vox_core::hash::Digest32> + Send + Sync>;
 
 /// Where a session's new name goes (ADR-029 MD-1): its registration, and its Session's record.
 pub type Renamer = Arc<dyn Fn(&NodeName, &str, &str) + Send + Sync>;
@@ -53,13 +65,13 @@ pub type Renamer = Arc<dyn Fn(&NodeName, &str, &str) + Send + Sync>;
 pub struct Sink {
     state: Mutex<BTreeMap<(NodeName, String), Session>>,
     post: Poster,
+    room_of: RoomOf,
     rename: Renamer,
 }
 
 /// What the sink holds for one session.
 #[derive(Default)]
 struct Session {
-    seq: u64,
     /// Started tool calls not yet ended.
     open: Vec<ToolCall>,
     /// Requests waiting, by the call they are tied to.
@@ -72,6 +84,8 @@ struct Session {
 
 /// One approval or question waiting.
 struct Ask {
+    /// Distinguishes a replacement using the same harness id across an admission await.
+    ticket: Arc<()>,
     /// `approval` or `question`.
     of: String,
     /// Who waits for the first answer, until it is handed one or released.
@@ -94,6 +108,7 @@ enum Waiter {
 
 /// How many settled requests a session remembers, to tell a late answer why it was refused.
 const SETTLED_KEPT: usize = 256;
+const ASKS_KEPT: usize = 256;
 
 /// An answer a member with drive gave in the Session.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,10 +131,11 @@ pub enum Handed {
 impl Sink {
     /// A sink posting through `post`, and naming a session anew through `rename`.
     #[must_use]
-    pub fn new(post: Poster, rename: Renamer) -> Arc<Self> {
+    pub fn new(post: Poster, room_of: RoomOf, rename: Renamer) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(BTreeMap::new()),
             post,
+            room_of,
             rename,
         })
     }
@@ -141,38 +157,82 @@ impl Sink {
         f(&mut g)
     }
 
-    /// Number `bodies` and post them, in order. A body that is not a JSON object is dropped:
-    /// only the shared format reaches a Session.
-    fn post_numbered(&self, node: &NodeName, session: &str, bodies: Vec<String>) {
-        let numbered = self.with(|all| {
-            let s = all.entry((node.clone(), session.to_owned())).or_default();
-            bodies
-                .into_iter()
-                .filter_map(|b| {
-                    let Ok(Value::Object(mut m)) = serde_json::from_str::<Value>(&b) else {
-                        return None;
-                    };
-                    s.seq += 1;
-                    m.insert("seq".into(), json!(s.seq));
-                    Some(Value::Object(m).to_string())
-                })
-                .collect::<Vec<_>>()
+    /// Admit bounded batches in order. Numbering belongs to the durable node transaction;
+    /// no in-memory counter can claim acceptance before its bodies are saved.
+    async fn post_numbered(
+        &self,
+        node: &NodeName,
+        session: &str,
+        bodies: Vec<String>,
+    ) -> SessionAdmission {
+        use vox_core::node::session_ingress::{MAX_BATCH_BYTES, MAX_BATCH_ITEMS};
+        let invalid = bodies.iter().find_map(|body| {
+            if !serde_json::from_str::<Value>(body).is_ok_and(|v| v.is_object()) {
+                Some("Session activity must be a JSON object")
+            } else if body.len() > MAX_BATCH_BYTES {
+                Some("one Session activity item exceeds the batch bound")
+            } else {
+                None
+            }
         });
-        if !numbered.is_empty() {
-            (self.post)(node, session, numbered);
+        if let Some(why) = invalid {
+            return reported(node, session, SessionAdmission::Refused(why.into()));
         }
+        let Some(room) = (self.room_of)(node, session) else {
+            return SessionAdmission::Skipped;
+        };
+        let mut batch = Vec::new();
+        let mut bytes = 0usize;
+        let mut result = SessionAdmission::Skipped;
+        for body in bodies {
+            if !batch.is_empty()
+                && (bytes + body.len() > MAX_BATCH_BYTES || batch.len() == MAX_BATCH_ITEMS)
+            {
+                let next = (self.post)(
+                    node.clone(),
+                    session.to_owned(),
+                    room,
+                    std::mem::take(&mut batch),
+                )
+                .await;
+                result = combine(result, next);
+                if !result.taken() {
+                    return reported(node, session, result);
+                }
+                bytes = 0;
+            }
+            bytes += body.len();
+            batch.push(body);
+        }
+        if !batch.is_empty() {
+            result = combine(
+                result,
+                (self.post)(node.clone(), session.to_owned(), room, batch).await,
+            );
+        }
+        reported(node, session, result)
     }
 
     /// A harness's activity ([`vox_core::node::daemonipc::DaemonRequest::SessionActivity`]).
     /// `call` is the tool call `bodies` start; a `tool-done` ends the call it names, and a
     /// `turn-end` ends the turn, which retires every request still waiting in it.
-    pub fn activity(
+    pub async fn activity(
         self: &Arc<Self>,
         node: &NodeName,
         session: &str,
         bodies: Vec<String>,
         call: Option<ToolCall>,
-    ) {
+    ) -> SessionAdmission {
+        if bodies
+            .iter()
+            .any(|body| !serde_json::from_str::<Value>(body).is_ok_and(|v| v.is_object()))
+        {
+            return reported(
+                node,
+                session,
+                SessionAdmission::Refused("Session activity must be a JSON object".into()),
+            );
+        }
         let mut ended: Vec<String> = Vec::new();
         let mut turn_end = false;
         let mut kept = Vec::with_capacity(bodies.len());
@@ -205,15 +265,17 @@ impl Sink {
             }
             s.open.retain(|c| !ended.contains(&c.id));
         });
-        self.post_numbered(node, session, bodies);
-        // A call that ended settles its request: read the transcript now rather than at the next
-        // poll, so the request is retired beside the call's result.
+        // Revoke answer authority as soon as the harness reports settlement. Saving its
+        // transcript must never keep a stale approval waiter alive.
+        let mut bodies = bodies;
         for r in ended {
-            self.settle(node, session, &r);
+            let (_, entry) = self.settled_entry(node, session, &r);
+            bodies.extend(entry);
         }
         if turn_end {
-            self.expire_all(node, session);
+            bodies.extend(self.expired_entries(node, session));
         }
+        self.post_numbered(node, session, bodies).await
     }
 
     /// A driver's text was delivered to `session` as its input (#544): its `drive` entry already
@@ -255,8 +317,8 @@ impl Sink {
 
     /// The session ended (ADR-029 SE-4): every request still waiting expires, and its calls are
     /// forgotten.
-    pub fn session_end(&self, node: &NodeName, session: &str) {
-        self.expire_all(node, session);
+    pub async fn session_end(&self, node: &NodeName, session: &str) {
+        self.expire_all(node, session).await;
         self.with(|all| all.remove(&(node.clone(), session.to_owned())));
     }
 
@@ -283,6 +345,7 @@ impl Sink {
         let usable =
             transcript.is_absolute() && transcript.extension().is_some_and(|e| e == "jsonl");
         let (tx, rx) = oneshot::channel();
+        let ticket = Arc::new(());
         let tied = self.with(|all| {
             let s = all.entry((node.clone(), session.to_owned())).or_default();
             let matching: Vec<&ToolCall> = s
@@ -295,6 +358,9 @@ impl Sink {
                         && !s.asks.contains_key(&c.id)
                 })
                 .collect();
+            if s.asks.len() >= ASKS_KEPT {
+                return Err("Vox has too many pending requests; answer at the terminal");
+            }
             match (usable, matching.as_slice()) {
                 (false, _) => Err("Vox cannot read where the session records its answers"),
                 (true, [one]) => {
@@ -302,6 +368,7 @@ impl Sink {
                     s.asks.insert(
                         id.clone(),
                         Ask {
+                            ticket: Arc::clone(&ticket),
                             of: of.clone(),
                             waiter: Some(Waiter::Hook(tx)),
                             given: None,
@@ -321,12 +388,31 @@ impl Sink {
                 // Shown, so the person knows it is there, but answered only at the terminal.
                 entry.insert("answerable".into(), json!(false));
                 entry.insert("why".into(), json!(why));
-                self.post_numbered(node, session, crate::session_mirror::split(entry, "input"));
+                self.post_numbered(node, session, crate::session_mirror::split(entry, "input"))
+                    .await;
                 None
             }
             Ok(id) => {
                 entry.insert("ref".into(), json!(id));
-                self.post_numbered(node, session, crate::session_mirror::split(entry, "input"));
+                let admission = self
+                    .post_numbered(node, session, crate::session_mirror::split(entry, "input"))
+                    .await;
+                if !matches!(
+                    admission,
+                    SessionAdmission::Committed { .. } | SessionAdmission::Held(_)
+                ) {
+                    self.with(|all| {
+                        if let Some(s) = all.get_mut(&(node.clone(), session.to_owned())) {
+                            if s.asks
+                                .get(&id)
+                                .is_some_and(|ask| Arc::ptr_eq(&ask.ticket, &ticket))
+                            {
+                                s.asks.remove(&id);
+                            }
+                        }
+                    });
+                    return None;
+                }
                 self.watch(node, session, &id);
                 rx.await.ok().flatten()
             }
@@ -340,7 +426,7 @@ impl Sink {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(TRANSCRIPT_POLL).await;
-                if !me.settle(&node, &session, &id) {
+                if !me.settle(&node, &session, &id).await {
                     return;
                 }
             }
@@ -349,32 +435,40 @@ impl Sink {
 
     /// Retire `id`'s request if the transcript records its result. Returns whether it is still
     /// waiting.
-    fn settle(&self, node: &NodeName, session: &str, id: &str) -> bool {
+    fn settled_entry(&self, node: &NodeName, session: &str, id: &str) -> (bool, Option<String>) {
         let path = self.with(|all| {
             all.get(&(node.clone(), session.to_owned()))
                 .and_then(|s| s.asks.get(id))
                 .map(|a| a.transcript.clone())
         });
         let Some(path) = path else {
-            return false;
+            return (false, None);
         };
-        // An adapter's request is settled by the adapter's report, not here.
         let Some(path) = path else {
-            return true;
+            return (true, None);
         };
         let Some(r) = tool_result(&path, id) else {
-            return true;
+            return (true, None);
         };
-        // Only Vox's rejection carries its words; any other refusal was the terminal's.
         let outcome = if r.is_error { "denied" } else { "" };
-        self.retire(node, session, id, outcome, r.answers, &r.text);
-        false
+        (
+            false,
+            self.retired_entry(node, session, id, outcome, r.answers, &r.text),
+        )
+    }
+
+    async fn settle(&self, node: &NodeName, session: &str, id: &str) -> bool {
+        let (waiting, entry) = self.settled_entry(node, session, id);
+        if let Some(entry) = entry {
+            self.post_numbered(node, session, vec![entry]).await;
+        }
+        waiting
     }
 
     /// An adapter's harness settled `id` (Codex `serverRequest/resolved`, OpenCode
     /// `permission.replied` / `question.replied`): `outcome` is `allowed`, `denied` or
     /// `answered`, with the answers that took effect when the harness says them.
-    pub fn resolved(
+    pub async fn resolved(
         &self,
         node: &NodeName,
         session: &str,
@@ -382,13 +476,15 @@ impl Sink {
         outcome: &str,
         answers: Option<Value>,
     ) {
-        self.retire(node, session, id, outcome, answers, "");
+        if let Some(entry) = self.retired_entry(node, session, id, outcome, answers, "") {
+            self.post_numbered(node, session, vec![entry]).await;
+        }
     }
 
     /// Retire `id`'s request as settled by its harness, post its `resolved` entry, release its
     /// waiter, and remember what a late answer is told. `outcome` empty means "the harness took
     /// it": allowed, or answered for a question. `said` is the harness's own text of a refusal.
-    fn retire(
+    fn retired_entry(
         &self,
         node: &NodeName,
         session: &str,
@@ -396,14 +492,12 @@ impl Sink {
         outcome: &str,
         answers: Option<Value>,
         said: &str,
-    ) {
+    ) -> Option<String> {
         let ask = self.with(|all| {
             all.get_mut(&(node.clone(), session.to_owned()))
                 .and_then(|s| s.asks.remove(id))
         });
-        let Some(mut ask) = ask else {
-            return;
-        };
+        let mut ask = ask?;
         let outcome = match outcome {
             "" if ask.of == "question" => "answered",
             "" => "allowed",
@@ -421,7 +515,7 @@ impl Sink {
             "already answered at the terminal"
         };
         self.remember(node, session, id, late);
-        self.post_numbered(node, session, vec![entry]);
+        Some(entry)
     }
 
     fn remember(&self, node: &NodeName, session: &str, id: &str, late: &str) {
@@ -438,7 +532,7 @@ impl Sink {
     /// or `question` entry, with its `ref` (the harness's request id). It is posted, and the
     /// first answer a member with drive gives arrives on the receiver; once the harness settles
     /// it, the adapter calls [`Sink::resolved`].
-    pub fn request(
+    pub async fn request(
         &self,
         node: &NodeName,
         session: &str,
@@ -454,33 +548,60 @@ impl Sink {
             .unwrap_or("approval")
             .to_owned();
         let (tx, rx) = oneshot::channel();
-        self.with(|all| {
+        let ticket = Arc::new(());
+        let installed = self.with(|all| {
             let s = all.entry((node.clone(), session.to_owned())).or_default();
+            if s.asks.len() >= ASKS_KEPT || s.asks.contains_key(&id) {
+                return false;
+            }
             s.asks.insert(
-                id,
+                id.clone(),
                 Ask {
+                    ticket: Arc::clone(&ticket),
                     of,
                     waiter: Some(Waiter::Adapter(tx)),
                     given: None,
                     transcript: None,
                 },
             );
+            true
         });
-        self.post_numbered(node, session, vec![entry]);
+        if !installed {
+            return None;
+        }
+        let admission = self.post_numbered(node, session, vec![entry]).await;
+        if !matches!(
+            admission,
+            SessionAdmission::Committed { .. } | SessionAdmission::Held(_)
+        ) {
+            self.with(|all| {
+                if let Some(s) = all.get_mut(&(node.clone(), session.to_owned())) {
+                    if s.asks
+                        .get(&id)
+                        .is_some_and(|ask| Arc::ptr_eq(&ask.ticket, &ticket))
+                    {
+                        s.asks.remove(&id);
+                    }
+                }
+            });
+            return None;
+        }
         Some(rx)
     }
 
     /// Every request still waiting in `session` expires: the harness moved on without settling it
     /// in its transcript (an interrupted turn, the session's end).
-    fn expire_all(&self, node: &NodeName, session: &str) {
-        let ids: Vec<String> = self.with(|all| {
+    fn expired_entries(&self, node: &NodeName, session: &str) -> Vec<String> {
+        let ids: Vec<_> = self.with(|all| {
             all.get(&(node.clone(), session.to_owned()))
                 .map(|s| s.asks.keys().cloned().collect())
                 .unwrap_or_default()
         });
+        let mut entries = Vec::new();
         for id in ids {
-            // A result written just before the turn ended is still the answer.
-            if !self.settle(node, session, &id) {
+            let (waiting, settled) = self.settled_entry(node, session, &id);
+            entries.extend(settled);
+            if !waiting {
                 continue;
             }
             let ask = self.with(|all| {
@@ -492,13 +613,19 @@ impl Sink {
                     let _ = h.send(None);
                 }
                 self.remember(node, session, &id, "the request expired before an answer");
-                let e = json!({
-                    "v": crate::session_mirror::VERSION, "session": session, "kind": "resolved",
-                    "ref": id, "of": ask.of, "outcome": "expired",
-                });
-                self.post_numbered(node, session, vec![e.to_string()]);
+                entries.push(
+                    json!({"v": crate::session_mirror::VERSION, "session": session,
+                    "kind":"resolved", "ref":id, "of":ask.of, "outcome":"expired"})
+                    .to_string(),
+                );
             }
         }
+        entries
+    }
+
+    async fn expire_all(&self, node: &NodeName, session: &str) {
+        let entries = self.expired_entries(node, session);
+        self.post_numbered(node, session, entries).await;
     }
 
     /// A member with drive answered `id` in the Session (the drive router calls this once it has
@@ -661,4 +788,44 @@ fn resolved(
     }
     m.insert("by".into(), json!(by.unwrap_or("terminal")));
     Value::Object(m).to_string()
+}
+
+// Every producer gets truthful logging even if it has no replay cursor and cannot retain a
+// refused event. Earlier accepted batches are never described as rolled back by a later refusal.
+fn reported(node: &NodeName, session: &str, result: SessionAdmission) -> SessionAdmission {
+    match &result {
+        SessionAdmission::Held(why) => eprintln!("vox daemon: {node}: session {session}: some activity is held only in memory, not saved: {why}"),
+        SessionAdmission::Refused(why) => eprintln!("vox daemon: {node}: session {session}: this batch and any following unsubmitted activity were not retained: {why}"),
+        SessionAdmission::Unconfirmed(why) => eprintln!("vox daemon: {node}: session {session}: acceptance is unknown; do not replay this batch; following unsubmitted activity was not retained: {why}"),
+        _ => {}
+    }
+    result
+}
+
+// A split activity is committed only when every constituent batch is committed.
+fn combine(before: SessionAdmission, next: SessionAdmission) -> SessionAdmission {
+    let prior = match &before {
+        SessionAdmission::Committed { first, last } => {
+            format!(" Earlier sequences {first} through {last} are committed.")
+        }
+        SessionAdmission::Held(_) => {
+            " Earlier activity was taken, but some remains only in memory.".into()
+        }
+        _ => String::new(),
+    };
+    match (before, next) {
+        (_, SessionAdmission::Unconfirmed(why)) => {
+            SessionAdmission::Unconfirmed(format!("{why}{prior}"))
+        }
+        (u @ SessionAdmission::Unconfirmed(_), _) => u,
+        (_, SessionAdmission::Refused(why)) => SessionAdmission::Refused(format!("{why}{prior}")),
+        (r @ SessionAdmission::Refused(_), _) => r,
+        (_, h @ SessionAdmission::Held(_)) => h,
+        (h @ SessionAdmission::Held(_), _) => h,
+        (SessionAdmission::Committed { first, .. }, SessionAdmission::Committed { last, .. }) => {
+            SessionAdmission::Committed { first, last }
+        }
+        (s, SessionAdmission::Skipped) => s,
+        (_, s) => s,
+    }
 }

@@ -1115,6 +1115,26 @@ pub enum NodeCommand {
         /// The activity item.
         body: String,
     },
+    /// Persist a complete Session activity batch before acknowledging it. Delivery is local,
+    /// bounded work on the actor's tick, independently of the producer's lifetime.
+    AcceptSessionBatch {
+        /// Destination captured by the registered session at admission.
+        channel_id: Digest32,
+        /// The harness session.
+        session_id: String,
+        /// Unnumbered shared-format activity, within the ingress batch bound.
+        bodies: Vec<String>,
+        /// Exact committed range, or the saving/refusal error. Never a network receipt.
+        reply: tokio::sync::oneshot::Sender<crate::node::session_ingress::AdmissionResult>,
+    },
+    /// Finish a hosted daemon's ordered cleanup after it retired this room's volatile tails
+    /// and session bindings. Does not delete room history or reset persistent counters.
+    RetireSessionRoom {
+        /// The explicitly removed room.
+        channel_id: Digest32,
+        /// Receipt for the final inbox cleanup.
+        reply: tokio::sync::oneshot::Sender<crate::error::Result<()>>,
+    },
     /// Reconcile a channel's log with the members this node can reach (ADR-008
     /// frontier sync).
     Sync {
@@ -1183,6 +1203,10 @@ pub enum Fault {
     ProfileBusy,
     /// Local pairwise delivery capacity is occupied; no new key was sealed or grant recorded.
     DeliveryBusy,
+    /// A previous hosted room deletion is still awaiting its bounded daemon handoff.
+    SessionCleanupBusy,
+    /// The hosted daemon's reliable Session cleanup handler has gone away.
+    SessionCleanupUnavailable,
     /// Making an identity, its file (`vault.cbor`) could not be written. Not [`Fault::Storage`],
     /// which named the store when the store was fine (V210-77).
     IdentityFileUnwritable,
@@ -1405,6 +1429,12 @@ impl Fault {
             Fault::DeliveryBusy => {
                 "this node's key-delivery capacity is busy; the key waits locally\n       existing deliveries are retried; no new grant was recorded by this attempt"
             }
+            Fault::SessionCleanupBusy => {
+                "an earlier room's Session cleanup is still pending; no deletion started for this request\n       try again after that cleanup finishes"
+            }
+            Fault::SessionCleanupUnavailable => {
+                "the daemon's Session cleanup handler is unavailable; no deletion started for this request\n       restart the daemon before trying again"
+            }
             Fault::RetentionFileUnwritable => {
                 "your retention for this room could not be saved: the node's retention file (`retention`, in its configuration directory) could not be written\n       check free disk space, and that the configuration directory is writable; then run it again"
             }
@@ -1620,6 +1650,8 @@ fault_names!(
     Storage,
     ProfileBusy,
     DeliveryBusy,
+    SessionCleanupBusy,
+    SessionCleanupUnavailable,
     IdentityFileUnwritable,
     RetentionFileUnwritable,
     SealedUnreadable,

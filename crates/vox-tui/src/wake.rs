@@ -398,10 +398,77 @@ pub fn register(paths: &Paths, session: &str, codex: bool) {
     store(paths, &Session::from_env(session, codex));
 }
 
+// Every registration rewrite, including a hook's idle update, shares this lock. Atomic
+// rename alone cannot stop a stale whole-record rewrite from restoring a removed room.
+// The lock file is outside the registrations directory, so it can never look like a session.
+fn registration_lock(paths: &Paths) -> Result<std::fs::File, String> {
+    let path = paths.session_dir().with_extension("lock");
+    if let Some(parent) = path.parent() {
+        vox_core::node::paths::create_private_dir(parent).map_err(|e| e.to_string())?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let file = options.open(&path).map_err(|e| e.to_string())?;
+    file.try_lock()
+        .map_err(|e| format!("session registration is busy or cannot be locked: {e}"))?;
+    Ok(file)
+}
+
+fn registration_write(paths: &Paths) -> Option<std::fs::File> {
+    match registration_lock(paths) {
+        Ok(file) => Some(file),
+        Err(why) => {
+            eprintln!("vox: session registration was not changed: {why}");
+            None
+        }
+    }
+}
+
+/// Invalidate only bindings to a room the node has explicitly removed. Existing records keep
+/// their first-seen time, so a later ordinary hook cannot silently restore that old room.
+///
+/// # Errors
+/// A lock, read, parse or durable write failed; retirement must not be acknowledged.
+pub fn clear_room_bindings(paths: &Paths, room: &str) -> Result<usize, String> {
+    let _lock = registration_lock(paths)?;
+    let entries = match std::fs::read_dir(paths.session_dir()) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut changed = 0;
+    for entry in entries {
+        let path = entry.map_err(|e| e.to_string())?.path();
+        // Unique atomic-write staging files are never registrations.
+        if path.extension().is_some_and(|x| x == "tmp") {
+            continue;
+        }
+        let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+        let mut reg: Session = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        if reg.room.as_deref() != Some(room) {
+            continue;
+        }
+        reg.room = None;
+        let bytes = serde_json::to_vec(&reg).map_err(|e| e.to_string())?;
+        vox_core::node::paths::write_private_file_unique(&path, &bytes)
+            .map_err(|e| e.to_string())?;
+        changed += 1;
+    }
+    Ok(changed)
+}
+
 /// Store `reg` as its session's registration (ADR-020 6.10): the daemon's half of
 /// [`register`], the client's half being [`Session::from_env`]. When the session was first seen
 /// is kept from its earlier record; this turn is its last drain.
 pub fn store(paths: &Paths, reg: &Session) {
+    let Some(_lock) = registration_write(paths) else {
+        return;
+    };
     let mut reg = reg.clone();
     let session = reg.session.clone();
     let session = session.as_str();
@@ -450,6 +517,7 @@ pub fn store(paths: &Paths, reg: &Session) {
 /// adapter that hears a rename (Codex's thread name, OpenCode's session title) records. `None`
 /// when the session is not registered; else the registration as it now is.
 pub fn store_name(paths: &Paths, session: &str, name: &str) -> Option<Session> {
+    let _lock = registration_write(paths)?;
     let mut reg = load(paths, session)?;
     reg.name = Some(name.to_owned());
     if let Ok(body) = serde_json::to_vec(&reg) {
@@ -463,11 +531,15 @@ pub fn store_name(paths: &Paths, session: &str, name: &str) -> Option<Session> {
 /// session's room changes. `None` when the session is not registered; else the room it worked in
 /// before, if any.
 pub fn store_room(paths: &Paths, session: &str, room: &str) -> Option<Option<String>> {
+    let _lock = registration_write(paths)?;
     let mut reg = load(paths, session)?;
     let before = reg.room.replace(room.to_owned());
-    if let Ok(body) = serde_json::to_vec(&reg) {
-        let _ =
-            vox_core::node::paths::write_private_file_unique(&paths.session_file(session), &body);
+    let body = serde_json::to_vec(&reg).ok()?;
+    if let Err(error) =
+        vox_core::node::paths::write_private_file_unique(&paths.session_file(session), &body)
+    {
+        eprintln!("vox: Session room binding was not changed: {error}");
+        return None;
     }
     Some(before)
 }
@@ -707,6 +779,9 @@ pub fn registered(paths: &Paths) -> Vec<Session> {
 ///
 /// Returns whether it was removed.
 pub fn forget(paths: &Paths, session: &Session) -> bool {
+    let Some(_lock) = registration_write(paths) else {
+        return false;
+    };
     let path = paths.session_file(&session.session);
     let still = load(paths, &session.session).is_some_and(|now| now.same(session));
     let gone = still && std::fs::remove_file(&path).is_ok();
@@ -732,6 +807,9 @@ fn load(paths: &Paths, session: &str) -> Option<Session> {
 /// Record that `session`'s turn ended (Claude Code's `Stop`, V030-20): it is idle now, so a reply
 /// to it can be announced. A session with no registration has nothing to record.
 pub fn record_idle(paths: &Paths, session: &str) {
+    let Some(_lock) = registration_write(paths) else {
+        return;
+    };
     let Some(mut reg) = load(paths, session) else {
         return;
     };
@@ -747,6 +825,9 @@ pub fn record_idle(paths: &Paths, session: &str) {
 /// `SessionEnd`, V030-20): a session that has ended is never woken again. Its cursors stay, for a
 /// session resumed later.
 pub fn end(paths: &Paths, session: &str) {
+    let Some(_lock) = registration_write(paths) else {
+        return;
+    };
     let _ = std::fs::remove_file(paths.session_file(session));
     let _ = std::fs::remove_file(notices_file(paths, session));
     let _ = std::fs::remove_file(woke_file(paths, session));

@@ -588,7 +588,12 @@ impl ChannelState {
         self.save_error = Some(error.to_string());
     }
 
-    fn keep_private(&mut self, store: &Store, saved: Stored) -> Result<Digest32> {
+    fn keep_private(
+        &mut self,
+        store: &Store,
+        saved: Stored,
+        completion: Option<&crate::node::session_ingress::Completion>,
+    ) -> Result<Digest32> {
         let hash = saved.record.hash();
         let id = self
             .private_sessions
@@ -606,6 +611,9 @@ impl ChannelState {
             let mut batch = store.batch()?;
             batch.put_segment(&self.channel_id, SegmentKind::PrivateSession, id, &segment)?;
             self.queue_drive(&mut batch)?;
+            if let Some(completion) = completion {
+                completion.queue(&mut batch)?;
+            }
             batch.commit()
         })();
         if let Err(e) = result {
@@ -687,7 +695,7 @@ impl ChannelState {
                 continue;
             }
             let content = crate::node::content::SessionEntry::new(created, &session, &body)?;
-            self.append_private_content(profile, content, holders, now)?;
+            self.append_private_content(profile, content, holders, now, None)?;
         }
         Ok(())
     }
@@ -702,7 +710,20 @@ impl ChannelState {
         now: u64,
     ) -> Result<Digest32> {
         let content = crate::node::content::SessionEntry::new(now, session_id, body)?;
-        self.append_private_content(profile, content, holders, now)
+        self.append_private_content(profile, content, holders, now, None)
+    }
+
+    pub(crate) fn append_ingress_session(
+        &mut self,
+        profile: &Profile,
+        session_id: &str,
+        body: &str,
+        holders: &BTreeSet<Digest32>,
+        now: u64,
+        completion: &crate::node::session_ingress::Completion,
+    ) -> Result<Digest32> {
+        let content = crate::node::content::SessionEntry::new(now, session_id, body)?;
+        self.append_private_content(profile, content, holders, now, Some(completion))
     }
 
     fn append_private_content(
@@ -711,6 +732,7 @@ impl ChannelState {
         content: crate::node::content::SessionEntry,
         holders: &BTreeSet<Digest32>,
         now: u64,
+        completion: Option<&crate::node::session_ingress::Completion>,
     ) -> Result<Digest32> {
         if self.poisoned {
             return Err(Error::Profile("room save failed; reopen it"));
@@ -757,6 +779,7 @@ impl ChannelState {
                     row: Some(row),
                     first_seen: now,
                 },
+                completion,
             )
         })();
         if let Err(e) = &result {
@@ -1008,6 +1031,7 @@ impl ChannelState {
                 row: Some(row),
                 first_seen,
             },
+            None,
         )?;
         self.sweep_private_sessions(store, now)?;
         Ok(())

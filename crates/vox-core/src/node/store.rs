@@ -76,6 +76,7 @@ const fn kind_code(kind: SegmentKind) -> u8 {
         SegmentKind::PrivateSession => 10,
         SegmentKind::EntryIndex => 11,
         SegmentKind::ProvisionalLog => 12,
+        SegmentKind::SessionIngress => 13,
     }
 }
 
