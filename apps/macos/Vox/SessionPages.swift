@@ -13,6 +13,10 @@ struct SessionPages: Equatable {
     /// At most 128 protocol-admitted activity entries, independently of stored history.
     /// This row budget is not a measured process-memory or whole-app byte bound.
     private static let windowEntries = 128
+    /// UTF-8 payload retained across older pages, including Details and question/file fields.
+    /// A single protocol-bounded entry is always kept, so a large activity remains readable.
+    /// Swift/SwiftUI allocation overhead and physical footprint are measured separately.
+    private static let windowTextBytes = 8 * 1024 * 1024
     private(set) var hasNewer = false
 
     /// Following replaces the window with the authoritative newest page. While the reader
@@ -28,6 +32,7 @@ struct SessionPages: Equatable {
                                      uniquingKeysWith: { _, latest in latest })
             entries = entries.map { current[$0.id] ?? $0 }
             hasNewer = hasNewer || page.entries.last?.id != entries.last?.id
+            boundOlderWindow()
         }
     }
 
@@ -39,8 +44,8 @@ struct SessionPages: Equatable {
         guard before == cursor else { return false }
         let have = Set(entries.map(\.id))
         let joined = page.entries.filter { !have.contains($0.id) } + entries
-        if joined.count > Self.windowEntries { hasNewer = true }
-        entries = Array(joined.prefix(Self.windowEntries))
+        entries = joined
+        boundOlderWindow()
         older = page.older
         before = page.before
         return true
@@ -51,6 +56,41 @@ struct SessionPages: Equatable {
     mutating func refreshRequests(_ current: [FfiSessionEntry]) {
         let byID = Dictionary(current.map { ($0.id, $0) }, uniquingKeysWith: { _, latest in latest })
         entries = entries.map { byID[$0.id] ?? $0 }
+        boundOlderWindow()
+    }
+
+    /// Drop only the newest edge of a pinned window. Its authoritative older count and
+    /// cursor still describe its unchanged first entry; evicted activity stays on disk.
+    private mutating func boundOlderWindow() {
+        var bytes = 0
+        var kept = 0
+        for entry in entries {
+            let cost = Self.textBytes(entry)
+            if kept > 0 && (kept >= Self.windowEntries || cost > Self.windowTextBytes - bytes) { break }
+            bytes += cost
+            kept += 1
+            if bytes >= Self.windowTextBytes { break }
+        }
+        if kept < entries.count {
+            entries = Array(entries.prefix(kept))
+            hasNewer = true
+        }
+    }
+
+    private static func textBytes(_ entry: FfiSessionEntry) -> Int {
+        var size = entry.id.utf8.count + entry.line.utf8.count + entry.details.utf8.count
+        if let file = entry.file {
+            size += file.name.utf8.count + file.sha256.utf8.count + file.entry.utf8.count
+            size += file.pulledPath?.utf8.count ?? 0
+        }
+        if let request = entry.request {
+            size += request.reference.utf8.count + (request.state?.utf8.count ?? 0)
+            for question in request.questions {
+                size += question.text.utf8.count
+                for option in question.options { size += option.utf8.count }
+            }
+        }
+        return size
     }
 
     /// Nothing loaded: another Session, or none, on screen.
