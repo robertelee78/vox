@@ -52,9 +52,11 @@ caps are the only loop guards that provably terminate.
   separate repositories consuming a UniFFI/XCFramework artifact. A desktop client MAY attach to a
   running daemon over §7's socket; a mobile app MUST embed the node as a library.
 - **1.4** Agent comms MUST NOT introduce a room type. Any room MAY carry agent comms.
-- **1.5** Vox MUST NOT start an agent, harness or model run of any kind (no `codex exec`, no
-  `claude -p`, no `opencode run`). A Vox feature uses only participants that already exist:
-  sessions a person opened and nodes in the room.
+- **1.5** Vox MUST NOT launch an agent, harness or standalone model run (no `codex exec`, no
+  `claude -p`, no `opencode run`), or reopen a closed conversation. A Vox feature uses only
+  participants that already exist: sessions a person opened and nodes in the room. A supported
+  adapter MAY deliver a notice into an existing, still-open conversation under §6; Codex's
+  next-turn-only exception in §6.15 remains explicit.
 
 ### 2. Identity and sessions
 
@@ -208,7 +210,7 @@ no cross-author parent), so two actions inside one millisecond are ordered by en
 dishonest `created_millis` can win a race it should have lost. Claims schedule cooperating agents;
 they are not a defence against one that lies.
 
-### 6. Delivery: queue always, wake only when addressed and urgent
+### 6. Delivery: queue always, bounded attention in an existing session
 
 - **6.1** A message MUST always land in the recipient's durable inbox: the room's log read from
   the session's cursor. Any push is only a wake.
@@ -216,7 +218,8 @@ they are not a defence against one that lies.
   **and** is `urgent`, has hops left (§9), was not posted by that session, and does not answer a
   reply chain that session already spoke in (V210-121). An urgent broadcast MUST wake nobody.
   *Amended by ADR-029 TA-3:* a message addressed to one session wakes only that session.
-  Everything else waits for the next turn.
+  Ordinary room conversation gains the separate, non-urgent attention path in §6.15. Other
+  messages wait for the next turn unless §6.9 applies.
 - **6.3 (M19.5, M19.5b).** The drain MUST be a harness hook, not a skill instruction:
 
   | Harness | Drain at turn start | Wake |
@@ -298,6 +301,95 @@ they are not a defence against one that lies.
   (`VOX_OPENCODE_WAKE_SOCKET`, `_TOKEN`). The plugin MUST NOT abort a running turn to deliver.
 - **6.14** The wake channel MUST be registered by the drain hook as a side effect of each turn,
   never configured by the operator.
+
+#### 6.15. Ordinary room conversation (#812, v0.4.5) — planned
+
+The operator's room-wide response policy and Codex exception are decided; implementation and
+acceptance are still required. These requirements amend §§6.2, 6.8–6.10 and 9.1 only as stated
+below. Repository binding (ADR-029), thread audiences and pause (ADR-033) still apply.
+
+- **RA-1. Audience.** An ordinary message in General with no recipients MUST be offered to every
+  eligible existing agent session working in that repository room. Each relevant agent answers
+  for its own work in the message's thread. A question such as “How's everyone doing—any
+  blockers?” MUST NOT elect one responder or require mentions or special syntax. Irrelevant
+  messages and thanks do not require acknowledgements. Explicit recipients narrow the audience;
+  a message inside a thread retains that thread's audience (TH-4). An agent's reply MUST NOT
+  suppress another agent's response or a later ordinary follow-up question.
+- **RA-2. Origin.** Classification MUST use each message's enclosing metadata, never a permanent
+  human/agent node type, its text, a name, or earlier traffic from that node. In a valid envelope,
+  a nonempty valid `from`, `at.session_name`, or `data.session.harness` is recognized session-origin
+  metadata; each is a bounded, single-line string. Those messages follow the existing agent-message
+  rules. A present but unusable origin field is malformed, not evidence of an ordinary sender. Generic
+  envelope, work, tag, branch, repository, recipient or reply metadata alone is not agent origin.
+  A valid message lacking the recognized fields, including bare prose, defaults to ordinary
+  conversation. No sender confirmation is required. Session, ping, pong and other plumbing never
+  becomes a conversation request. A malformed/unsupported envelope is shown as such and MUST NOT
+  acquire automatic attention by losing its invalid metadata. A forged session marker can only
+  change this delivery default; it establishes neither identity nor authority.
+- **RA-3. Posting.** Every supported posting path invoked from a harness MUST stamp its actual
+  registered sending session, including plain-text posts and replies. It MUST reject a conflicting
+  supplied session instead of speaking as it. A person's app/TUI/terminal post outside a harness
+  MUST NOT inherit another session's origin. Quoted metadata does not change the enclosing origin.
+  Metadata-absent clients use RA-2's default; no older-client compatibility layer is required.
+- **RA-4. Eligibility.** The recipient is `(room, node, session)`, using that session's saved
+  repository-room binding. Membership, readability, explicit recipients, thread participation,
+  pause, node attachment and the session's lifetime MUST be checked before delivery. A node in
+  several rooms MUST NOT expose their news or wakes to its other repository sessions. No elapsed
+  timer, loaded thread, process name or stale registration proves an interactive session is open.
+  A background but still-open conversation is eligible; it need not be the selected foreground
+  tab. An ended session MUST NOT be replaced silently by another session on its node.
+- **RA-5. Adapter boundary.** Busy sessions receive ordinary attention at a supported safe
+  boundary, without cancelling work or escalating urgency. Idle delivery MUST use the existing
+  session's supported input adapter, which must reject an ended conversation without reopening
+  it. Claude Code uses its authenticated messaging socket; OpenCode uses its existing plugin
+  endpoint and `promptAsync`. Their actual busy, idle and ended-session behavior MUST be measured
+  before acceptance. An adapter that cannot establish the required boundary reports unavailable;
+  it MUST NOT substitute another node, SSH, a new harness, or a new model run.
+- **RA-6. Codex exception.** For v0.4.5 Codex MUST deliver at the next ordinary hook turn, including
+  when a room question arrives while it is idle. Vox MUST NOT use queue/add, turn/start,
+  turn/steer, retained-thread subscriptions, background hooks or MCP as an automatic idle wake.
+  The app/TUI MUST say “Waiting for next Codex turn”, not “answering” or “delivered”. This is the
+  operator-authorized exception after the current-interface research, not proof of idle response.
+  It does not relax idle delivery for the other measured adapters, change direct driving under
+  ADR-029 DR-7, or permit reopening a conversation. When a normal Codex turn does start, the same
+  audience, origin, deduplication and response rules apply.
+- **RA-7. Observable state.** A durable room entry and intended recipient session identify one
+  response obligation. The recipient's sealed local state MUST distinguish queued, delivered to
+  the harness, answering, answered and unavailable, with pause and next-turn waiting stated.
+  A successful wake enqueue is only an attempted notice; delivery requires the hook/context
+  receipt. Answering requires an observed running harness turn consuming that receipt; without
+  that observation the state remains delivered. Answered requires its `answer` post correlated
+  to the original request. Cursor movement, transport ack,
+  expiry and somebody else's reply MUST NOT stand in for those observations. Relevance is the
+  agent's decision; delivery alone does not promise an answer. The app/TUI MUST show observed
+  pending/unavailable state and its limits. Private recipient identities and states are visible
+  only through the existing drive-authorized Session surface; an ordinary room reader gets no
+  private roster/count or assertion that every agent has replied.
+- **RA-8. Retry and storage.** Reuse the durable room log and per-session cursor/notice records;
+  keep pending state on local storage and page it with bounded resident memory. At most one
+  attention notice per session may be in flight. The notice carries only Vox's count, room and
+  keyring names as in §6.8; participant text arrives through the attributed drain. Recheck current
+  eligibility before dispatch. Definite rejection before acceptance permits a retry; ambiguous
+  delivery stays visibly uncertain until a hook receipt or supported request-id reconciliation
+  resolves it. Timeout alone MUST NOT start another turn. Restart/disconnect MUST preserve an
+  unanswered request without creating another room entry. Normal connected delivery presents the
+  request once per recipient; distributed exactly-once model execution is not promised. Room
+  retention governs the source entry: a removed request becomes unavailable/expired, and its
+  obsolete delivery records are reclaimed rather than kept forever.
+- **RA-9. Pause and permissions.** Pause holds attention and its cursor. Resume alone MUST NOT
+  wake an idle session for messages accumulated while paused (PA-4): those ordinary messages wait
+  for its next turn; a new post after resume follows the normal rules. Room text remains attributed
+  participant context. Automatic attention grants no drive, execution approval, operator status
+  or access to private Session content. Agent answers retain origin metadata and existing hop
+  limits; delivery/answer receipts and acknowledgements MUST NOT trigger room-wide attention.
+- **RA-10. Proof.** Extend existing real-binary hook/wake conversations and the existing app/TUI
+  journey. Cover an ordinary room-wide status question with separate relevant answers, mixed
+  person/agent use of one node, automatic origin stamping, busy/idle/ended sessions, two repository
+  sessions of one node, explicit recipients/threads, pause, restart and uncertain delivery. Record
+  actual harness versions and Codex's visible next-turn limit. Each deterministic claim needs its
+  own PRODUCT-red mutant; real harness/model conversations are optional on-demand spikes under
+  ADR-018. Reuse unchanged greens, never add a mandatory live-model gate. Shipped skill wording
+  and adapter behavior must agree; a prompt-only change is not completion.
 
 ### 7. The node fans out to many local clients, none able to stall it
 
@@ -422,6 +514,8 @@ they are not a defence against one that lies.
 
 - **9.1** An agent MUST NOT reply to a message unless addressed in `to` or asked. An agent MUST NOT
   auto-reply to `status`, `hello`, `bye` or `ack`. (Skill conventions.)
+  Under §6.15 an ordinary room question asks each relevant eligible participant; the exclusion of
+  agent-origin `status` does not exclude a person's ordinary question about everyone's status.
 - **9.2** A terminal acknowledgement MUST NOT generate another.
 - **9.3** `hops` MUST default to 8, MUST be decremented on relay and the message dropped at zero.
   Vox relays no message; what is built is a budget along the `re` chain: a reply's budget is at most
