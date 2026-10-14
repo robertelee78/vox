@@ -4962,7 +4962,11 @@ pub struct Node {
     session_room_removed: Option<mpsc::Sender<crate::node::session_ingress::Retirement>>,
     session_rooms_retiring: BTreeSet<crate::node::session_ingress::Retirement>,
     session_ingress_cursor: usize,
+    /// An empty inbox clears a recovery failure, not delivery or room cleanup failures.
+    /// Separate health keeps successful reads/appends from hiding unresolved cleanup.
+    session_ingress_recovery_error: Option<String>,
     session_ingress_error: Option<String>,
+    session_retirement_error: Option<String>,
     session_ingress_wake: Arc<tokio::sync::Notify>,
     /// When each peer was last tried for a better path (unix milliseconds), so a relayed connection is retried
     /// on a schedule rather than only at the moment it was made.
@@ -5388,7 +5392,9 @@ impl Node {
             session_room_removed,
             session_rooms_retiring: BTreeSet::new(),
             session_ingress_cursor: 0,
+            session_ingress_recovery_error: None,
             session_ingress_error: None,
+            session_retirement_error: None,
             session_ingress_wake: Arc::new(tokio::sync::Notify::new()),
             last_upgrade: std::collections::BTreeMap::new(),
             reachers: std::collections::BTreeMap::new(),
@@ -18248,7 +18254,12 @@ impl Node {
             .collect();
         report.diagnose();
         self.storage_health(&mut report);
-        if let Some(message) = &self.session_ingress_error {
+        if let Some(message) = self
+            .session_retirement_error
+            .as_ref()
+            .or(self.session_ingress_recovery_error.as_ref())
+            .or(self.session_ingress_error.as_ref())
+        {
             report.unhealthy.push(crate::node::status::Unhealthy {
                 key: "session-ingress".into(),
                 message: message.clone(),
@@ -18940,7 +18951,7 @@ impl Node {
         let rooms = match crate::node::session_ingress::retirements(profile) {
             Ok(rooms) => rooms,
             Err(error) => {
-                self.session_ingress_error =
+                self.session_retirement_error =
                     Some(format!("Session room cleanup cannot recover: {error}"));
                 return;
             }
@@ -18956,7 +18967,7 @@ impl Node {
                 }
                 Err(mpsc::error::TrySendError::Full(_)) => break,
                 Err(mpsc::error::TrySendError::Closed(_)) => {
-                    self.session_ingress_error = Some(
+                    self.session_retirement_error = Some(
                         "Session room cleanup owner is unavailable; restart the daemon".into(),
                     );
                     break;
@@ -18970,17 +18981,24 @@ impl Node {
     /// One bounded item per tick. Closed/joining rooms keep their durable head; another
     /// session is tried next tick. No harness/registration lifetime owns accepted bodies.
     async fn drain_session_ingress(&mut self) -> bool {
-        let Some(profile) = self.profile.as_ref() else {
+        let Some(profile) = self
+            .profile
+            .as_ref()
+            .filter(|profile| profile.is_unlocked())
+        else {
             return false;
         };
         let pending = match crate::node::session_ingress::pending(
             profile,
             &mut self.session_ingress_cursor,
         ) {
-            Ok(Some(pending)) => pending,
-            Ok(None) => return false,
+            Ok(pending) => {
+                self.session_ingress_recovery_error = None;
+                let Some(pending) = pending else { return false };
+                pending
+            }
             Err(error) => {
-                self.session_ingress_error =
+                self.session_ingress_recovery_error =
                     Some(format!("Session activity cannot be recovered: {error}"));
                 return false;
             }
