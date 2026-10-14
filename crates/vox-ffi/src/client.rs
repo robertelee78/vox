@@ -2144,6 +2144,18 @@ impl VoxClient {
         self.anchor_request(DaemonRequest::Anchors).await
     }
 
+    /// Resolve an optional room anchor field without saving it anywhere.
+    /// A bare host:port proves the responding anchor's fingerprint. An explicit
+    /// fingerprint@address is checked as input and authenticated when the room dials it.
+    /// Callers must still discard a stale result after the field, room or node changes.
+    pub async fn resolve_anchor(&self, input: String) -> Result<String, VoxError> {
+        match self.daemon(DaemonRequest::AnchorResolve { input }).await? {
+            DaemonFrame::AnchorResolved(spec) => Ok(spec),
+            DaemonFrame::AnchorFailed(why) => Err(failed(why)),
+            _ => Err(failed("the daemon did not return the resolved anchor")),
+        }
+    }
+
     /// Add fingerprint@address or host:port; host lookup proves the returned fingerprint.
     pub async fn add_anchor(&self, input: String) -> Result<Vec<AnchorSummary>, VoxError> {
         self.anchor_request(DaemonRequest::AnchorAdd { input })
@@ -3030,7 +3042,7 @@ impl VoxClient {
     }
 
     /// Add a full pinned fingerprint@address to this room's signed governance statement.
-    /// This proposal consumes an already authenticated/resolved spec, or a fingerprint the
+    /// This consumes an already authenticated/resolved spec, or a fingerprint the
     /// person explicitly pinned. It does not perform bare host:port identity discovery/search,
     /// and never changes the machine's manual-anchor list. DNS parsing is off the async workers;
     /// the room's ordinary anchor transport still authenticates the pinned identity on dial.
@@ -3039,31 +3051,31 @@ impl VoxClient {
     /// Malformed pinned input, a closed room, or the daemon's fresh NotAdmin refusal.
     pub async fn add_room_anchor_pinned(&self, room: String, spec: String) -> Result<(), VoxError> {
         let channel_id = digest(&room, "room id")?;
-        let add = self
-            .on_rt(async move {
-                tokio::task::spawn_blocking(move || {
-                    let mut add = vox_core::nat::bootstrap::BootstrapSet::new();
-                    vox_core::node::link::merge_anchor_spec(&mut add, &spec)
-                        .map_err(|error| failed(error.to_string()))?;
-                    Ok::<_, VoxError>(add)
-                })
-                .await
-                .map_err(|error| {
-                    failed(format!(
-                        "the pinned room anchor could not be parsed: {error}"
-                    ))
-                })?
+        on_held!(self, |c| {
+            // Hold the selected actor across DNS parsing and mutation: switching this client
+            // during the await must never submit the old intent as the newly selected node.
+            let add = tokio::task::spawn_blocking(move || {
+                let mut add = vox_core::nat::bootstrap::BootstrapSet::new();
+                vox_core::node::link::merge_anchor_spec(&mut add, &spec)
+                    .map_err(|error| failed(error.to_string()))?;
+                Ok::<_, VoxError>(add)
             })
-            .await?;
-        on_held!(self, |c| done(
-            c,
-            &Request::ChangeRoomAnchors {
-                channel_id,
-                add,
-                remove: None,
-            }
-        )
-        .await)
+            .await
+            .map_err(|error| {
+                failed(format!(
+                    "the pinned room anchor could not be parsed: {error}"
+                ))
+            })??;
+            done(
+                c,
+                &Request::ChangeRoomAnchors {
+                    channel_id,
+                    add,
+                    remove: None,
+                },
+            )
+            .await
+        })
     }
 
     /// Remove the exact full anchor fingerprint from this room's signed governance statement.

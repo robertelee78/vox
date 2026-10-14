@@ -236,7 +236,7 @@ pub struct Management {
 }
 impl Management {
     /// The account's explicit host:port lookup uses its existing socket, but no management
-    /// identity or authority. The returned fingerprint is proved before it is persisted.
+    /// identity or authority. The returned fingerprint is proved; lookup persists no anchor source.
     pub async fn lookup_anchor(&self, input: &str) -> Result<String> {
         let input = input.to_owned();
         tokio::time::timeout(std::time::Duration::from_secs(20), async {
