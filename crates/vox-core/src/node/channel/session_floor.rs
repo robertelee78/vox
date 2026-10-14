@@ -91,21 +91,27 @@ impl ChannelState {
         if self.drive.floors_indexed {
             return Ok(());
         }
-        for author in self.dag.authors() {
-            let head = self.dag.verified_head(&author);
-            for seq in 1..=head {
-                let entry = self
-                    .entries
-                    .read(store, &self.sek, &self.channel_id)?
-                    .get(&author, seq)?
-                    .ok_or(Error::MalformedAtRest("Session floor feed entry missing"))?;
-                if entry.payload.as_deref().is_some_and(is_session_floor) {
-                    self.learn_session_floor(&entry);
+        let indexed = (|| -> Result<()> {
+            for author in self.dag.authors() {
+                let head = self.dag.verified_head(&author);
+                for seq in 1..=head {
+                    let entry = self
+                        .entries
+                        .read(store, &self.sek, &self.channel_id)?
+                        .get(&author, seq)?
+                        .ok_or(Error::MalformedAtRest("Session floor feed entry missing"))?;
+                    if entry.payload.as_deref().is_some_and(is_session_floor) {
+                        self.learn_session_floor(&entry);
+                    }
                 }
             }
+            self.drive.floors_indexed = true;
+            Ok(())
+        })();
+        if let Err(ref error) = indexed {
+            self.poison(error);
         }
-        self.drive.floors_indexed = true;
-        Ok(())
+        indexed
     }
 
     /// Publish the boundary before releasing the matching key or writing a Session step.
@@ -312,7 +318,6 @@ impl ChannelState {
                     .write(&mut batch, &self.sek, &self.channel_id)?;
                 self.dag.prune_payload(&mut index, &entry.entry_hash())?;
                 index.seal()?;
-                drop(index);
                 batch.commit()?;
                 self.entries.committed();
                 self.drive

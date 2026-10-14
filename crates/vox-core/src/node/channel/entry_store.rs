@@ -1232,7 +1232,6 @@ impl EntryIndex {
             if matches!(writer.directory.phase, Phase::Building | Phase::Switched) {
                 let done = writer.cleanup_chunk()?;
                 writer.seal()?;
-                drop(writer);
                 batch.commit()?;
                 self.committed();
                 if !done {
@@ -1287,7 +1286,6 @@ impl EntryIndex {
                 let mut writer = self.write(current, sek, channel)?;
                 writer.index_existing(&entry, id)?;
                 writer.seal()?;
-                drop(writer);
                 count += 1;
                 if count == PROMOTION_ENTRIES {
                     batch
@@ -1303,7 +1301,6 @@ impl EntryIndex {
             let mut writer = self.write(&mut batch, sek, channel)?;
             writer.finish_rebuild()?;
             writer.seal()?;
-            drop(writer);
             batch.commit()?;
             self.committed();
         }
@@ -1347,7 +1344,6 @@ impl EntryIndex {
                 removed += 1;
             }
             writer.seal()?;
-            drop(writer);
             batch.commit()?;
             self.committed();
             if removed < PROMOTION_ENTRIES {
@@ -1595,7 +1591,6 @@ impl EntryWrite for Staging<'_> {
         let mut writer = self.index.write(&mut batch, self.sek, self.channel)?;
         writer.stage(entry)?;
         writer.seal()?;
-        drop(writer);
         batch.commit()?;
         self.index.committed();
         Ok(())
@@ -1605,7 +1600,6 @@ impl EntryWrite for Staging<'_> {
         let mut writer = self.index.write(&mut batch, self.sek, self.channel)?;
         writer.remove_staged(author, seq)?;
         writer.seal()?;
-        drop(writer);
         batch.commit()?;
         self.index.committed();
         Ok(())

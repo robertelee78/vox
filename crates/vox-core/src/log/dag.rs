@@ -368,7 +368,6 @@ impl Dag {
     }
 
     /// Look up a stored entry by its 32-byte hash (the Negentropy key).
-    #[must_use]
     pub fn get_by_hash(&self, entries: &impl EntryRead, hash: &Digest32) -> Result<Option<Entry>> {
         let Some((author, seq)) = entries.locate(hash)? else {
             return Ok(None);
@@ -470,7 +469,6 @@ impl Dag {
     }
 
     /// Whether an entry with this hash is stored.
-    #[must_use]
     pub fn contains(&self, entries: &impl EntryRead, hash: &Digest32) -> Result<bool> {
         Ok(self.position(entries, hash)?.is_some())
     }
@@ -867,7 +865,6 @@ impl Dag {
     /// that saw another claim follows it. `false` means concurrent **or** not yet
     /// known to be ordered — `a` may be an ancestor through an entry this node has not
     /// received. Neither entry held is `false`.
-    #[must_use]
     pub fn happened_before(
         &self,
         entries: &impl EntryRead,

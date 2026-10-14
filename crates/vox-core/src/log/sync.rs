@@ -494,7 +494,6 @@ pub fn frontiers_of(dag: &Dag) -> Vec<FeedFrontier> {
 ///   and no fork proof would form (ADR-008 §"Fork / equivocation handling"). The
 ///   pulled conflicting entry is fed into DAG fork handling, which freezes the
 ///   author on the proof.
-#[must_use]
 pub fn wants_for(
     dag: &Dag,
     entries: &impl EntryRead,
@@ -561,7 +560,6 @@ pub fn wants_for(
 /// again (PRD-001 D2). Now each author's ranges are merged, so duplicates and
 /// overlaps cost nothing and serve nothing twice, and each merged range walks
 /// only the entries the feed actually has. Entries not held are simply omitted.
-#[must_use]
 pub fn entries_for_wants(
     dag: &Dag,
     entries: &impl EntryRead,
@@ -1640,7 +1638,6 @@ pub fn apply_staged_classified<R: AuthorResolver>(
 
 /// [`wants_for`], without asking for a frozen author's entries (ADR-025 D3: the same prefix is
 /// not re-served for ever).
-#[must_use]
 pub fn wants_for_unfrozen(
     dag: &Dag,
     entries: &impl EntryRead,
