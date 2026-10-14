@@ -1432,9 +1432,7 @@ fn said(socket: &std::path::Path, e: Error) -> VoxError {
     let reason = vox_core::node::daemonipc::unreached(socket, None, e);
     if unreachable {
         VoxError::Unreachable { reason }
-    } else if interrupted {
-        VoxError::Unknown { reason }
-    } else if uncertain {
+    } else if interrupted || uncertain {
         VoxError::Unknown { reason }
     } else {
         VoxError::Failed { reason }
