@@ -51,7 +51,6 @@ extension NodeModel {
     var timelineTitle: String {
         switch showing {
         case .general: return "Timeline · ⏱ \(retention)"
-        case .all: return "Timeline — All · ⏱ \(retention)"
         case .session:
             guard let s = shownSession else { return "Timeline — a Session this room no longer lists" }
             let kept = stepRetention.map { " · steps kept \(Retention.words($0.effectiveSeconds))" } ?? ""
@@ -97,13 +96,6 @@ extension NodeModel {
         switch showing {
         case .general:
             return roomItems
-        case .all:
-            // Each Session's opening and end among the room's lines, by time.
-            var items = roomItems
-            for line in sessions.flatMap(TimelineItem.openedAndEnded) {
-                items.insert(line, at: items.firstIndex { $0.millis > line.millis } ?? items.count)
-            }
-            return items
         case .tag:
             // The server selected the exact raw tag before applying its page budget.
             return withEarlierRoomEntries(messages.map(TimelineItem.message))

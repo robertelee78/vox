@@ -126,6 +126,7 @@ final class NodeModel: ObservableObject {
         didSet {
             roomReadGeneration = UUID()
             invalidateRoomAnchorState(preservingSnapshot: oldValue == selection)
+            invalidateMemberRoles()
             individualTrustFacts = [:]
             individualTrustReads = [:]
             rejectedRoomMark = nil
@@ -188,7 +189,9 @@ final class NodeModel: ObservableObject {
 
     @Published private(set) var roomOlder: UInt64 = 0
     private var roomBefore: String?
-    private var roomInstance: Data?
+    private var roomInstance: Data? {
+        didSet { if oldValue != roomInstance { invalidateMemberRoles() } }
+    }
     @Published private var roomHasNewer = false
     @Published private(set) var roomReloadNeeded = false
     private static let roomWindowLimit = 128
@@ -299,7 +302,8 @@ final class NodeModel: ObservableObject {
     @Published private(set) var sessionsOpenNext: String?
     @Published private(set) var sessionsHistoryNext: String?
     @Published private(set) var sessionsMetadataLoading = false
-    private var sessionsOpenAfter: String?
+    @Published private var sessionsOpenAfter: String?
+    var sessionsOpenPaged: Bool { sessionsOpenAfter != nil }
     @Published private var sessionsHistoryAfter: String?
     var sessionsHistoryPaged: Bool { sessionsHistoryAfter != nil }
     private var sessionsMetadataRead = UUID()
@@ -458,6 +462,7 @@ final class NodeModel: ObservableObject {
     private static func progressWords(_ operation: String) -> String {
         let words = ["bind-room": "Binding the room…", "decline-room": "Declining the room…",
                      "dismiss-offer": "Dismissing the offer…", "lan-helper": "Updating the LAN helper…",
+                     "family-lan": "Updating the family LAN…",
                      "create-room": "Creating the room…", "join-room": "Joining the room…",
                      "copy-link": "Reading the room link…", "leave": "Leaving the room…",
                      "retention": "Setting retention…", "step-retention": "Setting Session step retention…",
@@ -490,7 +495,19 @@ final class NodeModel: ObservableObject {
     private var watching: Task<Void, Never>?
     /// Follows the node's facts (keyring, nodes, peers) while the model lives.
     private var following: Task<Void, Never>?
-    @Published private(set) var members: [MemberRow] = []
+    @Published private(set) var members: [MemberRow] = [] {
+        didSet {
+            if Set(oldValue.map(\.id)) != Set(members.map(\.id)) { invalidateMemberRoles() }
+        }
+    }
+    enum MemberRole: String {
+        case creator = "Creator", admin = "Admin", member = "Member"
+    }
+    /// Only the displayed roster, including this node. Missing is unknown, never non-admin.
+    @Published private(set) var memberRoles: [String: MemberRole] = [:]
+    @Published private(set) var memberRolesError: String?
+    @Published private(set) var memberRolesLoading = false
+    private var memberRolesRead = UUID()
     @Published private(set) var trusted: [TrustedNode] = []
     /// Trust offers waiting on this node: newcomers, and nodes that trust it (ADR-028 K-15, K-17).
     @Published private(set) var offers: [OfferInfo] = []
@@ -783,7 +800,6 @@ final class NodeModel: ObservableObject {
     private var selectedRoomView: RoomView {
         switch showing {
         case .general, .session: return .general
-        case .all: return .all
         case .tag(let key, _): return .tag(key: key)
         }
     }
@@ -971,6 +987,7 @@ final class NodeModel: ObservableObject {
             if fresh.first(where: { $0.name == node })?.state != "attached" {
                 nodeObservationEpoch = UUID()
                 invalidateRoomAnchorState(preservingSnapshot: true)
+                invalidateMemberRoles()
                 daemonReachable = true
                 ended = fresh.first(where: { $0.name == node })?.status == "Locked"
                     ? "Node \(node) is Locked." : "Node \(node) is unavailable."
@@ -997,6 +1014,7 @@ final class NodeModel: ObservableObject {
                 if case .room = selection {
                     threadDisplayRevision = nil
                     roomReadGeneration = UUID()
+                    invalidateMemberRoles()
                     roomNeedsPage = true
                     watching?.cancel()
                     stepRetentionRead = UUID()
@@ -1023,6 +1041,7 @@ final class NodeModel: ObservableObject {
             nodeObservationEpoch = UUID()
             threadDisplayRevision = nil
             invalidateRoomAnchorState(preservingSnapshot: true)
+            invalidateMemberRoles()
             daemonFailure = sentence(error)
             reportBackground(error)
             return
@@ -1791,18 +1810,24 @@ final class NodeModel: ObservableObject {
     /// Bring this Mac onto `room`'s family LAN, or take it down; a failure is the daemon's
     /// sentence, shown where it was asked (M-7).
     func setLan(_ room: String, on: Bool) async {
+        let operation = "family-lan", attempt = begin("family-lan")
+        defer { end(attempt) }
         lanFailed[room] = nil
         do {
             if on {
-                lanSaid[room] = try await client.lanUp(room: room, allow: [], helperSocket: "")
+                let said = try await client.lanUp(room: room, allow: [], helperSocket: "")
+                lanSaid[room] = said
                 lanOn.insert(room)
+                report(operation: operation, done: said)
             } else {
                 try await client.lanDown(room: room)
                 lanOn.remove(room)
                 lanSaid[room] = nil
+                report(operation: operation, done: "Turned off the family LAN for \(roomName(room)).")
             }
         } catch {
             lanFailed[room] = sentence(error)
+            report(error, operation: operation)
         }
     }
 
@@ -2136,7 +2161,8 @@ final class NodeModel: ObservableObject {
         roomAnchorAuthority = nil
         await loadRoomAnchorState()
         guard !Task.isCancelled, roomOnScreen == room, roomReadGeneration == generation,
-              nodeObservationEpoch == epoch, canManageRoomAnchors else { return }
+              nodeObservationEpoch == epoch, ended == nil else { return }
+        // Every member may inspect the configuration; only current admins may change it.
         sheet = .roomAnchors
     }
 
@@ -2628,6 +2654,62 @@ final class NodeModel: ObservableObject {
     private var readRoomOrder: [ReadContext] = []
     private var flushing: Task<Void, Never>?
 
+    private func invalidateMemberRoles() {
+        memberRolesRead = UUID()
+        memberRoles = [:]
+        memberRolesError = nil
+        memberRolesLoading = false
+    }
+
+    /// The inspector owns this read separately from message loading and its watcher. One admin
+    /// page identifies the creator and common cases; exact lookups cover only displayed members,
+    /// never a collection of historical governance. A final revision check rejects mixed roles.
+    func loadMemberRoles(_ room: String) async {
+        guard roomOnScreen == room, let instance = roomInstance, ended == nil else { return }
+        let request = UUID(), generation = roomReadGeneration, epoch = nodeObservationEpoch
+        let targets = Set(members.map(\.id)).union([me])
+        memberRolesRead = request
+        memberRolesLoading = true
+        defer { if memberRolesRead == request { memberRolesLoading = false } }
+        func current() -> Bool {
+            !Task.isCancelled && memberRolesRead == request && roomReadGeneration == generation
+                && nodeObservationEpoch == epoch && roomOnScreen == room && roomInstance == instance
+                && ended == nil && targets == Set(members.map(\.id)).union([me])
+        }
+        do {
+            let first = try await client.adminsPage(room: room, after: nil, revision: nil)
+            guard current() else { return }
+            let admins = Set(first.members)
+            var roles: [String: MemberRole] = [:]
+            for fingerprint in targets.sorted() {
+                if fingerprint == first.creator {
+                    roles[fingerprint] = .creator
+                } else if admins.contains(fingerprint) {
+                    roles[fingerprint] = .admin
+                } else if first.next == nil {
+                    roles[fingerprint] = .member
+                } else {
+                    let admin = try await client.isAdmin(room: room, member: fingerprint)
+                    guard current() else { return }
+                    roles[fingerprint] = admin ? .admin : .member
+                }
+            }
+            // Exact queries carry no revision themselves. Revalidate the same governance
+            // revision before publishing their combined answer, including a creator change.
+            let last = try await client.adminsPage(room: room, after: nil, revision: first.revision)
+            guard current() else { return }
+            guard last.revision == first.revision, last.creator == first.creator else {
+                throw VoxError.Failed(reason: "Room roles changed while reading; trying again.")
+            }
+            memberRoles = roles
+            memberRolesError = nil
+        } catch {
+            guard current() else { return }
+            memberRoles = [:]
+            memberRolesError = "Room roles unavailable: " + sentence(error)
+        }
+    }
+
     /// The members of `room` other than this node, with the trust each has here.
     private func memberRows(_ room: String) async throws -> (rows: [MemberRow], trustsMe: Set<String>, presented: [String: String]) {
         let roster = try await client.roster(room: room)
@@ -2915,7 +2997,7 @@ final class NodeModel: ObservableObject {
             // that may be a thread reply or a message belonging to another raw tag.
             if !timelineFollowingNewest {
                 switch showing {
-                case .general, .all:
+                case .general:
                     if message.thread.isEmpty { roomHasNewer = true }
                 case .tag(let key, _):
                     if message.tagSelectors.contains(where: { $0.key == key }) { roomHasNewer = true }
@@ -2967,6 +3049,7 @@ final class NodeModel: ObservableObject {
     /// Recoverable history is reloaded from the node after leaving a view or losing its
     /// owner. Drafts are user working state and are preserved independently of these caches.
     private func releaseHistoryViews() {
+        invalidateMemberRoles()
         clearThreadState()
         messages = []
         roomOlder = 0
@@ -3148,13 +3231,9 @@ extension NodeModel {
             guard current() else { return }
             selectedSessionMetadata = found
             selectedSessionMetadataKnown = true
-            if found == nil {
-                sessionPages.clear()
-                sessionWindowRevision = UUID()
-                selectedEarlierRequest = nil
-                sessionNote = "This Session's opening is no longer available."
-                sessionLoading = false
-            }
+            // Only this successful exact lookup can revoke the selected tab. Its absence
+            // from a bounded open/history page is not evidence that access disappeared.
+            if found == nil || found?.canDrive == false { showing = .general }
         } catch {
             guard current() else { return }
             selectedSessionMetadata = nil
