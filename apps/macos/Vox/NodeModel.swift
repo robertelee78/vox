@@ -252,7 +252,9 @@ final class NodeModel: ObservableObject {
 
     /// The sheet a menu, key or palette action opened.
     @Published private(set) var roomAnchorAuthority: RoomAnchorAuthority?
-    @Published private(set) var roomAnchorEntries: [AnchorSummary] = []
+    @Published private(set) var roomAnchorEntries: [RoomAnchorEndpoint] = []
+    @Published private(set) var roomAnchorReach: [String: String] = [:]
+    @Published private(set) var roomAnchorReachError: String?
     @Published private(set) var roomAnchorError: String?
     @Published private(set) var roomAnchorLoading = false
     @Published private(set) var roomAnchorChanging = false
@@ -1651,6 +1653,8 @@ final class NodeModel: ObservableObject {
         roomAnchorAuthorityEpoch = nil
         roomAnchorAuthorityGeneration = nil
         roomAnchorEntries = []
+        roomAnchorReach = [:]
+        roomAnchorReachError = nil
         roomAnchorError = nil
         roomAnchorLoading = false
         roomAnchorChanging = false
@@ -1676,10 +1680,24 @@ final class NodeModel: ObservableObject {
             roomAnchorAuthority = authority
             roomAnchorAuthorityEpoch = epoch
             roomAnchorAuthorityGeneration = generation
-            let entries = try await client.anchors()
+            let configuration = try await client.roomAnchorConfiguration(room: room)
             guard current() else { return }
-            roomAnchorEntries = entries.filter { $0.sources.contains { $0.room == room } }
+            guard configuration.room == room, configuration.node == me else {
+                throw VoxError.Failed(reason: "The anchor configuration belongs to another room or node.")
+            }
+            roomAnchorEntries = configuration.anchors
             roomAnchorError = nil
+            // Reach is an identity-level observation across machine sources, not proof that
+            // every address in this room's signed configuration is reachable.
+            do {
+                let inventory = try await client.anchors()
+                guard current() else { return }
+                roomAnchorReach = Dictionary(uniqueKeysWithValues: inventory.map { ($0.fingerprint, $0.reachText) })
+                roomAnchorReachError = nil
+            } catch {
+                guard current() else { return }
+                roomAnchorReachError = sentence(error)
+            }
         } catch {
             guard current() else { return }
             roomAnchorAuthority = nil

@@ -200,7 +200,18 @@ struct RoomAnchorEditor: View {
                         HStack(alignment: .top) {
                             VStack(alignment: .leading, spacing: Space.s4) {
                                 Text(anchor.fingerprint).font(Theme.mono).textSelection(.enabled)
-                                AnchorNetworkRow(anchor: anchor, reachable: model.daemonReachable && model.roomAnchorError == nil)
+                                Text(anchor.addresses.joined(separator: ", ")).font(Theme.mono)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                Text(model.roomAnchorError == nil
+                                     ? "From this room's configuration."
+                                     : "Room configuration unavailable; showing last known configuration.")
+                                    .secondaryText()
+                                Text("Identity reach across this machine's sources: "
+                                     + (model.roomAnchorReachError == nil
+                                        ? (model.roomAnchorReach[anchor.fingerprint] ?? "No current observation.")
+                                        : "unavailable; last known: " + (model.roomAnchorReach[anchor.fingerprint] ?? "none")))
+                                    .secondaryText()
+                                    .accessibilityIdentifier("room-anchor-reach-" + anchor.fingerprint)
                             }
                             Spacer()
                             Button("Remove from Room") {
