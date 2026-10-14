@@ -3360,10 +3360,14 @@ extension NodeModel {
                 let changed = self.threadDisplayRevision != revision
                 self.threadDisplayRevision = revision
                 if changed { self.refreshOpenThread() }
-                let roots = self.messages.filter { $0.thread.isEmpty && !$0.owed }.map(\.id)
+                var roots = self.messages.filter { $0.thread.isEmpty && !$0.owed }.map(\.id)
+                if let root = self.openThread, self.threadRootMessage != nil, !roots.contains(root) { roots.append(root) }
                 let known = Set(roots)
                 self.threadSummaries = self.threadSummaries.filter { known.contains($0.key) }
                 self.threadSummaryErrors = self.threadSummaryErrors.filter { known.contains($0.key) }
+                self.threadSummaryVersions = self.threadSummaryVersions.filter { known.contains($0.key) }
+                self.threadAuthorRequests = self.threadAuthorRequests.filter { known.contains($0.key) }
+                self.threadForcedSummaries.formIntersection(known)
                 let forced = self.threadForcedSummaries
                 self.threadForcedSummaries = []
                 for root in roots where changed || forced.contains(root)
