@@ -51,9 +51,14 @@ pub(super) enum Tree {
     PrivateAge,
     PrivateStepAge,
     Controls,
+    Floors,
+    FloorAuthors,
+    FloorSelf,
+    FloorContinuity,
+    FloorFirst,
 }
 
-const TREES: usize = 30;
+const TREES: usize = 35;
 
 impl Tree {
     fn index(self) -> usize {
@@ -88,6 +93,11 @@ impl Tree {
             Self::PrivateAge => 27,
             Self::PrivateStepAge => 28,
             Self::Controls => 29,
+            Self::Floors => 30,
+            Self::FloorAuthors => 31,
+            Self::FloorSelf => 32,
+            Self::FloorContinuity => 33,
+            Self::FloorFirst => 34,
         }
     }
 }
@@ -207,7 +217,7 @@ impl Header {
         let stored_trees = d.array()?;
         // These are append-only derived roots within the current development format. Keep
         // every original locator; startup streams the absent private/control facts.
-        if next == 0 || !matches!(stored_trees, 26 | 29 | TREES) {
+        if next == 0 || !matches!(stored_trees, 26 | 29 | 30 | TREES) {
             return Err(invalid("Session index header roots"));
         }
         let mut roots = [0; TREES];
@@ -467,6 +477,24 @@ pub(super) fn find_in(
     session_tree::Read::batch(batch, sek, room, KIND).find(header.roots[tree.index()], key)
 }
 
+pub(super) fn descriptor_in(
+    batch: &Batch<'_>,
+    sek: &Sek,
+    room: &Digest32,
+    id: u64,
+) -> Result<Zeroizing<Vec<u8>>> {
+    if id == HEADER {
+        return Err(invalid("Session descriptor id"));
+    }
+    let sealed = batch
+        .get_segment(room, KIND, id)?
+        .ok_or_else(|| invalid("Session descriptor missing"))?;
+    if sealed.ciphertext.len() > DESCRIPTOR_BYTES + TAG_LEN {
+        return Err(invalid("Session descriptor exceeds its format"));
+    }
+    open_segment(sek, KIND, id, &sealed)
+}
+
 impl<'a, 's> Write<'a, 's> {
     pub fn activity_is_working(&self) -> bool {
         self.activity_working
@@ -604,6 +632,11 @@ impl<'a, 's> Write<'a, 's> {
     pub fn next(&self, tree: Tree, after: Option<Key>) -> Result<Option<(Key, u64)>> {
         session_tree::Read::batch(self.batch, self.sek, self.room, KIND)
             .first_after(self.root(tree)?, after)
+    }
+
+    pub fn previous(&self, tree: Tree, before: Option<Key>) -> Result<Option<(Key, u64)>> {
+        session_tree::Read::batch(self.batch, self.sek, self.room, KIND)
+            .last_before(self.root(tree)?, before)
     }
 
     pub fn work(mut self) -> Result<Self> {
@@ -750,6 +783,11 @@ impl<'a, 's> Write<'a, 's> {
             Tree::PrivateAge,
             Tree::PrivateStepAge,
             Tree::Controls,
+            Tree::Floors,
+            Tree::FloorAuthors,
+            Tree::FloorSelf,
+            Tree::FloorContinuity,
+            Tree::FloorFirst,
         ];
         self.working = true;
         for _ in 0..limit {
@@ -782,6 +820,7 @@ impl<'a, 's> Write<'a, 's> {
                         | Tree::ActivitySessions
                         | Tree::ActivityCreated
                         | Tree::Lifecycle
+                        | Tree::FloorSelf
                 ) {
                     self.delete_descriptor(id)?;
                 }

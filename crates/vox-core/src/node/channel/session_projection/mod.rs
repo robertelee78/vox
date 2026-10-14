@@ -33,6 +33,7 @@ mod storage;
 mod text;
 mod waiting;
 
+pub(super) mod floor_index;
 pub(super) mod private_index;
 
 pub(crate) use activity_query::{

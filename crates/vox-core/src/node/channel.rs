@@ -881,6 +881,24 @@ pub const STAMP_LEAD_LIMIT_MILLIS: u64 = 10 * 60 * 1000;
 /// How many of this node's own posts `ChannelState::skipped_when_stamped` remembers.
 const SKIPPED_KEPT: usize = 64;
 
+/// Stable inputs to receipt eligibility. Routine directory seals do not wake a completed
+/// pass; a changed pending set, rendered row or read policy does. Reopen starts a fresh pass.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ReadMarkEligibility {
+    reader: Digest32,
+    pending: u64,
+    rendered: [u64; 4],
+    governance: u64,
+    retention: (u64, u64),
+}
+
+#[derive(Clone, Copy)]
+struct ReadMarkScan {
+    after: Option<Digest32>,
+    through: Digest32,
+    started: ReadMarkEligibility,
+}
+
 /// An open (SEK-unlocked) channel on this device.
 pub struct ChannelState {
     channel_id: Digest32,
@@ -907,8 +925,10 @@ pub struct ChannelState {
     sender: SenderChain,
     /// The next `LogDb` / `PlaintextCache` segment id.
     next_log_id: u64,
-    /// Current pending-read pass: last examined hash and its fixed tail; no mark set is resident.
-    read_mark_scan: Option<(Option<Digest32>, Digest32)>,
+    /// Current fixed-tail pass and the unchanged eligibility it last finished examining.
+    /// No mark set is resident, and skipped marks stay sealed while an idle pass is parked.
+    read_mark_scan: Option<ReadMarkScan>,
+    read_mark_complete: Option<ReadMarkEligibility>,
     /// Stored entries set aside when the room opened (V210-74): each as `author#seq: why`.
     set_aside: SetAside,
     /// A receiver chain advanced in memory since the chains were last written (V210-74): a decrypt
@@ -1784,6 +1804,7 @@ impl ChannelState {
             sender,
             next_log_id: 1,
             read_mark_scan: None,
+            read_mark_complete: None,
             set_aside: SetAside::default(),
             chains_advanced: false,
             legacy_sessions: legacy_session::LegacySessions::default(),
@@ -2311,6 +2332,7 @@ impl ChannelState {
             sender,
             next_log_id,
             read_mark_scan: None,
+            read_mark_complete: None,
             set_aside,
             chains_advanced: false,
             legacy_sessions: legacy_session::LegacySessions::default(),
@@ -2365,9 +2387,8 @@ impl ChannelState {
         // Apply the new default while upgrading an existing room, before publishing any
         // cached Session rows or permitting a sync to send its old encrypted bodies.
         room.restore_legacy_sessions(store, now.0)?;
-        // A revoked member may hold no body from the newest drive generation. Restore the
-        // author's signed generation announcements before exposing its Session permissions.
-        room.index_session_floors(store)?;
+        // Signed authorization facts catch up in bounded maintenance. Session permissions
+        // refuse while that catalog is incomplete, without replaying whole feeds at open.
         room.restore_private_sessions(store)?;
         if let Some(hash) = retained_step_body {
             room.private_sessions.legacy_pending.insert(hash);
@@ -2551,6 +2572,7 @@ impl ChannelState {
             sender,
             next_log_id: 1,
             read_mark_scan: None,
+            read_mark_complete: None,
             set_aside: SetAside::default(),
             chains_advanced: false,
             legacy_sessions: legacy_session::LegacySessions::default(),
@@ -3190,7 +3212,13 @@ impl ChannelState {
         let mut index = self.entries.write(batch, &self.sek, &self.channel_id)?;
         index.publish_promotion()?;
         index.seal()?;
-        session_projection::private_index::observe_public(batch, &self.sek, &self.channel_id, entry)
+        session_projection::private_index::observe_public(
+            batch,
+            &self.sek,
+            &self.channel_id,
+            entry,
+            self.epoch,
+        )
     }
 
     fn finish_entry_publication(&mut self, store: &Store) -> Result<()> {
@@ -4250,7 +4278,10 @@ impl ChannelState {
     /// Mark this room poisoned after a real storage or consistency failure.
     /// Pending governance or subtype replay is retryable and keeps the last good display.
     pub fn poison(&mut self, e: &Error) {
-        if governance::refreshing(e) || Self::legacy_classification_refreshing(e) {
+        if governance::refreshing(e)
+            || Self::legacy_classification_refreshing(e)
+            || Self::authorization_refreshing(e)
+        {
             return;
         }
         self.poisoned = true;
@@ -5291,6 +5322,7 @@ impl ChannelState {
                     &self.sek,
                     &self.channel_id,
                     &entry,
+                    self.epoch,
                 )?;
                 self.inspect_legacy_body_into(&mut batch, &entry)?;
                 {
@@ -5921,6 +5953,7 @@ impl ChannelState {
                         &self.sek,
                         &self.channel_id,
                         &held,
+                        self.epoch,
                     )?;
                     if promotion.is_none() {
                         logged += 1;
@@ -6214,12 +6247,8 @@ impl ChannelState {
         for author in held {
             let legacy = self.legacy_drive_generation(store, &author)?;
             let announced = self
-                .drive
-                .floors
-                .keys()
-                .filter(|(a, _, epoch, _)| *a == author && *epoch <= self.epoch)
-                .map(|(_, _, _, generation)| *generation)
-                .max();
+                .floor_author(Transaction::Snapshot(&store.snapshot()?), &author)?
+                .announced;
             let newest = legacy.into_iter().chain(announced).max();
             if newest.is_none_or(|g| self.drive.receivers.contains_key(&(author, g)))
                 || self.key_packages.pending_from(&author)
@@ -6281,12 +6310,8 @@ impl ChannelState {
         self.index_session_floors(store)?;
         let me = self.me();
         let published = self
-            .drive
-            .floors
-            .keys()
-            .filter(|(author, _, epoch, _)| *author == me && *epoch <= self.epoch)
-            .map(|(_, _, _, generation)| *generation)
-            .max();
+            .floor_author(Transaction::Snapshot(&store.snapshot()?), &me)?
+            .announced;
         let floor = self
             .drive
             .chain
@@ -7877,25 +7902,39 @@ impl ChannelState {
             if last != 0 && now_ms < last.saturating_add(interval_ms) {
                 return Ok(None);
             }
-            let (after, through) = match self.read_mark_scan {
+            let governance = self.current_governance(profile.store())?;
+            let eligibility = ReadMarkEligibility {
+                reader: me,
+                pending: rendered.pending_reads_root()?,
+                rendered: rendered.display_roots(),
+                governance: governance.revision(),
+                retention: (self.effective_retention(), self.effective_step_retention()),
+            };
+            if self.read_mark_scan.is_none() && self.read_mark_complete == Some(eligibility) {
+                return Ok(None);
+            }
+            let scan = match self.read_mark_scan {
                 Some(scan) => scan,
                 None => match rendered.pending_reads_tail(&me)? {
-                    Some(tail) => (None, tail),
-                    None => return Ok(None),
+                    Some(through) => ReadMarkScan {
+                        after: None,
+                        through,
+                        started: eligibility,
+                    },
+                    None => return Ok(Some((Vec::new(), None, Some(eligibility)))),
                 },
             };
-            let (page, more) = rendered.pending_reads_page(&me, after)?;
-            let governance = self.current_governance(profile.store())?;
+            let (page, more) = rendered.pending_reads_page(&me, scan.after)?;
             let mut read = Vec::new();
-            let mut cursor = after;
+            let mut cursor = scan.after;
             let mut complete = !more;
             for hash in page {
-                if hash > through {
+                if hash > scan.through {
                     complete = true;
                     break;
                 }
                 cursor = Some(hash);
-                if hash == through {
+                if hash == scan.through {
                     complete = true;
                 }
                 if rendered.fact(&hash)?.is_none() {
@@ -7923,9 +7962,18 @@ impl ChannelState {
             let next = if complete {
                 None
             } else {
-                Some((cursor, through))
+                Some(ReadMarkScan {
+                    after: cursor,
+                    ..scan
+                })
             };
-            Ok(Some((read, next)))
+            // Changes during a pass can make an already examined mark eligible or add a
+            // mark behind its cursor. Finish the fixed tail fairly, then take another pass.
+            // Own receipt commits also change the pending root; at most one unchanged pass
+            // over the remaining skipped marks parks them without any postcommit read.
+            let finished =
+                (complete && read.is_empty() && scan.started == eligibility).then_some(eligibility);
+            Ok(Some((read, next, finished)))
         })();
         let selected = match selected {
             Ok(selected) => selected,
@@ -7934,15 +7982,17 @@ impl ChannelState {
                 return Err(error);
             }
         };
-        let Some((read, next)) = selected else {
+        let Some((read, next, finished)) = selected else {
             return Ok(false);
         };
         if read.is_empty() {
             self.read_mark_scan = next;
+            self.read_mark_complete = finished;
             return Ok(false);
         }
         self.append_read(profile, read, now_ms)?;
         self.read_mark_scan = next;
+        self.read_mark_complete = None;
         Ok(true)
     }
 
@@ -8779,6 +8829,10 @@ impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
         let mut room = self.room()?;
         match room.session_entries_for(self.store, &self.peer, wants, self.now_ms) {
             Ok(entries) => Ok(entries),
+            Err(error) if session_projection::floor_index::refreshing(&error) => {
+                *self.fatal.borrow_mut() = Some(error);
+                Err(crate::wire::WireError::TransportFailed)
+            }
             Err(error) => {
                 room.poisoned = true;
                 room.save_error = Some(error.to_string());

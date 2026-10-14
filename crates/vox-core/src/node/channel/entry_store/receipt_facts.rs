@@ -341,6 +341,11 @@ impl RenderView<'_> {
         self.order.read.directory.read_sent_ms
     }
 
+    /// Stable pending membership identity, unaffected by unrelated directory seals.
+    pub(crate) fn pending_reads_root(&self) -> Result<u64> {
+        Ok(readable_roots(&self.order.read.directory)?.read_pending)
+    }
+
     /// Fix one pass's tail without retaining the pending set.
     pub(crate) fn pending_reads_tail(&self, reader: &Digest32) -> Result<Option<Digest32>> {
         let read = &self.order.read;

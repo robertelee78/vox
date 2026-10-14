@@ -97,9 +97,6 @@ pub struct DriveState {
     /// Member → `(generation, iteration)` from which it is owed this node's drive key: where the
     /// live generation stood when it became owed it.
     marks: BTreeMap<Digest32, (u64, u64)>,
-    /// Public authorization floors, derived from verified control entries; never secret keys.
-    pub(crate) floors: BTreeMap<SessionFloorKey, SessionFloorBoundary>,
-    pub(crate) floors_indexed: bool,
     /// Bodies a particular peer omitted, only until new authorization is learned or restart.
     pub(crate) omitted: BTreeMap<Digest32, (std::time::Instant, BTreeSet<(Digest32, u64)>)>,
     /// Drive keys released to this node, by `(author, generation)`.
@@ -340,8 +337,6 @@ impl DriveState {
             chain,
             origin,
             marks,
-            floors: BTreeMap::new(),
-            floors_indexed: false,
             omitted: BTreeMap::new(),
             receivers,
             delivered,

@@ -20538,7 +20538,10 @@ async fn agree_round(
 /// that does the same work itself (`vox id` making an identity, ADR-026 C-5).
 #[must_use]
 pub fn fault_of(e: &Error) -> Fault {
-    if ChannelState::governance_refreshing(e) || ChannelState::legacy_classification_refreshing(e) {
+    if ChannelState::governance_refreshing(e)
+        || ChannelState::legacy_classification_refreshing(e)
+        || ChannelState::authorization_refreshing(e)
+    {
         return Fault::GovernanceRefreshing;
     }
     match e {

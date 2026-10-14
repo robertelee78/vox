@@ -3,7 +3,7 @@
 
 use std::time::{Duration, Instant};
 
-use super::session_projection::private_index;
+use super::session_projection::{floor_index, private_index};
 use super::*;
 use crate::node::sessionstream::{Ask, Cursor, Page, Record, PAGE_RECORDS};
 
@@ -310,6 +310,10 @@ impl ChannelState {
         for author in self.authors.keys() {
             if private_index::control(&snapshot, &self.sek, &self.channel_id, author)?.through
                 < self.dag.verified_head(author)
+                || self
+                    .floor_author(Transaction::Snapshot(&snapshot), author)?
+                    .through
+                    < self.dag.verified_head(author)
             {
                 return Ok(false);
             }
@@ -354,12 +358,15 @@ impl ChannelState {
             let fact =
                 private_index::control(&store.snapshot()?, &self.sek, &self.channel_id, &author)?;
             let head = self.dag.verified_head(&author);
-            if fact.through >= head {
+            let floor_through = self
+                .floor_author(Transaction::Snapshot(&store.snapshot()?), &author)?
+                .through;
+            let through = fact.through.min(floor_through);
+            if through >= head {
                 self.private_sessions.controls_after = Some(author);
                 continue;
             }
-            let seq = fact
-                .through
+            let seq = through
                 .checked_add(1)
                 .ok_or(Error::MalformedAtRest("Session control frontier exhausted"))?;
             let entry = {
@@ -383,7 +390,13 @@ impl ChannelState {
             }
             bytes = bytes.saturating_add(size);
             let mut batch = store.batch()?;
-            private_index::observe_public(&mut batch, &self.sek, &self.channel_id, &entry)?;
+            private_index::observe_public(
+                &mut batch,
+                &self.sek,
+                &self.channel_id,
+                &entry,
+                self.epoch,
+            )?;
             batch.commit()?;
             if seq == head {
                 self.private_sessions.controls_after = Some(author);
@@ -510,13 +523,11 @@ impl ChannelState {
         {
             return Err(Error::StreamRefused("Session control facts are refreshing"));
         }
-        let announced = self
-            .drive
-            .floors
-            .keys()
-            .filter(|(a, _, epoch, _)| a == author && *epoch <= self.epoch)
-            .map(|(_, _, _, g)| *g)
-            .max();
+        let floor = self.floor_author(transaction, author)?;
+        if floor.through < self.dag.verified_head(author) {
+            return Err(Error::StreamRefused(floor_index::REFRESHING));
+        }
+        let announced = floor.announced;
         let newest = announced
             .into_iter()
             .chain(fact.generation)
@@ -533,15 +544,9 @@ impl ChannelState {
             return Ok(false);
         };
         if announced == Some(generation) {
-            return Ok(self.drive.floors.iter().any(
-                |((a, target, epoch, g), (membership, _, _))| {
-                    a == author
-                        && *target == self.me()
-                        && *epoch == self.epoch
-                        && *g == generation
-                        && *membership == self.admission(&self.me()).0
-                },
-            ));
+            return Ok(self
+                .session_floor(transaction, &(*author, self.me(), self.epoch, generation))?
+                .is_some_and(|(membership, _, _)| membership == self.admission(&self.me()).0));
         }
         Ok(self.drive.receivers.contains_key(&(*author, generation)))
     }
@@ -635,7 +640,13 @@ impl ChannelState {
                 .is_some_and(|p| is_step_body(&self.channel_id, p))
             {
                 if work.migrating {
-                    self.migrate_legacy_row(store, entry)?;
+                    if let Err(error) = self.migrate_legacy_row(store, entry) {
+                        if floor_index::refreshing(&error) {
+                            self.private_sessions.legacy_work = Some(work);
+                            return Ok(false);
+                        }
+                        return Err(error);
+                    }
                 } else if let Ok(record) = Record::legacy(entry) {
                     let author = record.message.header.author_id;
                     if self
@@ -668,6 +679,17 @@ impl ChannelState {
     /// One legal large entry is processed alone; no transaction grows with retained history.
     fn migrate_legacy_row(&mut self, store: &Store, entry: Entry) -> Result<()> {
         let hash = entry.entry_hash();
+        let tracked_before = self
+            .retention_get(store, &hash)?
+            .ok_or(Error::MalformedAtRest("legacy step retention missing"))?;
+        let permitted =
+            if tracked_before.cache_id.is_some() || entry.skeleton.author_id == self.me() {
+                true
+            } else if let Ok(record) = Record::legacy(entry.clone()) {
+                self.private_permitted(store, &record, &self.me())?
+            } else {
+                false
+            };
         let mut batch = store.batch()?;
         let Some(tracked) = self.retention_get_in(Transaction::Batch(&batch), &hash)? else {
             return Err(Error::MalformedAtRest("legacy step retention missing"));
@@ -694,7 +716,7 @@ impl ChannelState {
             None => None,
         };
         let author = entry.skeleton.author_id;
-        private_index::observe_public(&mut batch, &self.sek, &self.channel_id, &entry)?;
+        private_index::observe_public(&mut batch, &self.sek, &self.channel_id, &entry, self.epoch)?;
         let current_drive = self.legacy_current_drive(Transaction::Batch(&batch), &author)?;
         let generation =
             private_index::control_in(&batch, &self.sek, &self.channel_id, &author)?.generation;
@@ -704,13 +726,17 @@ impl ChannelState {
                 .is_some_and(|key| r.verify(&self.channel_id, key).is_ok())
         });
         let mut next = self.private_sessions.next.max(1);
+        let no_announced_floor = self
+            .floor_author(Transaction::Batch(&batch), &author)?
+            .announced
+            .is_none();
         if !self.private_contains_in(&batch, &hash)? {
             if let Some(record) = record.filter(|r| {
                 current_drive
                     && (cached.is_some()
-                        || self.private_permitted(r, &self.me())
+                        || permitted
                         || author == self.me()
-                        || (!self.drive.floors.keys().any(|(a, _, _, _)| *a == author)
+                        || (no_announced_floor
                             && generation == Some(r.message.header.chain_id)
                             && self
                                 .drive
@@ -818,7 +844,7 @@ impl ChannelState {
                 if let Err(error) = self.take_private_record(store, &saved.record.wire(), now) {
                     // A policy replay is not a verdict on the saved wire. Keep both the
                     // record and the last completed cursor so the same row can be retried.
-                    if super::governance::refreshing(&error) {
+                    if super::governance::refreshing(&error) || floor_index::refreshing(&error) {
                         return Ok(false);
                     }
                     if self.poisoned {
@@ -881,7 +907,11 @@ impl ChannelState {
     fn private_policy_ready(&self, store: &Store, now: u64) -> Result<bool> {
         match self.require_governance_ready(store, crate::time::Ms(now)) {
             Ok(()) => Ok(true),
-            Err(error) if super::governance::refreshing(&error) => Ok(false),
+            Err(error)
+                if super::governance::refreshing(&error) || floor_index::refreshing(&error) =>
+            {
+                Ok(false)
+            }
             Err(error) => Err(error),
         }
     }
@@ -1091,7 +1121,7 @@ impl ChannelState {
     }
 
     fn private_save_failed(&mut self, error: &Error) {
-        if super::governance::refreshing(error) {
+        if super::governance::refreshing(error) || floor_index::refreshing(error) {
             return;
         }
         self.poisoned = true;
@@ -1172,7 +1202,12 @@ impl ChannelState {
         result
     }
 
-    fn refresh_grant(&self, holders: &BTreeSet<Digest32>, owed: &[Digest32]) -> Digest32 {
+    fn refresh_grant(
+        &self,
+        store: &Store,
+        holders: &BTreeSet<Digest32>,
+        owed: &[Digest32],
+    ) -> Result<Digest32> {
         use sha2::{Digest, Sha256};
         let mut hash = Sha256::new();
         hash.update(b"vox/private-session-refresh-grant/v1");
@@ -1193,22 +1228,14 @@ impl ChannelState {
             hash.update(peer);
             hash.update(self.admission(peer).0.to_be_bytes());
         }
-        // Grant floors can move without a chain rotation. They must invalidate a completed
-        // scan before it can authorize release using an obsolete recipient position.
-        for ((author, target, epoch, generation), (membership, iteration, from)) in
-            &self.drive.floors
-        {
-            if *author == self.me() && (owed.contains(target) || *target == self.me()) {
-                hash.update(author);
-                hash.update(target);
-                hash.update(epoch.to_be_bytes());
-                hash.update(generation.to_be_bytes());
-                hash.update(membership.to_be_bytes());
-                hash.update(iteration.to_be_bytes());
-                hash.update(from.to_be_bytes());
-            }
-        }
-        hash.finalize().into()
+        // Any signed floor change by this author invalidates the previous scan, including
+        // a late change to an old generation. Current-recipient membership is hashed above.
+        hash.update(
+            self.floor_author(Transaction::Snapshot(&store.snapshot()?), &self.me())?
+                .revision
+                .to_be_bytes(),
+        );
+        Ok(hash.finalize().into())
     }
 
     fn refresh_session_records_inner(
@@ -1219,7 +1246,7 @@ impl ChannelState {
         now: u64,
     ) -> Result<bool> {
         self.rotate_drive_if_lost(profile.store(), holders, crate::time::Ms(now))?;
-        let grant = self.refresh_grant(holders, owed);
+        let grant = self.refresh_grant(profile.store(), holders, owed)?;
         let public = self
             .entries
             .render_view(profile.store(), &self.sek, &self.channel_id)?
@@ -1249,105 +1276,115 @@ impl ChannelState {
             .take()
             .ok_or(Error::MalformedAtRest("Session refresh cursor missing"))?;
         let mut bytes = 0usize;
-        for _ in 0..WORK_ROWS {
-            if work.stage == 0 {
-                let next = {
-                    let view =
-                        self.entries
-                            .render_view(profile.store(), &self.sek, &self.channel_id)?;
-                    view.session_candidate(work.public_after)?
-                        .map(|(key, _)| {
-                            let row = view.row(&key.2)?.ok_or(Error::MalformedAtRest(
-                                "Session refresh candidate missing",
-                            ))?;
-                            Ok::<_, Error>((key, row))
-                        })
-                        .transpose()?
-                };
-                let Some((key, row)) = next else {
-                    work.stage = 1;
-                    continue;
-                };
-                if bytes != 0 && bytes.saturating_add(row.text.len()) > WORK_BYTES {
-                    break;
-                }
-                bytes = bytes.saturating_add(row.text.len());
-                if row.author == self.me() && crate::node::sessions::is_record(&row.text) {
-                    let tracked = self
-                        .retention_get(profile.store(), &row.entry_hash)?
-                        .ok_or(Error::MalformedAtRest("Session refresh retention missing"))?;
-                    let ttl = self.effective_retention();
-                    if ttl == 0
-                        || tracked.first_seen_ms.min(row.created_millis)
-                            > now.saturating_sub(ttl.saturating_mul(1000))
-                    {
-                        let env =
-                            vox_agentcomms::envelope::Envelope::parse(&row.text).map_err(|_| {
-                                Error::MalformedAtRest("classified Session envelope changed")
-                            })?;
-                        let session = if env.from.is_empty() {
-                            env.data["session_parts"]
-                                .as_str()
-                                .unwrap_or_default()
-                                .to_owned()
-                        } else {
-                            env.from
-                        };
-                        self.refresh_one_session_record(
-                            profile,
-                            holders,
-                            owed,
-                            row.created_millis,
-                            &session,
-                            &row.text,
-                            now,
+        let progress = (|| -> Result<()> {
+            for _ in 0..WORK_ROWS {
+                if work.stage == 0 {
+                    let next = {
+                        let view = self.entries.render_view(
+                            profile.store(),
+                            &self.sek,
+                            &self.channel_id,
                         )?;
-                    }
-                }
-                work.public_after = Some(key);
-            } else if work.stage == 1 {
-                let next = private_index::candidate_after(
-                    &profile.store().snapshot()?,
-                    &self.sek,
-                    &self.channel_id,
-                    work.private_after,
-                )?;
-                let Some((key, id)) = next else {
-                    work.stage = 2;
-                    break;
-                };
-                if id < work.through {
-                    let saved =
-                        self.private_at(profile.store(), id)?
-                            .ok_or(Error::MalformedAtRest(
-                                "Session refresh private source missing",
-                            ))?;
-                    let size = saved.record.message.ciphertext.len();
-                    if bytes != 0 && bytes.saturating_add(size) > WORK_BYTES {
+                        view.session_candidate(work.public_after)?
+                            .map(|(key, _)| {
+                                let row = view.row(&key.2)?.ok_or(Error::MalformedAtRest(
+                                    "Session refresh candidate missing",
+                                ))?;
+                                Ok::<_, Error>((key, row))
+                            })
+                            .transpose()?
+                    };
+                    let Some((key, row)) = next else {
+                        work.stage = 1;
+                        continue;
+                    };
+                    if bytes != 0 && bytes.saturating_add(row.text.len()) > WORK_BYTES {
                         break;
                     }
-                    bytes = bytes.saturating_add(size);
-                    if !self.private_expired(&saved, now) {
-                        if let Some(row) = saved.row.filter(|r| {
-                            r.author == self.me() && crate::node::sessions::is_record(&r.body)
-                        }) {
+                    bytes = bytes.saturating_add(row.text.len());
+                    if row.author == self.me() && crate::node::sessions::is_record(&row.text) {
+                        let tracked = self
+                            .retention_get(profile.store(), &row.entry_hash)?
+                            .ok_or(Error::MalformedAtRest("Session refresh retention missing"))?;
+                        let ttl = self.effective_retention();
+                        if ttl == 0
+                            || tracked.first_seen_ms.min(row.created_millis)
+                                > now.saturating_sub(ttl.saturating_mul(1000))
+                        {
+                            let env = vox_agentcomms::envelope::Envelope::parse(&row.text)
+                                .map_err(|_| {
+                                    Error::MalformedAtRest("classified Session envelope changed")
+                                })?;
+                            let session = if env.from.is_empty() {
+                                env.data["session_parts"]
+                                    .as_str()
+                                    .unwrap_or_default()
+                                    .to_owned()
+                            } else {
+                                env.from
+                            };
                             self.refresh_one_session_record(
                                 profile,
                                 holders,
                                 owed,
                                 row.created_millis,
-                                &row.session_id,
-                                &row.body,
+                                &session,
+                                &row.text,
                                 now,
                             )?;
                         }
                     }
+                    work.public_after = Some(key);
+                } else if work.stage == 1 {
+                    let next = private_index::candidate_after(
+                        &profile.store().snapshot()?,
+                        &self.sek,
+                        &self.channel_id,
+                        work.private_after,
+                    )?;
+                    let Some((key, id)) = next else {
+                        work.stage = 2;
+                        break;
+                    };
+                    if id < work.through {
+                        let saved =
+                            self.private_at(profile.store(), id)?
+                                .ok_or(Error::MalformedAtRest(
+                                    "Session refresh private source missing",
+                                ))?;
+                        let size = saved.record.message.ciphertext.len();
+                        if bytes != 0 && bytes.saturating_add(size) > WORK_BYTES {
+                            break;
+                        }
+                        bytes = bytes.saturating_add(size);
+                        if !self.private_expired(&saved, now) {
+                            if let Some(row) = saved.row.filter(|r| {
+                                r.author == self.me() && crate::node::sessions::is_record(&r.body)
+                            }) {
+                                self.refresh_one_session_record(
+                                    profile,
+                                    holders,
+                                    owed,
+                                    row.created_millis,
+                                    &row.session_id,
+                                    &row.body,
+                                    now,
+                                )?;
+                            }
+                        }
+                    }
+                    work.private_after = Some(key);
+                } else {
+                    break;
                 }
-                work.private_after = Some(key);
-            } else {
-                break;
             }
+            Ok(())
+        })();
+        if progress.as_ref().is_err_and(floor_index::refreshing) {
+            self.private_sessions.refresh = Some(work);
+            return Ok(false);
         }
+        progress?;
         // Our own refresh copies change this generation; they do not invalidate their
         // source cursor. A later independent lifecycle write does restart it next turn.
         work.private = private_index::lifecycle_revision(
@@ -1355,7 +1392,8 @@ impl ChannelState {
             &self.sek,
             &self.channel_id,
         )?;
-        let complete = work.stage == 2 && work.grant == self.refresh_grant(holders, owed);
+        let complete =
+            work.stage == 2 && work.grant == self.refresh_grant(profile.store(), holders, owed)?;
         self.private_sessions.refresh = Some(work);
         Ok(complete)
     }
@@ -1387,12 +1425,17 @@ impl ChannelState {
             }) {
                 return Err(Error::MalformedAtRest("Session refresh locator binding"));
             }
-            if !self.private_expired(&saved, now)
-                && owed
-                    .iter()
-                    .all(|peer| self.private_permitted(&saved.record, peer))
-            {
-                return Ok(());
+            if !self.private_expired(&saved, now) {
+                let mut all = true;
+                for peer in owed {
+                    if !self.private_permitted(profile.store(), &saved.record, peer)? {
+                        all = false;
+                        break;
+                    }
+                }
+                if all {
+                    return Ok(());
+                }
             }
         }
         let content = crate::node::content::SessionEntry::new(created, session, body)?;
@@ -1494,53 +1537,49 @@ impl ChannelState {
 
     /// A current grant and an uninterrupted grant from the step's generation are both needed.
     /// A revoked-and-regranted peer cannot use its retained old key to backfill a former grant.
-    fn private_permitted(&self, record: &Record, recipient: &Digest32) -> bool {
+    fn private_permitted(
+        &self,
+        store: &Store,
+        record: &Record,
+        recipient: &Digest32,
+    ) -> Result<bool> {
         let h = &record.message.header;
         if !self.settled || self.has_left(recipient) || !self.authors.contains_key(recipient) {
-            return false;
+            return Ok(false);
         }
         if h.author_id == *recipient {
-            return true;
+            return Ok(true);
         }
         let membership = self.admission(recipient).0;
-        let Some((m, iteration, _)) =
-            self.drive
-                .floors
-                .get(&(h.author_id, *recipient, h.epoch, h.chain_id))
-        else {
-            return false;
-        };
-        if *m != membership || h.iteration < *iteration {
-            return false;
-        }
-        let mut saw_author = false;
-        for ((author, target, epoch, generation), (_, _, author_start)) in &self.drive.floors {
-            if *author != h.author_id
-                || author != target
-                || (*epoch, *generation) < (h.epoch, h.chain_id)
+        {
+            let snapshot = store.snapshot()?;
+            let transaction = Transaction::Snapshot(&snapshot);
+            if self.floor_author(transaction, &h.author_id)?.through
+                < self.dag.verified_head(&h.author_id)
             {
-                continue;
+                return Err(Error::StreamRefused(floor_index::REFRESHING));
             }
-            saw_author = true;
-            if self
-                .drive
-                .floors
-                .get(&(*author, *recipient, *epoch, *generation))
-                .is_none_or(|(m, from, first_seq)| {
-                    *m != membership
-                        || ((*epoch, *generation) > (h.epoch, h.chain_id)
-                            && (*from != 0 || first_seq > author_start))
-                })
-            {
-                return false;
+            let Some((m, iteration, _)) =
+                self.session_floor(transaction, &(h.author_id, *recipient, h.epoch, h.chain_id))?
+            else {
+                return Ok(false);
+            };
+            if m != membership || h.iteration < iteration {
+                return Ok(false);
             }
-            // Continuing holders are marked at iteration zero before the author's own floor
-            // is published. A later grant in any intervening generation breaks continuity:
-            // its key position may be later, or it may still be zero if nobody has written
-            // yet. The signed public position distinguishes that second case. Merely having
-            // a floor again must never revive permission to fetch the former grant's bodies.
         }
-        saw_author
+        let range = floor_index::continuity_step(
+            store,
+            &self.sek,
+            &self.channel_id,
+            &h.author_id,
+            recipient,
+            membership,
+        )?
+        .ok_or(Error::StreamRefused(floor_index::REFRESHING))?;
+        Ok(range.is_some_and(|(lower, upper)| {
+            lower <= (h.epoch, h.chain_id) && (h.epoch, h.chain_id) <= upper
+        }))
     }
 
     pub(crate) fn private_page(
@@ -1559,10 +1598,7 @@ impl ChannelState {
         {
             return Err(Error::StreamRefused("private Session room unavailable"));
         }
-        if let Err(error) = self.index_session_floors(store) {
-            self.poison(&error);
-            return Err(error);
-        }
+        self.index_session_floors(store)?;
         let incarnation = match self.private_sessions.incarnation {
             Some(i) => i,
             None => {
@@ -1593,7 +1629,7 @@ impl ChannelState {
             if saved.record.message.header.author_id == self.me() && !holders.contains(peer) {
                 continue;
             }
-            if self.private_permitted(&saved.record, peer) {
+            if self.private_permitted(store, &saved.record, peer)? {
                 records.push(saved.record.wire());
             }
         }
@@ -1707,7 +1743,7 @@ impl ChannelState {
         let locally_held = migrated.is_some()
             && record.legacy_claimed_ms().is_some()
             && self.legacy_current_drive(Transaction::Snapshot(&store.snapshot()?), &author)?;
-        if !locally_held && !self.private_permitted(&record, &self.me()) {
+        if !locally_held && !self.private_permitted(store, &record, &self.me())? {
             return Err(Error::StreamRefused("private Session has no drive grant"));
         }
         let slot = (author, record.message.header.chain_id);

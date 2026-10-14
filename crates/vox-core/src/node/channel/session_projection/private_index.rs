@@ -296,6 +296,7 @@ pub(in crate::node::channel) fn observe_public(
     sek: &Sek,
     room: &Digest32,
     entry: &crate::log::entry::Entry,
+    current_epoch: u64,
 ) -> Result<()> {
     if entry.skeleton.channel_id != *room {
         return Err(Error::MalformedAtRest("Session control room binding"));
@@ -325,6 +326,7 @@ pub(in crate::node::channel) fn observe_public(
         }
     }
     merge_control(&mut index, &author, seen)?;
+    super::floor_index::observe(&mut index, room, entry, current_epoch)?;
     index.seal()
 }
 
