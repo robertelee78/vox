@@ -1796,16 +1796,18 @@ final class NodeModel: ObservableObject {
     /// Resolve input without a manual write; only the held actor signs this room's change.
     @discardableResult
     func changeRoomAnchor(input: String? = nil, removing: String? = nil) async -> Bool {
-        guard let room = roomOnScreen, ended == nil, !roomAnchorChanging,
+        guard let room = roomOnScreen, ended == nil, !roomAnchorChanging, sheet == .roomAnchors,
               (input != nil) != (removing != nil) else { return false }
         let generation = roomReadGeneration, epoch = nodeObservationEpoch, request = UUID()
+        let editor = sheetInstance
         roomAnchorAction = request
         roomAnchorChanging = true
         roomAnchorAuthority = nil
         roomAnchorError = nil
         defer { if roomAnchorAction == request { roomAnchorChanging = false } }
         @MainActor func current() -> Bool {
-            !Task.isCancelled && roomAnchorAction == request && roomReadGeneration == generation
+            !Task.isCancelled && sheet == .roomAnchors && sheetInstance == editor
+                && roomAnchorAction == request && roomReadGeneration == generation
                 && nodeObservationEpoch == epoch && roomOnScreen == room && ended == nil
         }
         do {

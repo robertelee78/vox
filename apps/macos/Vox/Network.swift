@@ -309,7 +309,12 @@ final class RoomAnchorChoices: ObservableObject {
             }
             for endpoint in result {
                 found.removeAll { $0.fingerprint == endpoint.fingerprint }
-                found.append(endpoint)
+                if let existing = kept.first(where: { $0.fingerprint == endpoint.fingerprint }),
+                   Set(endpoint.addresses).subtracting(existing.addresses).isEmpty {
+                    // No extra address was offered. Show the full kept chip, so Remove
+                    // describes the actual creation snapshot rather than a smaller answer.
+                    found.append(existing)
+                } else { found.append(endpoint) }
             }
         } catch {
             guard !Task.isCancelled, generation == request, model.anchorChoiceContext == context else { return }
