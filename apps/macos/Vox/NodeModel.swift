@@ -3524,8 +3524,26 @@ extension NodeModel {
                     guard rows.allSatisfy({ !$0.owed && $0.thread == root }) else {
                         throw VoxError.Failed(reason: "A held reply is no longer readable in this thread.")
                     }
-                    self.threadReplies = Self.boundedRoomRows(rows, newest: false)
-                    // Exact refresh is not a new navigation page; keep its existing cursors.
+                    let bounded = Self.boundedRoomRows(rows, newest: false)
+                    guard let first = bounded.first, let last = bounded.last else {
+                        throw VoxError.Failed(reason: "The held reply window is no longer retained. Reload the first replies.")
+                    }
+                    // Probe adjacent indexed pages without accumulating or displaying them.
+                    // New replies become reachable while the reader's held window stays pinned.
+                    let prior = try await self.client.threadPage(room: room, root: root,
+                        instance: instance, before: first.id, after: nil)
+                    guard current() else { return }
+                    let later = try await self.client.threadPage(room: room, root: root,
+                        instance: instance, before: nil, after: last.id)
+                    guard current() else { return }
+                    guard prior.instance == instance, later.instance == instance else {
+                        throw VoxError.Failed(reason: "The saved room changed while probing thread navigation.")
+                    }
+                    self.threadReplies = bounded
+                    self.threadBefore = prior.messages.isEmpty ? nil : first.id
+                    self.threadAfter = later.messages.isEmpty ? nil : last.id
+                    self.threadHasEarlier = self.threadBefore != nil
+                    self.threadHasMore = self.threadAfter != nil
                 } else {
                     let page = try await self.client.threadPage(room: room, root: root,
                         instance: instance, before: before, after: after)
