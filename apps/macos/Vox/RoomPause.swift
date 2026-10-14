@@ -86,7 +86,7 @@ struct RoomPauseSheet: View {
         .padding(Space.s24)
         .frame(width: Theme.scaled(600))
         .task { await load() }
-        .onChange(of: model.roomPauseContext) { _, value in
+        .onChange(of: model.roomPauseContext) { value in
             guard !context.isEmpty, value != context else { return }
             invalidate()
             failure = "The room or node connection changed. Showing last known state; reload targets before another action."
