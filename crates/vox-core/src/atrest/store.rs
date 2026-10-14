@@ -81,6 +81,10 @@ pub enum SegmentKind {
     SessionClassification,
     /// Drive-authorized Session wire and cache, independent of the public log (SA-7).
     PrivateSession,
+    /// Encrypted entry locators, B-tree pages and their atomic publication directory.
+    EntryIndex,
+    /// Unpublished wire entries, including unsigned checkpoint suffixes.
+    ProvisionalLog,
 }
 
 impl SegmentKind {
@@ -95,6 +99,8 @@ impl SegmentKind {
             SegmentKind::Trust => b"vox/seg/trust-keyring/v1",
             SegmentKind::SessionClassification => b"vox/seg/session-classification/v1",
             SegmentKind::PrivateSession => b"vox/seg/private-session/v1",
+            SegmentKind::EntryIndex => b"vox/seg/entry-index/v1",
+            SegmentKind::ProvisionalLog => b"vox/seg/provisional-log/v1",
         }
     }
 }

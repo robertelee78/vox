@@ -214,43 +214,45 @@ impl ChannelState {
     }
 
     fn migrate_legacy_steps_inner(&mut self, store: &Store, now: u64) -> Result<()> {
-        self.index_session_floors();
+        self.index_session_floors(store)?;
+        // Discover generations first, keeping only compact work coordinates. A second pass
+        // reads one public entry at a time into the existing private-record transaction.
         let pending: Vec<_> = self
             .private_sessions
             .legacy_pending
             .iter()
-            .filter_map(|hash| self.dag.get_by_hash(hash).cloned())
-            .filter(|entry| {
-                entry
-                    .payload
-                    .as_deref()
-                    .is_some_and(|p| is_step_body(&self.channel_id, p))
-            })
+            .copied()
             .collect();
-        // Learn every verified generation before deciding which old rows may survive. Neither
-        // log order nor a stale receiver key may preserve an already-revoked legacy cache.
         let mut records = Vec::new();
-        for entry in pending {
-            let hash = entry.entry_hash();
+        for hash in pending {
+            let Some(entry) = self.entry(store, &hash)? else {
+                continue;
+            };
+            if !entry
+                .payload
+                .as_deref()
+                .is_some_and(|p| is_step_body(&self.channel_id, p))
+            {
+                continue;
+            }
             let Some(tracked) = self.retention.get(&hash) else {
                 continue;
             };
-            let mut record = Record::legacy(entry.clone()).ok();
-            if record.as_ref().is_some_and(|r| {
-                self.authors
-                    .get(&entry.skeleton.author_id)
-                    .is_none_or(|key| r.verify(&self.channel_id, key).is_err())
-            }) {
-                record = None;
+            if let Ok(record) = Record::legacy(entry) {
+                let author = record.message.header.author_id;
+                if self
+                    .authors
+                    .get(&author)
+                    .is_some_and(|key| record.verify(&self.channel_id, key).is_ok())
+                {
+                    self.private_sessions
+                        .legacy_generations
+                        .entry(author)
+                        .and_modify(|g| *g = (*g).max(record.message.header.chain_id))
+                        .or_insert(record.message.header.chain_id);
+                }
             }
-            if let Some(r) = &record {
-                self.private_sessions
-                    .legacy_generations
-                    .entry(entry.skeleton.author_id)
-                    .and_modify(|g| *g = (*g).max(r.message.header.chain_id))
-                    .or_insert(r.message.header.chain_id);
-            }
-            records.push((entry, record, tracked));
+            records.push((hash, tracked));
         }
         let cached: BTreeMap<_, _> = self
             .drive
@@ -267,8 +269,17 @@ impl ChannelState {
         let mut kept = Vec::new();
         let mut next = self.private_sessions.next.max(1);
         let mut batch = store.batch()?;
-        for (entry, record, tracked) in &mut records {
-            let hash = entry.entry_hash();
+        for (hash, tracked) in &records {
+            let hash = *hash;
+            let entry = self
+                .entry_at(Transaction::Batch(&batch), &hash)?
+                .ok_or(Error::MalformedAtRest("legacy step disappeared"))?;
+            let author = entry.skeleton.author_id;
+            let mut record = Record::legacy(entry.clone()).ok().filter(|record| {
+                self.authors
+                    .get(&author)
+                    .is_some_and(|key| record.verify(&self.channel_id, key).is_ok())
+            });
             if !self.private_sessions.hashes.contains_key(&hash) {
                 if let Some(record) = record.take().filter(|r| {
                     self.legacy_current_drive(&r.message.header.author_id)
@@ -310,20 +321,14 @@ impl ChannelState {
                     kept.push((id, saved));
                 }
             }
-            let mut bare = entry.clone();
-            bare.prune_payload();
-            let segment = seal_segment(
-                &self.sek,
-                SegmentKind::LogDb,
-                tracked.log_id,
-                &bare.to_wire(),
-            )?;
-            batch.put_segment(
-                &self.channel_id,
-                SegmentKind::LogDb,
-                tracked.log_id,
-                &segment,
-            )?;
+            {
+                let mut index = self
+                    .entries
+                    .write(&mut batch, &self.sek, &self.channel_id)?;
+                index.committing(self.next_log_id);
+                self.dag.prune_payload(&mut index, &hash)?;
+                index.seal()?;
+            }
             let age = seal_segment(
                 &self.sek,
                 SegmentKind::Index,
@@ -342,12 +347,9 @@ impl ChannelState {
             self.private_sessions.records.insert(id, saved);
         }
         self.private_sessions.next = next;
-        let gone: BTreeSet<_> = records
-            .iter()
-            .map(|(entry, _, _)| entry.entry_hash())
-            .collect();
+        self.entries.committed();
+        let gone: BTreeSet<_> = records.iter().map(|(hash, _)| *hash).collect();
         for hash in &gone {
-            self.dag.prune_payload(hash);
             self.retention.forget(hash);
         }
         self.drive.sessions.retain(|row| {
@@ -430,29 +432,40 @@ impl ChannelState {
         self.render_pending_private(store, now)
     }
 
-    pub(super) fn supports_private(&mut self, peer: &Digest32) -> bool {
-        let seq = self.dag.verified_head(peer);
+    pub(super) fn supports_private(&mut self, store: &Store, peer: &Digest32) -> Result<bool> {
+        let head = self.dag.verified_head(peer);
         if let Some((known, supported)) = self.private_sessions.supports.get(peer) {
-            if *known == seq {
-                return *supported;
+            if *known == head {
+                return Ok(*supported);
             }
         }
         let expected = support_body(&self.channel_id, peer);
-        let supported = self.dag.feed(peer).is_some_and(|feed| {
-            feed.iter()
-                .any(|e| e.skeleton.seq <= seq && e.payload.as_deref() == Some(expected.as_slice()))
-        });
+        let mut supported = false;
+        let entries = self.entries.read(store, &self.sek, &self.channel_id)?;
+        for seq in 1..=head {
+            let entry = entries.get(peer, seq)?.ok_or(Error::MalformedAtRest(
+                "private capability feed entry missing",
+            ))?;
+            if entry.payload.as_deref() == Some(expected.as_slice()) {
+                supported = true;
+                break;
+            }
+        }
         self.private_sessions
             .supports
-            .insert(*peer, (seq, supported));
-        supported
+            .insert(*peer, (head, supported));
+        Ok(supported)
     }
 
     /// Authenticated capability, not a Session step. Published old readers skip its unknown
     /// content body. Only an author who advertised support is ever probed with stream 13.
     pub(crate) fn announce_private_support(&mut self, profile: &Profile, now: u64) -> Result<()> {
         let me = self.me();
-        if !self.settled || self.poisoned || self.has_left(&me) || self.supports_private(&me) {
+        if !self.settled
+            || self.poisoned
+            || self.has_left(&me)
+            || self.supports_private(profile.store(), &me)?
+        {
             return Ok(());
         }
         self.append_control_kind(
@@ -717,7 +730,7 @@ impl ChannelState {
             .as_ref()
             .is_none_or(|c| c.epoch() != self.epoch || c.should_rotate(now))
         {
-            self.begin_drive(holders, now)?;
+            self.begin_drive(profile.store(), holders, now)?;
         }
         self.ensure_session_floors(profile, holders, now)?;
         // Every failure after encrypting poisons the in-memory chain. Nothing may reuse its
@@ -808,6 +821,7 @@ impl ChannelState {
 
     pub(crate) fn private_page(
         &mut self,
+        store: &Store,
         ask: &Ask,
         peer: &Digest32,
         holders: &BTreeSet<Digest32>,
@@ -819,7 +833,10 @@ impl ChannelState {
         {
             return Err(Error::StreamRefused("private Session room unavailable"));
         }
-        self.index_session_floors();
+        if let Err(error) = self.index_session_floors(store) {
+            self.poison(&error);
+            return Err(error);
+        }
         let incarnation = match self.private_sessions.incarnation {
             Some(i) => i,
             None => {
@@ -867,10 +884,14 @@ impl ChannelState {
         })
     }
 
-    pub(crate) fn start_private_pull(&mut self, peer: Digest32) -> Option<Ask> {
+    pub(crate) fn start_private_pull(
+        &mut self,
+        store: &Store,
+        peer: Digest32,
+    ) -> Result<Option<Ask>> {
         if self.poisoned
             || self.drive.receivers.is_empty()
-            || !self.supports_private(&peer)
+            || !self.supports_private(store, &peer)?
             || !self.drive_members().contains(&peer)
             || self.private_sessions.pulling.contains(&peer)
             || self
@@ -879,11 +900,11 @@ impl ChannelState {
                 .get(&peer)
                 .is_some_and(|t| t.elapsed() < Duration::from_secs(1))
         {
-            return None;
+            return Ok(None);
         }
         self.private_sessions.pulling.insert(peer);
         self.private_sessions.attempted.insert(peer, Instant::now());
-        Some(Ask {
+        Ok(Some(Ask {
             revision: self.private_sessions.revision,
             room: self.channel_id,
             epoch: self.epoch,
@@ -893,7 +914,7 @@ impl ChannelState {
                 .get(&peer)
                 .cloned()
                 .unwrap_or_default(),
-        })
+        }))
     }
 
     pub(crate) fn finish_private_pull(
@@ -908,7 +929,7 @@ impl ChannelState {
         if self.poisoned || !self.drive_members().contains(&peer) {
             return Err(Error::StreamRefused("private Session room unavailable"));
         }
-        self.index_session_floors();
+        self.index_session_floors(store)?;
         for wire in &page.records {
             self.take_private_record(store, wire, now)?;
         }

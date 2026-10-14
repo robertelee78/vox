@@ -1,0 +1,1613 @@
+//! Bounded encrypted entry locators. LogDb remains the authoritative wire storage.
+//!
+//! Both trees use immutable, SEK-sealed pages. Only page ids appear outside ciphertext;
+//! authors, hashes, sequence numbers, separator keys and locations are all encrypted.
+//! A reader pins one redb snapshot for the directory, every page and the final entry.
+//! A writer reads its own Batch. Roots are installed only by its durable commit.
+
+use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
+
+use zeroize::Zeroizing;
+
+use crate::atrest::sek::Sek;
+use crate::atrest::store::{open_segment, seal_segment, SegmentKind};
+use crate::cbor::{Decoder, Encoder};
+use crate::error::{Error, Result};
+use crate::hash::Digest32;
+use crate::log::entry::{Entry, EntryRead, EntryWrite};
+use crate::node::store::{Batch, Snapshot, Store};
+
+const PAGE_BYTES: usize = 16 * 1024;
+const PAGE_ITEMS: usize = 128;
+const CACHE_BYTES: usize = 4 * 1024 * 1024;
+const CACHE_ITEMS: usize = 128;
+const MAX_DEPTH: usize = 64;
+const DIRECTORY: u64 = 0;
+type Key = [u8; 40];
+
+fn invalid(why: &'static str) -> Error {
+    Error::MalformedAtRest(why)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Locator {
+    pub author: Digest32,
+    pub seq: u64,
+    pub log: u64,
+}
+
+impl Locator {
+    fn write(self, e: &mut Encoder) {
+        e.array(3).bytes(&self.author).uint(self.seq).uint(self.log);
+    }
+    fn read(d: &mut Decoder<'_>) -> Result<Self> {
+        if d.array()? != 3 {
+            return Err(invalid("entry locator arity"));
+        }
+        let author = d
+            .bytes()?
+            .try_into()
+            .map_err(|_| invalid("entry locator author"))?;
+        let seq = d.uint()?;
+        let log = d.uint()?;
+        if seq == 0 || log == 0 {
+            return Err(invalid("zero entry location"));
+        }
+        Ok(Self { author, seq, log })
+    }
+}
+
+fn position(author: &Digest32, seq: u64) -> Key {
+    let mut key = [0; 40];
+    key[..32].copy_from_slice(author);
+    key[32..].copy_from_slice(&seq.to_be_bytes());
+    key
+}
+
+fn hashed(hash: &Digest32) -> Key {
+    let mut key = [0; 40];
+    key[..32].copy_from_slice(hash);
+    key
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Roots {
+    sequence: u64,
+    hash: u64,
+}
+
+impl Roots {
+    fn write(self, e: &mut Encoder) {
+        e.array(2).uint(self.sequence).uint(self.hash);
+    }
+    fn read(d: &mut Decoder<'_>) -> Result<Self> {
+        if d.array()? != 2 {
+            return Err(invalid("entry roots arity"));
+        }
+        Ok(Self {
+            sequence: d.uint()?,
+            hash: d.uint()?,
+        })
+    }
+}
+
+/// Building roots are never readable history. Switched means the new active roots are
+/// committed and only the old pages/spool may be reclaimed. The phase is never inferred
+/// from whether a particular candidate row happens to exist.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Phase {
+    Idle,
+    Rebuilding,
+    Building,
+    Switched,
+}
+
+#[derive(Clone, Debug)]
+struct Promotion {
+    author: Digest32,
+    from: u64,
+    through: u64,
+    base_hash: Digest32,
+    received_ms: u64,
+    witness: u64,
+    witness_hash: Digest32,
+    cursor: u64,
+    work: Roots,
+    first_log: u64,
+    after_log: u64,
+    first_page: u64,
+    after_page: u64,
+    retired: u64,
+}
+
+#[derive(Clone, Debug)]
+struct Directory {
+    active: Roots,
+    provisional: Roots,
+    next_page: u64,
+    next_provisional: u64,
+    revision: u64,
+    phase: Phase,
+    promotion: Option<Promotion>,
+}
+
+impl Default for Directory {
+    fn default() -> Self {
+        Self {
+            active: Roots::default(),
+            provisional: Roots::default(),
+            next_page: 1,
+            next_provisional: 1,
+            revision: 0,
+            phase: Phase::Rebuilding,
+            promotion: None,
+        }
+    }
+}
+
+impl Directory {
+    fn bytes(&self) -> Zeroizing<Vec<u8>> {
+        let mut e = Encoder::new();
+        e.array(8).uint(1);
+        self.active.write(&mut e);
+        self.provisional.write(&mut e);
+        e.uint(self.next_page)
+            .uint(self.next_provisional)
+            .uint(self.revision)
+            .uint(match self.phase {
+                Phase::Idle => 0,
+                Phase::Rebuilding => 1,
+                Phase::Building => 2,
+                Phase::Switched => 3,
+            });
+        match &self.promotion {
+            None => {
+                e.array(0);
+            }
+            Some(p) => {
+                e.array(14)
+                    .bytes(&p.author)
+                    .uint(p.from)
+                    .uint(p.through)
+                    .bytes(&p.base_hash)
+                    .uint(p.received_ms)
+                    .uint(p.witness)
+                    .bytes(&p.witness_hash)
+                    .uint(p.cursor);
+                p.work.write(&mut e);
+                e.uint(p.first_log)
+                    .uint(p.after_log)
+                    .uint(p.first_page)
+                    .uint(p.after_page)
+                    .uint(p.retired);
+            }
+        }
+        Zeroizing::new(e.finish())
+    }
+    fn parse(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() > PAGE_BYTES {
+            return Err(invalid("entry directory exceeds page bound"));
+        }
+        let mut d = Decoder::new(bytes);
+        if d.array()? != 8 || d.uint()? != 1 {
+            return Err(invalid("entry directory format"));
+        }
+        let active = Roots::read(&mut d)?;
+        let provisional = Roots::read(&mut d)?;
+        let next_page = d.uint()?;
+        let next_provisional = d.uint()?;
+        let revision = d.uint()?;
+        let phase = match d.uint()? {
+            0 => Phase::Idle,
+            1 => Phase::Rebuilding,
+            2 => Phase::Building,
+            3 => Phase::Switched,
+            _ => return Err(invalid("entry directory phase")),
+        };
+        let promotion = match d.array()? {
+            0 => None,
+            14 => Some(Promotion {
+                author: d
+                    .bytes()?
+                    .try_into()
+                    .map_err(|_| invalid("promotion author"))?,
+                from: d.uint()?,
+                through: d.uint()?,
+                base_hash: d
+                    .bytes()?
+                    .try_into()
+                    .map_err(|_| invalid("promotion base hash"))?,
+                received_ms: d.uint()?,
+                witness: d.uint()?,
+                witness_hash: d
+                    .bytes()?
+                    .try_into()
+                    .map_err(|_| invalid("promotion witness"))?,
+                cursor: d.uint()?,
+                work: Roots::read(&mut d)?,
+                first_log: d.uint()?,
+                after_log: d.uint()?,
+                first_page: d.uint()?,
+                after_page: d.uint()?,
+                retired: d.uint()?,
+            }),
+            _ => return Err(invalid("promotion arity")),
+        };
+        d.finish()?;
+        if next_page == 0
+            || next_provisional == 0
+            || [
+                active.sequence,
+                active.hash,
+                provisional.sequence,
+                provisional.hash,
+            ]
+            .iter()
+            .any(|id| *id >= next_page)
+            || matches!(phase, Phase::Building | Phase::Switched) != promotion.is_some()
+        {
+            return Err(invalid("entry directory bounds"));
+        }
+        if let Some(p) = &promotion {
+            if p.from == 0
+                || p.through < p.from
+                || p.cursor < p.from
+                || p.cursor > p.through.saturating_add(1)
+                || p.witness == 0
+                || p.witness >= next_provisional
+                || p.first_log == 0
+                || p.after_log < p.first_log
+                || p.first_page == 0
+                || p.after_page < p.first_page
+                || p.after_page > next_page
+                || p.work.sequence >= next_page
+                || p.work.hash >= next_page
+                || p.retired >= next_page
+            {
+                return Err(invalid("promotion bounds"));
+            }
+        }
+        Ok(Self {
+            active,
+            provisional,
+            next_page,
+            next_provisional,
+            revision,
+            phase,
+            promotion,
+        })
+    }
+}
+
+/// The cache retains bounded canonical plaintext pages, wiped on drop; decoded nodes and
+/// complete Entries are owned call-local values. Large legal Entries never enter this cache.
+#[derive(Default)]
+struct PageCache {
+    rows: VecDeque<(u64, Zeroizing<Vec<u8>>)>,
+    bytes: usize,
+}
+
+impl PageCache {
+    fn clear(&mut self) {
+        self.rows.clear();
+        self.bytes = 0;
+    }
+    fn get(&mut self, id: u64) -> Option<Zeroizing<Vec<u8>>> {
+        let at = self.rows.iter().position(|(key, _)| *key == id)?;
+        let row = self.rows.remove(at)?;
+        let found = row.1.clone();
+        self.rows.push_back(row);
+        Some(found)
+    }
+    fn put(&mut self, id: u64, bytes: Zeroizing<Vec<u8>>) {
+        // Fixed slot overhead plus actual Vec capacity, not merely logical byte length.
+        let charge = bytes.capacity() + std::mem::size_of::<(u64, Zeroizing<Vec<u8>>)>() * 2;
+        if charge > CACHE_BYTES {
+            return;
+        }
+        while self.bytes + charge > CACHE_BYTES || self.rows.len() >= CACHE_ITEMS {
+            let Some((_, old)) = self.rows.pop_front() else {
+                break;
+            };
+            self.bytes -= old.capacity() + std::mem::size_of::<(u64, Zeroizing<Vec<u8>>)>() * 2;
+        }
+        self.bytes += charge;
+        self.rows.push_back((id, bytes));
+    }
+}
+
+#[derive(Clone, Debug)]
+enum Page {
+    Leaf(Vec<(Key, Locator)>),
+    Branch(Vec<(Key, u64)>),
+}
+
+impl Page {
+    fn max(&self) -> Result<Key> {
+        match self {
+            Self::Leaf(rows) => rows.last().map(|r| r.0),
+            Self::Branch(rows) => rows.last().map(|r| r.0),
+        }
+        .ok_or(invalid("empty entry page"))
+    }
+    fn bytes(&self) -> Result<Zeroizing<Vec<u8>>> {
+        let mut e = Encoder::new();
+        e.array(3).uint(1);
+        match self {
+            Self::Leaf(rows) => {
+                e.uint(0).array(rows.len());
+                for (key, value) in rows {
+                    e.array(2).bytes(key);
+                    value.write(&mut e);
+                }
+            }
+            Self::Branch(rows) => {
+                e.uint(1).array(rows.len());
+                for (key, id) in rows {
+                    e.array(2).bytes(key).uint(*id);
+                }
+            }
+        }
+        let bytes = e.finish();
+        if bytes.len() > PAGE_BYTES {
+            return Err(invalid("entry page exceeds bound"));
+        }
+        Ok(Zeroizing::new(bytes))
+    }
+    fn parse(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() > PAGE_BYTES {
+            return Err(invalid("entry page exceeds bound"));
+        }
+        let mut d = Decoder::new(bytes);
+        if d.array()? != 3 || d.uint()? != 1 {
+            return Err(invalid("entry page format"));
+        }
+        let kind = d.uint()?;
+        let count = d.array()?;
+        if count == 0 || count > PAGE_ITEMS {
+            return Err(invalid("entry page count"));
+        }
+        let mut previous = None;
+        let mut leaves = Vec::new();
+        let mut branches = Vec::new();
+        for _ in 0..count {
+            if d.array()? != 2 {
+                return Err(invalid("entry page row arity"));
+            }
+            let key: Key = d
+                .bytes()?
+                .try_into()
+                .map_err(|_| invalid("entry page key"))?;
+            if previous.is_some_and(|p| p >= key) {
+                return Err(invalid("entry page key order"));
+            }
+            previous = Some(key);
+            match kind {
+                0 => leaves.push((key, Locator::read(&mut d)?)),
+                1 => {
+                    let id = d.uint()?;
+                    if id == 0 {
+                        return Err(invalid("entry child id"));
+                    }
+                    branches.push((key, id));
+                }
+                _ => return Err(invalid("entry page kind")),
+            }
+        }
+        d.finish()?;
+        Ok(if kind == 0 {
+            Self::Leaf(leaves)
+        } else {
+            Self::Branch(branches)
+        })
+    }
+}
+
+enum Source<'a> {
+    Snapshot(&'a Snapshot),
+    Cached(&'a Snapshot, &'a RefCell<PageCache>),
+    Batch(&'a Batch<'a>),
+}
+
+impl Source<'_> {
+    fn open(
+        &self,
+        sek: &Sek,
+        channel: &Digest32,
+        kind: SegmentKind,
+        id: u64,
+    ) -> Result<Option<Zeroizing<Vec<u8>>>> {
+        let sealed = match self {
+            Self::Snapshot(snapshot) | Self::Cached(snapshot, _) => {
+                snapshot.get_segment(channel, kind, id)?
+            }
+            Self::Batch(batch) => batch.get_segment(channel, kind, id)?,
+        };
+        sealed
+            .map(|value| open_segment(sek, kind, id, &value))
+            .transpose()
+    }
+    fn page(&self, sek: &Sek, channel: &Digest32, id: u64) -> Result<Page> {
+        if let Self::Cached(_, cache) = self {
+            if let Some(bytes) = cache.borrow_mut().get(id) {
+                return Page::parse(&bytes);
+            }
+        }
+        let bytes = self
+            .open(sek, channel, SegmentKind::EntryIndex, id)?
+            .ok_or(invalid("entry index page missing"))?;
+        let page = Page::parse(&bytes)?;
+        if let Self::Cached(_, cache) = self {
+            cache.borrow_mut().put(id, bytes);
+        }
+        Ok(page)
+    }
+    fn find(
+        &self,
+        sek: &Sek,
+        channel: &Digest32,
+        mut root: u64,
+        key: &Key,
+    ) -> Result<Option<Locator>> {
+        if root == 0 {
+            return Ok(None);
+        }
+        for _ in 0..MAX_DEPTH {
+            match self.page(sek, channel, root)? {
+                Page::Leaf(rows) => {
+                    return Ok(rows
+                        .binary_search_by_key(key, |r| r.0)
+                        .ok()
+                        .map(|at| rows[at].1))
+                }
+                Page::Branch(rows) => match rows.iter().find(|r| r.0 >= *key) {
+                    Some((_, next)) => root = *next,
+                    None => return Ok(None),
+                },
+            }
+        }
+        Err(invalid("entry index cycle or depth"))
+    }
+    fn first(
+        &self,
+        sek: &Sek,
+        channel: &Digest32,
+        root: u64,
+        key: &Key,
+        depth: usize,
+    ) -> Result<Option<(Key, Locator)>> {
+        if root == 0 {
+            return Ok(None);
+        }
+        if depth >= MAX_DEPTH {
+            return Err(invalid("entry index cycle or depth"));
+        }
+        match self.page(sek, channel, root)? {
+            Page::Leaf(rows) => Ok(rows.into_iter().find(|r| r.0 >= *key)),
+            Page::Branch(rows) => {
+                for (max, child) in rows {
+                    if max >= *key {
+                        if let Some(row) = self.first(sek, channel, child, key, depth + 1)? {
+                            return Ok(Some(row));
+                        }
+                    }
+                }
+                Ok(None)
+            }
+        }
+    }
+}
+
+/// The channel owns only this small directory/cache; Store and SEK are borrowed per call.
+#[derive(Default)]
+pub(crate) struct EntryIndex {
+    cache: RefCell<PageCache>,
+    cache_revision: Cell<u64>,
+}
+
+impl std::fmt::Debug for EntryIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EntryIndex")
+            .field("cached_bytes", &self.cache.borrow().bytes)
+            .finish()
+    }
+}
+
+pub(crate) struct Read<'a> {
+    snapshot: Snapshot,
+    cache: &'a RefCell<PageCache>,
+    sek: &'a Sek,
+    channel: &'a Digest32,
+    directory: Directory,
+}
+
+impl EntryIndex {
+    pub(crate) fn read<'a>(
+        &'a self,
+        store: &Store,
+        sek: &'a Sek,
+        channel: &'a Digest32,
+    ) -> Result<Read<'a>> {
+        let snapshot = store.snapshot()?;
+        let source = Source::Snapshot(&snapshot);
+        let bytes = source
+            .open(sek, channel, SegmentKind::EntryIndex, DIRECTORY)?
+            .ok_or(invalid("entry index directory missing"))?;
+        let directory = Directory::parse(&bytes)?;
+        if directory.phase == Phase::Rebuilding {
+            return Err(invalid("entry index publication incomplete"));
+        }
+        if self.cache_revision.replace(directory.revision) != directory.revision {
+            self.cache.borrow_mut().clear();
+        }
+        Ok(Read {
+            snapshot,
+            cache: &self.cache,
+            sek,
+            channel,
+            directory,
+        })
+    }
+}
+
+impl Read<'_> {
+    fn source(&self) -> Source<'_> {
+        Source::Cached(&self.snapshot, self.cache)
+    }
+    pub(crate) fn staged(&self, author: &Digest32, seq: u64) -> Result<bool> {
+        Ok(self
+            .source()
+            .find(
+                self.sek,
+                self.channel,
+                self.directory.provisional.sequence,
+                &position(author, seq),
+            )?
+            .is_some())
+    }
+    pub(crate) fn log_id(&self, hash: &Digest32) -> Result<Option<u64>> {
+        Ok(self
+            .source()
+            .find(
+                self.sek,
+                self.channel,
+                self.directory.active.hash,
+                &hashed(hash),
+            )?
+            .map(|at| at.log))
+    }
+}
+
+fn indexed_entry(
+    source: &Source<'_>,
+    sek: &Sek,
+    channel: &Digest32,
+    kind: SegmentKind,
+    at: Locator,
+) -> Result<Entry> {
+    let wire = source
+        .open(sek, channel, kind, at.log)?
+        .ok_or(invalid("indexed log entry missing"))?;
+    let entry = Entry::from_wire(&wire)?;
+    if entry.skeleton.author_id != at.author
+        || entry.skeleton.seq != at.seq
+        || entry.skeleton.channel_id != *channel
+    {
+        return Err(invalid("indexed log entry identity differs"));
+    }
+    Ok(entry)
+}
+
+fn find_position(
+    source: &Source<'_>,
+    sek: &Sek,
+    channel: &Digest32,
+    directory: &Directory,
+    author: &Digest32,
+    seq: u64,
+) -> Result<Option<Entry>> {
+    let key = position(author, seq);
+    for (root, kind) in [
+        (directory.provisional.sequence, SegmentKind::ProvisionalLog),
+        (directory.active.sequence, SegmentKind::LogDb),
+    ] {
+        if let Some(at) = source.find(sek, channel, root, &key)? {
+            if at.author != *author || at.seq != seq {
+                return Err(invalid("sequence locator differs"));
+            }
+            return indexed_entry(source, sek, channel, kind, at).map(Some);
+        }
+    }
+    Ok(None)
+}
+
+fn find_hash(
+    source: &Source<'_>,
+    sek: &Sek,
+    channel: &Digest32,
+    directory: &Directory,
+    hash: &Digest32,
+) -> Result<Option<(Digest32, u64)>> {
+    for (root, kind) in [
+        (directory.provisional.hash, SegmentKind::ProvisionalLog),
+        (directory.active.hash, SegmentKind::LogDb),
+    ] {
+        if let Some(at) = source.find(sek, channel, root, &hashed(hash))? {
+            if indexed_entry(source, sek, channel, kind, at)?.entry_hash() != *hash {
+                return Err(invalid("hash locator differs"));
+            }
+            return Ok(Some((at.author, at.seq)));
+        }
+    }
+    Ok(None)
+}
+
+impl EntryRead for Read<'_> {
+    fn get(&self, author: &Digest32, seq: u64) -> Result<Option<Entry>> {
+        find_position(
+            &self.source(),
+            self.sek,
+            self.channel,
+            &self.directory,
+            author,
+            seq,
+        )
+    }
+    fn locate(&self, hash: &Digest32) -> Result<Option<(Digest32, u64)>> {
+        find_hash(
+            &self.source(),
+            self.sek,
+            self.channel,
+            &self.directory,
+            hash,
+        )
+    }
+}
+
+/// Startup validates the exact persisted bytes through the ordinary acceptance predicate.
+/// Replay never writes, or accepts bytes that differ from its pinned snapshot.
+impl EntryWrite for Read<'_> {
+    fn put(&mut self, entry: &Entry) -> Result<()> {
+        let saved = self
+            .get(&entry.skeleton.author_id, entry.skeleton.seq)?
+            .ok_or(invalid("replayed entry missing"))?;
+        if saved.to_wire() != entry.to_wire() {
+            return Err(invalid("replayed entry differs"));
+        }
+        Ok(())
+    }
+    fn remove(&mut self, _author: &Digest32, _seq: u64) -> Result<()> {
+        Err(invalid("a stored unsigned entry has no signed successor"))
+    }
+}
+
+/// A write context sees only its own Batch, including earlier tree splits. Dropping the Batch
+/// discards its directory as well: no root or cache is changed before commit.
+pub(crate) struct Write<'a, 's> {
+    batch: &'a mut Batch<'s>,
+    sek: &'a Sek,
+    channel: &'a Digest32,
+    directory: Directory,
+    destination: Option<u64>,
+}
+
+impl EntryIndex {
+    pub(crate) fn write<'a, 's>(
+        &self,
+        batch: &'a mut Batch<'s>,
+        sek: &'a Sek,
+        channel: &'a Digest32,
+    ) -> Result<Write<'a, 's>> {
+        let directory =
+            match Source::Batch(batch).open(sek, channel, SegmentKind::EntryIndex, DIRECTORY)? {
+                Some(bytes) => Directory::parse(&bytes)?,
+                None => Directory::default(),
+            };
+        Ok(Write {
+            batch,
+            sek,
+            channel,
+            directory,
+            destination: None,
+        })
+    }
+    pub(crate) fn committed(&self) {
+        self.cache.borrow_mut().clear();
+    }
+}
+
+impl Write<'_, '_> {
+    fn allocate(&mut self) -> Result<u64> {
+        let id = self.directory.next_page;
+        self.directory.next_page = id
+            .checked_add(1)
+            .ok_or(invalid("entry page allocator exhausted"))?;
+        if let Some(p) = &mut self.directory.promotion {
+            p.after_page = self.directory.next_page;
+        }
+        Ok(id)
+    }
+    fn put_page(&mut self, page: &Page) -> Result<(Key, u64)> {
+        let bytes = page.bytes()?;
+        let id = self.allocate()?;
+        let sealed = seal_segment(self.sek, SegmentKind::EntryIndex, id, &bytes)?;
+        self.batch
+            .put_segment(self.channel, SegmentKind::EntryIndex, id, &sealed)?;
+        Ok((page.max()?, id))
+    }
+    fn retire(&mut self, id: u64) -> Result<()> {
+        if self.directory.phase == Phase::Building {
+            let previous = self
+                .directory
+                .promotion
+                .as_ref()
+                .ok_or(invalid("promotion missing"))?
+                .retired;
+            let mut e = Encoder::new();
+            e.array(4).uint(1).uint(2).uint(previous).uint(id);
+            let ledger = self.allocate()?;
+            let sealed = seal_segment(self.sek, SegmentKind::EntryIndex, ledger, &e.finish())?;
+            self.batch
+                .put_segment(self.channel, SegmentKind::EntryIndex, ledger, &sealed)?;
+            self.directory
+                .promotion
+                .as_mut()
+                .ok_or(invalid("promotion missing"))?
+                .retired = ledger;
+        } else {
+            self.batch
+                .delete_segment(self.channel, SegmentKind::EntryIndex, id)?;
+        }
+        Ok(())
+    }
+    fn replace(
+        &mut self,
+        root: u64,
+        key: Key,
+        value: Option<Locator>,
+        depth: usize,
+    ) -> Result<Vec<(Key, u64)>> {
+        if depth >= MAX_DEPTH {
+            return Err(invalid("entry index cycle or depth"));
+        }
+        let old = if root == 0 {
+            Page::Leaf(Vec::new())
+        } else {
+            Source::Batch(self.batch).page(self.sek, self.channel, root)?
+        };
+        let mut parts = Vec::with_capacity(2);
+        match old {
+            Page::Leaf(mut rows) => {
+                match (rows.binary_search_by_key(&key, |r| r.0), value) {
+                    (Ok(at), Some(value)) => rows[at].1 = value,
+                    (Ok(at), None) => {
+                        rows.remove(at);
+                    }
+                    (Err(at), Some(value)) => rows.insert(at, (key, value)),
+                    (Err(_), None) => {
+                        return Ok(if root == 0 {
+                            Vec::new()
+                        } else {
+                            vec![(rows.last().ok_or(invalid("empty entry leaf"))?.0, root)]
+                        })
+                    }
+                }
+                if rows.len() > PAGE_ITEMS {
+                    let right = rows.split_off(rows.len() / 2);
+                    parts.push(self.put_page(&Page::Leaf(rows))?);
+                    parts.push(self.put_page(&Page::Leaf(right))?);
+                } else if !rows.is_empty() {
+                    parts.push(self.put_page(&Page::Leaf(rows))?);
+                }
+            }
+            Page::Branch(mut rows) => {
+                let at = rows
+                    .iter()
+                    .position(|r| r.0 >= key)
+                    .unwrap_or(rows.len() - 1);
+                let children = self.replace(rows[at].1, key, value, depth + 1)?;
+                rows.splice(at..=at, children);
+                if rows.len() > PAGE_ITEMS {
+                    let right = rows.split_off(rows.len() / 2);
+                    parts.push(self.put_page(&Page::Branch(rows))?);
+                    parts.push(self.put_page(&Page::Branch(right))?);
+                } else if !rows.is_empty() {
+                    parts.push(self.put_page(&Page::Branch(rows))?);
+                }
+            }
+        }
+        if root != 0 {
+            self.retire(root)?;
+        }
+        Ok(parts)
+    }
+    fn change(&mut self, root: u64, key: Key, value: Option<Locator>) -> Result<u64> {
+        let parts = self.replace(root, key, value, 0)?;
+        match parts.as_slice() {
+            [] => Ok(0),
+            [(_, id)] => Ok(*id),
+            _ => Ok(self.put_page(&Page::Branch(parts))?.1),
+        }
+    }
+    fn index(&mut self, mut roots: Roots, entry: &Entry, log: u64) -> Result<Roots> {
+        let at = Locator {
+            author: entry.skeleton.author_id,
+            seq: entry.skeleton.seq,
+            log,
+        };
+        let key = position(&at.author, at.seq);
+        if let Some(existing) =
+            Source::Batch(self.batch).find(self.sek, self.channel, roots.sequence, &key)?
+        {
+            if existing != at {
+                return Err(invalid("entry position already indexed differently"));
+            }
+        }
+        roots.sequence = self.change(roots.sequence, key, Some(at))?;
+        roots.hash = self.change(roots.hash, hashed(&entry.entry_hash()), Some(at))?;
+        Ok(roots)
+    }
+    pub(crate) fn index_existing(&mut self, entry: &Entry, log: u64) -> Result<()> {
+        if self.directory.phase != Phase::Rebuilding {
+            return Err(invalid("not rebuilding entry index"));
+        }
+        self.directory.active = self.index(self.directory.active, entry, log)?;
+        Ok(())
+    }
+    pub(crate) fn finish_rebuild(&mut self) -> Result<()> {
+        if self.directory.phase != Phase::Rebuilding {
+            return Err(invalid("not rebuilding entry index"));
+        }
+        self.directory.phase = Phase::Idle;
+        Ok(())
+    }
+    pub(crate) fn put_committed(&mut self, entry: &Entry, log: u64) -> Result<()> {
+        if self.directory.phase != Phase::Idle {
+            return Err(invalid("entry index publication in progress"));
+        }
+        let sealed = seal_segment(self.sek, SegmentKind::LogDb, log, &entry.to_wire())?;
+        self.batch
+            .put_segment(self.channel, SegmentKind::LogDb, log, &sealed)?;
+        self.directory.active = self.index(self.directory.active, entry, log)?;
+        Ok(())
+    }
+    pub(crate) fn stage(&mut self, entry: &Entry) -> Result<u64> {
+        if self.directory.phase != Phase::Idle {
+            return Err(invalid("entry index publication in progress"));
+        }
+        let existing = Source::Batch(self.batch).find(
+            self.sek,
+            self.channel,
+            self.directory.provisional.sequence,
+            &position(&entry.skeleton.author_id, entry.skeleton.seq),
+        )?;
+        let id = match existing {
+            Some(at) => {
+                if indexed_entry(
+                    &Source::Batch(self.batch),
+                    self.sek,
+                    self.channel,
+                    SegmentKind::ProvisionalLog,
+                    at,
+                )?
+                .entry_hash()
+                    != entry.entry_hash()
+                {
+                    return Err(invalid("provisional replacement differs"));
+                }
+                at.log
+            }
+            None => {
+                let id = self.directory.next_provisional;
+                self.directory.next_provisional = id
+                    .checked_add(1)
+                    .ok_or(invalid("provisional allocator exhausted"))?;
+                id
+            }
+        };
+        let sealed = seal_segment(self.sek, SegmentKind::ProvisionalLog, id, &entry.to_wire())?;
+        self.batch
+            .put_segment(self.channel, SegmentKind::ProvisionalLog, id, &sealed)?;
+        self.directory.provisional = self.index(self.directory.provisional, entry, id)?;
+        Ok(id)
+    }
+    pub(crate) fn seal(&mut self) -> Result<()> {
+        self.directory.revision = self
+            .directory
+            .revision
+            .checked_add(1)
+            .ok_or(invalid("entry index revision exhausted"))?;
+        let sealed = seal_segment(
+            self.sek,
+            SegmentKind::EntryIndex,
+            DIRECTORY,
+            &self.directory.bytes(),
+        )?;
+        self.batch
+            .put_segment(self.channel, SegmentKind::EntryIndex, DIRECTORY, &sealed)
+    }
+}
+
+const PROMOTION_ENTRIES: usize = 64;
+const PROMOTION_BYTES: usize = 1024 * 1024;
+
+impl Write<'_, '_> {
+    /// The caller already checked the complete feed linkage and the successor's signature.
+    /// The signed witness stays in the provisional store until publication and cleanup finish.
+    pub(crate) fn begin_promotion(
+        &mut self,
+        witness: &Entry,
+        from: u64,
+        first_log: u64,
+        received_ms: u64,
+    ) -> Result<()> {
+        if self.directory.phase != Phase::Idle
+            || !witness.is_signed()
+            || from == 0
+            || from > witness.skeleton.seq
+            || first_log == 0
+        {
+            return Err(invalid("invalid entry promotion start"));
+        }
+        let author = witness.skeleton.author_id;
+        let source = Source::Batch(self.batch);
+        let at = source
+            .find(
+                self.sek,
+                self.channel,
+                self.directory.provisional.sequence,
+                &position(&author, witness.skeleton.seq),
+            )?
+            .ok_or(invalid("promotion witness missing"))?;
+        let wire = source
+            .open(self.sek, self.channel, SegmentKind::ProvisionalLog, at.log)?
+            .ok_or(invalid("promotion witness wire missing"))?;
+        let saved = Entry::from_wire(&wire)?;
+        if saved.to_wire() != witness.to_wire() {
+            return Err(invalid("promotion witness differs"));
+        }
+        let base_hash = if from == 1 {
+            [0; 32]
+        } else {
+            let at = source
+                .find(
+                    self.sek,
+                    self.channel,
+                    self.directory.active.sequence,
+                    &position(&author, from - 1),
+                )?
+                .ok_or(invalid("promotion base missing"))?;
+            let wire = source
+                .open(self.sek, self.channel, SegmentKind::LogDb, at.log)?
+                .ok_or(invalid("promotion base wire missing"))?;
+            Entry::from_wire(&wire)?.entry_hash()
+        };
+        let count = witness
+            .skeleton
+            .seq
+            .checked_sub(from)
+            .and_then(|v| v.checked_add(1))
+            .ok_or(invalid("promotion sequence overflow"))?;
+        first_log
+            .checked_add(count)
+            .ok_or(invalid("promotion log allocator exhausted"))?;
+        self.directory.promotion = Some(Promotion {
+            author,
+            from,
+            through: witness.skeleton.seq,
+            base_hash,
+            received_ms,
+            witness: at.log,
+            witness_hash: witness.entry_hash(),
+            cursor: from,
+            work: self.directory.active,
+            first_log,
+            after_log: first_log,
+            first_page: self.directory.next_page,
+            after_page: self.directory.next_page,
+            retired: 0,
+        });
+        self.directory.phase = Phase::Building;
+        Ok(())
+    }
+
+    /// Copy at most one bounded chunk, never an entire authenticated suffix. A single legal
+    /// large witness is allowed as one entry; the index-page bound is not a message-size cap.
+    /// The caller seals this updated descriptor and commits the same Batch after each step.
+    pub(crate) fn promotion_chunk(&mut self) -> Result<bool> {
+        if self.directory.phase != Phase::Building {
+            return Err(invalid("no building promotion"));
+        }
+        let mut p = self
+            .directory
+            .promotion
+            .clone()
+            .ok_or(invalid("promotion missing"))?;
+        let mut bytes = 0usize;
+        for _ in 0..PROMOTION_ENTRIES {
+            if p.cursor > p.through {
+                break;
+            }
+            let source = Source::Batch(self.batch);
+            let at = source
+                .find(
+                    self.sek,
+                    self.channel,
+                    self.directory.provisional.sequence,
+                    &position(&p.author, p.cursor),
+                )?
+                .ok_or(invalid("promotion suffix missing"))?;
+            let wire = source
+                .open(self.sek, self.channel, SegmentKind::ProvisionalLog, at.log)?
+                .ok_or(invalid("promotion suffix wire missing"))?;
+            if bytes != 0 && bytes.saturating_add(wire.len()) > PROMOTION_BYTES {
+                break;
+            }
+            let entry = Entry::from_wire(&wire)?;
+            if entry.skeleton.author_id != p.author
+                || entry.skeleton.seq != p.cursor
+                || entry.skeleton.channel_id != *self.channel
+                || (p.cursor < p.through && (entry.is_signed() || entry.payload.is_some()))
+                || (p.cursor == p.through
+                    && (!entry.is_signed() || entry.entry_hash() != p.witness_hash))
+            {
+                return Err(invalid("promotion entry differs from authenticated suffix"));
+            }
+            let previous = if p.cursor == p.from {
+                p.base_hash
+            } else {
+                let at = source
+                    .find(
+                        self.sek,
+                        self.channel,
+                        p.work.sequence,
+                        &position(&p.author, p.cursor - 1),
+                    )?
+                    .ok_or(invalid("promotion predecessor missing"))?;
+                indexed_entry(&source, self.sek, self.channel, SegmentKind::LogDb, at)?.entry_hash()
+            };
+            if entry.skeleton.prev_hash != previous
+                || (p.cursor == p.through && at.log != p.witness)
+            {
+                return Err(invalid("promotion predecessor or witness differs"));
+            }
+            let log = p
+                .first_log
+                .checked_add(p.cursor - p.from)
+                .ok_or(invalid("promotion log overflow"))?;
+            if self
+                .batch
+                .get_segment(self.channel, SegmentKind::LogDb, log)?
+                .is_some()
+            {
+                return Err(invalid("promotion would overwrite an active log entry"));
+            }
+            let sealed = seal_segment(self.sek, SegmentKind::LogDb, log, &wire)?;
+            self.batch
+                .put_segment(self.channel, SegmentKind::LogDb, log, &sealed)?;
+            // Bodyless skeletons have no decrypt/ratchet effect. Their first-seen facts still
+            // land with their wire and locator; the witness effects are queued at publication.
+            if p.cursor < p.through {
+                let seen = seal_segment(
+                    self.sek,
+                    SegmentKind::Index,
+                    log,
+                    &super::first_seen_bytes(p.received_ms, false),
+                )?;
+                self.batch
+                    .put_segment(self.channel, SegmentKind::Index, log, &seen)?;
+            }
+            p.work = self.index(p.work, &entry, log)?;
+            p.after_log = log
+                .checked_add(1)
+                .ok_or(invalid("promotion log overflow"))?;
+            p.cursor = p
+                .cursor
+                .checked_add(1)
+                .ok_or(invalid("promotion sequence overflow"))?;
+            bytes = bytes.saturating_add(wire.len());
+        }
+        // Tree writes also appended retirement nodes and advanced the page allocator.
+        let allocated = self
+            .directory
+            .promotion
+            .as_ref()
+            .ok_or(invalid("promotion missing"))?;
+        p.after_page = allocated.after_page;
+        p.retired = allocated.retired;
+        let complete = p.cursor > p.through;
+        self.directory.promotion = Some(p);
+        Ok(complete)
+    }
+
+    /// Queue the root switch in the same Batch as the witness's ratchet/cache/governance
+    /// effects. The caller must not publish the new head or stored credit before commit.
+    pub(crate) fn publish_promotion(&mut self) -> Result<(u64, u64)> {
+        if self.directory.phase != Phase::Building {
+            return Err(invalid("no building promotion"));
+        }
+        let p = self
+            .directory
+            .promotion
+            .as_ref()
+            .ok_or(invalid("promotion missing"))?;
+        if p.cursor <= p.through {
+            return Err(invalid("promotion suffix incomplete"));
+        }
+        let result = (p.through - p.from + 1, p.after_log);
+        let from = p.from;
+        self.directory.active = p.work;
+        self.directory.phase = Phase::Switched;
+        self.directory
+            .promotion
+            .as_mut()
+            .ok_or(invalid("promotion missing"))?
+            .cursor = from;
+        Ok(result)
+    }
+
+    /// Cleanup is itself restartable. Building rolls back only unpublished allocations before
+    /// LogDb replay; Switched never deletes newly active LogDb, only retired page versions.
+    pub(crate) fn cleanup_chunk(&mut self) -> Result<bool> {
+        let Some(mut p) = self.directory.promotion.clone() else {
+            return Ok(true);
+        };
+        match self.directory.phase {
+            Phase::Building => {
+                for _ in 0..PROMOTION_ENTRIES {
+                    if p.after_log > p.first_log {
+                        p.after_log -= 1;
+                        self.batch
+                            .delete_segment(self.channel, SegmentKind::LogDb, p.after_log)?;
+                        self.batch
+                            .delete_segment(self.channel, SegmentKind::Index, p.after_log)?;
+                    } else if p.after_page > p.first_page {
+                        p.after_page -= 1;
+                        self.batch.delete_segment(
+                            self.channel,
+                            SegmentKind::EntryIndex,
+                            p.after_page,
+                        )?;
+                    } else {
+                        self.directory.phase = Phase::Idle;
+                        self.directory.promotion = None;
+                        return Ok(true);
+                    }
+                }
+            }
+            Phase::Switched => {
+                for _ in 0..PROMOTION_ENTRIES {
+                    if p.retired == 0 {
+                        if p.cursor <= p.through {
+                            self.remove_staged(&p.author, p.cursor)?;
+                            p.cursor = p
+                                .cursor
+                                .checked_add(1)
+                                .ok_or(invalid("promotion cleanup overflow"))?;
+                            continue;
+                        }
+                        self.directory.phase = Phase::Idle;
+                        self.directory.promotion = None;
+                        return Ok(true);
+                    }
+                    let ledger = p.retired;
+                    let bytes = Source::Batch(self.batch)
+                        .open(self.sek, self.channel, SegmentKind::EntryIndex, ledger)?
+                        .ok_or(invalid("entry retirement ledger missing"))?;
+                    if bytes.len() > PAGE_BYTES {
+                        return Err(invalid("entry retirement ledger exceeds bound"));
+                    }
+                    let mut d = Decoder::new(&bytes);
+                    if d.array()? != 4 || d.uint()? != 1 || d.uint()? != 2 {
+                        return Err(invalid("entry retirement ledger format"));
+                    }
+                    let previous = d.uint()?;
+                    let retired = d.uint()?;
+                    d.finish()?;
+                    if retired == 0 || retired >= ledger || previous >= ledger {
+                        return Err(invalid("entry retirement ledger order"));
+                    }
+                    self.batch
+                        .delete_segment(self.channel, SegmentKind::EntryIndex, retired)?;
+                    self.batch
+                        .delete_segment(self.channel, SegmentKind::EntryIndex, ledger)?;
+                    p.retired = previous;
+                }
+            }
+            _ => return Err(invalid("unexpected promotion cleanup phase")),
+        }
+        self.directory.promotion = Some(p);
+        Ok(false)
+    }
+}
+
+impl EntryIndex {
+    /// Complete crash cleanup before a caller scans authoritative LogDb. An absent derived
+    /// index is rebuilt from sealed wire entries; no saved entry, key or first-seen fact is reset.
+    pub(crate) fn prepare(&self, store: &Store, sek: &Sek, channel: &Digest32) -> Result<()> {
+        loop {
+            let mut batch = store.batch()?;
+            let mut writer = self.write(&mut batch, sek, channel)?;
+            if matches!(writer.directory.phase, Phase::Building | Phase::Switched) {
+                let done = writer.cleanup_chunk()?;
+                writer.seal()?;
+                drop(writer);
+                batch.commit()?;
+                self.committed();
+                if !done {
+                    continue;
+                }
+            }
+            break;
+        }
+        let snapshot = store.snapshot()?;
+        let directory = Source::Snapshot(&snapshot)
+            .open(sek, channel, SegmentKind::EntryIndex, DIRECTORY)?
+            .map(|v| Directory::parse(&v))
+            .transpose()?;
+        let rebuilding = directory
+            .as_ref()
+            .is_none_or(|d| d.phase == Phase::Rebuilding);
+        drop(snapshot);
+        if rebuilding {
+            // A crashed rebuild is restarted after discarding only its derived pages. Keep a
+            // durable Rebuilding directory throughout, never an apparently complete empty index.
+            loop {
+                let mut batch = store.batch()?;
+                let mut removed = 0;
+                for _ in 0..PROMOTION_ENTRIES {
+                    let Some((id, _)) =
+                        batch.segment_after(channel, SegmentKind::EntryIndex, Some(0))?
+                    else {
+                        break;
+                    };
+                    batch.delete_segment(channel, SegmentKind::EntryIndex, id)?;
+                    removed += 1;
+                }
+                let fresh = Directory::default();
+                let sealed = seal_segment(sek, SegmentKind::EntryIndex, DIRECTORY, &fresh.bytes())?;
+                batch.put_segment(channel, SegmentKind::EntryIndex, DIRECTORY, &sealed)?;
+                batch.commit()?;
+                if removed < PROMOTION_ENTRIES {
+                    break;
+                }
+            }
+            let mut batch = Some(store.batch()?);
+            let mut count = 0usize;
+            store.visit_segments(channel, SegmentKind::LogDb, |id, sealed| {
+                let wire = open_segment(sek, SegmentKind::LogDb, id, &sealed)?;
+                let entry = Entry::from_wire(&wire)?;
+                if entry.skeleton.channel_id != *channel {
+                    return Err(invalid("saved entry belongs to another room"));
+                }
+                let current = batch
+                    .as_mut()
+                    .ok_or(invalid("entry rebuild batch missing"))?;
+                let mut writer = self.write(current, sek, channel)?;
+                writer.index_existing(&entry, id)?;
+                writer.seal()?;
+                drop(writer);
+                count += 1;
+                if count == PROMOTION_ENTRIES {
+                    batch
+                        .take()
+                        .ok_or(invalid("entry rebuild batch missing"))?
+                        .commit()?;
+                    batch = Some(store.batch()?);
+                    count = 0;
+                }
+                Ok(())
+            })?;
+            let mut batch = batch.ok_or(invalid("entry rebuild batch missing"))?;
+            let mut writer = self.write(&mut batch, sek, channel)?;
+            writer.finish_rebuild()?;
+            writer.seal()?;
+            drop(writer);
+            batch.commit()?;
+            self.committed();
+        }
+        // An unfinished unsigned run is never recovered as an authentic feed. Reclaim its
+        // sealed wire and both locator rows atomically, in bounded batches.
+        // Provisional trees share no pages with active trees; ordinary COW updates have already
+        // retired their superseded versions. Walk deletion by key so no whole-tree Vec is held.
+        self.discard_provisional(store, sek, channel)
+    }
+
+    pub(crate) fn discard_provisional(
+        &self,
+        store: &Store,
+        sek: &Sek,
+        channel: &Digest32,
+    ) -> Result<()> {
+        loop {
+            let mut batch = store.batch()?;
+            let mut writer = self.write(&mut batch, sek, channel)?;
+            if writer.directory.phase != Phase::Idle {
+                return Err(invalid("provisional cleanup before publication cleanup"));
+            }
+            let mut removed = 0;
+            for _ in 0..PROMOTION_ENTRIES {
+                let roots = writer.directory.provisional;
+                let first =
+                    Source::Batch(writer.batch).first(sek, channel, roots.sequence, &[0; 40], 0)?;
+                let Some((key, at)) = first else {
+                    break;
+                };
+                let wire = Source::Batch(writer.batch)
+                    .open(sek, channel, SegmentKind::ProvisionalLog, at.log)?
+                    .ok_or(invalid("provisional entry missing"))?;
+                let entry = Entry::from_wire(&wire)?;
+                writer.directory.provisional.sequence = writer.change(roots.sequence, key, None)?;
+                writer.directory.provisional.hash =
+                    writer.change(roots.hash, hashed(&entry.entry_hash()), None)?;
+                writer
+                    .batch
+                    .delete_segment(channel, SegmentKind::ProvisionalLog, at.log)?;
+                removed += 1;
+            }
+            writer.seal()?;
+            drop(writer);
+            batch.commit()?;
+            self.committed();
+            if removed < PROMOTION_ENTRIES {
+                return Ok(());
+            }
+        }
+    }
+}
+
+impl EntryRead for Write<'_, '_> {
+    fn get(&self, author: &Digest32, seq: u64) -> Result<Option<Entry>> {
+        find_position(
+            &Source::Batch(self.batch),
+            self.sek,
+            self.channel,
+            &self.directory,
+            author,
+            seq,
+        )
+    }
+    fn locate(&self, hash: &Digest32) -> Result<Option<(Digest32, u64)>> {
+        find_hash(
+            &Source::Batch(self.batch),
+            self.sek,
+            self.channel,
+            &self.directory,
+            hash,
+        )
+    }
+}
+
+impl Write<'_, '_> {
+    /// Local append or retention edits use the same transaction for wire, locator and effects.
+    /// Existing positions keep their LogDb id; a new local entry uses exactly `next_log`.
+    pub(crate) fn committing(&mut self, next_log: u64) {
+        self.destination = Some(next_log);
+    }
+
+    pub(crate) fn remove_staged(&mut self, author: &Digest32, seq: u64) -> Result<()> {
+        if !matches!(self.directory.phase, Phase::Idle | Phase::Switched) {
+            return Err(invalid("remove during entry publication"));
+        }
+        let key = position(author, seq);
+        let roots = self.directory.provisional;
+        let Some(at) =
+            Source::Batch(self.batch).find(self.sek, self.channel, roots.sequence, &key)?
+        else {
+            return Ok(());
+        };
+        let entry = indexed_entry(
+            &Source::Batch(self.batch),
+            self.sek,
+            self.channel,
+            SegmentKind::ProvisionalLog,
+            at,
+        )?;
+        self.directory.provisional.sequence = self.change(roots.sequence, key, None)?;
+        self.directory.provisional.hash =
+            self.change(roots.hash, hashed(&entry.entry_hash()), None)?;
+        self.batch
+            .delete_segment(self.channel, SegmentKind::ProvisionalLog, at.log)?;
+        Ok(())
+    }
+}
+
+impl EntryWrite for Write<'_, '_> {
+    fn put(&mut self, entry: &Entry) -> Result<()> {
+        if let Some(next) = self.destination {
+            let existing = Source::Batch(self.batch).find(
+                self.sek,
+                self.channel,
+                self.directory.active.sequence,
+                &position(&entry.skeleton.author_id, entry.skeleton.seq),
+            )?;
+            let id = match existing {
+                Some(at) => {
+                    if indexed_entry(
+                        &Source::Batch(self.batch),
+                        self.sek,
+                        self.channel,
+                        SegmentKind::LogDb,
+                        at,
+                    )?
+                    .entry_hash()
+                        != entry.entry_hash()
+                    {
+                        return Err(invalid("committed replacement differs"));
+                    }
+                    at.log
+                }
+                None => {
+                    if self
+                        .batch
+                        .get_segment(self.channel, SegmentKind::LogDb, next)?
+                        .is_some()
+                    {
+                        return Err(invalid("local append would overwrite log"));
+                    }
+                    self.destination = Some(
+                        next.checked_add(1)
+                            .ok_or(invalid("log allocator exhausted"))?,
+                    );
+                    next
+                }
+            };
+            self.put_committed(entry, id)?;
+            self.remove_staged(&entry.skeleton.author_id, entry.skeleton.seq)?;
+        } else {
+            self.stage(entry)?;
+        }
+        Ok(())
+    }
+    fn remove(&mut self, author: &Digest32, seq: u64) -> Result<()> {
+        self.remove_staged(author, seq)
+    }
+}
+
+/// A short transaction reference supplied by the caller. Never retained by the room.
+#[derive(Clone, Copy)]
+pub(crate) enum Transaction<'a, 's> {
+    Snapshot(&'a Snapshot),
+    Batch(&'a Batch<'s>),
+}
+impl Transaction<'_, '_> {
+    fn source(&self) -> Source<'_> {
+        match self {
+            Self::Snapshot(s) => Source::Snapshot(s),
+            Self::Batch(b) => Source::Batch(b),
+        }
+    }
+}
+
+pub(crate) struct View<'a, 's> {
+    transaction: Transaction<'a, 's>,
+    sek: &'a Sek,
+    channel: &'a Digest32,
+    directory: Directory,
+}
+impl EntryIndex {
+    pub(crate) fn view<'a, 's>(
+        &self,
+        transaction: Transaction<'a, 's>,
+        sek: &'a Sek,
+        channel: &'a Digest32,
+    ) -> Result<View<'a, 's>> {
+        let bytes = transaction
+            .source()
+            .open(sek, channel, SegmentKind::EntryIndex, DIRECTORY)?
+            .ok_or(invalid("entry index directory missing"))?;
+        Ok(View {
+            transaction,
+            sek,
+            channel,
+            directory: Directory::parse(&bytes)?,
+        })
+    }
+    pub(crate) fn in_batch<'a, 's>(
+        &self,
+        batch: &'a Batch<'s>,
+        sek: &'a Sek,
+        channel: &'a Digest32,
+    ) -> Result<View<'a, 's>> {
+        self.view(Transaction::Batch(batch), sek, channel)
+    }
+}
+impl View<'_, '_> {
+    pub(crate) fn log_id(&self, hash: &Digest32) -> Result<Option<u64>> {
+        Ok(self
+            .transaction
+            .source()
+            .find(
+                self.sek,
+                self.channel,
+                self.directory.active.hash,
+                &hashed(hash),
+            )?
+            .map(|at| at.log))
+    }
+}
+impl EntryRead for View<'_, '_> {
+    fn get(&self, author: &Digest32, seq: u64) -> Result<Option<Entry>> {
+        find_position(
+            &self.transaction.source(),
+            self.sek,
+            self.channel,
+            &self.directory,
+            author,
+            seq,
+        )
+    }
+    fn locate(&self, hash: &Digest32) -> Result<Option<(Digest32, u64)>> {
+        find_hash(
+            &self.transaction.source(),
+            self.sek,
+            self.channel,
+            &self.directory,
+            hash,
+        )
+    }
+}
+
+/// Streaming protocol/rollback access. Each staged entry/removal commits its own bounded
+/// transaction; this context never holds a write transaction across a network wait.
+pub(crate) struct Staging<'a> {
+    index: &'a EntryIndex,
+    store: &'a Store,
+    sek: &'a Sek,
+    channel: &'a Digest32,
+}
+impl EntryIndex {
+    pub(crate) fn staging<'a>(
+        &'a self,
+        store: &'a Store,
+        sek: &'a Sek,
+        channel: &'a Digest32,
+    ) -> Staging<'a> {
+        Staging {
+            index: self,
+            store,
+            sek,
+            channel,
+        }
+    }
+}
+impl EntryRead for Staging<'_> {
+    fn get_by_hash(&self, hash: &Digest32) -> Result<Option<Entry>> {
+        self.index
+            .read(self.store, self.sek, self.channel)?
+            .get_by_hash(hash)
+    }
+    fn get(&self, author: &Digest32, seq: u64) -> Result<Option<Entry>> {
+        self.index
+            .read(self.store, self.sek, self.channel)?
+            .get(author, seq)
+    }
+    fn locate(&self, hash: &Digest32) -> Result<Option<(Digest32, u64)>> {
+        self.index
+            .read(self.store, self.sek, self.channel)?
+            .locate(hash)
+    }
+}
+impl EntryWrite for Staging<'_> {
+    fn put(&mut self, entry: &Entry) -> Result<()> {
+        let mut batch = self.store.batch()?;
+        let mut writer = self.index.write(&mut batch, self.sek, self.channel)?;
+        writer.stage(entry)?;
+        writer.seal()?;
+        drop(writer);
+        batch.commit()?;
+        self.index.committed();
+        Ok(())
+    }
+    fn remove(&mut self, author: &Digest32, seq: u64) -> Result<()> {
+        let mut batch = self.store.batch()?;
+        let mut writer = self.index.write(&mut batch, self.sek, self.channel)?;
+        writer.remove_staged(author, seq)?;
+        writer.seal()?;
+        drop(writer);
+        batch.commit()?;
+        self.index.committed();
+        Ok(())
+    }
+}

@@ -74,6 +74,8 @@ const fn kind_code(kind: SegmentKind) -> u8 {
         SegmentKind::Trust => 8,
         SegmentKind::SessionClassification => 9,
         SegmentKind::PrivateSession => 10,
+        SegmentKind::EntryIndex => 11,
+        SegmentKind::ProvisionalLog => 12,
     }
 }
 
@@ -483,6 +485,13 @@ impl Store {
         b.commit()
     }
 
+    /// Hold one read snapshot across a paged lookup, including its final log entry.
+    pub(crate) fn snapshot(&self) -> Result<Snapshot> {
+        Ok(Snapshot {
+            txn: self.begin_read()?,
+        })
+    }
+
     /// Read one sealed segment.
     pub fn get_segment(
         &self,
@@ -694,6 +703,31 @@ fn source_table<K: redb::Key + 'static, V: redb::Value + 'static>(
     }
 }
 
+/// One consistent sealed-segment snapshot. It owns no Store or SEK reference.
+pub(crate) struct Snapshot {
+    txn: redb::ReadTransaction,
+}
+
+impl Snapshot {
+    pub(crate) fn get_segment(
+        &self,
+        channel: &Digest32,
+        kind: SegmentKind,
+        id: u64,
+    ) -> Result<Option<SealedSegment>> {
+        let table = self
+            .txn
+            .open_table(SEGMENTS)
+            .map_err(storage("open segments"))?;
+        let value = table
+            .get((*channel, kind_code(kind), id))
+            .map_err(storage("read segment"))?;
+        value
+            .map(|v| sealed_segment_from_slice(v.value()))
+            .transpose()
+    }
+}
+
 /// An open write transaction over the store (see [`Store::batch`]).
 pub struct Batch<'a> {
     txn: redb::WriteTransaction,
@@ -701,6 +735,55 @@ pub struct Batch<'a> {
 }
 
 impl Batch<'_> {
+    /// Read this transaction's writes as well as its original rows. Reading through Store
+    /// here would miss a split/root update made earlier in this same batch.
+    pub(crate) fn get_segment(
+        &self,
+        channel: &Digest32,
+        kind: SegmentKind,
+        id: u64,
+    ) -> Result<Option<SealedSegment>> {
+        let table = self
+            .txn
+            .open_table(SEGMENTS)
+            .map_err(storage("open segments"))?;
+        let value = table
+            .get((*channel, kind_code(kind), id))
+            .map_err(storage("read segment"))?;
+        value
+            .map(|v| sealed_segment_from_slice(v.value()))
+            .transpose()
+    }
+
+    /// The next sealed row in this transaction, without materializing the remaining range.
+    pub(crate) fn segment_after(
+        &self,
+        channel: &Digest32,
+        kind: SegmentKind,
+        after: Option<u64>,
+    ) -> Result<Option<(u64, SealedSegment)>> {
+        use std::ops::Bound::{Excluded, Included};
+        let table = self
+            .txn
+            .open_table(SEGMENTS)
+            .map_err(storage("open segments"))?;
+        let low = match after {
+            Some(id) => Excluded((*channel, kind_code(kind), id)),
+            None => Included((*channel, kind_code(kind), 0)),
+        };
+        let high = Included((*channel, kind_code(kind), u64::MAX));
+        let mut rows = table
+            .range((low, high))
+            .map_err(storage("range segments"))?;
+        let result = rows
+            .next()
+            .transpose()
+            .map_err(storage("iterate segments"))?
+            .map(|(key, value)| Ok((key.value().2, sealed_segment_from_slice(value.value())?)))
+            .transpose();
+        result
+    }
+
     /// Queue a sealed segment write.
     pub fn put_segment(
         &mut self,

@@ -622,3 +622,37 @@ fn decode_authenticator(d: &mut Decoder<'_>, auth_type: u64) -> Result<Authentic
 fn u16_from(v: u64) -> Result<u16> {
     u16::try_from(v).map_err(|_| Error::MalformedBundle("log-entry algo id out of range"))
 }
+
+/// Fallible access to a room's encrypted, disk-backed entries. Callers retain owned entries
+/// only for the current operation; absence is distinct from a failed local store read.
+pub trait EntryRead {
+    /// The entry at an exact author position, if held.
+    fn get(&self, author: &Digest32, seq: u64) -> Result<Option<Entry>>;
+    /// Resolve an exact entry hash through the authenticated entry index.
+    fn locate(&self, hash: &Digest32) -> Result<Option<(Digest32, u64)>>;
+    /// Resolve and read one exact entry.
+    fn get_by_hash(&self, hash: &Digest32) -> Result<Option<Entry>> {
+        match self.locate(hash)? {
+            Some((author, seq)) => {
+                let entry = self
+                    .get(&author, seq)?
+                    .ok_or(Error::MalformedAtRest("indexed feed entry missing"))?;
+                if entry.entry_hash() != *hash {
+                    return Err(Error::MalformedAtRest("indexed feed hash differs"));
+                }
+                Ok(Some(entry))
+            }
+            None => Ok(None),
+        }
+    }
+}
+
+/// Transaction-local entry changes used by the feed's acceptance predicate. The concrete
+/// channel context stages or queues the wire with both encrypted indexes; it never publishes
+/// a durable frontier before its encompassing batch commits.
+pub trait EntryWrite: EntryRead {
+    /// Insert or replace an exact entry without changing its signed position/hash.
+    fn put(&mut self, entry: &Entry) -> Result<()>;
+    /// Remove one unpublished entry while discarding an unsigned suffix.
+    fn remove(&mut self, author: &Digest32, seq: u64) -> Result<()>;
+}

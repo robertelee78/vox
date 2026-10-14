@@ -54,7 +54,9 @@ use crate::error::{Error, Result};
 use crate::hash::{Digest32, DIGEST_LEN};
 use crate::identity::composite::CompositePublicKey;
 use crate::log::dag::{AdmissionPolicy, Dag, Rejected};
-use crate::log::entry::{Entry, EntryKind, MAX_AUTHENTICATOR_LEN, MAX_PAYLOAD_LEN};
+use crate::log::entry::{
+    Entry, EntryKind, EntryRead, EntryWrite, MAX_AUTHENTICATOR_LEN, MAX_PAYLOAD_LEN,
+};
 use crate::log::negentropy::{self, Role, MAX_MESSAGE_LEN as MAX_NEG_MESSAGE_LEN};
 use crate::wire::{FrameId, WireError, SYNC_MODE_FRONTIER, SYNC_MODE_RANGE_RECONCILIATION};
 
@@ -493,7 +495,11 @@ pub fn frontiers_of(dag: &Dag) -> Vec<FeedFrontier> {
 ///   pulled conflicting entry is fed into DAG fork handling, which freezes the
 ///   author on the proof.
 #[must_use]
-pub fn wants_for(dag: &Dag, remote: &[FeedFrontier]) -> Vec<WantRange> {
+pub fn wants_for(
+    dag: &Dag,
+    entries: &impl EntryRead,
+    remote: &[FeedFrontier],
+) -> crate::error::Result<Vec<WantRange>> {
     let mut wants = Vec::new();
     for rf in remote {
         let local = dag.feed(&rf.author_id);
@@ -514,7 +520,11 @@ pub fn wants_for(dag: &Dag, remote: &[FeedFrontier]) -> Vec<WantRange> {
             // **The peer's head, held here too, is compared as well** (V210-63): the member with
             // the longer history asks for nothing, so without this it never learned of a fork the
             // shorter one could show it. Only a head that differs from ours is asked for.
-            let ours = local.and_then(|f| f.get(rf.max_seq)).map(Entry::entry_hash);
+            let ours = match local {
+                Some(feed) => feed.get(entries, rf.max_seq)?,
+                None => None,
+            }
+            .map(|entry| entry.entry_hash());
             if ours.is_some_and(|h| h != rf.head_hash) {
                 wants.push(WantRange {
                     author_id: rf.author_id,
@@ -536,7 +546,7 @@ pub fn wants_for(dag: &Dag, remote: &[FeedFrontier]) -> Vec<WantRange> {
             }
         }
     }
-    wants
+    Ok(wants)
 }
 
 /// Collect the `ENTRY` wire frames satisfying a peer's `WANT` ranges from the
@@ -552,7 +562,11 @@ pub fn wants_for(dag: &Dag, remote: &[FeedFrontier]) -> Vec<WantRange> {
 /// overlaps cost nothing and serve nothing twice, and each merged range walks
 /// only the entries the feed actually has. Entries not held are simply omitted.
 #[must_use]
-pub fn entries_for_wants(dag: &Dag, wants: &[WantRange]) -> Vec<Vec<u8>> {
+pub fn entries_for_wants(
+    dag: &Dag,
+    entries: &impl EntryRead,
+    wants: &[WantRange],
+) -> Result<Vec<Vec<u8>>> {
     let mut out = Vec::new();
     let mut bytes = 0usize;
     for (author, ranges) in merged_wants(wants) {
@@ -560,20 +574,20 @@ pub fn entries_for_wants(dag: &Dag, wants: &[WantRange]) -> Vec<Vec<u8>> {
             continue;
         };
         for (from, to) in ranges {
-            for entry in feed.range(from, to) {
-                let wire = entry.to_wire();
+            for entry in feed.range(entries, from, to) {
+                let wire = entry?.to_wire();
                 if !out.is_empty()
                     && (out.len() >= MAX_SERVE_ENTRIES
                         || bytes.saturating_add(wire.len()) > MAX_SERVE_BYTES)
                 {
-                    return out;
+                    return Ok(out);
                 }
                 bytes = bytes.saturating_add(wire.len());
                 out.push(wire);
             }
         }
     }
-    out
+    Ok(out)
 }
 
 /// A `WANT`'s ranges grouped by author (in author order) with each author's
@@ -629,6 +643,7 @@ pub fn wire_error_for_rejected(rej: &Rejected) -> WireError {
     match rej {
         Rejected::NotAdmitted | Rejected::Frozen => WireError::EpochMismatch,
         Rejected::Verification(e) => wire_error_for(e),
+        Rejected::Local(_) => WireError::TransportFailed,
         Rejected::Feed(_) => WireError::AuthenticatorInvalid,
         Rejected::Fork(_) => WireError::AuthenticatorInvalid,
         // A duplicate is not a hard fail; callers handle it before mapping. If it
@@ -636,6 +651,35 @@ pub fn wire_error_for_rejected(rej: &Rejected) -> WireError {
         Rejected::Duplicate => WireError::AuthenticatorInvalid,
         // Likewise handled before mapping (`apply_entry`): refused, and the session goes on.
         Rejected::PreCheckpoint => WireError::AuthenticatorInvalid,
+    }
+}
+
+/// Local storage errors retain their cause; they must never accuse a peer of bad authentication.
+#[derive(Debug)]
+pub enum ApplyError {
+    /// A peer/protocol or transport refusal.
+    Wire(WireError),
+    /// A local disk/index operation failed.
+    Local(Error),
+}
+impl ApplyError {
+    /// The public stream-close code, without discarding the local cause.
+    pub fn code(&self) -> WireError {
+        match self {
+            Self::Wire(code) => *code,
+            Self::Local(_) => WireError::TransportFailed,
+        }
+    }
+    fn rejected(why: Rejected) -> Self {
+        match why {
+            Rejected::Local(e) => Self::Local(e),
+            other => Self::Wire(wire_error_for_rejected(&other)),
+        }
+    }
+}
+impl From<WireError> for ApplyError {
+    fn from(code: WireError) -> Self {
+        Self::Wire(code)
     }
 }
 
@@ -669,10 +713,11 @@ pub enum ApplyOutcome {
 /// partitions can exchange conflicting heads and form the proof.
 pub fn apply_entry<R: AuthorResolver>(
     dag: &mut Dag,
+    entries: &mut impl EntryWrite,
     resolver: &R,
     admission: &AdmissionPolicy,
     entry_wire: &[u8],
-) -> std::result::Result<ApplyOutcome, WireError> {
+) -> std::result::Result<ApplyOutcome, ApplyError> {
     let entry = Entry::from_wire(entry_wire).map_err(|e| wire_error_for(&e))?;
     // **An author this node has not admitted is `NotAdmitted`, as the DAG says it** (#217) — not an
     // authenticator failure. Nothing about the entry was shown to be forged: this node simply does
@@ -685,14 +730,14 @@ pub fn apply_entry<R: AuthorResolver>(
         .key_for(&entry.skeleton.author_id)
         .ok_or_else(|| wire_error_for_rejected(&Rejected::NotAdmitted))?;
     let kind = resolver.kind_for(&entry);
-    match dag.accept(entry, kind, &key, admission) {
+    match dag.accept(entries, entry, kind, &key, admission) {
         Ok(_) => Ok(ApplyOutcome::Stored),
         Err(Rejected::Duplicate) => Ok(ApplyOutcome::Duplicate),
         // A fork is recorded by `accept` (freeze / proof) and surfaced; it does
         // not close the stream.
         Err(Rejected::Fork(_)) => Ok(ApplyOutcome::Fork),
         Err(Rejected::PreCheckpoint) => Ok(ApplyOutcome::PreCheckpoint),
-        Err(other) => Err(wire_error_for_rejected(&other)),
+        Err(other) => Err(ApplyError::rejected(other)),
     }
 }
 
@@ -713,11 +758,13 @@ pub fn frontier_session<TA, TB, R, P>(
     ta: &mut TA,
     tb: &mut TB,
     a: &mut Dag,
+    a_entries: &mut impl EntryWrite,
     b: &mut Dag,
+    b_entries: &mut impl EntryWrite,
     resolver: &R,
     admission: &AdmissionPolicy,
     pump: P,
-) -> std::result::Result<(usize, usize), WireError>
+) -> std::result::Result<(usize, usize), ApplyError>
 where
     TA: Transport,
     TB: Transport,
@@ -727,11 +774,13 @@ where
     // Centralized fail-and-close: ANY hard fail closes BOTH endpoints with the
     // exact coded reason (ADR-008 §"Abort / error signalling" — never a silent
     // downgrade, never an unclosed stream).
-    match frontier_session_inner(ta, tb, a, b, resolver, admission, pump) {
+    match frontier_session_inner(
+        ta, tb, a, a_entries, b, b_entries, resolver, admission, pump,
+    ) {
         Ok(counts) => Ok(counts),
         Err(code) => {
-            ta.close(code);
-            tb.close(code);
+            ta.close(code.code());
+            tb.close(code.code());
             Err(code)
         }
     }
@@ -742,11 +791,13 @@ fn frontier_session_inner<TA, TB, R, P>(
     ta: &mut TA,
     tb: &mut TB,
     a: &mut Dag,
+    a_entries: &mut impl EntryWrite,
     b: &mut Dag,
+    b_entries: &mut impl EntryWrite,
     resolver: &R,
     admission: &AdmissionPolicy,
     mut pump: P,
-) -> std::result::Result<(usize, usize), WireError>
+) -> std::result::Result<(usize, usize), ApplyError>
 where
     TA: Transport,
     TB: Transport,
@@ -773,8 +824,8 @@ where
     let b_sees = expect_have(tb.recv())?; // a's frontiers, seen by b
 
     // 3. WANT exchange (each asks for what it lacks, including equal-seq forks).
-    let a_wants = wants_for(a, &a_sees);
-    let b_wants = wants_for(b, &b_sees);
+    let a_wants = wants_for(a, a_entries, &a_sees).map_err(ApplyError::Local)?;
+    let b_wants = wants_for(b, b_entries, &b_sees).map_err(ApplyError::Local)?;
     send_a(ta, encode_want(&a_wants))?;
     send_b(tb, encode_want(&b_wants))?;
     pump(ta, tb);
@@ -782,10 +833,10 @@ where
     let b_got_want = expect_want(tb.recv())?; // what a wants from b
 
     // 4. ENTRY streaming (each serves the other's WANT).
-    for wire in entries_for_wants(a, &a_got_want) {
+    for wire in entries_for_wants(a, a_entries, &a_got_want).map_err(ApplyError::Local)? {
         send_a(ta, encode_entry(&wire))?;
     }
-    for wire in entries_for_wants(b, &b_got_want) {
+    for wire in entries_for_wants(b, b_entries, &b_got_want).map_err(ApplyError::Local)? {
         send_b(tb, encode_entry(&wire))?;
     }
     pump(ta, tb);
@@ -794,8 +845,8 @@ where
     //    here as the conflicting entry is fed into DAG fork handling; an
     //    attributable fork freezes the equivocator (its WireError is the coded
     //    close). Both peers drain independently.
-    let into_a = drain_entries(ta, a, resolver, admission)?;
-    let into_b = drain_entries(tb, b, resolver, admission)?;
+    let into_a = drain_entries(ta, a, a_entries, resolver, admission)?;
+    let into_b = drain_entries(tb, b, b_entries, resolver, admission)?;
     Ok((into_a, into_b))
 }
 
@@ -819,21 +870,22 @@ where
 pub fn frontier_session_peer<T, R>(
     t: &mut T,
     dag: &mut Dag,
+    entries: &mut impl EntryWrite,
     resolver: &R,
     admission: &AdmissionPolicy,
-) -> std::result::Result<usize, WireError>
+) -> std::result::Result<usize, ApplyError>
 where
     T: Transport,
     R: AuthorResolver,
 {
-    let outcome = frontier_session_peer_inner(t, dag, resolver, admission);
+    let outcome = frontier_session_peer_inner(t, dag, entries, resolver, admission);
     // Whatever arrived without a signature and was never chained to a signed entry is not
     // authentic; it is taken back on every path out of the session (ADR-023 decision 3).
-    let discarded = dag.discard_unverified();
+    let discarded = dag.discard_unverified(entries).map_err(ApplyError::Local)?;
     match outcome {
         Ok(applied) => Ok(applied.saturating_sub(discarded)),
         Err(code) => {
-            t.close(code);
+            t.close(code.code());
             Err(code)
         }
     }
@@ -842,9 +894,10 @@ where
 fn frontier_session_peer_inner<T, R>(
     t: &mut T,
     dag: &mut Dag,
+    entries: &mut impl EntryWrite,
     resolver: &R,
     admission: &AdmissionPolicy,
-) -> std::result::Result<usize, WireError>
+) -> std::result::Result<usize, ApplyError>
 where
     T: Transport,
     R: AuthorResolver,
@@ -861,7 +914,7 @@ where
     let remote_have = expect_have(t.recv())?;
 
     // 3. WANT exchange (ask for what we lack, including equal-seq forks).
-    let my_wants = wants_for(dag, &remote_have);
+    let my_wants = wants_for(dag, entries, &remote_have).map_err(ApplyError::Local)?;
     send(t, encode_want(&my_wants))?;
     let their_wants = expect_want(t.recv())?;
 
@@ -875,7 +928,8 @@ where
     //    Served **while** the peer's entries are drained (V210-39): see
     //    `Transport::start_serving`.
     let serve_deadline = std::time::Instant::now() + SERVE_BUDGET;
-    let frames: Vec<Vec<u8>> = entries_for_wants(dag, &their_wants)
+    let frames: Vec<Vec<u8>> = entries_for_wants(dag, entries, &their_wants)
+        .map_err(ApplyError::Local)?
         .iter()
         .map(|w| encode_entry(w))
         .collect();
@@ -884,7 +938,7 @@ where
 
     // 5. Drain and apply the entries the peer serves us, until the peer's clean
     //    half-close (recv → Ok(None)), then collect how our own serving went.
-    let applied = drain_entries(t, dag, resolver, admission)?;
+    let applied = drain_entries(t, dag, entries, resolver, admission)?;
     t.finish_serving().map_err(|e| wire_of(&e))?;
     Ok(applied)
 }
@@ -1491,10 +1545,11 @@ pub mod mutant {
 /// The entry is malformed, fails verification, or does not link into its feed.
 pub fn apply_entry_classified<R: AuthorResolver>(
     dag: &mut Dag,
+    entries: &mut impl EntryWrite,
     resolver: &R,
     admission: &AdmissionPolicy,
     entry_wire: &[u8],
-) -> std::result::Result<EntryClass, WireError> {
+) -> std::result::Result<EntryClass, ApplyError> {
     let entry = Entry::from_wire(entry_wire).map_err(|e| wire_error_for(&e))?;
     let Some(key) = resolver.key_for(&entry.skeleton.author_id) else {
         return Ok(EntryClass::Unadmitted);
@@ -1513,11 +1568,15 @@ pub fn apply_entry_classified<R: AuthorResolver>(
     // its author's feed for a late joiner. Taken, it links the feed; whether its body is expired
     // or still owed is the receiver's own computation, and an owed body is asked for again.
     // A body for a skeleton held without one is put back, if its author could sign it here.
-    if entry.payload.is_some() && dag.contains(&entry.entry_hash()) {
+    if entry.payload.is_some()
+        && dag
+            .contains(entries, &entry.entry_hash())
+            .map_err(ApplyError::Local)?
+    {
         if resolver.unclassifiable(&entry).is_some() {
             return Ok(EntryClass::Refused);
         }
-        if dag.fill_body(&entry) {
+        if dag.fill_body(entries, &entry).map_err(ApplyError::Local)? {
             return Ok(EntryClass::BodyArrived);
         }
     }
@@ -1537,13 +1596,13 @@ pub fn apply_entry_classified<R: AuthorResolver>(
         return Ok(EntryClass::Refused);
     }
     let kind = resolver.kind_for(&entry);
-    match dag.accept(entry, kind, &key, admission) {
+    match dag.accept(entries, entry, kind, &key, admission) {
         Ok(_) => Ok(EntryClass::Stored),
         Err(Rejected::Duplicate) => Ok(EntryClass::Duplicate),
         Err(Rejected::Fork(_)) => Ok(EntryClass::ForkHandled),
         Err(Rejected::Frozen) => Ok(EntryClass::Frozen),
         Err(Rejected::NotAdmitted) => Ok(EntryClass::Unadmitted),
-        Err(other) => Err(wire_error_for_rejected(&other)),
+        Err(other) => Err(ApplyError::rejected(other)),
     }
 }
 
@@ -1552,13 +1611,15 @@ pub fn apply_entry_classified<R: AuthorResolver>(
 /// `stored` in the result counts entries the DAG took; the caller persists them and corrects it.
 pub fn apply_staged_classified<R: AuthorResolver>(
     dag: &mut Dag,
+    entries: &mut impl EntryWrite,
     resolver: &R,
     admission: &AdmissionPolicy,
     staged: &[Vec<u8>],
-) -> ApplyReport {
+) -> (ApplyReport, Option<Error>) {
     let mut report = ApplyReport::default();
+    let mut local = None;
     for wire in staged {
-        match apply_entry_classified(dag, resolver, admission, wire) {
+        match apply_entry_classified(dag, entries, resolver, admission, wire) {
             Ok(class) => {
                 if class == EntryClass::Stored {
                     report.stored += 1;
@@ -1566,19 +1627,26 @@ pub fn apply_staged_classified<R: AuthorResolver>(
                 report.classes.push(class);
             }
             Err(code) => {
-                report.fail = Some(code);
+                report.fail = Some(code.code());
+                if let ApplyError::Local(error) = code {
+                    local = Some(error);
+                }
                 break;
             }
         }
     }
-    report
+    (report, local)
 }
 
 /// [`wants_for`], without asking for a frozen author's entries (ADR-025 D3: the same prefix is
 /// not re-served for ever).
 #[must_use]
-pub fn wants_for_unfrozen(dag: &Dag, remote: &[FeedFrontier]) -> Vec<WantRange> {
-    let mut wants = wants_for(dag, remote);
+pub fn wants_for_unfrozen(
+    dag: &Dag,
+    entries: &impl EntryRead,
+    remote: &[FeedFrontier],
+) -> crate::error::Result<Vec<WantRange>> {
+    let mut wants = wants_for(dag, entries, remote)?;
     wants.retain(|w| !dag.is_frozen(&w.author_id));
     // A feed closed here from a position on is not asked for from there (V210-74).
     for w in &mut wants {
@@ -1587,7 +1655,7 @@ pub fn wants_for_unfrozen(dag: &Dag, remote: &[FeedFrontier]) -> Vec<WantRange> 
         }
     }
     wants.retain(|w| w.from_seq <= w.to_seq);
-    wants
+    Ok(wants)
 }
 
 /// Apply staged entries into `dag`, returning how many were newly stored — the apply half of
@@ -1597,14 +1665,15 @@ pub fn wants_for_unfrozen(dag: &Dag, remote: &[FeedFrontier]) -> Vec<WantRange> 
 /// The first hard sync failure.
 pub fn apply_staged<R: AuthorResolver>(
     dag: &mut Dag,
+    entries: &mut impl EntryWrite,
     resolver: &R,
     admission: &AdmissionPolicy,
     staged: &[Vec<u8>],
-) -> std::result::Result<usize, WireError> {
+) -> std::result::Result<usize, ApplyError> {
     let mut stored = 0;
     for wire in staged {
         if matches!(
-            apply_entry(dag, resolver, admission, wire)?,
+            apply_entry(dag, entries, resolver, admission, wire)?,
             ApplyOutcome::Stored
         ) {
             stored += 1;
@@ -1622,9 +1691,10 @@ pub fn apply_staged<R: AuthorResolver>(
 fn drain_entries<T: Transport, R: AuthorResolver>(
     t: &mut T,
     dag: &mut Dag,
+    entries: &mut impl EntryWrite,
     resolver: &R,
     admission: &AdmissionPolicy,
-) -> std::result::Result<usize, WireError> {
+) -> std::result::Result<usize, ApplyError> {
     let mut applied = 0;
     // **The whole phase is bounded, not just the gap between frames.**
     //
@@ -1640,12 +1710,12 @@ fn drain_entries<T: Transport, R: AuthorResolver>(
     let deadline = std::time::Instant::now() + DRAIN_BUDGET;
     while let Some(frame) = t.recv().map_err(|e| wire_of(&e))? {
         if std::time::Instant::now() >= deadline {
-            return Err(WireError::SyncModeUnsupported);
+            return Err(WireError::SyncModeUnsupported.into());
         }
         match decode_frame(&frame) {
             Ok(SyncFrame::Entry(wire)) => {
                 if matches!(
-                    apply_entry(dag, resolver, admission, &wire)?,
+                    apply_entry(dag, entries, resolver, admission, &wire)?,
                     ApplyOutcome::Stored
                 ) {
                     applied += 1;
@@ -1655,8 +1725,8 @@ fn drain_entries<T: Transport, R: AuthorResolver>(
             // only, and silently accepting anything else is what made the hold above free: a
             // non-entry frame costs the sender nothing and never reaches `apply_entry`, so it
             // would buy the whole budget for free.
-            Ok(_) => return Err(WireError::SyncModeUnsupported),
-            Err(_) => return Err(WireError::SyncModeUnsupported),
+            Ok(_) => return Err(WireError::SyncModeUnsupported.into()),
+            Err(_) => return Err(WireError::SyncModeUnsupported.into()),
         }
     }
     Ok(applied)
@@ -1715,10 +1785,12 @@ fn expect_want(r: Result<Option<Vec<u8>>>) -> std::result::Result<Vec<WantRange>
 /// predicate as frontier mode.
 pub fn range_reconcile_exchange<R: AuthorResolver>(
     a: &mut Dag,
+    a_entries: &mut impl EntryWrite,
     b: &mut Dag,
+    b_entries: &mut impl EntryWrite,
     resolver: &R,
     admission: &AdmissionPolicy,
-) -> std::result::Result<(usize, usize), WireError> {
+) -> std::result::Result<(usize, usize), ApplyError> {
     let _mode = negotiate_mode(
         SYNC_MODE_FRONTIER | SYNC_MODE_RANGE_RECONCILIATION,
         SYNC_MODE_FRONTIER | SYNC_MODE_RANGE_RECONCILIATION,
@@ -1736,7 +1808,7 @@ pub fn range_reconcile_exchange<R: AuthorResolver>(
     loop {
         rounds += 1;
         if rounds > 64 {
-            return Err(WireError::SyncModeUnsupported);
+            return Err(WireError::SyncModeUnsupported.into());
         }
         // Carry NEG over the wire frame to exercise the codec.
         let neg_wire = encode_neg(&negentropy::encode_message(&msg));
@@ -1757,8 +1829,8 @@ pub fn range_reconcile_exchange<R: AuthorResolver>(
     }
 
     // Apply: a pulls its `need` from b; b pulls its `need` (= a's `have`) from a.
-    let applied_into_a = apply_hashes(a, b, resolver, admission, &a_need)?;
-    let applied_into_b = apply_hashes(b, a, resolver, admission, &a_have)?;
+    let applied_into_a = apply_hashes(a, a_entries, b, b_entries, resolver, admission, &a_need)?;
+    let applied_into_b = apply_hashes(b, b_entries, a, a_entries, resolver, admission, &a_have)?;
     Ok((applied_into_a, applied_into_b))
 }
 
@@ -1782,25 +1854,34 @@ fn decode_neg_frame(frame: &[u8]) -> std::result::Result<negentropy::Message, Wi
 /// skipped. Entries are applied in seq order per author so feed links resolve.
 fn apply_hashes<R: AuthorResolver>(
     dst: &mut Dag,
+    dst_entries: &mut impl EntryWrite,
     src: &Dag,
+    src_entries: &impl EntryRead,
     resolver: &R,
     admission: &AdmissionPolicy,
     hashes: &[Digest32],
-) -> std::result::Result<usize, WireError> {
+) -> std::result::Result<usize, ApplyError> {
     // Gather the source entries, then order by (author, seq) so prev/lipmaa links
     // are satisfiable as they are appended.
-    let mut wires: Vec<(Digest32, u64, Vec<u8>)> = hashes
-        .iter()
-        .filter_map(|h| {
-            src.get_by_hash(h)
-                .map(|e| (e.skeleton.author_id, e.skeleton.seq, e.to_wire()))
-        })
-        .collect();
-    wires.sort_by(|x, y| x.0.cmp(&y.0).then(x.1.cmp(&y.1)));
+    // Sort only compact locators; fetch and apply one legal entry at a time.
+    let mut positions = Vec::with_capacity(hashes.len());
+    for hash in hashes {
+        if let Some((author, seq)) = src_entries.locate(hash).map_err(ApplyError::Local)? {
+            positions.push((author, seq, *hash));
+        }
+    }
+    positions.sort_unstable();
     let mut applied = 0;
-    for (_, _, wire) in wires {
+    for (_, _, hash) in positions {
+        let Some(entry) = src
+            .get_by_hash(src_entries, &hash)
+            .map_err(ApplyError::Local)?
+        else {
+            continue;
+        };
+        let wire = entry.to_wire();
         if matches!(
-            apply_entry(dst, resolver, admission, &wire)?,
+            apply_entry(dst, dst_entries, resolver, admission, &wire)?,
             ApplyOutcome::Stored
         ) {
             applied += 1;

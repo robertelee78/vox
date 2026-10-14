@@ -90,7 +90,10 @@ impl ChannelState {
         let previous = self.legacy_announced_through(profile.store())?;
         let mut readers = BTreeMap::new();
         for peer in self.consented() {
-            if peer == me || self.has_left(&peer) || !self.supports_private(&peer) {
+            if peer == me
+                || self.has_left(&peer)
+                || !self.supports_private(profile.store(), &peer)?
+            {
                 continue;
             }
             if let Some((generation, iteration)) = self.entitled.get(&peer) {
@@ -118,7 +121,15 @@ impl ChannelState {
             for seq in
                 through.saturating_add(1)..=verified.min(through.saturating_add(SCAN_PER_TURN))
             {
-                let Some(entry) = feed.get(seq) else { break };
+                let Some(entry) = feed.get(
+                    &self
+                        .entries
+                        .read(profile.store(), &self.sek, &self.channel_id)?,
+                    seq,
+                )?
+                else {
+                    break;
+                };
                 scanned = seq;
                 let hash = entry.entry_hash();
                 if self.step_bodies.contains(&hash) {
@@ -168,7 +179,7 @@ impl ChannelState {
             let posted = if let Some(plaintext) = plaintext {
                 let signer = profile.signer()?;
                 let payload = self.sender.encrypt(&plaintext)?.to_wire();
-                let skeleton = self.next_skeleton(&me, &payload, now_ms);
+                let skeleton = self.next_skeleton(profile.store(), &me, &payload, now_ms)?;
                 let entry = Entry::build_signed(signer, skeleton, payload)?;
                 let hash = entry.entry_hash();
                 let id = self.next_log_id;
@@ -185,14 +196,7 @@ impl ChannelState {
                     id,
                     &first_seen_bytes(now_ms, false),
                 )?;
-                self.dag
-                    .accept(
-                        entry,
-                        EntryKind::Content,
-                        &signer.public_key(),
-                        &self.admission,
-                    )
-                    .map_err(|_| Error::Profile("authored Session index failed acceptance"))?;
+                self.accept_into(&mut batch, entry, EntryKind::Content, &signer.public_key())?;
                 batch.put_segment(&self.channel_id, SegmentKind::LogDb, id, &log)?;
                 batch.put_segment(&self.channel_id, SegmentKind::Index, id, &seen)?;
                 batch.put_segment(
@@ -227,7 +231,7 @@ impl ChannelState {
             readers,
         });
         if let Some((hash, id)) = posted {
-            self.log_ids.insert(hash, id);
+            self.entries.committed();
             self.next_log_id = id.saturating_add(1);
             self.retention.track(
                 hash,
