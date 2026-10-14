@@ -181,7 +181,16 @@ private struct Sidebar: View {
                     RoomRow(room: room, selected: model.selection == .room(room.id), health: model.roomHealth(room.id))
                         .tag(NodeModel.Selection.room(room.id))
                         .sidebarRow(model.selection == .room(room.id))
-                        .copyMenu([("Copy Name", room.name)])
+                        .contextMenu {
+                            Button("Copy Room Link") {
+                                Task { await model.copyRoomLink(room: room.id) }
+                            }
+                            .keyboardShortcut("c", modifiers: .command)
+                            Button("Copy Name") {
+                                NSPasteboard.general.clearContents()
+                                NSPasteboard.general.setString(room.name, forType: .string)
+                            }
+                        }
                 }
             }
         }

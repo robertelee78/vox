@@ -235,8 +235,6 @@ final class NodeModel: ObservableObject {
     var roomDrafts: [String: RoomDraft] = [:]
     /// A Session's draft, by its destination (`room/node/session`).
     var sessionDrafts: [String: String] = [:]
-    /// What each room last showed (General, All, or a Session), restored when it opens again.
-    var lastShowing: [String: Showing] = [:]
 
     /// The request selected in the Session on screen, by its reference: what Approve (⌥⌘Y) and
     /// Reject (⌥⌘N) act on, and where ⌘J and a notification land (P1).
@@ -960,9 +958,8 @@ final class NodeModel: ObservableObject {
     /// its own is read (show reads it).
     func select(_ selection: Selection?) {
         guard selection != self.selection else { return }
-        // The room left keeps what it showed and the reply being written (D12).
+        // Preserve the room's reply draft when leaving it (D12).
         if case let .room(left) = self.selection {
-            lastShowing[left] = showing
             roomDrafts[left, default: RoomDraft()].reply = replyTo
         }
         self.selection = selection
@@ -1012,9 +1009,9 @@ final class NodeModel: ObservableObject {
         selectedMessages = []
         selectionAnchor = nil
         selectedService = nil
-        // What this room last showed, and its reply, come back (D12): General the first time.
+        // Every room opens at General (ADR-033 LY-4); its reply draft is retained.
         if case let .room(opened) = selection {
-            showing = lastShowing[opened] ?? .general
+            showing = .general
             replyTo = roomDrafts[opened]?.reply
         } else {
             showing = .general
@@ -1720,18 +1717,22 @@ final class NodeModel: ObservableObject {
         }
     }
 
-    /// Copy the room on screen's link (⌘L), saying what it carries.
-    func copyRoomLink() async {
+    /// Copy the requested room's link; menus pass the clicked row, commands use the selected room.
+    func copyRoomLink(room requested: String? = nil) async {
         let operation = "copy-link"
         let attempt = begin(operation)
         defer { end(attempt) }
-        guard let id = roomOnScreen else { return }
+        guard let id = requested ?? roomOnScreen, rooms.contains(where: { $0.id == id }) else { return }
+        let epoch = nodeObservationEpoch, actor = me
         do {
             let link = try await client.link(room: id)
+            guard !Task.isCancelled, nodeObservationEpoch == epoch, me == actor,
+                  rooms.contains(where: { $0.id == id }) else { return }
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(link.url, forType: .string)
             report(operation: operation, done: link.note.isEmpty ? "Room link copied." : "Room link copied. \(link.note)")
         } catch {
+            guard nodeObservationEpoch == epoch, me == actor else { return }
             report(error, operation: operation)
         }
     }
@@ -1980,6 +1981,50 @@ final class NodeModel: ObservableObject {
         } catch {
             reportBackground(error)
             return []
+        }
+    }
+
+    /// Bind an ending permission read to the same room and acting node throughout.
+    func canEndRoom(_ room: String) async throws -> Bool {
+        let epoch = nodeObservationEpoch, actor = me, generation = roomReadGeneration, editor = sheetInstance
+        guard roomOnScreen == room, sheet == .end, ended == nil else {
+            throw VoxError.Failed(reason: "The room to end is no longer selected.")
+        }
+        let admin = try await client.isAdmin(room: room, member: actor)
+        guard !Task.isCancelled, nodeObservationEpoch == epoch, me == actor,
+              roomReadGeneration == generation, roomOnScreen == room, sheet == .end, sheetInstance == editor, ended == nil else {
+            throw VoxError.Failed(reason: "The room or acting node changed while checking who may end it.")
+        }
+        return admin
+    }
+
+    /// A late ending reply must never clear a newer room or close a replacement sheet.
+    func endRoomFromSheet(_ room: String) async -> String? {
+        let epoch = nodeObservationEpoch, actor = me, generation = roomReadGeneration, editor = sheetInstance
+        let operation = "end-room", attempt = begin("end-room")
+        defer { end(attempt) }
+        func current() -> Bool {
+            !Task.isCancelled && nodeObservationEpoch == epoch && me == actor
+                && roomReadGeneration == generation && roomOnScreen == room
+                && sheet == .end && sheetInstance == editor && ended == nil
+        }
+        guard current() else { return nil }
+        do {
+            guard try await canEndRoom(room) else {
+                return "Only this room's creator or an admin can end it for everyone."
+            }
+            guard current() else { return nil }
+            try await client.end(room: room)
+            guard current() else { return nil }
+            report(operation: operation, done: "The room is ended for everyone.")
+            sheet = nil
+            select(nil)
+            await refresh()
+            return nil
+        } catch {
+            guard current() else { return nil }
+            report(error, operation: operation)
+            return sentence(error)
         }
     }
 

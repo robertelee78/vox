@@ -275,7 +275,7 @@ struct NodeSheets: View {
             case .admins: AdminsSheet(model: model)
             case .roomAnchors: RoomAnchorEditor(model: model)
             case .leave: LeaveSheet(model: model, ending: false)
-            case .end: LeaveSheet(model: model, ending: true)
+            case .end: EndRoomSheet(model: model)
             }
         }
         .panelSurface()
@@ -670,6 +670,58 @@ private struct AdminsSheet: View {
         .padding(Space.s24).frame(width: Theme.scaled(440))
         .onAppear { model.clearOutcome(of: "admins") }
         .task { await read(first: true) }
+    }
+}
+
+/// Ending a room has its own sheet and names why this actor cannot do it (LY-9).
+private struct EndRoomSheet: View {
+    @ObservedObject var model: NodeModel
+    @State private var authorizedRoom: String?
+    @State private var checking = true
+    @State private var working = false
+    @State private var reason: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Space.s12) {
+            Text("End this room for everyone?").title()
+            Text("Every member's copy of the room is deleted, and no one can post in it again.")
+            if checking {
+                Text("Checking whether you are this room's creator or an admin…")
+                    .accessibilityIdentifier("end-room-reason")
+            } else if let reason {
+                Text(reason).textSelection(.enabled)
+                    .accessibilityIdentifier("end-room-reason")
+            }
+            HStack {
+                Button("Cancel") { model.sheet = nil }.keyboardShortcut(.cancelAction)
+                Button("End for Everyone", role: .destructive) {
+                    guard let room = authorizedRoom, model.roomOnScreen == room else { return }
+                    working = true
+                    Task {
+                        defer { working = false }
+                        if let why = await model.endRoomFromSheet(room) {
+                            reason = why
+                            authorizedRoom = nil
+                        }
+                    }
+                }
+                .disabled(checking || working || authorizedRoom != model.roomOnScreen || authorizedRoom == nil)
+                .accessibilityIdentifier("end-room-confirm")
+            }
+        }
+        .padding(Space.s24)
+        .frame(width: Theme.scaled(440))
+        .task(id: model.roomOnScreen) {
+            checking = true
+            authorizedRoom = nil
+            reason = nil
+            defer { checking = false }
+            guard let room = model.roomOnScreen else { reason = "No room is selected."; return }
+            do {
+                if try await model.canEndRoom(room) { authorizedRoom = room }
+                else { reason = "Only this room's creator or an admin can end it for everyone." }
+            } catch { if !Task.isCancelled { reason = "Cannot check who may end this room. " + sentence(error) } }
+        }
     }
 }
 
