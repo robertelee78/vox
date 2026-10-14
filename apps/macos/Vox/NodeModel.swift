@@ -3087,10 +3087,9 @@ extension NodeModel {
 
     /// Current pending targets come from the node's index; ended Session history and
     /// resolution transcripts are never collected to discover them.
-    private func waiting(in room: String) async throws -> [(node: String, session: String, reference: String, label: String)] {
+    private func waiting(in room: String, visit: ((node: String, session: String, reference: String, label: String)) -> Void) async throws {
         let epoch = nodeObservationEpoch
         var after: String?
-        var found: [(node: String, session: String, reference: String, label: String)] = []
         repeat {
                 let page = try await client.sessionsPendingPage(room: room, after: after)
                 guard epoch == nodeObservationEpoch, !Task.isCancelled else { throw CancellationError() }
@@ -3104,7 +3103,7 @@ extension NodeModel {
                     guard epoch == nodeObservationEpoch, !Task.isCancelled else { throw CancellationError() }
                     if let request = held.entries.first(where: { $0.id == target.entry })?.request,
                        request.state == nil {
-                        found.append((target.node, target.sessionId, request.reference, session.label))
+                        visit((target.node, target.sessionId, request.reference, session.label))
                     }
                 }
                 if let next = page.next, next == after {
@@ -3112,7 +3111,6 @@ extension NodeModel {
                 }
                 after = page.next
         } while after != nil
-        return found
     }
 
     /// A request that is new since the last look notifies, once per Session, replacing that
@@ -3124,15 +3122,14 @@ extension NodeModel {
         var bySession: [String: (room: String, node: String, session: String, reference: String, label: String)] = [:]
         do {
         for room in rooms where room.open {
-            let targets = try await waiting(in: room.id)
-            guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
-            for w in targets {
+            try await waiting(in: room.id) { w in
                 let key = "\(room.id)/\(w.node)/\(w.session)/\(w.reference)"
                 now.insert(key)
                 if !knownWaiting.contains(key) && waitingSeen {
                     bySession["\(room.id)/\(w.node)/\(w.session)"] = (room.id, w.node, w.session, w.reference, w.label)
                 }
             }
+            guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
         }
         } catch {
             guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
