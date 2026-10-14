@@ -5692,9 +5692,11 @@ final class FirstRunProof: XCTestCase {
                     file: file, line: line)
             return false
         }
-        // One text read is the premise; the full listing is for a red's message only.
-        let text = ui.windows.firstMatch.staticTexts.firstMatch
-        guard ui.windows.firstMatch.waitForExistence(timeout: 5), text.exists, !shown(text).isEmpty else {
+        // Read actual words rather than assuming the first AX text is nonempty: a window
+        // with a content tab row may retain an empty native navigation-title text element.
+        let window = ui.windows.firstMatch
+        guard window.waitForExistence(timeout: 5),
+              window.staticTexts.allElementsBoundByIndex.contains(where: { !shown($0).isEmpty }) else {
             XCTFail("APPARATUS: XCTest reads no words in what Vox shows, so nothing in it can be checked",
                     file: file, line: line)
             return false
