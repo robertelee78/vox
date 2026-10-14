@@ -412,6 +412,8 @@ const T_KEY_WAITS_REQ: u64 = 5464;
 const T_KEY_WAITS: u64 = 5465;
 /// `[5462, channel_id]` — [`Request::PullStates`].
 const T_PULL_STATES_REQ: u64 = 5462;
+/// `[8730, channel_id, [entry, …]]` — states for at most 64 displayed offers.
+const T_PULL_STATES_FOR: u64 = 8730;
 /// `[5463, [[entry, kind, bytes, of, why], …]]` — [`Frame::PullStates`]; kind 0 pulling,
 /// 1 waiting, 2 failed.
 const T_PULL_STATES: u64 = 5463;
@@ -655,6 +657,13 @@ pub enum Request {
     PullStates {
         /// The room.
         channel_id: Digest32,
+    },
+    /// Where only the requested file offers stand, answered [`Frame::PullStates`].
+    PullStatesFor {
+        /// The room.
+        channel_id: Digest32,
+        /// At most 64 displayed announcement hashes.
+        entries: Vec<Digest32>,
     },
     /// This node's decision record, newest first (ADR-028 D-3), answered with
     /// [`Frame::Decisions`]: read by the node, which alone opens it (#563).
@@ -1240,6 +1249,18 @@ impl Request {
             }
             Request::PullStates { channel_id } => {
                 e.array(2).uint(T_PULL_STATES_REQ).bytes(channel_id);
+            }
+            Request::PullStatesFor {
+                channel_id,
+                entries,
+            } => {
+                e.array(3)
+                    .uint(T_PULL_STATES_FOR)
+                    .bytes(channel_id)
+                    .array(entries.len());
+                for entry in entries {
+                    e.bytes(entry);
+                }
             }
             Request::SessionShare {
                 channel_id,
@@ -1965,6 +1986,25 @@ impl Request {
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::PullStates { channel_id })
+            }
+            (T_PULL_STATES_FOR, 3) => {
+                let channel_id = digest(&mut d)?;
+                let count = d
+                    .array()
+                    .map_err(|_| Error::MalformedIpc("ipc pull entries array"))?;
+                if count > 64 {
+                    return Err(Error::MalformedIpc("ipc pull entries exceed 64"));
+                }
+                let mut entries = Vec::with_capacity(count);
+                for _ in 0..count {
+                    entries.push(digest(&mut d)?);
+                }
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::PullStatesFor {
+                    channel_id,
+                    entries,
+                })
             }
             (T_SESSIONS_REQ, 2) => {
                 let channel_id = digest(&mut d)?;
@@ -5597,8 +5637,13 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             },
             Err(reason) => Frame::Error { reason },
         },
-        Request::PullStates { channel_id } => Frame::PullStates {
-            states: handle.pulls().states(&channel_id).await,
+        Request::PullStates { channel_id } => match handle.pulls().states(&channel_id).await {
+            Ok(states) => Frame::PullStates { states },
+            Err(reason) => Frame::Error { reason },
+        },
+        Request::PullStatesFor { channel_id, entries } => match handle.pulls().states_for(&channel_id, &entries).await {
+            Ok(states) => Frame::PullStates { states },
+            Err(reason) => Frame::Error { reason },
         },
         // The previous release's whole read, while the whole fits one reply; never a whole
         // history past it (ADR-034 FR-4).

@@ -4096,13 +4096,10 @@ async fn collect_folder(
             d
         }
     };
-    let (target, prior) = if managed {
+    let target = if managed {
         vox_core::node::pulls::folder_dir(paths, &base, &channel_id, &offer.author, &offer.name)
     } else {
-        (
-            base.join(safe_file_name(&offer.name)),
-            std::collections::BTreeMap::new(),
-        )
+        base.join(safe_file_name(&offer.name))
     };
     if let Some(why) = vox_core::node::pulls::short_of_space(&base, offer.size) {
         return Err(AppError::Usage(format!(
@@ -4134,6 +4131,11 @@ async fn collect_folder(
     };
     let pulled = match &listed {
         Ok(list) => {
+            let prior = if managed {
+                vox_core::node::pulls::folder_prior(paths, &target, list)
+            } else {
+                std::collections::BTreeMap::new()
+            };
             // **A get cut short is resumed in the same place** (F-8): recorded before it starts,
             // in the node's files directory; one the person put elsewhere is theirs.
             pull.files = list

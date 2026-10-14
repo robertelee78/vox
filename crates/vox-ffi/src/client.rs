@@ -3987,11 +3987,57 @@ impl VoxClient {
         })
     }
 
+    /// Where the displayed offers stand, without reading older transfers. Read at most 64
+    /// announcement hashes per call; every requested state is returned whole or the call refuses.
+    ///
+    /// # Errors
+    /// No node attached, malformed ids, too many entries, or the node's refusal.
+    pub async fn pull_states_for(
+        &self,
+        room: String,
+        entries: Vec<String>,
+    ) -> Result<Vec<OfferPull>, VoxError> {
+        use vox_core::node::pulls::PullState as P;
+        if entries.len() > 64 {
+            return Err(failed("read at most 64 pull states at a time"));
+        }
+        let channel_id = digest(&room, "room id")?;
+        let entries = entries
+            .iter()
+            .map(|s| digest(s, "offer entry"))
+            .collect::<Result<Vec<_>, _>>()?;
+        on_held!(self, |c| {
+            match ask(
+                c,
+                &Request::PullStatesFor {
+                    channel_id,
+                    entries,
+                },
+            )
+            .await?
+            {
+                Frame::PullStates { states } => Ok(states
+                    .into_iter()
+                    .map(|(entry, state)| OfferPull {
+                        entry: b32_encode(&entry),
+                        state: match state {
+                            P::Pulling { bytes, of } => PullState::Pulling { bytes, of },
+                            P::Waiting { why } => PullState::Waiting { why },
+                            P::Failed { why } => PullState::Failed { why },
+                        },
+                    })
+                    .collect()),
+                other => Err(unexpected(&other)),
+            }
+        })
+    }
+
     /// What this node pulled by itself in `room` and verified, oldest first, each where `vox room
     /// get` puts it: `<data root>/nodes/<node>/files/<room>/`.
     ///
     /// # Errors
-    /// No node attached, or a malformed id.
+    /// No node attached, a malformed id, or more receipts than one reply holds; use
+    /// [`Self::pulled_for`] for the displayed entries in that case.
     pub async fn pulled(&self, room: String) -> Result<Vec<PulledFile>, VoxError> {
         let channel_id = digest(&room, "room id")?;
         let held = Arc::clone(&self.held);
@@ -4009,7 +4055,58 @@ impl VoxClient {
                 .node_paths(&node)
                 .map_err(|e| failed(format!("node {node}: {e}")))?;
             let mut pulled: Vec<PulledFile> = vox_core::node::pulls::recorded(&paths)
-                .into_iter()
+                .filter(|p| p.room == channel_id)
+                .take(65)
+                .map(|p| PulledFile {
+                    entry: b32_encode(&p.entry),
+                    path: p.path.to_string_lossy().into_owned(),
+                    created: p.created_ms / 1_000,
+                })
+                .collect();
+            if pulled.len() > 64 {
+                return Err(failed("this room has more saved copies than one reply holds; read the copies of the displayed entries"));
+            }
+            pulled.sort_by_key(|p| p.created);
+            Ok(pulled)
+        })
+        .await
+    }
+
+    /// The verified local copies of at most 64 displayed announcements. Folder manifests
+    /// remain on disk; only the entry, destination and date cross into the app.
+    ///
+    /// # Errors
+    /// No node attached, malformed ids, or too many entries.
+    pub async fn pulled_for(
+        &self,
+        room: String,
+        entries: Vec<String>,
+    ) -> Result<Vec<PulledFile>, VoxError> {
+        if entries.len() > 64 {
+            return Err(failed("read at most 64 saved copies at a time"));
+        }
+        let channel_id = digest(&room, "room id")?;
+        let entries = entries
+            .iter()
+            .map(|s| digest(s, "offer entry"))
+            .collect::<Result<Vec<_>, _>>()?;
+        let held = Arc::clone(&self.held);
+        let (data_root, config_dir) = (self.data_root.clone(), self.config_dir.clone());
+        self.on_rt(async move {
+            let node = held
+                .lock()
+                .await
+                .as_ref()
+                .map(|h| h.node.clone())
+                .ok_or_else(not_attached)?;
+            let account = Account::of(Some(&data_root), Some(&config_dir))
+                .map_err(|e| failed(format!("data root: {e}")))?;
+            let paths = account
+                .node_paths(&node)
+                .map_err(|e| failed(format!("node {node}: {e}")))?;
+            let mut pulled: Vec<PulledFile> = entries
+                .iter()
+                .filter_map(|entry| vox_core::node::pulls::recorded_entry(&paths, entry))
                 .filter(|p| p.room == channel_id)
                 .map(|p| PulledFile {
                     entry: b32_encode(&p.entry),
