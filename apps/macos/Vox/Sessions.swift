@@ -70,6 +70,10 @@ extension NodeModel {
     /// The Session on screen, if one is and the room still lists it.
     var shownSession: FfiSession? {
         guard case let .session(node, id) = showing else { return nil }
+        if let selectedSessionMetadata,
+           selectedSessionMetadata.nodeFingerprint == node, selectedSessionMetadata.sessionId == id {
+            return selectedSessionMetadata
+        }
         return sessions.first { $0.nodeFingerprint == node && $0.sessionId == id }
     }
 

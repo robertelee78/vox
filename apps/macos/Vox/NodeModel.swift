@@ -227,7 +227,11 @@ final class NodeModel: ObservableObject {
             // would centre it, not follow its newest line. openRequest chooses it after this.
             selectedRequest = nil
             selectionAnchor = nil
-            Task { await readSession() }
+            selectedSessionMetadata = nil
+            Task {
+                await readSelectedSessionMetadata()
+                await readSession()
+            }
         }
     }
     /// The Session on screen is being read: its timeline says "Loading…" (D3).
@@ -249,6 +253,7 @@ final class NodeModel: ObservableObject {
     private var waitingSeen = false
     /// The room on screen's Sessions, open and ended (ADR-029 CL-2).
     @Published private(set) var sessions: [FfiSession] = []
+    @Published private(set) var selectedSessionMetadata: FfiSession?
     /// The Session on screen's entries, oldest first, to a member with drive (SC-1): its newest
     /// page, and the older pages the person scrolled up to (ADR-034 FR-4); never its whole
     /// history.
@@ -665,7 +670,10 @@ final class NodeModel: ObservableObject {
                 await self.readFacts()
                 guard self.daemonReachable else { continue }
                 await self.readWaiting()
-                if self.showingSession { await self.readSession() }
+                if self.showingSession {
+                    await self.readSelectedSessionMetadata()
+                    await self.readSession()
+                }
                 else { await self.readNewOnScreen() }
             }
         }
@@ -2554,6 +2562,7 @@ final class NodeModel: ObservableObject {
         sessionPages.clear()
         sessionWindowRevision = UUID()
         selectedEarlierRequest = nil
+        selectedSessionMetadata = nil
         sessionNote = nil
         sessionLoading = false
         readBy = [:]
@@ -2630,6 +2639,32 @@ private final class Listener: ClientListener, @unchecked Sendable {
 
 // A room's Sessions (ADR-029): read when one is shown, and again when the node says it changed.
 extension NodeModel {
+    /// Exact selected metadata stays independent of the bounded tab/history pages.
+    func readSelectedSessionMetadata() async {
+        guard let room = roomOnScreen, case let .session(node, id) = showing else {
+            selectedSessionMetadata = nil
+            return
+        }
+        let epoch = nodeObservationEpoch, generation = roomReadGeneration
+        func current() -> Bool {
+            roomOnScreen == room && showing == .session(node: node, id: id)
+                && epoch == nodeObservationEpoch && generation == roomReadGeneration
+        }
+        do {
+            let found = try await client.session(room: room, node: node, sessionId: id)
+            guard current() else { return }
+            selectedSessionMetadata = found
+        } catch {
+            guard current() else { return }
+            selectedSessionMetadata = nil
+            sessionPages.clear()
+            sessionWindowRevision = UUID()
+            selectedEarlierRequest = nil
+            sessionNote = sentence(error)
+            reportBackground(error)
+        }
+    }
+
     /// The Session on screen's entries, to a member with drive; nothing to one without (SC-3).
     func readSession() async {
         guard let room = roomOnScreen, let s = shownSession, s.canDrive else {
