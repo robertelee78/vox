@@ -2791,12 +2791,13 @@ final class FirstRunProof: XCTestCase {
                                 "hook", work, vox, room], env: hookEnv, input: json)
             guard r.status == 0 else { throw Apparatus("`vox agent hook` exited \(r.status): \(r.out)") }
         }
+
         let asked = root.appendingPathComponent("asked")
         var pendingHookPid: String?
         defer { if let pendingHookPid { _ = stager.run(["/bin/kill", pendingHookPid], env: [:]) } }
         if selectedStep.isEmpty {
             for (session, words) in [(s1, "S1-WORDS"), (s2, "S2-WORDS")] {
-                try stager.write(Data(), to: work + "/\(session).jsonl")
+                try stager.write(Data(("{\"type\":\"custom-title\",\"customTitle\":\"" + words + "\"}\n").utf8), to: work + "/\(session).jsonl")
                 try hook(event(session, "UserPromptSubmit", ["prompt": words]))
             }
             // S1 asks an approval: its hook waits for the answer, in the background, its pid kept.
@@ -2840,6 +2841,17 @@ final class FirstRunProof: XCTestCase {
             // P1: the room's mark leads to its Session; the waiting request is selected by a click.
             // Next Room That Needs You and its shortcut were removed by the decider (#766).
             tap(ui, Key.id("room-work"), "work, marked as needing alice", premise: inRoom(vox, voxEnv, "work"))
+            guard present(ui, Key.id("room-tabs"), timeout: 20,
+                          "the principal top line must expose the room tabs") else { return }
+            words(ui, Key.id("session-\(s1.prefix(8))"), timeout: 20,
+                  "two Sessions of one node must label its first tab with alias and name",
+                  until: { $0.contains("claude-a · S1-WORDS") && $0.contains("waiting on you") })
+            words(ui, Key.id("session-\(s2.prefix(8))"), timeout: 20,
+                  "two Sessions of one node must label its second tab with alias and name",
+                  until: { $0 == "claude-a · S2-WORDS" })
+            for obsolete in ["room-header-name", "room-header-meta", "sessions", "session-all"] {
+                XCTAssertNil(locate(ui, Key.id(obsolete)), "PRODUCT: duplicate header, Sessions list and All must be absent: \(obsolete)")
+            }
             tap(ui, Key.id("session-\(s1.prefix(8))"), "S1 in work's Sessions")
             let requestRow = Key.idPrefix("request-row-")
             present(ui, requestRow, timeout: 30,
@@ -2885,6 +2897,7 @@ final class FirstRunProof: XCTestCase {
             }
             XCTAssertTrue(answered.contains("\"allow\""),
                           "PRODUCT: ⌥⌘Y must approve the selected request: S1's hook must get allow; it printed \(answered.debugDescription)")
+
 
             // D12: work's draft survives going to other and back.
             tap(ui, Key.id("session-general"), "General in work's Sessions")
@@ -2937,6 +2950,49 @@ final class FirstRunProof: XCTestCase {
                     "⌃C must ask before stopping the Session")
             ui.typeKey(.escape, modifierFlags: [])
             print("[proof] sessions: clicking S1's waiting request selected it and ⌥⌘Y approved it; work's draft kept; ⌘↩ in S1 sent nothing; S1's draft stayed in S1; S2 said \(said.debugDescription) and kept the prompt; ⌃C asked")
+
+            // Ended authorized Sessions remain reachable only through the top-row menu.
+            try staged(vox, ["node", "attach", "claude-a", "--passphrase-file", pass("claude-a")], env: voxEnv)
+            try hook(event(s2, "SessionEnd", ["reason": "prompt_input_exit"]))
+            let endedDeadline = Date().addingTimeInterval(20)
+            var endedPublic = ""
+            func endedS2(_ output: String) -> Bool {
+                output.split(separator: "\n").contains { line in
+                    guard let value = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any] else { return false }
+                    return value["id"] as? String == s2 && value["node"] as? String == agentFp
+                        && value["open"] as? Bool == false && value["can_drive"] as? Bool == true
+                }
+            }
+            repeat {
+                endedPublic = try staged(vox, ["room", "sessions", room, "--node", "alice", "--json"], env: voxEnv)
+                if endedS2(endedPublic) { break }
+                Thread.sleep(forTimeInterval: 0.25)
+            } while Date() < endedDeadline
+            guard endedS2(endedPublic) else {
+                throw Apparatus("the real hook did not publish the ended Session: \(endedPublic)")
+            }
+            tap(ui, Key.id("session-general"), "General in the top row")
+            guard present(ui, compose, timeout: 10, "General must restore the room composer") else { return }
+            tap(ui, Key.id("sessions-ended"), "Ended menu in the top row")
+            tap(ui, Key.menuItem("claude-a · S2-WORDS"), "S2 from the Ended menu")
+            guard words(ui, Key.id("timeline-title"), timeout: 20,
+                        "choosing an ended Session must switch the centre to its ended history",
+                        until: { $0.contains("S2-WORDS") && $0.contains("ended") }) != nil else { return }
+            XCTAssertNil(locate(ui, sessionCompose), "PRODUCT: an ended Session must not offer a drive composer")
+            let endedRead = try staged(vox, ["room", "session", room, s2, "--node", "alice", "--json"], env: voxEnv)
+            guard endedRead.contains("S2-WORDS") else { throw Apparatus("ended S2's retained body was not staged: \(endedRead)") }
+            let endedBody = ui.descendants(matching: .staticText).matching(NSPredicate(
+                format: "identifier BEGINSWITH %@ AND (label CONTAINS %@ OR CAST(value, 'NSString') CONTAINS %@)",
+                "entry-line-", "S2-WORDS", "S2-WORDS")).firstMatch
+            guard endedBody.waitForExistence(timeout: 20) else {
+                throw Product("the selected ended Session's retained S2-WORDS body must appear in the centre")
+            }
+            let endedTimeline = ui.scrollViews.matching(identifier: "timeline").firstMatch
+            guard endedTimeline.exists, [endedBody.frame, endedTimeline.frame, ui.windows.firstMatch.frame].allSatisfy({
+                $0.minX.isFinite && $0.minY.isFinite && $0.width.isFinite && $0.height.isFinite && $0.width > 0 && $0.height > 0
+            }), endedTimeline.frame.contains(endedBody.frame), ui.windows.firstMatch.frame.contains(endedBody.frame) else {
+                throw Apparatus("the ended Session body is not realized visibly inside its actual timeline")
+            }
 
         } else { print("NOT RUN: Sessions approval/composer/draft/stop flows; selected room-ask only") }
 
@@ -3228,9 +3284,14 @@ final class FirstRunProof: XCTestCase {
         guard present(ui, Key.id("to-remote-owner-\(privateSession.prefix(8))"), timeout: 15,
                       "the Drive member must be offered the owner's Session in To") else { return }
         ui.typeKey(.escape, modifierFlags: [])
+        tap(ui, privateRow, "Select the authorized owner tab before revocation")
         try staged(vox, ["trust", "read", "--node", "remote-owner", agentFp,
                          "--identity-passphrase-file", ownerPass], env: ownerEnv)
         missingWithin(ui, privateRow, 60, "downgrade to Read must remove the retained owner's Session row")
+        guard present(ui, Key.id("compose"), timeout: 15,
+                      "revoking the selected Session must fall back to General") else { return }
+        XCTAssertNil(locate(ui, Key.id("session-compose")),
+                     "PRODUCT: revoked selected Session must not retain its private composer")
         tap(ui, Key.id("compose-to"), "To options after revocation")
         XCTAssertNil(locate(ui, Key.id("to-remote-owner-\(privateSession.prefix(8))")),
                      "PRODUCT: revoked drive must remove the owner's Session To option")
@@ -3664,7 +3725,7 @@ final class FirstRunProof: XCTestCase {
         try local.pause()
         defer { try? local.resume() }
         // A suspended daemon answers only when its 60-second IPC deadline expires.
-        guard words(ui, Key.id("room-header-meta"), timeout: 90,
+        guard words(ui, Key.id("room-tab-members"), timeout: 90,
                     "an interrupted daemon must make the room's members unavailable, not authoritative",
                     until: { $0.contains("members unavailable") }) != nil else { return }
         guard timelineBody("RECOVERY-KEPT", timeout: 10,
@@ -3694,9 +3755,12 @@ final class FirstRunProof: XCTestCase {
             throw Apparatus("the remote three-member roster was not staged before Alice resumed: \(rosterSaid)")
         }
         try local.resume()
-        guard words(ui, Key.id("room-header-meta"), timeout: 45,
+        guard words(ui, Key.id("room-tab-members"), timeout: 45,
                     "the same room must recover the changed authoritative three-member roster without reopening",
-                    until: { $0.contains("3 members") && $0.contains("forever") }) != nil else { return }
+                    until: { $0.contains("3 members") }) != nil else { return }
+        guard words(ui, Key.id("timeline-title"), timeout: 10,
+                    "the recovered room must preserve its forever retention",
+                    until: { $0.contains("forever") }) != nil else { return }
         guard present(ui, Key.id("member-bob"), timeout: 10,
                       "the recovered room must retain its actual remote member") else { return }
         guard timelineBody("RECOVERY-KEPT", timeout: 10,
@@ -3716,9 +3780,12 @@ final class FirstRunProof: XCTestCase {
         guard retentionStatus == 0 && retentionSaid.contains("1 hour") else {
             throw Apparatus("the remote owner's changed retention did not reach Alice before checking the watcher: \(retentionSaid)")
         }
-        guard words(ui, Key.id("room-header-meta"), timeout: 15,
+        guard words(ui, Key.id("room-tab-members"), timeout: 15,
                     "the recovered room's live watcher must show Bob's later retention change without reopening",
-                    until: { $0.contains("3 members") && $0.contains("1 hour") }) != nil else { return }
+                    until: { $0.contains("3 members") }) != nil else { return }
+        guard words(ui, Key.id("timeline-title"), timeout: 15,
+                    "the room watcher must refresh retention to one hour",
+                    until: { $0.contains("1 hour") }) != nil else { return }
         print("[proof] transport: unavailable retained timeline; same room recovered roster; later remote retention reached header")
     }
 
@@ -4838,11 +4905,11 @@ final class FirstRunProof: XCTestCase {
         tap(ui, Key.id("room-mission"), "mission in the sidebar", premise: inRoom(vox, voxEnv, "mission"))
         // A room opens at what it last showed (D12), here bob's Session from 4f: General first.
         tap(ui, Key.id("session-general"), "General in mission's Sessions")
-        words(ui, Key.id("room-header-name"), timeout: 10, "the room's header must name it: \"mission\"",
+        words(ui, Key.id("room-tab-name"), timeout: 10, "the room's header must name it: \"mission\"",
               until: { $0 == "mission" })
-        words(ui, Key.id("room-header-meta"), timeout: 10,
-              "the room's header must say what is shown and the room's retention: \"… · General · ⏱ …\"",
-              until: { $0.contains("General") && $0.contains("⏱") })
+        words(ui, Key.id("room-tab-members"), timeout: 10,
+              "the top tab row must show the room's member count",
+              until: { $0.contains("member") })
         let titled = Date().addingTimeInterval(10)
         while Date() < titled && !ui.windows.firstMatch.title.hasPrefix("mission") {
             Thread.sleep(forTimeInterval: 0.25)
@@ -5255,8 +5322,8 @@ final class FirstRunProof: XCTestCase {
         try staged(vox, ["room", "retention", "--node", "alice", room, String(365 * 86_400)], env: voxEnv)
         // The sheet opens at what the app knows of the room; set from the CLI a moment ago, it is
         // known once the header says it (else a red here would be the staging's race, not D14's).
-        words(ui, Key.id("room-header-meta"), timeout: 30,
-              "the room's header must show the retention just set, 365 days",
+        words(ui, Key.id("timeline-title"), timeout: 30,
+              "the timeline must show the retention just set, 365 days",
               until: { $0.contains("365 days") })
         ui.menuBars.menuBarItems["Room"].click()
         ui.menuBars.menuItems["Retention…"].click()
@@ -6115,9 +6182,11 @@ final class FirstRunProof: XCTestCase {
                     file: file, line: line)
             return false
         }
-        // One text read is the premise; the full listing is for a red's message only.
-        let text = ui.windows.firstMatch.staticTexts.firstMatch
-        guard ui.windows.firstMatch.waitForExistence(timeout: 5), text.exists, !shown(text).isEmpty else {
+        // Read actual words rather than assuming the first AX text is nonempty: a window
+        // with a content tab row may retain an empty native navigation-title text element.
+        let window = ui.windows.firstMatch
+        guard window.waitForExistence(timeout: 5),
+              window.staticTexts.allElementsBoundByIndex.contains(where: { !shown($0).isEmpty }) else {
             XCTFail("APPARATUS: XCTest reads no words in what Vox shows, so nothing in it can be checked",
                     file: file, line: line)
             return false
