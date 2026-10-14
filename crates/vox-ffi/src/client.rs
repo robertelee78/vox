@@ -351,6 +351,51 @@ pub struct RoomMessage {
     pub tags: Vec<String>,
     /// Exact raw selectors paired with the same safe labels as tags, in the same order.
     pub tag_selectors: Vec<FfiMessageTag>,
+    /// Source data.work, safely displayed as opaque plain text; never a tracker link.
+    pub work: String,
+}
+
+/// One daemon-folded current claim or outstanding addressed relationship (ADR-033 WD).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MemberWork {
+    /// Responsible member's complete fingerprint.
+    pub member: String,
+    /// Exact Session, empty for a node-wide address.
+    pub session: String,
+    /// Claim, handoff, ask, assign, or blocked.
+    pub kind: String,
+    /// Source room message, for identity only.
+    pub entry: String,
+    /// Authenticated source author.
+    pub author: String,
+    /// Source author's claimed Session.
+    pub from: String,
+    /// Resource, displayed as plain text.
+    pub resource: String,
+    /// Safe source tags, displayed as plain text.
+    pub tags: Vec<String>,
+    /// Opaque safe work reference, displayed as plain text.
+    pub work: String,
+    /// Safe source description or blocked reason.
+    pub text: String,
+}
+/// One bounded page; clients replace this page rather than accumulating history.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MemberWorkPage {
+    /// Reading node identity.
+    pub node: String,
+    /// Saved room incarnation.
+    pub instance: Vec<u8>,
+    /// Current display token; a changed token invalidates this page.
+    pub revision: String,
+    /// Earliest expiry or refresh deadline, milliseconds since Unix epoch.
+    pub refresh_at: u64,
+    /// Current claims and outstanding relationships, at most 64 and 96 KiB before safe display.
+    pub rows: Vec<MemberWork>,
+    /// Explicit next-page cursor. Absent means complete, including an empty complete board.
+    pub next: Option<String>,
+    /// A version mismatch refuses coordination; it does not hide what the room said.
+    pub coordination_refused: bool,
 }
 
 /// One author in a thread summary, named by this node's keyring.
@@ -2001,6 +2046,15 @@ fn rendered(row: &MessageRow, names: &HashMap<Digest32, String>, me: Option<&str
                 FfiMessageTag { key, label }
             })
             .collect(),
+        work: vox_agentcomms::envelope::Envelope::parse(&row.text)
+            .ok()
+            .and_then(|env| {
+                env.data
+                    .get(vox_agentcomms::envelope::WORK_KEY)
+                    .and_then(|v| v.as_str())
+                    .map(shown_name)
+            })
+            .unwrap_or_default(),
     }
 }
 
@@ -4124,6 +4178,77 @@ impl VoxClient {
                 page: GovernancePage::Admin { admin, .. },
             } => Ok(admin),
             other => Err(unexpected(&other)),
+        })
+    }
+
+    /// One bounded page of the daemon's canonical work board. No app fold or tracker lookup.
+    /// The held node, saved room and display revision are checked around the read.
+    ///
+    /// # Errors
+    /// A changed room, stale cursor, capacity refusal, or the daemon's read failure.
+    pub async fn member_work_page(
+        &self,
+        room: String,
+        after: Option<String>,
+    ) -> Result<MemberWorkPage, VoxError> {
+        use vox_core::node::work_board::{Cursor, Page, Query, Row, Section};
+        let channel_id = digest(&room, "room id")?;
+        let after = after
+            .map(|s| {
+                serde_json::from_str::<Cursor>(&s).map_err(|_| failed("Invalid work-board cursor."))
+            })
+            .transpose()?;
+        let query = serde_json::to_string(&Query {
+            section: Section::Work,
+            member: None,
+            after,
+        })
+        .map_err(|e| failed(e.to_string()))?;
+        on_held!(self, |c| {
+            let actor = c.me().ok_or_else(not_attached)?;
+            let fence = room_read_fence(c, channel_id).await?;
+            let page: Page = match ask(c, &Request::WorkBoard { channel_id, query }).await? {
+                Frame::WorkBoard { page } => serde_json::from_str(&page)
+                    .map_err(|_| failed("Invalid daemon work-board page."))?,
+                other => return Err(unexpected(&other)),
+            };
+            if room_read_fence(c, channel_id).await? != fence || c.me() != Some(actor) {
+                return Err(failed(
+                    "The room changed while reading its work board. Refresh and retry.",
+                ));
+            }
+            let mut rows = Vec::with_capacity(page.rows.len());
+            for row in page.rows {
+                let Row::Work(row) = row else {
+                    return Err(failed("Unexpected work-board row."));
+                };
+                rows.push(MemberWork {
+                    member: b32_encode(&row.member),
+                    session: shown_name(&row.session),
+                    kind: row.kind,
+                    entry: b32_encode(&row.entry),
+                    author: b32_encode(&row.author),
+                    from: shown_name(&row.from),
+                    resource: shown_name(&row.resource),
+                    tags: row.tags.iter().map(|s| shown_name(s)).collect(),
+                    work: shown_name(&row.work),
+                    text: vox_agentcomms::envelope::reveal_keeping(&row.body, |c| {
+                        c == '\n' || c == '\t'
+                    }),
+                });
+            }
+            Ok(MemberWorkPage {
+                node: b32_encode(&actor),
+                instance: fence.0.to_vec(),
+                revision: b32_encode(&fence.1),
+                refresh_at: page.cursor.valid_until,
+                rows,
+                next: page
+                    .next
+                    .map(|c| serde_json::to_string(&c).map_err(|e| failed(e.to_string())))
+                    .transpose()?,
+                coordination_refused: page.refused,
+            })
         })
     }
 

@@ -3886,157 +3886,215 @@ pub async fn board(
     json: bool,
     session: Option<&str>,
 ) -> Result<(), AppError> {
+    use vox_core::node::work_board::{Row, Section};
     let (mut client, cid, room_key) = open_room(paths, room).await?;
-    let snap = coord::snapshot(&mut client, cid).await?;
-    // The board's position is the whole room's: its row count and newest row, which the node
-    // counts rather than this reading every row (V210-120).
-    let (entries, last) = if json {
-        match client
-            .request(&vox_core::node::ipc::Request::Count {
-                channel_id: cid,
-                since: None,
-            })
-            .await
-            .map_err(|e| AppError::Usage(e.to_string()))?
-        {
-            vox_core::node::ipc::Frame::Count { n, last } => (n, last),
-            vox_core::node::ipc::Frame::Error { reason } => return Err(AppError::Usage(reason)),
-            other => return Err(crate::client::unexpected(&other)),
-        }
-    } else {
-        (0, None)
-    };
     let session = coord::session(session).unwrap_or_default();
+    let first = board_page(&mut client, cid, Section::Claims, None).await?;
     let me = Owner {
-        author: snap.me,
+        author: first.me,
         session: session.clone(),
     };
-
+    let anchor = first.cursor.clone();
+    let mut out = std::io::stdout().lock();
     if json {
-        let resources: Vec<serde_json::Value> = snap
-            .fold
-            .resources
-            .iter()
-            .map(|(r, s)| state_json(r, s, &me))
-            .collect();
-        let by_hash: std::collections::BTreeMap<[u8; 32], &Posted> =
-            snap.posted.iter().map(|p| (p.entry_hash, p)).collect();
-        let violations = snap
-            .fold
-            .outcomes
-            .iter()
-            .filter(|(_, o)| !matches!(o, Outcome::Applied | Outcome::Lost))
-            .map(|(h, o)| {
-                let p = by_hash.get(h);
-                serde_json::json!({
-                    "entry_hash": claim::b32(h),
-                    "author": p.map(|p| claim::b32(&p.author)),
-                    "session": p.map(|p| p.envelope.from.clone()),
-                    "type": p.map(|p| p.envelope.kind.clone()),
-                    "outcome": outcome_json(Some(o)),
-                })
-            });
-        let participants: Vec<serde_json::Value> = snap
-            .table
-            .participants
-            .iter()
-            .map(|p| {
-                serde_json::json!({
-                    "author": claim::b32(&p.author),
-                    "session": p.session,
-                    "stamp": p.stamp.token(),
-                    "version": p.stamp.carried(&snap.table.mine),
-                    "last_millis": p.last_millis,
-                    "entry_hash": claim::b32(&p.entry_hash),
-                })
-            })
-            .collect();
         let mut header = serde_json::json!({
-            "schema": "vox.room.board/1",
-            "room": room_key,
-            "me": { "author": claim::b32(&snap.me), "session": session },
-            "version": coord::VERSION,
-            "coordination": if snap.table.refused() { "refused" } else { "ok" },
-            "participants": participants,
-            "resources": resources,
-            "position": {
-                // A cursor, so never a message not received yet (V030-10): the node's
-                // `last` is the row that arrived last.
-                "entries": entries,
-                "last": last.map(|h| claim::b32(&h)),
-            },
-            "now_millis": snap.now_millis,
+            "schema": "vox.room.board/1", "room": room_key,
+            "me": {"author": claim::b32(&me.author), "session": session},
+            "version": first.version,
+            "coordination": if first.refused { "refused" } else { "ok" },
+            "position": {"entries": first.entries, "last": first.last.as_ref().map(claim::b32)},
+            "now_millis": first.cursor.now_millis,
         })
         .to_string();
-        // Each conflicted operation lists its whole group for every member. Keep that
-        // output schema, but stream one violation at a time rather than building a
-        // quadratic JSON value in memory before printing any of it.
         header.pop();
-        let mut out = std::io::stdout().lock();
-        write!(out, "{header},\"violations\":[")?;
-        for (index, violation) in violations.enumerate() {
-            if index != 0 {
-                write!(out, ",")?;
-            }
-            write!(out, "{violation}")?;
+        write!(out, "{header}")?;
+    }
+    let mut first_page = Some(first);
+    for (section, field) in [
+        (Section::Claims, "resources"),
+        (Section::Participants, "participants"),
+        (Section::Violations, "violations"),
+        (Section::Work, "work"),
+    ] {
+        if !json && section == Section::Violations {
+            continue;
         }
-        writeln!(out, "]}}")?;
-        return Ok(());
-    }
-
-    let mut out = std::io::stdout().lock();
-    if snap.table.refused() {
-        writeln!(out, "{}", coord::refusal(&room_key, &snap.table)).map_err(AppError::Io)?;
-    }
-    if snap.fold.resources.is_empty() {
-        writeln!(out, "nothing is claimed").map_err(AppError::Io)?;
-    }
-    for (resource, s) in &snap.fold.resources {
-        let line = match s {
-            State::Held {
-                owner,
-                expires_millis,
-                ..
-            } => {
-                let mine = if *owner == me { " (you)" } else { "" };
-                let expiry = match expires_millis {
-                    // Time remaining, not an absolute time: "in 240s" is actionable.
-                    Some(e) if *e > snap.now_millis => {
-                        format!(" expires in {}s", (e - snap.now_millis).div_ceil(1_000))
-                    }
-                    Some(_) => " expired".to_owned(),
-                    None => String::new(),
-                };
-                format!("{}\t{}{mine}{expiry}", name(resource), who(owner))
-            }
-            State::Pending {
-                from,
-                to_fp,
-                to_session,
-                deadline_millis,
-                ..
-            } => format!(
-                "{}\tpending handoff from {} to {}{}{} (lapses in {}s)",
-                name(resource),
-                who(from),
-                &crate::ident::name_of(to_fp),
-                to_session
-                    .as_ref()
-                    .map(|s| format!("/{}", session_name(s)))
-                    .unwrap_or_default(),
-                if s.is_eligible(&me) {
-                    " — you may claim or decline it"
-                } else {
-                    ""
-                },
-                deadline_millis
-                    .saturating_sub(snap.now_millis)
-                    .div_ceil(1_000)
-            ),
+        if json {
+            write!(out, ",\"{field}\":[")?;
+        }
+        let mut cursor = anchor.clone();
+        cursor.section = section;
+        let mut page = match first_page.take() {
+            Some(page) => page,
+            None => board_page(&mut client, cid, section, Some(cursor)).await?,
         };
-        writeln!(out, "{line}").map_err(AppError::Io)?;
+        let mut count = 0usize;
+        loop {
+            for row in page.rows {
+                match row {
+                    Row::Claim { resource, state } => {
+                        if json {
+                            if count != 0 {
+                                write!(out, ",")?;
+                            }
+                            write!(out, "{}", state_json(&resource, &state, &me))?;
+                        } else {
+                            let line = match &state {
+                                State::Held {
+                                    owner,
+                                    expires_millis,
+                                    ..
+                                } => {
+                                    let mine = if *owner == me { " (you)" } else { "" };
+                                    let expiry = expires_millis
+                                        .map(|e| {
+                                            format!(
+                                                " expires in {}s",
+                                                e.saturating_sub(anchor.now_millis).div_ceil(1_000)
+                                            )
+                                        })
+                                        .unwrap_or_default();
+                                    format!("{}\t{}{mine}{expiry}", name(&resource), who(owner))
+                                }
+                                State::Pending {
+                                    from,
+                                    to_fp,
+                                    to_session,
+                                    deadline_millis,
+                                    ..
+                                } => format!(
+                                    "{}\tpending handoff from {} to {}{}{} (lapses in {}s)",
+                                    name(&resource),
+                                    who(from),
+                                    crate::ident::name_of(to_fp),
+                                    to_session
+                                        .as_ref()
+                                        .map(|s| format!("/{}", session_name(s)))
+                                        .unwrap_or_default(),
+                                    if state.is_eligible(&me) {
+                                        " — you may claim or decline it"
+                                    } else {
+                                        ""
+                                    },
+                                    deadline_millis
+                                        .saturating_sub(anchor.now_millis)
+                                        .div_ceil(1_000)
+                                ),
+                            };
+                            writeln!(out, "{line}")?;
+                        }
+                        count += 1;
+                    }
+                    Row::Participant(p) => {
+                        if json {
+                            if count != 0 {
+                                write!(out, ",")?;
+                            }
+                            write!(
+                                out,
+                                "{}",
+                                serde_json::json!({"author": claim::b32(&p.author), "session": p.session,
+                                "stamp": p.stamp.token(), "version": p.stamp.carried(&page.version),
+                                "last_millis": p.last_millis, "entry_hash": claim::b32(&p.entry_hash)})
+                            )?;
+                        } else if p.stamp != vox_agentcomms::version::Stamp::Match {
+                            writeln!(out, "work coordination refused: worker {} session {} runs vox {}; required {}",
+                                crate::ident::name_of(&p.author), session_name(&p.session), p.stamp.describe(&page.version), page.version)?;
+                        }
+                        count += 1;
+                    }
+                    Row::Violation { first, text, .. } => {
+                        if json {
+                            if first {
+                                if count != 0 {
+                                    write!(out, ",")?;
+                                }
+                                count += 1;
+                            }
+                            write!(out, "{text}")?;
+                        }
+                    }
+                    Row::Work(work) => {
+                        if json {
+                            if count != 0 {
+                                write!(out, ",")?;
+                            }
+                            write!(
+                                out,
+                                "{}",
+                                serde_json::json!({"member": claim::b32(&work.member), "session": work.session,
+                                "type": work.kind, "entry_hash": claim::b32(&work.entry), "author": claim::b32(&work.author),
+                                "from": work.from, "resource": work.resource, "tags": work.tags, "work": work.work, "body": work.body})
+                            )?;
+                        } else if !["claim", "handoff"].contains(&work.kind.as_str()) {
+                            writeln!(
+                                out,
+                                "{}\t{}{}: {} {} {}",
+                                work.kind,
+                                crate::ident::name_of(&work.member),
+                                if work.session.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!("/{}", session_name(&work.session))
+                                },
+                                vox_agentcomms::envelope::shown(&work.body, 512),
+                                name(&work.work),
+                                work.tags
+                                    .iter()
+                                    .map(|t| name(t))
+                                    .collect::<Vec<_>>()
+                                    .join(" ")
+                            )?;
+                        }
+                        count += 1;
+                    }
+                }
+            }
+            let Some(next) = page.next else {
+                break;
+            };
+            page = board_page(&mut client, cid, section, Some(next)).await?;
+        }
+        if json {
+            write!(out, "]")?;
+        } else if section == Section::Claims && count == 0 {
+            writeln!(out, "nothing is claimed")?;
+        }
+    }
+    if json {
+        writeln!(out, "}}")?;
     }
     Ok(())
+}
+
+async fn board_page(
+    client: &mut vox_core::node::ipc::IpcClient,
+    room: vox_core::hash::Digest32,
+    section: vox_core::node::work_board::Section,
+    after: Option<vox_core::node::work_board::Cursor>,
+) -> Result<vox_core::node::work_board::Page, AppError> {
+    use vox_core::node::{
+        ipc::{Frame, Request},
+        work_board::Query,
+    };
+    let query = serde_json::to_string(&Query {
+        section,
+        member: None,
+        after,
+    })
+    .map_err(|e| AppError::Usage(e.to_string()))?;
+    match client
+        .request(&Request::WorkBoard {
+            channel_id: room,
+            query,
+        })
+        .await
+        .map_err(|e| AppError::Usage(e.to_string()))?
+    {
+        Frame::WorkBoard { page } => serde_json::from_str(&page)
+            .map_err(|e| AppError::Usage(format!("invalid daemon work board: {e}"))),
+        other => Err(crate::client::unexpected(&other)),
+    }
 }
 
 // ---------------------------------------------------------------------------

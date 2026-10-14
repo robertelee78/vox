@@ -1923,6 +1923,10 @@ private struct MessageRow: View {
             if let card = message.card {
                 LinkCardView(card: card)
             }
+            if !message.work.isEmpty {
+                Text(message.work).caption().secondaryText().textSelection(.enabled)
+                    .accessibilityIdentifier("message-work-" + message.id)
+            }
             if !message.tags.isEmpty {
                 // What it relates to, as its sender tagged it (#636): quiet, under it; each opens
                 // the room's thread of that tag.
@@ -2364,6 +2368,34 @@ private struct Inspector: View {
                         Text("\(model.node) (you)").fontWeight(.bold)
                             .accessibilityIdentifier("member-self")
                         role(model.me)
+                        work(model.me)
+                    }
+                    if let problem = model.memberWorkError {
+                        Text(problem).secondaryText().fixedSize(horizontal: false, vertical: true)
+                            .accessibilityIdentifier("member-work-unavailable")
+                    }
+                    if let page = model.memberWork {
+                        if page.coordinationRefused { Text("Work coordination refused: participating Vox versions differ.").secondaryText() }
+                        Text("Showing one page of room work. Refresh returns to the first page.").caption().secondaryText()
+                        HStack {
+                            Button("Refresh work") { Task { await model.loadMemberWork(room, force: true) } }
+                                .accessibilityIdentifier("member-work-refresh")
+                            if page.next != nil {
+                                Button("Next work page") { Task { await model.loadMemberWork(room, next: true) } }
+                                    .accessibilityIdentifier("member-work-next")
+                            }
+                        }.disabled(model.memberWorkLoading)
+                        if page.next != nil { Text("More room work is on the next page.").caption().secondaryText() }
+                        if page.rows.isEmpty { Text("No current claims or unanswered addressed work.").caption().secondaryText() }
+                        let listed = Set(model.members.map(\.id)).union([model.me])
+                        ForEach(Array(page.rows.enumerated()).filter { !listed.contains($0.element.member) }, id: \.offset) { _, row in
+                            VStack(alignment: .leading) {
+                                Text("Member " + row.member).caption().textSelection(.enabled)
+                                workRow(row)
+                            }
+                        }
+                    } else {
+                        Text(model.memberWorkLoading ? "Reading room work…" : "Room work unavailable").caption().secondaryText()
                     }
                     if let problem = model.memberRolesError {
                         Text(problem).secondaryText().fixedSize(horizontal: false, vertical: true)
@@ -2374,6 +2406,7 @@ private struct Inspector: View {
                             .nodeCard(model, member.id, name: member.name)
                             .accessibilityIdentifier("member-\(member.name)")
                         role(member.id)
+                        work(member.id)
                         Text(member.trust.sentence(member.name)).caption().secondaryText()
                             .fixedSize(horizontal: false, vertical: true)
                             .accessibilityIdentifier("member-trust-directions-" + member.id)
@@ -2420,12 +2453,40 @@ private struct Inspector: View {
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("inspector")
         .task(id: model.me + "/" + room + "/" + (model.ended ?? "")) {
+            var first = true
             while !Task.isCancelled, model.roomOnScreen == room, model.ended == nil {
+                await model.loadMemberWork(room, force: first)
+                first = false
                 await model.loadMemberRoles(room)
                 do { try await Task.sleep(for: .seconds(2)) }
                 catch { return }
             }
         }
+    }
+
+    @ViewBuilder private func work(_ fingerprint: String) -> some View {
+        if let page = model.memberWork {
+            ForEach(Array(page.rows.enumerated()).filter { $0.element.member == fingerprint }, id: \.offset) { _, row in
+                workRow(row)
+            }
+        }
+    }
+
+    private func workRow(_ row: MemberWork) -> some View {
+        VStack(alignment: .leading, spacing: Space.s4) {
+            Text("\(row.kind.capitalized)\(row.session.isEmpty ? "" : " · " + row.session)").fontWeight(.semibold)
+            if ["ask", "assign", "handoff"].contains(row.kind) {
+                Text("From \(model.nodeName(row.author))\(row.from.isEmpty ? "" : " · " + row.from)")
+                    .textSelection(.enabled)
+            }
+            if !row.resource.isEmpty { Text(row.resource).textSelection(.enabled) }
+            if !row.text.isEmpty { Text(row.text).fixedSize(horizontal: false, vertical: true) }
+            if !row.work.isEmpty { Text(row.work).textSelection(.enabled) }
+            ForEach(row.tags, id: \.self) { Text($0).textSelection(.enabled) }
+        }
+        .caption().padding(.leading, Space.s12)
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("member-work-" + row.entry + "-" + row.member)
     }
 
     @ViewBuilder private func role(_ fingerprint: String) -> some View {

@@ -40,7 +40,7 @@ pub const VOX_KEY: &str = "vox";
 pub const PARTICIPATION_HORIZON_MILLIS: u64 = 24 * 3600 * 1_000;
 
 /// What a message's version stamp says, relative to the reading worker's version.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Stamp {
     /// Exactly the reader's version.
     Match,
@@ -139,7 +139,7 @@ fn counts(env: &Envelope) -> bool {
 }
 
 /// One participating worker and what its latest message says.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Participant {
     /// The worker's harness fingerprint.
     pub author: [u8; 32],

@@ -425,6 +425,8 @@ const T_FOOTERS: u64 = 8742;
 const T_ROOM_VIEW_PAGE_REQ: u64 = 8743;
 const T_ROOM_VIEW_FIND: u64 = 8744;
 const T_POST_AT: u64 = 8745;
+const T_WORK_BOARD_REQ: u64 = 8746;
+const T_WORK_BOARD: u64 = 8747;
 const T_ROOM_PAGE_REQ: u64 = 5492;
 const T_ROOM_PAGE: u64 = 5493;
 
@@ -492,6 +494,13 @@ const T_OFFERS: u64 = 4952;
 /// is accident prevention on top of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
+    /// One stateless daemon-folded work-board page (ADR-033 WD).
+    WorkBoard {
+        /// Selected readable room.
+        channel_id: Digest32,
+        /// JSON encoding of work_board::Query, bounded by the ordinary IPC frame.
+        query: String,
+    },
     /// Recipient pages for an exact displayed selection on the saved room instance.
     Footers {
         /// Selected room.
@@ -1354,6 +1363,12 @@ impl Request {
             Request::Ping => {
                 e.array(1).uint(T_PING);
             }
+            Request::WorkBoard { channel_id, query } => {
+                e.array(3)
+                    .uint(T_WORK_BOARD_REQ)
+                    .bytes(channel_id)
+                    .text(query);
+            }
             Request::Structured {
                 channel_id,
                 types,
@@ -2203,6 +2218,13 @@ impl Request {
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Rooms { after })
             }
+            (T_WORK_BOARD_REQ, 3) => {
+                let channel_id = digest(&mut d)?;
+                let query = text(&mut d, "work board query")?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("work board trailing"))?;
+                Ok(Request::WorkBoard { channel_id, query })
+            }
             (T_STRUCTURED, 5) => {
                 let channel_id = digest(&mut d)?;
                 let n = d.array().map_err(|_| Error::MalformedIpc("ipc types"))?;
@@ -2925,6 +2947,11 @@ pub struct SharedService {
 /// how a `Lagged` report comes to be silently swallowed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
+    /// One daemon-owned work-board projection, never a client-side fold.
+    WorkBoard {
+        /// JSON encoding of work_board::Page, bounded to one displayed page.
+        page: String,
+    },
     /// Bounded exact message footers, with independent per-card recipient continuations.
     Footers {
         /// Saved-room instance used by the query.
@@ -3333,6 +3360,9 @@ impl Frame {
                         e.array(0);
                     }
                 }
+            }
+            Frame::WorkBoard { page } => {
+                e.array(2).uint(T_WORK_BOARD).text(page);
             }
             Frame::GovernancePage { page } => {
                 e.array(2).uint(T_ROOM_PAGE);
@@ -4217,6 +4247,10 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 return Err(Error::MalformedIpc("unread summary counts"));
             }
             return Ok(Frame::UnreadSummary { summary });
+        }
+        (T_WORK_BOARD, 2) => {
+            let page = text(d, "work board page")?;
+            return Ok(Frame::WorkBoard { page });
         }
         (T_FOOTERS, 3) => {
             let instance = d
@@ -6508,6 +6542,7 @@ async fn serve_requests(
                 | Frame::RoomPage { .. }
                 | Frame::ThreadPage { .. }
                 | Frame::GovernancePage { .. }
+                | Frame::WorkBoard { .. }
                 | Frame::Order { .. }
                 | Frame::Members { .. }
                 | Frame::KeyWaits { .. }
@@ -7097,6 +7132,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                     next,
                     revision,
                     conflict_at,
+                    ..
                 }) => Frame::OperationPage {
                     rows,
                     next,
@@ -8055,6 +8091,25 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 .map(|(_, member, why)| (*member, why.clone()))
                 .collect(),
         },
+        Request::WorkBoard { channel_id, query } => {
+            let query = match serde_json::from_str::<crate::node::work_board::Query>(&query) {
+                Ok(query) => query,
+                Err(_) => {
+                    return Frame::Error {
+                        reason: "invalid work board selection".into(),
+                    }
+                }
+            };
+            match crate::node::work_board::page(handle, channel_id, query).await {
+                Ok(page) => match serde_json::to_string(&page) {
+                    Ok(page) => Frame::WorkBoard { page },
+                    Err(error) => Frame::Error {
+                        reason: error.to_string(),
+                    },
+                },
+                Err(reason) => Frame::Error { reason },
+            }
+        }
         Request::Roster { channel_id } => {
             let view = handle.view();
             match view

@@ -107,7 +107,7 @@ impl Posted {
 }
 
 /// Who holds something: a harness key and one session under it.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct Owner {
     /// The harness identity's fingerprint — proven by the log's signature.
     pub author: [u8; 32],
@@ -267,7 +267,7 @@ pub fn parse_op(env: &Envelope) -> Result<ClaimOp, String> {
 }
 
 /// The state of one resource that is not free.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum State {
     /// Owned by one session.
     Held {

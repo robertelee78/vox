@@ -510,6 +510,10 @@ final class NodeModel: ObservableObject {
     @Published private(set) var memberRolesError: String?
     @Published private(set) var memberRolesLoading = false
     private var memberRolesRead = UUID()
+    @Published private(set) var memberWork: MemberWorkPage?
+    @Published private(set) var memberWorkError: String?
+    @Published private(set) var memberWorkLoading = false
+    private var memberWorkRead = UUID()
     @Published private(set) var trusted: [TrustedNode] = []
     /// Trust offers waiting on this node: newcomers, and nodes that trust it (ADR-028 K-15, K-17).
     @Published private(set) var offers: [OfferInfo] = []
@@ -810,7 +814,7 @@ final class NodeModel: ObservableObject {
 
     private static func roomPayloadBytes(_ row: RoomMessage) -> Int {
         var size = 512 + row.id.utf8.count + row.author.utf8.count + row.authorName.utf8.count
-            + row.kind.utf8.count + row.text.utf8.count + row.re.utf8.count + row.thread.utf8.count
+            + row.kind.utf8.count + row.text.utf8.count + row.re.utf8.count + row.thread.utf8.count + row.work.utf8.count
         for value in row.to + row.tags { size += value.utf8.count }
         for tag in row.tagSelectors { size += tag.key.utf8.count + tag.label.utf8.count }
         if let file = row.file {
@@ -2680,6 +2684,10 @@ final class NodeModel: ObservableObject {
     private var flushing: Task<Void, Never>?
 
     private func invalidateMemberRoles() {
+        memberWorkRead = UUID()
+        memberWork = nil
+        memberWorkError = nil
+        memberWorkLoading = false
         memberRolesRead = UUID()
         memberRoles = [:]
         memberRolesError = nil
@@ -2732,6 +2740,38 @@ final class NodeModel: ObservableObject {
             guard current() else { return }
             memberRoles = [:]
             memberRolesError = "Room roles unavailable: " + sentence(error)
+        }
+    }
+
+    /// The panel keeps one daemon-folded page. Reopening, a changed room revision or a
+    /// claim deadline recomputes it; navigation never accumulates previous board pages.
+    func loadMemberWork(_ room: String, next: Bool = false, force: Bool = false) async {
+        guard roomOnScreen == room, let instance = roomInstance, ended == nil,
+              !memberWorkLoading else { return }
+        let request = UUID(), generation = roomReadGeneration, epoch = nodeObservationEpoch
+        memberWorkRead = request
+        memberWorkLoading = true
+        defer { if memberWorkRead == request { memberWorkLoading = false } }
+        func current() -> Bool {
+            !Task.isCancelled && memberWorkRead == request && roomReadGeneration == generation
+                && nodeObservationEpoch == epoch && roomOnScreen == room && roomInstance == instance && ended == nil
+        }
+        do {
+            if !force && !next, let page = memberWork, memberWorkError == nil {
+                let revision = try await client.roomDisplayRevision(room: room)
+                guard current() else { return }
+                if revision == page.revision && Date().timeIntervalSince1970 * 1000 < Double(page.refreshAt) { return }
+            }
+            let after = next ? memberWork?.next : nil
+            if next && after == nil { return }
+            let page = try await client.memberWorkPage(room: room, after: after)
+            guard current(), page.node == me, page.instance == instance else { return }
+            memberWork = page
+            memberWorkError = nil
+        } catch {
+            guard current() else { return }
+            // Last known rows remain visibly stale until an authoritative replacement succeeds.
+            memberWorkError = "Room work unavailable; displayed work may be stale: " + sentence(error)
         }
     }
 
