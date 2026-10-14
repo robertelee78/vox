@@ -110,16 +110,15 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
   to        `:to alice` and `:urgent` show on the composer as "To: alice · urgent", and the
             message Bob then sends reaches Alice with `to` naming her and `urgent` (W-4, #513);
   sessions  Alice's hooks open two Sessions and end one. Bob sees neither without drive;
-            after Alice's terminal grant he sees the open/ended Sessions and their lifecycle,
-            and the open Session offers its composer (ADR-031 SA-1–SA-3).
-  session-order  Alice posts, then her hook opens a new Session, within one second: in Bob's All the
-            post reads first and "<label> opened" under it (#562: times in milliseconds);
+            after Alice's terminal grant the open Session has a horizontal tab, the ended one
+            is available through Ended, General has no lifecycle rows or All choice, and the
+            open Session offers its composer (ADR-033 LY-1–LY-4; ADR-031 SA-1–SA-3).
   drive     once Alice gives Bob drive (`vox trust drive`, at a terminal) and her open Session
             runs a turn through Claude Code's hook, Bob's `:session` shows each line his `vox room
             session` prints, not "Only members …"; `d` on the tool call's line shows its output
             (ADR-029 SC-1, CL-1, #553);
   approve   Alice's session asks to run a command through Claude Code's PermissionRequest hook:
-            Bob's TUI lists the room with "waiting 1" and the Session "· waiting on you"; `a` on
+            Bob's TUI lists the room with "waiting 1" and the Session tab marked "@!"; `a` on
             the request's line approves it, the waiting hook gives Claude Code "allow", and the line
             then reads "approved here" (ADR-029 DR-1.4, CL-2, #553);
   answer    Alice's session asks one question through the PermissionRequest hook: `:answer 1; 2`
@@ -539,18 +538,19 @@ try:
           f"{[r.strip() for r in timeline().splitlines() if r.strip()][-3:]!r}")
 
     stage("quote")
-    # All keeps ordinary one-level quote navigation. General now folds canonical thread replies
+    # A tag conversation includes matching replies. General folds canonical thread replies
     # under their root; its collapsed/expanded behavior is checked below (#754).
-    tui.key(":all\r", 0.5)
+    tui.key(":tag project:tui-quote\r", 0.5)
     def alice_posts(*args):
-        p = run("alice", "room", "post", room, "--json", "--session", "quote-proof", *args)
+        p = run("alice", "room", "post", room, "--json", "--session", "quote-proof",
+                "--project", "tui-quote", *args)
         if p.returncode != 0: product(f"alice's `vox room post {' '.join(args)}` failed: {p.stderr.strip()}")
         return json.loads(p.stdout.strip().splitlines()[-1])["entry_hash"]
     q_root = alice_posts("--to", fp["bob"], "q-root @bob what shall we build")
     q_mid = alice_posts("--re", q_root, "q-mid the lexer first")
     FILL = 50  # more lines than the pane holds, so q-mid is off screen under the reply
     for i in range(1, FILL + 1):
-        p = run("alice", "room", "post", room, f"f-{i:03d}")
+        p = run("alice", "room", "post", room, "--project", "tui-quote", f"f-{i:03d}")
         if p.returncode != 0: product(f"alice's `vox room post` of f-{i:03d} failed: {p.stderr.strip()}")
     if not tui.until(lambda: has(timeline(), f"f-{FILL:03d}"), 60, 1):
         product(f"bob's `vox tui` never drew f-{FILL:03d} within 60 s")
@@ -560,7 +560,7 @@ try:
         """Tab until `pane`'s title says it has the focus."""
         for _ in range(6):
             # The title may say more after the pane's name (the timeline's retention, #483).
-            if any(re.search(rf"\u250c{pane}[^\u2510]*\[focus\]", r) for r in tui.display()):
+            if any(re.search(rf"\u250c[^\u2510]*{pane}[^\u2510]*\[focus\]", r) for r in tui.display()):
                 return
             tui.key("\t", 0.3)
         product(f"Tab never gave bob's {pane} the focus; screen:\n" + tui.text())
@@ -720,7 +720,7 @@ try:
             said.append(f"{who} {glyph}name bold {name_cells[0].bold} fg {name_cells[0].fg!r} "
                         f"(want bold {strong}, {colour!r})")
         # The sidebar beside the room shows its live "● online", which the accent marks (L-3).
-        # The members pane is under the Sessions pane: its own top row holds its title.
+        # The members pane has its own title beside the timeline.
         box = members_box(t)
         off = stray(t, accent, live=("● online",), cols=box[1:], top=box[0])
         said.append(f"accent cells off the focused border: {off[:6]!r}")
@@ -786,7 +786,7 @@ try:
           f"OSC 52 carried {copied!r}, want {SSH_COPY!r}; printed in the Shared pane: "
           f"{SSH_COPY in printed}; status line: {bar.strip()!r}")
     # Back round to the members pane, where the stages after this one expect focus: Shared,
-    # Sessions, Timeline, Composer, Members.
+    # Tabs, Timeline, Composer, Members.
     for _ in range(4):
         tui.key("\t", 0.5)
 
@@ -903,8 +903,7 @@ try:
                and "⏱ 1 week" in header(atui) and "⏱ 1 week" in header(tui), 60)
     after = (header(atui), header(tui))
     # A focused pane names itself once on its border: "Members [focus]", never "MembersMembers".
-    # The members pane sits under the Sessions pane (ADR-029 CL-2), so its title is on a row of
-    # its own: read there.
+    # Read the members pane's own title beside the timeline.
     def members_title(t):
         return [bare(r) for r in t.display() if "\u250cMembers" in r]
     once = all(h.count("Timeline") == 1 for h in after) \
@@ -1335,12 +1334,8 @@ try:
           f"said {refused!r}, To: left unset: {unset}")
 
     stage("sessions")
-    # A room's Sessions (ADR-029 CL-2, CL-3, #553): Alice's node, as Claude Code's hook runs it in a
-    # session a person is at, opens two Sessions in the room and ends one with a real `SessionEnd`.
-    # Bob's TUI lists the open one by the label `vox room sessions` gives it, the ended one apart
-    # under "Ended (1)"; All merges each Session's opening and end among the room's messages; a
-    # Before drive neither Session is visible (ADR-031 SA-1–SA-3); after drive both are listed
-    # and the open Session offers its composer.
+    # A room's live Session tabs and Ended menu (ADR-033 LY-1–LY-4). Before drive neither
+    # Session is visible; after drive the live one is a tab and history remains reachable.
     def hook(w, payload):
         e = env(w)
         e["CLAUDE_CODE_ENTRYPOINT"] = "cli"  # a session a person is at, not a headless run
@@ -1379,17 +1374,30 @@ try:
                 f"{cli_labels()!r}")
     labels = cli_labels()
     open_label, ended_label = labels[OPEN_ID]["label"], labels[ENDED_ID]["label"]
-    sessions_pane = lambda: [r.strip().strip("│").strip() for r in pane(tui.display(), "Sessions")]
-    listed = tui.until(lambda: any(r.endswith("● " + open_label) for r in sessions_pane())
-                       and "Ended (1)" in " ".join(sessions_pane()), 60, 1)
-    listed_rows = sessions_pane()
-    apart = not any(ended_label in r for r in listed_rows)
-    tui.key(":all\r", 2)
-    all_rows = pane(tui.display(), "Timeline")
-    all_text = " ".join(" ".join(r.split()) for r in all_rows)
-    merged = (f"{open_label} opened" in all_text and f"{ended_label} opened" in all_text
-              and f"{ended_label} ended" in all_text and "TO-ALICE-513" in all_text
-              and any("Timeline — All" in r for r in tui.display()))
+    def tabs():
+        screen = tui.display()
+        for at, line in enumerate(screen[:-1]):
+            start = line.find("┌")
+            if start >= 0 and " · Tabs" in line[start:]:
+                return screen[at + 1][start + 1:line.find("┐", start)].strip()
+        return ""
+    open_tab = ("alice · " + labels[OPEN_ID]["name"]
+                if labels[OPEN_ID].get("name") else open_label)
+    listed = tui.until(lambda: "General" in tabs() and open_tab in tabs() and "Ended…" in tabs(), 60, 1)
+    listed_rows = tabs()
+    no_vertical = not pane(tui.display(), "Sessions")
+    focus("Tabs")
+    tui.key("\x1b[C" * (1 + sum(x["open"] and x["can_drive"] for x in labels.values()))
+            + "\r", 0.5)  # General → live tabs → Ended menu.
+    history = tui.until(lambda: any(ended_label in row and "ended" in row
+                        for row in pane(tui.display(), "Ended")), 30, 0.5)
+    history_rows = pane(tui.display(), "Ended")
+    tui.key("\x1b", 0.5)
+    tui.key(":general\r", 1)
+    general_text = " ".join(pane(tui.display(), "Timeline"))
+    apart = all(mark not in general_text for mark in
+                [f"{open_label} opened", f"{ended_label} opened", f"{ended_label} ended"])
+    no_all = "All" not in tabs()
     tui.key(f":session {OPEN_ID[:8]}\r", 2)
     screen = tui.display()
     inside = " ".join(" ".join(r.split()) for r in pane(screen, "Timeline"))
@@ -1397,47 +1405,13 @@ try:
     # The Session's name and id are alice's node's claim, and the TUI says so (ADR-029 MD-3).
     claimed = any(f"{open_label} — name and id as alice says" in r for r in screen)
     composer = any("Composer" in row for row in screen)
-    claim("sessions", private and listed and apart and merged and titled and claimed and composer,
-          f"Sessions hidden before drive: {private}; after drive, Sessions pane: {listed_rows!r} "
-          f"(open listed: {listed}, ended apart: {apart}); All merged openings/end: {merged}; "
+    claim("sessions", private and listed and no_vertical and history and apart and no_all
+          and titled and claimed and composer,
+          f"Sessions hidden before drive: {private}; live tabs: {listed_rows!r}; "
+          f"no vertical Sessions pane: {no_vertical}; Ended menu: {history_rows!r}; "
+          f"General excludes lifecycle: {apart}; no All: {no_all}; "
           f"selected Session titled: {titled}, source named: {claimed}, composer offered: {composer}")
     tui.key(":general\r", 2)
-
-    stage("session-order")
-    # A Session that opens just after a post, within the same second, reads after it in All (#562,
-    # the lead's ruling: times stay in milliseconds; a Session's opened line has no message to
-    # follow, so it is placed by its time). Alice posts, then her node's hook opens a new Session;
-    # the two are staged within one wall-clock second (else again with another session, then
-    # APPARATUS). In Bob's All the post comes first, then "<label> opened".
-    order_staged = None
-    for attempt in range(3):
-        sid = f"0dde{attempt:04d}-aaaa-4bbb-8ccc-dddddddddddd"
-        t0 = time.time()
-        p = run("alice", "room", "post", room, f"SESSION-ORDER-{attempt}")
-        hook("alice", claude(sid, "UserPromptSubmit", prompt="order"))
-        t1 = time.time()
-        if p.returncode != 0:
-            product(f"alice's post failed: {p.stderr.strip()}")
-        if int(t0) == int(t1):
-            order_staged = (attempt, sid, t0, t1)
-            break
-    if order_staged is None:
-        apparatus("CANNOT MEASURE: a post and a Session's opening were never staged within one second")
-    attempt, sid, t0, t1 = order_staged
-    if not until(lambda: sid in cli_labels(), 60):
-        product(f"bob's `vox room sessions` never listed the Session {sid} within 60 s")
-    opened_mark = f"{cli_labels()[sid]['label']} opened".replace(" ", "")
-    post_mark = f"SESSION-ORDER-{attempt}"
-    tui.key(":all\r", 2)
-    all_text = lambda: "".join(bare(r) for r in pane(tui.display(), "Timeline")).replace(" ", "")
-    tui.until(lambda: post_mark in all_text() and opened_mark in all_text(), 60, 1)
-    text = all_text()
-    in_order = post_mark in text and opened_mark in text and text.find(post_mark) < text.find(opened_mark)
-    tail_rows = [bare(r) for r in pane(tui.display(), "Timeline")][-6:]
-    tui.key(":general\r", 2)
-    claim("session-order", in_order,
-          f"post at {t0:.3f}, the Session opened by {t1:.3f}; in bob's All the post "
-          f"{'precedes' if in_order else 'does not precede'} the opened line: {tail_rows!r}")
 
     stage("drive")
     # A Session read from inside (ADR-029 SC-1, CL-1, #553): Alice gave Bob drive at the terminal
@@ -1512,10 +1486,9 @@ try:
                                    "tool_name": "Bash", "tool_input": touch, "permission_suggestions": []}))
     asking.stdin.close()
     side_rows = lambda: [bare(r) for r in pane(tui.display(), "Rooms")]
-    flagged = tui.until(lambda: any(r.startswith(f"! {open_label} · waiting on you") or
-                                    f"! {open_label} · waiting on you" in r for r in sessions_pane())
-                        and any("waiting 1" in r for r in side_rows()), 60, 1)
-    flags = (sessions_pane(), side_rows())
+    flagged = tui.until(lambda: f"@! {open_tab}" in tabs()
+                        and any("@!" in r and "waiting 1" in r for r in side_rows()), 60, 1)
+    flags = (tabs(), side_rows())
     tui.key(f":session {OPEN_ID[:8]}\r", 2)
     focus("Timeline")
     tui.until(lambda: "approve or reject?" in flat(), 30, 1)
@@ -1543,7 +1516,7 @@ try:
     approved = tui.until(lambda: "Bash: touch e2 — approved here" in flat(), 60, 1)
     tui.key(":general\r", 2)
     claim("approve", flagged and (decision or {}).get("behavior") == "allow" and approved,
-          f"needs you: Sessions pane {flags[0]!r}, rooms {flags[1]!r} (flagged: {flagged}); `a` "
+          f"needs you: tabs {flags[0]!r}, rooms {flags[1]!r} (flagged: {flagged}); `a` "
           f"said {said_a!r}; the hook gave Claude Code {decision!r} (stdout {out!r}, stderr "
           f"{err.strip()[:200]!r}); the line then read \"approved here\": {approved}")
 

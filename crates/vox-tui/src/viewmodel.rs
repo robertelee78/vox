@@ -221,6 +221,8 @@ pub struct ChannelSummary {
     /// Unread messages addressed to this node (their `to` names it): the first level (ADR-028
     /// R-8, #484).
     pub to_you: usize,
+    /// Addressed unread messages marked urgent by their sender.
+    pub urgent: usize,
     /// Other unread messages: the second level.
     pub unread: usize,
     /// Unread coordination traffic (presence, progress, claims), counted only: the third level.
@@ -235,13 +237,11 @@ pub struct ChannelSummary {
     pub reachability: Reachability,
 }
 
-/// The bounded ordinary/All page currently published, independent of changing row contents.
+/// The bounded selected-domain page currently published, independent of changing row contents.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct RoomPagePosition {
     /// Exclusive ordinary display-order boundary.
     pub before: Option<Digest32>,
-    /// Exclusive lifecycle boundary for All, in the daemon's total order.
-    pub lifecycle: Option<vox_core::node::sessions::LifecycleCursor>,
 }
 
 /// The fully-rendered active-channel view.
@@ -286,12 +286,12 @@ pub struct ChannelView {
     pub sessions_first: bool,
     /// More metadata follows this displayed page.
     pub sessions_more: bool,
+    /// One requested history page, filtered to ended Sessions.
+    pub ended_sessions: Vec<SessionView>,
+    /// More metadata remains, even if this page has no ended Sessions.
+    pub ended_more: bool,
     /// Exact selected identity, independent of the displayed metadata page.
     pub selected_session: Option<SessionView>,
-    /// Session opening/end notices for the loaded All range.
-    pub session_lifecycle: Vec<NoticeView>,
-    /// More lifecycle notices remain in the current ordinary-page range.
-    pub lifecycle_older: bool,
     /// The lines of the Session on screen, for a member with drive (ADR-029 SC-1): one per
     /// activity, in the words `vox room session` prints. Empty while none is shown.
     pub session_lines: Vec<SessionLineView>,
@@ -640,14 +640,14 @@ pub enum Command {
         act: DriveAct,
     },
     /// The Session the room's timeline now shows, by its node and session id; `None` for General
-    /// or All (ADR-029 CL-2).
+    /// or an exact tag (ADR-033 LY-3).
     ShowSession {
         /// The room.
         channel_id: Digest32,
         /// The Session's node and the harness's session id.
         session: Option<(Digest32, String)>,
-        /// Include the bounded lifecycle page in All.
-        all: bool,
+        /// General or an exact tag; ignored while a Session is selected.
+        view: vox_core::node::api::RoomView,
     },
     /// Resolve an explicit typed Session name/id across bounded pages before showing it.
     FindSession {
@@ -660,6 +660,8 @@ pub enum Command {
     SessionsPage {
         /// The room.
         channel_id: Digest32,
+        /// Page the Ended menu instead of the live tabs.
+        ended: bool,
         /// Start at the first page instead of following the next cursor.
         first: bool,
     },
@@ -676,7 +678,7 @@ pub enum Command {
         /// The Session's node and the harness's session id.
         session: (Digest32, String),
     },
-    /// Return the ordinary/All timeline to its newest page.
+    /// Return the selected ordinary timeline to its newest page.
     LatestRoom {
         /// The room on screen.
         channel_id: Digest32,
