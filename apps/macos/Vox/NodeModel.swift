@@ -2579,7 +2579,7 @@ extension NodeModel {
                     }
                 }
             }
-            func current() -> Bool {
+            @MainActor func current() -> Bool {
                 !Task.isCancelled && self.roomOnScreen == room && self.openThread == root
                     && self.threadGeneration == generation && self.roomReadGeneration == roomGeneration
                     && self.nodeObservationEpoch == epoch && self.ended == nil
