@@ -395,6 +395,7 @@ fn detail_of(
         drive_from: ch.drive_from(store)?,
         session_files: ch.session_files(),
         session_records: ch.session_records(),
+        session_revision: ch.sessions_revision(store)?,
     })
 }
 
@@ -4190,6 +4191,18 @@ impl NodeHandle {
             }
         }
         view
+    }
+
+    /// Current Session token with actor lifetime and effective local policy. Reopening
+    /// a held connection to a replacement actor cannot alias its old cached token.
+    pub(crate) fn session_display_token(&self, detail: &ChannelDetail, current: bool) -> Digest32 {
+        crate::hash::sha256_concat(&[
+            b"vox/session-view/v1",
+            &self.display_incarnation,
+            &detail.channel_id,
+            &detail.session_revision,
+            &[u8::from(current)],
+        ])
     }
 
     /// An opaque cache token for one open room's published rows and display names (#754).
@@ -17869,18 +17882,6 @@ impl Node {
         };
         let now_ms = self.now_ms();
         let now_millis = (self.millis_clock)();
-        let has_session = {
-            let me = self.profile.as_ref().map(Profile::fingerprint);
-            let view = self.view_tx.borrow();
-            view.open_channels
-                .iter()
-                .find(|d| d.channel_id == *channel_id)
-                .is_some_and(|d| {
-                    crate::node::sessions::fold(d)
-                        .iter()
-                        .any(|s| s.open && Some(s.node) == me)
-                })
-        };
         let releases = {
             let Some(profile) = self.profile.as_ref() else {
                 return;
@@ -17900,6 +17901,21 @@ impl Node {
             {
                 return;
             }
+            use crate::node::channel::session_projection::{Query, Reply};
+            if ch.advance_sessions(profile.store()).is_err() {
+                return;
+            }
+            let has_session = match ch.session_query(
+                profile.store(),
+                Query::HasOpen {
+                    node: profile.fingerprint(),
+                },
+                1,
+            ) {
+                Ok(Reply::HasOpen(open)) => open,
+                // A rebuilding or failed projection does not assert absence or release keys.
+                _ => return,
+            };
             if has_session && ch.ensure_drive(profile.store(), holders, now_ms).is_err() {
                 return;
             }

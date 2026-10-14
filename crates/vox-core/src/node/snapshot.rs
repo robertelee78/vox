@@ -81,6 +81,8 @@ pub struct OpenRoomSnap {
     /// The room's Sessions, oldest opening first (ADR-029;
     /// [`crate::node::sessions::fold`]).
     pub sessions: Vec<crate::node::sessions::SessionRow>,
+    /// Opaque Session change token, including private activity and actor lifetime.
+    pub session_revision: Digest32,
 }
 
 /// One node as a client draws it.
@@ -153,6 +155,7 @@ impl NodeSnapshot {
                         step_retention: d.step_retention,
                         local_step_retention: d.local_step_retention,
                         sessions: crate::node::sessions::fold(d),
+                        session_revision: handle.session_display_token(d, policy_current),
                     })
                     .collect(),
                 trusted: nv.trusted.clone(),
@@ -191,7 +194,7 @@ impl NodeSnapshot {
         }
         e.array(self.open.len());
         for o in &self.open {
-            e.array(19)
+            e.array(20)
                 .bytes(&o.channel_id)
                 .text(o.name.as_deref().unwrap_or_default());
             digests(&mut e, &o.members);
@@ -246,7 +249,7 @@ impl NodeSnapshot {
             if let Some(seconds) = o.local_step_retention {
                 e.uint(seconds);
             }
-            e.uint(o.display_revision);
+            e.uint(o.display_revision).bytes(&o.session_revision);
         }
         e.array(self.trusted.len());
         for (fp, name) in &self.trusted {
@@ -320,7 +323,7 @@ impl NodeSnapshot {
         let mut open = Vec::new();
         for _ in 0..d.array().map_err(bad("ipc snapshot open rooms"))? {
             let fields = d.array().map_err(bad("ipc snapshot open room"))?;
-            if fields != 19 {
+            if fields != 20 {
                 return Err(Error::MalformedIpc("ipc snapshot open room"));
             }
             let channel_id = digest(&mut d)?;
@@ -414,9 +417,11 @@ impl NodeSnapshot {
                 _ => return Err(Error::MalformedIpc("ipc snapshot local step retention")),
             };
             let display_revision = d.uint().map_err(bad("ipc snapshot display revision"))?;
+            let session_revision = digest(&mut d)?;
             open.push(OpenRoomSnap {
                 channel_id,
                 display_revision,
+                session_revision,
                 name,
                 members,
                 consented,

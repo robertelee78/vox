@@ -39,9 +39,10 @@ pub(super) enum Tree {
     OpeningHash,
     Counts,
     AuthorOpenings,
+    OpenCounts,
 }
 
-const TREES: usize = 19;
+const TREES: usize = 20;
 
 impl Tree {
     fn index(self) -> usize {
@@ -65,6 +66,7 @@ impl Tree {
             Self::OpeningHash => 16,
             Self::Counts => 17,
             Self::AuthorOpenings => 18,
+            Self::OpenCounts => 19,
         }
     }
 }
@@ -82,6 +84,7 @@ pub(super) struct Header {
     pub public_after: Option<(u64, u64, Digest32)>,
     pub ready: bool,
     pub private_generation: u64,
+    pub activity_generation: u64,
     pub published: Option<(u64, u64)>,
     pub building: Option<Building>,
 }
@@ -121,6 +124,7 @@ impl Default for Header {
             public_after: None,
             ready: false,
             private_generation: 0,
+            activity_generation: 0,
             published: None,
             building: None,
         }
@@ -130,7 +134,7 @@ impl Default for Header {
 impl Header {
     fn bytes(&self) -> Zeroizing<Vec<u8>> {
         let mut e = Encoder::new();
-        e.array(10)
+        e.array(11)
             .uint(1)
             .uint(self.next)
             .uint(self.revision)
@@ -148,6 +152,7 @@ impl Header {
         }
         e.uint(u64::from(self.ready));
         e.uint(self.private_generation);
+        e.uint(self.activity_generation);
         e.array(usize::from(self.published.is_some()));
         if let Some((public, private)) = self.published {
             e.array(2).uint(public).uint(private);
@@ -170,7 +175,7 @@ impl Header {
 
     fn read(bytes: &[u8]) -> Result<Self> {
         let mut d = Decoder::new(bytes);
-        if d.array()? != 10 || d.uint()? != 1 {
+        if d.array()? != 11 || d.uint()? != 1 {
             return Err(invalid("Session index header version"));
         }
         let next = d.uint()?;
@@ -212,6 +217,7 @@ impl Header {
             _ => return Err(invalid("Session index ready state")),
         };
         let private_generation = d.uint()?;
+        let activity_generation = d.uint()?;
         let published = match d.array()? {
             0 => None,
             1 => {
@@ -277,6 +283,7 @@ impl Header {
             public_after,
             ready,
             private_generation,
+            activity_generation,
             published,
             building,
         })
@@ -527,6 +534,7 @@ impl<'a, 's> Write<'a, 's> {
             Tree::OpeningHash,
             Tree::Counts,
             Tree::AuthorOpenings,
+            Tree::OpenCounts,
         ] {
             std::mem::swap(
                 &mut self.header.roots[tree.index()],
@@ -564,6 +572,7 @@ impl<'a, 's> Write<'a, 's> {
             Tree::OpeningHash,
             Tree::Counts,
             Tree::AuthorOpenings,
+            Tree::OpenCounts,
         ];
         self.working = true;
         for _ in 0..limit {
@@ -590,6 +599,7 @@ impl<'a, 's> Write<'a, 's> {
                         | Tree::OpeningHash
                         | Tree::Counts
                         | Tree::AuthorOpenings
+                        | Tree::OpenCounts
                 ) {
                     self.delete_descriptor(id)?;
                 }

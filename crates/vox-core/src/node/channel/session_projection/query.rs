@@ -78,7 +78,11 @@ pub(crate) struct TextPage {
     pub next: Option<u64>,
 }
 
+#[derive(Clone)]
 pub(crate) enum Query {
+    HasOpen {
+        node: Digest32,
+    },
     Page {
         after: Option<Digest32>,
         revision: Option<Revision>,
@@ -91,6 +95,10 @@ pub(crate) enum Query {
         node: Digest32,
         id: String,
     },
+    Exact {
+        node: Digest32,
+        id: String,
+    },
     Text {
         opening: Digest32,
         field: FieldKind,
@@ -100,6 +108,7 @@ pub(crate) enum Query {
 }
 
 pub(crate) enum Reply {
+    HasOpen(bool),
     Page {
         rows: Vec<Row>,
         more: bool,
@@ -175,6 +184,7 @@ impl ChannelState {
         let snapshot = store.snapshot()?;
         let read = Read::existing(&snapshot, &self.sek, &self.channel_id)?;
         let private = read.as_ref().map_or(0, |r| r.header.private_generation);
+        let activity = read.as_ref().map_or(0, |r| r.header.activity_generation);
         let published = read
             .as_ref()
             .and_then(|r| r.header.published)
@@ -187,6 +197,8 @@ impl ChannelState {
         h.update(&view.history_instance());
         h.update(&view.session_revision().to_be_bytes());
         h.update(&private.to_be_bytes());
+        h.update(&activity.to_be_bytes());
+        h.update(&self.legacy_sessions.display_revision().to_be_bytes());
         h.update(&published.0.to_be_bytes());
         h.update(&published.1.to_be_bytes());
         for author in self.drive_from(store)? {
@@ -236,6 +248,14 @@ impl ChannelState {
                 Ok(())
             };
             match query {
+                Query::HasOpen { node } => {
+                    if !authors.contains(&node) {
+                        return Err(Failure::Request("this node cannot read that Session"));
+                    }
+                    Ok(Reply::HasOpen(
+                        read.find(Tree::OpenCounts, &hash_key(&node))?.unwrap_or(0) != 0,
+                    ))
+                }
                 Query::Page {
                     after,
                     revision: previous,
@@ -295,6 +315,23 @@ impl ChannelState {
                             .ok_or(Error::MalformedAtRest("Session count overflow"))?;
                     }
                     Ok(Reply::Count { count, revision })
+                }
+                Query::Exact { node, id } => {
+                    if !authors.contains(&node) {
+                        return Err(Failure::Request("this node cannot read that Session"));
+                    }
+                    let group =
+                        sha256_concat(&[b"vox/session-projection/id/v1", &node, id.as_bytes()]);
+                    let row = read
+                        .find(Tree::Groups, &hash_key(&group))?
+                        .map(|id| descriptor(&read, id))
+                        .transpose()?
+                        .map(Row::from);
+                    Ok(Reply::Page {
+                        rows: row.into_iter().collect(),
+                        more: false,
+                        revision,
+                    })
                 }
                 Query::Lookup { node, id } => {
                     if !authors.contains(&node) {

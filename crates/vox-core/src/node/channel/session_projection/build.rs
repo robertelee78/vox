@@ -354,6 +354,7 @@ fn fold(index: &mut Write<'_, '_>, event: Event) -> Result<()> {
         None
     };
     let old_opening = row.as_ref().map(|row| row.opening.position.hash);
+    let was_open = row.as_ref().is_some_and(|row| row.ended.is_none());
     let mut new = false;
     match (event.kind, row.as_mut()) {
         (1, Some(row)) if row.ended.is_none() => {
@@ -419,6 +420,18 @@ fn fold(index: &mut Write<'_, '_>, event: Event) -> Result<()> {
             .checked_add(1)
             .ok_or_else(|| invalid("Session opening count exhausted"))?;
         index.set(Tree::Counts, key, Some(count))?;
+    }
+    let is_open = row.ended.is_none();
+    if new || was_open != is_open {
+        let key = hash_key(&row.node);
+        let old = index.find(Tree::OpenCounts, &key)?.unwrap_or(0);
+        let count = if is_open {
+            old.checked_add(1)
+        } else {
+            old.checked_sub(1)
+        }
+        .ok_or_else(|| invalid("Session open count invalid"))?;
+        index.set(Tree::OpenCounts, key, Some(count))?;
     }
     index.set(
         Tree::OpeningHash,

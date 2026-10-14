@@ -514,6 +514,8 @@ pub struct ChannelDetail {
     pub session_files: Vec<crate::node::drive::SessionRow>,
     /// Drive-sealed lifecycle records, kept separate from public chat and activity steps.
     pub session_records: Vec<crate::node::drive::SessionRow>,
+    /// Opaque Session input/publication/drive token; no retained metadata strings.
+    pub session_revision: Digest32,
 }
 
 /// The node's latest-wins view (published over a `watch`).

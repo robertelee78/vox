@@ -391,6 +391,8 @@ const T_SESSION_PAGE: u64 = 5436;
 const T_SESSIONS_PAGE_REQ: u64 = 5437;
 /// `[5438, [session, …], [[entries, newest, waiting], …], more]` — [`Frame::SessionsPage`].
 const T_SESSIONS_PAGE: u64 = 5438;
+/// Exact Session metadata, using the existing bounded SessionsPage reply.
+const T_SESSION_LOOKUP: u64 = 8721;
 const T_ROOM_PAGE_REQ: u64 = 5492;
 const T_ROOM_PAGE: u64 = 5493;
 
@@ -640,6 +642,16 @@ pub enum Request {
         channel_id: Digest32,
         /// The opening entry of the last Session of the page before; `None` from the start.
         after: Option<Digest32>,
+    },
+    /// The latest opening of this exact node/session, at most one row, or a refusal.
+    /// Uses [`Frame::SessionsPage`]; `more` is always false.
+    SessionLookup {
+        /// The room.
+        channel_id: Digest32,
+        /// The authenticated Session author.
+        node: Digest32,
+        /// The complete harness Session id.
+        id: String,
     },
     /// Pull the file the message `entry` of a room offers, now, as `vox room get` does (ADR-028
     /// F-3; D5): whoever it is addressed to, verified before it is kept. Answered
@@ -1178,6 +1190,17 @@ impl Request {
             }
             Request::Sessions { channel_id } => {
                 e.array(2).uint(T_SESSIONS_REQ).bytes(channel_id);
+            }
+            Request::SessionLookup {
+                channel_id,
+                node,
+                id,
+            } => {
+                e.array(4)
+                    .uint(T_SESSION_LOOKUP)
+                    .bytes(channel_id)
+                    .bytes(node)
+                    .text(id);
             }
             Request::SessionsPage { channel_id, after } => {
                 e.array(3)
@@ -1917,6 +1940,25 @@ impl Request {
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::SessionEntries { channel_id })
+            }
+            (T_SESSION_LOOKUP, 4) => {
+                let channel_id = digest(&mut d)?;
+                let node = digest(&mut d)?;
+                let id = d
+                    .text()
+                    .map_err(|_| Error::MalformedIpc("ipc Session id"))?;
+                if !vox_agentcomms::envelope::is_valid_name(id, vox_agentcomms::envelope::MAX_NAME)
+                {
+                    return Err(Error::MalformedIpc("ipc Session id"));
+                }
+                let id = id.to_owned();
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::SessionLookup {
+                    channel_id,
+                    node,
+                    id,
+                })
             }
             (T_SESSIONS_PAGE_REQ, 3) => {
                 let channel_id = digest(&mut d)?;
@@ -4029,6 +4071,222 @@ async fn write_found(
     Ok(true)
 }
 
+/// Read an incomplete projection one bounded actor step at a time. This retains
+/// only one request and does not enqueue a waiter for every saved Session.
+async fn session_projection(
+    handle: &NodeHandle,
+    room: Digest32,
+    query: crate::node::channel::session_projection::Query,
+) -> std::result::Result<crate::node::channel::session_projection::Reply, String> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        match handle.session_projection(room, query.clone()).await {
+            Err(reason)
+                if reason == "the room is refreshing saved Sessions; retry"
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::task::yield_now().await
+            }
+            answer => return answer,
+        }
+    }
+}
+
+fn text_header(bytes: u64) -> Vec<u8> {
+    let mut e = Encoder::new();
+    e.uint(bytes);
+    let mut header = e.finish();
+    // The same canonical argument encoding is used by unsigned integers and text.
+    // Only the major type differs; no field-sized allocation occurs here.
+    header[0] |= 0x60;
+    header
+}
+
+/// Existing SessionsPage wire bytes, produced from at most one logical page of
+/// compact references. Arbitrarily large metadata is decoded a bounded chunk at
+/// a time, with current room/drive checks before every continuation.
+async fn write_sessions(
+    stream: &mut UnixStream,
+    handle: &NodeHandle,
+    room: Digest32,
+    after: Option<Digest32>,
+    whole: bool,
+    exact: Option<(Digest32, String)>,
+    writing: &std::sync::atomic::AtomicBool,
+) -> Result<bool> {
+    use crate::node::channel::session_projection::{FieldKind, Query, Reply};
+    let query = match exact {
+        Some((node, id)) => Query::Exact { node, id },
+        None => Query::Page {
+            after,
+            revision: None,
+            limit: SESSIONS_PAGE_ROWS,
+        },
+    };
+    let selected = tokio::select! {
+        result = session_projection(handle, room, query) => result,
+        () = subscriber_gone(stream) => return Ok(false),
+    };
+    let (rows, more, revision) = match selected {
+        Ok(Reply::Page {
+            rows,
+            more,
+            revision,
+        }) => (rows, more, revision),
+        Ok(_) => return Err(Error::MalformedIpc("unexpected Session selection answer")),
+        Err(reason) => {
+            found_frame(stream, &Frame::Error { reason }.to_bytes(), writing).await?;
+            return Ok(true);
+        }
+    };
+    // The old whole-list request cannot demand an unlimited retained collection.
+    // Current clients use SessionsPage; a partial whole list is never called complete.
+    if whole && more {
+        found_frame(
+            stream,
+            &Frame::Error {
+                reason: "this room's Sessions require SessionsPage".into(),
+            }
+            .to_bytes(),
+            writing,
+        )
+        .await?;
+        return Ok(true);
+    }
+    let mut prefix = Encoder::new();
+    prefix
+        .array(if whole { 2 } else { 4 })
+        .uint(if whole { T_SESSIONS } else { T_SESSIONS_PAGE })
+        .array(rows.len());
+    let mut offset = 0usize;
+    if rows.is_empty() && whole {
+        found_frame(stream, &prefix.finish(), writing).await?;
+        return Ok(true);
+    }
+    reply_part(stream, &prefix.finish(), &mut offset, true, writing).await?;
+    let mut summaries = Vec::with_capacity(rows.len());
+    for (at, row) in rows.iter().enumerate() {
+        let mut prefix = Encoder::new();
+        prefix.array(10).bytes(&row.node).text(&row.id);
+        reply_part(stream, &prefix.finish(), &mut offset, true, writing).await?;
+        for (which, field) in [
+            (FieldKind::Name, row.name),
+            (FieldKind::Harness, row.harness),
+        ] {
+            reply_part(
+                stream,
+                &text_header(field.map_or(0, |f| f.bytes)),
+                &mut offset,
+                true,
+                writing,
+            )
+            .await?;
+            if field.is_none_or(|f| f.bytes == 0) {
+                continue;
+            }
+            let mut after = None;
+            let mut sent = 0u64;
+            loop {
+                let answer = tokio::select! {
+                    result = handle.session_projection(room, Query::Text { opening: row.opening, field: which, after, revision: revision.clone() }) => result,
+                    () = subscriber_gone(stream) => return Ok(false),
+                };
+                let page = match answer {
+                    Ok(Reply::Text(page)) => page,
+                    Ok(_) => return Err(Error::MalformedIpc("unexpected Session field answer")),
+                    Err(reason) => {
+                        found_frame(stream, &Frame::Error { reason }.to_bytes(), writing).await?;
+                        return Ok(true);
+                    }
+                };
+                sent = sent
+                    .checked_add(page.bytes.len() as u64)
+                    .ok_or(Error::SizeLimitExceeded("Session metadata length"))?;
+                if sent > field.map_or(0, |f| f.bytes)
+                    || (page.next.is_some() && (page.bytes.is_empty() || page.next == after))
+                {
+                    return Err(Error::MalformedIpc("Session field did not advance"));
+                }
+                if !page.bytes.is_empty() {
+                    reply_part(stream, &page.bytes, &mut offset, true, writing).await?;
+                }
+                after = page.next;
+                if after.is_none() {
+                    break;
+                }
+            }
+            if sent != field.map_or(0, |f| f.bytes) {
+                return Err(Error::MalformedIpc("Session field length changed"));
+            }
+        }
+        let checked = tokio::select! {
+            result = handle.session_projection(room, Query::Count { revision: Some(revision.clone()) }) => result,
+            () = subscriber_gone(stream) => return Ok(false),
+        };
+        match checked {
+            Ok(Reply::Count { .. }) => {}
+            Ok(_) => return Err(Error::MalformedIpc("unexpected Session revision answer")),
+            Err(reason) => {
+                found_frame(stream, &Frame::Error { reason }.to_bytes(), writing).await?;
+                return Ok(true);
+            }
+        }
+        if !whole {
+            // The summary currently uses the activity index; no metadata string is
+            // needed for its identity, count or permission decision.
+            summaries.push(
+                session_summary(
+                    handle,
+                    room,
+                    &crate::node::sessions::SessionRow {
+                        node: row.node,
+                        id: row.id.clone(),
+                        name: None,
+                        harness: String::new(),
+                        open: row.open,
+                        opened_millis: row.opened_millis,
+                        ended_millis: row.ended_millis,
+                        opening: row.opening,
+                        ended: row.ended,
+                        can_drive: true,
+                    },
+                )
+                .await,
+            );
+        }
+        let mut suffix = Encoder::new();
+        suffix
+            .uint(u64::from(row.open))
+            .uint(row.opened_millis)
+            .uint(row.ended_millis.unwrap_or(0))
+            .bytes(&row.opening)
+            .bytes(row.ended.as_ref().map_or(&[][..], |hash| &hash[..]))
+            .uint(1);
+        reply_part(
+            stream,
+            &suffix.finish(),
+            &mut offset,
+            !whole || at + 1 < rows.len(),
+            writing,
+        )
+        .await?;
+    }
+    if !whole {
+        let mut suffix = Encoder::new();
+        suffix.array(summaries.len());
+        for summary in summaries {
+            suffix
+                .array(3)
+                .uint(summary.entries)
+                .bytes(summary.newest.as_ref().map_or(&[][..], |hash| &hash[..]))
+                .uint(u64::from(summary.waiting));
+        }
+        suffix.uint(u64::from(more));
+        reply_part(stream, &suffix.finish(), &mut offset, false, writing).await?;
+    }
+    Ok(true)
+}
+
 async fn reply_part(
     stream: &mut UnixStream,
     bytes: &[u8],
@@ -4530,6 +4788,31 @@ async fn serve_requests(
                 r = pump(stream, events) => r,
                 () = node_detached(&mut watch) => Ok(()),
             };
+        }
+        let sessions = match &request {
+            Request::Sessions { channel_id } => Some((*channel_id, None, true, None)),
+            Request::SessionsPage { channel_id, after } => Some((*channel_id, *after, false, None)),
+            Request::SessionLookup {
+                channel_id,
+                node,
+                id,
+            } => Some((*channel_id, None, false, Some((*node, id.clone())))),
+            _ => None,
+        };
+        if let Some((room, after, whole, exact)) = sessions {
+            let writing = std::sync::atomic::AtomicBool::new(false);
+            tokio::select! {
+                result = write_sessions(&mut stream, handle, room, after, whole, exact, &writing) => {
+                    if !result? { return Ok(()); }
+                },
+                () = node_detached(&mut watch) => {
+                    if !writing.load(std::sync::atomic::Ordering::Relaxed) {
+                        if let Some(body) = gone(&node) { let _ = write_frame(&mut stream, &body).await; }
+                    }
+                    return Ok(());
+                },
+            }
+            continue;
         }
         let found = match &request {
             Request::Find {
@@ -5063,41 +5346,6 @@ pub struct SessionSummary {
     pub newest: Option<Digest32>,
     /// The requests waiting in it that this node may answer: none without drive, or once it ended.
     pub waiting: u32,
-}
-
-/// One page of a room's Sessions (ADR-034 FR-1): oldest opening first, after the Session `after`
-/// opened, filling [`rows_budget`] bytes and carrying at least one while any remain; and whether
-/// more follow. A larger individual row is carried whole across transport pages.
-///
-/// The order is the room's log's, where a late arrival can land before the cursor: such a Session
-/// is in the next listing, not this one.
-fn sessions_page(
-    sessions: Vec<crate::node::sessions::SessionRow>,
-    after: Option<Digest32>,
-) -> std::result::Result<(Vec<crate::node::sessions::SessionRow>, bool), String> {
-    let mut rest = sessions.into_iter().peekable();
-    if let Some(after) = after {
-        if !rest.by_ref().any(|s| s.opening == after) {
-            return Err("cursor not among this room's Sessions".into());
-        }
-    }
-    // Its id, name and harness, and the rest of a row. Member-written fields have no length
-    // cap: a row larger than this budget goes alone, across as many transport pages as needed.
-    let cost = |s: &crate::node::sessions::SessionRow| {
-        s.id.len() + s.name.as_ref().map_or(0, String::len) + s.harness.len() + ROW_OVERHEAD
-    };
-    let mut page = Vec::new();
-    let mut bytes = 0usize;
-    while let Some(s) = rest.peek() {
-        if !page.is_empty() && (page.len() >= SESSIONS_PAGE_ROWS || bytes + cost(s) > rows_budget())
-        {
-            break;
-        }
-        bytes += cost(s);
-        page.extend(rest.next());
-    }
-    let more = rest.peek().is_some();
-    Ok((page, more))
 }
 
 // A page always carries at least one Session entry, so the largest must fit by itself.
@@ -5670,48 +5918,9 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 reason: other.to_string(),
             },
         },
-        Request::Sessions { channel_id } => {
-            if !handle
-                .view()
-                .open_channels
-                .iter()
-                .any(|d| d.channel_id == channel_id)
-            {
-                return Frame::Error {
-                    reason: "room not open".into(),
-                };
-            }
-            Frame::Sessions {
-                sessions: crate::node::sessions::of_room(handle, &channel_id),
-            }
-        }
-        Request::SessionsPage { channel_id, after } => {
-            if !handle
-                .view()
-                .open_channels
-                .iter()
-                .any(|d| d.channel_id == channel_id)
-            {
-                return Frame::Error {
-                    reason: "room not open".into(),
-                };
-            }
-            let all = crate::node::sessions::of_room(handle, &channel_id);
-            match sessions_page(all, after) {
-                Ok((sessions, more)) => {
-                    let mut summaries = Vec::with_capacity(sessions.len());
-                    for s in &sessions {
-                        summaries.push(session_summary(handle, channel_id, s).await);
-                    }
-                    Frame::SessionsPage {
-                        sessions,
-                        summaries,
-                        more,
-                    }
-                }
-                Err(reason) => Frame::Error { reason },
-            }
-        }
+        Request::Sessions { .. } | Request::SessionsPage { .. } | Request::SessionLookup { .. } => Frame::Error {
+            reason: "Sessions require a reply stream".into(),
+        },
         Request::Services { channel_id } => match handle.open_detail(channel_id).await {
             Some(detail) => Frame::Services {
                 room: crate::node::resolver::room_shown_here(
@@ -6841,6 +7050,42 @@ impl IpcClient {
                 channel_id,
                 which,
                 before,
+            })
+            .await?;
+        Ok(self.older_daemon(reply))
+    }
+
+    /// One bounded page of a room's Sessions. `after` is the last opening of the
+    /// previous page. Callers retain only the page they display or consume.
+    ///
+    /// # Errors
+    /// The node cannot be reached or answers with a malformed frame.
+    pub async fn sessions_page(
+        &mut self,
+        channel_id: Digest32,
+        after: Option<Digest32>,
+    ) -> Result<Frame> {
+        let reply = self
+            .request(&Request::SessionsPage { channel_id, after })
+            .await?;
+        Ok(self.older_daemon(reply))
+    }
+
+    /// Metadata and summary for one exact Session, using at most one logical row.
+    ///
+    /// # Errors
+    /// The node cannot be reached or answers with a malformed frame.
+    pub async fn session_lookup(
+        &mut self,
+        channel_id: Digest32,
+        node: Digest32,
+        id: String,
+    ) -> Result<Frame> {
+        let reply = self
+            .request(&Request::SessionLookup {
+                channel_id,
+                node,
+                id,
             })
             .await?;
         Ok(self.older_daemon(reply))

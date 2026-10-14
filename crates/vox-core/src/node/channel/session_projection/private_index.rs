@@ -71,6 +71,14 @@ pub(in crate::node::channel) fn put(
     saved: &Stored,
 ) -> Result<()> {
     let mut index = Write::open(batch, sek, room)?;
+    index.header.activity_generation =
+        index
+            .header
+            .activity_generation
+            .checked_add(1)
+            .ok_or(Error::MalformedAtRest(
+                "Session activity revision exhausted",
+            ))?;
     let hash = saved.record.hash();
     if id == 0 {
         return Err(Error::MalformedAtRest("private Session id is zero"));
@@ -124,6 +132,14 @@ pub(in crate::node::channel) fn remove(
     saved: &Stored,
 ) -> Result<()> {
     let mut index = Write::open(batch, sek, room)?;
+    index.header.activity_generation =
+        index
+            .header
+            .activity_generation
+            .checked_add(1)
+            .ok_or(Error::MalformedAtRest(
+                "Session activity revision exhausted",
+            ))?;
     index.set(Tree::PrivateHash, hash_key(&saved.record.hash()), None)?;
     index.set(Tree::PrivateArrival, arrival_key(id), None)?;
     index.set(Tree::Files, arrival_key(id), None)?;
