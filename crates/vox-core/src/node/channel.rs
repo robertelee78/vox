@@ -7969,7 +7969,7 @@ impl ChannelState {
         // Its `seen` names every head this node holds, so it sorts after all of them;
         // placed through the same path as any row all the same.
         // Persistence succeeded; a later ordering read failure reports storage health, not an unsent post.
-        self.place_rendered(profile.store(), rendered.clone())?;
+        let _ = self.place_rendered(profile.store(), rendered.clone());
         Ok(rendered)
     }
 

@@ -12,7 +12,7 @@ pub(crate) enum Query {
     LocateUnread,
     SessionCandidates {
         after: Option<(u64, u64, Digest32)>,
-        revision: Option<Revision>,
+        revision: Option<SessionRevision>,
         limit: usize,
     },
     Arrival {
@@ -65,7 +65,7 @@ pub(crate) enum Reply {
     SessionCandidates {
         rows: Vec<MessageRow>,
         next: Option<(u64, u64, Digest32)>,
-        revision: Revision,
+        revision: SessionRevision,
     },
     ThreadSummary {
         count: u64,
@@ -154,6 +154,25 @@ impl Revision {
     fn current(&self, ch: &ChannelState) -> bool {
         let now = Self::of(ch);
         Arc::ptr_eq(&self.incarnation, &now.incarnation) && self.facts == now.facts
+    }
+}
+
+/// Only a Session/name candidate insertion, removal or canonical move invalidates
+/// this fold. Unrelated chat must not keep a multi-page Session rebuild restarting.
+#[derive(Clone)]
+pub(crate) struct SessionRevision {
+    incarnation: Arc<std::sync::atomic::AtomicU64>,
+    root: u64,
+}
+impl SessionRevision {
+    fn of(ch: &ChannelState, rendered: &entry_store::RenderView<'_>) -> Self {
+        Self {
+            incarnation: ch.gen.clone(),
+            root: rendered.session_revision(),
+        }
+    }
+    fn current(&self, ch: &ChannelState, rendered: &entry_store::RenderView<'_>) -> bool {
+        Arc::ptr_eq(&self.incarnation, &ch.gen) && self.root == rendered.session_revision()
     }
 }
 
@@ -377,10 +396,14 @@ impl View<'_> {
                 revision,
                 limit,
             } => {
-                if revision.as_ref().is_some_and(|r| !r.current(self.ch)) {
+                if revision
+                    .as_ref()
+                    .is_some_and(|r| !r.current(self.ch, &self.rendered))
+                {
                     return Err(Failure::Request(CHANGED));
                 }
-                let revision = revision.unwrap_or_else(|| Revision::of(self.ch));
+                let revision =
+                    revision.unwrap_or_else(|| SessionRevision::of(self.ch, &self.rendered));
                 let mut cursor = after;
                 let mut rows = Vec::new();
                 let mut used = 0usize;

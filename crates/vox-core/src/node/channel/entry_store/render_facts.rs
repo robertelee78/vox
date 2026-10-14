@@ -821,6 +821,11 @@ impl RenderView<'_> {
         })
         .transpose()
     }
+    /// The immutable root changes only when the public Session/name input changes.
+    pub(crate) fn session_revision(&self) -> u64 {
+        self.roots().session_candidates
+    }
+
     /// One public Session/name candidate in stable created-time/canonical order.
     pub(crate) fn session_candidate(
         &self,
