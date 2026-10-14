@@ -107,6 +107,7 @@ nix = { version = "0.31", default-features = false, features = ["fs"] }
 
 # `tempfile` is a normal dependency above and is in scope for the integration proofs too.
 [dev-dependencies]
+async-trait.workspace = true
 # The large room's proof reads its Sessions through the app's client (`VoxClient`), as Vox.app does,
 # against the shipped `vox` this crate builds (ADR-034 PF-1).
 vox-ffi = { path = "../vox-ffi" }

@@ -226,6 +226,12 @@ fn value_text(v: &Value) -> String {
 fn outcome_words(resolved: &Body, names: &dyn Names) -> String {
     let outcome = resolved.str("outcome");
     let what = match outcome {
+        "unobserved" => {
+            return format!(
+                "not answerable from Vox: {}; answer at the terminal",
+                resolved.str("why")
+            )
+        }
         "allowed" => "approved".to_owned(),
         "denied" => "rejected".to_owned(),
         "answered" => resolved
@@ -252,16 +258,84 @@ fn outcome_words(resolved: &Body, names: &dyn Names) -> String {
 /// Where a request stands: `None` while it is open and may be answered from Vox.
 fn request_state(
     b: &Body,
-    resolved: &BTreeMap<String, usize>,
+    at: usize,
+    resolved: &BTreeMap<usize, usize>,
     bodies: &[Body],
     names: &dyn Names,
 ) -> Option<String> {
     if b.fields.get("answerable").and_then(Value::as_bool) == Some(false) {
         return Some(format!("not answerable from Vox: {}", b.str("why")));
     }
+    resolved.get(&at).map(|&i| outcome_words(&bodies[i], names))
+}
+
+type RequestKey<'a> = (Digest32, &'a str, &'a str, &'a str, &'a str);
+
+fn request_key(body: &Body) -> Option<RequestKey<'_>> {
+    let kind = match body.kind() {
+        "approval" | "question" => body.kind(),
+        "resolved" => body.str("of"),
+        _ => return None,
+    };
+    (matches!(kind, "approval" | "question") && !body.reference().is_empty()).then(|| {
+        (
+            body.author.author,
+            body.str("session"),
+            kind,
+            body.reference(),
+            body.str("occurrence"),
+        )
+    })
+}
+
+fn follows(bodies: &[Body], later: usize, earlier: usize) -> bool {
+    match (
+        bodies[later].fields.get("seq").and_then(Value::as_u64),
+        bodies[earlier].fields.get("seq").and_then(Value::as_u64),
+    ) {
+        (Some(later), Some(earlier)) if later != 0 && earlier != 0 => later > earlier,
+        _ => later > earlier,
+    }
+}
+
+/// Page companions can contain outcomes for origins outside this page. A producer's
+/// occurrence binds those outcomes without requiring the intervening transcript. Old
+/// unbound rows use the preceding request in this bounded page, never a later request.
+fn request_outcomes(bodies: &[Body]) -> BTreeMap<usize, usize> {
+    let mut exact = BTreeMap::new();
+    let mut legacy = BTreeMap::new();
+    let mut resolved = BTreeMap::new();
+    for (i, body) in bodies.iter().enumerate() {
+        let Some(key) = request_key(body) else {
+            continue;
+        };
+        if key.4.is_empty() {
+            if body.kind() == "resolved" {
+                if let Some(&request) = legacy.get(&key) {
+                    if follows(bodies, i, request) {
+                        resolved.insert(request, i);
+                    }
+                }
+            } else {
+                legacy.insert(key, i);
+            }
+        } else if body.kind() == "resolved"
+            && exact.get(&key).is_none_or(|&old| follows(bodies, i, old))
+        {
+            exact.insert(key, i);
+        }
+    }
+    for (i, body) in bodies.iter().enumerate() {
+        if !matches!(body.kind(), "approval" | "question") || body.str("occurrence").is_empty() {
+            continue;
+        }
+        if let Some(outcome) = request_key(body).and_then(|key| exact.get(&key)).copied() {
+            if follows(bodies, outcome, i) {
+                resolved.insert(i, outcome);
+            }
+        }
+    }
     resolved
-        .get(b.reference())
-        .map(|&i| outcome_words(&bodies[i], names))
 }
 
 /// One Session's lines, in order. `label` names the Session, as `vox_agentcomms::session_label`
@@ -272,7 +346,7 @@ pub fn lines(rows: &[SessionRow], label: &str, names: &dyn Names) -> Vec<Line> {
     let bodies = joined(rows);
     // What settles an earlier line: a tool call's result, a request's resolution.
     let mut done: BTreeMap<String, usize> = BTreeMap::new();
-    let mut resolved: BTreeMap<String, usize> = BTreeMap::new();
+    let resolved = request_outcomes(&bodies);
     // A drive's results, by the drive's tag (`of` on the result, `id` on the drive), in order.
     let mut results: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     let mut driven: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
@@ -287,9 +361,6 @@ pub fn lines(rows: &[SessionRow], label: &str, names: &dyn Names) -> Vec<Line> {
             "tool-done" => {
                 done.insert(b.reference().to_owned(), i);
             }
-            "resolved" => {
-                resolved.insert(b.reference().to_owned(), i);
-            }
             "drive" if !b.str("id").is_empty() => {
                 driven.insert(b.str("id").to_owned());
             }
@@ -300,7 +371,7 @@ pub fn lines(rows: &[SessionRow], label: &str, names: &dyn Names) -> Vec<Line> {
         }
     }
     let mut out = Vec::new();
-    for b in &bodies {
+    for (at, b) in bodies.iter().enumerate() {
         let seq = b.fields.get("seq").and_then(Value::as_u64).unwrap_or(0);
         let prefix = match b.str("agent") {
             "" => String::new(),
@@ -348,7 +419,7 @@ pub fn lines(rows: &[SessionRow], label: &str, names: &dyn Names) -> Vec<Line> {
             "approval" => {
                 details.push(("input".into(), b.str("input").to_owned()));
                 let head = format!("{}: {}", b.str("tool"), b.str("summary"));
-                let state = request_state(b, &resolved, &bodies, names);
+                let state = request_state(b, at, &resolved, &bodies, names);
                 request = Some(RequestLine {
                     reference: b.reference().to_owned(),
                     is_question: false,
@@ -410,7 +481,7 @@ pub fn lines(rows: &[SessionRow], label: &str, names: &dyn Names) -> Vec<Line> {
                     .collect::<Vec<_>>()
                     .join(" | ");
                 let head = format!("question: {head}");
-                let state = request_state(b, &resolved, &bodies, names);
+                let state = request_state(b, at, &resolved, &bodies, names);
                 request = Some(RequestLine {
                     reference: b.reference().to_owned(),
                     is_question: true,

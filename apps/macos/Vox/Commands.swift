@@ -275,7 +275,7 @@ struct NodeSheets: View {
             case .admins: AdminsSheet(model: model)
             case .roomAnchors: RoomAnchorEditor(model: model)
             case .leave: LeaveSheet(model: model, ending: false)
-            case .end: LeaveSheet(model: model, ending: true)
+            case .end: EndRoomSheet(model: model)
             }
         }
         .panelSurface()
@@ -612,64 +612,116 @@ private struct RenameSheet: View {
 /// The room's admins: its creator first, then those it made admins.
 private struct AdminsSheet: View {
     @ObservedObject var model: NodeModel
-    @State private var admins: [String] = []
-    /// The member about to be made an admin, asked first: an admin can end the room for everyone
-    /// (E-5). Taking adminship away goes through at once.
+    @State private var page: RoomAdmins?
     @State private var asking: NodeModel.MemberRow?
 
+    private func name(_ id: String) -> String {
+        model.members.first(where: { $0.id == id })?.name ?? String(id.prefix(12))
+    }
+    private func read(first: Bool) async {
+        let next = first ? nil : page?.next
+        let revision = first ? nil : page?.revision
+        if let read = await model.adminsPage(after: next, revision: revision) { page = read }
+    }
     var body: some View {
         VStack(alignment: .leading, spacing: Space.s12) {
             Text("Admins").title()
             Text("An admin may end the room and set its retention.").secondaryText()
-            ForEach(model.members) { member in
-                Toggle(isOn: Binding(get: { admins.contains(member.id) }, set: { on in
-                    if on {
-                        asking = member
-                        return
-                    }
-                    Task {
-                        await model.setAdmin(member.id, false)
-                        admins = await model.admins()
-                    }
-                })) {
-                    TrustMark(name: member.name, trust: member.trust)
-                }
-                .disabled(admins.first == member.id || asking != nil)
-                .accessibilityIdentifier("admin-\(member.name)")
-                .accessibilityLabel(admins.contains(member.id) ? "\(member.name), admin"
-                                                               : "\(member.name), not an admin")
-            }
-            if let member = asking {
-                VStack(alignment: .leading, spacing: 8) {
-                    StateMark(kind: .attention,
-                              words: "Make \(member.name) an admin? An admin can end this room for "
-                                  + "everyone and change its retention.")
-                        .accessibilityIdentifier("admin-confirm")
-                    HStack {
-                        Spacer()
-                        Button("Cancel") { asking = nil }
-                            .keyboardShortcut(.cancelAction)
-                            .accessibilityIdentifier("admin-confirm-cancel")
-                        Button("Make Admin") {
-                            asking = nil
-                            Task {
-                                await model.setAdmin(member.id, true)
-                                admins = await model.admins()
+            if let page {
+                Text("\(name(page.creator)) · creator").fontWeight(.bold)
+                ScrollView {
+                    VStack(alignment: .leading, spacing: Space.s8) {
+                        ForEach(page.members, id: \.self) { member in
+                            HStack {
+                                Text(name(member))
+                                Spacer()
+                                Button("Remove Admin") { Task { await model.setAdmin(member, false); await read(first: true) } }
+                                    .disabled(asking != nil)
+                                    .accessibilityIdentifier("admin-\(name(member))")
                             }
                         }
-                        .accessibilityIdentifier("admin-confirm-make")
                     }
+                }.frame(maxHeight: Theme.scaled(280))
+                HStack {
+                    Button("First Page") { Task { await read(first: true) } }
+                    if page.next != nil {
+                        Button("Next Admins") { Task { await read(first: false) } }
+                    }
+                }
+                Menu("Make a Member Admin") {
+                    ForEach(model.members.filter { $0.id != page.creator }) { member in
+                        Button(member.name) { asking = member }
+                    }
+                }.disabled(asking != nil)
+            } else { ProgressView("Reading admins…") }
+            if let member = asking {
+                StateMark(kind: .attention, words: "Make \(member.name) an admin? An admin can end this room for everyone and change its retention.")
+                    .accessibilityIdentifier("admin-confirm")
+                HStack {
+                    Button("Cancel") { asking = nil }.accessibilityIdentifier("admin-confirm-cancel")
+                    Button("Make Admin") { asking = nil; Task { await model.setAdmin(member.id, true); await read(first: true) } }
+                        .accessibilityIdentifier("admin-confirm-make")
                 }
             }
             OutcomeMark(outcome: model.failure(of: "admins"))
-            if asking == nil {
-                Button("Done") { model.sheet = nil }.keyboardShortcut(.defaultAction)
+            Button("Reload Admins") { Task { await read(first: true) } }
+            if asking == nil { Button("Done") { model.sheet = nil }.keyboardShortcut(.defaultAction) }
+        }
+        .padding(Space.s24).frame(width: Theme.scaled(440))
+        .onAppear { model.clearOutcome(of: "admins") }
+        .task { await read(first: true) }
+    }
+}
+
+/// Ending a room has its own sheet and names why this actor cannot do it (LY-9).
+private struct EndRoomSheet: View {
+    @ObservedObject var model: NodeModel
+    @State private var authorizedRoom: String?
+    @State private var checking = true
+    @State private var working = false
+    @State private var reason: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Space.s12) {
+            Text("End this room for everyone?").title()
+            Text("Every member's copy of the room is deleted, and no one can post in it again.")
+            if checking {
+                Text("Checking whether you are this room's creator or an admin…")
+                    .accessibilityIdentifier("end-room-reason")
+            } else if let reason {
+                Text(reason).textSelection(.enabled)
+                    .accessibilityIdentifier("end-room-reason")
+            }
+            HStack {
+                Button("Cancel") { model.sheet = nil }.keyboardShortcut(.cancelAction)
+                Button("End for Everyone", role: .destructive) {
+                    guard let room = authorizedRoom, model.roomOnScreen == room else { return }
+                    working = true
+                    Task {
+                        defer { working = false }
+                        if let why = await model.endRoomFromSheet(room) {
+                            reason = why
+                            authorizedRoom = nil
+                        }
+                    }
+                }
+                .disabled(checking || working || authorizedRoom != model.roomOnScreen || authorizedRoom == nil)
+                .accessibilityIdentifier("end-room-confirm")
             }
         }
         .padding(Space.s24)
         .frame(width: Theme.scaled(440))
-        .onAppear { model.clearOutcome(of: "admins") }
-        .task { admins = await model.admins() }
+        .task(id: model.roomOnScreen) {
+            checking = true
+            authorizedRoom = nil
+            reason = nil
+            defer { checking = false }
+            guard let room = model.roomOnScreen else { reason = "No room is selected."; return }
+            do {
+                if try await model.canEndRoom(room) { authorizedRoom = room }
+                else { reason = "Only this room's creator or an admin can end it for everyone." }
+            } catch { if !Task.isCancelled { reason = "Cannot check who may end this room. " + sentence(error) } }
+        }
     }
 }
 

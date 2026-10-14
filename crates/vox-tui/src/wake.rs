@@ -54,13 +54,13 @@
 //! A wake is a **notice**: how many urgent messages and replies wait, from whom, in which room,
 //! and never a byte of any of them (`agent_hook::render_wake`). The messages arrive once, in the
 //! drain of the turn the notice starts. The daemon counts what is owed just before it sends
-//! ([`unread`], [`tend`]), keeps at most one notice outstanding per session in its saved room,
+//! ([`crate::node_tasks`], [`tend`]), keeps at most one notice outstanding per session in its saved room,
 //! and announces an unread reply to an idle session on a schedule ([`Settings`]). What it owes
 //! each session is kept in [`Notices`], beside the registration, so a restart resumes it.
 
 use std::path::Path;
 
-use vox_agentcomms::envelope::{Envelope, DEFAULT_HOPS};
+use vox_agentcomms::envelope::Envelope;
 use vox_core::hash::Digest32;
 use vox_core::node::api::MessageRow;
 use vox_core::node::paths::Paths;
@@ -336,7 +336,7 @@ impl Session {
 
     /// Whether `other` is this same registration: the same session, room and endpoint. What the
     /// harness says about its turns does not make it another one.
-    fn same(&self, other: &Session) -> bool {
+    pub(crate) fn same(&self, other: &Session) -> bool {
         self.session == other.session
             && self.harness == other.harness
             && self.endpoint == other.endpoint
@@ -880,17 +880,6 @@ pub fn first_detached_notice(paths: &Paths, session: &str) -> bool {
     true
 }
 
-/// The hop budget `envelope` really has left, given the `rows` of its room (ADR-020 §9): see
-/// [`vox_agentcomms::envelope::hops_left_by`], the one rule.
-#[must_use]
-pub fn hops_left<'a, R>(envelope: &Envelope, rows: &'a R) -> u32
-where
-    R: ?Sized,
-    &'a R: IntoIterator<Item = &'a MessageRow>,
-{
-    vox_agentcomms::envelope::hops_left_by(envelope, |h| find(rows, h).map(|r| r.text.clone()))
-}
-
 /// The budget a reply to entry `re` starts with: its parent's less one, or the default when the
 /// room does not hold that entry.
 #[must_use]
@@ -979,34 +968,6 @@ pub fn open_wakes(
         }
     }
     open
-}
-
-/// Whether `session`, a session of this node (`me`), already spoke in the `re` chain
-/// `envelope` answers (V210-121): a parent, grandparent and so on, signed by `me` and
-/// naming `session` in `from`. Waking it again would answer it with its own conversation,
-/// which is how two agents keep each other awake; the message still queues for its next turn.
-#[must_use]
-pub fn in_chain<'a, R>(envelope: &Envelope, rows: &'a R, me: &Digest32, session: &str) -> bool
-where
-    R: ?Sized,
-    &'a R: IntoIterator<Item = &'a MessageRow>,
-{
-    let mut re = envelope.re.clone();
-    let mut depth: u32 = 0;
-    while let Some(parent) = re.as_deref().and_then(|h| find(rows, h)) {
-        depth += 1;
-        if depth > DEFAULT_HOPS {
-            break;
-        }
-        let Ok(p) = Envelope::parse(&parent.text) else {
-            break;
-        };
-        if parent.author == *me && p.from == session {
-            return true;
-        }
-        re = p.re;
-    }
-    false
 }
 
 fn find<'a, R>(rows: &'a R, re: &str) -> Option<&'a MessageRow>
@@ -1192,63 +1153,6 @@ pub fn is_reply(
             .as_deref()
             .and_then(|re| vox_core::node::link::b32_decode(re.trim(), "re").ok())
             .is_some_and(|h| asked.contains(&h))
-}
-
-/// What `session` has not been given yet in one room that it is owed a notice for: the urgent
-/// messages addressed to its node `me` that may still interrupt it (hops left, ADR-020 §9; not a
-/// reply chain it already spoke in, V210-121), and the replies to its posts (V030-20), each oldest
-/// first.
-///
-/// "Not given yet" is the drain's own rule: past the session's `cursor` by arrival (a cursor the
-/// room no longer holds starts from the first message, as the drain does), not the session's own,
-/// not a message not received yet, and not one its drain already showed ahead of the cursor.
-pub fn unread<'a>(
-    timeline: &'a vox_core::node::api::Timeline,
-    me: Option<vox_core::hash::Digest32>,
-    session: &Session,
-    cursor: Option<vox_core::hash::Digest32>,
-    ahead: &std::collections::BTreeSet<vox_core::hash::Digest32>,
-) -> (Vec<&'a MessageRow>, Vec<&'a MessageRow>) {
-    let mark = cursor.and_then(|c| {
-        timeline
-            .iter()
-            .rev()
-            .find(|r| r.entry_hash == c && !r.owed)
-            .map(|r| r.arrival)
-    });
-    let asked = asked(timeline.iter(), me, &session.session);
-    // `to` names nodes, by whole fingerprint (V210-161).
-    let me_fp = me.map(|m| vox_core::node::link::b32_encode(&m));
-    let mut rows: Vec<&MessageRow> = timeline
-        .iter()
-        .filter(|r| !r.owed && mark.is_none_or(|m| r.arrival > m))
-        .filter(|r| !ahead.contains(&r.entry_hash))
-        .collect();
-    rows.sort_by_key(|r| r.arrival);
-    let (mut urgent, mut replies) = (Vec::new(), Vec::new());
-    for r in rows {
-        let Ok(e) = Envelope::parse(&r.text) else {
-            continue;
-        };
-        if me == Some(r.author) && !e.from.is_empty() && e.from == session.session {
-            continue;
-        }
-        let for_me = me_fp
-            .as_deref()
-            .is_some_and(|fp| wakes(&e, fp, &session.session));
-        if for_me
-            && hops_left(&e, timeline) > 0
-            && !me.is_some_and(|m| in_chain(&e, timeline, &m, &session.session))
-        {
-            urgent.push(r);
-        } else if is_reply(&e, &asked) && hops_left(&e, timeline) > 0 {
-            // **A reply with no hops left is announced to nobody** (ADR-020 §9): two sessions
-            // answering each other's answers would otherwise wake each other for ever. It is
-            // still read at the next turn.
-            replies.push(r);
-        }
-    }
-    (urgent, replies)
 }
 
 /// The timings of a session's notices, from the profile's settings file (`vox daemon` reads it

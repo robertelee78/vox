@@ -270,6 +270,11 @@ pub const COORDINATION: &[&str] = &[
     vox_agentcomms::envelope::work::FAILED,
 ];
 
+// Agreement already has a finite coordination capacity. A client must enforce it while
+// paging, before building a fold, rather than collecting an unlimited history first.
+const COORD_ROWS: usize = vox_core::node::agreestream::MAX_LISTED;
+const COORD_BYTES: usize = 64 * 1024 * 1024;
+
 /// A room's structured posts of `types`, and those under any operation id in `ops` (exactly:
 /// rows matched by a colliding hash are dropped), oldest first.
 ///
@@ -282,39 +287,72 @@ pub async fn structured(
     ops: &[String],
 ) -> Result<Vec<MessageRow>, AppError> {
     let mut rows: Vec<MessageRow> = Vec::new();
+    let mut bytes = 0usize;
+    let mut seen = std::collections::HashSet::new();
+    if types.len() > vox_core::node::ipc::MAX_FIND || ops.len() > COORD_ROWS {
+        return Err(AppError::Usage(
+            "too many names for a bounded coordination read".into(),
+        ));
+    }
     // At most `MAX_FIND` names to a request, types and ids together.
     let room = vox_core::node::ipc::MAX_FIND
         .saturating_sub(types.len())
         .max(1);
-    let mut chunks: Vec<&[String]> = ops.chunks(room).collect();
-    if chunks.is_empty() || !types.is_empty() {
-        chunks.insert(0, &[]);
-    }
-    for (k, ids) in chunks.into_iter().enumerate() {
+    for (k, ids) in std::iter::once(&[][..]).chain(ops.chunks(room)).enumerate() {
         let t: &[&str] = if k == 0 { types } else { &[] };
         if t.is_empty() && ids.is_empty() {
             continue;
         }
-        match client
-            .read_structured(channel_id, t, ids)
-            .await
-            .map_err(|e| AppError::Usage(e.to_string()))?
-        {
-            Frame::Rows { rows: got } => rows.extend(got),
-            Frame::Error { reason } => return Err(AppError::Usage(reason)),
-            other => return Err(crate::client::unexpected(&other)),
+        let mut cursor = None;
+        loop {
+            let page = match ask(
+                client,
+                &Request::Structured {
+                    channel_id,
+                    types: t.iter().map(|t| (*t).to_owned()).collect(),
+                    ops: ids.to_vec(),
+                    since: cursor,
+                },
+            )
+            .await?
+            {
+                Frame::Rows { rows } => rows,
+                other => return Err(crate::client::unexpected(&other)),
+            };
+            let Some(last) = page.last().map(|row| row.entry_hash) else {
+                break;
+            };
+            if cursor == Some(last) {
+                return Err(AppError::Usage("coordination page did not advance".into()));
+            }
+            cursor = Some(last);
+            for row in page {
+                if seen.contains(&row.entry_hash) {
+                    continue;
+                }
+                let Ok(env) = Envelope::parse(&row.text) else {
+                    continue;
+                };
+                if !t.contains(&env.kind.as_str())
+                    && !ops::op_of(&env).is_some_and(|op| ids.iter().any(|id| id == op))
+                {
+                    continue;
+                }
+                let charge = row
+                    .text
+                    .capacity()
+                    .saturating_add(std::mem::size_of::<MessageRow>());
+                if rows.len() == COORD_ROWS || bytes.saturating_add(charge) > COORD_BYTES {
+                    return Err(AppError::Usage(format!(
+                        "coordination history exceeds this reader's capacity ({COORD_ROWS} posts / 64 MiB); no partial board or ownership verdict was produced. Saved messages remain available through paged room reads"
+                    )));
+                }
+                bytes += charge;
+                seen.insert(row.entry_hash);
+                rows.push(row);
+            }
         }
     }
-    let wanted: std::collections::BTreeSet<&str> = ops.iter().map(String::as_str).collect();
-    rows.retain(|r| {
-        let Ok(env) = Envelope::parse(&r.text) else {
-            return false;
-        };
-        types.contains(&env.kind.as_str()) || ops::op_of(&env).is_some_and(|o| wanted.contains(o))
-    });
-    // Each request answers oldest first; a row two of them matched is kept once, where it first came.
-    let mut seen = std::collections::HashSet::new();
-    rows.retain(|r| seen.insert(r.entry_hash));
     Ok(rows)
 }
 
@@ -516,7 +554,12 @@ pub async fn read_upto(
                     return Ok(Some(rows));
                 }
             }
-            Frame::Error { .. } if since.is_some() && rows.is_empty() && cursor == since => {
+            Frame::Error { reason }
+                if reason == "cursor not in this room's timeline"
+                    && since.is_some()
+                    && rows.is_empty()
+                    && cursor == since =>
+            {
                 return Ok(None)
             }
             Frame::Error { reason } => return Err(AppError::Usage(reason)),
@@ -554,6 +597,7 @@ pub async fn snapshot(client: &mut IpcClient, channel_id: Digest32) -> Result<Sn
         other => return Err(crate::client::unexpected(&other)),
     };
     let posted = posted_of(&rows);
+    drop(rows);
     let now = now_millis();
     let fold = claim::fold(&posted, VERSION, now);
     let table = version::version_table(&posted, me, &roster, VERSION, now, &fold);

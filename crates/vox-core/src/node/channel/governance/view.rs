@@ -1,0 +1,645 @@
+//! Bounded checked reads of published governance. Historical bodies remain in
+//! the source log; callers retain only their scalar view or one requested page.
+
+use super::authority::Grant;
+use super::facts::{hash_key, Read, Table};
+use super::fold::{self, kind_key};
+use crate::atrest::sek::Sek;
+use crate::cbor::Decoder;
+use crate::error::{Error, Result};
+use crate::governance::capability::Capability;
+use crate::governance::entry::{GovBody, GovEntry};
+use crate::governance::evaluator::{DenyReason, Lifecycle, Verdict};
+use crate::governance::genesis::{ChannelPolicy, Genesis};
+use crate::hash::Digest32;
+use crate::log::entry::Entry;
+use crate::nat::bootstrap::BootstrapSet;
+use crate::node::store::Store;
+
+pub(in crate::node::channel) const REFRESHING: &str =
+    "room governance is refreshing; try again when it is ready";
+pub(in crate::node::channel) const PAGE_ROWS: usize = 64;
+
+fn invalid(why: &'static str) -> Error {
+    Error::MalformedAtRest(why)
+}
+fn pair(left: &Digest32, right: &Digest32) -> [u8; 64] {
+    let mut key = hash_key(left);
+    key[32..].copy_from_slice(right);
+    key
+}
+
+/// No historical event list, no snapshot and no Store reference survives in the
+/// Channel's last-good display. Names and bootstrap addresses have wire bounds.
+#[derive(Clone, Debug)]
+pub(in crate::node::channel) struct Display {
+    pub name: Option<String>,
+    pub policy: ChannelPolicy,
+    pub step_ttl_ms: u64,
+    pub lifecycle: Lifecycle,
+    pub anchors: Option<BootstrapSet>,
+    pub revision: u64,
+    pub valid_until: u64,
+}
+impl Display {
+    pub(in crate::node::channel) fn genesis(genesis: &Genesis) -> Self {
+        Self {
+            name: None,
+            policy: genesis.body.policy,
+            step_ttl_ms: crate::governance::step_policy::DEFAULT_STEP_TTL_MS,
+            lifecycle: Lifecycle::default(),
+            anchors: None,
+            revision: 0,
+            valid_until: 0,
+        }
+    }
+}
+
+pub(in crate::node::channel) struct View<'a> {
+    facts: Read<'a>,
+    root: Digest32,
+}
+impl<'a> View<'a> {
+    pub(in crate::node::channel) fn revision(&self) -> u64 {
+        self.facts.revision()
+    }
+
+    pub(in crate::node::channel) fn open(
+        store: &Store,
+        sek: &'a Sek,
+        room: &'a Digest32,
+        root: Digest32,
+        now: u64,
+    ) -> Result<Self> {
+        let facts = Read::open(store, sek, room)?;
+        if !facts.ready(now)? {
+            return Err(Error::Profile(REFRESHING));
+        }
+        Ok(Self { facts, root })
+    }
+
+    /// Single-writer consent/presence/share facts do not depend on the admin
+    /// fold. Their source receipt barrier must still be complete.
+    pub(in crate::node::channel) fn current(
+        store: &Store,
+        sek: &'a Sek,
+        room: &'a Digest32,
+        root: Digest32,
+    ) -> Result<Self> {
+        let facts = Read::open(store, sek, room)?;
+        if !facts.current_ready()? {
+            return Err(Error::Profile(REFRESHING));
+        }
+        Ok(Self { facts, root })
+    }
+
+    pub(in crate::node::channel) fn current_in_batch(
+        batch: &'a crate::node::store::Batch<'a>,
+        sek: &'a Sek,
+        room: &'a Digest32,
+        root: Digest32,
+    ) -> Result<Self> {
+        let facts = Read::in_batch(batch, sek, room)?;
+        if !facts.current_ready()? {
+            return Err(Error::Profile(REFRESHING));
+        }
+        Ok(Self { facts, root })
+    }
+
+    pub(in crate::node::channel) fn admin_clock(&self) -> Option<u64> {
+        self.facts.admin_clock()
+    }
+
+    pub(in crate::node::channel) fn admins(
+        &self,
+        after: Option<Digest32>,
+        limit: usize,
+    ) -> Result<TargetPage> {
+        let mut cursor = after;
+        let mut rows = Vec::new();
+        for _ in 0..limit.clamp(1, PAGE_ROWS) {
+            let Some((key, _)) = self
+                .facts
+                .first(Table::ActiveAdmins, cursor.as_ref().map(hash_key))?
+            else {
+                return Ok(TargetPage { rows, next: None });
+            };
+            let target = key[..32]
+                .try_into()
+                .map_err(|_| invalid("governance admin cursor"))?;
+            cursor = Some(target);
+            if target == self.root || !self.is_admin(&target)? {
+                return Err(invalid("governance active admin binding"));
+            }
+            rows.push(target);
+        }
+        Ok(TargetPage { rows, next: cursor })
+    }
+
+    /// Preserve the existing remove-admin selection: every certificate naming
+    /// this target that no effective authorized revocation has removed. Return
+    /// at most one page, including progress through already revoked statements.
+    pub(in crate::node::channel) fn certificates(
+        &self,
+        target: &Digest32,
+        after: Option<Digest32>,
+        limit: usize,
+    ) -> Result<TargetPage> {
+        let mut cursor = after;
+        let mut rows = Vec::new();
+        for _ in 0..limit.clamp(1, PAGE_ROWS) {
+            let row = match cursor {
+                Some(hash) => self
+                    .facts
+                    .first(Table::AllCerts, Some(pair(target, &hash)))?,
+                None => self.facts.at_or_after(Table::AllCerts, hash_key(target))?,
+            }
+            .filter(|(key, _)| key[..32] == target[..]);
+            let Some((key, log)) = row else {
+                return Ok(TargetPage { rows, next: None });
+            };
+            let hash = key[32..]
+                .try_into()
+                .map_err(|_| invalid("governance certificate cursor"))?;
+            let entry = self.facts.entry(log)?;
+            let GovBody::AdminCert(cert) = GovEntry::body_bound_to(&entry)? else {
+                return Err(invalid("governance certificate kind"));
+            };
+            if cert.body.delegate_id() != *target || entry.entry_hash() != hash {
+                return Err(invalid("governance certificate binding"));
+            }
+            cursor = Some(hash);
+            if self.facts.get(Table::NamedRevoked, &hash_key(&hash))?
+                != Some(self.facts.authority_generation())
+            {
+                rows.push(hash);
+            }
+        }
+        Ok(TargetPage { rows, next: cursor })
+    }
+
+    pub(in crate::node::channel) fn share(
+        &self,
+        host: &Digest32,
+        name: &str,
+    ) -> Result<Option<super::super::Share>> {
+        let name_hash = crate::hash::sha256(name.as_bytes());
+        let Some(log) = self.facts.get(Table::Shares, &pair(host, &name_hash))? else {
+            return Ok(None);
+        };
+        let row = self.share_record(log, host, &name_hash)?;
+        if row.as_ref().is_some_and(|row| row.name != name) {
+            return Err(invalid("governance share name binding"));
+        }
+        Ok(row)
+    }
+
+    pub(in crate::node::channel) fn share_selector(
+        &self,
+        host: &Digest32,
+        selector: &str,
+    ) -> Result<Option<super::super::Share>> {
+        if let Some(share) = self.share(host, selector)? {
+            return Ok(Some(share));
+        }
+        let Ok(fingerprint) = crate::node::link::b32_decode(selector, "service fingerprint") else {
+            return Ok(None);
+        };
+        let Some(log) = self
+            .facts
+            .get(Table::ShareFingerprints, &pair(host, &fingerprint))?
+        else {
+            return Ok(None);
+        };
+        let entry = self.facts.entry(log)?;
+        let GovBody::ServiceShare(share) = GovEntry::body_bound_to(&entry)? else {
+            return Err(invalid("governance share fingerprint kind"));
+        };
+        if crate::governance::share::service_fingerprint(
+            &entry.skeleton.channel_id,
+            host,
+            &share.body.name,
+        ) != fingerprint
+        {
+            return Err(invalid("governance share fingerprint binding"));
+        }
+        self.share_record(log, host, &crate::hash::sha256(share.body.name.as_bytes()))
+    }
+
+    fn share_record(
+        &self,
+        log: u64,
+        host: &Digest32,
+        name_hash: &Digest32,
+    ) -> Result<Option<super::super::Share>> {
+        let entry = self.facts.entry(log)?;
+        let GovBody::ServiceShare(share) = GovEntry::body_bound_to(&entry)? else {
+            return Err(invalid("governance share kind"));
+        };
+        if entry.skeleton.author_id != *host
+            || share.body.author_id != *host
+            || crate::hash::sha256(share.body.name.as_bytes()) != *name_hash
+        {
+            return Err(invalid("governance share binding"));
+        }
+        Ok(share.body.shared.then_some(super::super::Share {
+            host: *host,
+            name: share.body.name,
+            udp: share.body.udp,
+            kind: share.body.kind,
+        }))
+    }
+
+    pub(in crate::node::channel) fn shares(
+        &self,
+        after: Option<(Digest32, Digest32)>,
+        limit: usize,
+    ) -> Result<SharePage> {
+        let mut cursor = after;
+        let mut rows = Vec::new();
+        for _ in 0..limit.clamp(1, PAGE_ROWS) {
+            let Some((key, log)) = self
+                .facts
+                .first(Table::Shares, cursor.map(|(host, name)| pair(&host, &name)))?
+            else {
+                return Ok(SharePage { rows, next: None });
+            };
+            let host = key[..32]
+                .try_into()
+                .map_err(|_| invalid("governance share host cursor"))?;
+            let name = key[32..]
+                .try_into()
+                .map_err(|_| invalid("governance share name cursor"))?;
+            cursor = Some((host, name));
+            if let Some(row) = self.share_record(log, &host, &name)? {
+                rows.push(row);
+            }
+        }
+        Ok(SharePage { rows, next: cursor })
+    }
+
+    pub(in crate::node::channel) fn display(&self, genesis: &Genesis) -> Result<Display> {
+        let mut display = Display::genesis(genesis);
+        display.revision = self.facts.revision();
+        display.valid_until = self.facts.deadline();
+        for kind in [
+            fold::NAME,
+            fold::MESSAGES,
+            fold::STEPS,
+            fold::END,
+            fold::IDLE,
+            fold::ANCHORS,
+        ] {
+            let Some(entry) = self.effect(kind, kind == fold::END)? else {
+                continue;
+            };
+            match GovEntry::body_bound_to(&entry)? {
+                GovBody::RoomName(name) if kind == fold::NAME => {
+                    display.name = Some(name.body.name)
+                }
+                GovBody::PolicyUpdate(policy) if kind == fold::MESSAGES => {
+                    display.policy.ttl_ms = policy
+                        .body
+                        .ttl_ms
+                        .ok_or(invalid("governance retention effect missing"))?;
+                }
+                GovBody::StepPolicyUpdate(policy) if kind == fold::STEPS => {
+                    display.step_ttl_ms = policy.ttl_ms
+                }
+                GovBody::Lifecycle(lifecycle) if kind == fold::END => {
+                    if !matches!(
+                        lifecycle.body.kind,
+                        crate::governance::lifecycle::LifecycleKind::End
+                    ) {
+                        return Err(invalid("governance end effect kind"));
+                    }
+                    display.lifecycle.ended_by = Some(entry.entry_hash());
+                }
+                GovBody::Lifecycle(lifecycle) if kind == fold::IDLE => {
+                    let crate::governance::lifecycle::LifecycleKind::IdleEnd(ms) =
+                        lifecycle.body.kind
+                    else {
+                        return Err(invalid("governance idle effect kind"));
+                    };
+                    display.lifecycle.idle_end_ms = Some(ms);
+                }
+                GovBody::RoomAnchors(anchors) if kind == fold::ANCHORS => {
+                    display.anchors = Some(anchors.body.anchors)
+                }
+                _ => return Err(invalid("governance display effect kind")),
+            }
+        }
+        Ok(display)
+    }
+
+    fn effect(&self, kind: u64, first: bool) -> Result<Option<Entry>> {
+        let row = if first {
+            self.facts
+                .at_or_after(Table::EffectKinds, kind_key(kind, 0))?
+        } else {
+            self.facts
+                .last(Table::EffectKinds, Some(kind_key(kind + 1, 0)))?
+        };
+        row.filter(|(key, _)| key[..8] == kind.to_be_bytes())
+            .map(|(_, log)| self.facts.entry(log))
+            .transpose()
+    }
+
+    fn authority(&self, target: &Digest32) -> Result<(Grant, DenyReason)> {
+        if target == &self.root {
+            return Ok((Grant::root(), DenyReason::NotAdmin));
+        }
+        let Some(record) = self.facts.get(Table::CurrentAuthority, &hash_key(target))? else {
+            return Ok((Grant::default(), DenyReason::NotAdmin));
+        };
+        let bytes = self.facts.record(record)?;
+        let mut d = Decoder::new(&bytes);
+        if d.array()? != 4 || d.uint()? != 1 || d.uint()? != self.facts.authority_generation() {
+            return Err(invalid("governance current authority stale"));
+        }
+        let grant = Grant::read(&mut d)?;
+        let deny = match d.uint()? {
+            1 => DenyReason::NotAdmin,
+            2 => DenyReason::CapabilityNotHeld,
+            3 => DenyReason::OverAttenuated,
+            4 => DenyReason::Expired,
+            5 => DenyReason::Revoked,
+            _ => return Err(invalid("governance current denial")),
+        };
+        d.finish()?;
+        Ok((grant, deny))
+    }
+
+    pub(in crate::node::channel) fn is_admin(&self, target: &Digest32) -> Result<bool> {
+        Ok(self.authority(target)?.0.present)
+    }
+
+    pub(in crate::node::channel) fn can_end(&self, target: &Digest32) -> Result<bool> {
+        let grant = self.authority(target)?.0;
+        Ok(grant.present && (grant.admin || grant.policy))
+    }
+
+    pub(in crate::node::channel) fn grants(
+        &self,
+        target: &Digest32,
+        cap: &Capability,
+    ) -> Result<Verdict> {
+        let (grant, denied) = self.authority(target)?;
+        if !grant.present {
+            return Ok(Verdict::Denied(denied));
+        }
+        let set = grant.capabilities();
+        if !set.grants(cap) {
+            return Ok(Verdict::Denied(DenyReason::CapabilityNotHeld));
+        }
+        Ok(Verdict::Granted {
+            governing: if grant.admin {
+                Capability::Admin
+            } else {
+                cap.clone()
+            },
+            effective_set: set,
+        })
+    }
+
+    pub(in crate::node::channel) fn can_read(
+        &self,
+        reader: &Digest32,
+        author: &Digest32,
+    ) -> Result<bool> {
+        let Some(log) = self.facts.get(Table::Consent, &pair(author, reader))? else {
+            return Ok(false);
+        };
+        let entry = self.facts.entry(log)?;
+        if entry.skeleton.author_id != *author {
+            return Err(invalid("governance consent author"));
+        }
+        let grant = match GovEntry::body_bound_to(&entry)? {
+            GovBody::ConsentGrant(grant) => grant,
+            GovBody::ConsentRevocation(revoke)
+                if revoke.body.author_id == *author
+                    && revoke.body.target_id == *reader
+                    && revoke.body.epoch == 0 =>
+            {
+                return Ok(false)
+            }
+            _ => return Err(invalid("governance consent locator kind")),
+        };
+        if grant.body.target_id != *reader
+            || grant.body.author_id != *author
+            || grant.body.epoch != 0
+        {
+            return Err(invalid("governance consent locator binding"));
+        }
+        let reset = self
+            .facts
+            .get(Table::ConsentReset, &hash_key(author))?
+            .map(|log| self.facts.entry(log))
+            .transpose()?
+            .map_or(0, |entry| entry.skeleton.seq);
+        Ok(entry.skeleton.seq > reset)
+    }
+
+    pub(in crate::node::channel) fn ever_revoked(
+        &self,
+        author: &Digest32,
+        target: &Digest32,
+    ) -> Result<bool> {
+        let Some(log) = self.facts.get(Table::EverRevoked, &pair(author, target))? else {
+            return Ok(false);
+        };
+        let entry = self.facts.entry(log)?;
+        match GovEntry::body_bound_to(&entry)? {
+            GovBody::ConsentRevocation(revoke)
+                if entry.skeleton.author_id == *author
+                    && revoke.body.author_id == *author
+                    && revoke.body.target_id == *target =>
+            {
+                Ok(true)
+            }
+            _ => Err(invalid("governance revoked locator binding")),
+        }
+    }
+
+    pub(in crate::node::channel) fn grant_sequence(
+        &self,
+        author: &Digest32,
+        target: &Digest32,
+    ) -> Result<Option<u64>> {
+        if !self.can_read(target, author)? {
+            return Ok(None);
+        }
+        let log = self
+            .facts
+            .get(Table::Consent, &pair(author, target))?
+            .ok_or(invalid("governance consent disappeared"))?;
+        Ok(Some(self.facts.entry(log)?.skeleton.seq))
+    }
+
+    /// The cursor advances over inspected slots, including withdrawn/reset
+    /// consent. An empty page is not an end-of-range claim.
+    pub(in crate::node::channel) fn consenters(
+        &self,
+        author: &Digest32,
+        after: Option<Digest32>,
+        limit: usize,
+    ) -> Result<TargetPage> {
+        let mut after = after;
+        let mut rows = Vec::new();
+        for _ in 0..limit.clamp(1, PAGE_ROWS) {
+            let row = match after {
+                Some(target) => self
+                    .facts
+                    .first(Table::Consent, Some(pair(author, &target)))?,
+                None => self.facts.at_or_after(Table::Consent, hash_key(author))?,
+            }
+            .filter(|(key, _)| key[..32] == author[..]);
+            let Some((key, _)) = row else {
+                return Ok(TargetPage { rows, next: None });
+            };
+            let target = key[32..]
+                .try_into()
+                .map_err(|_| invalid("governance consenter cursor"))?;
+            after = Some(target);
+            if self.can_read(&target, author)? {
+                rows.push(target);
+            }
+        }
+        Ok(TargetPage { rows, next: after })
+    }
+
+    /// Newest-first disk continuation returned in chronological order. Caller
+    /// supplies the same exact published revision when asking for older rows.
+    pub(in crate::node::channel) fn notices(
+        &self,
+        before: Option<(u64, Digest32)>,
+        revision: Option<u64>,
+        limit: usize,
+    ) -> Result<NoticePage> {
+        self.notices_between(before, None, false, revision, limit)
+    }
+
+    pub(in crate::node::channel) fn notices_between(
+        &self,
+        cursor: Option<(u64, Digest32)>,
+        end: Option<(u64, Digest32)>,
+        forward: bool,
+        revision: Option<u64>,
+        limit: usize,
+    ) -> Result<NoticePage> {
+        if revision.is_some_and(|revision| revision != self.facts.revision()) {
+            return Err(Error::Profile(
+                "room notices changed; reload the visible page",
+            ));
+        }
+        let first_name = self
+            .effect(fold::NAME, true)?
+            .map(|entry| entry.entry_hash());
+        let mut before_key = cursor.map(|(clock, hash)| {
+            let mut key = [0; 64];
+            key[..8].copy_from_slice(&clock.to_be_bytes());
+            key[8..40].copy_from_slice(&hash);
+            key
+        });
+        let mut rows = Vec::new();
+        let mut next = None;
+        for _ in 0..limit.clamp(1, PAGE_ROWS) {
+            let candidate = if forward {
+                self.facts.first(Table::Notices, before_key)?
+            } else {
+                self.facts.last(Table::Notices, before_key)?
+            };
+            let Some((key, log)) = candidate else {
+                if !forward {
+                    rows.reverse();
+                }
+                return Ok(NoticePage {
+                    rows,
+                    next: None,
+                    revision: self.facts.revision(),
+                });
+            };
+            if key[40..].iter().any(|byte| *byte != 0) {
+                return Err(invalid("governance notice order padding"));
+            }
+            let clock = u64::from_be_bytes(
+                key[..8]
+                    .try_into()
+                    .map_err(|_| invalid("governance notice clock"))?,
+            );
+            let hash: Digest32 = key[8..40]
+                .try_into()
+                .map_err(|_| invalid("governance notice hash"))?;
+            if forward && end.is_some_and(|end| (clock, hash) >= end) {
+                return Ok(NoticePage {
+                    rows,
+                    next: None,
+                    revision: self.facts.revision(),
+                });
+            }
+            let entry = self.facts.entry(log)?;
+            if entry.entry_hash() != hash {
+                return Err(invalid("governance notice locator binding"));
+            }
+            let what = match GovEntry::body_bound_to(&entry)? {
+                GovBody::RoomName(name) => {
+                    if first_name == Some(hash) {
+                        format!("named the room {}", name.body.name)
+                    } else {
+                        format!("renamed the room to {}", name.body.name)
+                    }
+                }
+                GovBody::PolicyUpdate(policy) => {
+                    let ttl = policy
+                        .body
+                        .ttl_ms
+                        .ok_or(invalid("governance notice retention missing"))?;
+                    if ttl == 0 {
+                        "set the room's retention to forever: from now on no message is removed for its age".to_owned()
+                    } else {
+                        let d = crate::node::retention::describe(ttl / 1_000);
+                        format!(
+                            "set the room's retention to {d}: messages older than {d} are removed from now on"
+                        )
+                    }
+                }
+                _ => return Err(invalid("governance notice kind")),
+            };
+            rows.push((
+                clock,
+                super::super::RoomNotice {
+                    entry_hash: hash,
+                    author: entry.skeleton.author_id,
+                    created_millis: entry.skeleton.claimed_ms,
+                    after: None,
+                    what,
+                },
+            ));
+            next = Some((clock, hash));
+            before_key = Some(key);
+        }
+        if !forward {
+            rows.reverse();
+        }
+        Ok(NoticePage {
+            rows,
+            next,
+            revision: self.facts.revision(),
+        })
+    }
+}
+
+pub(in crate::node::channel) struct TargetPage {
+    pub rows: Vec<Digest32>,
+    pub next: Option<Digest32>,
+}
+pub(in crate::node::channel) struct NoticePage {
+    pub rows: Vec<(u64, super::super::RoomNotice)>,
+    pub next: Option<(u64, Digest32)>,
+    pub revision: u64,
+}
+
+pub(in crate::node::channel) struct SharePage {
+    pub rows: Vec<super::super::Share>,
+    pub next: Option<(Digest32, Digest32)>,
+}

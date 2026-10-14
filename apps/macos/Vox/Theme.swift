@@ -26,7 +26,7 @@ enum Theme {
     /// A sidebar row's time and preview: SF Pro, one step under the text, never mono or
     /// letter-spaced.
     static var small: Font { font(VoxTokens.Fonts.appSmall) }
-    /// Uppercase eyebrow labels: SF Mono, tracked (L-7).
+    /// Uppercase metadata labels use the body face, tracked (ADR-033 LY-10).
     static var eyebrow: Font { font(VoxTokens.Fonts.appEyebrow) }
     /// Pane, sheet and dialog titles: SF Pro semibold (L-7), at a steady size.
     static var title: Font { font(VoxTokens.Fonts.appTitle) }

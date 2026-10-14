@@ -3,13 +3,45 @@
 
 use std::time::{Duration, Instant};
 
+use super::session_projection::{floor_index, private_index};
 use super::*;
 use crate::node::sessionstream::{Ask, Cursor, Page, Record, PAGE_RECORDS};
 
 const SUPPORT: &str = "vox/private-session-stream/v1";
 const SEG_LEGACY_DRIVE_GENERATIONS: u64 = 19;
+const WORK_ROWS: usize = 32;
+const WORK_BYTES: usize = 1024 * 1024;
 
-fn support_body(room: &Digest32, author: &Digest32) -> Vec<u8> {
+/// Callers only signal that committed public steps need inspection. The actual work is a
+/// disk cursor, not one resident hash for every historical step.
+#[derive(Default)]
+pub(super) struct LegacyPending(bool);
+impl LegacyPending {
+    pub(super) fn insert(&mut self, _hash: Digest32) {
+        self.0 = true;
+    }
+    pub(super) fn is_empty(&self) -> bool {
+        !self.0
+    }
+}
+
+struct LegacyWork {
+    through: u64,
+    after: Option<u64>,
+    migrating: bool,
+}
+
+struct RefreshWork {
+    grant: Digest32,
+    public: u64,
+    private: u64,
+    through: u64,
+    public_after: Option<(u64, u64, Digest32)>,
+    private_after: Option<[u8; 64]>,
+    stage: u8,
+}
+
+pub(super) fn support_body(room: &Digest32, author: &Digest32) -> Vec<u8> {
     let mut e = Encoder::new();
     e.array(3).text(SUPPORT).bytes(room).bytes(author);
     let mut body = GROUP_MSG_SIGN_DOMAIN.as_bytes().to_vec();
@@ -29,33 +61,36 @@ pub(super) fn is_support(body: &[u8]) -> bool {
         && d.finish().is_ok()
 }
 
-struct Stored {
-    record: Record,
+pub(super) struct Stored {
+    pub(super) record: Record,
     // An authorized legacy body can arrive before its drive key package is installed.
-    row: Option<SessionRow>,
-    first_seen: u64,
+    pub(super) row: Option<SessionRow>,
+    pub(super) first_seen: u64,
 }
 
 #[derive(Default)]
 pub(super) struct PrivateSessions {
-    records: BTreeMap<u64, Stored>,
-    hashes: BTreeMap<Digest32, u64>,
-    pub(super) legacy_pending: BTreeSet<Digest32>,
+    pub(super) legacy_pending: LegacyPending,
+    legacy_work: Option<LegacyWork>,
+    restoring: bool,
+    restore_after: Option<u64>,
+    pending_active: bool,
+    pending_after: Option<u64>,
+    pending_through: u64,
+    refresh: Option<RefreshWork>,
+    invalid_noted: bool,
     pub(super) upgrading: bool,
-    legacy_generations: BTreeMap<Digest32, u64>,
+    // Verified input from one bounded receive batch, cleared only after its effects commit.
+    observed_generations: BTreeMap<Digest32, (Digest32, u64)>,
+    controls_import: bool,
+    controls_import_after: Option<(usize, u64, Digest32)>,
+    controls_after: Option<Digest32>,
     next: u64,
     incarnation: Option<Digest32>,
     cursors: BTreeMap<Digest32, Cursor>,
     pulling: BTreeSet<Digest32>,
     attempted: BTreeMap<Digest32, Instant>,
-    supports: BTreeMap<Digest32, (u64, bool)>,
     revision: u64,
-}
-
-impl PrivateSessions {
-    pub(super) fn contains(&self, hash: &Digest32) -> bool {
-        self.hashes.contains_key(hash)
-    }
 }
 
 impl Stored {
@@ -69,7 +104,7 @@ impl Stored {
         Zeroizing::new(e.finish())
     }
 
-    fn read(bytes: &[u8]) -> Result<Self> {
+    pub(super) fn read(bytes: &[u8]) -> Result<Self> {
         let mut d = Decoder::new(bytes);
         if d.array()? != 4 || d.uint()? != 1 {
             return Err(Error::MalformedAtRest("private Session state version"));
@@ -100,361 +135,833 @@ impl Stored {
 }
 
 impl ChannelState {
-    /// Local evidence about a legacy sender's generation survives deletion of its body. It
-    /// confers no relay permission: other recipients still need the author's signed floors.
-    pub(super) fn legacy_drive_generation(&self, author: &Digest32) -> Option<u64> {
-        self.private_sessions
-            .legacy_generations
-            .get(author)
-            .copied()
+    pub(super) fn private_contains_in(
+        &self,
+        batch: &crate::node::store::Batch<'_>,
+        hash: &Digest32,
+    ) -> Result<bool> {
+        private_index::find_in(batch, &self.sek, &self.channel_id, hash).map(|id| id.is_some())
     }
 
-    /// Called only after verification, before a forbidden legacy body is discarded. A
-    /// generation observation can deny obsolete permission, never grant forwarding rights.
-    pub(super) fn observe_legacy_drive_generation(&mut self, entry: &Entry) {
+    pub(super) fn private_id(&self, store: &Store, hash: &Digest32) -> Result<Option<u64>> {
+        let snapshot = store.snapshot()?;
+        private_index::find(&snapshot, &self.sek, &self.channel_id, hash)
+    }
+
+    fn private_at(&self, store: &Store, id: u64) -> Result<Option<Stored>> {
+        store
+            .get_segment(&self.channel_id, SegmentKind::PrivateSession, id)?
+            .map(|segment| self.read_private(id, &segment))
+            .transpose()
+    }
+
+    pub(super) fn read_private(
+        &self,
+        id: u64,
+        segment: &crate::atrest::store::SealedSegment,
+    ) -> Result<Stored> {
+        if segment.ciphertext.len()
+            > 2 * crate::node::sessionstream::MAX_RECORD + crate::atrest::sek::TAG_LEN
+        {
+            return Err(Error::MalformedAtRest(
+                "private Session stored row exceeds format",
+            ));
+        }
+        Stored::read(&open_segment(
+            &self.sek,
+            SegmentKind::PrivateSession,
+            id,
+            segment,
+        )?)
+    }
+
+    fn private_after(&self, store: &Store, after: Option<u64>) -> Result<Option<(u64, Stored)>> {
+        let snapshot = store.snapshot()?;
+        snapshot
+            .segment_after(&self.channel_id, SegmentKind::PrivateSession, after)?
+            .map(|(id, segment)| self.read_private(id, &segment).map(|saved| (id, saved)))
+            .transpose()
+    }
+
+    /// A ready sealed observation is a denial boundary, never a grant. Missing evidence is
+    /// meaningful only after the published feed has been inspected through its current head.
+    pub(super) fn legacy_drive_generation(
+        &self,
+        store: &Store,
+        author: &Digest32,
+    ) -> Result<Option<u64>> {
+        let fact = private_index::control(&store.snapshot()?, &self.sek, &self.channel_id, author)?;
+        if self.private_sessions.controls_import
+            || self.private_sessions.restoring
+            || fact.through < self.dag.verified_head(author)
+        {
+            return Err(Error::StreamRefused("Session control facts are refreshing"));
+        }
+        Ok(fact
+            .generation
+            .into_iter()
+            .chain(
+                self.private_sessions
+                    .observed_generations
+                    .values()
+                    .filter(|(a, _)| a == author)
+                    .map(|(_, generation)| *generation)
+                    .max(),
+            )
+            .max())
+    }
+
+    /// Called only for an authenticated input in the current bounded receive batch, before
+    /// withholding can remove its payload. No uncommitted observation survives a restart.
+    pub(super) fn observe_legacy_drive_generation(&mut self, entry: &Entry) -> Result<()> {
         let Some(message) = entry
             .payload
             .as_deref()
             .and_then(|p| GroupMessage::from_wire(p).ok())
         else {
-            return;
+            return Ok(());
         };
         let h = message.header;
         if h.channel_id != drive_channel(&self.channel_id)
             || h.author_id != entry.skeleton.author_id
             || h.epoch != entry.skeleton.epoch
         {
-            return;
+            return Ok(());
+        }
+        let hash = entry.entry_hash();
+        if !self
+            .private_sessions
+            .observed_generations
+            .contains_key(&hash)
+            && self.private_sessions.observed_generations.len() >= crate::log::sync::MAX_STAGED
+        {
+            return Err(Error::SizeLimitExceeded(
+                "Session received control observations",
+            ));
         }
         self.private_sessions
-            .legacy_generations
-            .entry(h.author_id)
-            .and_modify(|generation| *generation = (*generation).max(h.chain_id))
-            .or_insert(h.chain_id);
+            .observed_generations
+            .insert(hash, (h.author_id, h.chain_id));
+        Ok(())
     }
 
+    /// Queue compact evidence with the received entries' own effects. Do not clear on failure.
     pub(super) fn queue_private_generations(
         &self,
         batch: &mut crate::node::store::Batch<'_>,
     ) -> Result<()> {
-        if self.private_sessions.legacy_generations.is_empty() {
-            return Ok(());
+        for (hash, (author, generation)) in &self.private_sessions.observed_generations {
+            if self
+                .entries
+                .in_batch(batch, &self.sek, &self.channel_id)?
+                .log_id(hash)?
+                .is_some()
+            {
+                private_index::observe_control(
+                    batch,
+                    &self.sek,
+                    &self.channel_id,
+                    author,
+                    private_index::Control {
+                        generation: Some(*generation),
+                        ..Default::default()
+                    },
+                )?;
+            }
         }
-        let mut e = Encoder::new();
-        e.array(2)
-            .uint(1)
-            .array(self.private_sessions.legacy_generations.len());
-        for (author, generation) in &self.private_sessions.legacy_generations {
-            e.array(2).bytes(author).uint(*generation);
-        }
-        let segment = seal_segment(
-            &self.sek,
-            SegmentKind::KeyMaterial,
-            SEG_LEGACY_DRIVE_GENERATIONS,
-            &e.finish(),
-        )?;
-        batch.put_segment(
-            &self.channel_id,
-            SegmentKind::KeyMaterial,
-            SEG_LEGACY_DRIVE_GENERATIONS,
-            &segment,
-        )
+        Ok(())
     }
 
-    fn legacy_current_drive(&self, author: &Digest32) -> bool {
-        if *author == self.me() {
-            return true;
-        }
-        if !self.authors.contains_key(author) || self.has_left(&self.me()) {
-            return false;
-        }
-        let announced = self
-            .drive
-            .floors
-            .keys()
-            .filter(|(a, _, epoch, _)| a == author && *epoch <= self.epoch)
-            .map(|(_, _, _, g)| *g)
-            .max();
-        let newest = announced
-            .into_iter()
-            .chain(self.legacy_drive_generation(author))
-            .max();
-        let Some(generation) = newest else {
-            return false;
-        };
-        if announced == Some(generation) {
-            // Merely having an unopened old key package is not a current grant.
-            return self
-                .drive
-                .floors
-                .iter()
-                .any(|((a, target, epoch, g), (membership, _, _))| {
-                    a == author
-                        && *target == self.me()
-                        && *epoch == self.epoch
-                        && *g == generation
-                        && *membership == self.admission(&self.me()).0
-                });
-        }
-        self.drive.receivers.contains_key(&(*author, generation))
-    }
-
-    /// Rewrite old public step pages before a room is exposed. Repeating this is harmless:
-    /// migrated records are no longer public bodies, and later drive loss never deletes an
-    /// already-read private row. The same operation handles an older writer during upgrade.
-    pub(super) fn migrate_legacy_steps(&mut self, store: &Store, now: u64) -> Result<()> {
-        if self.private_sessions.upgrading || self.private_sessions.legacy_pending.is_empty() {
-            return Ok(());
-        }
-        let result = self.migrate_legacy_steps_inner(store, now);
+    pub(super) fn private_controls_committed(&mut self, store: &Store) -> Result<()> {
+        let result = (|| {
+            let read = self.entries.read(store, &self.sek, &self.channel_id)?;
+            let mut after = None;
+            loop {
+                let next = match after {
+                    Some(hash) => self
+                        .private_sessions
+                        .observed_generations
+                        .range((std::ops::Bound::Excluded(hash), std::ops::Bound::Unbounded))
+                        .next(),
+                    None => self.private_sessions.observed_generations.first_key_value(),
+                }
+                .map(|(hash, _)| *hash);
+                let Some(hash) = next else {
+                    break;
+                };
+                if read.log_id(&hash)?.is_some() {
+                    self.private_sessions.observed_generations.remove(&hash);
+                }
+                after = Some(hash);
+            }
+            Ok(())
+        })();
         if let Err(error) = &result {
             self.private_save_failed(error);
         }
         result
     }
 
-    fn migrate_legacy_steps_inner(&mut self, store: &Store, now: u64) -> Result<()> {
-        self.index_session_floors(store)?;
-        // Discover generations first, keeping only compact work coordinates. A second pass
-        // reads one public entry at a time into the existing private-record transaction.
-        let pending: Vec<_> = self
-            .private_sessions
-            .legacy_pending
-            .iter()
-            .copied()
-            .collect();
-        let mut records = Vec::new();
-        for hash in pending {
-            let Some(entry) = self.entry(store, &hash)? else {
-                continue;
+    pub(super) fn private_controls_ready(&self, store: &Store) -> Result<bool> {
+        if self.private_sessions.controls_import || self.private_sessions.restoring {
+            return Ok(false);
+        }
+        let snapshot = store.snapshot()?;
+        for author in self.authors.keys() {
+            if private_index::control(&snapshot, &self.sek, &self.channel_id, author)?.through
+                < self.dag.verified_head(author)
+                || self
+                    .floor_author(Transaction::Snapshot(&snapshot), author)?
+                    .through
+                    < self.dag.verified_head(author)
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// One bounded catch-up turn over already published entries. A staged suffix cannot
+    /// certify absence, and no snapshot is retained while the actor yields or waits.
+    pub(super) fn advance_private_controls(&mut self, store: &Store) -> Result<bool> {
+        if self.poisoned {
+            return Err(self.save_failure());
+        }
+        let result = self.advance_private_controls_inner(store);
+        if let Err(error) = &result {
+            self.private_save_failed(error);
+        }
+        result
+    }
+
+    fn advance_private_controls_inner(&mut self, store: &Store) -> Result<bool> {
+        if self.private_sessions.controls_import {
+            return self.import_private_controls(store);
+        }
+        if self.private_sessions.restoring {
+            return Ok(false);
+        }
+        let mut bytes = 0usize;
+        for _ in 0..WORK_ROWS {
+            let author = match self.private_sessions.controls_after {
+                Some(after) => self
+                    .authors
+                    .range((std::ops::Bound::Excluded(after), std::ops::Bound::Unbounded))
+                    .next()
+                    .map(|(a, _)| *a),
+                None => self.authors.keys().next().copied(),
             };
-            if !entry
+            let Some(author) = author else {
+                self.private_sessions.controls_after = None;
+                return self.private_controls_ready(store);
+            };
+            let fact =
+                private_index::control(&store.snapshot()?, &self.sek, &self.channel_id, &author)?;
+            let head = self.dag.verified_head(&author);
+            let floor_through = self
+                .floor_author(Transaction::Snapshot(&store.snapshot()?), &author)?
+                .through;
+            let through = fact.through.min(floor_through);
+            if through >= head {
+                self.private_sessions.controls_after = Some(author);
+                continue;
+            }
+            let seq = through
+                .checked_add(1)
+                .ok_or(Error::MalformedAtRest("Session control frontier exhausted"))?;
+            let entry = {
+                let read = self.entries.read(store, &self.sek, &self.channel_id)?;
+                let entry = read
+                    .get(&author, seq)?
+                    .ok_or(Error::MalformedAtRest("Session control entry missing"))?;
+                if read.log_id(&entry.entry_hash())?.is_none() {
+                    return Ok(false); // verified in memory, not durably published yet
+                }
+                self.entries
+                    .order_view(store, &self.sek, &self.channel_id)?
+                    .entry(&entry.entry_hash())?
+                    .ok_or(Error::MalformedAtRest(
+                        "published Session control entry missing",
+                    ))?
+            };
+            let size = entry.payload.as_ref().map_or(0, Vec::len);
+            if bytes != 0 && bytes.saturating_add(size) > WORK_BYTES {
+                break;
+            }
+            bytes = bytes.saturating_add(size);
+            let mut batch = store.batch()?;
+            private_index::observe_public(
+                &mut batch,
+                &self.sek,
+                &self.channel_id,
+                &entry,
+                self.epoch,
+            )?;
+            batch.commit()?;
+            if seq == head {
+                self.private_sessions.controls_after = Some(author);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Current-data transition of the old sealed author map. It is format-bounded by the
+    /// existing admitted-author limit, read one row at a time, and deleted only after its
+    /// final page commits. A restart safely repeats monotone observations.
+    fn import_private_controls(&mut self, store: &Store) -> Result<bool> {
+        let Some(segment) = store.get_segment(
+            &self.channel_id,
+            SegmentKind::KeyMaterial,
+            SEG_LEGACY_DRIVE_GENERATIONS,
+        )?
+        else {
+            self.private_sessions.controls_import = false;
+            return Ok(false);
+        };
+        if segment.ciphertext.len() > AUTHORS_HARD_LIMIT * 48 + 128 + crate::atrest::sek::TAG_LEN {
+            return Err(Error::MalformedAtRest(
+                "legacy drive generation record exceeds author bound",
+            ));
+        }
+        let bytes = open_segment(
+            &self.sek,
+            SegmentKind::KeyMaterial,
+            SEG_LEGACY_DRIVE_GENERATIONS,
+            &segment,
+        )?;
+        let mut header = Decoder::new(&bytes);
+        if header.array()? != 2 || header.uint()? != 1 {
+            return Err(Error::MalformedAtRest("legacy drive generations version"));
+        }
+        let count = header.array()?;
+        if count > AUTHORS_HARD_LIMIT {
+            return Err(Error::MalformedAtRest("legacy drive generation authors"));
+        }
+        let (offset, done, mut previous) = self.private_sessions.controls_import_after.unwrap_or((
+            bytes.len() - header.remaining(),
+            0,
+            [0; 32],
+        ));
+        let rest = bytes
+            .get(offset..)
+            .ok_or(Error::MalformedAtRest("legacy drive generation cursor"))?;
+        let mut d = Decoder::new(rest);
+        let mut done = done;
+        let mut batch = store.batch()?;
+        for _ in 0..WORK_ROWS {
+            if done == count as u64 {
+                break;
+            }
+            if d.array()? != 2 {
+                return Err(Error::MalformedAtRest("legacy drive generation row"));
+            }
+            let author: Digest32 = d
+                .bytes()?
+                .try_into()
+                .map_err(|_| Error::MalformedAtRest("legacy drive author"))?;
+            if done != 0 && author <= previous {
+                return Err(Error::MalformedAtRest(
+                    "legacy drive authors not unique ordered",
+                ));
+            }
+            if !self.authors.contains_key(&author) {
+                return Err(Error::MalformedAtRest("legacy drive author unknown"));
+            }
+            let generation = d.uint()?;
+            private_index::observe_control(
+                &mut batch,
+                &self.sek,
+                &self.channel_id,
+                &author,
+                private_index::Control {
+                    generation: Some(generation),
+                    ..Default::default()
+                },
+            )?;
+            previous = author;
+            done += 1;
+        }
+        let complete = done == count as u64;
+        let next_offset = bytes.len() - d.remaining();
+        if complete {
+            d.finish()?;
+            batch.delete_segment(
+                &self.channel_id,
+                SegmentKind::KeyMaterial,
+                SEG_LEGACY_DRIVE_GENERATIONS,
+            )?;
+        }
+        batch.commit()?;
+        self.private_sessions.controls_import_after =
+            (!complete).then_some((next_offset, done, previous));
+        self.private_sessions.controls_import = !complete;
+        Ok(false)
+    }
+
+    fn legacy_current_drive(
+        &self,
+        transaction: Transaction<'_, '_>,
+        author: &Digest32,
+    ) -> Result<bool> {
+        if *author == self.me() {
+            return Ok(true);
+        }
+        if !self.authors.contains_key(author) || self.has_left(&self.me()) {
+            return Ok(false);
+        }
+        let fact = match transaction {
+            Transaction::Snapshot(snapshot) => {
+                private_index::control(snapshot, &self.sek, &self.channel_id, author)?
+            }
+            Transaction::Batch(batch) => {
+                private_index::control_in(batch, &self.sek, &self.channel_id, author)?
+            }
+        };
+        if self.private_sessions.controls_import
+            || self.private_sessions.restoring
+            || fact.through < self.dag.verified_head(author)
+        {
+            return Err(Error::StreamRefused("Session control facts are refreshing"));
+        }
+        let floor = self.floor_author(transaction, author)?;
+        if floor.through < self.dag.verified_head(author) {
+            return Err(Error::StreamRefused(floor_index::REFRESHING));
+        }
+        let announced = floor.announced;
+        let newest = announced
+            .into_iter()
+            .chain(fact.generation)
+            .chain(
+                self.private_sessions
+                    .observed_generations
+                    .values()
+                    .filter(|(a, _)| a == author)
+                    .map(|(_, generation)| *generation)
+                    .max(),
+            )
+            .max();
+        let Some(generation) = newest else {
+            return Ok(false);
+        };
+        if announced == Some(generation) {
+            return Ok(self
+                .session_floor(transaction, &(*author, self.me(), self.epoch, generation))?
+                .is_some_and(|(membership, _, _)| membership == self.admission(&self.me()).0));
+        }
+        Ok(self.drive.receivers.contains_key(&(*author, generation)))
+    }
+
+    /// Inspect committed rows by their stable LogDb coordinate. Publication already removed
+    /// provisional work before opening; verify that the active index still owns each row.
+    fn legacy_after(
+        &self,
+        store: &Store,
+        after: Option<u64>,
+        through: u64,
+    ) -> Result<Option<(u64, Entry)>> {
+        let snapshot = store.snapshot()?;
+        let Some((id, sealed)) =
+            snapshot.segment_after(&self.channel_id, SegmentKind::LogDb, after)?
+        else {
+            return Ok(None);
+        };
+        if id >= through {
+            return Ok(None);
+        }
+        let entry = Entry::from_wire(&open_segment(&self.sek, SegmentKind::LogDb, id, &sealed)?)?;
+        let view = self.entries.view(
+            Transaction::Snapshot(&snapshot),
+            &self.sek,
+            &self.channel_id,
+        )?;
+        if view.log_id(&entry.entry_hash())? != Some(id) {
+            return Err(Error::MalformedAtRest(
+                "private migration unpublished entry",
+            ));
+        }
+        Ok(Some((id, entry)))
+    }
+
+    /// One bounded turn. New arrivals restart generation discovery before another row can
+    /// be retained: a newer signed generation can revoke permission, never silently grant it.
+    pub(super) fn migrate_legacy_steps(&mut self, store: &Store, now: u64) -> Result<()> {
+        if self.private_sessions.upgrading
+            || self.private_sessions.restoring
+            || !self.private_controls_ready(store)?
+        {
+            return Ok(());
+        }
+        let result = self.migrate_legacy_steps_inner(store, now).map(|_| ());
+        if let Err(error) = &result {
+            self.private_save_failed(error);
+        }
+        result
+    }
+
+    fn migrate_legacy_steps_inner(&mut self, store: &Store, _now: u64) -> Result<bool> {
+        if !self.private_sessions.legacy_pending.is_empty() {
+            self.index_session_floors(store)?;
+            self.private_sessions.legacy_pending.0 = false;
+            self.private_sessions.legacy_work = Some(LegacyWork {
+                through: self.next_log_id,
+                after: None,
+                migrating: false,
+            });
+        }
+        let Some(mut work) = self.private_sessions.legacy_work.take() else {
+            return Ok(true);
+        };
+        let mut bytes = 0usize;
+        for _ in 0..WORK_ROWS {
+            let Some((id, entry)) = self.legacy_after(store, work.after, work.through)? else {
+                if !work.migrating {
+                    let mut batch = store.batch()?;
+                    self.queue_private_generations(&mut batch)?;
+                    batch.commit()?;
+                    self.private_controls_committed(store)?;
+                    work.migrating = true;
+                    work.after = None;
+                    self.private_sessions.legacy_work = Some(work);
+                    return Ok(false);
+                }
+                self.private_sessions.pending_active = true;
+                self.private_sessions.pending_after = None;
+                self.private_sessions.pending_through = self.private_sessions.next;
+                return Ok(true);
+            };
+            let size = entry.payload.as_ref().map_or(0, Vec::len);
+            if bytes != 0 && bytes.saturating_add(size) > WORK_BYTES {
+                break;
+            }
+            bytes = bytes.saturating_add(size);
+            if entry
                 .payload
                 .as_deref()
                 .is_some_and(|p| is_step_body(&self.channel_id, p))
             {
-                continue;
+                if work.migrating {
+                    if let Err(error) = self.migrate_legacy_row(store, entry) {
+                        if floor_index::refreshing(&error) {
+                            self.private_sessions.legacy_work = Some(work);
+                            return Ok(false);
+                        }
+                        return Err(error);
+                    }
+                } else if let Ok(record) = Record::legacy(entry) {
+                    let author = record.message.header.author_id;
+                    if self
+                        .authors
+                        .get(&author)
+                        .is_some_and(|key| record.verify(&self.channel_id, key).is_ok())
+                    {
+                        let mut batch = store.batch()?;
+                        private_index::observe_control(
+                            &mut batch,
+                            &self.sek,
+                            &self.channel_id,
+                            &author,
+                            private_index::Control {
+                                generation: Some(record.message.header.chain_id),
+                                ..Default::default()
+                            },
+                        )?;
+                        batch.commit()?;
+                    }
+                }
             }
-            let Some(tracked) = self.retention.get(&hash) else {
-                continue;
+            work.after = Some(id);
+        }
+        self.private_sessions.legacy_work = Some(work);
+        Ok(false)
+    }
+
+    /// Wire, exact cached row, retention retirement and public-body pruning commit together.
+    /// One legal large entry is processed alone; no transaction grows with retained history.
+    fn migrate_legacy_row(&mut self, store: &Store, entry: Entry) -> Result<()> {
+        let hash = entry.entry_hash();
+        let tracked_before = self
+            .retention_get(store, &hash)?
+            .ok_or(Error::MalformedAtRest("legacy step retention missing"))?;
+        let permitted =
+            if tracked_before.cache_id.is_some() || entry.skeleton.author_id == self.me() {
+                true
+            } else if let Ok(record) = Record::legacy(entry.clone()) {
+                self.private_permitted(store, &record, &self.me())?
+            } else {
+                false
             };
-            if let Ok(record) = Record::legacy(entry) {
-                let author = record.message.header.author_id;
-                if self
-                    .authors
-                    .get(&author)
-                    .is_some_and(|key| record.verify(&self.channel_id, key).is_ok())
-                {
-                    self.private_sessions
-                        .legacy_generations
-                        .entry(author)
-                        .and_modify(|g| *g = (*g).max(record.message.header.chain_id))
-                        .or_insert(record.message.header.chain_id);
-                }
-            }
-            records.push((hash, tracked));
-        }
-        let cached: BTreeMap<_, _> = self
-            .drive
-            .sessions
-            .rows()
-            .iter()
-            .filter(|row| {
-                self.private_sessions
-                    .legacy_pending
-                    .contains(&row.entry_hash)
-            })
-            .map(|row| (row.entry_hash, row.clone()))
-            .collect();
-        let mut kept = Vec::new();
-        let mut next = self.private_sessions.next.max(1);
         let mut batch = store.batch()?;
-        for (hash, tracked) in &records {
-            let hash = *hash;
-            let entry = self
-                .entry_at(Transaction::Batch(&batch), &hash)?
-                .ok_or(Error::MalformedAtRest("legacy step disappeared"))?;
-            let author = entry.skeleton.author_id;
-            let mut record = Record::legacy(entry.clone()).ok().filter(|record| {
-                self.authors
-                    .get(&author)
-                    .is_some_and(|key| record.verify(&self.channel_id, key).is_ok())
-            });
-            if !self.private_sessions.hashes.contains_key(&hash) {
-                if let Some(record) = record.take().filter(|r| {
-                    self.legacy_current_drive(&r.message.header.author_id)
-                        && (cached.contains_key(&hash)
-                            || self.private_permitted(r, &self.me())
-                            || r.message.header.author_id == self.me()
-                            || (!self
-                                .drive
-                                .floors
-                                .keys()
-                                .any(|(a, _, _, _)| *a == r.message.header.author_id)
-                                && self.legacy_drive_generation(&r.message.header.author_id)
-                                    == Some(r.message.header.chain_id)
-                                && self
-                                    .drive
-                                    .receivers
-                                    .get(&(r.message.header.author_id, r.message.header.chain_id))
-                                    .is_some_and(|chain| {
-                                        chain.can_open_iteration(r.message.header.iteration)
-                                    })))
-                }) {
-                    let saved = Stored {
-                        record,
-                        row: cached.get(&hash).cloned(),
-                        first_seen: tracked.first_seen_ms,
-                    };
-                    let id = next;
-                    next = id
-                        .checked_add(1)
-                        .ok_or(Error::SizeLimitExceeded("private Session records"))?;
-                    let segment =
-                        seal_segment(&self.sek, SegmentKind::PrivateSession, id, &saved.bytes())?;
-                    batch.put_segment(
-                        &self.channel_id,
-                        SegmentKind::PrivateSession,
-                        id,
-                        &segment,
-                    )?;
-                    kept.push((id, saved));
+        let Some(tracked) = self.retention_get_in(Transaction::Batch(&batch), &hash)? else {
+            return Err(Error::MalformedAtRest("legacy step retention missing"));
+        };
+        let cached = match tracked.cache_id {
+            Some(id) => {
+                let sealed = batch
+                    .get_segment(&self.channel_id, SegmentKind::PlaintextCache, id)?
+                    .ok_or(Error::MalformedAtRest("legacy Session cache missing"))?;
+                let CacheRow::Session(row) = parse_cache(&open_segment(
+                    &self.sek,
+                    SegmentKind::PlaintextCache,
+                    id,
+                    &sealed,
+                )?)?
+                else {
+                    return Err(Error::MalformedAtRest("legacy Session cache kind"));
+                };
+                if row.entry_hash != hash || row.author != entry.skeleton.author_id {
+                    return Err(Error::MalformedAtRest("legacy Session cache binding"));
                 }
+                Some(row)
             }
-            {
-                let mut index = self
-                    .entries
-                    .write(&mut batch, &self.sek, &self.channel_id)?;
-                index.committing(self.next_log_id);
-                self.dag.prune_payload(&mut index, &hash)?;
-                index.seal()?;
-            }
-            let age = seal_segment(
-                &self.sek,
-                SegmentKind::Index,
-                tracked.log_id,
-                &first_seen_bytes(tracked.first_seen_ms, true),
-            )?;
-            batch.put_segment(&self.channel_id, SegmentKind::Index, tracked.log_id, &age)?;
-            if let Some(cache) = tracked.cache_id {
-                batch.delete_segment(&self.channel_id, SegmentKind::PlaintextCache, cache)?;
+            None => None,
+        };
+        let author = entry.skeleton.author_id;
+        private_index::observe_public(&mut batch, &self.sek, &self.channel_id, &entry, self.epoch)?;
+        let current_drive = self.legacy_current_drive(Transaction::Batch(&batch), &author)?;
+        let generation =
+            private_index::control_in(&batch, &self.sek, &self.channel_id, &author)?.generation;
+        let record = Record::legacy(entry).ok().filter(|r| {
+            self.authors
+                .get(&author)
+                .is_some_and(|key| r.verify(&self.channel_id, key).is_ok())
+        });
+        let mut next = self.private_sessions.next.max(1);
+        let no_announced_floor = self
+            .floor_author(Transaction::Batch(&batch), &author)?
+            .announced
+            .is_none();
+        if !self.private_contains_in(&batch, &hash)? {
+            if let Some(record) = record.filter(|r| {
+                current_drive
+                    && (cached.is_some()
+                        || permitted
+                        || author == self.me()
+                        || (no_announced_floor
+                            && generation == Some(r.message.header.chain_id)
+                            && self
+                                .drive
+                                .receivers
+                                .get(&(author, r.message.header.chain_id))
+                                .is_some_and(|chain| {
+                                    chain.can_open_iteration(r.message.header.iteration)
+                                })))
+            }) {
+                let saved = Stored {
+                    record,
+                    row: cached,
+                    first_seen: tracked.first_seen_ms,
+                };
+                let id = next;
+                next = id
+                    .checked_add(1)
+                    .ok_or(Error::SizeLimitExceeded("private Session records"))?;
+                let segment =
+                    seal_segment(&self.sek, SegmentKind::PrivateSession, id, &saved.bytes())?;
+                batch.put_segment(&self.channel_id, SegmentKind::PrivateSession, id, &segment)?;
+                private_index::put(&mut batch, &self.sek, &self.channel_id, id, &saved)?;
             }
         }
-        self.queue_private_generations(&mut batch)?;
+        {
+            let mut index = self
+                .entries
+                .write(&mut batch, &self.sek, &self.channel_id)?;
+            index.committing(self.next_log_id);
+            self.dag.prune_payload(&mut index, &hash)?;
+            index.set_retention(hash, None)?;
+            index.seal()?;
+        }
+        let age = seal_segment(
+            &self.sek,
+            SegmentKind::Index,
+            tracked.log_id,
+            &first_seen_bytes(tracked.first_seen_ms, true),
+        )?;
+        batch.put_segment(&self.channel_id, SegmentKind::Index, tracked.log_id, &age)?;
+        if let Some(cache) = tracked.cache_id {
+            batch.delete_segment(&self.channel_id, SegmentKind::PlaintextCache, cache)?;
+        }
         batch.commit()?;
-        for (id, saved) in kept {
-            self.private_sessions.hashes.insert(saved.record.hash(), id);
-            self.private_sessions.records.insert(id, saved);
-        }
         self.private_sessions.next = next;
         self.entries.committed();
-        let gone: BTreeSet<_> = records.iter().map(|(hash, _)| *hash).collect();
-        for hash in &gone {
-            self.retention.forget(hash);
-        }
-        self.drive.sessions.retain(|row| {
-            !gone.contains(&row.entry_hash)
-                || self.private_sessions.hashes.contains_key(&row.entry_hash)
-        });
-        self.private_sessions.legacy_pending.clear();
-        self.sweep_private_sessions(store, now)?;
         Ok(())
     }
 
-    /// A migrated, authorized body may have preceded its key package. Decrypt it once that key
-    /// is installed; retain its original age and never re-fetch it through the public log.
+    /// A key arrival schedules a bounded pass; it cannot synchronously scan every retained
+    /// record while holding the room. Already readable rows are never reopened or discarded.
     pub(super) fn render_pending_private(&mut self, store: &Store, now: u64) -> Result<()> {
-        if self.private_sessions.upgrading {
-            return Ok(());
+        self.private_sessions.pending_active = true;
+        self.private_sessions.pending_after = None;
+        self.private_sessions.pending_through = self.private_sessions.next;
+        if self.private_policy_ready(store, now)?
+            && !self.private_sessions.upgrading
+            && !self.private_sessions.restoring
+            && self.private_sessions.legacy_work.is_none()
+            && self.private_sessions.legacy_pending.is_empty()
+            && self.private_controls_ready(store)?
+        {
+            let result = self.advance_pending_private(store, now).map(|_| ());
+            if let Err(error) = &result {
+                self.private_save_failed(error);
+            }
+            result
+        } else {
+            Ok(())
         }
-        let pending: Vec<_> = self
-            .private_sessions
-            .records
-            .values()
-            .filter(|saved| {
-                saved.row.is_none()
-                    && self.legacy_current_drive(&saved.record.message.header.author_id)
-            })
-            .filter(|saved| {
-                self.drive.receivers.contains_key(&(
+    }
+
+    fn advance_pending_private(&mut self, store: &Store, now: u64) -> Result<bool> {
+        if !self.private_sessions.pending_active {
+            return Ok(true);
+        }
+        if !self.private_policy_ready(store, now)? {
+            return Ok(false);
+        }
+        let mut bytes = 0usize;
+        for _ in 0..WORK_ROWS {
+            let next = self.private_after(store, self.private_sessions.pending_after)?;
+            let Some((id, saved)) =
+                next.filter(|(id, _)| *id < self.private_sessions.pending_through)
+            else {
+                self.private_sessions.pending_active = false;
+                self.private_sessions.pending_after = None;
+                return Ok(true);
+            };
+            let size = saved.record.message.ciphertext.len();
+            if bytes != 0 && bytes.saturating_add(size) > WORK_BYTES {
+                break;
+            }
+            bytes = bytes.saturating_add(size);
+            if saved.row.is_none()
+                && self.legacy_current_drive(
+                    Transaction::Snapshot(&store.snapshot()?),
+                    &saved.record.message.header.author_id,
+                )?
+                && self.drive.receivers.contains_key(&(
                     saved.record.message.header.author_id,
                     saved.record.message.header.chain_id,
                 ))
-            })
-            .map(|saved| saved.record.wire())
-            .collect();
-        for wire in pending {
-            if let Err(error) = self.take_private_record(store, &wire, now) {
-                if self.poisoned {
-                    return Err(error);
+            {
+                if let Err(error) = self.take_private_record(store, &saved.record.wire(), now) {
+                    // A policy replay is not a verdict on the saved wire. Keep both the
+                    // record and the last completed cursor so the same row can be retried.
+                    if super::governance::refreshing(&error) || floor_index::refreshing(&error) {
+                        return Ok(false);
+                    }
+                    if self.poisoned {
+                        return Err(error);
+                    }
+                    // Only an unread invalid wire is discarded. Storage failures propagate
+                    // through the caller's poison guard and cannot masquerade as absence.
+                    if let Some(current) = self.private_at(store, id)? {
+                        if current.row.is_none() {
+                            let mut batch = store.batch()?;
+                            batch.delete_segment(
+                                &self.channel_id,
+                                SegmentKind::PrivateSession,
+                                id,
+                            )?;
+                            private_index::remove(
+                                &mut batch,
+                                &self.sek,
+                                &self.channel_id,
+                                id,
+                                &current,
+                            )?;
+                            batch.commit()?;
+                            if !self.private_sessions.invalid_noted {
+                                self.set_aside.push(format!(
+                                    "invalid unread private Session {}: {error}; further refusals are logged",
+                                    crate::node::link::b32_encode(&current.record.hash())
+                                ));
+                                self.private_sessions.invalid_noted = true;
+                            }
+                            tracing::warn!(room = ?self.channel_id, hash = ?current.record.hash(), %error,
+                                "discarded invalid unread legacy Session");
+                        }
+                    }
                 }
-                // An old author may have sealed malformed/non-Session content in the drive
-                // namespace. Do not let that keep a whole room closed during upgrade. Only
-                // unread migration records are discarded here; a stored readable row stays.
-                let hash = Record::read(&wire)?.hash();
-                let Some(id) = self.private_sessions.hashes.get(&hash).copied() else {
-                    continue;
-                };
-                if self
-                    .private_sessions
-                    .records
-                    .get(&id)
-                    .is_none_or(|s| s.row.is_some())
-                {
-                    continue;
-                }
-                let mut batch = store.batch()?;
-                batch.delete_segment(&self.channel_id, SegmentKind::PrivateSession, id)?;
-                batch.commit()?;
-                self.private_sessions.records.remove(&id);
-                self.private_sessions.hashes.remove(&hash);
-                self.set_aside.push(format!(
-                    "legacy Session {}: {error}",
-                    crate::node::link::b32_encode(&hash)
-                ));
             }
+            self.private_sessions.pending_after = Some(id);
         }
-        Ok(())
+        Ok(false)
     }
 
     pub(crate) fn needs_session_upgrade(&self) -> bool {
         self.private_sessions.upgrading
+            || self.private_sessions.restoring
+            || self.private_sessions.controls_import
+            || !self.private_sessions.legacy_pending.is_empty()
+            || self.private_sessions.legacy_work.is_some()
+            || self.private_sessions.pending_active
     }
 
-    /// Called before publication, after the actor has tried the stored key packages. Without
-    /// that ordering an old writer's legitimate, not-yet-opened drive grant could look absent.
-    pub(crate) fn finish_session_upgrade(&mut self, store: &Store, now: u64) -> Result<()> {
+    /// The actor yields between false results and keeps the room unpublished. Key packages
+    /// have already been attempted when the initial gate is lifted.
+    pub(crate) fn finish_session_upgrade(&mut self, store: &Store, now: u64) -> Result<bool> {
+        self.private_sessions.upgrading = false;
+        self.advance_private_sessions(store, now)
+    }
+
+    // An incomplete governance projection must neither expire saved Session bodies nor
+    // release them using a policy sampled before the current canonical room history.
+    fn private_policy_ready(&self, store: &Store, now: u64) -> Result<bool> {
+        match self.require_governance_ready(store, crate::time::Ms(now)) {
+            Ok(()) => Ok(true),
+            Err(error)
+                if super::governance::refreshing(&error) || floor_index::refreshing(&error) =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Also driven by ordinary maintenance, before Session projection or grant release.
+    pub(crate) fn advance_private_sessions(&mut self, store: &Store, now: u64) -> Result<bool> {
+        if !self.private_policy_ready(store, now)? {
+            return Ok(false);
+        }
         if self.poisoned {
             return Err(self.save_failure());
         }
-        self.private_sessions.upgrading = false;
-        self.migrate_legacy_steps(store, now)?;
-        self.render_pending_private(store, now)
+        if self.private_sessions.upgrading {
+            return Ok(false);
+        }
+        let result = (|| {
+            if self.private_sessions.restoring {
+                return self.restore_private_chunk(store);
+            }
+            if !self.private_controls_ready(store)? {
+                self.advance_private_controls(store)?;
+                return Ok(false);
+            }
+            if self.private_sessions.legacy_work.is_some()
+                || !self.private_sessions.legacy_pending.is_empty()
+            {
+                self.migrate_legacy_steps_inner(store, now)?;
+                return Ok(false);
+            }
+            if !self.advance_pending_private(store, now)? {
+                return Ok(false);
+            }
+            self.sweep_private_sessions(store, now)?;
+            self.private_expiry_ready(store, now)
+        })();
+        if let Err(error) = &result {
+            self.private_save_failed(error);
+        }
+        result.map(|complete| complete && !self.needs_session_upgrade())
     }
 
     pub(super) fn supports_private(&mut self, store: &Store, peer: &Digest32) -> Result<bool> {
-        let head = self.dag.verified_head(peer);
-        if let Some((known, supported)) = self.private_sessions.supports.get(peer) {
-            if *known == head {
-                return Ok(*supported);
-            }
+        if !self.private_controls_ready(store)? {
+            return Err(Error::StreamRefused("Session control facts are refreshing"));
         }
-        let expected = support_body(&self.channel_id, peer);
-        let mut supported = false;
-        let entries = self.entries.read(store, &self.sek, &self.channel_id)?;
-        for seq in 1..=head {
-            let entry = entries.get(peer, seq)?.ok_or(Error::MalformedAtRest(
-                "private capability feed entry missing",
-            ))?;
-            if entry.payload.as_deref() == Some(expected.as_slice()) {
-                supported = true;
-                break;
-            }
-        }
-        self.private_sessions
-            .supports
-            .insert(*peer, (head, supported));
-        Ok(supported)
+        Ok(
+            private_index::control(&store.snapshot()?, &self.sek, &self.channel_id, peer)?
+                .support
+                .is_some(),
+        )
     }
 
     /// Authenticated capability, not a Session step. Published old readers skip its unknown
@@ -477,113 +984,146 @@ impl ChannelState {
         Ok(())
     }
     pub(super) fn restore_private_sessions(&mut self, store: &Store) -> Result<()> {
-        if let Some(segment) = store.get_segment(
-            &self.channel_id,
-            SegmentKind::KeyMaterial,
-            SEG_LEGACY_DRIVE_GENERATIONS,
-        )? {
-            let bytes = open_segment(
-                &self.sek,
-                SegmentKind::KeyMaterial,
-                SEG_LEGACY_DRIVE_GENERATIONS,
-                &segment,
-            )?;
-            let mut d = Decoder::new(&bytes);
-            if d.array()? != 2 || d.uint()? != 1 {
-                return Err(Error::MalformedAtRest("legacy drive generations version"));
+        let _ = store;
+        self.private_sessions.controls_import = true;
+        self.private_sessions.controls_import_after = None;
+        self.private_sessions.controls_after = None;
+        self.private_sessions.restoring = true;
+        self.private_sessions.restore_after = None;
+        Ok(())
+    }
+
+    fn restore_private_chunk(&mut self, store: &Store) -> Result<bool> {
+        let mut bytes = 0usize;
+        for _ in 0..WORK_ROWS {
+            let Some((id, saved)) =
+                self.private_after(store, self.private_sessions.restore_after)?
+            else {
+                self.private_sessions.restoring = false;
+                self.private_sessions.pending_active = true;
+                self.private_sessions.pending_after = None;
+                self.private_sessions.pending_through = self.private_sessions.next;
+                return Ok(false);
+            };
+            let size = saved.record.message.ciphertext.len();
+            if bytes != 0 && bytes.saturating_add(size) > WORK_BYTES {
+                break;
             }
-            for _ in 0..d.array()? {
-                if d.array()? != 2 {
-                    return Err(Error::MalformedAtRest("legacy drive generation row"));
-                }
-                let author = d
-                    .bytes()?
-                    .try_into()
-                    .map_err(|_| Error::MalformedAtRest("legacy drive author"))?;
-                if self
-                    .private_sessions
-                    .legacy_generations
-                    .insert(author, d.uint()?)
-                    .is_some()
-                {
-                    return Err(Error::MalformedAtRest("duplicate legacy drive author"));
-                }
-            }
-            d.finish()?;
-        }
-        for (id, segment) in store.segments(&self.channel_id, SegmentKind::PrivateSession)? {
-            let bytes = open_segment(&self.sek, SegmentKind::PrivateSession, id, &segment)?;
-            let saved = Stored::read(&bytes)?;
+            bytes = bytes.saturating_add(size);
             let key = self
                 .authors
                 .get(&saved.record.message.header.author_id)
                 .ok_or(Error::MalformedAtRest("private Session author missing"))?;
             saved.record.verify(&self.channel_id, key)?;
-            self.private_sessions.next = self.private_sessions.next.max(id.saturating_add(1));
-            self.private_sessions.hashes.insert(saved.record.hash(), id);
-            if let Some(row) = &saved.row {
-                self.drive.sessions.push(row.clone());
-            }
-            self.private_sessions.records.insert(id, saved);
+            let next = id
+                .checked_add(1)
+                .ok_or(Error::MalformedAtRest("private Session id exhausted"))?;
+            let mut batch = store.batch()?;
+            private_index::put(&mut batch, &self.sek, &self.channel_id, id, &saved)?;
+            batch.commit()?;
+            self.private_sessions.next = self.private_sessions.next.max(next);
+            self.private_sessions.restore_after = Some(id);
         }
-        Ok(())
+        Ok(false)
     }
 
     pub(super) fn sweep_private_sessions(&mut self, store: &Store, now: u64) -> Result<usize> {
+        if !self.private_policy_ready(store, now)? {
+            return Ok(0);
+        }
         if self.poisoned {
             return Ok(0);
         }
-        let due: Vec<_> = self
-            .private_sessions
-            .records
-            .iter()
-            .filter(|(_, s)| {
-                let ttl = if s
-                    .row
-                    .as_ref()
-                    .is_some_and(|r| crate::node::sessions::is_record(&r.body))
-                {
-                    self.effective_retention()
-                } else {
-                    self.effective_step_retention()
-                };
-                ttl != 0
-                    && s.first_seen.min(
-                        s.row
-                            .as_ref()
-                            .map(|r| r.created_millis)
-                            .or_else(|| s.record.legacy_claimed_ms())
-                            .unwrap_or(s.first_seen),
-                    ) <= now.saturating_sub(ttl.saturating_mul(1000))
-            })
-            .map(|(id, s)| (*id, s.record.hash()))
-            .collect();
-        if due.is_empty() {
-            return Ok(0);
+        let result = self.sweep_private_sessions_inner(store, now);
+        if let Err(error) = &result {
+            self.private_save_failed(error);
         }
-        let saved = (|| {
-            let mut batch = store.batch()?;
-            for (id, _) in &due {
-                batch.delete_segment(&self.channel_id, SegmentKind::PrivateSession, *id)?;
+        result
+    }
+
+    fn sweep_private_sessions_inner(&mut self, store: &Store, now: u64) -> Result<usize> {
+        let mut count = 0usize;
+        let mut bytes = 0usize;
+        // One bounded page per maintenance turn; expiration is also checked at query time.
+        for _ in 0..WORK_ROWS {
+            let Some(id) = private_index::next_expired(
+                &store.snapshot()?,
+                &self.sek,
+                &self.channel_id,
+                now,
+                self.effective_retention(),
+                self.effective_step_retention(),
+            )?
+            else {
+                break;
+            };
+            let saved = self
+                .private_at(store, id)?
+                .ok_or(Error::MalformedAtRest("Session expiry locator missing"))?;
+            let size = saved.record.message.ciphertext.len();
+            if bytes != 0 && bytes.saturating_add(size) > WORK_BYTES {
+                break;
             }
-            batch.commit()
-        })();
-        if let Err(e) = saved {
-            self.private_save_failed(&e);
-            return Err(e);
+            bytes = bytes.saturating_add(size);
+            if !self.private_expired(&saved, now) {
+                return Err(Error::MalformedAtRest("Session expiry fact differs"));
+            }
+            let result = (|| {
+                let mut batch = store.batch()?;
+                batch.delete_segment(&self.channel_id, SegmentKind::PrivateSession, id)?;
+                private_index::remove(&mut batch, &self.sek, &self.channel_id, id, &saved)?;
+                batch.commit()
+            })();
+            if let Err(error) = result {
+                self.private_save_failed(&error);
+                return Err(error);
+            }
+            count = count.saturating_add(1);
         }
-        for (id, hash) in &due {
-            self.private_sessions.records.remove(id);
-            self.private_sessions.hashes.remove(hash);
+        Ok(count)
+    }
+
+    pub(super) fn private_expiry_ready(&self, store: &Store, now: u64) -> Result<bool> {
+        if !self.private_policy_ready(store, now)? {
+            return Ok(false);
         }
-        let gone: BTreeSet<_> = due.iter().map(|(_, h)| *h).collect();
-        self.drive
-            .sessions
-            .retain(|row| !gone.contains(&row.entry_hash));
-        Ok(due.len())
+        if self.needs_session_upgrade() {
+            return Ok(false);
+        }
+        Ok(private_index::next_expired(
+            &store.snapshot()?,
+            &self.sek,
+            &self.channel_id,
+            now,
+            self.effective_retention(),
+            self.effective_step_retention(),
+        )?
+        .is_none())
+    }
+
+    pub(super) fn private_expired(&self, saved: &Stored, now: u64) -> bool {
+        let ttl = if saved
+            .row
+            .as_ref()
+            .is_some_and(|row| crate::node::sessions::is_record(&row.body))
+        {
+            self.effective_retention()
+        } else {
+            self.effective_step_retention()
+        };
+        let claimed = saved
+            .row
+            .as_ref()
+            .map(|row| row.created_millis)
+            .or_else(|| saved.record.legacy_claimed_ms())
+            .unwrap_or(saved.first_seen);
+        ttl != 0 && saved.first_seen.min(claimed) <= now.saturating_sub(ttl.saturating_mul(1000))
     }
 
     fn private_save_failed(&mut self, error: &Error) {
+        if super::governance::refreshing(error) || floor_index::refreshing(error) {
+            return;
+        }
         self.poisoned = true;
         self.save_error = Some(error.to_string());
     }
@@ -596,10 +1136,7 @@ impl ChannelState {
     ) -> Result<Digest32> {
         let hash = saved.record.hash();
         let id = self
-            .private_sessions
-            .hashes
-            .get(&hash)
-            .copied()
+            .private_id(store, &hash)?
             .unwrap_or(self.private_sessions.next.max(1));
         let Some(next) = id.checked_add(1) else {
             let error = Error::SizeLimitExceeded("private Session records");
@@ -609,8 +1146,15 @@ impl ChannelState {
         let result = (|| {
             let segment = seal_segment(&self.sek, SegmentKind::PrivateSession, id, &saved.bytes())?;
             let mut batch = store.batch()?;
+            if let Some(old) =
+                batch.get_segment(&self.channel_id, SegmentKind::PrivateSession, id)?
+            {
+                let old = self.read_private(id, &old)?;
+                private_index::remove(&mut batch, &self.sek, &self.channel_id, id, &old)?;
+            }
             batch.put_segment(&self.channel_id, SegmentKind::PrivateSession, id, &segment)?;
             self.queue_drive(&mut batch)?;
+            private_index::put(&mut batch, &self.sek, &self.channel_id, id, &saved)?;
             if let Some(completion) = completion {
                 completion.queue(&mut batch)?;
             }
@@ -624,79 +1168,279 @@ impl ChannelState {
             if !crate::node::drive::is_key_changed(&row.session_id) {
                 self.drive.news.push(row.session_id.clone());
             }
-            self.drive.sessions.push(row.clone());
         }
-        self.private_sessions.hashes.insert(hash, id);
-        self.private_sessions.records.insert(id, saved);
         self.private_sessions.next = self.private_sessions.next.max(next);
         self.gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(hash)
     }
 
-    /// Copy retained lifecycle state into the current grant without backfilling a step. Old
-    /// public copies stay unchanged (SA-5). Exact content/time matches make retry and restart
-    /// idempotent; a new grant needs a freshly sealed copy after its own key position.
+    /// Copy lifecycle source records into a new grant, without assembling whole metadata or
+    /// backfilling activity. False is pending work: callers must not release that grant yet.
     pub(crate) fn refresh_session_records(
         &mut self,
         profile: &Profile,
         holders: &BTreeSet<Digest32>,
         owed: &[Digest32],
         now: u64,
-    ) -> Result<()> {
-        let me = self.me();
-        let mut records = Vec::new();
-        for r in self.timeline.iter().filter(|r| r.author == me) {
-            let Ok(env) = vox_agentcomms::envelope::Envelope::parse(&r.text) else {
-                continue;
-            };
-            if !crate::node::sessions::is_record(&r.text) {
-                continue;
-            }
-            // An old multipart wrapper carries its bundle tag instead of `from`; the complete
-            // envelope inside still supplies the harness's actual id when folded.
-            let id = if env.from.is_empty() {
-                env.data["session_parts"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_owned()
-            } else {
-                env.from
-            };
-            records.push((r.created_millis, id, r.text.clone()));
+    ) -> Result<bool> {
+        if !self.private_policy_ready(profile.store(), now)? {
+            return Ok(false);
         }
-        records.extend(
+        if self.poisoned {
+            return Err(self.save_failure());
+        }
+        if self.needs_session_upgrade() {
+            return Ok(false);
+        }
+        if self.has_left(&self.me()) || self.ended(now).is_some() {
+            return Ok(true);
+        }
+        let result = self.refresh_session_records_inner(profile, holders, owed, now);
+        if let Err(error) = &result {
+            self.private_save_failed(error);
+        }
+        result
+    }
+
+    fn refresh_grant(
+        &self,
+        store: &Store,
+        holders: &BTreeSet<Digest32>,
+        owed: &[Digest32],
+    ) -> Result<Digest32> {
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        hash.update(b"vox/private-session-refresh-grant/v1");
+        hash.update(self.epoch.to_be_bytes());
+        hash.update(
             self.drive
-                .sessions
-                .lifecycle()
-                .filter(|r| r.author == me)
-                .map(|r| (r.created_millis, r.session_id.clone(), r.body.clone())),
+                .chain
+                .as_ref()
+                .map_or(0, |c| c.chain_id())
+                .to_be_bytes(),
         );
-        if records.is_empty() || self.has_left(&me) || self.ended(now).is_some() {
-            return Ok(());
+        hash.update((holders.len() as u64).to_be_bytes());
+        for peer in holders {
+            hash.update(peer);
         }
+        hash.update((owed.len() as u64).to_be_bytes());
+        for peer in owed {
+            hash.update(peer);
+            hash.update(self.admission(peer).0.to_be_bytes());
+        }
+        // Any signed floor change by this author invalidates the previous scan, including
+        // a late change to an old generation. Current-recipient membership is hashed above.
+        hash.update(
+            self.floor_author(Transaction::Snapshot(&store.snapshot()?), &self.me())?
+                .revision
+                .to_be_bytes(),
+        );
+        Ok(hash.finalize().into())
+    }
+
+    fn refresh_session_records_inner(
+        &mut self,
+        profile: &Profile,
+        holders: &BTreeSet<Digest32>,
+        owed: &[Digest32],
+        now: u64,
+    ) -> Result<bool> {
         self.rotate_drive_if_lost(profile.store(), holders, crate::time::Ms(now))?;
-        let mut seen = BTreeSet::new();
-        for (created, session, body) in records {
-            if !seen.insert((created, body.clone())) {
-                continue;
-            }
-            let covered = self
-                .drive
-                .sessions
-                .lifecycle()
-                .filter(|r| r.author == me && r.created_millis == created && r.body == body)
-                .filter_map(|r| self.private_sessions.hashes.get(&r.entry_hash))
-                .filter_map(|id| self.private_sessions.records.get(id))
-                .any(|saved| {
-                    owed.iter()
-                        .all(|peer| self.private_permitted(&saved.record, peer))
-                });
-            if covered {
-                continue;
-            }
-            let content = crate::node::content::SessionEntry::new(created, &session, &body)?;
-            self.append_private_content(profile, content, holders, now, None)?;
+        let grant = self.refresh_grant(profile.store(), holders, owed)?;
+        let public = self
+            .entries
+            .render_view(profile.store(), &self.sek, &self.channel_id)?
+            .session_revision();
+        let private = private_index::lifecycle_revision(
+            &profile.store().snapshot()?,
+            &self.sek,
+            &self.channel_id,
+        )?;
+        let reset = self.private_sessions.refresh.as_ref().is_none_or(|work| {
+            work.grant != grant || work.public != public || work.private != private
+        });
+        if reset {
+            self.private_sessions.refresh = Some(RefreshWork {
+                grant,
+                public,
+                private,
+                through: self.private_sessions.next,
+                public_after: None,
+                private_after: None,
+                stage: 0,
+            });
         }
+        let mut work = self
+            .private_sessions
+            .refresh
+            .take()
+            .ok_or(Error::MalformedAtRest("Session refresh cursor missing"))?;
+        let mut bytes = 0usize;
+        let progress = (|| -> Result<()> {
+            for _ in 0..WORK_ROWS {
+                if work.stage == 0 {
+                    let next = {
+                        let view = self.entries.render_view(
+                            profile.store(),
+                            &self.sek,
+                            &self.channel_id,
+                        )?;
+                        view.session_candidate(work.public_after)?
+                            .map(|(key, _)| {
+                                let row = view.row(&key.2)?.ok_or(Error::MalformedAtRest(
+                                    "Session refresh candidate missing",
+                                ))?;
+                                Ok::<_, Error>((key, row))
+                            })
+                            .transpose()?
+                    };
+                    let Some((key, row)) = next else {
+                        work.stage = 1;
+                        continue;
+                    };
+                    if bytes != 0 && bytes.saturating_add(row.text.len()) > WORK_BYTES {
+                        break;
+                    }
+                    bytes = bytes.saturating_add(row.text.len());
+                    if row.author == self.me() && crate::node::sessions::is_record(&row.text) {
+                        let tracked = self
+                            .retention_get(profile.store(), &row.entry_hash)?
+                            .ok_or(Error::MalformedAtRest("Session refresh retention missing"))?;
+                        let ttl = self.effective_retention();
+                        if ttl == 0
+                            || tracked.first_seen_ms.min(row.created_millis)
+                                > now.saturating_sub(ttl.saturating_mul(1000))
+                        {
+                            let env = vox_agentcomms::envelope::Envelope::parse(&row.text)
+                                .map_err(|_| {
+                                    Error::MalformedAtRest("classified Session envelope changed")
+                                })?;
+                            let session = if env.from.is_empty() {
+                                env.data["session_parts"]
+                                    .as_str()
+                                    .unwrap_or_default()
+                                    .to_owned()
+                            } else {
+                                env.from
+                            };
+                            self.refresh_one_session_record(
+                                profile,
+                                holders,
+                                owed,
+                                row.created_millis,
+                                &session,
+                                &row.text,
+                                now,
+                            )?;
+                        }
+                    }
+                    work.public_after = Some(key);
+                } else if work.stage == 1 {
+                    let next = private_index::candidate_after(
+                        &profile.store().snapshot()?,
+                        &self.sek,
+                        &self.channel_id,
+                        work.private_after,
+                    )?;
+                    let Some((key, id)) = next else {
+                        work.stage = 2;
+                        break;
+                    };
+                    if id < work.through {
+                        let saved =
+                            self.private_at(profile.store(), id)?
+                                .ok_or(Error::MalformedAtRest(
+                                    "Session refresh private source missing",
+                                ))?;
+                        let size = saved.record.message.ciphertext.len();
+                        if bytes != 0 && bytes.saturating_add(size) > WORK_BYTES {
+                            break;
+                        }
+                        bytes = bytes.saturating_add(size);
+                        if !self.private_expired(&saved, now) {
+                            if let Some(row) = saved.row.filter(|r| {
+                                r.author == self.me() && crate::node::sessions::is_record(&r.body)
+                            }) {
+                                self.refresh_one_session_record(
+                                    profile,
+                                    holders,
+                                    owed,
+                                    row.created_millis,
+                                    &row.session_id,
+                                    &row.body,
+                                    now,
+                                )?;
+                            }
+                        }
+                    }
+                    work.private_after = Some(key);
+                } else {
+                    break;
+                }
+            }
+            Ok(())
+        })();
+        if progress.as_ref().is_err_and(floor_index::refreshing) {
+            self.private_sessions.refresh = Some(work);
+            return Ok(false);
+        }
+        progress?;
+        // Our own refresh copies change this generation; they do not invalidate their
+        // source cursor. A later independent lifecycle write does restart it next turn.
+        work.private = private_index::lifecycle_revision(
+            &profile.store().snapshot()?,
+            &self.sek,
+            &self.channel_id,
+        )?;
+        let complete =
+            work.stage == 2 && work.grant == self.refresh_grant(profile.store(), holders, owed)?;
+        self.private_sessions.refresh = Some(work);
+        Ok(complete)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn refresh_one_session_record(
+        &mut self,
+        profile: &Profile,
+        holders: &BTreeSet<Digest32>,
+        owed: &[Digest32],
+        created: u64,
+        session: &str,
+        body: &str,
+        now: u64,
+    ) -> Result<()> {
+        let matched = private_index::matching_lifecycle(
+            &profile.store().snapshot()?,
+            &self.sek,
+            &self.channel_id,
+            &self.me(),
+            created,
+            body,
+        )?;
+        if let Some(id) = matched {
+            let saved = self
+                .private_at(profile.store(), id)?
+                .ok_or(Error::MalformedAtRest("Session refresh locator missing"))?;
+            if !saved.row.as_ref().is_some_and(|row| {
+                row.author == self.me() && row.created_millis == created && row.body == body
+            }) {
+                return Err(Error::MalformedAtRest("Session refresh locator binding"));
+            }
+            if !self.private_expired(&saved, now) {
+                let mut all = true;
+                for peer in owed {
+                    if !self.private_permitted(profile.store(), &saved.record, peer)? {
+                        all = false;
+                        break;
+                    }
+                }
+                if all {
+                    return Ok(());
+                }
+            }
+        }
+        let content = crate::node::content::SessionEntry::new(created, session, body)?;
+        self.append_private_content(profile, content, holders, now, None)?;
         Ok(())
     }
 
@@ -734,6 +1478,7 @@ impl ChannelState {
         now: u64,
         completion: Option<&crate::node::session_ingress::Completion>,
     ) -> Result<Digest32> {
+        self.require_governance_ready(profile.store(), crate::time::Ms(now))?;
         if self.poisoned {
             return Err(Error::Profile("room save failed; reopen it"));
         }
@@ -793,53 +1538,49 @@ impl ChannelState {
 
     /// A current grant and an uninterrupted grant from the step's generation are both needed.
     /// A revoked-and-regranted peer cannot use its retained old key to backfill a former grant.
-    fn private_permitted(&self, record: &Record, recipient: &Digest32) -> bool {
+    fn private_permitted(
+        &self,
+        store: &Store,
+        record: &Record,
+        recipient: &Digest32,
+    ) -> Result<bool> {
         let h = &record.message.header;
         if !self.settled || self.has_left(recipient) || !self.authors.contains_key(recipient) {
-            return false;
+            return Ok(false);
         }
         if h.author_id == *recipient {
-            return true;
+            return Ok(true);
         }
         let membership = self.admission(recipient).0;
-        let Some((m, iteration, _)) =
-            self.drive
-                .floors
-                .get(&(h.author_id, *recipient, h.epoch, h.chain_id))
-        else {
-            return false;
-        };
-        if *m != membership || h.iteration < *iteration {
-            return false;
-        }
-        let mut saw_author = false;
-        for ((author, target, epoch, generation), (_, _, author_start)) in &self.drive.floors {
-            if *author != h.author_id
-                || author != target
-                || (*epoch, *generation) < (h.epoch, h.chain_id)
+        {
+            let snapshot = store.snapshot()?;
+            let transaction = Transaction::Snapshot(&snapshot);
+            if self.floor_author(transaction, &h.author_id)?.through
+                < self.dag.verified_head(&h.author_id)
             {
-                continue;
+                return Err(Error::StreamRefused(floor_index::REFRESHING));
             }
-            saw_author = true;
-            if self
-                .drive
-                .floors
-                .get(&(*author, *recipient, *epoch, *generation))
-                .is_none_or(|(m, from, first_seq)| {
-                    *m != membership
-                        || ((*epoch, *generation) > (h.epoch, h.chain_id)
-                            && (*from != 0 || first_seq > author_start))
-                })
-            {
-                return false;
+            let Some((m, iteration, _)) =
+                self.session_floor(transaction, &(h.author_id, *recipient, h.epoch, h.chain_id))?
+            else {
+                return Ok(false);
+            };
+            if m != membership || h.iteration < iteration {
+                return Ok(false);
             }
-            // Continuing holders are marked at iteration zero before the author's own floor
-            // is published. A later grant in any intervening generation breaks continuity:
-            // its key position may be later, or it may still be zero if nobody has written
-            // yet. The signed public position distinguishes that second case. Merely having
-            // a floor again must never revive permission to fetch the former grant's bodies.
         }
-        saw_author
+        let range = floor_index::continuity_step(
+            store,
+            &self.sek,
+            &self.channel_id,
+            &h.author_id,
+            recipient,
+            membership,
+        )?
+        .ok_or(Error::StreamRefused(floor_index::REFRESHING))?;
+        Ok(range.is_some_and(|(lower, upper)| {
+            lower <= (h.epoch, h.chain_id) && (h.epoch, h.chain_id) <= upper
+        }))
     }
 
     pub(crate) fn private_page(
@@ -849,17 +1590,16 @@ impl ChannelState {
         peer: &Digest32,
         holders: &BTreeSet<Digest32>,
     ) -> Result<Page> {
+        self.require_governance_ready(store, crate::time::Ms(self.now_hint))?;
         if self.poisoned
+            || self.needs_session_upgrade()
             || ask.room != self.channel_id
             || ask.epoch != self.epoch
             || !self.drive_members().contains(peer)
         {
             return Err(Error::StreamRefused("private Session room unavailable"));
         }
-        if let Err(error) = self.index_session_floors(store) {
-            self.poison(&error);
-            return Err(error);
-        }
+        self.index_session_floors(store)?;
         let incarnation = match self.private_sessions.incarnation {
             Some(i) => i,
             None => {
@@ -876,29 +1616,25 @@ impl ChannelState {
         };
         let mut records = Vec::new();
         // Bound CPU and bytes even when most retained records belong to other audiences.
-        for (scanned, (id, saved)) in self
-            .private_sessions
-            .records
-            .range((std::ops::Bound::Excluded(after), std::ops::Bound::Unbounded))
-            .enumerate()
-        {
-            if scanned == 256 || records.len() == PAGE_RECORDS {
+        for _ in 0..256 {
+            if records.len() == PAGE_RECORDS {
                 break;
             }
-            after = *id;
+            let Some((id, saved)) = self.private_after(store, Some(after))? else {
+                break;
+            };
+            after = id;
+            if self.private_expired(&saved, self.now_hint) {
+                continue;
+            }
             if saved.record.message.header.author_id == self.me() && !holders.contains(peer) {
                 continue;
             }
-            if self.private_permitted(&saved.record, peer) {
+            if self.private_permitted(store, &saved.record, peer)? {
                 records.push(saved.record.wire());
             }
         }
-        let more = self
-            .private_sessions
-            .records
-            .keys()
-            .next_back()
-            .is_some_and(|id| *id > after);
+        let more = self.private_after(store, Some(after))?.is_some();
         Ok(Page {
             revision: 0,
             cursor: Cursor { incarnation, after },
@@ -912,6 +1648,9 @@ impl ChannelState {
         store: &Store,
         peer: Digest32,
     ) -> Result<Option<Ask>> {
+        if !self.private_policy_ready(store, self.now_hint)? {
+            return Ok(None);
+        }
         if self.poisoned
             || self.drive.receivers.is_empty()
             || !self.supports_private(store, &peer)?
@@ -949,6 +1688,7 @@ impl ChannelState {
     ) -> Result<bool> {
         self.private_sessions.pulling.remove(&peer);
         let page = page?;
+        self.require_governance_ready(store, crate::time::Ms(now))?;
         if self.poisoned || !self.drive_members().contains(&peer) {
             return Err(Error::StreamRefused("private Session room unavailable"));
         }
@@ -968,15 +1708,26 @@ impl ChannelState {
     }
 
     fn take_private_record(&mut self, store: &Store, wire: &[u8], now: u64) -> Result<()> {
+        if let Err(error) = self.require_governance_ready(store, crate::time::Ms(now)) {
+            self.private_save_failed(&error);
+            return Err(error);
+        }
         let record = Record::read(wire)?;
         let hash = record.hash();
-        if self
-            .private_sessions
-            .hashes
-            .get(&hash)
-            .and_then(|id| self.private_sessions.records.get(id))
-            .is_some_and(|s| s.row.is_some())
-        {
+        let known = (|| {
+            self.private_id(store, &hash)?
+                .map(|id| self.private_at(store, id))
+                .transpose()
+                .map(Option::flatten)
+        })();
+        let known = match known {
+            Ok(known) => known,
+            Err(error) => {
+                self.private_save_failed(&error);
+                return Err(error);
+            }
+        };
+        if known.as_ref().is_some_and(|saved| saved.row.is_some()) {
             return Ok(());
         }
         let author = record.message.header.author_id;
@@ -988,16 +1739,12 @@ impl ChannelState {
         if author == self.me() {
             return Ok(());
         }
-        let migrated = self
-            .private_sessions
-            .hashes
-            .get(&hash)
-            .and_then(|id| self.private_sessions.records.get(id));
+        let migrated = known.as_ref();
         let first_seen = migrated.map_or(now, |saved| saved.first_seen);
         let locally_held = migrated.is_some()
             && record.legacy_claimed_ms().is_some()
-            && self.legacy_current_drive(&author);
-        if !locally_held && !self.private_permitted(&record, &self.me()) {
+            && self.legacy_current_drive(Transaction::Snapshot(&store.snapshot()?), &author)?;
+        if !locally_held && !self.private_permitted(store, &record, &self.me())? {
             return Err(Error::StreamRefused("private Session has no drive grant"));
         }
         let slot = (author, record.message.header.chain_id);
@@ -1043,12 +1790,7 @@ impl ChannelState {
         self.private_sessions.attempted.clear();
     }
 
-    pub(super) fn private_drive_used(&self) -> Option<u64> {
-        self.private_sessions
-            .records
-            .values()
-            .filter(|s| s.record.message.header.author_id == self.me())
-            .map(|s| s.record.message.header.chain_id)
-            .max()
+    pub(super) fn private_drive_used(&self, store: &Store) -> Result<Option<u64>> {
+        self.legacy_drive_generation(store, &self.me())
     }
 }

@@ -150,14 +150,14 @@ impl<A> Entry<A> {
 }
 
 /// `rows` (author, body), one Session's entries in order, as entries: the parts of a split entry
-/// joined into one, whole, by (author, kind, ref). A body that is not a JSON object is skipped.
+/// joined by (author, kind, ref, occurrence). A body that is not a JSON object is skipped.
 #[must_use]
 pub fn join<'a, A: Ord + Clone + 'a>(
     rows: impl IntoIterator<Item = (A, &'a str)>,
 ) -> Vec<Entry<A>> {
     let mut out: Vec<Entry<A>> = Vec::new();
-    // A split entry waiting for its later parts: (author, kind, ref) → its index in `out`.
-    let mut open: BTreeMap<(A, String, String), usize> = BTreeMap::new();
+    // An occurrence keeps later observations of a reused request ref separate.
+    let mut open: BTreeMap<(A, String, String, String), usize> = BTreeMap::new();
     for (author, body) in rows {
         let Ok(Value::Object(fields)) = serde_json::from_str::<Value>(body) else {
             continue;
@@ -171,6 +171,7 @@ pub fn join<'a, A: Ord + Clone + 'a>(
             e.author.clone(),
             e.kind().to_owned(),
             e.reference().to_owned(),
+            e.str("occurrence").to_owned(),
         );
         let field = big_field(e.kind());
         match open.get(&key) {

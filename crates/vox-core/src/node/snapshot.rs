@@ -1,6 +1,7 @@
 //! What a client that draws a node's rooms needs of it, in one request (ADR-026 C-7): the TUI is a
 //! client of the daemon and holds no node of its own (S-4), so the rooms, members, consents,
-//! shares, keyring, connected peers and tunnels it shows come from here.
+//! keyring, connected peers and tunnels it shows come from here. Governance is read
+//! through selected pages, with explicit continuation.
 //!
 //! The node's [`NodeView`](crate::node::api::NodeView) minus everything a client draws no row of:
 //! no timelines (a client reads the room on screen with [`crate::node::ipc::Request::Read`], one
@@ -43,13 +44,13 @@ pub struct OpenRoomSnap {
     pub name: Option<String>,
     /// Its members, in fingerprint order.
     pub members: Vec<Digest32>,
-    /// Who this identity consents to reading it here, in fingerprint order.
-    pub consented: Vec<Digest32>,
+    /// Current members this identity consents to, for roster indicators only.
+    pub member_consent: Vec<Digest32>,
+    /// Checked governance revision for selected-page refresh.
+    pub governance_revision: u64,
     /// The other members that consent to this identity reading them here, in fingerprint order:
-    /// the inbound half of `consented`, so a client can show who trusts this node (ADR-028 L-4).
+    /// the inbound half of `member_consent`, so a client can show who trusts this node (ADR-028 L-4).
     pub consenting: Vec<Digest32>,
-    /// What every member shares here: `(sharer, name, udp, kind)`.
-    pub shares: Vec<crate::node::channel::Share>,
     /// The members held back for equivocating: `(author, seq)`.
     pub equivocations: Vec<(Digest32, u64)>,
     /// Who has read this node's own recent messages here: `(entry, readers)`, oldest first
@@ -58,14 +59,9 @@ pub struct OpenRoomSnap {
     /// Where this node's own recent messages are: `(entry, how many of the other members' nodes
     /// hold it)` ([`crate::node::api::ChannelDetail::held`]).
     pub held: Vec<(Digest32, u64)>,
-    /// What a person is told happened to the room, in its order (ADR-028 E-5).
-    pub notices: Vec<crate::node::channel::RoomNotice>,
     /// Who trusts each member (ADR-028 K-7): `(member, the members that consent to it reading
     /// them)`.
     pub trusted_by: Vec<(Digest32, Vec<Digest32>)>,
-    /// Who has pulled each of this node's shares here whole: `(entry, members)` (ADR-028 F-7;
-    /// [`crate::node::shares::Shares::pulled_by`]).
-    pub pulled_by: Vec<(Digest32, Vec<Digest32>)>,
     /// The retention this node applies here, seconds, `0` forever
     /// ([`crate::node::api::ChannelDetail::retention`]): what the room's header always shows
     /// (ADR-028 R-7).
@@ -78,9 +74,8 @@ pub struct OpenRoomSnap {
     pub step_retention: u64,
     /// This node's explicit shorter Session-step lifetime, if it has one.
     pub local_step_retention: Option<u64>,
-    /// The room's Sessions, oldest opening first (ADR-029;
-    /// [`crate::node::sessions::fold`]).
-    pub sessions: Vec<crate::node::sessions::SessionRow>,
+    /// Opaque Session change token, including private activity and actor lifetime.
+    pub session_revision: Digest32,
 }
 
 /// One node as a client draws it.
@@ -138,21 +133,19 @@ impl NodeSnapshot {
                         display_revision: d.display_revision,
                         name: d.name.clone(),
                         members: d.members.clone(),
-                        consented: d.consented.clone(),
+                        member_consent: d.member_consent.clone(),
+                        governance_revision: d.governance_revision,
                         consenting: d.consenting.clone(),
-                        shares: d.shares.clone(),
                         equivocations: d.equivocations.clone(),
                         read_by: d.read_by.clone(),
                         held: d.held.clone(),
-                        notices: d.notices.clone(),
                         trusted_by: d.trusted_by.clone(),
-                        pulled_by: handle.shares().pulled_by(&d.channel_id),
                         retention: d.retention,
                         room_retention: d.room_retention,
                         room_step_retention: d.room_step_retention,
                         step_retention: d.step_retention,
                         local_step_retention: d.local_step_retention,
-                        sessions: crate::node::sessions::fold(d),
+                        session_revision: handle.session_display_token(d, policy_current),
                     })
                     .collect(),
                 trusted: nv.trusted.clone(),
@@ -191,20 +184,13 @@ impl NodeSnapshot {
         }
         e.array(self.open.len());
         for o in &self.open {
-            e.array(19)
+            e.array(17)
                 .bytes(&o.channel_id)
                 .text(o.name.as_deref().unwrap_or_default());
             digests(&mut e, &o.members);
-            digests(&mut e, &o.consented);
+            digests(&mut e, &o.member_consent);
+            e.uint(o.governance_revision);
             digests(&mut e, &o.consenting);
-            e.array(o.shares.len());
-            for s in &o.shares {
-                e.array(4)
-                    .bytes(&s.host)
-                    .text(&s.name)
-                    .uint(u64::from(s.udp))
-                    .text(s.kind.as_str());
-            }
             e.array(o.equivocations.len());
             for (author, seq) in &o.equivocations {
                 e.array(2).bytes(author).uint(*seq);
@@ -218,27 +204,12 @@ impl NodeSnapshot {
             for (entry, n) in &o.held {
                 e.array(2).bytes(entry).uint(*n);
             }
-            e.array(o.notices.len());
-            for n in &o.notices {
-                e.array(5)
-                    .bytes(&n.entry_hash)
-                    .bytes(&n.author)
-                    .uint(n.created_millis)
-                    .text(&n.what)
-                    .bytes(n.after.as_ref().map_or(&[][..], |d| &d[..]));
-            }
             e.array(o.trusted_by.len());
             for (member, by) in &o.trusted_by {
                 e.array(2).bytes(member);
                 digests(&mut e, by);
             }
-            e.array(o.pulled_by.len());
-            for (entry, who) in &o.pulled_by {
-                e.array(2).bytes(entry);
-                digests(&mut e, who);
-            }
             e.uint(o.retention);
-            crate::node::sessions::put_rows(&mut e, &o.sessions);
             e.uint(o.room_retention)
                 .uint(o.room_step_retention)
                 .uint(o.step_retention);
@@ -246,7 +217,7 @@ impl NodeSnapshot {
             if let Some(seconds) = o.local_step_retention {
                 e.uint(seconds);
             }
-            e.uint(o.display_revision);
+            e.uint(o.display_revision).bytes(&o.session_revision);
         }
         e.array(self.trusted.len());
         for (fp, name) in &self.trusted {
@@ -320,32 +291,16 @@ impl NodeSnapshot {
         let mut open = Vec::new();
         for _ in 0..d.array().map_err(bad("ipc snapshot open rooms"))? {
             let fields = d.array().map_err(bad("ipc snapshot open room"))?;
-            if fields != 19 {
+            if fields != 17 {
                 return Err(Error::MalformedIpc("ipc snapshot open room"));
             }
             let channel_id = digest(&mut d)?;
             let name = Some(d.text().map_err(bad("ipc snapshot open name"))?.to_owned())
                 .filter(|n| !n.is_empty());
             let members = read_digests(&mut d)?;
-            let consented = read_digests(&mut d)?;
+            let member_consent = read_digests(&mut d)?;
+            let governance_revision = d.uint().map_err(bad("ipc snapshot governance revision"))?;
             let consenting = read_digests(&mut d)?;
-            let mut shares = Vec::new();
-            for _ in 0..d.array().map_err(bad("ipc snapshot shares"))? {
-                want(&mut d, 4, "ipc snapshot share")?;
-                let host = digest(&mut d)?;
-                let name = d.text().map_err(bad("ipc snapshot share name"))?.to_owned();
-                let udp = d.uint().map_err(bad("ipc snapshot share udp"))? != 0;
-                let kind = crate::governance::share::ServiceKind::from_word(
-                    d.text().map_err(bad("ipc snapshot share kind"))?,
-                )
-                .ok_or(Error::MalformedIpc("ipc snapshot share kind"))?;
-                shares.push(crate::node::channel::Share {
-                    host,
-                    name,
-                    udp,
-                    kind,
-                });
-            }
             let mut equivocations = Vec::new();
             for _ in 0..d.array().map_err(bad("ipc snapshot equivocations"))? {
                 want(&mut d, 2, "ipc snapshot equivocation")?;
@@ -365,40 +320,13 @@ impl NodeSnapshot {
                 let entry = digest(&mut d)?;
                 held.push((entry, d.uint().map_err(bad("ipc snapshot held count"))?));
             }
-            let mut notices = Vec::new();
-            for _ in 0..d.array().map_err(bad("ipc snapshot notices"))? {
-                want(&mut d, 5, "ipc snapshot notice")?;
-                let entry_hash = digest(&mut d)?;
-                let author = digest(&mut d)?;
-                let created_millis = d.uint().map_err(bad("ipc snapshot notice time"))?;
-                let what = d.text().map_err(bad("ipc snapshot notice"))?.to_owned();
-                let after = d.bytes().map_err(bad("ipc snapshot notice after"))?;
-                notices.push(crate::node::channel::RoomNotice {
-                    entry_hash,
-                    author,
-                    created_millis,
-                    what,
-                    after: if after.is_empty() {
-                        None
-                    } else {
-                        Some(digest_of(after)?)
-                    },
-                });
-            }
             let mut trusted_by = Vec::new();
             for _ in 0..d.array().map_err(bad("ipc snapshot trusted-by"))? {
                 want(&mut d, 2, "ipc snapshot trusted-by entry")?;
                 let member = digest(&mut d)?;
                 trusted_by.push((member, read_digests(&mut d)?));
             }
-            let mut pulled_by = Vec::new();
-            for _ in 0..d.array().map_err(bad("ipc snapshot pulled by"))? {
-                want(&mut d, 2, "ipc snapshot pulled by entry")?;
-                let entry = digest(&mut d)?;
-                pulled_by.push((entry, read_digests(&mut d)?));
-            }
             let retention = d.uint().map_err(bad("ipc snapshot retention"))?;
-            let sessions = crate::node::sessions::read_rows(&mut d)?;
             let room_retention = d.uint().map_err(bad("ipc snapshot room retention"))?;
             let room_step_retention = d.uint().map_err(bad("ipc snapshot room step retention"))?;
             let step_retention = d.uint().map_err(bad("ipc snapshot step retention"))?;
@@ -414,26 +342,25 @@ impl NodeSnapshot {
                 _ => return Err(Error::MalformedIpc("ipc snapshot local step retention")),
             };
             let display_revision = d.uint().map_err(bad("ipc snapshot display revision"))?;
+            let session_revision = digest(&mut d)?;
             open.push(OpenRoomSnap {
                 channel_id,
                 display_revision,
+                session_revision,
                 name,
                 members,
-                consented,
+                member_consent,
+                governance_revision,
                 consenting,
-                shares,
                 equivocations,
                 read_by,
                 held,
-                notices,
                 trusted_by,
-                pulled_by,
                 retention,
                 room_retention,
                 room_step_retention,
                 step_retention,
                 local_step_retention,
-                sessions,
             });
         }
         let mut trusted = Vec::new();

@@ -483,16 +483,18 @@ pub enum DaemonEvent {
 /// What happened to one batch of mirrored Session activity. Only Committed survives restart.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionAdmission {
-    /// Every item is committed to the encrypted inbox, with this sequence range.
+    /// Every applicable item has a durable receipt in this inclusive sequence range.
+    /// Repeated adapter source events reference their original sequences.
     Committed {
-        /// First sequence committed in this batch.
+        /// Lowest durable sequence covered by this batch.
         first: u64,
-        /// Last sequence committed in this batch.
+        /// Highest durable sequence covered by this batch.
         last: u64,
     },
     /// Retained only in the bounded volatile tail; no restart guarantee.
     Held(String),
-    /// Not retained. The producer must not claim acceptance or silently replay it.
+    /// This submission was refused; it did not retain new activity. Earlier source receipts
+    /// still stand. The producer must not claim new acceptance or silently replay it.
     Refused(String),
     /// The receipt disappeared; do not claim either acceptance or rejection, or replay it.
     Unconfirmed(String),
