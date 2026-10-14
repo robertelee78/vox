@@ -842,11 +842,13 @@ pub fn end(paths: &Paths, session: &str) {
 /// Lock contention or a failed removal is reported; absence already satisfies the removal.
 pub fn end_checked(paths: &Paths, session: &str) -> Result<(), String> {
     let _lock = registration_lock(paths)?;
+    // Keep the room-bearing registration until every fallible auxiliary removal is done.
+    // On failure the daemon can retry and still enqueue the end in its captured room.
     for path in [
-        paths.session_file(session),
         notices_file(paths, session),
         woke_file(paths, session),
         said_detached_file(paths, session),
+        paths.session_file(session),
     ] {
         match std::fs::remove_file(path) {
             Ok(()) => {}

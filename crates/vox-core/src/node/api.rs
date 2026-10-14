@@ -1130,8 +1130,8 @@ pub enum NodeCommand {
     /// Finish a hosted daemon's ordered cleanup after it retired this room's volatile tails
     /// and session bindings. Does not delete room history or reset persistent counters.
     RetireSessionRoom {
-        /// The explicitly removed room.
-        channel_id: Digest32,
+        /// The exact deletion whose saved bindings the owner cleared.
+        retirement: crate::node::session_ingress::Retirement,
         /// Receipt for the final inbox cleanup.
         reply: tokio::sync::oneshot::Sender<crate::error::Result<()>>,
     },

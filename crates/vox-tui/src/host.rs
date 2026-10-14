@@ -1698,7 +1698,27 @@ impl Router {
                 req.v
             ));
         }
+        // A fingerprint outlives locking in the actor's view. Bind this request to the
+        // currently attached actor, not merely to the same identity after a replacement.
+        let generation = {
+            let slots = lock(&self.inner.slots);
+            match slots.get(node) {
+                Some(Slot::Attached(attached))
+                    if Arc::ptr_eq(attached.handle.app(), handle.app())
+                        && !*attached.detached.borrow() =>
+                {
+                    Some(attached.generation)
+                }
+                _ => None,
+            }
+        };
+        let Some(generation) = generation else {
+            return refuse("the Session node is no longer attached; nothing was sent".into());
+        };
         let view = handle.view();
+        if view.locked || view.locking {
+            return refuse("the Session node is locking or Locked; nothing was sent".into());
+        }
         let me = view.identity.as_ref().map(|i| i.fingerprint);
         // DR-2: only a member this node trusts with drive, or the node itself, its Sessions'
         // operator (SC-2), which reaches here only from its own socket (`drive_own`).
@@ -1785,12 +1805,20 @@ impl Router {
             None,
         )
         .await;
+        let same_attachment = {
+            let slots = lock(&self.inner.slots);
+            matches!(slots.get(node), Some(Slot::Attached(attached))
+                if attached.generation == generation && !*attached.detached.borrow())
+        };
         let current = handle.view();
-        if current
-            .identity
-            .as_ref()
-            .map(|identity| identity.fingerprint)
-            != me
+        if !same_attachment
+            || current.locked
+            || current.locking
+            || current
+                .identity
+                .as_ref()
+                .map(|identity| identity.fingerprint)
+                != me
         {
             return refuse(
                 "the Session node stopped or changed while saving; nothing was sent".into(),
@@ -2258,7 +2286,7 @@ impl Router {
         node: &NodeName,
         handle: &NodeHandle,
         paths: &Paths,
-        mut removals: tokio::sync::mpsc::Receiver<Digest32>,
+        mut removals: tokio::sync::mpsc::Receiver<vox_core::node::session_ingress::Retirement>,
         ended: watch::Receiver<bool>,
     ) -> tokio::task::JoinHandle<()> {
         let weak = Arc::downgrade(&self.inner);
@@ -2266,15 +2294,23 @@ impl Router {
         self.inner.rt.spawn(async move {
             // An ended actor still leaves saved registration bindings to clear. Drain every
             // reserved notification before permitting this node to attach again.
-            while let Some(room) = removals.recv().await {
+            while let Some(retirement) = removals.recv().await {
+                let room = retirement.room;
+                let mut bindings_cleared = false;
                 loop {
                     let Some(inner) = weak.upgrade() else { return; };
                     let mut ingress = inner.posting.lock().await;
                     ingress.blocked_nodes.entry(node.clone()).or_insert_with(|| "a removed room's Session cleanup is pending".into());
-                    ingress.retire_room(&node, &room);
-                    let cleared = crate::wake::clear_room_bindings(
-                        &paths, &vox_core::node::link::b32_encode(&room),
-                    );
+                    let cleared = if bindings_cleared {
+                        Ok(())
+                    } else {
+                        ingress.retire_room(&node, &room);
+                        crate::wake::clear_room_bindings(
+                            &paths, &vox_core::node::link::b32_encode(&room),
+                        ).map(|_| { bindings_cleared = true; })
+                    };
+                    // Once bindings are cleared, retry only this exact durable completion.
+                    // Its receipt may have been lost after a successful commit and rejoin.
                     let result = match cleared {
                         // The actor purged earlier rows before notification and refused later
                         // old-room admissions while retiring. After it ends there is no writer
@@ -2282,7 +2318,7 @@ impl Router {
                         // the durable marker for the next Unlock to complete; actor shutdown
                         // is not a durable retirement receipt.
                         Ok(_) if *ended.borrow() => Ok(()),
-                        Ok(_) => retire_session_room(&handle, room).await,
+                        Ok(_) => retire_session_room(&handle, retirement).await,
                         Err(why) => Err(why),
                     };
                     match result {
@@ -3988,10 +4024,13 @@ async fn save_session_batch(
     }
 }
 
-async fn retire_session_room(handle: &NodeHandle, room: Digest32) -> Result<(), String> {
+async fn retire_session_room(
+    handle: &NodeHandle,
+    retirement: vox_core::node::session_ingress::Retirement,
+) -> Result<(), String> {
     let (reply, mut received) = tokio::sync::oneshot::channel();
     tokio::time::timeout(Duration::from_secs(2), async {
-        let applying = handle.apply(NodeCommand::RetireSessionRoom { channel_id: room, reply });
+        let applying = handle.apply(NodeCommand::RetireSessionRoom { retirement, reply });
         tokio::pin!(applying);
         tokio::select! {
             result = &mut received => result.map_err(|_| "the cleanup receipt disappeared".to_owned())?.map_err(|e| e.to_string()),

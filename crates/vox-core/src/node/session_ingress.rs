@@ -51,12 +51,22 @@ impl From<Error> for AdmissionError {
 /// Receipt for one durable batch admission.
 pub type AdmissionResult = std::result::Result<Committed, AdmissionError>;
 
+/// One exact room-deletion cleanup, distinct from a later deletion of the same room.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct Retirement {
+    /// The explicitly removed room.
+    pub room: Digest32,
+    /// Monotonic serial in this node's sealed inbox directory.
+    pub serial: u64,
+}
+
 #[derive(Default, Serialize, Deserialize)]
 struct Directory {
     bytes: u64,
     active: Vec<Digest32>,
     /// Only explicit room deletions awaiting daemon registration cleanup.
-    retiring: Vec<Digest32>,
+    retiring: Vec<Retirement>,
+    retirement_serial: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -135,10 +145,13 @@ fn directory(batch: &Batch<'_>, key: &Sek, node: &Digest32) -> Result<Directory>
 
 fn check_directory(d: &Directory) -> Result<()> {
     if d.retiring.len() > 2
-        || d.retiring
-            .iter()
-            .enumerate()
-            .any(|(i, id)| d.retiring[..i].contains(id))
+        || d.retiring.iter().enumerate().any(|(i, item)| {
+            item.serial == 0
+                || item.serial > d.retirement_serial
+                || d.retiring[..i]
+                    .iter()
+                    .any(|old| old.room == item.room || old.serial == item.serial)
+        })
         || d.active.len() > MAX_PENDING_SESSIONS
         || d.bytes > MAX_PENDING_BYTES
         || d.active
@@ -189,7 +202,7 @@ pub fn admit(
     let scope = scope(profile, name);
     let mut batch = profile.store().batch()?;
     let mut directory = directory(&batch, &key, &node)?;
-    if directory.retiring.contains(&room) {
+    if directory.retiring.iter().any(|item| item.room == room) {
         return Err(Error::Profile("this room was removed; its Session cleanup is pending").into());
     }
     let mut session = session_in(&batch, &key, &scope, name)?;
@@ -397,38 +410,59 @@ fn purge_pending(
 }
 
 /// Explicit deletion and its outstanding owner cleanup share one atomic transaction.
-pub(crate) fn remove_room(profile: &Profile, room: &Digest32, hosted: bool) -> Result<()> {
+pub(crate) fn remove_room(
+    profile: &Profile,
+    room: &Digest32,
+    hosted: bool,
+) -> Result<Option<Retirement>> {
     let key = key(profile)?;
     let node = profile.fingerprint();
     let mut batch = profile.store().batch()?;
     let mut d = directory(&batch, &key, &node)?;
-    if hosted && !d.retiring.contains(room) {
-        if d.retiring.len() == 2 {
+    let retirement = if hosted {
+        if d.retiring.len() == 2 || d.retiring.iter().any(|item| item.room == *room) {
             return Err(Error::Profile("earlier Session room cleanup is pending"));
         }
-        d.retiring.push(*room);
-    }
+        d.retirement_serial = d
+            .retirement_serial
+            .checked_add(1)
+            .ok_or(Error::SizeLimitExceeded("Session room retirement serial"))?;
+        let retirement = Retirement {
+            room: *room,
+            serial: d.retirement_serial,
+        };
+        d.retiring.push(retirement);
+        Some(retirement)
+    } else {
+        None
+    };
     purge_pending(profile, &key, &mut batch, &mut d, room)?;
     batch.purge_channel(room)?;
     put(&mut batch, &key, &node, HEADER, &d)?;
-    batch.commit()
+    batch.commit()?;
+    Ok(retirement)
 }
 
 /// Resume the at-most-two outstanding owner cleanups after unlock/restart.
-pub(crate) fn retirements(profile: &Profile) -> Result<Vec<Digest32>> {
+pub(crate) fn retirements(profile: &Profile) -> Result<Vec<Retirement>> {
     let snapshot = profile.store().snapshot()?;
     Ok(from_snapshot(&snapshot, &key(profile)?, &profile.fingerprint())?.retiring)
 }
 
 /// The daemon already cleared matching registration bindings and volatile tails. Preserve
 /// the durable marker on every failure; ending the actor alone never completes retirement.
-pub(crate) fn complete_retirement(profile: &Profile, room: &Digest32) -> Result<()> {
+pub(crate) fn complete_retirement(profile: &Profile, retirement: Retirement) -> Result<()> {
     let key = key(profile)?;
     let node = profile.fingerprint();
     let mut batch = profile.store().batch()?;
     let mut d = directory(&batch, &key, &node)?;
-    purge_pending(profile, &key, &mut batch, &mut d, room)?;
-    d.retiring.retain(|id| id != room);
+    // A lost receipt can be retried after a rejoin and even another deletion. Only this
+    // exact recorded retirement may remove work; an older completion is a read-only no-op.
+    if !d.retiring.contains(&retirement) {
+        return Ok(());
+    }
+    purge_pending(profile, &key, &mut batch, &mut d, &retirement.room)?;
+    d.retiring.retain(|item| *item != retirement);
     put(&mut batch, &key, &node, HEADER, &d)?;
     batch.commit()
 }

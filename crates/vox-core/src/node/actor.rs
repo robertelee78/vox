@@ -718,7 +718,7 @@ pub struct NodeConfig {
     pub computer: Option<Arc<crate::node::computer::Computer>>,
     /// Reliable capacity-bounded handoff of removed rooms to this hosted node's daemon.
     /// Standalone nodes have no daemon-owned volatile Session tails and leave this absent.
-    pub session_room_removed: Option<mpsc::Sender<Digest32>>,
+    pub session_room_removed: Option<mpsc::Sender<crate::node::session_ingress::Retirement>>,
     /// An override for the ADR-005 PoW parameters a join binds (tests reduce them).
     pub pow_params: Option<crate::join::pow::PowParams>,
     /// The anchors, if any, that bridge this node to peers it cannot reach directly
@@ -4842,8 +4842,8 @@ pub struct Node {
     /// decision (V210-30). Kept beside the keyring, sealed the same way.
     consent_keys: crate::node::pending_consent::PendingConsents,
     /// Fair scheduling cursor only; accepted Session work is in the encrypted Store.
-    session_room_removed: Option<mpsc::Sender<Digest32>>,
-    session_rooms_retiring: BTreeSet<Digest32>,
+    session_room_removed: Option<mpsc::Sender<crate::node::session_ingress::Retirement>>,
+    session_rooms_retiring: BTreeSet<crate::node::session_ingress::Retirement>,
     session_ingress_cursor: usize,
     session_ingress_error: Option<String>,
     session_ingress_wake: Arc<tokio::sync::Notify>,
@@ -5730,7 +5730,11 @@ impl Node {
                 bodies,
                 reply,
             } => {
-                let result = if self.session_rooms_retiring.contains(&channel_id) {
+                let result = if self
+                    .session_rooms_retiring
+                    .iter()
+                    .any(|item| item.room == channel_id)
+                {
                     Err(crate::error::Error::Profile(
                         "this room was removed; its Session activity was not accepted",
                     )
@@ -5758,16 +5762,16 @@ impl Node {
                 let _ = reply.send(result);
                 Outcome::Done
             }
-            NodeCommand::RetireSessionRoom { channel_id, reply } => {
+            NodeCommand::RetireSessionRoom { retirement, reply } => {
                 let result = self
                     .profile
                     .as_ref()
                     .ok_or(crate::error::Error::Profile("the node is locked"))
                     .and_then(|profile| {
-                        crate::node::session_ingress::complete_retirement(profile, &channel_id)
+                        crate::node::session_ingress::complete_retirement(profile, retirement)
                     });
                 if result.is_ok() {
-                    self.session_rooms_retiring.remove(&channel_id);
+                    self.session_rooms_retiring.remove(&retirement);
                 }
                 let _ = reply.send(result);
                 Outcome::Done
@@ -10559,7 +10563,7 @@ impl Node {
         // room can be rejoined; otherwise that cleanup could erase the new binding.
         if let Some(profile) = self.profile.as_ref() {
             match crate::node::session_ingress::retirements(profile) {
-                Ok(rooms) if rooms.contains(&parsed.channel_id) => {
+                Ok(rooms) if rooms.iter().any(|item| item.room == parsed.channel_id) => {
                     let _ = reply.send(Outcome::Failed(Fault::SessionCleanupBusy));
                     return;
                 }
@@ -16388,8 +16392,27 @@ impl Node {
     /// and then the store is rewritten so none of the deleted bytes stay in the file. A room left
     /// (V210-164) or ended (the decider, 2026-10-03) goes this way.
     async fn purge_room(&mut self, channel_id: &Digest32) -> Outcome {
-        if self.session_rooms_retiring.contains(channel_id) {
+        if self
+            .session_rooms_retiring
+            .iter()
+            .any(|item| item.room == *channel_id)
+        {
             return Outcome::Failed(Fault::SessionCleanupBusy);
+        }
+        let Some(profile) = self.profile.as_ref() else {
+            return Outcome::Failed(Fault::NoIdentity);
+        };
+        // Recovery may have delivered only one of two durable markers to the capacity-one
+        // queue. Check the authoritative bound before any cursor/channel state is removed.
+        match crate::node::session_ingress::retirements(profile) {
+            Ok(pending)
+                if pending.iter().any(|item| item.room == *channel_id)
+                    || (self.session_room_removed.is_some() && pending.len() == 2) =>
+            {
+                return Outcome::Failed(Fault::SessionCleanupBusy);
+            }
+            Err(error) => return Outcome::Failed(fault_of(&error)),
+            Ok(_) => {}
         }
         // Reserve before deleting anything. Never await a full owner queue while the owner
         // may hold admission ordering and be waiting for this actor to finish an admission.
@@ -16472,16 +16495,19 @@ impl Node {
         }
         // Accepted Session activity is node-scoped so it survives detach, but the operator's
         // explicit deletion of its captured room removes it with that room's other data.
-        if let Err(e) =
-            crate::node::session_ingress::remove_room(profile, channel_id, retirement.is_some())
-        {
-            return Outcome::Failed(fault_of(&e));
-        }
-        if let Some(retirement) = retirement {
+        let pending = match crate::node::session_ingress::remove_room(
+            profile,
+            channel_id,
+            retirement.is_some(),
+        ) {
+            Ok(pending) => pending,
+            Err(error) => return Outcome::Failed(fault_of(&error)),
+        };
+        if let (Some(permit), Some(pending)) = (retirement, pending) {
             // The corresponding bounded receipt is already durable with the deletion.
             // Notify before rewrite_fresh: failure there must not strand owner cleanup.
-            self.session_rooms_retiring.insert(*channel_id);
-            retirement.send(*channel_id);
+            self.session_rooms_retiring.insert(pending);
+            permit.send(pending);
         }
         if let Err(e) = profile.store().rewrite_fresh() {
             return Outcome::Failed(fault_of(&e));
