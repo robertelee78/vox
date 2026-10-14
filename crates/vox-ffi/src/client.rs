@@ -2517,8 +2517,10 @@ impl VoxClient {
         })
     }
 
-    /// One bounded page of thread replies in arrival order. Empty `since` starts the thread;
-    /// the next request follows the last returned id. An empty page finishes the read.
+    /// One bounded page of readable thread replies in arrival order, matching `thread_summary`.
+    /// Opaque owed rows have no readable thread metadata and are not included. Empty `since`
+    /// starts the thread; the next request follows the last returned id. An empty page finishes
+    /// the read. A cursor removed by retention is an explicit error; reload from the beginning.
     /// This does not drain later pages or read another room.
     ///
     /// # Errors

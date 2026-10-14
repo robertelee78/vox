@@ -898,8 +898,9 @@ pub enum Request {
         /// Return only matching rows **after** this one. Absent reads from the first.
         since: Option<Digest32>,
     },
-    /// A thread's replies, indexed by its General message, in arrival order. The root is
-    /// read with `Find`. Existing row pages bound each reply; nothing reads another room.
+    /// A thread's readable replies, indexed by its General message, in arrival order. The
+    /// root is read with `Find`. Opaque owed rows cannot establish thread membership and
+    /// are neither replies nor cursors. Pages are bounded by both row count and bytes.
     Thread {
         /// The room.
         channel_id: Digest32,
@@ -5357,20 +5358,31 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             let Some(detail) = view.open_channels.iter().find(|d| d.channel_id == channel_id) else {
                 return Frame::Error { reason: "room not open".into() };
             };
-            let mut matched: Vec<&MessageRow> = detail.structured.by_thread.get(&root)
-                .into_iter().flat_map(|positions| positions.iter())
-                .filter_map(|i| detail.timeline.get(*i as usize)).collect();
-            matched.sort_by_key(|r| r.arrival);
-            if let Some(cursor) = since {
-                let Some(mark) = matched.iter().find(|r| r.entry_hash == cursor && !r.owed)
+            let positions = detail.structured.by_thread.get(&root);
+            let mark = if let Some(cursor) = since {
+                let Some(mark) = positions.into_iter().flat_map(|p| p.iter())
+                    .filter_map(|i| detail.timeline.get(*i as usize))
+                    .find(|r| r.entry_hash == cursor && !r.owed && r.entry_hash != root)
                     .map(|r| r.arrival) else {
                     return Frame::Error { reason: "cursor not among this room's thread replies".into() };
                 };
-                matched.retain(|r| r.arrival > mark);
+                Some(mark)
+            } else { None };
+            // Select one page without allocating/sorting every reply in a long thread.
+            // The position breaks arrival ties in the same order as the room's index.
+            let mut page = std::collections::BTreeSet::new();
+            for i in positions.into_iter().flat_map(|p| p.iter()) {
+                let Some(r) = detail.timeline.get(*i as usize) else { continue };
+                if r.owed || r.entry_hash == root || mark.is_some_and(|m| r.arrival <= m) {
+                    continue;
+                }
+                page.insert((r.arrival, *i));
+                if page.len() > PAGE_ENTRIES { page.pop_last(); }
             }
             let mut rows = Vec::new();
             let mut bytes = 0usize;
-            for r in matched {
+            for (_, i) in page {
+                let Some(r) = detail.timeline.get(i as usize) else { continue };
                 let cost = r.text.len() + ROW_OVERHEAD;
                 if !rows.is_empty() && bytes + cost > rows_budget() { break; }
                 bytes += cost;
