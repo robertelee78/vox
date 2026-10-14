@@ -2680,6 +2680,7 @@ extension NodeModel {
               let before = sessionBefore, !sessionReadingOlder else { return }
         timelineFollowingNewest = false
         let revision = sessionWindowRevision
+        let epoch = nodeObservationEpoch, generation = roomReadGeneration
         sessionReadingOlder = true
         defer { sessionReadingOlder = false }
         do {
@@ -2695,6 +2696,14 @@ extension NodeModel {
             sessionWindowRevision = UUID()
             await refreshSessionRequests(room: room, session: now)
         } catch {
+            guard revision == sessionWindowRevision, epoch == nodeObservationEpoch,
+                  generation == roomReadGeneration, roomOnScreen == room,
+                  shownSession?.nodeFingerprint == s.nodeFingerprint,
+                  shownSession?.sessionId == s.sessionId else { return }
+            sessionPages.clear()
+            sessionWindowRevision = UUID()
+            selectedEarlierRequest = nil
+            sessionNote = sentence(error)
             reportBackground(error)
         }
     }
