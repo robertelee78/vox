@@ -421,6 +421,8 @@ const T_THREAD_PAGE_REQ: u64 = 8739;
 const T_THREAD_PAGE: u64 = 8740;
 const T_FOOTERS_REQ: u64 = 8741;
 const T_FOOTERS: u64 = 8742;
+const T_ROOM_VIEW_PAGE_REQ: u64 = 8743;
+const T_ROOM_VIEW_FIND: u64 = 8744;
 const T_ROOM_PAGE_REQ: u64 = 5492;
 const T_ROOM_PAGE: u64 = 5493;
 
@@ -534,6 +536,30 @@ pub enum Request {
         query: crate::node::api::GovernanceQuery,
     },
 
+    /// A bounded canonical page selected by its displayed message domain before budgeting.
+    RoomViewPage {
+        /// Selected room.
+        channel_id: Digest32,
+        /// General/All roots or one exact raw tag (including matching replies).
+        view: crate::node::api::RoomView,
+        /// Saved room identity; mandatory when continuing an older page.
+        instance: Option<[u8; 16]>,
+        /// Exclusive first displayed entry, or none for newest.
+        before: Option<Digest32>,
+        /// Requested row bound; zero uses the daemon's page bound.
+        limit: u64,
+    },
+    /// Revalidate a bounded held selection against the same view domain and room instance.
+    RoomViewFind {
+        /// Selected room.
+        channel_id: Digest32,
+        /// The domain that selected these entries.
+        view: crate::node::api::RoomView,
+        /// Saved room identity.
+        instance: [u8; 16],
+        /// At most MAX_FIND exact ids; bodies stream under the ordinary Find fence.
+        entries: Vec<Digest32>,
+    },
     /// A room's newest bounded history page, or the page before an entry (ADR-034 FR-4/5).
     RoomPage {
         /// The room.
@@ -1156,6 +1182,36 @@ mod governance_page;
 #[path = "ipc_session_activity.rs"]
 mod session_activity;
 
+fn encode_room_view(e: &mut Encoder, view: &crate::node::api::RoomView) {
+    use crate::node::api::RoomView;
+    match view {
+        RoomView::General => {
+            e.array(1).uint(0);
+        }
+        RoomView::All => {
+            e.array(1).uint(1);
+        }
+        RoomView::Tag(tag) => {
+            e.array(2).uint(2).text(tag);
+        }
+    }
+}
+fn decode_room_view(d: &mut Decoder<'_>) -> Result<crate::node::api::RoomView> {
+    use crate::node::api::RoomView;
+    match (d.array()?, d.uint()?) {
+        (1, 0) => Ok(RoomView::General),
+        (1, 1) => Ok(RoomView::All),
+        (2, 2) => {
+            let tag = d.text()?;
+            if !vox_agentcomms::envelope::is_valid_tag(tag) {
+                return Err(Error::MalformedIpc("room history tag"));
+            }
+            Ok(RoomView::Tag(tag.to_owned()))
+        }
+        _ => Err(Error::MalformedIpc("room history view")),
+    }
+}
+
 impl Request {
     /// Canonical CBOR body (unframed).
     #[must_use]
@@ -1225,6 +1281,32 @@ impl Request {
             Request::GovernancePage { channel_id, query } => {
                 e.array(3).uint(T_ROOM_PAGE_REQ).bytes(channel_id);
                 governance_page::put_query(&mut e, query);
+            }
+            Request::RoomViewPage {
+                channel_id,
+                view,
+                instance,
+                before,
+                limit,
+            } => {
+                e.array(6).uint(T_ROOM_VIEW_PAGE_REQ).bytes(channel_id);
+                encode_room_view(&mut e, view);
+                e.bytes(instance.as_ref().map_or(&[][..], |value| &value[..]))
+                    .bytes(before.as_ref().map_or(&[][..], |value| &value[..]))
+                    .uint(*limit);
+            }
+            Request::RoomViewFind {
+                channel_id,
+                view,
+                instance,
+                entries,
+            } => {
+                e.array(5).uint(T_ROOM_VIEW_FIND).bytes(channel_id);
+                encode_room_view(&mut e, view);
+                e.bytes(instance).array(entries.len());
+                for entry in entries {
+                    e.bytes(entry);
+                }
             }
             Request::RoomPage {
                 channel_id,
@@ -1945,6 +2027,53 @@ impl Request {
                     since,
                     after,
                     limit,
+                })
+            }
+            (T_ROOM_VIEW_PAGE_REQ, 6) => {
+                let channel_id = digest(&mut d)?;
+                let view = decode_room_view(&mut d)?;
+                let bytes = d.bytes()?;
+                let instance = if bytes.is_empty() {
+                    None
+                } else {
+                    Some(
+                        bytes
+                            .try_into()
+                            .map_err(|_| Error::MalformedIpc("room view instance"))?,
+                    )
+                };
+                let before = optional_digest(&mut d)?;
+                let limit = d.uint()?;
+                d.finish()?;
+                Ok(Request::RoomViewPage {
+                    channel_id,
+                    view,
+                    instance,
+                    before,
+                    limit,
+                })
+            }
+            (T_ROOM_VIEW_FIND, 5) => {
+                let channel_id = digest(&mut d)?;
+                let view = decode_room_view(&mut d)?;
+                let instance = d
+                    .bytes()?
+                    .try_into()
+                    .map_err(|_| Error::MalformedIpc("room view instance"))?;
+                let count = d.array()?;
+                if count > MAX_FIND {
+                    return Err(Error::MalformedIpc("ipc too many entries"));
+                }
+                let mut entries = Vec::with_capacity(count);
+                for _ in 0..count {
+                    entries.push(digest(&mut d)?);
+                }
+                d.finish()?;
+                Ok(Request::RoomViewFind {
+                    channel_id,
+                    view,
+                    instance,
+                    entries,
                 })
             }
             (T_ROOM_PAGE_REQ, 3) => {
@@ -6231,6 +6360,19 @@ async fn serve_requests(
             continue;
         }
         let found = match &request {
+            Request::RoomViewFind {
+                channel_id,
+                view,
+                instance,
+                entries,
+            } => Some((
+                *channel_id,
+                crate::node::channel::history::Query::ViewLocate {
+                    view: view.clone(),
+                    instance: *instance,
+                    entries: entries.clone(),
+                },
+            )),
             Request::Find {
                 channel_id,
                 entries,
@@ -6930,6 +7072,40 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 Err(reason) => Frame::Error { reason },
             }
         }
+        Request::RoomViewPage {
+            channel_id,
+            view,
+            instance,
+            before,
+            limit,
+        } => {
+            use crate::node::channel::history::{Query, Reply};
+            let limit = if limit == 0 {
+                SESSION_PAGE_ROWS
+            } else {
+                usize::try_from(limit)
+                    .unwrap_or(usize::MAX)
+                    .min(SESSION_PAGE_ROWS)
+            };
+            match handle
+                .room_history(
+                    channel_id,
+                    Query::ViewPage {
+                        view,
+                        instance,
+                        before,
+                        limit,
+                    },
+                )
+                .await
+            {
+                Ok(Reply::Older { rows, older }) => Frame::RoomPage { rows, older },
+                Ok(_) => Frame::Error {
+                    reason: "unexpected selected room history answer".into(),
+                },
+                Err(reason) => Frame::Error { reason },
+            }
+        }
         Request::RoomPage {
             channel_id,
             before,
@@ -7564,7 +7740,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             reason: "Unread requires a reply stream".into(),
         },
         // The server streams exact Find rows without materializing all requested bodies.
-        Request::Find { .. } => Frame::Error {
+        Request::Find { .. } | Request::RoomViewFind { .. } => Frame::Error {
             reason: "Find requires a reply stream".into(),
         },
         // Open or not by the node's own count, not by whether the view has caught up with an

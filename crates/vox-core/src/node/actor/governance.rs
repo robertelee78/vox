@@ -197,6 +197,16 @@ impl Node {
                 Err(error) => channel.poison(&error),
             }
         }
+        let mut views_finished = false;
+        if progress.ready {
+            match channel.advance_room_views(&store) {
+                Ok((more, finished)) => {
+                    self.governance_work.again |= more;
+                    views_finished = finished;
+                }
+                Err(error) => channel.poison(&error),
+            }
+        }
         drop(channel);
         if progress.ready {
             // Discover stale consent from disk a page at a time. A quiet room must finish
@@ -209,7 +219,7 @@ impl Node {
             self.refresh_network_view().await;
             self.publish_admin_roster(&room).await;
         }
-        if progress.changed || backfilled > 0 || legacy_finished {
+        if progress.changed || backfilled > 0 || legacy_finished || views_finished {
             self.publish().await;
         }
     }

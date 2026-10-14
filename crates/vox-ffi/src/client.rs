@@ -267,6 +267,45 @@ pub struct FfiStepRetention {
     pub local_seconds: Option<u64>,
 }
 
+/// The message domain of one native room window. All adds Session lifecycle notices
+/// separately; its message domain is the same General roots, not every thread reply.
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum RoomView {
+    /// General messages and readable owed placeholders.
+    General,
+    /// General messages, with separate Session lifecycle notices supplied by the caller.
+    All,
+    /// Messages carrying one exact raw tag, including replies.
+    Tag {
+        /// The raw key from FfiMessageTag; never its escaped display label.
+        key: String,
+    },
+}
+impl RoomView {
+    fn core(&self) -> Result<vox_core::node::api::RoomView, VoxError> {
+        use vox_core::node::api::RoomView as Core;
+        Ok(match self {
+            Self::General => Core::General,
+            Self::All => Core::All,
+            Self::Tag { key } => {
+                if !vox_agentcomms::envelope::is_valid_tag(key) {
+                    return Err(failed("The selected room tag is invalid."));
+                }
+                Core::Tag(key.clone())
+            }
+        })
+    }
+}
+
+/// A tag's exact selection identity and separately escaped, bounded display label.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiMessageTag {
+    /// Raw validated tag for RoomView::Tag; never decode a label to recover this value.
+    pub key: String,
+    /// Safe label for visible text and accessibility.
+    pub label: String,
+}
+
 /// One message, rendered.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct RoomMessage {
@@ -310,6 +349,8 @@ pub struct RoomMessage {
     /// What it relates to, as its sender tagged it (#636): `task:#636`, `project:vox`, each on
     /// one line and cut, sorted. Shown only to those who can read the message.
     pub tags: Vec<String>,
+    /// Exact raw selectors paired with the same safe labels as tags, in the same order.
+    pub tag_selectors: Vec<FfiMessageTag>,
 }
 
 /// One author in a thread summary, named by this node's keyring.
@@ -1893,9 +1934,7 @@ fn rendered(row: &MessageRow, names: &HashMap<Digest32, String>, me: Option<&str
                 },
                 env.to.iter().map(|t| shown_name(t)).collect(),
                 env.re.as_deref().map(shown_name).unwrap_or_default(),
-                env.thread
-                    .as_deref()
-                    .and_then(|root| vox_core::node::link::b32_decode(root.trim(), "thread").ok())
+                vox_core::node::api::message_thread(&row.text)
                     .map(|root| b32_encode(&root))
                     .unwrap_or_default(),
                 env.urgent,
@@ -1946,6 +1985,16 @@ fn rendered(row: &MessageRow, names: &HashMap<Digest32, String>, me: Option<&str
                     t,
                     vox_agentcomms::envelope::MAX_TAG + "milestone:".len(),
                 )
+            })
+            .collect(),
+        tag_selectors: vox_core::node::api::message_tags(&row.text)
+            .into_iter()
+            .map(|key| {
+                let label = vox_agentcomms::envelope::shown(
+                    &key,
+                    vox_agentcomms::envelope::MAX_TAG + "milestone:".len(),
+                );
+                FfiMessageTag { key, label }
             })
             .collect(),
     }
@@ -2201,22 +2250,35 @@ impl VoxClient {
         &self,
         room: String,
         before: Option<Digest32>,
+        view: Option<RoomView>,
+        instance: Option<[u8; 16]>,
     ) -> Result<FfiRoomRead, VoxError> {
         let channel_id = digest(&room, "room id")?;
+        let view = view.map(|view| view.core()).transpose()?;
         on_held!(self, |c| {
             let actor = c.me().ok_or_else(not_attached)?;
             let fence = room_read_fence(c, channel_id).await?;
+            if instance.is_some_and(|expected| expected != fence.0) {
+                return Err(failed(
+                    "The saved room changed. Open its current page again.",
+                ));
+            }
             let names = names(c).await?;
-            let (rows, older) = match ask(
-                c,
-                &Request::RoomPage {
+            let request = match view {
+                Some(view) => Request::RoomViewPage {
+                    channel_id,
+                    view,
+                    instance: Some(fence.0),
+                    before,
+                    limit: ROOM_WINDOW_ROWS as u64,
+                },
+                None => Request::RoomPage {
                     channel_id,
                     before,
                     limit: ROOM_WINDOW_ROWS as u64,
                 },
-            )
-            .await?
-            {
+            };
+            let (rows, older) = match ask(c, &request).await? {
                 Frame::RoomPage { rows, older } => (rows, older),
                 other => return Err(unexpected(&other)),
             };
@@ -2241,6 +2303,99 @@ impl VoxClient {
             })
         })
     }
+    async fn room_selection_read(
+        &self,
+        room: String,
+        node: String,
+        instance: Vec<u8>,
+        loaded: Vec<String>,
+        view: Option<RoomView>,
+    ) -> Result<FfiRoomRead, VoxError> {
+        if loaded.len() > ROOM_WINDOW_ROWS {
+            return Err(failed("A held room window may name at most 128 messages."));
+        }
+        let channel_id = digest(&room, "room id")?;
+        let view = view.map(|view| view.core()).transpose()?;
+        let actor = input_fingerprint(&node)?;
+        let instance: [u8; 16] = instance
+            .try_into()
+            .map_err(|_| failed("The saved room identity must contain exactly 16 bytes."))?;
+        let entries = loaded
+            .iter()
+            .map(|id| digest(id, "entry"))
+            .collect::<Result<Vec<_>, _>>()?;
+        on_held!(self, |c| {
+            if c.me() != Some(actor) {
+                return Err(failed(
+                    "The acting node changed before refreshing this room.",
+                ));
+            }
+            let fence = room_read_fence(c, channel_id).await?;
+            if fence.0 != instance {
+                return Err(failed(
+                    "The saved room changed. Open its current page again.",
+                ));
+            }
+            let names = names(c).await?;
+            let mut found = HashMap::new();
+            let mut bytes = 0usize;
+            for chunk in entries.chunks(vox_core::node::ipc::MAX_FIND) {
+                // Find itself streams one coherent selection. At most 64 bounded raw rows
+                // exist in this temporary reply, independent of the room's history size.
+                let request = match &view {
+                    Some(view) => Request::RoomViewFind {
+                        channel_id,
+                        view: view.clone(),
+                        instance,
+                        entries: chunk.to_vec(),
+                    },
+                    None => Request::Find {
+                        channel_id,
+                        entries: chunk.to_vec(),
+                    },
+                };
+                let rows = match ask(c, &request).await? {
+                    Frame::Rows { rows } => rows,
+                    other => return Err(unexpected(&other)),
+                };
+                for row in rows {
+                    if !chunk.contains(&row.entry_hash) {
+                        return Err(failed(
+                            "The room returned a message outside the held selection.",
+                        ));
+                    }
+                    if found.contains_key(&row.entry_hash) {
+                        continue;
+                    }
+                    bytes =
+                        bytes.saturating_add(row.text.len() + vox_core::node::ipc::ROW_OVERHEAD);
+                    if !found.is_empty() && bytes > ROOM_WINDOW_BYTES {
+                        return Err(failed(
+                            "The held room selection exceeds one window's byte budget. Refresh fewer messages.",
+                        ));
+                    }
+                    found.insert(row.entry_hash, row);
+                }
+            }
+            if room_read_fence(c, channel_id).await? != fence || c.me() != Some(actor) {
+                return Err(failed(
+                    "The room changed while refreshing its held messages. Try again.",
+                ));
+            }
+            let me = b32_encode(&actor);
+            Ok(FfiRoomRead {
+                instance: instance.to_vec(),
+                messages: entries
+                    .iter()
+                    .filter_map(|id| found.remove(id))
+                    .map(|row| rendered(&row, &names, Some(&me)))
+                    .collect(),
+                older: 0,
+                before: None,
+            })
+        })
+    }
+
     /// A page of a Session, newest first: see [`VoxClient::session_read`].
     async fn session_page_read(
         &self,
@@ -3150,7 +3305,62 @@ impl VoxClient {
     /// # Errors
     /// The room id is malformed or the node refuses the read.
     pub async fn room_read(&self, room: String) -> Result<FfiRoomRead, VoxError> {
-        self.room_page_read(room, None).await
+        self.room_page_read(room, None, None, None).await
+    }
+
+    /// Newest bounded page in the selected view domain; filtering precedes the page limit.
+    /// All uses General's message domain; lifecycle notices remain a separate bounded read.
+    ///
+    /// # Errors
+    /// A malformed selection, incomplete derived index, or the node's current read refusal.
+    pub async fn room_view_read(
+        &self,
+        room: String,
+        view: RoomView,
+    ) -> Result<FfiRoomRead, VoxError> {
+        self.room_page_read(room, None, Some(view), None).await
+    }
+
+    /// Older selected-domain page in this saved room, using current canonical order.
+    /// A cursor outside the selected domain or a replaced room is refused.
+    ///
+    /// # Errors
+    /// Invalid view, room identity or cursor; a changed room or the node's refusal.
+    pub async fn room_view_read_older(
+        &self,
+        room: String,
+        view: RoomView,
+        instance: Vec<u8>,
+        before: String,
+    ) -> Result<FfiRoomRead, VoxError> {
+        let instance = instance
+            .try_into()
+            .map_err(|_| failed("The saved room identity must contain exactly 16 bytes."))?;
+        self.room_page_read(
+            room,
+            Some(digest(&before, "entry")?),
+            Some(view),
+            Some(instance),
+        )
+        .await
+    }
+
+    /// Revalidate only held ids in their selected domain and original saved room, within
+    /// the existing 128-row/128-KiB window. No gap is walked and no new rows are added.
+    /// Paging metadata is unchanged by this lookup: the result has older=0 and before=None.
+    ///
+    /// # Errors
+    /// A malformed or oversized selection, changed actor/room/view, or read refusal.
+    pub async fn room_view_read_retaining(
+        &self,
+        room: String,
+        view: RoomView,
+        node: String,
+        instance: Vec<u8>,
+        loaded: Vec<String>,
+    ) -> Result<FfiRoomRead, VoxError> {
+        self.room_selection_read(room, node, instance, loaded, Some(view))
+            .await
     }
 
     /// Revalidate exactly the held message ids, in their requested order, on the same node
@@ -3165,84 +3375,8 @@ impl VoxClient {
         instance: Vec<u8>,
         loaded: Vec<String>,
     ) -> Result<FfiRoomRead, VoxError> {
-        if loaded.len() > ROOM_WINDOW_ROWS {
-            return Err(failed("A held room window may name at most 128 messages."));
-        }
-        let channel_id = digest(&room, "room id")?;
-        let actor = input_fingerprint(&node)?;
-        let instance: [u8; 16] = instance
-            .try_into()
-            .map_err(|_| failed("The saved room identity must contain exactly 16 bytes."))?;
-        let entries = loaded
-            .iter()
-            .map(|id| digest(id, "entry"))
-            .collect::<Result<Vec<_>, _>>()?;
-        on_held!(self, |c| {
-            if c.me() != Some(actor) {
-                return Err(failed(
-                    "The acting node changed before refreshing this room.",
-                ));
-            }
-            let fence = room_read_fence(c, channel_id).await?;
-            if fence.0 != instance {
-                return Err(failed(
-                    "The saved room changed. Open its current page again.",
-                ));
-            }
-            let names = names(c).await?;
-            let mut found = HashMap::new();
-            let mut bytes = 0usize;
-            for chunk in entries.chunks(vox_core::node::ipc::MAX_FIND) {
-                // Find itself streams one coherent selection. At most 64 bounded raw rows
-                // exist in this temporary reply, independent of the room's history size.
-                let rows = match ask(
-                    c,
-                    &Request::Find {
-                        channel_id,
-                        entries: chunk.to_vec(),
-                    },
-                )
-                .await?
-                {
-                    Frame::Rows { rows } => rows,
-                    other => return Err(unexpected(&other)),
-                };
-                for row in rows {
-                    if !chunk.contains(&row.entry_hash) {
-                        return Err(failed(
-                            "The room returned a message outside the held selection.",
-                        ));
-                    }
-                    if found.contains_key(&row.entry_hash) {
-                        continue;
-                    }
-                    bytes =
-                        bytes.saturating_add(row.text.len() + vox_core::node::ipc::ROW_OVERHEAD);
-                    if !found.is_empty() && bytes > ROOM_WINDOW_BYTES {
-                        return Err(failed(
-                            "The held room selection exceeds one window's byte budget. Refresh fewer messages.",
-                        ));
-                    }
-                    found.insert(row.entry_hash, row);
-                }
-            }
-            if room_read_fence(c, channel_id).await? != fence || c.me() != Some(actor) {
-                return Err(failed(
-                    "The room changed while refreshing its held messages. Try again.",
-                ));
-            }
-            let me = b32_encode(&actor);
-            Ok(FfiRoomRead {
-                instance: instance.to_vec(),
-                messages: entries
-                    .iter()
-                    .filter_map(|id| found.remove(id))
-                    .map(|row| rendered(&row, &names, Some(&me)))
-                    .collect(),
-                older: 0,
-                before: None,
-            })
-        })
+        self.room_selection_read(room, node, instance, loaded, None)
+            .await
     }
 
     /// Load the room-history page before `before`, when the person scrolls up (ADR-034 FR-4).
@@ -3254,7 +3388,7 @@ impl VoxClient {
         room: String,
         before: String,
     ) -> Result<FfiRoomRead, VoxError> {
-        self.room_page_read(room, Some(digest(&before, "entry")?))
+        self.room_page_read(room, Some(digest(&before, "entry")?), None, None)
             .await
     }
 

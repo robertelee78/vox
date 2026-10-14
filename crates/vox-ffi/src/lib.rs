@@ -39,12 +39,13 @@ mod client;
 mod computer;
 pub use client::{
     config_dir, room_group, room_group_words, AnchorReachSummary, AnchorSourceSummary,
-    AnchorSummary, ClientListener, DecisionEvent, FileOffer, FileShare, IndividualTrustEligibility,
-    Member, MessageFooter, MessageFooters, NodeSummary, NodeView, NoticeCursor, OfferedService,
-    Passphrase, PulledFile, ReadBy, RoomAdmins, RoomAnchorAuthority, RoomAnchorConfiguration,
-    RoomAnchorEndpoint, RoomConsentPage, RoomConsents, RoomGroup, RoomLink, RoomLinkPreview,
-    RoomMessage, RoomNotices, RoomServices, RoomSummary, RoomUnread, ServiceCursor, SharedService,
-    ThreadAuthor, ThreadSummary, TrustedNode, UnreadLevel, VoxClient,
+    AnchorSummary, ClientListener, DecisionEvent, FfiMessageTag, FileOffer, FileShare,
+    IndividualTrustEligibility, Member, MessageFooter, MessageFooters, NodeSummary, NodeView,
+    NoticeCursor, OfferedService, Passphrase, PulledFile, ReadBy, RoomAdmins, RoomAnchorAuthority,
+    RoomAnchorConfiguration, RoomAnchorEndpoint, RoomConsentPage, RoomConsents, RoomGroup,
+    RoomLink, RoomLinkPreview, RoomMessage, RoomNotices, RoomServices, RoomSummary, RoomUnread,
+    RoomView, ServiceCursor, SharedService, ThreadAuthor, ThreadSummary, TrustedNode, UnreadLevel,
+    VoxClient,
 };
 pub use computer::{
     ComputerApplication, ComputerBindingAction, ComputerIdentity, ComputerNode, ComputerStatus,

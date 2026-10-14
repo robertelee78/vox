@@ -16813,6 +16813,9 @@ impl Node {
         if ch.legacy_classification_pending(profile.store())? {
             return Ok(false);
         }
+        if ch.advance_room_views(profile.store())?.0 {
+            return Ok(false);
+        }
         Ok(true)
     }
 
