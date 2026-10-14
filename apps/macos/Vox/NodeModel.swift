@@ -4,6 +4,7 @@
 
 import AppKit
 import Foundation
+import SQLite3
 import os
 import ServiceManagement
 
@@ -259,8 +260,9 @@ final class NodeModel: ObservableObject {
     /// The requests waiting on this node already known, by `room/node/session/reference`: one
     /// that is new notifies, once per Session (P1). Taken in silence the first time, so opening
     /// Vox notifies nothing.
-    private var knownWaiting: Set<String> = []
-    private var waitingSeen = false
+    private var waitingLedger: PendingNotificationLedger?
+    private var waitingScanRunning = false
+    private var waitingScanDirty = false
     /// The room on screen's Sessions, open and ended (ADR-029 CL-2).
     @Published private(set) var sessions: [FfiSession] = []
     @Published private(set) var sessionsOpenNext: String?
@@ -3087,7 +3089,7 @@ extension NodeModel {
 
     /// Current pending targets come from the node's index; ended Session history and
     /// resolution transcripts are never collected to discover them.
-    private func waiting(in room: String, visit: ((node: String, session: String, reference: String, label: String)) -> Void) async throws {
+    private func waiting(in room: String, visit: ((node: String, session: String, reference: String, label: String)) throws -> Void) async throws {
         let epoch = nodeObservationEpoch
         var after: String?
         repeat {
@@ -3103,7 +3105,7 @@ extension NodeModel {
                     guard epoch == nodeObservationEpoch, !Task.isCancelled else { throw CancellationError() }
                     if let request = held.entries.first(where: { $0.id == target.entry })?.request,
                        request.state == nil {
-                        visit((target.node, target.sessionId, request.reference, session.label))
+                        try visit((target.node, target.sessionId, request.reference, session.label))
                     }
                 }
                 if let next = page.next, next == after {
@@ -3117,37 +3119,44 @@ extension NodeModel {
     /// Session's earlier one; a Session no longer waiting has its notification withdrawn (P1).
     /// Never the request's text (R-10).
     private func noteWaiting() async {
-        let epoch = nodeObservationEpoch
-        var now: Set<String> = []
-        var bySession: [String: (room: String, node: String, session: String, reference: String, label: String)] = [:]
-        do {
-        for room in rooms where room.open {
-            try await waiting(in: room.id) { w in
-                let key = "\(room.id)/\(w.node)/\(w.session)/\(w.reference)"
-                now.insert(key)
-                if !knownWaiting.contains(key) && waitingSeen {
-                    bySession["\(room.id)/\(w.node)/\(w.session)"] = (room.id, w.node, w.session, w.reference, w.label)
+        guard !waitingScanRunning else { waitingScanDirty = true; return }
+        waitingScanRunning = true
+        defer { waitingScanRunning = false }
+        repeat {
+            waitingScanDirty = false
+            let epoch = nodeObservationEpoch
+            do {
+                if waitingLedger == nil { waitingLedger = try PendingNotificationLedger() }
+                guard let ledger = waitingLedger else { return }
+                try ledger.begin()
+                do {
+                    for room in rooms where room.open {
+                        try await waiting(in: room.id) { w in
+                            try ledger.observe(room: room.id, node: w.node, session: w.session,
+                                               reference: w.reference, label: w.label)
+                        }
+                        guard epoch == nodeObservationEpoch, !Task.isCancelled else {
+                            throw CancellationError()
+                        }
+                    }
+                    try ledger.finish()
+                } catch {
+                    ledger.abort()
+                    throw error
                 }
+                // Both walks are streaming database cursors, after a complete committed scan.
+                try ledger.notifications { room, node, session, reference, label in
+                    let name = rooms.first { $0.id == room }?.name ?? "a room"
+                    notifier.postWaiting(room: room, roomName: name, node: node,
+                                         session: session, reference: reference, label: label)
+                }
+                try ledger.withdrawals { notifier.withdrawWaiting(sessionKey: $0) }
+            } catch {
+                guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
+                reportBackground(error)
+                return
             }
-            guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
-        }
-        } catch {
-            guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
-            reportBackground(error)
-            return // No notification withdrawal from an incomplete scan.
-        }
-        for (_, w) in bySession {
-            let name = rooms.first { $0.id == w.room }?.name ?? "a room"
-            notifier.postWaiting(room: w.room, roomName: name, node: w.node, session: w.session,
-                                 reference: w.reference, label: w.label)
-        }
-        let stillWaiting = Set(now.map { $0.split(separator: "/").prefix(3).joined(separator: "/") })
-        for gone in Set(knownWaiting.map { $0.split(separator: "/").prefix(3).joined(separator: "/") })
-            .subtracting(stillWaiting) {
-            notifier.withdrawWaiting(sessionKey: gone)
-        }
-        knownWaiting = now
-        waitingSeen = true
+        } while waitingScanDirty && !Task.isCancelled
     }
 
     /// Open `room`, its Session `session` of `node`, and select its request `reference`, centred
@@ -3640,5 +3649,137 @@ extension NodeModel {
             guard current() else { return }
             threadSummaryErrors[root] = sentence(error)
         }
+    }
+}
+
+
+/// Ephemeral comparison state for complete pending-request scans. It is never a profile or
+/// authority: the daemon supplies every target again, and an aborted scan keeps its predecessor.
+/// SQLite's page cache is bounded; result rows are stepped individually, never collected.
+@MainActor
+private final class PendingNotificationLedger {
+    private var database: OpaquePointer?
+    private let directory: URL
+    private var hasSnapshot = false
+
+    init() throws {
+        directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("vox-pending-" + UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700])
+        guard sqlite3_open(directory.appendingPathComponent("pending.sqlite").path, &database) == SQLITE_OK else {
+            if let database { sqlite3_close(database) }
+            database = nil
+            try? FileManager.default.removeItem(at: directory)
+            throw VoxError.Failed(reason: "The temporary pending-notification ledger could not open.")
+        }
+        do {
+            try run("PRAGMA cache_size=-256")
+            try run("PRAGMA temp_store=FILE")
+            try run("PRAGMA mmap_size=0")
+            for table in ["known_refs", "known_sessions", "scan_refs", "scan_sessions", "gone"] {
+                try run("CREATE TABLE " + table + " (key TEXT PRIMARY KEY) WITHOUT ROWID")
+            }
+            try run("CREATE TABLE notifications (key TEXT PRIMARY KEY, room TEXT, node TEXT, session TEXT, reference TEXT, label TEXT) WITHOUT ROWID")
+        } catch {
+            sqlite3_close(database)
+            database = nil
+            try? FileManager.default.removeItem(at: directory)
+            throw error
+        }
+    }
+
+    deinit {
+        sqlite3_close(database)
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    private func failure() -> VoxError {
+        VoxError.Failed(reason: "The temporary pending-notification ledger failed: "
+            + String(cString: sqlite3_errmsg(database)))
+    }
+
+    private func statement(_ sql: String, _ values: [String] = []) throws -> OpaquePointer {
+        var result: OpaquePointer?
+        guard sqlite3_prepare_v2(database, sql, -1, &result, nil) == SQLITE_OK,
+              let result else { throw failure() }
+        for (index, value) in values.enumerated() {
+            let code = value.withCString {
+                sqlite3_bind_text(result, Int32(index + 1), $0, -1,
+                    unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+            }
+            guard code == SQLITE_OK else { sqlite3_finalize(result); throw failure() }
+        }
+        return result
+    }
+
+    private func run(_ sql: String, _ values: [String] = []) throws {
+        let query = try statement(sql, values)
+        defer { sqlite3_finalize(query) }
+        var code = sqlite3_step(query)
+        while code == SQLITE_ROW { code = sqlite3_step(query) }
+        guard code == SQLITE_DONE else { throw failure() }
+    }
+
+    private func exists(_ key: String) throws -> Bool {
+        let query = try statement("SELECT 1 FROM known_refs WHERE key=?", [key])
+        defer { sqlite3_finalize(query) }
+        let code = sqlite3_step(query)
+        guard code == SQLITE_ROW || code == SQLITE_DONE else { throw failure() }
+        return code == SQLITE_ROW
+    }
+
+    func begin() throws {
+        try run("BEGIN")
+        do {
+            for table in ["scan_refs", "scan_sessions", "notifications", "gone"] {
+                try run("DELETE FROM " + table)
+            }
+        } catch { abort(); throw error }
+    }
+
+    func observe(room: String, node: String, session: String, reference: String, label: String) throws {
+        let sessionKey = room + "/" + node + "/" + session
+        let key = sessionKey + "/" + reference
+        try run("INSERT OR IGNORE INTO scan_refs VALUES (?)", [key])
+        try run("INSERT OR IGNORE INTO scan_sessions VALUES (?)", [sessionKey])
+        if hasSnapshot && !(try exists(key)) {
+            try run("INSERT OR REPLACE INTO notifications VALUES (?,?,?,?,?,?)",
+                    [sessionKey, room, node, session, reference, label])
+        }
+    }
+
+    func finish() throws {
+        try run("INSERT INTO gone SELECT key FROM known_sessions EXCEPT SELECT key FROM scan_sessions")
+        try run("DELETE FROM known_refs")
+        try run("INSERT INTO known_refs SELECT key FROM scan_refs")
+        try run("DELETE FROM known_sessions")
+        try run("INSERT INTO known_sessions SELECT key FROM scan_sessions")
+        try run("COMMIT")
+        hasSnapshot = true
+    }
+
+    func abort() { try? run("ROLLBACK") }
+
+    private func walk(_ sql: String, visit: (OpaquePointer) -> Void) throws {
+        let query = try statement(sql)
+        defer { sqlite3_finalize(query) }
+        while true {
+            let code = sqlite3_step(query)
+            if code == SQLITE_DONE { return }
+            guard code == SQLITE_ROW else { throw failure() }
+            visit(query)
+        }
+    }
+
+    func notifications(_ visit: (String, String, String, String, String) -> Void) throws {
+        try walk("SELECT room,node,session,reference,label FROM notifications") { query in
+            func text(_ column: Int32) -> String { String(cString: sqlite3_column_text(query, column)) }
+            visit(text(0), text(1), text(2), text(3), text(4))
+        }
+    }
+
+    func withdrawals(_ visit: (String) -> Void) throws {
+        try walk("SELECT key FROM gone") { visit(String(cString: sqlite3_column_text($0, 0))) }
     }
 }
