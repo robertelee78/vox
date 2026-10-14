@@ -1,5 +1,6 @@
 // The daemon owns the machine's anchors. Settings changes only manual sources; a room's
-// inspector reads its source from that same inventory and never grants dialing authority.
+// inspector reads its signed room endpoints separately from machine-wide identity reach.
+// Neither presentation grants dialing authority.
 import SwiftUI
 
 @MainActor
@@ -131,7 +132,8 @@ struct NetworkSettingsView: View {
     }
 }
 
-/// The selected room's source in the same machine list, including its honest stale/unknown state.
+/// The selected room's signed endpoints, with separately labelled machine identity reach
+/// and honest last-known configuration when an authoritative refresh is unavailable.
 struct RoomAnchorsView: View {
     @ObservedObject var model: NodeModel
     let room: String
