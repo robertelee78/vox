@@ -5478,10 +5478,6 @@ impl ChannelState {
         if self.timeline.len() != before {
             self.invalidate_display();
         }
-        // A Session entry follows the room's retention (SE-5).
-        self.drive
-            .sessions
-            .retain(|r| !gone.contains(&r.entry_hash));
         for h in &gone {
             self.forget_read_record(h);
         }

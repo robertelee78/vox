@@ -36,7 +36,7 @@ mod waiting;
 pub(super) mod private_index;
 
 pub(crate) use activity_query::{
-    Cursor as ActivityCursor, Plan as ActivityPlan, Query as ActivityQuery, Reply as ActivityReply,
+    Cursor as ActivityCursor, Query as ActivityQuery, Reply as ActivityReply,
 };
 pub(crate) use files::{FileQuery, FileReply};
 pub(crate) use query::{FieldKind, Query, Reply, Row};
