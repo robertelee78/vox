@@ -699,15 +699,10 @@ private struct EndRoomSheet: View {
                     working = true
                     Task {
                         defer { working = false }
-                        do {
-                            guard try await model.canEndRoom(room) else {
-                                authorizedRoom = nil
-                                reason = "Only this room's creator or an admin can end it for everyone."
-                                return
-                            }
-                            if let why = await model.leaveRoom(endingIt: true) { reason = why }
-                            else { model.sheet = nil }
-                        } catch { reason = sentence(error); authorizedRoom = nil }
+                        if let why = await model.endRoomFromSheet(room) {
+                            reason = why
+                            authorizedRoom = nil
+                        }
                     }
                 }
                 .disabled(checking || working || authorizedRoom != model.roomOnScreen || authorizedRoom == nil)

@@ -1961,16 +1961,46 @@ final class NodeModel: ObservableObject {
 
     /// Bind an ending permission read to the same room and acting node throughout.
     func canEndRoom(_ room: String) async throws -> Bool {
-        let epoch = nodeObservationEpoch, actor = me, generation = roomReadGeneration
+        let epoch = nodeObservationEpoch, actor = me, generation = roomReadGeneration, editor = sheetInstance
         guard roomOnScreen == room, sheet == .end, ended == nil else {
             throw VoxError.Failed(reason: "The room to end is no longer selected.")
         }
         let admins = try await client.admins(room: room)
         guard !Task.isCancelled, nodeObservationEpoch == epoch, me == actor,
-              roomReadGeneration == generation, roomOnScreen == room, sheet == .end, ended == nil else {
+              roomReadGeneration == generation, roomOnScreen == room, sheet == .end, sheetInstance == editor, ended == nil else {
             throw VoxError.Failed(reason: "The room or acting node changed while checking who may end it.")
         }
         return admins.contains(actor)
+    }
+
+    /// A late ending reply must never clear a newer room or close a replacement sheet.
+    func endRoomFromSheet(_ room: String) async -> String? {
+        let epoch = nodeObservationEpoch, actor = me, generation = roomReadGeneration, editor = sheetInstance
+        let operation = "end-room", attempt = begin("end-room")
+        defer { end(attempt) }
+        func current() -> Bool {
+            !Task.isCancelled && nodeObservationEpoch == epoch && me == actor
+                && roomReadGeneration == generation && roomOnScreen == room
+                && sheet == .end && sheetInstance == editor && ended == nil
+        }
+        guard current() else { return nil }
+        do {
+            guard try await canEndRoom(room) else {
+                return "Only this room's creator or an admin can end it for everyone."
+            }
+            guard current() else { return nil }
+            try await client.end(room: room)
+            guard current() else { return nil }
+            report(operation: operation, done: "The room is ended for everyone.")
+            sheet = nil
+            select(nil)
+            await refresh()
+            return nil
+        } catch {
+            guard current() else { return nil }
+            report(error, operation: operation)
+            return sentence(error)
+        }
     }
 
     /// The room on screen's admins, creator first.
