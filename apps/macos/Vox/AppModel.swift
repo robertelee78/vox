@@ -323,11 +323,12 @@ final class AppModel: ObservableObject {
                 await connection.close()
                 // A superseding lifecycle request must consult the daemon's saved selection;
                 // it must not write an obsolete app choice after this authoritative commit.
-                if self.client === original, self.node === old { await reach() }
+                if ownsNodeRequest(original, generation), self.node === old { await reach() }
                 return
             }
             guard selected.selectedNode == expected, selected.selectedName == name else {
                 await connection.close()
+                guard ownsNodeRequest(original, generation), self.node === old else { return }
                 appNodeChooser = false
                 appNodeChoiceSaid = "The daemon selected a different node. Reconnecting to its saved selection."
                 await reach()
