@@ -134,6 +134,7 @@ final class NodeModel: ObservableObject {
         }
     }
     private var roomReadGeneration = UUID()
+    private var roomViewGeneration = UUID()
     private var rejectedRoomMark: String?
     private var roomMessageRevision = UUID()
     @Published private var roomNeedsPage = false
@@ -235,15 +236,13 @@ final class NodeModel: ObservableObject {
     @Published var showing: Showing = .general {
         didSet {
             guard showing != oldValue else { return }
-            roomReadGeneration = UUID()
+            roomViewGeneration = UUID()
             messages = []
-            roomInstance = nil
             roomBefore = nil
             roomOlder = 0
             roomHasNewer = false
             roomReloadNeeded = false
             roomReadingOlder = false
-            roomNeedsPage = true
             roomOlderRead = UUID()
             messageFooters = [:]
             messageFooterErrors = [:]
@@ -826,11 +825,11 @@ final class NodeModel: ObservableObject {
     private func readNewOnScreen() async {
         guard case let .room(id) = selection, ended == nil, !showingSession, !roomReloadNeeded else { return }
         let generation = roomReadGeneration, epoch = nodeObservationEpoch
-        let view = selectedRoomView, displayed = showing
+        let view = selectedRoomView, displayed = showing, viewGeneration = roomViewGeneration
         let revision = roomMessageRevision, follows = timelineFollowingNewest
         let loaded = messages.map(\.id), instance = roomInstance
         func current() -> Bool {
-            selection == .room(id) && showing == displayed && ended == nil && generation == roomReadGeneration
+            selection == .room(id) && roomViewGeneration == viewGeneration && showing == displayed && ended == nil && generation == roomReadGeneration
                 && epoch == nodeObservationEpoch && revision == roomMessageRevision
                 && follows == timelineFollowingNewest
         }
@@ -881,14 +880,14 @@ final class NodeModel: ObservableObject {
         }
         guard let room = roomOnScreen, let before = roomBefore, !roomReadingOlder, ended == nil else { return }
         guard let instance = roomInstance else { return }
-        let view = selectedRoomView, displayed = showing
+        let view = selectedRoomView, displayed = showing, viewGeneration = roomViewGeneration
         let generation = roomReadGeneration, epoch = nodeObservationEpoch
         timelineFollowingNewest = false
         let revision = roomMessageRevision, request = UUID()
         roomOlderRead = request
         roomReadingOlder = true
         func current() -> Bool {
-            showing == displayed && generation == roomReadGeneration && epoch == nodeObservationEpoch
+            roomViewGeneration == viewGeneration && showing == displayed && generation == roomReadGeneration && epoch == nodeObservationEpoch
                 && revision == roomMessageRevision && roomOlderRead == request
                 && roomOnScreen == room && roomBefore == before
                 && !timelineFollowingNewest && ended == nil
@@ -1234,7 +1233,8 @@ final class NodeModel: ObservableObject {
             decisionEvents = await decisions()
         }
         guard case let .room(id) = selection, ended == nil else { return }
-        let view = selectedRoomView
+        watchReads(id)
+        let view = selectedRoomView, viewGeneration = roomViewGeneration
         let generation = roomReadGeneration
         let messageRevision = roomMessageRevision
         let metadataToken = sessionsMetadataRead
@@ -1248,7 +1248,7 @@ final class NodeModel: ObservableObject {
             let unread = try await readUnreadSummary(id)
             let page = try await client.roomViewRead(room: id, view: view)
             let read = page.messages
-            guard generation == roomReadGeneration, self.selection == .room(id), ended == nil else { return }
+            guard viewGeneration == roomViewGeneration, generation == roomReadGeneration, self.selection == .room(id), ended == nil else { return }
             let services = try await client.servicesPage(room: id, after: nil, revision: nil)
             let rows = try await memberRows(id)
             let kept = (try? await client.retention(room: id)) ?? ""
@@ -1256,7 +1256,7 @@ final class NodeModel: ObservableObject {
             let done = try await client.noticesPage(room: id, before: nil, revision: nil)
             let livePage = try await client.sessionsOpenPage(room: id, after: liveAfter)
             let historyPage = try await client.sessionsPage(room: id, after: historyAfter)
-            guard generation == roomReadGeneration, self.selection == .room(id), ended == nil else { return }
+            guard viewGeneration == roomViewGeneration, generation == roomReadGeneration, self.selection == .room(id), ended == nil else { return }
             guard messageRevision == roomMessageRevision else { return }
             // The page and its inspector replace the prior view together, after both reads
             // have succeeded. An ordinary refresh must not publish a half-empty room.
@@ -1291,12 +1291,12 @@ final class NodeModel: ObservableObject {
             await loadStepRetention()
             guard !Task.isCancelled, generation == roomReadGeneration, selection == .room(id), ended == nil else { return }
             await loadRoomAnchorState()
-            guard generation == roomReadGeneration, self.selection == .room(id), ended == nil else { return }
+            guard viewGeneration == roomViewGeneration, generation == roomReadGeneration, self.selection == .room(id), ended == nil else { return }
             // A Session restored as this room's last view is read once the room lists it (D12).
             if showingSession { await readSession() }
             watchReads(id)
         } catch {
-            guard generation == roomReadGeneration, self.selection == .room(id), ended == nil else { return }
+            guard viewGeneration == roomViewGeneration, generation == roomReadGeneration, self.selection == .room(id), ended == nil else { return }
             reportBackground(error)
         }
     }
@@ -2767,13 +2767,24 @@ final class NodeModel: ObservableObject {
     /// only when it changed: who has read this node's messages (read records arrive with the
     /// room's syncs and draw nothing of their own), the pulled copies, the services
     /// shared, and the members with their trust (one who joins while the room is on screen).
+    private struct WatchScope: Equatable {
+        let room: String
+        let generation: UUID
+        let epoch: UUID
+    }
+    private var watchScope: WatchScope?
+
     private func watchReads(_ room: String) {
+        let scope = WatchScope(room: room, generation: roomReadGeneration, epoch: nodeObservationEpoch)
+        if watchScope == scope, watching?.isCancelled == false { return }
+        watchScope = scope
+
         watching?.cancel()
         let generation = roomReadGeneration
         watching = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
-                guard !Task.isCancelled, let self, self.roomReadGeneration == generation,
+                guard !Task.isCancelled, let self, self.roomReadGeneration == generation, self.nodeObservationEpoch == scope.epoch,
                       self.selection == .room(room), self.ended == nil else { return }
                 await self.refreshMessageFooters(room)
                 let fileIDs = self.displayedFileIDs
@@ -2782,18 +2793,18 @@ final class NodeModel: ObservableObject {
                 let kept = try? await self.client.retention(room: room)
                 let keptSecs = try? await self.client.retentionSecs(room: room)
                 await self.readGovernancePages()
-                guard !Task.isCancelled, self.roomReadGeneration == generation,
+                guard !Task.isCancelled, self.roomReadGeneration == generation, self.nodeObservationEpoch == scope.epoch,
                       self.selection == .room(room), self.ended == nil else { return }
                 if let kept, kept != self.retention { self.retention = kept }
                 if let keptSecs, keptSecs != self.retentionSecs { self.retentionSecs = keptSecs }
                 await self.loadStepRetention()
-                guard !Task.isCancelled, self.roomReadGeneration == generation,
+                guard !Task.isCancelled, self.roomReadGeneration == generation, self.nodeObservationEpoch == scope.epoch,
                       self.selection == .room(room), self.ended == nil else { return }
                 await self.loadRoomAnchorState()
-                guard !Task.isCancelled, self.roomReadGeneration == generation,
+                guard !Task.isCancelled, self.roomReadGeneration == generation, self.nodeObservationEpoch == scope.epoch,
                       self.selection == .room(room), self.ended == nil else { return }
                 await self.refreshSessionMetadata()
-                guard !Task.isCancelled, self.roomReadGeneration == generation,
+                guard !Task.isCancelled, self.roomReadGeneration == generation, self.nodeObservationEpoch == scope.epoch,
                       self.selection == .room(room), self.ended == nil else { return }
                 let visibleFiles = self.displayedFileIDs
                 if visibleFiles == fileIDs, let copies = fileFacts?.copies {
@@ -2814,6 +2825,7 @@ final class NodeModel: ObservableObject {
                         let before = Set(self.members.map(\.id))
                         let came = rows.rows.filter { !before.contains($0.id) }
                         self.members = rows.rows
+                    self.roomNeedsPage = false
                         if !before.isEmpty || !came.isEmpty {
                             let at = UInt64(Date().timeIntervalSince1970 * 1000)
                             for m in came where !self.joins.contains(where: { $0.fingerprint == m.id }) {
@@ -2827,7 +2839,7 @@ final class NodeModel: ObservableObject {
                 // keyring's nodes trusting the newcomer.
                 for (i, line) in self.joins.enumerated() {
                     if let said = try? await self.client.joinSaid(room: room, member: line.fingerprint),
-                       !Task.isCancelled, self.roomReadGeneration == generation,
+                       !Task.isCancelled, self.roomReadGeneration == generation, self.nodeObservationEpoch == scope.epoch,
                        self.selection == .room(room), self.ended == nil, i < self.joins.count,
                        self.joins[i].said != said {
                         self.joins[i].said = said
