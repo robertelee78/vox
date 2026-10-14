@@ -752,7 +752,12 @@ final class NodeModel: ObservableObject {
 
     /// The node ended: detached, or the daemon stopped.
     @Published private(set) var ended: String? {
-        didSet { if ended != nil { clearThreadState() } }
+        didSet {
+            if ended != nil {
+                clearThreadState()
+                invalidateSessionPause()
+            }
+        }
     }
 
     /// Whether macOS lets Vox notify; nil until it says.
@@ -777,6 +782,8 @@ final class NodeModel: ObservableObject {
         notifier.allowed = { [weak self] granted in self?.notifying = granted }
         notifier.ask()
     }
+
+    deinit { sessionPauseTask?.cancel() }
 
     /// The rooms in `need`, urgent first, then by name.
     /// The rooms as the sidebar lists them (the decider, v0.4.3, "more like" a chat list): the
