@@ -2088,7 +2088,10 @@ final class NodeModel: ObservableObject {
     private func reportBackground(_ error: Error) {
         guard outcome == nil || outcome?.operation == "" else { return }
         let connectivity: Bool
-        if case VoxError.Unreachable(_) = error { connectivity = true } else { connectivity = false }
+        switch error {
+        case VoxError.Unreachable(_), VoxError.Interrupted(_): connectivity = true
+        default: connectivity = false
+        }
         outcome = Outcome(operation: "", kind: Outcome.kind(of: error), words: sentence(error),
                           backgroundConnectivity: connectivity)
     }
@@ -2645,6 +2648,7 @@ struct Outcome: Equatable {
 
     static func kind(of error: Error) -> Kind {
         if case VoxError.Unknown(_) = error { return .unknown }
+        if case VoxError.Interrupted(_) = error { return .unknown }
         return .refused
     }
 }

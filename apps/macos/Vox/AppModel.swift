@@ -855,6 +855,7 @@ final class AppModel: ObservableObject {
 func sentence(_ error: Error) -> String {
     switch error {
     case let VoxError.Unreachable(reason): return asSentence(reason)
+    case let VoxError.Interrupted(reason): return asSentence(reason)
     case let VoxError.Failed(reason): return asSentence(reason)
     case let VoxError.Detached(reason): return asSentence(reason)
     case let VoxError.Unknown(reason): return asSentence(reason)

@@ -60,6 +60,13 @@ pub enum VoxError {
         /// The existing daemon connection sentence, unchanged for a person.
         reason: String,
     },
+    /// The daemon connection ended before its answer. The request outcome is unknown;
+    /// only a background read may retire this observation after later healthy reads.
+    #[error("{reason}")]
+    Interrupted {
+        /// The existing interruption sentence, unchanged for a person.
+        reason: String,
+    },
     /// The operation failed.
     #[error("{reason}")]
     Failed {

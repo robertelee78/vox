@@ -1384,6 +1384,9 @@ impl Held {
                     VoxError::Unreachable { reason } => VoxError::Unreachable {
                         reason: contextual(reason),
                     },
+                    VoxError::Interrupted { reason } => VoxError::Interrupted {
+                        reason: contextual(reason),
+                    },
                     VoxError::Unknown { reason } => VoxError::Unknown {
                         reason: contextual(reason),
                     },
@@ -1424,10 +1427,13 @@ pub struct VoxClient {
 fn said(socket: &std::path::Path, e: Error) -> VoxError {
     use vox_core::error::IpcHandshake;
     let unreachable = matches!(&e, Error::Ipc(IpcHandshake::Unreachable { .. }));
+    let interrupted = matches!(&e, Error::Ipc(IpcHandshake::HungUp { .. }));
     let uncertain = matches!(&e, Error::Ipc(IpcHandshake::RequestTimedOut { .. }));
     let reason = vox_core::node::daemonipc::unreached(socket, None, e);
     if unreachable {
         VoxError::Unreachable { reason }
+    } else if interrupted {
+        VoxError::Interrupted { reason }
     } else if uncertain {
         VoxError::Unknown { reason }
     } else {
