@@ -2670,13 +2670,16 @@ final class NodeModel: ObservableObject {
         }
     }
 
-    fileprivate func arrived(_ message: RoomMessage, in room: String) async {
-        let epoch = nodeObservationEpoch
-        if !rooms.contains(where: { $0.id == room }) {
-            await refresh()
-            guard epoch == nodeObservationEpoch, !Task.isCancelled,
-                  rooms.contains(where: { $0.id == room }) else { return }
-        }
+    fileprivate func arrived(_ message: RoomMessage, in room: String, instance: Data,
+                             epoch: UUID, actor: String) async -> Bool {
+        guard acceptsObservation(epoch, actor: actor),
+              acceptsArrivalInstance(instance, room: room) else { return false }
+        if !rooms.contains(where: { $0.id == room }) { await refresh() }
+        // Refresh can suspend while selection, observation or the saved-room instance
+        // changes. Revalidate immediately before the first preview/body/notification write.
+        guard acceptsObservation(epoch, actor: actor),
+              acceptsArrivalInstance(instance, room: room),
+              rooms.contains(where: { $0.id == room }) else { return false }
         // Looked at: the room's own timeline (General or All) on screen in a window in front of
         // the person, following its newest message, so this one is drawn in view as it lands. A
         // room chosen but with a Session shown, scrolled up, or behind another window is not.
@@ -2718,8 +2721,9 @@ final class NodeModel: ObservableObject {
             }
         }
         // Unread until drawn in view (this node's own never are), the room on screen too.
-        guard message.author != me else { return }
+        guard message.author != me else { return true }
         count(message, in: room)
+        return true
     }
 
     /// The room whose own timeline is in view and following its newest message, in a window in
@@ -2839,8 +2843,9 @@ private final class Listener: ClientListener {
             return false
         }
         readLog.debug("follow: event message \(message.id, privacy: .public) in \(room, privacy: .public)")
-        await model.arrived(message, in: room)
-        return current() != nil
+        let consumed = await model.arrived(message, in: room, instance: instance,
+                                           epoch: epoch, actor: actor)
+        return consumed && current() != nil
     }
 
     func onNotice(text: String) async -> Bool {
