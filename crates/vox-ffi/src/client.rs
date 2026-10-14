@@ -5274,6 +5274,95 @@ impl VoxClient {
         on_held!(self, |c| done(c, &req).await)
     }
 
+    /// Mark received messages from other members through one captured arrival head.
+    /// One held actor, one room instance, and one bounded page are retained throughout.
+    /// Cursor, authority and durable-mark failures abort without claiming whole-room success.
+    pub async fn mark_room_read(&self, room: String, node: String) -> Result<u64, VoxError> {
+        let channel_id = digest(&room, "room id")?;
+        let actor = digest(&node, "fingerprint")?;
+        on_held!(self, |c| {
+            if c.me() != Some(actor) {
+                return Err(failed(
+                    "The acting node changed before marking this room read.",
+                ));
+            }
+            let head = match ask(c, &Request::ArrivalHead { channel_id }).await? {
+                Frame::ArrivalHead { head } => head,
+                other => return Err(unexpected(&other)),
+            };
+            let mut cursor = HistoryCursor {
+                instance: head.instance,
+                arrival: 0,
+            };
+            let mut marked = 0u64;
+            while cursor.arrival < head.arrival {
+                let (rows, instance, next) = match ask(
+                    c,
+                    &Request::ArrivalPage {
+                        channel_id,
+                        after: cursor,
+                    },
+                )
+                .await?
+                {
+                    Frame::ArrivalPage {
+                        rows,
+                        instance,
+                        next,
+                    } => (rows, instance, next),
+                    other => return Err(unexpected(&other)),
+                };
+                if instance != head.instance {
+                    return Err(failed(
+                        "The saved room changed while marking it read. Try again.",
+                    ));
+                }
+                let mut last = cursor.arrival;
+                for row in &rows {
+                    if row.arrival <= last || row.owed {
+                        return Err(failed(
+                            "The room's arrival page did not advance consistently.",
+                        ));
+                    }
+                    last = row.arrival;
+                }
+                if next.is_some_and(|n| {
+                    n.instance != head.instance || n.arrival <= cursor.arrival || n.arrival < last
+                }) {
+                    return Err(failed(
+                        "The room's arrival continuation did not advance consistently.",
+                    ));
+                }
+                let mut entries: Vec<_> = rows
+                    .iter()
+                    .filter(|row| row.arrival <= head.arrival && row.author != actor)
+                    .map(|row| row.entry_hash)
+                    .collect();
+                entries.sort_unstable();
+                entries.dedup();
+                for page in entries.chunks(vox_core::node::content::MAX_READ_HASHES) {
+                    done(
+                        c,
+                        &Request::MarkRead {
+                            channel_id,
+                            entries: page.to_vec(),
+                        },
+                    )
+                    .await?;
+                    marked = marked
+                        .checked_add(page.len() as u64)
+                        .ok_or_else(|| failed("The room's read count is too large."))?;
+                }
+                if last >= head.arrival {
+                    break;
+                }
+                let Some(next) = next else { break };
+                cursor = next;
+            }
+            Ok(marked)
+        })
+    }
+
     /// Deliver the held node's events to `listener` until it is detached or the daemon stops.
     ///
     /// When the node says a room has new readable messages (its own post, a sync that rendered

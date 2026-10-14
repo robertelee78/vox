@@ -186,6 +186,10 @@ private struct Sidebar: View {
                                 Task { await model.copyRoomLink(room: room.id) }
                             }
                             .keyboardShortcut("c", modifiers: .command)
+                            Button("Mark as Read") {
+                                Task { await model.markRoomRead(room.id) }
+                            }
+                            .disabled(model.busy)
                             Button("Copy Name") {
                                 NSPasteboard.general.clearContents()
                                 NSPasteboard.general.setString(room.name, forType: .string)

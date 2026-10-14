@@ -1737,6 +1737,26 @@ final class NodeModel: ObservableObject {
         }
     }
 
+    /// Deliberately mark the clicked room's captured received history, not only loaded rows.
+    func markRoomRead(_ room: String) async {
+        let actor = me, epoch = nodeObservationEpoch
+        guard rooms.contains(where: { $0.id == room }), ended == nil else { return }
+        let operation = "mark-room-read", attempt = begin("mark-room-read")
+        defer { end(attempt) }
+        do {
+            let count = try await client.markRoomRead(room: room, node: actor)
+            guard !Task.isCancelled, me == actor, nodeObservationEpoch == epoch,
+                  rooms.contains(where: { $0.id == room }) else { return }
+            report(operation: operation, done: count == 0
+                   ? "No received messages from other members to mark read in this room."
+                   : "Room marked as read.")
+            await refresh()
+        } catch {
+            guard me == actor, nodeObservationEpoch == epoch else { return }
+            report(error, operation: operation)
+        }
+    }
+
     /// Leave the room on screen, or end it for everyone: nil once done, else why not (D19), for
     /// the sheet that asked to say where it was asked.
     func leaveRoom(endingIt: Bool) async -> String? {
