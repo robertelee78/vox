@@ -4770,10 +4770,8 @@ pub struct Node {
     /// entry is removed once a view reads the room under its lock, since that read includes the
     /// write: an entry here is therefore always newer than the published one.
     fresh_details: BTreeMap<Digest32, (ChannelSummary, ChannelDetail)>,
-    /// Per room, the entries shown to this node's person or drained into its agent's turn and not
-    /// yet named by a read record of its own, and when it last posted one (ms): ADR-028 RR-2's
-    /// "at most one per room per 5 seconds" ([`READ_RECORD_EVERY_MS`]).
-    reads_pending: BTreeMap<Digest32, (BTreeSet<Digest32>, u64)>,
+    /// Fair room cursor for bounded publication of durably accepted local read marks.
+    reads_after: Option<Digest32>,
     /// What this node decided, kept on its disk for 14 days (ADR-028 §7).
     decisions: crate::node::decisions::DecisionLog,
     /// Rooms this node holds ended, passing the end on before it deletes them (V030-08).
@@ -5316,7 +5314,7 @@ impl Node {
             nearby_rooms: 0,
             nearby_dialed: BTreeMap::new(),
             fresh_details: BTreeMap::new(),
-            reads_pending: BTreeMap::new(),
+            reads_after: None,
             winding: BTreeMap::new(),
             departed_seen: BTreeMap::new(),
             withdrawn: BTreeMap::new(),
@@ -5789,7 +5787,7 @@ impl Node {
                         self.publish().await;
                     }
                     // A read record held back by the 5-second batch goes out when it is due.
-                    self.flush_reads().await;
+                    if self.flush_reads().await { self.publish().await; }
                     // A folded decision's count is written once its hour is over (ADR-028 D-1).
                     self.decisions.flush_folded((self.millis_clock)());
                 }
@@ -18537,93 +18535,94 @@ impl Node {
         pruned > 0 || !checkpointed.is_empty() || applied
     }
 
-    /// Note that `entries` of a room were shown to this node's person or drained into its agent's
-    /// turn (ADR-028 RR-1), and post a read record for them if one is due (RR-2).
+    /// Done acknowledges durable local read state. Signed receipt publication is bounded
+    /// background work; it may wait for sync without retaining or losing a volatile backlog.
     async fn mark_read(&mut self, channel_id: &Digest32, entries: Vec<Digest32>) -> Outcome {
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return Outcome::Failed(Fault::ChannelNotOpen);
         };
-        // A room that is over takes no record (one after a leave would undo it, V210-164), so
-        // the client is told and asks no more: it is not left to retry what can never be posted.
-        {
-            let ch = shared.lock().await;
-            if ch.ended((self.millis_clock)()).is_some() {
-                return Outcome::Failed(Fault::RoomEnded);
-            }
-            if ch.has_left(&ch.me()) {
-                return Outcome::Failed(Fault::RoomLeft);
+        let Some(profile) = self
+            .profile
+            .as_ref()
+            .filter(|profile| profile.is_unlocked())
+        else {
+            return Outcome::Failed(Fault::Locked);
+        };
+        let mut ch = shared.lock().await;
+        match ch.admit_read_marks(profile, &entries, (self.millis_clock)()) {
+            Ok(()) => Outcome::Done,
+            Err(error) => {
+                if !matches!(
+                    error,
+                    Error::Profile(
+                        "read selection changed; refresh and retry"
+                            | "this identity has left the room"
+                            | "this room has ended"
+                    ) | Error::SizeLimitExceeded(_)
+                ) {
+                    ch.poison(&error);
+                }
+                Outcome::Failed(fault_of(&error))
             }
         }
-        if !entries.is_empty() {
-            self.reads_pending
-                .entry(*channel_id)
-                .or_insert_with(|| (BTreeSet::new(), 0))
-                .0
-                .extend(entries);
-            self.flush_reads().await;
-        }
-        Outcome::Done
     }
 
-    /// Post a read record in each room whose pending reads are due: the last record is
-    /// [`READ_RECORD_EVERY_MS`] old. A room not synced yet keeps its reads for a later tick; one
-    /// that refuses the record (ended, left) drops them.
-    async fn flush_reads(&mut self) {
-        let now_millis = (self.millis_clock)();
-        let due: Vec<Digest32> = self
-            .reads_pending
-            .iter()
-            .filter(|(_, (pending, last))| {
-                !pending.is_empty() && now_millis >= last.saturating_add(READ_RECORD_EVERY_MS)
+    /// Give one open room one page per timer turn. The Channel persists cadence and marks;
+    /// reopening resumes them from disk. A failed publication never discards accepted marks.
+    async fn flush_reads(&mut self) -> bool {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let room = self
+            .reads_after
+            .and_then(|after| {
+                self.channels
+                    .range((Excluded(after), Unbounded))
+                    .next()
+                    .map(|(id, _)| *id)
             })
-            .map(|(cid, _)| *cid)
-            .collect();
-        for cid in due {
-            let Some(profile) = self.profile.as_ref() else {
-                return;
-            };
-            let Some(shared) = self.channels.get(&cid).map(Arc::clone) else {
-                self.reads_pending.remove(&cid);
-                continue;
-            };
-            // A room mid-session is left for the next tick, as the sweep does.
-            let Ok(mut ch) = shared.try_lock() else {
-                continue;
-            };
-            let me = profile.fingerprint();
-            let Some((pending, last)) = self.reads_pending.get_mut(&cid) else {
-                continue;
-            };
-            let shown: Vec<Digest32> = pending.iter().copied().collect();
-            let mut read = match ch.unrecorded_reads(profile.store(), &me, &shown) {
-                Ok(read) => read,
-                Err(error) => {
-                    ch.poison(&error);
-                    continue;
-                }
-            };
-            read.truncate(crate::node::content::MAX_READ_HASHES);
-            if read.is_empty() {
-                pending.clear();
-                continue;
+            .or_else(|| self.channels.first_key_value().map(|(id, _)| *id));
+        let Some(cid) = room else {
+            return false;
+        };
+        self.reads_after = Some(cid);
+        let Some(profile) = self
+            .profile
+            .as_ref()
+            .filter(|profile| profile.is_unlocked())
+        else {
+            return false;
+        };
+        let Some(shared) = self.channels.get(&cid).map(Arc::clone) else {
+            return false;
+        };
+        let Ok(mut ch) = shared.try_lock() else {
+            return false;
+        };
+        if ch.is_poisoned() {
+            return false;
+        }
+        let result = ch.flush_read_marks(profile, (self.millis_clock)(), READ_RECORD_EVERY_MS);
+        match result {
+            Ok(false) => false,
+            Ok(true) => {
+                drop(ch);
+                self.note_local_append(&cid);
+                true
             }
-            match ch.append_read(profile, read.clone(), now_millis) {
-                Ok(_) => {
-                    for h in &read {
-                        pending.remove(h);
-                    }
-                    *last = now_millis;
-                }
-                Err(crate::error::Error::RoomNotSynced) => continue,
-                Err(_) => {
-                    pending.clear();
-                    continue;
-                }
+            Err(error)
+                if matches!(error, Error::RoomNotSynced)
+                    || ChannelState::governance_refreshing(&error)
+                    || ChannelState::legacy_classification_refreshing(&error) =>
+            {
+                false
             }
-            drop(ch);
-            // Pushed like a post, so the members it trusts learn of it promptly; no event, since
-            // a read record wakes nobody and is no row (RR-4).
-            self.note_local_append(&cid);
+            Err(error) => {
+                ch.poison(&error);
+                let _ = self.event_tx.send(NodeEvent::NodeNote {
+                    note: format!("room {} could not publish its saved read marks: {error}; the marks remain saved",
+                        crate::node::link::b32_encode(&cid)),
+                });
+                true
+            }
         }
     }
 
@@ -20588,6 +20587,8 @@ pub fn fault_of(e: &Error) -> Fault {
         Error::MalformedGovernance("room name is not a DNS label") => Fault::NotARoomName,
         // A room's lifecycle (V030-08): said as what it is, not as an internal fault.
         Error::Profile("this room has ended") => Fault::RoomEnded,
+        Error::Profile("this identity has left the room") => Fault::RoomLeft,
+        Error::Profile("read selection changed; refresh and retry") => Fault::ReadSelectionChanged,
         Error::Profile(
             "only the room's creator or an admin may end it"
             | "only the room's creator may choose its idle end",

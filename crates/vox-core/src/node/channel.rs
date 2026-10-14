@@ -907,6 +907,8 @@ pub struct ChannelState {
     sender: SenderChain,
     /// The next `LogDb` / `PlaintextCache` segment id.
     next_log_id: u64,
+    /// Current pending-read pass: last examined hash and its fixed tail; no mark set is resident.
+    read_mark_scan: Option<(Option<Digest32>, Digest32)>,
     /// Stored entries set aside when the room opened (V210-74): each as `author#seq: why`.
     set_aside: SetAside,
     /// A receiver chain advanced in memory since the chains were last written (V210-74): a decrypt
@@ -1781,6 +1783,7 @@ impl ChannelState {
             presence: BTreeMap::new(),
             sender,
             next_log_id: 1,
+            read_mark_scan: None,
             set_aside: SetAside::default(),
             chains_advanced: false,
             legacy_sessions: legacy_session::LegacySessions::default(),
@@ -2307,6 +2310,7 @@ impl ChannelState {
             presence,
             sender,
             next_log_id,
+            read_mark_scan: None,
             set_aside,
             chains_advanced: false,
             legacy_sessions: legacy_session::LegacySessions::default(),
@@ -2546,6 +2550,7 @@ impl ChannelState {
             presence: BTreeMap::new(),
             sender,
             next_log_id: 1,
+            read_mark_scan: None,
             set_aside: SetAside::default(),
             chains_advanced: false,
             legacy_sessions: legacy_session::LegacySessions::default(),
@@ -5385,6 +5390,55 @@ impl ChannelState {
         index.seal()
     }
 
+    /// Keep the authenticated carrier's age and public kind when permissions withhold its
+    /// body. This is not a decrypted Session classification or a retained-body record.
+    fn preserve_withheld_body_into(
+        &self,
+        batch: &mut crate::node::store::Batch<'_>,
+        entry: &Entry,
+    ) -> Result<()> {
+        let hash = entry.entry_hash();
+        let log = self
+            .log_id_at(Transaction::Batch(batch), &hash)?
+            .ok_or(Error::MalformedAtRest("withheld body has no log page"))?;
+        let saved = batch
+            .get_segment(&self.channel_id, SegmentKind::Index, log)?
+            .map(|segment| {
+                parse_first_seen(&open_segment(&self.sek, SegmentKind::Index, log, &segment)?)
+            })
+            .transpose()?;
+        let tracked = self.retention_get_in(Transaction::Batch(batch), &hash)?;
+        let first_seen = saved
+            .map(|(at, _)| at)
+            .into_iter()
+            .chain(tracked.map(|value| value.first_seen_ms))
+            .min()
+            .unwrap_or(self.now_hint);
+        let steps = entry
+            .payload
+            .as_deref()
+            .is_some_and(|body| is_step_body(&self.channel_id, body))
+            || saved.is_some_and(|(_, steps)| steps)
+            || tracked.is_some_and(|value| value.steps);
+        if saved != Some((first_seen, steps)) {
+            let sealed = seal_segment(
+                &self.sek,
+                SegmentKind::Index,
+                log,
+                &first_seen_bytes(first_seen, steps),
+            )?;
+            batch.put_segment(&self.channel_id, SegmentKind::Index, log, &sealed)?;
+        }
+        if let Some(mut tracked) = tracked {
+            if tracked.first_seen_ms != first_seen || tracked.steps != steps {
+                tracked.first_seen_ms = first_seen;
+                tracked.steps = steps;
+                self.queue_retention(batch, hash, Some(tracked))?;
+            }
+        }
+        Ok(())
+    }
+
     /// Queue a body's age beside its authoritative log row, before the same commit.
     fn track_body_into(
         &mut self,
@@ -6413,6 +6467,7 @@ impl ChannelState {
         // Its newly available local key makes eligible bodies worth asking for again now.
         self.drive.omitted.clear();
         self.persist_drive(store)?;
+        self.drive.told_unheld.remove(&skdm.body.author_id);
         let before = self.drive.news.len();
         self.backfill(store, &skdm.body.author_id, now_ms)?;
         self.render_pending_private(store, now_ms)?;
@@ -6439,7 +6494,7 @@ impl ChannelState {
             // key it held: the author changed its key away from this node, and this node's drive
             // over the author's Sessions is gone (SC-2b). Said once as Session news for the room,
             // so a client that keeps the room's Sessions reads them again; there is no row.
-            if self.drive.holds_from(&author) && self.drive.told_unheld.insert(entry_hash) {
+            if self.drive.holds_from(&author) && self.drive.told_unheld.insert(author) {
                 self.drive
                     .news
                     .push(crate::node::drive::KEY_CHANGED.to_owned());
@@ -7647,7 +7702,8 @@ impl ChannelState {
 
     /// What this node's person has not read here (ADR-028 R-8 at launch): the rows after the newest
     /// one this node recorded as read, oldest first — rendered, not owed, written by someone else,
-    /// and named by no read record of this node's. A room this node never recorded anything read
+    /// and covered by neither a signed receipt nor a durable local read mark of this node's.
+    /// A room this node never recorded anything read
     /// in counts from its first row. At most [`UNREAD_LOOKED`] rows from the newest are looked at.
     pub fn unread(&self, store: &Store) -> Result<Vec<Digest32>> {
         if self.poisoned {
@@ -7706,44 +7762,188 @@ impl ChannelState {
         Ok(out)
     }
 
-    /// Of `shown`, the entries a read record of this identity's should name: rows of the timeline
-    /// (not a body still owed), written by someone else, and not named by a record of its own
-    /// already (RR-2: "since its last record").
-    ///
-    /// **Never a read record** (the decider): a record that named another's record would be read
-    /// in turn, and named by a record of that member's, and so on — two nodes answering each
-    /// other's records every 5 seconds for as long as both are open, a storm nobody sees but
-    /// whose cost every member pays in storage and traffic. A record's hash is refused here,
-    /// whatever a client says it showed, besides never being a row to show.
-    pub fn unrecorded_reads(
-        &self,
-        store: &Store,
-        me: &Digest32,
+    /// Durably mark one bounded request as locally read. Signed receipts are published
+    /// later; an already recorded mark is idempotent, and invalidated selections fail whole.
+    pub(crate) fn admit_read_marks(
+        &mut self,
+        profile: &Profile,
         shown: &[Digest32],
-    ) -> Result<Vec<Digest32>> {
+        now_ms: u64,
+    ) -> Result<()> {
+        if shown.len() > crate::node::content::MAX_READ_HASHES {
+            return Err(Error::SizeLimitExceeded("read marks"));
+        }
         if self.poisoned {
             return Err(self.save_failure());
         }
-        let rendered = self
-            .entries
-            .render_view(store, &self.sek, &self.channel_id)?;
-        let mut out = BTreeSet::new();
-        for hash in shown {
-            if rendered.read_receipt_cache(hash)?.is_some()
-                || rendered.fact(hash)?.is_none()
-                || rendered.was_read(hash, me)?
-            {
-                continue;
+        self.require_governance_ready(profile.store(), crate::time::Ms(now_ms))?;
+        let me = profile.fingerprint();
+        if !self.authors.contains_key(&me) || self.has_left(&me) {
+            return Err(Error::Profile("this identity has left the room"));
+        }
+        if self.ended(now_ms).is_some() {
+            return Err(Error::Profile("this room has ended"));
+        }
+        let result = (|| -> Result<()> {
+            let rendered =
+                self.entries
+                    .render_view(profile.store(), &self.sek, &self.channel_id)?;
+            let governance = self.current_governance(profile.store())?;
+            let mut marks = BTreeSet::new();
+            for hash in shown {
+                if rendered.was_read(hash, &me)? {
+                    continue;
+                }
+                if rendered.fact(hash)?.is_none() {
+                    return Err(Error::Profile("read selection changed; refresh and retry"));
+                }
+                let entry = rendered
+                    .order()
+                    .entry(hash)?
+                    .ok_or(Error::MalformedAtRest("rendered read-mark entry missing"))?;
+                let retained = rendered.retention(hash)?.ok_or(Error::MalformedAtRest(
+                    "rendered read-mark retention missing",
+                ))?;
+                if expired_at(
+                    retained.base(),
+                    now_ms,
+                    self.entry_retention(rendered.transaction(), &entry)?,
+                ) {
+                    return Err(Error::Profile("read selection changed; refresh and retry"));
+                }
+                if entry.skeleton.author_id == me {
+                    continue;
+                }
+                if !governance.can_read(&me, &entry.skeleton.author_id)? {
+                    return Err(Error::Profile("read selection changed; refresh and retry"));
+                }
+                marks.insert(*hash);
             }
-            let entry = rendered
-                .order()
-                .entry(hash)?
-                .ok_or(Error::MalformedAtRest("rendered entry missing"))?;
-            if entry.skeleton.author_id != *me {
-                out.insert(*hash);
+            drop(governance);
+            drop(rendered);
+            if marks.is_empty() {
+                return Ok(());
+            }
+            let mut batch = profile.store().batch()?;
+            let mut index = self
+                .entries
+                .write(&mut batch, &self.sek, &self.channel_id)?;
+            let mut changed = false;
+            for hash in marks {
+                changed |= index.put_read_mark(&hash, &me)?;
+            }
+            if changed {
+                index.seal()?;
+                batch.commit()?;
+                self.entries.committed();
+            }
+            Ok(())
+        })();
+        if let Err(ref error) = result {
+            if !matches!(
+                error,
+                Error::Profile("read selection changed; refresh and retry")
+            ) {
+                self.poison(error);
             }
         }
-        Ok(out.into_iter().collect())
+        result
+    }
+
+    /// Examine one fixed-tail page of durable local marks and publish at most one receipt.
+    /// Skipped marks remain sealed. An unavailable room or failed append loses no accepted work.
+    pub(crate) fn flush_read_marks(
+        &mut self,
+        profile: &Profile,
+        now_ms: u64,
+        interval_ms: u64,
+    ) -> Result<bool> {
+        if self.poisoned {
+            return Err(self.save_failure());
+        }
+        if !self.settled {
+            return Err(Error::RoomNotSynced);
+        }
+        self.require_governance_ready(profile.store(), crate::time::Ms(now_ms))?;
+        let me = profile.fingerprint();
+        if self.has_left(&me) || self.ended(now_ms).is_some() {
+            return Ok(false);
+        }
+        let selected = (|| -> Result<_> {
+            let rendered =
+                self.entries
+                    .render_view(profile.store(), &self.sek, &self.channel_id)?;
+            let last = rendered.read_sent_ms();
+            if last != 0 && now_ms < last.saturating_add(interval_ms) {
+                return Ok(None);
+            }
+            let (after, through) = match self.read_mark_scan {
+                Some(scan) => scan,
+                None => match rendered.pending_reads_tail(&me)? {
+                    Some(tail) => (None, tail),
+                    None => return Ok(None),
+                },
+            };
+            let (page, more) = rendered.pending_reads_page(&me, after)?;
+            let governance = self.current_governance(profile.store())?;
+            let mut read = Vec::new();
+            let mut cursor = after;
+            let mut complete = !more;
+            for hash in page {
+                if hash > through {
+                    complete = true;
+                    break;
+                }
+                cursor = Some(hash);
+                if hash == through {
+                    complete = true;
+                }
+                if rendered.fact(&hash)?.is_none() {
+                    continue;
+                }
+                let entry = rendered
+                    .order()
+                    .entry(&hash)?
+                    .ok_or(Error::MalformedAtRest("pending read-mark entry missing"))?;
+                let retained = rendered.retention(&hash)?.ok_or(Error::MalformedAtRest(
+                    "pending read-mark retention missing",
+                ))?;
+                if entry.skeleton.author_id == me
+                    || expired_at(
+                        retained.base(),
+                        now_ms,
+                        self.entry_retention(rendered.transaction(), &entry)?,
+                    )
+                    || !governance.can_read(&me, &entry.skeleton.author_id)?
+                {
+                    continue;
+                }
+                read.push(hash);
+            }
+            let next = if complete {
+                None
+            } else {
+                Some((cursor, through))
+            };
+            Ok(Some((read, next)))
+        })();
+        let selected = match selected {
+            Ok(selected) => selected,
+            Err(error) => {
+                self.poison(&error);
+                return Err(error);
+            }
+        };
+        let Some((read, next)) = selected else {
+            return Ok(false);
+        };
+        if read.is_empty() {
+            self.read_mark_scan = next;
+            return Ok(false);
+        }
+        self.append_read(profile, read, now_ms)?;
+        self.read_mark_scan = next;
+        Ok(true)
     }
 
     /// Author a read record naming `read` (ADR-028 RR-2): sealed under this identity's sender key
@@ -7773,6 +7973,7 @@ impl ChannelState {
         if self.ended(now_millis).is_some() {
             return Err(Error::Profile("this room has ended"));
         }
+        let sent_ms = now_millis;
         let (now_millis, _) = self.stamp_after_held(profile.store(), now_millis)?;
         let record = crate::node::content::ReadRecord::new(now_millis, read)?;
         let plaintext = Zeroizing::new(record.to_canonical_vec());
@@ -7851,6 +8052,7 @@ impl ChannelState {
                     .entries
                     .write(&mut batch, &self.sek, &self.channel_id)?;
                 index.put_read_receipt(&row, id)?;
+                index.read_sent(sent_ms);
                 index.seal()?;
             }
             batch.commit()
@@ -7863,7 +8065,9 @@ impl ChannelState {
         self.entries.committed();
         self.next_log_id = id.saturating_add(1);
         self.gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.finish_entry_publication(profile.store())?;
+        // The signed receipt and removal of its pending marks are already durable.
+        // Cleanup failure poisons the room but cannot turn that success into a lost mark.
+        let _ = self.finish_entry_publication(profile.store());
 
         Ok(entry_hash)
     }
@@ -8638,7 +8842,9 @@ impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
             }
             return report;
         }
-        if let Err(error) = ch.filter_received_session_bodies(self.store, self.peer, &staged) {
+        if let Err(error) =
+            ch.filter_received_session_bodies(self.store, self.peer, &staged, self.now_ms)
+        {
             ch.poisoned = true;
             ch.save_error = Some(error.to_string());
             *self.fatal.borrow_mut() = Some(error);

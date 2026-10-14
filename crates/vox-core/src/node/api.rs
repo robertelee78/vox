@@ -869,8 +869,9 @@ pub enum NodeCommand {
         text: String,
     },
     /// Note that these entries of an open channel were shown to this node's person, or drained
-    /// into its agent's turn (ADR-028 RR-1). The node posts a read record naming them, at most
-    /// one per room per 5 seconds (RR-2).
+    /// into its agent's turn (ADR-028 RR-1). Done means their local read marks are durably
+    /// stored. The node later publishes a signed read record, at most one per room per
+    /// 5 seconds (RR-2); a deferred publication does not lose the local marks.
     MarkRead {
         /// The channelID.
         channel_id: Digest32,
@@ -1187,6 +1188,8 @@ pub enum Fault {
     DeliveryBusy,
     /// Stored governance is being brought current; no permission decision may use its old view.
     GovernanceRefreshing,
+    /// The requested read marks no longer name the room's readable retained selection.
+    ReadSelectionChanged,
     /// One admin removal is already being applied over bounded actor turns.
     AdminChangePending,
     /// A previous hosted room deletion is still awaiting its bounded daemon handoff.
@@ -1418,6 +1421,9 @@ impl Fault {
             Fault::GovernanceRefreshing => {
                 "this room's permissions are still being read from local storage\n       try again once the room is ready"
             }
+            Fault::ReadSelectionChanged => {
+                "the selected messages changed before they could be marked as read\n       refresh the room and try again"
+            }
             Fault::AdminChangePending => {
                 "an admin change is already being applied on this node\n       wait for its answer before making another admin change"
             }
@@ -1643,6 +1649,7 @@ fault_names!(
     ProfileBusy,
     DeliveryBusy,
     GovernanceRefreshing,
+    ReadSelectionChanged,
     AdminChangePending,
     SessionCleanupBusy,
     SessionCleanupUnavailable,

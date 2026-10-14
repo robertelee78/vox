@@ -296,7 +296,9 @@ impl ChannelState {
         store: &Store,
         peer: Digest32,
         staged: &[Vec<u8>],
+        now_ms: u64,
     ) -> Result<()> {
+        self.now_hint = self.now_hint.max(now_ms);
         self.index_session_floors(store)?;
         for wire in staged {
             let Ok(incoming) = Entry::from_wire(wire) else {
@@ -366,6 +368,7 @@ impl ChannelState {
         if entry.payload.is_none() || self.session_body_allowed(entry, &self.me()) {
             return Ok(false);
         }
+        self.preserve_withheld_body_into(batch, entry)?;
         let mut index = self.entries.write(batch, &self.sek, &self.channel_id)?;
         self.dag.prune_payload(&mut index, &entry.entry_hash())?;
         index.seal()?;

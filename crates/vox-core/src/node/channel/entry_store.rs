@@ -86,11 +86,12 @@ pub(crate) struct Roots {
     read_receipts: u64,
     read_pairs: u64,
     missing_positions: u64,
+    read_pending: u64,
 }
 
 impl Roots {
     fn write(self, e: &mut Encoder) {
-        e.array(11)
+        e.array(12)
             .uint(self.sequence)
             .uint(self.hash)
             .uint(self.clock)
@@ -101,10 +102,11 @@ impl Roots {
         self.retained.write(e);
         e.uint(self.read_receipts)
             .uint(self.read_pairs)
-            .uint(self.missing_positions);
+            .uint(self.missing_positions)
+            .uint(self.read_pending);
     }
     fn read(d: &mut Decoder<'_>) -> Result<Self> {
-        if d.array()? != 11 {
+        if d.array()? != 12 {
             return Err(invalid("entry roots arity"));
         }
         Ok(Self {
@@ -119,6 +121,7 @@ impl Roots {
             read_receipts: d.uint()?,
             read_pairs: d.uint()?,
             missing_positions: d.uint()?,
+            read_pending: d.uint()?,
         })
     }
 }
@@ -173,6 +176,7 @@ struct Directory {
     history_instance: [u8; 16],
     retention_stage: u8,
     retention_cursor: Option<u64>,
+    read_sent_ms: u64,
 }
 
 impl Default for Directory {
@@ -195,6 +199,7 @@ impl Default for Directory {
             history_instance: [0; 16],
             retention_stage: 0,
             retention_cursor: None,
+            read_sent_ms: 0,
         }
     }
 }
@@ -211,7 +216,7 @@ impl Directory {
     }
     fn bytes(&self) -> Zeroizing<Vec<u8>> {
         let mut e = Encoder::new();
-        e.array(18).uint(6);
+        e.array(19).uint(7);
         self.active.write(&mut e);
         self.provisional.write(&mut e);
         e.uint(self.next_page)
@@ -277,6 +282,7 @@ impl Directory {
                 e.array(0);
             }
         }
+        e.uint(self.read_sent_ms);
         Zeroizing::new(e.finish())
     }
     fn parse(bytes: &[u8]) -> Result<Self> {
@@ -286,9 +292,9 @@ impl Directory {
         let mut d = Decoder::new(bytes);
         let arity = d.array()?;
         let version = d.uint()?;
-        // This unpublished format includes durable receipt and recovery membership roots.
-        // Reading older roots as empty would silently lose reads and owed bodies.
-        if (arity, version) != (18, 6) {
+        // This unpublished format includes durable receipts, pending local read marks and
+        // recovery membership. Reading older roots as empty would silently lose accepted work.
+        if (arity, version) != (19, 7) {
             return Err(invalid("entry directory format"));
         }
         let active = Roots::read(&mut d)?;
@@ -392,6 +398,7 @@ impl Directory {
         } else {
             None
         };
+        let read_sent_ms = d.uint()?;
         d.finish()?;
         if retention_stage > 2
             || (retention_stage == 2 && retention_cursor.is_some())
@@ -407,11 +414,13 @@ impl Directory {
                 active.read_receipts,
                 active.read_pairs,
                 active.missing_positions,
+                active.read_pending,
                 provisional.sequence,
                 provisional.hash,
                 provisional.read_receipts,
                 provisional.read_pairs,
                 provisional.missing_positions,
+                provisional.read_pending,
             ]
             .iter()
             .any(|id| *id >= next_page)
@@ -443,6 +452,7 @@ impl Directory {
                 || p.work.read_receipts >= next_page
                 || p.work.read_pairs >= next_page
                 || p.work.missing_positions >= next_page
+                || p.work.read_pending >= next_page
                 || !p.work.rendered.valid_for(next_page)
                 || !p.work.retained.valid_for(next_page)
                 || p.retired >= next_page
@@ -468,6 +478,7 @@ impl Directory {
             history_instance,
             retention_stage,
             retention_cursor,
+            read_sent_ms,
         })
     }
 }

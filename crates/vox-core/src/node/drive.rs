@@ -115,8 +115,9 @@ pub struct DriveState {
     /// a member that lost drive cannot tell ([`KEY_CHANGED`]); `None` until worked out from the
     /// room's log. Not kept: it is worked out again when the room is opened.
     pub(crate) change_unsaid: Option<bool>,
-    /// Entries under a key of another author's this node does not hold, already said as news
-    /// (a lost drive key, SC-2b). Not kept.
+    /// Authors whose unavailable drive key has already been announced since their last
+    /// accepted key. Bounded by receiver authors, never by the number of withheld entries.
+    /// Not kept: reopening may announce each current author's unavailable key once again.
     pub(crate) told_unheld: std::collections::HashSet<Digest32>,
 }
 

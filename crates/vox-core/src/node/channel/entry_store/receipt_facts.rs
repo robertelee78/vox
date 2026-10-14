@@ -1,5 +1,6 @@
 //! Read receipts retain one cache locator and exact message/reader reference counts.
 //! Their bodies remain in PlaintextCache. All changes share the cache/retention Batch.
+//! Accepted local marks are sealed separately until their signed receipt commits.
 
 use super::dag_facts::successor;
 use super::*;
@@ -40,6 +41,35 @@ fn count(source: &Source<'_>, sek: &Sek, room: &Digest32, root: u64, key: &Key) 
         None => Ok(0),
         _ => Err(invalid("read receipt reference count")),
     }
+}
+
+fn pending(
+    source: &Source<'_>,
+    sek: &Sek,
+    room: &Digest32,
+    root: u64,
+    reader: &Digest32,
+    message: &Digest32,
+) -> Result<bool> {
+    match source.find_value(sek, room, root, &pair(reader, message))? {
+        Some(Value::Present) => Ok(true),
+        None => Ok(false),
+        _ => Err(invalid("pending read mark")),
+    }
+}
+
+fn was_read(
+    source: &Source<'_>,
+    sek: &Sek,
+    room: &Digest32,
+    roots: Roots,
+    message: &Digest32,
+    reader: &Digest32,
+) -> Result<bool> {
+    Ok(
+        count(source, sek, room, roots.read_pairs, &pair(message, reader))? != 0
+            || pending(source, sek, room, roots.read_pending, reader, message)?,
+    )
 }
 
 fn row_at(
@@ -117,6 +147,33 @@ fn readers(
 }
 
 impl Write<'_, '_> {
+    /// Caller has checked current retained/rendered membership before this atomic admission.
+    pub(crate) fn put_read_mark(&mut self, message: &Digest32, reader: &Digest32) -> Result<bool> {
+        let mut roots = self.render_roots()?;
+        if was_read(
+            &Source::Batch(self.batch),
+            self.sek,
+            self.channel,
+            roots,
+            message,
+            reader,
+        )? {
+            return Ok(false);
+        }
+        roots.read_pending = self.change_value(
+            roots.read_pending,
+            pair(reader, message),
+            Some(Value::Present),
+        )?;
+        self.set_render_roots(roots)?;
+        Ok(true)
+    }
+
+    /// The wall-clock send cadence commits with the signed receipt, not with admission.
+    pub(crate) fn read_sent(&mut self, now_ms: u64) {
+        self.directory.read_sent_ms = now_ms;
+    }
+
     pub(crate) fn read_receipt_cache(&self, receipt: &Digest32) -> Result<Option<u64>> {
         receipt_cache(
             &Source::Batch(self.batch),
@@ -165,6 +222,17 @@ impl Write<'_, '_> {
             return Ok(false);
         }
         for message in &row.read {
+            if pending(
+                &Source::Batch(self.batch),
+                self.sek,
+                self.channel,
+                roots.read_pending,
+                &row.reader,
+                message,
+            )? {
+                roots.read_pending =
+                    self.change_value(roots.read_pending, pair(&row.reader, message), None)?;
+            }
             let key = pair(message, &row.reader);
             let next = count(
                 &Source::Batch(self.batch),
@@ -234,24 +302,15 @@ impl Write<'_, '_> {
 }
 
 impl Read<'_> {
-    pub(crate) fn read_receipt_cache(&self, receipt: &Digest32) -> Result<Option<u64>> {
-        receipt_cache(
+    pub(crate) fn was_read(&self, message: &Digest32, reader: &Digest32) -> Result<bool> {
+        was_read(
             &self.source(),
             self.sek,
             self.channel,
             readable_roots(&self.directory)?,
-            receipt,
+            message,
+            reader,
         )
-    }
-
-    pub(crate) fn was_read(&self, message: &Digest32, reader: &Digest32) -> Result<bool> {
-        Ok(count(
-            &self.source(),
-            self.sek,
-            self.channel,
-            readable_roots(&self.directory)?.read_pairs,
-            &pair(message, reader),
-        )? != 0)
     }
 
     pub(crate) fn readers_page(
@@ -272,36 +331,79 @@ impl Read<'_> {
     }
 }
 
-impl View<'_, '_> {
-    pub(crate) fn read_receipt_cache(&self, receipt: &Digest32) -> Result<Option<u64>> {
-        receipt_cache(
-            &self.transaction.source(),
-            self.sek,
-            self.channel,
-            readable_roots(&self.directory)?,
-            receipt,
-        )
-    }
-
-    pub(crate) fn was_read(&self, message: &Digest32, reader: &Digest32) -> Result<bool> {
-        Ok(count(
-            &self.transaction.source(),
-            self.sek,
-            self.channel,
-            readable_roots(&self.directory)?.read_pairs,
-            &pair(message, reader),
-        )? != 0)
-    }
-}
-
 impl RenderView<'_> {
-    /// Uses this render view's pinned snapshot, so body and read state cannot cross revisions.
-    pub(crate) fn read_receipt_cache(&self, receipt: &Digest32) -> Result<Option<u64>> {
-        self.order.read.read_receipt_cache(receipt)
-    }
-
+    /// Uses the rendered row's pinned snapshot for both signed and pending local reads.
     pub(crate) fn was_read(&self, message: &Digest32, reader: &Digest32) -> Result<bool> {
         self.order.read.was_read(message, reader)
+    }
+
+    pub(crate) fn read_sent_ms(&self) -> u64 {
+        self.order.read.directory.read_sent_ms
+    }
+
+    /// Fix one pass's tail without retaining the pending set.
+    pub(crate) fn pending_reads_tail(&self, reader: &Digest32) -> Result<Option<Digest32>> {
+        let read = &self.order.read;
+        let roots = readable_roots(&read.directory)?;
+        let found = read.source().last(
+            read.sek,
+            read.channel,
+            roots.read_pending,
+            &pair(reader, &[u8::MAX; 32]),
+            0,
+        )?;
+        match found {
+            Some((key, Value::Present)) if key[..32] == reader[..] => Ok(Some(
+                key[32..]
+                    .try_into()
+                    .map_err(|_| invalid("pending read key"))?,
+            )),
+            Some((key, _)) if key[..32] == reader[..] => Err(invalid("pending read value")),
+            _ => Ok(None),
+        }
+    }
+
+    /// At most 64 pending positions plus one lookahead, including unpublishable marks.
+    pub(crate) fn pending_reads_page(
+        &self,
+        reader: &Digest32,
+        after: Option<Digest32>,
+    ) -> Result<(Vec<Digest32>, bool)> {
+        let read = &self.order.read;
+        let roots = readable_roots(&read.directory)?;
+        let mut key = match after {
+            Some(after) => match successor(pair(reader, &after)) {
+                Some(key) => key,
+                None => return Ok((Vec::new(), false)),
+            },
+            None => pair(reader, &[0; 32]),
+        };
+        let mut out = Vec::with_capacity(64);
+        for _ in 0..=64 {
+            let Some((found, value)) =
+                read.source()
+                    .first(read.sek, read.channel, roots.read_pending, &key, 0)?
+            else {
+                break;
+            };
+            if found[..32] != reader[..] {
+                break;
+            }
+            if !matches!(value, Value::Present) {
+                return Err(invalid("pending read value"));
+            }
+            if out.len() == 64 {
+                return Ok((out, true));
+            }
+            out.push(
+                found[32..]
+                    .try_into()
+                    .map_err(|_| invalid("pending read key"))?,
+            );
+            let Some(next) = successor(found) else { break };
+            key = next;
+        }
+        Ok((out, false))
     }
 
     pub(crate) fn readers_page(
