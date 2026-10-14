@@ -5038,8 +5038,9 @@ async fn chosen_anchors(
     if inputs.is_empty() && !find {
         return Ok(set);
     }
-    let mut daemon = DaemonClient::open(&paths.account().socket()).await?;
     for input in inputs {
+        // A daemon request is a connection's opening, followed by one reply and close.
+        let mut daemon = DaemonClient::open(&paths.account().socket()).await?;
         let spec = match daemon
             .request(DaemonRequest::AnchorResolve {
                 input: input.clone(),
@@ -5063,6 +5064,7 @@ async fn chosen_anchors(
         .map_err(|e| AppError::Usage(e.to_string()))??;
     }
     if find {
+        let mut daemon = DaemonClient::open(&paths.account().socket()).await?;
         match daemon.request(DaemonRequest::AnchorSearch).await? {
             DaemonFrame::AnchorsFound(found) => {
                 if found.is_empty() {
