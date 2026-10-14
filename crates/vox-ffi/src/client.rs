@@ -168,6 +168,17 @@ impl From<vox_core::node::daemonipc::AnchorInfo> for AnchorSummary {
     }
 }
 
+/// The selected node's current room-anchor editing capability, not a cached UI decision.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct RoomAnchorAuthority {
+    /// Full room identity that was queried.
+    pub room: String,
+    /// Full identity of the held actor that the daemon answered for.
+    pub node: String,
+    /// The room creator and currently delegated admins only.
+    pub can_manage: bool,
+}
+
 /// A room the acting node holds.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct RoomSummary {
@@ -2946,6 +2957,90 @@ impl VoxClient {
                 other => Err(unexpected(&other)),
             }
         )
+    }
+
+    /// Read creator/admin authority for the currently held node and exact room.
+    /// A caller must fence room/node changes before publishing this snapshot. Mutations below
+    /// independently enforce current authority in the daemon; this snapshot grants nothing.
+    ///
+    /// # Errors
+    /// A malformed room, no selected actor, a closed room, or the daemon's refusal.
+    pub async fn room_anchor_authority(
+        &self,
+        room: String,
+    ) -> Result<RoomAnchorAuthority, VoxError> {
+        let channel_id = digest(&room, "room id")?;
+        on_held!(self, |c| {
+            let me = c.me().ok_or_else(not_attached)?;
+            match ask(c, &Request::Admins { channel_id }).await? {
+                Frame::Members { members } => Ok(RoomAnchorAuthority {
+                    room: b32_encode(&channel_id),
+                    node: b32_encode(&me),
+                    can_manage: members.contains(&me),
+                }),
+                other => Err(unexpected(&other)),
+            }
+        })
+    }
+
+    /// Add a full pinned fingerprint@address to this room's signed governance statement.
+    /// This proposal consumes an already authenticated/resolved spec, or a fingerprint the
+    /// person explicitly pinned. It does not perform bare host:port identity discovery/search,
+    /// and never changes the machine's manual-anchor list. DNS parsing is off the async workers;
+    /// the room's ordinary anchor transport still authenticates the pinned identity on dial.
+    ///
+    /// # Errors
+    /// Malformed pinned input, a closed room, or the daemon's fresh NotAdmin refusal.
+    pub async fn add_room_anchor_pinned(&self, room: String, spec: String) -> Result<(), VoxError> {
+        let channel_id = digest(&room, "room id")?;
+        let add = self
+            .on_rt(async move {
+                tokio::task::spawn_blocking(move || {
+                    let mut add = vox_core::nat::bootstrap::BootstrapSet::new();
+                    vox_core::node::link::merge_anchor_spec(&mut add, &spec)
+                        .map_err(|error| failed(error.to_string()))?;
+                    Ok::<_, VoxError>(add)
+                })
+                .await
+                .map_err(|error| {
+                    failed(format!(
+                        "the pinned room anchor could not be parsed: {error}"
+                    ))
+                })?
+            })
+            .await?;
+        on_held!(self, |c| done(
+            c,
+            &Request::ChangeRoomAnchors {
+                channel_id,
+                add,
+                remove: None,
+            }
+        )
+        .await)
+    }
+
+    /// Remove the exact full anchor fingerprint from this room's signed governance statement.
+    /// The machine's independent manual source and other rooms are unchanged.
+    ///
+    /// # Errors
+    /// A malformed room/fingerprint, a closed room, or the daemon's fresh NotAdmin refusal.
+    pub async fn remove_room_anchor(
+        &self,
+        room: String,
+        fingerprint: String,
+    ) -> Result<(), VoxError> {
+        let channel_id = digest(&room, "room id")?;
+        let remove = Some(digest(&fingerprint, "anchor fingerprint")?);
+        on_held!(self, |c| done(
+            c,
+            &Request::ChangeRoomAnchors {
+                channel_id,
+                add: vox_core::nat::bootstrap::BootstrapSet::new(),
+                remove,
+            }
+        )
+        .await)
     }
 
     /// Make `member` an admin of `room`, or (`admin` false) take it back; its creator only.

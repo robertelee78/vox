@@ -40,7 +40,7 @@ mod computer;
 pub use client::{
     config_dir, room_group, room_group_words, AnchorReachSummary, AnchorSourceSummary,
     AnchorSummary, ClientListener, DecisionEvent, FileOffer, FileShare, Member, NodeSummary,
-    NodeView, OfferedService, Passphrase, PulledFile, ReadBy, RoomConsents, RoomGroup, RoomLink,
+    NodeView, OfferedService, Passphrase, PulledFile, ReadBy, RoomAnchorAuthority, RoomConsents, RoomGroup, RoomLink,
     RoomMessage, RoomServices, RoomSummary, SharedService, ThreadAuthor, ThreadSummary,
     TrustedNode, UnreadLevel, VoxClient,
 };
