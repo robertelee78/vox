@@ -1784,7 +1784,7 @@ impl ChannelState {
         let mut admission = AdmissionPolicy::new();
         admission.admit(channel_id, epoch, me);
         let origin_ms = genesis.body.created_ms;
-        governance::prepare(profile.store(), &sek, channel_id)?;
+        governance::prepare(profile.store(), &sek, &channel_id)?;
         let governance_display = governance::Display::genesis(&genesis);
         let mut room = Self {
             channel_id,
