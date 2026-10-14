@@ -4445,7 +4445,6 @@ struct RoomPreparation {
     channel: tokio::sync::Mutex<ChannelState>,
     reply: Option<oneshot::Sender<Outcome>>,
     reopening: bool,
-    packages: Option<std::vec::IntoIter<crate::node::keypackage::KeyPackage>>,
     recovery: Option<std::sync::Weak<tokio::sync::Mutex<ChannelState>>>,
 }
 
@@ -4662,6 +4661,9 @@ pub struct Node {
     /// One unpublished state per room being prepared; round-robin bounded actor turns.
     preparing_rooms: BTreeMap<Digest32, RoomPreparation>,
     preparation_after: Option<Digest32>,
+    /// One pending bit per open room; true requests a replay of retained package locators.
+    key_package_rooms: BTreeMap<Digest32, bool>,
+    key_package_after: Option<Digest32>,
     /// Exact off-actor unwraps; a close/lock cannot be undone by their late result.
     opening_rooms: BTreeMap<Digest32, Arc<()>>,
     /// Unlock replies held until the reopening has finished (#208).
@@ -5273,6 +5275,8 @@ impl Node {
             reopen_task: None,
             preparing_rooms: BTreeMap::new(),
             preparation_after: None,
+            key_package_rooms: BTreeMap::new(),
+            key_package_after: None,
             opening_rooms: BTreeMap::new(),
             unlock_waiters: Vec::new(),
             locking: 0,
@@ -5485,21 +5489,33 @@ impl Node {
         // A `Shutdown`'s reply, held until the node is actually gone: see the end of this function.
         let mut shutdown_reply: Option<oneshot::Sender<Outcome>> = None;
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // Both continuations share one select slot. Alternate when both have work;
-        // each retains its own round-robin room cursor and yields after one turn.
-        let mut prepare_next = true;
+        // Preparation, governance and package scans share one select slot. Rotate between
+        // ready classes; each retains its own room cursor and yields after one bounded turn.
+        let mut maintenance_next = 0u8;
         loop {
             tokio::select! {
-                () = tokio::task::yield_now(), if self.governance_work.pending || !self.preparing_rooms.is_empty() || self.publication_pending => {
+                () = tokio::task::yield_now(), if self.governance_work.pending || !self.preparing_rooms.is_empty() || self.publication_pending || self.key_package_work_ready() => {
                     if self.apply_computer_keyring().await.is_err() { continue; }
-                    if (!self.preparing_rooms.is_empty() || self.publication_pending) && (prepare_next || !self.governance_work.pending) {
-                        prepare_next = false;
-                        self.advance_room_preparation().await;
-                    } else {
-                        prepare_next = true;
-                        self.advance_governance_turn().await;
-                        self.publication_pending |= !self.publish_waiters.is_empty();
-                        self.publication_again |= !self.publish_waiters.is_empty();
+                    for _ in 0..3 {
+                        let turn = maintenance_next;
+                        maintenance_next = (maintenance_next + 1) % 3;
+                        match turn {
+                            0 if !self.preparing_rooms.is_empty() || self.publication_pending => {
+                                self.advance_room_preparation().await;
+                                break;
+                            }
+                            1 if self.governance_work.pending => {
+                                self.advance_governance_turn().await;
+                                self.publication_pending |= !self.publish_waiters.is_empty();
+                                self.publication_again |= !self.publish_waiters.is_empty();
+                                break;
+                            }
+                            2 if self.key_package_work_ready() => {
+                                self.advance_key_package_turn().await;
+                                break;
+                            }
+                            _ => {}
+                        }
                     }
                 }
                 received = cmd_rx.recv() => {
@@ -6970,6 +6986,7 @@ impl Node {
             }
             Err(error)
                 if ChannelState::governance_refreshing(&error)
+                    || ChannelState::legacy_classification_refreshing(&error)
                     || matches!(
                         error,
                         Error::StreamRefused("Session control facts are refreshing")
@@ -7039,6 +7056,7 @@ impl Node {
             }
             Err(error)
                 if ChannelState::governance_refreshing(&error)
+                    || ChannelState::legacy_classification_refreshing(&error)
                     || matches!(
                         error,
                         Error::StreamRefused("Session control facts are refreshing")
@@ -11938,6 +11956,9 @@ impl Node {
         self.deliver_owed_consents(Some(fingerprint)).await;
         // A key that reached this node by the log from the member just trusted was held
         // (V210-118): taken now.
+        for prepared in self.preparing_rooms.values_mut() {
+            prepared.channel.get_mut().release_held_packages();
+        }
         let rooms: Vec<Digest32> = self.channels.keys().copied().collect();
         for channel_id in rooms {
             if let Some(shared) = self.channels.get(&channel_id).map(Arc::clone) {
@@ -14438,67 +14459,124 @@ impl Node {
         posted
     }
 
-    /// Install the key-packages the log has delivered to this identity in `channel_id`: open
-    /// each with a one-shot PQXDH against this node's own prekeys and hand the sender key to
-    /// the channel, which verifies it against its author and backfills what it opens.
-    async fn install_key_packages(&mut self, channel_id: &Digest32) {
-        // Test-only: leave every key-package queued, unopened, while the file the knob names
-        // exists (`TEST_HOLD_PACKAGES_ENV`).
+    fn key_package_work_ready(&self) -> bool {
         #[cfg(feature = "test-knobs")]
         if std::env::var_os(TEST_HOLD_PACKAGES_ENV)
             .is_some_and(|f| std::path::Path::new(&f).exists())
         {
-            return;
+            return false;
         }
+        !self.key_package_rooms.is_empty()
+    }
+
+    /// Resume one room after the previous package/scan budget. A room with no package in
+    /// its first 64 positions still gets its next turn without another network event.
+    async fn advance_key_package_turn(&mut self) {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let room = self
+            .key_package_after
+            .and_then(|after| {
+                self.key_package_rooms
+                    .range((Excluded(after), Unbounded))
+                    .next()
+                    .map(|(id, _)| *id)
+            })
+            .or_else(|| self.key_package_rooms.first_key_value().map(|(id, _)| *id));
+        let Some(room) = room else { return };
+        self.key_package_after = Some(room);
+        if self.install_key_packages(&room).await {
+            self.publish().await;
+            self.schedule().await;
+        }
+    }
+
+    /// Open one retained package against this node's prekeys, retaining no body after the
+    /// attempt. The sender key still needs both explicit trust and the channel's validation.
+    async fn open_logged_key_package(
+        &mut self,
+        package: &crate::node::keypackage::KeyPackage,
+        ctx: &crate::join::session::JoinContext,
+        now: u64,
+    ) -> Option<crate::group::skdm::Skdm> {
+        let init = package.initial_message().ok()?;
+        let mut session = self.respond_to_initial(&init, ctx).await?;
+        let skdm = package.open(&mut session, now).ok()?;
+        self.trust.is_trusted(&skdm.body.author_id).then_some(skdm)
+    }
+
+    /// Attempt at most one package after examining at most 64 sealed log positions.
+    /// Acknowledgement releases only its drive-discovery hint. Trust changes request a
+    /// replay from disk, including packages which failed to open or were not trusted.
+    async fn install_key_packages(&mut self, channel_id: &Digest32) -> bool {
+        #[cfg(feature = "test-knobs")]
+        if std::env::var_os(TEST_HOLD_PACKAGES_ENV)
+            .is_some_and(|f| std::path::Path::new(&f).exists())
+        {
+            self.key_package_rooms.entry(*channel_id).or_insert(false);
+            return false;
+        }
+        let replay = self.key_package_rooms.remove(channel_id).unwrap_or(false);
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
-            return;
+            return false;
         };
-        let (packages, ctx) = {
+        let fetched = {
             let mut channel = shared.lock().await;
-            let packages = channel.take_inbound_packages();
-            if packages.is_empty() {
-                return;
+            if channel.is_poisoned() {
+                return false;
             }
-            let Ok(ctx) = channel.join_context() else {
-                return;
+            let Some(profile) = self.profile.as_ref() else {
+                return false;
             };
-            (packages, ctx)
+            if replay {
+                channel.release_held_packages();
+            }
+            let fetched = (|| -> crate::error::Result<_> {
+                // Establish the context before advancing the queue's cursor.
+                let ctx = channel.join_context()?;
+                let progress = channel.next_key_package(profile.store())?;
+                Ok((progress, ctx))
+            })();
+            if let Err(ref error) = fetched {
+                channel.poison(error);
+            }
+            fetched
         };
-        let now_ms = self.now_ms();
-        let now = now_ms.get();
-        for package in packages {
-            let Ok(init) = package.initial_message() else {
-                continue;
-            };
-            let Some(mut session) = self.respond_to_initial(&init, &ctx).await else {
-                continue;
-            };
-            let Ok(skdm) = package.open(&mut session, now) else {
-                continue;
-            };
-            let author = skdm.body.author_id;
-            // **A node reads only the members its owner trusts** (V210-118), whichever path the
-            // key took. The pairwise path refused a key from an untrusted author, and this one,
-            // the log's, took it: a member trusted by someone whose node was down when trusted
-            // (its key then goes by the log) was read by a node that never trusted it. Held, not
-            // dropped, so the key is taken once the owner trusts its author.
-            if !self.trust.is_trusted(&author) {
-                shared.lock().await.hold_package(package);
-                continue;
+        let (progress, ctx) = match fetched {
+            Ok(fetched) => fetched,
+            Err(error) => {
+                let _ = self.event_tx.send(NodeEvent::NodeNote {
+                    note: format!(
+                        "room {} could not read its saved key deliveries: {error}",
+                        crate::node::link::b32_encode(channel_id)
+                    ),
+                });
+                return true;
             }
+        };
+        if progress.pending {
+            self.key_package_rooms.entry(*channel_id).or_insert(false);
+        }
+        let Some(pending) = progress.package else {
+            return false;
+        };
+        let now = self.now_ms();
+        let opened = self
+            .open_logged_key_package(&pending.package, &ctx, now.get())
+            .await;
+        let mut changed = false;
+        if let Some(skdm) = opened {
             let installed = {
                 let Some(profile) = self.profile.as_ref() else {
-                    return;
+                    shared
+                        .lock()
+                        .await
+                        .key_package_attempted(&pending.author, pending.log_id);
+                    return false;
                 };
-                shared
-                    .lock()
-                    .await
-                    .accept_skdm(profile.store(), &skdm, now_ms)
+                shared.lock().await.accept_skdm(profile.store(), &skdm, now)
             };
             if let Ok(backfilled) = installed {
-                // A drive key opens a node's Sessions, not its messages: what changed is what this
-                // node may see of them, said as Session news (no row, nothing shown), so a client
-                // reads the room's Sessions again; "messages can be read now" would be untrue.
+                changed = true;
                 let _ = self.event_tx.send(
                     if skdm.body.channel_id == crate::node::drive::drive_channel(channel_id) {
                         NodeEvent::SessionEntry {
@@ -14508,13 +14586,19 @@ impl Node {
                     } else {
                         NodeEvent::SenderKeyReceived {
                             channel_id: *channel_id,
-                            peer: author,
+                            peer: skdm.body.author_id,
                             backfilled: backfilled as u64,
                         }
                     },
                 );
             }
         }
+        let mut channel = shared.lock().await;
+        channel.key_package_attempted(&pending.author, pending.log_id);
+        if channel.key_packages_pending() && !channel.is_poisoned() {
+            self.key_package_rooms.entry(*channel_id).or_insert(false);
+        }
+        changed || channel.is_poisoned()
     }
 
     /// The responder half of an ADR-004 PQXDH opening message: consume the one-time prekey it
@@ -15785,6 +15869,16 @@ impl Node {
             // maintained again at the next unlock.
             let _ = prekeys::save(profile.store(), signer, &ring);
         }
+        // Only newly usable key material can make a previous failed package open. Ordinary
+        // ticks and expiry/pruning of old keys do not replay the room's retained history.
+        if done.rotated || done.one_time_added > 0 {
+            for room in self.channels.keys() {
+                self.key_package_rooms.insert(*room, true);
+            }
+            for prepared in self.preparing_rooms.values_mut() {
+                prepared.channel.get_mut().release_held_packages();
+            }
+        }
         // What the bundle names now, against what it named when last looked at.
         let offered = ring.offered();
         let republish = self.prekeys_offered.is_some_and(|was| was != offered);
@@ -15844,6 +15938,8 @@ impl Node {
             }
         }
         self.preparation_after = None;
+        self.key_package_rooms.clear();
+        self.key_package_after = None;
         for (_, waiting) in std::mem::take(&mut self.publish_waiters) {
             if let Some(reply) = waiting.reply {
                 let _ = reply.send(Outcome::Failed(Fault::Locked));
@@ -16453,7 +16549,6 @@ impl Node {
                 channel: tokio::sync::Mutex::new(channel),
                 reply,
                 reopening,
-                packages: None,
                 recovery: None,
             },
         );
@@ -16529,9 +16624,12 @@ impl Node {
                         self.preparing_rooms.insert(id, prepared);
                         return;
                     }
-                    Err(error) if ChannelState::governance_refreshing(&error) => {
-                        // Current policy is a prerequisite for private retention and
-                        // publication. Pending replay keeps this same room unpublished.
+                    Err(error)
+                        if ChannelState::governance_refreshing(&error)
+                            || ChannelState::legacy_classification_refreshing(&error) =>
+                    {
+                        // Current policy and classification are prerequisites for private
+                        // retention/publication. Pending replay keeps this room unpublished.
                         self.preparing_rooms.insert(id, prepared);
                         return;
                     }
@@ -16591,32 +16689,41 @@ impl Node {
             }
             ch.require_governance_ready(profile.store(), now)?;
         }
-        if prepared.packages.is_none() {
-            prepared.packages = Some(
-                if ch.needs_session_upgrade() {
-                    ch.take_inbound_packages()
-                } else {
-                    Vec::new()
-                }
-                .into_iter(),
-            );
-        }
-        if let Some(package) = prepared.packages.as_mut().and_then(Iterator::next) {
+        if ch.needs_session_upgrade() && ch.key_packages_pending() {
             let ctx = ch.join_context()?;
-            let now = self.now_ms();
-            if let Ok(init) = package.initial_message() {
-                if let Some(mut session) = self.respond_to_initial(&init, &ctx).await {
-                    if let Ok(skdm) = package.open(&mut session, now.get()) {
-                        if self.trust.is_trusted(&skdm.body.author_id) {
-                            let profile = self.profile.as_ref().ok_or(Error::AtRestLocked)?;
-                            let _ = ch.accept_skdm(profile.store(), &skdm, now);
-                        } else {
-                            ch.hold_package(package);
-                        }
+            let profile = self.profile.as_ref().ok_or(Error::AtRestLocked)?;
+            let progress = ch.next_key_package(profile.store())?;
+            if let Some(pending) = progress.package {
+                let now = self.now_ms();
+                let opened = self
+                    .open_logged_key_package(&pending.package, &ctx, now.get())
+                    .await;
+                let installed = if let Some(skdm) = opened {
+                    match self.profile.as_ref() {
+                        Some(profile) => ch.accept_skdm(profile.store(), &skdm, now).map(|_| ()),
+                        None => Err(Error::AtRestLocked),
+                    }
+                } else {
+                    Ok(())
+                };
+                ch.key_package_attempted(&pending.author, pending.log_id);
+                // Every attempted outcome is acknowledged; storage faults keep the room closed.
+                if let Err(error) = installed {
+                    if ch.is_poisoned() || matches!(error, Error::AtRestLocked) {
+                        return Err(error);
                     }
                 }
+                return Ok(false);
             }
-            return Ok(false);
+            if progress.pending {
+                return Ok(false);
+            }
+        }
+        {
+            let profile = self.profile.as_ref().ok_or(Error::AtRestLocked)?;
+            if ch.advance_legacy_sessions(profile.store(), self.now_ms().get())? {
+                return Ok(false);
+            }
         }
         let id = ch.channel_id();
         let retention = self.node_retention_for(&id);
@@ -16630,6 +16737,9 @@ impl Node {
             return Ok(false);
         }
         ch.sweep_retention(profile.store(), self.now_ms())?;
+        if ch.legacy_classification_pending(profile.store())? {
+            return Ok(false);
+        }
         Ok(true)
     }
 
@@ -16674,6 +16784,7 @@ impl Node {
                 return Outcome::Failed(fault_of(&e));
             }
         }
+        self.key_package_rooms.remove(channel_id);
         let preparing = self.cancel_room_preparation(channel_id, Fault::ChannelNotOpen);
         let reopening = self.reopening.remove(channel_id);
         let outcome = match self.channels.remove(channel_id) {
@@ -17225,6 +17336,7 @@ impl Node {
             let _ = reply.send(Outcome::Failed(Fault::LeaveUndone));
         }
         let mut name = String::new();
+        self.key_package_rooms.remove(channel_id);
         if let Some(shared) = self.channels.remove(channel_id) {
             let mut ch = shared.lock().await;
             name = crate::node::resolver::room_shown(ch.name(), channel_id);
@@ -20427,7 +20539,7 @@ async fn agree_round(
 /// that does the same work itself (`vox id` making an identity, ADR-026 C-5).
 #[must_use]
 pub fn fault_of(e: &Error) -> Fault {
-    if ChannelState::governance_refreshing(e) {
+    if ChannelState::governance_refreshing(e) || ChannelState::legacy_classification_refreshing(e) {
         return Fault::GovernanceRefreshing;
     }
     match e {

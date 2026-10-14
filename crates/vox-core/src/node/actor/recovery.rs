@@ -118,7 +118,6 @@ impl Node {
                         channel: tokio::sync::Mutex::new(channel),
                         reply: None,
                         reopening: false,
-                        packages: None,
                         recovery: Some(original),
                     },
                 );

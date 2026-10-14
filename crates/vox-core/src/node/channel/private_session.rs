@@ -143,7 +143,7 @@ impl ChannelState {
         private_index::find_in(batch, &self.sek, &self.channel_id, hash).map(|id| id.is_some())
     }
 
-    fn private_id(&self, store: &Store, hash: &Digest32) -> Result<Option<u64>> {
+    pub(super) fn private_id(&self, store: &Store, hash: &Digest32) -> Result<Option<u64>> {
         let snapshot = store.snapshot()?;
         private_index::find(&snapshot, &self.sek, &self.channel_id, hash)
     }

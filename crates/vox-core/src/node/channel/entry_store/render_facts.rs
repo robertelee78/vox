@@ -717,9 +717,6 @@ impl RenderView<'_> {
     pub(crate) fn order(&self) -> &OrderView<'_> {
         &self.order
     }
-    pub(crate) fn revision(&self) -> u64 {
-        self.order.revision()
-    }
     /// Only facts that can change a rendered row or an owed placeholder. Ordinary
     /// directory seals, receipt writes and recovery cursors do not change this token.
     pub(crate) fn display_roots(&self) -> [u64; 4] {
@@ -1150,23 +1147,6 @@ impl RenderView<'_> {
             Some((key, Value::Owed(_))) => {
                 let (expires, _) = order_key(key)?;
                 Ok((expires != u64::MAX).then_some(expires))
-            }
-            None => Ok(None),
-            _ => Err(invalid("owed expiry value")),
-        }
-    }
-    pub(crate) fn expired_owed(&self, now: u64) -> Result<Option<Digest32>> {
-        let item = self.source().first(
-            self.order.read.sek,
-            self.order.read.channel,
-            self.roots().owed_expiry,
-            &[0; 64],
-            0,
-        )?;
-        match item {
-            Some((key, Value::Owed(_))) => {
-                let (expires, hash) = order_key(key)?;
-                Ok((expires != u64::MAX && expires <= now).then_some(hash))
             }
             None => Ok(None),
             _ => Err(invalid("owed expiry value")),

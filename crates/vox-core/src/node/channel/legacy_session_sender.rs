@@ -126,18 +126,15 @@ impl ChannelState {
             for seq in
                 through.saturating_add(1)..=verified.min(through.saturating_add(SCAN_PER_TURN))
             {
-                let Some(entry) = feed.get(
-                    &self
-                        .entries
-                        .read(profile.store(), &self.sek, &self.channel_id)?,
-                    seq,
-                )?
-                else {
+                let entries = self
+                    .entries
+                    .read(profile.store(), &self.sek, &self.channel_id)?;
+                let Some(entry) = feed.get(&entries, seq)? else {
                     break;
                 };
                 scanned = seq;
                 let hash = entry.entry_hash();
-                if self.step_bodies.contains(&hash) {
+                if self.entry_steps_in(entries.transaction(), &entry)? {
                     steps.push(hash);
                     if steps.len() == MAX_LEGACY_SESSION_HASHES {
                         break;

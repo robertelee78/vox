@@ -211,13 +211,15 @@ impl View<'_> {
             || !self
                 .rendered
                 .missing_contains(&entry.skeleton.author_id, entry.skeleton.seq)?
-            || self.ch.legacy_sessions.is_session(hash)
             || expired_at(
                 entry.skeleton.claimed_ms,
                 self.ch.now_hint,
                 self.ch
                     .entry_retention(self.rendered.transaction(), &entry)?,
             )
+            || self
+                .ch
+                .legacy_is_session_current_in(self.rendered.transaction(), hash)?
         {
             return Ok(None);
         }
@@ -281,8 +283,13 @@ impl View<'_> {
             Some(mark) => self.rendered.before(mark)?,
             None => self.rendered.count()?,
         };
+        let owed = self.rendered.owed_before(before)?;
+        if owed != 0 {
+            self.ch
+                .require_legacy_classification_complete_in(self.rendered.transaction())?;
+        }
         rendered
-            .checked_add(self.rendered.owed_before(before)?)
+            .checked_add(owed)
             .ok_or(Error::MalformedAtRest("visible row count overflow"))
     }
 
@@ -853,7 +860,7 @@ impl ChannelState {
         let hash = entry.entry_hash();
         if entry.payload.is_some()
             || self.private_contains_in(batch, &hash)?
-            || self.legacy_sessions.is_session(&hash)
+            || self.legacy_is_session_in(Transaction::Batch(batch), &hash)?
         {
             return Ok(None);
         }

@@ -37,10 +37,20 @@
 //! alone. M14 adds other authors' entries, SKDMs, consent and sync on top of the
 //! same layout.
 
+fn key_package_for(entry: &Entry, recipient: &Digest32) -> bool {
+    entry
+        .payload
+        .as_deref()
+        .filter(|payload| crate::node::keypackage::KeyPackage::is_key_package(payload))
+        .and_then(|payload| crate::node::keypackage::KeyPackage::from_wire(payload).ok())
+        .is_some_and(|package| package.recipient == *recipient)
+}
+
 mod diagnostics;
 mod entry_store;
 mod governance;
 pub(crate) mod history;
+pub(crate) mod key_package_queue;
 mod legacy_session;
 mod legacy_session_sender;
 mod private_session;
@@ -930,18 +940,9 @@ pub struct ChannelState {
     /// entry hash -> the `LogDb` page it is stored in, so a signature dropped under a
     /// checkpoint (ADR-023 decision 3) can be rewritten in place.
     entries: entry_store::EntryIndex,
-    /// Key-packages addressed to this identity that arrived in the log and are not installed
-    /// yet, oldest first (ADR-023 decision 4). Installing one needs this identity's prekey
-    /// ring, which the actor holds, so the actor drains them ([`Self::take_inbound_packages`]).
-    inbound_packages: Vec<crate::node::keypackage::KeyPackage>,
-    /// The authors of [`Self::inbound_packages`] the log brought: who may have released this node
-    /// a drive key it has not opened yet ([`Self::drive_from`]). Cleared with them.
-    packages_from: BTreeSet<Digest32>,
-    /// Key-packages opened here from a member this node's owner has not trusted: not installed
-    /// (V210-118), and kept so the key is taken the moment the owner trusts its author, as a key
-    /// on the pairwise path is when its author offers it again. In memory only: a reopened room
-    /// collects every key-package for this identity from its log again.
-    held_packages: Vec<crate::node::keypackage::KeyPackage>,
+    /// Bounded cursors over retained key-package log rows and admitted-author drive hints.
+    /// The actor opens one returned package at a time using its prekey ring.
+    key_packages: key_package_queue::Queue,
     /// Sender keys released to this identity, keyed by `(author, chain_id)`
     /// (M14.5b). Present only for authors that consented; its presence is what
     /// makes their content readable.
@@ -1794,9 +1795,7 @@ impl ChannelState {
             display_shown_at: 0,
             display_rewrite: 0,
             entries,
-            inbound_packages: Vec::new(),
-            packages_from: BTreeSet::new(),
-            held_packages: Vec::new(),
+            key_packages: key_package_queue::Queue::new(1),
             receivers: BTreeMap::new(),
             services: BTreeMap::new(),
             kinds: BTreeMap::new(),
@@ -1925,8 +1924,7 @@ impl ChannelState {
         // Key-packages for this identity found on reload are offered again: installing one
         // twice is harmless (`accept_skdm` keeps the live chain), and one that arrived just
         // before a crash would otherwise never be installed.
-        let mut inbound_packages = Vec::new();
-        let mut packages_from = BTreeSet::new();
+        let mut key_packages = key_package_queue::Queue::new(1);
         let mut set_aside = SetAside::default();
         let mut unlinked = 0usize;
         store.visit_segments(channel_id, SegmentKind::LogDb, |id, seg| {
@@ -2005,19 +2003,15 @@ impl ChannelState {
             if steps && entry.payload.is_some() {
                 retained_step_body.get_or_insert_with(|| entry.entry_hash());
             }
-            if let Some(payload) = entry.payload.as_deref() {
-                if let Some(pkg) = Some(payload)
-                    .filter(|p| crate::node::keypackage::KeyPackage::is_key_package(p))
-                    .and_then(|p| crate::node::keypackage::KeyPackage::from_wire(p).ok())
-                {
-                    if pkg.recipient == me {
-                        inbound_packages.push(pkg);
-                        packages_from.insert(entry.skeleton.author_id);
+            let package = key_package_for(&entry, &me);
+            let package_author = entry.skeleton.author_id;
+            let package_seq = entry.skeleton.seq;
+            match dag.accept(&mut entry_read, entry, kind, &key, &admission) {
+                Ok(_) => {
+                    if package && package_seq <= dag.verified_head(&package_author) {
+                        key_packages.note(package_author, id)?;
                     }
                 }
-            }
-            match dag.accept(&mut entry_read, entry, kind, &key, &admission) {
-                Ok(_) => {}
                 Err(crate::log::dag::Rejected::Feed(_)) => unlinked += 1,
                 Err(crate::log::dag::Rejected::Local(error)) => return Err(error),
                 Err(_) => return Err(Error::MalformedAtRest("stored entry failed acceptance")),
@@ -2060,8 +2054,15 @@ impl ChannelState {
                     Some(kind) => kind,
                     None => EntryKind::Content,
                 };
+                let package = key_package_for(&entry, &me);
+                let package_author = entry.skeleton.author_id;
+                let package_seq = entry.skeleton.seq;
                 match dag.accept(&mut entry_read, entry, kind, key, &admission) {
-                    Ok(_) => {}
+                    Ok(_) => {
+                        if package && package_seq <= dag.verified_head(&package_author) {
+                            key_packages.note(package_author, id)?;
+                        }
+                    }
                     Err(crate::log::dag::Rejected::Feed(_)) => unlinked += 1,
                     Err(crate::log::dag::Rejected::Local(error)) => return Err(error),
                     Err(_) => return Err(Error::MalformedAtRest("stored entry failed acceptance")),
@@ -2174,6 +2175,7 @@ impl ChannelState {
             let _ = parse_cache(&row)?;
             Ok(())
         })?;
+        key_packages.published(next_log_id);
         let display_order_revision = dag.reorder_generation();
 
         let sender_seg = store
@@ -2319,9 +2321,7 @@ impl ChannelState {
             display_shown_at: 0,
             display_rewrite: 0,
             entries,
-            inbound_packages,
-            packages_from,
-            held_packages: Vec::new(),
+            key_packages,
             receivers,
             services,
             kinds,
@@ -2560,9 +2560,7 @@ impl ChannelState {
             display_shown_at: 0,
             display_rewrite: 0,
             entries,
-            inbound_packages: Vec::new(),
-            packages_from: BTreeSet::new(),
-            held_packages: Vec::new(),
+            key_packages: key_package_queue::Queue::new(1),
             receivers: BTreeMap::new(),
             services: BTreeMap::new(),
             kinds: BTreeMap::new(),
@@ -3102,41 +3100,38 @@ impl ChannelState {
         Ok(())
     }
 
-    /// If `payload` is a key-package, queue it when it is for this identity and say so; the
-    /// caller then neither renders nor retries it as a message.
-    fn queue_if_key_package(&mut self, author: &Digest32, payload: &[u8]) -> bool {
-        if !crate::node::keypackage::KeyPackage::is_key_package(payload) {
-            return false;
-        }
-        if let Ok(pkg) = crate::node::keypackage::KeyPackage::from_wire(payload) {
-            if pkg.recipient == self.me() {
-                self.inbound_packages.push(pkg);
-                self.packages_from.insert(*author);
-            }
-        }
-        true
+    /// Read at most 64 committed log positions and return at most one valid delivery.
+    /// Unlinked rows kept for diagnostics never become key-delivery authority.
+    pub(crate) fn next_key_package(
+        &mut self,
+        store: &Store,
+    ) -> Result<key_package_queue::Progress> {
+        let room = self.channel_id;
+        let epoch = self.epoch;
+        let me = self.me();
+        let dag = &self.dag;
+        self.key_packages
+            .next(store, &self.sek, &room, &me, |entry| {
+                entry.skeleton.channel_id == room
+                    && entry.skeleton.epoch == epoch
+                    && entry.skeleton.seq != 0
+                    && entry.skeleton.seq <= dag.verified_head(&entry.skeleton.author_id)
+            })
     }
 
-    /// Hold a key-package from a member this node's owner has not trusted (V210-118): its key is
-    /// not taken until [`Self::release_held_packages`].
-    pub fn hold_package(&mut self, package: crate::node::keypackage::KeyPackage) {
-        if !self.held_packages.contains(&package) {
-            self.held_packages.push(package);
-        }
+    /// Whether a bounded forward scan or a requested retained-package replay needs a turn.
+    pub(crate) fn key_packages_pending(&self) -> bool {
+        self.key_packages.pending()
     }
 
-    /// Offer the held key-packages again, with the next ones the log delivers: the owner has
-    /// trusted someone, perhaps one of their authors.
+    /// Release the attempted locator's drive hint even when opening or trust checks refused it.
+    pub(crate) fn key_package_attempted(&mut self, author: &Digest32, log_id: u64) {
+        self.key_packages.attempted(author, log_id);
+    }
+
+    /// A trust or prekey change retries retained packages from disk without retaining bodies.
     pub fn release_held_packages(&mut self) {
-        let held = std::mem::take(&mut self.held_packages);
-        self.inbound_packages.extend(held);
-    }
-
-    /// Take the key-packages addressed to this identity that the log delivered since the last
-    /// call (ADR-023 decision 4). The caller installs them with its prekey ring.
-    pub fn take_inbound_packages(&mut self) -> Vec<crate::node::keypackage::KeyPackage> {
-        self.packages_from.clear();
-        std::mem::take(&mut self.inbound_packages)
+        self.key_packages.retry_retained();
     }
 
     /// Validate and prepare unpublished entry/DAG roots before opening the effects Batch.
@@ -3194,6 +3189,7 @@ impl ChannelState {
     }
 
     fn finish_entry_publication(&mut self, store: &Store) -> Result<()> {
+        self.key_packages.published(self.next_log_id);
         let result = (|| -> Result<()> {
             loop {
                 let mut batch = store.batch()?;
@@ -4247,9 +4243,9 @@ impl ChannelState {
     }
 
     /// Mark this room poisoned after a real storage or consistency failure.
-    /// Pending governance replay is retryable and keeps the last good display.
+    /// Pending governance or subtype replay is retryable and keeps the last good display.
     pub fn poison(&mut self, e: &Error) {
-        if governance::refreshing(e) {
+        if governance::refreshing(e) || Self::legacy_classification_refreshing(e) {
             return;
         }
         self.poisoned = true;
@@ -4704,11 +4700,24 @@ impl ChannelState {
         if entry.payload.as_deref().is_some_and(retained_control) {
             return Ok(0);
         }
+        Ok(if self.entry_steps_in(transaction, entry)? {
+            self.effective_step_retention()
+        } else {
+            self.effective_retention()
+        })
+    }
+
+    /// Exact saved Session subtype, including the first-seen fact retained after pruning.
+    pub(super) fn entry_steps_in(
+        &self,
+        transaction: Transaction<'_, '_>,
+        entry: &Entry,
+    ) -> Result<bool> {
         let hash = entry.entry_hash();
         let index = self
             .entries
             .view(transaction, &self.sek, &self.channel_id)?;
-        let steps = if let Some(tracked) = index.retention(&hash)? {
+        Ok(if let Some(tracked) = index.retention(&hash)? {
             tracked.steps
         } else if let Some(body) = entry.payload.as_deref() {
             is_step_body(&self.channel_id, body)
@@ -4734,11 +4743,6 @@ impl ChannelState {
                 }
                 None => false,
             }
-        };
-        Ok(if steps {
-            self.effective_step_retention()
-        } else {
-            self.effective_retention()
         })
     }
 
@@ -5283,6 +5287,7 @@ impl ChannelState {
                     &self.channel_id,
                     &entry,
                 )?;
+                self.inspect_legacy_body_into(&mut batch, &entry)?;
                 {
                     let mut index = self
                         .entries
@@ -5313,11 +5318,9 @@ impl ChannelState {
                     )?;
                 }
             }
-            self.reconcile_legacy_sessions_in(&batch, self.now_hint)?;
+            self.reconcile_legacy_sessions_in(&mut batch, self.now_hint)?;
             if with_receivers {
                 self.queue_receivers(&mut batch)?;
-            } else {
-                self.queue_legacy_sessions(&mut batch)?;
             }
             batch.commit()
         })();
@@ -5762,12 +5765,6 @@ impl ChannelState {
             }
             // A repeated authenticated body may contradict a declaration without adding a row.
             self.reconcile_legacy_sessions(store, now_ms)?;
-            if self.legacy_sessions.dirty() {
-                let mut batch = store.batch()?;
-                self.queue_legacy_sessions(&mut batch)?;
-                batch.commit()?;
-                self.legacy_sessions.committed();
-            }
             Ok(out)
         })();
         if let Err(ref error) = result {
@@ -5803,6 +5800,7 @@ impl ChannelState {
         // transaction blocks forever (redb). So a body's first-seen row goes into the batch
         // (`track_body_into`), and an expired late arrival is pruned only after the commit.
         let mut rendered_rows: Vec<Rendered> = Vec::new();
+        let mut packages = Vec::new();
         let mut expired: Vec<(Digest32, Tracked)> = Vec::new();
         let mut chains_advanced = false;
         let mut batch = match store.batch() {
@@ -5825,7 +5823,7 @@ impl ChannelState {
         // D1). Counted at the row, not per `arrived` entry — a refusal before the row is queued
         // stores nothing, one after it still stores the row.
         let mut logged: u64 = promotion.unwrap_or(0);
-        for (author, entry_hash, payload, refill) in arrived {
+        for (author, entry_hash, _, refill) in arrived {
             let step =
                 (|| -> Result<std::result::Result<Vec<Rendered>, Error>> {
                     // A refusal, not a write failure: `Ok(Err(..))`.
@@ -5837,7 +5835,7 @@ impl ChannelState {
                             }
                         };
                     }
-                    let held = self
+                    let mut held = self
                         .dag
                         .get_by_hash(
                             &self.entries.in_batch(&batch, &self.sek, &self.channel_id)?,
@@ -5878,17 +5876,10 @@ impl ChannelState {
                         Error::MalformedGovernance("synced entry from an unadmitted author")
                     ));
 
-                    if let Some((seen_author, session)) =
-                        self.legacy_sessions.observed.remove(&entry_hash)
-                    {
-                        self.remember_legacy_kind(
-                            Transaction::Batch(&batch),
-                            entry_hash,
-                            seen_author,
-                            session,
-                        )?;
-                    }
-                    let Some(payload) = payload else {
+                    // Save subtype evidence before withholding the body, beside the
+                    // source locator in this same publication transaction.
+                    self.filter_received_session_body_into(&mut batch, &mut held)?;
+                    let Some(payload) = held.payload.as_deref() else {
                         // A skeleton: stored, never rendered. Its body is owed unless it has
                         // expired here (V030-10).
                         // Promotion already inserted the missing position atomically.
@@ -5933,7 +5924,10 @@ impl ChannelState {
                     let mut rows = Vec::new();
                     // A key-package is queued for the actor to install, never rendered or aged as
                     // a message.
-                    if self.queue_if_key_package(&author, &payload) {
+                    if crate::node::keypackage::KeyPackage::is_key_package(payload) {
+                        if key_package_for(&held, &self.me()) {
+                            packages.push((author, id));
+                        }
                         return Ok(Ok(rows));
                     }
                     self.track_body_into(&mut batch, entry_hash, id, now_ms)?;
@@ -5962,11 +5956,9 @@ impl ChannelState {
         let committed = match write_failed {
             Some(e) => Err(e),
             None => (|| -> Result<()> {
-                self.reconcile_legacy_sessions_in(&batch, now_ms)?;
+                self.reconcile_legacy_sessions_in(&mut batch, now_ms)?;
                 if chains_advanced || self.chains_advanced {
                     self.queue_receivers(&mut batch)?;
-                } else {
-                    self.queue_legacy_sessions(&mut batch)?;
                 }
                 self.queue_private_generations(&mut batch)?;
 
@@ -5979,6 +5971,14 @@ impl ChannelState {
             return Err(e);
         }
         self.entries.committed();
+        self.legacy_sessions.committed();
+        self.key_packages.published(self.next_log_id);
+        for (author, log_id) in packages {
+            if let Err(error) = self.key_packages.note(author, log_id) {
+                self.poison(&error);
+                return Err(error);
+            }
+        }
         self.private_controls_committed(store)?;
         self.chains_advanced = false;
         // Only now, after the commit: `SessionRoom::apply` reports `stored` from the generation,
@@ -6168,7 +6168,7 @@ impl ChannelState {
                 .max();
             let newest = legacy.into_iter().chain(announced).max();
             if newest.is_none_or(|g| self.drive.receivers.contains_key(&(author, g)))
-                || self.packages_from.contains(&author)
+                || self.key_packages.pending_from(&author)
             {
                 from.insert(author);
             }
@@ -6453,10 +6453,10 @@ impl ChannelState {
         // Only a Session entry opens under a drive key: a node's message to the room is sealed
         // under its sender key, for every reader.
         let Ok(Decoded::Session(entry)) = crate::node::content::decode(&plaintext) else {
-            self.remember_legacy_kind(Transaction::Batch(batch), entry_hash, author, false)?;
+            self.remember_legacy_kind(batch, entry_hash, author, false)?;
             return Ok(());
         };
-        self.remember_legacy_kind(Transaction::Batch(batch), entry_hash, author, true)?;
+        self.remember_legacy_kind(batch, entry_hash, author, true)?;
         if self.already_expired(
             Transaction::Batch(batch),
             &entry_hash,
@@ -6998,13 +6998,7 @@ impl ChannelState {
             // A Session entry sealed under the sender key is not one: its node gave it to every
             // reader, and the Session is only for those with drive (SC-2). Not shown.
             Ok(Decoded::LegacySessionIndex(index)) => {
-                self.accept_legacy_index(
-                    Transaction::Batch(batch),
-                    entry_hash,
-                    author,
-                    index,
-                    now_ms,
-                )?;
+                self.accept_legacy_index(batch, entry_hash, author, index, now_ms)?;
                 return Ok(None);
             }
             Ok(Decoded::Session(_)) | Err(_) => return Ok(None),
@@ -7134,7 +7128,6 @@ impl ChannelState {
             SEG_RECEIVERS,
             &receivers_seg,
         )?;
-        self.queue_legacy_sessions(batch)?;
         // The drive keys advance in the same passes.
         self.queue_drive(batch)
     }
@@ -7322,6 +7315,8 @@ impl ChannelState {
                 self.track_body_into(&mut batch, entry_hash, id, now_ms)?;
             }
             self.observe_governance_into(store, &mut batch, &entry, id)?;
+            self.inspect_legacy_body_into(&mut batch, &entry)?;
+            self.reconcile_legacy_sessions_in(&mut batch, now_ms)?;
             batch.commit()
         })();
         if let Err(e) = persisted {
@@ -7330,6 +7325,7 @@ impl ChannelState {
             return Err(e);
         }
         self.entries.committed();
+        self.legacy_sessions.committed();
         self.next_log_id = id.saturating_add(1);
         self.gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.finish_entry_publication(store)?;
@@ -7351,7 +7347,10 @@ impl ChannelState {
                     else {
                         return Ok(Accepted::ContentNotReadable);
                     };
-                    if self.queue_if_key_package(&author, &payload) {
+                    if crate::node::keypackage::KeyPackage::is_key_package(&payload) {
+                        if key_package_for(&entry, &self.me()) {
+                            self.key_packages.note(author, id)?;
+                        }
                         return Ok(Accepted::ContentNotReadable);
                     }
                     if self.render_content(store, author, entry_hash, &payload, now_ms)? {
@@ -8637,14 +8636,6 @@ impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
             if let Err(error) = ch.keep_forks(self.store) {
                 *self.fatal.borrow_mut() = Some(error);
             }
-            return report;
-        }
-        if let Err(e) = ch.inspect_legacy_bodies(self.store, &staged) {
-            ch.poisoned = true;
-            ch.save_error = Some(e.to_string());
-            *self.fatal.borrow_mut() = Some(e);
-            report.stored = 0;
-            report.fail = Some(crate::wire::WireError::TransportFailed);
             return report;
         }
         if let Err(error) = ch.filter_received_session_bodies(self.store, self.peer, &staged) {

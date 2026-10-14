@@ -176,6 +176,27 @@ impl Node {
             Ok(pending) => self.governance_work.again |= pending,
             Err(error) => channel.poison(&error),
         }
+        // Classification has no authority until governance is current. Continue its
+        // bounded sealed scan in this same round-robin room turn; a quiet room must not
+        // need another sync to finish, and an unresolved absent target is not busy work.
+        let mut legacy_finished = false;
+        if progress.ready {
+            let was_pending = channel.legacy_classification_pending(&store);
+            match was_pending.and_then(|pending| {
+                channel
+                    .advance_legacy_sessions(&store, self.now_ms().get())
+                    .map(|more| (pending, more))
+            }) {
+                Ok((was_pending, more)) => {
+                    self.governance_work.again |= more;
+                    legacy_finished = was_pending && !more;
+                }
+                Err(error) if ChannelState::legacy_classification_refreshing(&error) => {
+                    self.governance_work.again = true;
+                }
+                Err(error) => channel.poison(&error),
+            }
+        }
         drop(channel);
         if progress.ready {
             // Discover stale consent from disk a page at a time. A quiet room must finish
@@ -188,7 +209,7 @@ impl Node {
             self.refresh_network_view().await;
             self.publish_admin_roster(&room).await;
         }
-        if progress.changed || backfilled > 0 {
+        if progress.changed || backfilled > 0 || legacy_finished {
             self.publish().await;
         }
     }

@@ -288,8 +288,9 @@ impl ChannelState {
             .collect()
     }
 
-    /// After verification, inspect all newly authenticated floors before deciding any body.
-    /// Both passes fetch one entry at a time; large legal bodies never form a history-sized Vec.
+    /// Learn every verified floor before publication decides which received bodies to keep.
+    /// Already published refills can be classified and withheld here atomically. New entries
+    /// wait for their publication Batch, where their log locator and subtype become durable.
     pub(super) fn filter_received_session_bodies(
         &mut self,
         store: &Store,
@@ -315,7 +316,7 @@ impl ChannelState {
             let Ok(incoming) = Entry::from_wire(wire) else {
                 continue;
             };
-            let Some(entry) = self.entry(store, &incoming.entry_hash())? else {
+            let Some(mut entry) = self.entry(store, &incoming.entry_hash())? else {
                 continue;
             };
             if entry.skeleton.seq > self.dag.verified_head(&entry.skeleton.author_id) {
@@ -323,15 +324,24 @@ impl ChannelState {
             }
             let missing = entry.payload.is_none() || !self.session_body_allowed(&entry, &me);
             let position = (entry.skeleton.author_id, entry.skeleton.seq);
-            if missing {
+            // No body of a newly verified entry is removed before its publication can save
+            // the exact subtype beside its assigned LogDb id. This closes the old volatile
+            // observation gap between pre-filtering and absorb_batch.
+            let published = {
+                let snapshot = store.snapshot()?;
+                self.log_id_at(Transaction::Snapshot(&snapshot), &entry.entry_hash())?
+                    .is_some()
+            };
+            if published {
                 let mut batch = store.batch()?;
-                let mut index = self
-                    .entries
-                    .write(&mut batch, &self.sek, &self.channel_id)?;
-                self.dag.prune_payload(&mut index, &entry.entry_hash())?;
-                index.seal()?;
-                batch.commit()?;
-                self.entries.committed();
+                let withheld = self.filter_received_session_body_into(&mut batch, &mut entry)?;
+                if withheld || self.legacy_sessions.dirty() {
+                    batch.commit()?;
+                    self.entries.committed();
+                    self.legacy_sessions.committed();
+                }
+            }
+            if missing {
                 self.drive
                     .omitted
                     .entry(peer)
@@ -343,5 +353,23 @@ impl ChannelState {
             }
         }
         Ok(())
+    }
+
+    /// Classify the authenticated body before withholding it, in the transaction that owns
+    /// its published locator. The caller must use the resulting payload for rendering too.
+    pub(super) fn filter_received_session_body_into(
+        &mut self,
+        batch: &mut crate::node::store::Batch<'_>,
+        entry: &mut Entry,
+    ) -> Result<bool> {
+        self.inspect_legacy_body_into(batch, entry)?;
+        if entry.payload.is_none() || self.session_body_allowed(entry, &self.me()) {
+            return Ok(false);
+        }
+        let mut index = self.entries.write(batch, &self.sek, &self.channel_id)?;
+        self.dag.prune_payload(&mut index, &entry.entry_hash())?;
+        index.seal()?;
+        entry.payload = None;
+        Ok(true)
     }
 }

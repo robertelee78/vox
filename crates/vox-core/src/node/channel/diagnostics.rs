@@ -2,7 +2,7 @@
 
 /// A sample of records set aside while opening a room, with a count of further records.
 /// This is a diagnostic summary, never the authoritative record of room history.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct SetAside {
     entries: Vec<String>,
     omitted: u64,
