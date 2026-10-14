@@ -235,8 +235,6 @@ final class NodeModel: ObservableObject {
     var roomDrafts: [String: RoomDraft] = [:]
     /// A Session's draft, by its destination (`room/node/session`).
     var sessionDrafts: [String: String] = [:]
-    /// What each room last showed (General, All, or a Session), restored when it opens again.
-    var lastShowing: [String: Showing] = [:]
 
     /// The request selected in the Session on screen, by its reference: what Approve (⌥⌘Y) and
     /// Reject (⌥⌘N) act on, and where ⌘J and a notification land (P1).
@@ -952,9 +950,8 @@ final class NodeModel: ObservableObject {
     /// its own is read (show reads it).
     func select(_ selection: Selection?) {
         guard selection != self.selection else { return }
-        // The room left keeps what it showed and the reply being written (D12).
+        // Preserve the room's reply draft when leaving it (D12).
         if case let .room(left) = self.selection {
-            lastShowing[left] = showing
             roomDrafts[left, default: RoomDraft()].reply = replyTo
         }
         self.selection = selection
@@ -996,9 +993,9 @@ final class NodeModel: ObservableObject {
         selectedMessages = []
         selectionAnchor = nil
         selectedService = nil
-        // What this room last showed, and its reply, come back (D12): General the first time.
+        // Every room opens at General (ADR-033 LY-4); its reply draft is retained.
         if case let .room(opened) = selection {
-            showing = lastShowing[opened] ?? .general
+            showing = .general
             replyTo = roomDrafts[opened]?.reply
         } else {
             showing = .general
