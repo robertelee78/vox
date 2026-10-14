@@ -1,6 +1,5 @@
-// A Session's entries as the app holds them (ADR-034 FR-4): only the pages asked for. The newest
-// page is read when the Session is shown and read again whenever the node says it changed; an
-// older page is read only when the person scrolls up to it. Each entry is held once, oldest first.
+// A Session's bounded activity window (ADR-034 FR-4). Older activity is loaded only on
+// request. Live refresh preserves a pinned older window; End reloads the newest page.
 
 /// The entries of the Session on screen loaded so far, and where the older ones begin.
 struct SessionPages: Equatable {
@@ -11,20 +10,25 @@ struct SessionPages: Equatable {
     /// Where the older entries end, for `sessionReadOlder`; nil when there are none.
     private(set) var before: String?
 
-    /// The Session's newest page, read again. Pages loaded on scroll that it joins stay, before it;
-    /// an entry in both is the newest page's, as it now stands (a request answered). A newest page
-    /// that does not reach what was loaded would leave a hole between them: the older pages are
-    /// let go, and read again as the person scrolls up.
-    mutating func newest(_ page: FfiSessionRead) {
-        let ids = Set(page.entries.map(\.id))
-        guard let first = entries.first, !ids.contains(first.id),
-              let joined = entries.firstIndex(where: { ids.contains($0.id) }) else {
+    /// At most 128 protocol-admitted activity entries, independently of stored history.
+    /// This row budget is not a measured process-memory or whole-app byte bound.
+    private static let windowEntries = 128
+    private(set) var hasNewer = false
+
+    /// Following replaces the window with the authoritative newest page. While the reader
+    /// is on older activity, refresh only held rows; new output must not move that window.
+    mutating func newest(_ page: FfiSessionRead, following: Bool) {
+        if following || entries.isEmpty {
             entries = page.entries
             older = page.older
             before = page.before
-            return
+            hasNewer = false
+        } else {
+            let current = Dictionary(page.entries.map { ($0.id, $0) },
+                                     uniquingKeysWith: { _, latest in latest })
+            entries = entries.map { current[$0.id] ?? $0 }
+            hasNewer = hasNewer || page.entries.last?.id != entries.last?.id
         }
-        entries = Array(entries[..<joined]) + page.entries
     }
 
     /// The page before the first entry loaded, read as the person scrolled up to it: put before
@@ -34,7 +38,9 @@ struct SessionPages: Equatable {
     mutating func older(_ page: FfiSessionRead, asked cursor: String) -> Bool {
         guard before == cursor else { return false }
         let have = Set(entries.map(\.id))
-        entries = page.entries.filter { !have.contains($0.id) } + entries
+        let joined = page.entries.filter { !have.contains($0.id) } + entries
+        if joined.count > Self.windowEntries { hasNewer = true }
+        entries = Array(joined.prefix(Self.windowEntries))
         older = page.older
         before = page.before
         return true
