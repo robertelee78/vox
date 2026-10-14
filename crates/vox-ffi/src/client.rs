@@ -1781,7 +1781,7 @@ async fn reply_chain(
             Frame::Rows { rows } => rows,
             other => return Err(unexpected(&other)),
         };
-        let Some(row) = rows.into_iter().find(|r| r.entry_hash == hash) else {
+        let Some(row) = rows.into_iter().find(|r| r.entry_hash == hash && !r.owed) else {
             break;
         };
         next = vox_agentcomms::envelope::Envelope::parse(&row.text)
@@ -2939,8 +2939,13 @@ impl VoxClient {
                     chain.get(&hash).cloned()
                 };
                 env.hops = vox_agentcomms::envelope::reply_hops_by(&re, parent);
-                env.thread =
-                    Some(vox_agentcomms::envelope::reply_thread_by(&re, parent).unwrap_or(re));
+                env.thread = Some(
+                    vox_agentcomms::envelope::reply_thread_by(&re, parent).ok_or_else(|| {
+                        failed(format!(
+                            "cannot reply to {re}: this node cannot read that message; nothing was posted"
+                        ))
+                    })?,
+                );
                 if let Some(root) = env.thread.as_deref().and_then(|h| digest(h, "thread").ok()) {
                     match ask(
                         c,
@@ -3905,8 +3910,13 @@ impl VoxClient {
                     chain.get(&hash).cloned()
                 };
                 env.hops = vox_agentcomms::envelope::reply_hops_by(&re, parent);
-                env.thread =
-                    Some(vox_agentcomms::envelope::reply_thread_by(&re, parent).unwrap_or(re));
+                env.thread = Some(
+                    vox_agentcomms::envelope::reply_thread_by(&re, parent).ok_or_else(|| {
+                        failed(format!(
+                            "cannot reply to {re}: this node cannot read that message; nothing was shared"
+                        ))
+                    })?,
+                );
                 if let Some(root) = env.thread.as_deref().and_then(|h| digest(h, "thread").ok()) {
                     match ask(
                         c,
