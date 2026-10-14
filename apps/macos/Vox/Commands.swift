@@ -81,7 +81,7 @@ extension VoxAction {
             VoxAction("Room", "Rename…", enabled: inRoom) { node?.sheet = .rename },
             VoxAction("Room", "Retention…", enabled: inRoom) { node?.sheet = .retention },
             VoxAction("Room", "Admins…", enabled: inRoom) { node?.sheet = .admins },
-            VoxAction("Room", "Anchors…", enabled: inRoom && node?.canManageRoomAnchors == true) {
+            VoxAction("Room", "Anchors…", enabled: inRoom) {
                 Task { await node?.openRoomAnchors() }
             },
             VoxAction("Room", "Reply in Thread", "r",
