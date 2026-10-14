@@ -218,6 +218,10 @@ struct Ask {
     transcript: Option<Arc<Mutex<TranscriptScan>>>,
 }
 
+/// Opaque identity of one admitted adapter request. An old observer cannot retire a newer
+/// request merely because its harness reused the same visible reference.
+pub struct RequestTicket(Arc<()>);
+
 /// Who waits for a request's first answer.
 enum Waiter {
     /// Claude Code's `PermissionRequest` hook: given the answer in no harness's shape
@@ -1036,6 +1040,19 @@ impl Sink {
         session: &str,
         entry: String,
     ) -> Option<oneshot::Receiver<Given>> {
+        self.request_observed(node, session, entry)
+            .await
+            .map(|(receiver, _)| receiver)
+    }
+
+    /// Admit an adapter request and return the identity its observer must use when observation
+    /// is lost. The receiver alone conveys an answer; the ticket conveys no answering authority.
+    pub async fn request_observed(
+        &self,
+        node: &NodeName,
+        session: &str,
+        entry: String,
+    ) -> Option<(oneshot::Receiver<Given>, RequestTicket)> {
         (self.room_of)(node, session)?;
         let Ok(Value::Object(m)) = serde_json::from_str::<Value>(&entry) else {
             return None;
@@ -1085,7 +1102,22 @@ impl Sink {
             });
             return None;
         }
-        Some(rx)
+        Some((rx, RequestTicket(ticket)))
+    }
+
+    /// The adapter lost observation of this exact request. Release its waiter and record that
+    /// Vox can no longer answer, without claiming that the harness accepted or refused anything.
+    pub async fn retire_observation(
+        &self,
+        node: &NodeName,
+        session: &str,
+        id: &str,
+        ticket: &RequestTicket,
+        why: &str,
+    ) {
+        if let Some(entry) = self.unobserved_entry(node, session, id, &ticket.0, why) {
+            self.post_numbered(node, session, vec![entry]).await;
+        }
     }
 
     /// Every request still waiting in `session` expires: the harness moved on without settling it
