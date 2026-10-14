@@ -575,6 +575,9 @@ pub struct ChannelDetail {
     pub timeline: Timeline,
     /// Local reuse stamp for the already-built display; never serialized or sent to peers.
     pub(crate) display_stamp: crate::node::channel::DisplayStamp,
+    /// Node-local change token for the published timeline, unchanged on projection reuse.
+    /// Scoped to this node actor; clients discard it when their node connection changes.
+    pub display_revision: u64,
     /// Entry-hash prefixes to timeline positions. Collisions are checked against the row's full
     /// hash. Shared sorted runs let history pages locate their cursor without scanning history.
     pub row_index: OpRuns,

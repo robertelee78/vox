@@ -539,6 +539,9 @@ try:
           f"{[r.strip() for r in timeline().splitlines() if r.strip()][-3:]!r}")
 
     stage("quote")
+    # All keeps ordinary one-level quote navigation. General now folds canonical thread replies
+    # under their root; its collapsed/expanded behavior is checked below (#754).
+    tui.key(":all\r", 0.5)
     def alice_posts(*args):
         p = run("alice", "room", "post", room, "--json", "--session", "quote-proof", *args)
         if p.returncode != 0: product(f"alice's `vox room post {' '.join(args)}` failed: {p.stderr.strip()}")
@@ -619,6 +622,27 @@ try:
     claim("thread", addressed.get("re") == q_mid and addressed.get("thread") == q_root
           and addressed.get("to") == [fp["alice"]],
           f"@alice reply must answer q-mid in q-root's thread and address alice; got {addressed!r}")
+
+    stage("thread-summary")
+    tui.key(":general\r", 0.5)
+    focus("Timeline")
+    for _ in range(FILL + 5):
+        tui.key("\x1b[A", 0.1)
+        if "q-root" in selected(): break
+    if "q-root" not in selected():
+        product("General never selected the thread root; screen:\n" + tui.text())
+    summarized = tui.until(lambda: any("3 replies" in line and "last reply" in line
+                            and "alice" in line and "you" in line for line in rows()), 10, 0.2)
+    collapsed = not any(s in timeline() for s in ["q-mid the lexer", "q-answer on it", "q-addressed on it"])
+    tui.key("\r", 0.5)
+    tui.key("\x1b[B", 0.3)  # Down selects the first indented reply, not the next General post.
+    expanded = tui.until(lambda: "q-mid" in selected(), 10, 0.2)
+    reply_line = selected()
+    tui.key("\x1b[D", 0.5)  # Left closes the thread and selects its root again.
+    closed = "q-root" in selected() and "q-mid the lexer" not in timeline()
+    claim("thread-summary", summarized and collapsed and expanded and reply_line.startswith("    ") and closed,
+          f"authoritative summary visible: {summarized}; collapsed replies absent: {collapsed}; "
+          f"selected expanded reply: {reply_line!r}; closed back to root: {closed}")
     tui.key("\x1b[F", 0)  # End
     tui.until(lambda: has(timeline(), f"f-{FILL:03d}"), 5, 0.2)
     focus("Timeline")  # where the stages below begin

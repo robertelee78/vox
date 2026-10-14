@@ -36,6 +36,9 @@ pub struct RoomSnap {
 pub struct OpenRoomSnap {
     /// The room.
     pub channel_id: Digest32,
+    /// Published row-display token, stable on reuse and unique across this actor's room opens.
+    /// Discard cached tokens when the node connection changes.
+    pub display_revision: u64,
     /// Its shared name (ADR-028 R-1); `None` for a room no admin has named.
     pub name: Option<String>,
     /// Its members, in fingerprint order.
@@ -132,6 +135,7 @@ impl NodeSnapshot {
                 .iter()
                 .map(|d| OpenRoomSnap {
                     channel_id: d.channel_id,
+                    display_revision: d.display_revision,
                     name: d.name.clone(),
                     members: d.members.clone(),
                     consented: d.consented.clone(),
@@ -182,7 +186,7 @@ impl NodeSnapshot {
         }
         e.array(self.open.len());
         for o in &self.open {
-            e.array(18)
+            e.array(19)
                 .bytes(&o.channel_id)
                 .text(o.name.as_deref().unwrap_or_default());
             digests(&mut e, &o.members);
@@ -237,6 +241,7 @@ impl NodeSnapshot {
             if let Some(seconds) = o.local_step_retention {
                 e.uint(seconds);
             }
+            e.uint(o.display_revision);
         }
         e.array(self.trusted.len());
         for (fp, name) in &self.trusted {
@@ -310,7 +315,7 @@ impl NodeSnapshot {
         let mut open = Vec::new();
         for _ in 0..d.array().map_err(bad("ipc snapshot open rooms"))? {
             let fields = d.array().map_err(bad("ipc snapshot open room"))?;
-            if fields != 14 && fields != 18 {
+            if fields != 19 {
                 return Err(Error::MalformedIpc("ipc snapshot open room"));
             }
             let channel_id = digest(&mut d)?;
@@ -389,40 +394,24 @@ impl NodeSnapshot {
             }
             let retention = d.uint().map_err(bad("ipc snapshot retention"))?;
             let sessions = crate::node::sessions::read_rows(&mut d)?;
-            let (room_retention, room_step_retention, step_retention, local_step_retention) =
-                if fields == 18 {
-                    let room_retention = d.uint().map_err(bad("ipc snapshot room retention"))?;
-                    let room_step_retention =
-                        d.uint().map_err(bad("ipc snapshot room step retention"))?;
-                    let step_retention = d.uint().map_err(bad("ipc snapshot step retention"))?;
-                    let local_step_retention = match d
-                        .array()
-                        .map_err(bad("ipc snapshot local step retention"))?
-                    {
-                        0 => None,
-                        1 => Some(
-                            d.uint()
-                                .map_err(bad("ipc snapshot local step retention seconds"))?,
-                        ),
-                        _ => return Err(Error::MalformedIpc("ipc snapshot local step retention")),
-                    };
-                    (
-                        room_retention,
-                        room_step_retention,
-                        step_retention,
-                        local_step_retention,
-                    )
-                } else {
-                    let steps = crate::node::retention::WEEK;
-                    (
-                        retention,
-                        steps,
-                        crate::node::retention::shortest(retention, steps),
-                        None,
-                    )
-                };
+            let room_retention = d.uint().map_err(bad("ipc snapshot room retention"))?;
+            let room_step_retention = d.uint().map_err(bad("ipc snapshot room step retention"))?;
+            let step_retention = d.uint().map_err(bad("ipc snapshot step retention"))?;
+            let local_step_retention = match d
+                .array()
+                .map_err(bad("ipc snapshot local step retention"))?
+            {
+                0 => None,
+                1 => Some(
+                    d.uint()
+                        .map_err(bad("ipc snapshot local step retention seconds"))?,
+                ),
+                _ => return Err(Error::MalformedIpc("ipc snapshot local step retention")),
+            };
+            let display_revision = d.uint().map_err(bad("ipc snapshot display revision"))?;
             open.push(OpenRoomSnap {
                 channel_id,
+                display_revision,
                 name,
                 members,
                 consented,

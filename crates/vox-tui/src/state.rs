@@ -290,6 +290,32 @@ pub enum Showing {
     Tag(String),
 }
 
+/// The exact message order drawn and selected. General hides canonical replies except for the
+/// one expanded bounded page, immediately under its starting message (ADR-033 TH-2).
+pub fn room_messages<'a>(
+    channel: &'a crate::viewmodel::ChannelView,
+    showing: &'a Showing,
+) -> impl DoubleEndedIterator<Item = &'a crate::viewmodel::MessageView> + Clone {
+    channel
+        .timeline
+        .iter()
+        .filter(move |message| match showing {
+            Showing::General => message.thread.is_none(),
+            Showing::Tag(tag) => message.tags.contains(tag),
+            Showing::All => true,
+            Showing::Session(..) => false,
+        })
+        .flat_map(move |message| {
+            let replies = channel
+                .expanded_thread
+                .as_ref()
+                .filter(|t| matches!(showing, Showing::General) && t.root == message.entry_hash)
+                .into_iter()
+                .flat_map(|t| t.replies.iter());
+            std::iter::once(message).chain(replies)
+        })
+}
+
 /// One row of a room's Sessions pane, top to bottom (ADR-029 CL-2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionRow {
@@ -681,7 +707,7 @@ impl UiState {
                 let newest = vm
                     .active
                     .as_ref()
-                    .and_then(|c| c.timeline.last().map(|m| m.entry_hash));
+                    .and_then(|c| room_messages(c, &self.showing).last().map(|m| m.entry_hash));
                 if let Some(re) = self.selected_message.or(newest) {
                     self.replying = Some(re);
                     self.focus = Focus::Composer;
@@ -759,9 +785,56 @@ impl UiState {
                 }
                 Action::Redraw
             }
-            // Enter on a reply jumps to the message it quotes.
+            // General roots expand in place; Enter on a reply keeps the one-level quote jump.
             KeyCode::Enter if self.screen == Screen::Channel && self.focus == Focus::Timeline => {
+                if let Some(action) = self.toggle_thread(vm) {
+                    return action;
+                }
                 self.jump_to_quote(vm);
+                Action::Redraw
+            }
+            KeyCode::Right
+                if self.screen == Screen::Channel
+                    && self.focus == Focus::Timeline
+                    && matches!(self.showing, Showing::General) =>
+            {
+                if let Some(channel) = vm.active.as_ref() {
+                    if let Some(thread) = channel.expanded_thread.as_ref() {
+                        if self.selected_message == Some(thread.root)
+                            || thread
+                                .replies
+                                .iter()
+                                .any(|r| Some(r.entry_hash) == self.selected_message)
+                        {
+                            if !thread.more {
+                                return Action::Redraw;
+                            }
+                            self.selected_message = Some(thread.root);
+                            self.reveal_selected = true;
+                            return Action::Dispatch(Command::NextThreadPage {
+                                channel_id: channel.channel_id,
+                                root: thread.root,
+                            });
+                        }
+                    }
+                }
+                self.toggle_thread(vm).unwrap_or(Action::Redraw)
+            }
+            KeyCode::Left
+                if self.screen == Screen::Channel
+                    && self.focus == Focus::Timeline
+                    && matches!(self.showing, Showing::General) =>
+            {
+                if let Some(channel) = vm.active.as_ref() {
+                    if let Some(thread) = channel.expanded_thread.as_ref() {
+                        self.selected_message = Some(thread.root);
+                        self.reveal_selected = true;
+                        return Action::Dispatch(Command::ShowThread {
+                            channel_id: channel.channel_id,
+                            root: None,
+                        });
+                    }
+                }
                 Action::Redraw
             }
             KeyCode::Tab if self.screen == Screen::Channel => {
@@ -826,10 +899,8 @@ impl UiState {
                     && !matches!(self.showing, Showing::Session(..))
                 {
                     if let Some(active) = vm.active.as_ref().filter(|c| c.room_older > 0) {
-                        if self.selected_message.is_some()
-                            && self.selected_message
-                                == active.timeline.first().map(|r| r.entry_hash)
-                        {
+                        let first = room_messages(active, &self.showing).next();
+                        if first.is_none_or(|row| self.selected_message == Some(row.entry_hash)) {
                             if let Some(channel_id) = self.active_channel_id(vm) {
                                 return Action::Dispatch(Command::OlderRoom { channel_id });
                             }
@@ -859,10 +930,7 @@ impl UiState {
                     );
                 } else {
                     if let Some(active) = vm.active.as_ref().filter(|c| c.room_older > 0) {
-                        let first = active.timeline.iter().find(|row| match &self.showing {
-                            Showing::Tag(tag) => row.tags.contains(tag),
-                            _ => true,
-                        });
+                        let first = room_messages(active, &self.showing).next();
                         if first.is_none_or(|row| self.on_screen.contains(&row.entry_hash)) {
                             if let Some(channel_id) = self.active_channel_id(vm) {
                                 return Action::Dispatch(Command::OlderRoom { channel_id });
@@ -1200,22 +1268,46 @@ impl UiState {
     /// **Selecting a quote jumps to it** (ADR-028 R-9, #485): the message the selected reply
     /// quotes is selected and scrolled to.
     fn jump_to_quote(&mut self, vm: &ViewModel) {
-        let Some(timeline) = vm.active.as_ref().map(|c| &c.timeline) else {
+        let Some(channel) = vm.active.as_ref() else {
             return;
         };
+        let timeline = room_messages(channel, &self.showing);
         let Some(quote) = self
             .selected_message
-            .and_then(|h| timeline.iter().find(|m| m.entry_hash == h))
+            .and_then(|h| timeline.clone().find(|m| m.entry_hash == h))
             .and_then(|m| m.quote.as_ref())
         else {
             return;
         };
-        if timeline.iter().any(|m| m.entry_hash == quote.entry_hash) {
+        if timeline.clone().any(|m| m.entry_hash == quote.entry_hash) {
             self.selected_message = Some(quote.entry_hash);
             self.reveal_selected = true;
         } else {
-            self.status_message = Some("the quoted message is not in this room yet".into());
+            self.status_message = Some(
+                "the quoted message is not on this page; open its thread from the start".into(),
+            );
         }
+    }
+
+    fn toggle_thread(&mut self, vm: &ViewModel) -> Option<Action> {
+        if !matches!(self.showing, Showing::General) {
+            return None;
+        }
+        let channel = vm.active.as_ref()?;
+        let root = self.selected_message?;
+        let message = channel.timeline.iter().find(|m| m.entry_hash == root)?;
+        if message.thread.is_some() {
+            return None;
+        }
+        let expanded = channel
+            .expanded_thread
+            .as_ref()
+            .is_some_and(|t| t.root == root);
+        self.reveal_selected = true;
+        Some(Action::Dispatch(Command::ShowThread {
+            channel_id: channel.channel_id,
+            root: (!expanded).then_some(root),
+        }))
     }
 
     /// The offer selected in the sidebar, while it is still offered.
@@ -1304,17 +1396,10 @@ impl UiState {
             }
             Screen::Channel if self.focus == Focus::Timeline => {
                 // Up selects an older message, Down a newer one; past the newest follows again.
-                let Some(timeline) = vm.active.as_ref().map(|c| &c.timeline) else {
+                let Some(channel) = vm.active.as_ref() else {
                     return;
                 };
-                // In a tag's thread, only its messages are there to select (#636).
-                let timeline: Vec<&crate::viewmodel::MessageView> = timeline
-                    .iter()
-                    .filter(|m| match &self.showing {
-                        Showing::Tag(tag) => m.tags.iter().any(|t| t == tag),
-                        _ => true,
-                    })
-                    .collect();
+                let timeline: Vec<_> = room_messages(channel, &self.showing).collect();
                 let at = self
                     .selected_message
                     .and_then(|h| timeline.iter().position(|m| m.entry_hash == h));
