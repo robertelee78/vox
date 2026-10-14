@@ -27,7 +27,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex};
+use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex, OwnedSemaphorePermit, Semaphore};
 
 use crate::atrest::sek::Argon2Profile;
 use crate::error::Error;
@@ -55,15 +55,18 @@ use crate::transport::quic::VoxConnection;
 
 /// One key on its way to one member in a session of its own (ADR-030 D-1, D-4): the frame that
 /// carries it, kept so a re-carry resends exactly these bytes and opens no second session.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct Delivery {
     /// `PairwiseFrame::RotationHello` bytes: the session's opening and the key sealed in it.
-    frame: Vec<u8>,
+    frame: Box<[u8]>,
     /// The one-time prekey of the member's the opening named, if any (ADR-030 P-3).
     one_time_prekey: Option<u64>,
     /// The `skdm_ref` of the key it carries: only that very key is resent in it, so a consent's
     /// grant always names the key delivered (ADR-007).
     key: Digest32,
+    /// Held until these exact retry bytes are no longer needed.
+    reservation: DeliveryReservation,
+    opening: Digest32,
 }
 
 /// A pairwise session this node opened (ADR-004 O2, O3).
@@ -1145,6 +1148,8 @@ enum NetEvent {
         channel_id: Digest32,
         /// The member.
         peer: Digest32,
+        session: Option<u64>,
+        epoch: u64,
     },
     /// A hello offered again with an `Open` behind it (ADR-004 O3) could not be written: it is
     /// offered again.
@@ -1153,6 +1158,8 @@ enum NetEvent {
         channel_id: Digest32,
         /// The member.
         peer: Digest32,
+        session: Option<u64>,
+        epoch: u64,
     },
     /// A peer connected inbound: it gets a sync schedule, due immediately.
     PresentationAsk {
@@ -1212,6 +1219,7 @@ enum NetEvent {
         peer: Digest32,
         /// The generation it took.
         chain_id: u64,
+        opening: Option<Digest32>,
         /// The serial of the session the key was sealed under: the peer holds it (V210-89).
         session: Option<u64>,
         /// Whether it was one of the keys of the history `peer` was owed.
@@ -1228,6 +1236,7 @@ enum NetEvent {
         peer: Digest32,
         /// The generation that did not land.
         chain_id: u64,
+        opening: Option<Digest32>,
         /// What the recipient's side said.
         why: String,
         /// Whether the recipient answered (a refusal it made), rather than the key being lost
@@ -1996,16 +2005,68 @@ async fn serve_typed(
     Flow::Go
 }
 
+// A complete retained-history batch plus its consent key fits for one peer. Jobs include
+// queued writes and answer watchers; cached exact retry frames have a separate allowance, so a
+// full cache can still retry. The only producers use fixed-array/u64 SKDM and InitialMessage
+// types, never arbitrary plaintext: SKDM <= 5,503 bytes, initial <= 1,248, ratchet header <= 59,
+// AEAD tag = 16. With CBOR heads and domain labels, RotationHello <= 6,892 bytes and the largest
+// two-frame job (Hello + Skdm) <= 6,928. Stored frames are boxed, with no spare Vec capacity.
+// Thus 514 jobs + 514 cached frames retain <= 7,103,480 payload bytes; watchers hold no frames.
+// This excludes bounded task/metadata allocations and the transport's own flow-control buffers.
+// Unavailable members can pin this allowance: retry bytes are never evicted/resealed. Spilling
+// inactive sealed deliveries durably is separate work; this bounds residence, not fairness.
+const PAIRWISE_PEER_LIMIT: usize = crate::group::history::MAX_RETAINED_ORIGINS + 1;
+const PAIRWISE_NODE_LIMIT: usize = 2 * PAIRWISE_PEER_LIMIT;
+
+/// One admission retained until the job or cached delivery actually leaves memory.
+#[derive(Debug)]
+struct PairwiseCredit {
+    _node: OwnedSemaphorePermit,
+    _peer: OwnedSemaphorePermit,
+}
+
+impl PairwiseCredit {
+    fn reserve(node: &Arc<Semaphore>, peer: &Arc<Semaphore>) -> Option<Self> {
+        Some(Self {
+            _node: Arc::clone(node).try_acquire_owned().ok()?,
+            _peer: Arc::clone(peer).try_acquire_owned().ok()?,
+        })
+    }
+}
+
+/// A history slot stays reserved until its whole batch is acknowledged, including while
+/// waiting for a fresh prekey or replacing an opening the recipient proved unusable.
+#[derive(Debug)]
+struct DeliveryReservation {
+    _credit: PairwiseCredit,
+    history: bool,
+}
+
+struct PairwiseOut {
+    queue: mpsc::Sender<PairwiseJob>,
+    epoch: u64,
+    jobs: Arc<Semaphore>,
+    deliveries: Arc<Semaphore>,
+}
+
+/// Reserved before sealing: sending cannot discover a full queue after advancing a ratchet.
+struct PairwiseAdmission {
+    queue: mpsc::OwnedPermit<PairwiseJob>,
+    job: PairwiseCredit,
+    delivery: Option<PairwiseCredit>,
+}
+
 /// Sealed pairwise frames for one stream to one member, and what their delivery decides.
 struct PairwiseJob {
     /// The connection to write on.
     conn: Arc<VoxConnection>,
     /// The frames, sealed on the actor in order.
-    frames: Vec<Vec<u8>>,
+    frames: Box<[Box<[u8]>]>,
     /// The room the frames are for.
     channel_id: Digest32,
     /// What the write's outcome tells the actor.
     after: AfterWrite,
+    credit: PairwiseCredit,
 }
 
 /// What a pairwise write's outcome decides.
@@ -2015,6 +2076,8 @@ enum AfterWrite {
     Key {
         /// The key's generation.
         chain_id: u64,
+        /// The exact modern opening; an older answer cannot retire its replacement.
+        opening: Option<Digest32>,
         /// Whether the stream carried the hello.
         hello: bool,
         /// The serial of the session the key was sealed under (V210-78): a refusal saying the
@@ -2026,24 +2089,39 @@ enum AfterWrite {
         epoch: u64,
     },
     /// The stream offered a hello again with an `Open` behind it (ADR-004 O3).
-    Reopen,
+    Reopen { session: Option<u64>, epoch: u64 },
 }
 
 /// Write one member's pairwise streams in the order they were queued (V210-71), each bounded by
 /// `pairwise_stream::WRITE_PATIENCE`. A write that fails is reported so the actor owes it again.
 async fn write_pairwise_jobs(
     peer: Digest32,
-    mut jobs: mpsc::UnboundedReceiver<PairwiseJob>,
+    mut jobs: mpsc::Receiver<PairwiseJob>,
     tx: mpsc::Sender<NetEvent>,
+    mut epoch_changed: watch::Receiver<u64>,
 ) {
-    while let Some(job) = jobs.recv().await {
-        let written = crate::node::pairwise_stream::write_pairwise(&job.conn, &job.frames).await;
+    loop {
+        let job = tokio::select! {
+            biased;
+            _ = epoch_changed.changed() => return,
+            job = jobs.recv() => match job {
+                Some(job) => job,
+                None => return,
+            },
+        };
+        let written = tokio::select! {
+            biased;
+            _ = epoch_changed.changed() => return,
+            result = crate::node::pairwise_stream::write_pairwise(&job.conn, &job.frames) => result,
+        };
         let channel_id = job.channel_id;
+        let mut credit = Some(job.credit);
         let events = match (written, job.after) {
             (
                 Ok(sent),
                 AfterWrite::Key {
                     chain_id,
+                    opening,
                     session,
                     history,
                     epoch,
@@ -2057,18 +2135,22 @@ async fn write_pairwise_jobs(
                         channel_id,
                         target: peer,
                         chain_id,
+                        opening,
                         session,
                         history,
                         epoch,
+                        _credit: credit.take(),
                     },
+                    epoch_changed.clone(),
                 );
                 Vec::new()
             }
-            (Ok(_), AfterWrite::Reopen) => Vec::new(),
+            (Ok(_), AfterWrite::Reopen { .. }) => Vec::new(),
             (
                 Err(e),
                 AfterWrite::Key {
                     chain_id,
+                    opening,
                     hello,
                     session,
                     history,
@@ -2077,12 +2159,18 @@ async fn write_pairwise_jobs(
             ) => {
                 let mut v = Vec::with_capacity(2);
                 if hello {
-                    v.push(NetEvent::HelloUndelivered { channel_id, peer });
+                    v.push(NetEvent::HelloUndelivered {
+                        channel_id,
+                        peer,
+                        session,
+                        epoch,
+                    });
                 }
                 v.push(NetEvent::SkdmRefused {
                     channel_id,
                     peer,
                     chain_id,
+                    opening,
                     why: e.to_string(),
                     answered: false,
                     session,
@@ -2091,11 +2179,20 @@ async fn write_pairwise_jobs(
                 });
                 v
             }
-            (Err(_), AfterWrite::Reopen) => vec![NetEvent::ReopenUndelivered { channel_id, peer }],
+            (Err(_), AfterWrite::Reopen { session, epoch }) => vec![NetEvent::ReopenUndelivered {
+                channel_id,
+                peer,
+                session,
+                epoch,
+            }],
         };
         for event in events {
-            if tx.send(event).await.is_err() {
-                return; // the actor is gone
+            tokio::select! {
+                biased;
+                _ = epoch_changed.changed() => return,
+                sent = tx.send(event) => if sent.is_err() {
+                    return; // the actor is gone
+                },
             }
         }
     }
@@ -2106,9 +2203,11 @@ struct Watched {
     channel_id: Digest32,
     target: Digest32,
     chain_id: u64,
+    opening: Option<Digest32>,
     session: Option<u64>,
     history: bool,
     epoch: u64,
+    _credit: Option<PairwiseCredit>,
 }
 
 /// Learn, off the actor, whether the key just written to `target` was taken; if it was not,
@@ -2116,21 +2215,36 @@ struct Watched {
 ///
 /// **Taken is when it is delivered** (V210-88): `NetEvent::SkdmTaken` records the generation as
 /// the member's. The key was counted in flight when it was queued (`Node::key_in_flight`).
-fn watch_delivery(tx: mpsc::Sender<NetEvent>, sent: quinn::RecvStream, w: Watched) {
+fn watch_delivery(
+    tx: mpsc::Sender<NetEvent>,
+    sent: quinn::RecvStream,
+    w: Watched,
+    mut epoch_changed: watch::Receiver<u64>,
+) {
     let Watched {
         channel_id,
         target,
         chain_id,
+        opening,
         session,
         history,
         epoch,
+        _credit: credit,
     } = w;
     tokio::spawn(async move {
-        let event = match crate::node::pairwise_stream::refusal(sent, KEY_DELIVERY_PATIENCE).await {
+        // Keep admission through the answer send, including a stale session's refusal.
+        let _credit = credit;
+        let refused = tokio::select! {
+            biased;
+            _ = epoch_changed.changed() => return,
+            refused = crate::node::pairwise_stream::refusal(sent, KEY_DELIVERY_PATIENCE) => refused,
+        };
+        let event = match refused {
             Some((why, answered)) => NetEvent::SkdmRefused {
                 channel_id,
                 peer: target,
                 chain_id,
+                opening,
                 why,
                 answered,
                 session,
@@ -2141,12 +2255,17 @@ fn watch_delivery(tx: mpsc::Sender<NetEvent>, sent: quinn::RecvStream, w: Watche
                 channel_id,
                 peer: target,
                 chain_id,
+                opening,
                 session,
                 history,
                 epoch,
             },
         };
-        let _ = tx.send(event).await;
+        tokio::select! {
+            biased;
+            _ = epoch_changed.changed() => {},
+            _ = tx.send(event) => {},
+        }
     });
 }
 
@@ -4429,8 +4548,12 @@ pub struct Node {
     /// Pairwise streams for a room still being joined, held until the join reports back: see
     /// `take_inbound_skdm`.
     held_pairwise: Vec<(Digest32, PairwiseIn)>,
-    /// Each member's pairwise writer (V210-71): see `write_pairwise`.
-    pairwise_out: BTreeMap<Digest32, mpsc::UnboundedSender<PairwiseJob>>,
+    /// Each member's bounded pairwise writer (V210-71, #872).
+    pairwise_out: BTreeMap<Digest32, PairwiseOut>,
+    pairwise_jobs: Arc<Semaphore>,
+    pairwise_deliveries: Arc<Semaphore>,
+    /// Lock cancels the old epoch's writers and watchers, including queued sealed jobs.
+    pairwise_epoch: watch::Sender<u64>,
     /// Per room, the members this node's board has held a bundle record for. A record from an
     /// author not in it is a member this node has just learned of, which is what
     /// `note_new_members` passes on at once; a refresh of a known member's record is not.
@@ -4538,6 +4661,9 @@ pub struct Node {
     /// Per `(room, member, generation)`: the key delivery opened for it (ADR-030 D-4), until the
     /// member takes it, a later key supersedes it, or the member says its opening cannot work.
     deliveries: BTreeMap<(Digest32, Digest32, u64), Delivery>,
+    /// Unsealed slots of an admitted history batch. Retained across a temporary prekey wait:
+    /// releasing them would let partial batches fill the cache and prevent any from finishing.
+    delivery_reserved: BTreeMap<(Digest32, Digest32, u64), DeliveryReservation>,
     /// Per `(room, member)`: why this identity's key for it waits, until it is taken (ADR-030
     /// D-5, W-4), shown beside the member in the roster, `vox status` and the app.
     key_waiting: BTreeMap<(Digest32, Digest32), String>,
@@ -5001,6 +5127,9 @@ impl Node {
             drive_changed: std::sync::atomic::AtomicBool::new(false),
             held_pairwise: Vec::new(),
             pairwise_out: BTreeMap::new(),
+            pairwise_jobs: Arc::new(Semaphore::new(PAIRWISE_NODE_LIMIT)),
+            pairwise_deliveries: Arc::new(Semaphore::new(PAIRWISE_NODE_LIMIT)),
+            pairwise_epoch: watch::channel(0).0,
             board_authors: BTreeMap::new(),
             publishing: std::collections::BTreeSet::new(),
             publish_again: BTreeMap::new(),
@@ -5035,6 +5164,7 @@ impl Node {
             reoffer: BTreeSet::new(),
             keys_in_flight: BTreeMap::new(),
             deliveries: BTreeMap::new(),
+            delivery_reserved: BTreeMap::new(),
             key_waiting: BTreeMap::new(),
             older: BTreeMap::new(),
             older_probes: BTreeSet::new(),
@@ -7763,12 +7893,32 @@ impl Node {
             NetEvent::Pairwise(stream) => {
                 self.take_inbound_skdm(stream).await;
             }
-            NetEvent::HelloUndelivered { channel_id, peer } => {
+            NetEvent::HelloUndelivered {
+                channel_id,
+                peer,
+                session,
+                epoch,
+            } => {
+                if epoch != self.delivery_epoch
+                    || self.session_serial.get(&(channel_id, peer)).copied() != session
+                {
+                    return;
+                }
                 if let Some(i) = self.initiated.get_mut(&(channel_id, peer)) {
                     i.hello_delivered = false;
                 }
             }
-            NetEvent::ReopenUndelivered { channel_id, peer } => {
+            NetEvent::ReopenUndelivered {
+                channel_id,
+                peer,
+                session,
+                epoch,
+            } => {
+                if epoch != self.delivery_epoch
+                    || self.session_serial.get(&(channel_id, peer)).copied() != session
+                {
+                    return;
+                }
                 if let Some(i) = self.initiated.get_mut(&(channel_id, peer)) {
                     i.hello_delivered = false;
                 }
@@ -8045,18 +8195,21 @@ impl Node {
                 channel_id,
                 peer,
                 chain_id,
+                opening,
                 why,
                 answered,
                 session,
                 history,
                 epoch,
             } => {
-                // A watcher from before a lock: what it answered is no longer in flight.
-                if epoch == self.delivery_epoch {
-                    self.key_landed(channel_id, peer);
-                    if history {
-                        self.history_landed(channel_id, peer, false);
-                    }
+                // A queued answer can outlive lock cancellation. It must not invalidate the
+                // new epoch's cache or recreate an old obligation; the durable ledger retries.
+                if epoch != self.delivery_epoch {
+                    return;
+                }
+                self.key_landed(channel_id, peer);
+                if history {
+                    self.history_landed(channel_id, peer, false);
                 }
                 // **A delivery whose opening cannot work is opened afresh** (ADR-030 D-4, P-3): the
                 // member does not hold the one-time prekey it named, or the prekey it was opened
@@ -8074,19 +8227,26 @@ impl Node {
                         self.older.insert((channel_id, peer), false);
                         self.deliveries
                             .retain(|(room, member, _), _| *room != channel_id || *member != peer);
+                        self.delivery_reserved
+                            .retain(|(room, member, _), _| *room != channel_id || *member != peer);
                     }
-                    if refused_as(KeyRefusal::UnknownPrekey) {
-                        if let Some(prekey_id) = self
+                    if session.is_none()
+                        && self
                             .deliveries
-                            .remove(&delivery)
-                            .and_then(|d| d.one_time_prekey)
-                        {
-                            self.note_refused_otp(peer, prekey_id);
-                        }
-                    } else if refused_as(KeyRefusal::HelloRefused)
-                        || refused_as(KeyRefusal::CannotOpen)
+                            .get(&delivery)
+                            .is_some_and(|d| Some(d.opening) == opening)
+                        && (refused_as(KeyRefusal::UnknownPrekey)
+                            || refused_as(KeyRefusal::HelloRefused)
+                            || refused_as(KeyRefusal::CannotOpen))
                     {
-                        self.deliveries.remove(&delivery);
+                        if let Some(old) = self.deliveries.remove(&delivery) {
+                            if refused_as(KeyRefusal::UnknownPrekey) {
+                                if let Some(prekey_id) = old.one_time_prekey {
+                                    self.note_refused_otp(peer, prekey_id);
+                                }
+                            }
+                            self.delivery_reserved.insert(delivery, old.reservation);
+                        }
                     }
                 }
                 let (Some(profile), Some(shared)) = (
@@ -8403,10 +8563,14 @@ impl Node {
                 channel_id,
                 peer,
                 chain_id,
+                opening,
                 session,
                 history,
                 epoch,
             } => {
+                if epoch != self.delivery_epoch {
+                    return;
+                }
                 self.key_backoff.remove(&(channel_id, peer));
                 // Taken: its delivery is done with (ADR-030 D-4), and the member waits no more. A
                 // key of a history batch is kept until the whole batch is taken: a batch that went
@@ -8414,8 +8578,14 @@ impl Node {
                 // and this key then goes as these same bytes, which its member answers taken
                 // without opening anything (W-3). Opened afresh each time, it took the fresh
                 // one-time prekey the waiting key was waiting for, and the batch never completed.
-                if !history {
-                    self.deliveries.remove(&(channel_id, peer, chain_id));
+                let delivery = (channel_id, peer, chain_id);
+                if !history
+                    && self
+                        .deliveries
+                        .get(&delivery)
+                        .is_some_and(|d| Some(d.opening) == opening && !d.reservation.history)
+                {
+                    self.deliveries.remove(&delivery);
                 }
                 // Taken in a session of its own: the member runs v0.4.3 or later, whatever it ran
                 // before (ADR-030 W-4). Taken in the long-lived session, it is still the older Vox
@@ -8430,15 +8600,12 @@ impl Node {
                 {
                     self.hello_delivered(&channel_id, peer);
                 }
-                // The key was taken, and is recorded so whenever it answered. What is in flight,
-                // and so a whole history batch, is counted only by a watcher of this epoch.
-                let fresh = epoch == self.delivery_epoch;
-                if fresh {
-                    self.key_landed(channel_id, peer);
-                }
-                let whole_history = fresh && history && self.history_landed(channel_id, peer, true);
+                self.key_landed(channel_id, peer);
+                let whole_history = history && self.history_landed(channel_id, peer, true);
                 if whole_history {
                     self.deliveries
+                        .retain(|(room, member, _), _| *room != channel_id || *member != peer);
+                    self.delivery_reserved
                         .retain(|(room, member, _), _| *room != channel_id || *member != peer);
                 }
                 let (Some(profile), Some(shared)) = (
@@ -10713,6 +10880,20 @@ impl Node {
         // the member's prekey bundle, read from this node's board; with none there, or a stale one
         // (P-2), the consent fails on every tick's retry and writes nothing. Said once per member
         // and room, until the key goes, each reason as itself.
+        let modern = !matches!(self.older.get(&(*channel_id, target)), Some(false));
+        let Some(admitted) = self.reserve_key_deliveries(
+            channel_id,
+            target,
+            std::slice::from_ref(&skdm),
+            modern,
+            false,
+        ) else {
+            return Outcome::Failed(Fault::DeliveryBusy);
+        };
+        let Some(admission) = admitted.into_iter().next() else {
+            return Outcome::Failed(Fault::DeliveryBusy);
+        };
+        let PairwiseAdmission { queue, job, .. } = admission;
         let mut older = self.older_route(channel_id, target).await;
         let Some((frames, carries_hello, session)) =
             self.key_frames(channel_id, target, &skdm, &mut older).await
@@ -10763,21 +10944,24 @@ impl Node {
         // it is recorded as delivered only then (V210-88).
         // In flight from here until the member answers (V210-88): a crash before then leaves it owed.
         let epoch = self.key_in_flight(*channel_id, target);
-        self.write_pairwise(
-            target,
-            PairwiseJob {
-                conn,
-                frames,
-                channel_id: *channel_id,
-                after: AfterWrite::Key {
-                    chain_id,
-                    hello: carries_hello,
-                    session,
-                    history: false,
-                    epoch,
-                },
+        let opening = frames
+            .first()
+            .filter(|_| session.is_none())
+            .map(|frame| crate::hash::sha256(frame));
+        queue.send(PairwiseJob {
+            conn,
+            frames: frames.into_iter().map(Vec::into_boxed_slice).collect(),
+            channel_id: *channel_id,
+            after: AfterWrite::Key {
+                chain_id,
+                opening,
+                hello: carries_hello,
+                session,
+                history: false,
+                epoch,
             },
-        );
+            credit: job,
+        });
         if history_owed {
             // At once rather than on the tick: the connection and session are live now.
             let _ = self.deliver_rekeys_for(channel_id, asked).await;
@@ -11189,6 +11373,11 @@ impl Node {
             return Outcome::Failed(fault_of(&e));
         }
         self.trust = next;
+        self.deliveries
+            .retain(|(_, peer, _), _| peer != fingerprint);
+        self.delivery_reserved
+            .retain(|(_, peer, _), _| peer != fingerprint);
+        self.key_waiting.retain(|(_, peer), _| peer != fingerprint);
         self.note_capability(*fingerprint, had_drive);
         // **It stops being read here too** (V210-118): its keys are dropped in every open room, so
         // nothing it posts from now opens on this node. A closed room drops them, and changes its
@@ -11385,6 +11574,12 @@ impl Node {
                 Err(e) => return Outcome::Failed(fault_of(&e)),
             }
         };
+        // The revocation is durable: this member is no longer owed any cached delivery.
+        self.deliveries
+            .retain(|(room, peer, _), _| room != channel_id || *peer != target);
+        self.delivery_reserved
+            .retain(|(room, peer, _), _| room != channel_id || *peer != target);
+        self.key_waiting.remove(&(*channel_id, target));
         // The revocation is a log fact the whole channel converges on.
         self.note_local_append(channel_id);
         let rekeyed = self.deliver_rekeys_for(channel_id, true).await;
@@ -11421,33 +11616,9 @@ impl Node {
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return 0;
         };
-        let (owed, skdm, mut history) = {
+        let (owed, history) = {
             let channel = shared.lock().await;
-            let owed = channel.owed_rekeys();
-            let history_owed = channel.owed_history();
-            if owed.is_empty() && history_owed.is_empty() {
-                return 0;
-            }
-            let Some(profile) = self.profile.as_ref() else {
-                return 0;
-            };
-            // A member owed history gets every generation from its floor to the live one, each
-            // at its origin, oldest first (V210-45). At most `MAX_RETAINED_ORIGINS` keys: the
-            // work is bounded by the history this identity holds, not by a constant.
-            let mut history: BTreeMap<Digest32, Vec<crate::group::skdm::Skdm>> = BTreeMap::new();
-            for (target, floor) in history_owed {
-                if let Ok(batch) = channel.history_skdms(profile, &target, floor) {
-                    history.insert(target, batch);
-                }
-            }
-            // Each member's re-key from where its entitlement begins (V210-45).
-            let mut skdm: BTreeMap<Digest32, crate::group::skdm::Skdm> = BTreeMap::new();
-            for target in &owed {
-                if let Ok(s) = channel.rekey_skdm_for(profile, target) {
-                    skdm.insert(*target, s);
-                }
-            }
-            (owed, skdm, history)
+            (channel.owed_rekeys(), channel.owed_history())
         };
         let mut delivered = 0u64;
         let now_ms = self.now_ms().get();
@@ -11472,64 +11643,92 @@ impl Node {
             {
                 continue;
             }
-            // Reach them through the ladder rather than requiring a live connection: a re-key
-            // that only reaches members this process happened to join with is the M15 gap
-            // ADR-016 recorded, and it is what made revocation undeliverable after a restart.
-            // No long-lived session is needed: each key opens its own (ADR-030 D-1).
-            let Some(conn) = self.reach_member(channel_id, target, asked).await else {
-                continue;
-            };
-            let batch = history.remove(&target);
-            let owes_history = batch.is_some();
-            let keys: Vec<&crate::group::skdm::Skdm> = match batch.as_ref() {
-                Some(b) => b.iter().collect(),
-                None => match skdm.get(&target) {
-                    Some(k) => vec![k],
-                    None => continue,
-                },
+            // Materialize only this member's bounded history, not every member's batches at
+            // once. Durable obligations stay in the channel until the recipient acknowledges.
+            let owes_history = history.contains_key(&target);
+            let keys = {
+                let channel = shared.lock().await;
+                let Some(profile) = self.profile.as_ref() else {
+                    return delivered;
+                };
+                let result = match history.get(&target) {
+                    Some(floor) => channel.history_skdms(profile, &target, *floor),
+                    None => channel
+                        .rekey_skdm_for(profile, &target)
+                        .map(|key| vec![key]),
+                };
+                match result {
+                    Ok(keys) => keys,
+                    Err(_) => continue,
+                }
             };
             // A delivery opened for a key no longer owed was superseded (ADR-030 D-4).
+            // Retire it even while the member is unavailable, so it cannot pin capacity forever.
             let owed_now: BTreeSet<u64> = keys.iter().map(|k| k.body.chain_id).collect();
             self.deliveries.retain(|(room, member, generation), _| {
                 room != channel_id || *member != target || owed_now.contains(generation)
             });
+            self.delivery_reserved
+                .retain(|(room, member, generation), _| {
+                    room != channel_id || *member != target || owed_now.contains(generation)
+                });
+            // Reach them through the ladder rather than requiring a live connection. No
+            // long-lived session is needed: each key opens its own (ADR-030 D-1).
+            let Some(conn) = self.reach_member(channel_id, target, asked).await else {
+                continue;
+            };
+            let modern = !matches!(self.older.get(&(*channel_id, target)), Some(false));
+            let Some(admitted) =
+                self.reserve_key_deliveries(channel_id, target, &keys, modern, owes_history)
+            else {
+                continue; // the entire batch remains owed; no key or ratchet was consumed
+            };
+            let mut older = self.older_route(channel_id, target).await;
             let mut all_sent = true;
             let mut jobs = Vec::with_capacity(keys.len());
             let mut watched = 0u32;
-            let mut older = self.older_route(channel_id, target).await;
-            for key in keys {
+            for (key, admission) in keys.iter().zip(admitted) {
+                let PairwiseAdmission { queue, job, .. } = admission;
                 let Some((frames, carries_hello, session)) =
                     self.key_frames(channel_id, target, key, &mut older).await
                 else {
                     all_sent = false;
                     break;
                 };
-                // Each key's own generation: a refusal re-owes exactly what was refused, and it is
-                // recorded as delivered only once taken (V210-88).
+                // Each key's own generation: a refusal re-owes exactly what was refused, and it
+                // is recorded as delivered only once taken (V210-88).
                 let epoch = self.key_in_flight(*channel_id, target);
-                jobs.push(PairwiseJob {
-                    conn: Arc::clone(&conn),
-                    frames,
-                    channel_id: *channel_id,
-                    after: AfterWrite::Key {
-                        chain_id: key.body.chain_id,
-                        hello: carries_hello,
-                        session,
-                        history: owes_history,
-                        epoch,
+                let opening = frames
+                    .first()
+                    .filter(|_| session.is_none())
+                    .map(|frame| crate::hash::sha256(frame));
+                jobs.push((
+                    queue,
+                    PairwiseJob {
+                        conn: Arc::clone(&conn),
+                        frames: frames.into_iter().map(Vec::into_boxed_slice).collect(),
+                        channel_id: *channel_id,
+                        after: AfterWrite::Key {
+                            chain_id: key.body.chain_id,
+                            opening,
+                            hello: carries_hello,
+                            session,
+                            history: owes_history,
+                            epoch,
+                        },
+                        credit: job,
                     },
-                });
+                ));
                 watched += 1;
             }
             if owes_history && watched > 0 {
                 // Answers are handled on this actor, after this returns: none is lost.
                 self.history_in_flight.insert(pair, (watched, !all_sent));
             }
-            // Written in order by this member's writer, off the actor (V210-71); whether each key
-            // was taken comes back as `NetEvent::SkdmTaken` or `SkdmRefused`, and only a taken key
-            // is recorded as delivered (V210-88).
-            for job in jobs {
-                self.write_pairwise(target, job);
+            // The complete batch was admitted before sealing. Reserved sends cannot fail or
+            // wait, and this peer's writer preserves ratchet order (V210-71).
+            for (queue, job) in jobs {
+                queue.send(job);
             }
             if all_sent {
                 delivered += 1;
@@ -11553,7 +11752,12 @@ impl Node {
         let id = (*channel_id, target, key.body.chain_id);
         let key_ref = crate::governance::membership::skdm_ref(key);
         if let Some(delivery) = self.deliveries.get(&id).filter(|d| d.key == key_ref) {
-            return Ok(delivery.frame.clone());
+            return Ok(delivery.frame.to_vec());
+        }
+        // Capacity was reserved for the complete batch before any session was opened.
+        // Keep it reserved if opening/sealing waits, so a partial batch can always finish.
+        if !self.delivery_reserved.contains_key(&id) {
+            return Err(None);
         }
         let bundle = self
             .delivery_bundle_waiting(channel_id, target, false)
@@ -11590,12 +11794,15 @@ impl Node {
         if let Some(prekey_id) = initial.one_time_prekey_id {
             self.refused_otps.note(target, prekey_id);
         }
+        let reservation = self.delivery_reserved.remove(&id).ok_or(None)?;
         self.deliveries.insert(
             id,
             Delivery {
-                frame: frame.clone(),
+                frame: frame.clone().into_boxed_slice(),
                 one_time_prekey: initial.one_time_prekey_id,
                 key: key_ref,
+                reservation,
+                opening: crate::hash::sha256(&frame),
             },
         );
         Ok(frame)
@@ -13830,6 +14037,12 @@ impl Node {
             let Some(conn) = self.reach_member(&channel_id, peer, false).await else {
                 continue;
             };
+            let Some(admitted) = self.reserve_pairwise(peer, &[false]) else {
+                continue; // still owed, with no ratchet step consumed
+            };
+            let Some(PairwiseAdmission { queue, job, .. }) = admitted.into_iter().next() else {
+                continue;
+            };
             let Some(session) = self.sessions.get_mut(&(channel_id, peer)) else {
                 self.reopen.remove(&(channel_id, peer));
                 continue;
@@ -13846,15 +14059,16 @@ impl Node {
             // Offered, not delivered: an `Open` is never answered, so the hello counts as held only
             // once a key sealed under the session is taken (V210-89).
             self.reopen.remove(&(channel_id, peer));
-            self.write_pairwise(
-                peer,
-                PairwiseJob {
-                    conn,
-                    frames,
-                    channel_id,
-                    after: AfterWrite::Reopen,
+            queue.send(PairwiseJob {
+                conn,
+                frames: frames.into_iter().map(Vec::into_boxed_slice).collect(),
+                channel_id,
+                after: AfterWrite::Reopen {
+                    session: self.session_serial.get(&(channel_id, peer)).copied(),
+                    epoch: self.delivery_epoch,
                 },
-            );
+                credit: job,
+            });
         }
     }
 
@@ -13882,23 +14096,121 @@ impl Node {
         }
     }
 
-    /// Hand `job` to `peer`'s pairwise writer, starting one if it has none (V210-71).
-    ///
-    /// One writer per member, so the streams to that member are opened in the order their frames
-    /// were sealed: a hello and the keys behind it, and the ratchet messages of one session, must
-    /// arrive in order (F12). The actor only seals and queues; it never waits on the peer.
-    fn write_pairwise(&mut self, peer: Digest32, job: PairwiseJob) {
-        let job = match self.pairwise_out.get(&peer) {
-            Some(q) => match q.send(job) {
-                Ok(()) => return,
-                Err(mpsc::error::SendError(job)) => job,
-            },
-            None => job,
-        };
-        let (q, rx) = mpsc::unbounded_channel();
-        tokio::spawn(write_pairwise_jobs(peer, rx, self.net_tx.clone()));
-        let _ = q.send(job);
-        self.pairwise_out.insert(peer, q);
+    /// Reserve a complete batch without waiting on the actor. Nothing is sealed until all
+    /// queue, watcher and new-cache slots fit. Retry bytes already cached need no second cache
+    /// credit; they still need a job credit through the recipient's answer.
+    fn reserve_pairwise(
+        &mut self,
+        peer: Digest32,
+        new_deliveries: &[bool],
+    ) -> Option<Vec<PairwiseAdmission>> {
+        // An idle peer must not leave a writer/credit registry entry behind forever.
+        self.pairwise_out.retain(|_, out| {
+            out.jobs.available_permits() != PAIRWISE_PEER_LIMIT
+                || out.deliveries.available_permits() != PAIRWISE_PEER_LIMIT
+        });
+        let out = self.pairwise_out.entry(peer).or_insert_with(|| {
+            let (queue, rx) = mpsc::channel(PAIRWISE_PEER_LIMIT);
+            tokio::spawn(write_pairwise_jobs(
+                peer,
+                rx,
+                self.net_tx.clone(),
+                self.pairwise_epoch.subscribe(),
+            ));
+            PairwiseOut {
+                queue,
+                epoch: self.delivery_epoch,
+                jobs: Arc::new(Semaphore::new(PAIRWISE_PEER_LIMIT)),
+                deliveries: Arc::new(Semaphore::new(PAIRWISE_PEER_LIMIT)),
+            }
+        });
+        if out.epoch != self.delivery_epoch {
+            let (queue, rx) = mpsc::channel(PAIRWISE_PEER_LIMIT);
+            tokio::spawn(write_pairwise_jobs(
+                peer,
+                rx,
+                self.net_tx.clone(),
+                self.pairwise_epoch.subscribe(),
+            ));
+            out.queue = queue;
+            out.epoch = self.delivery_epoch;
+        }
+        let mut admitted = Vec::with_capacity(new_deliveries.len());
+        for fresh in new_deliveries {
+            let job = PairwiseCredit::reserve(&self.pairwise_jobs, &out.jobs)?;
+            let delivery = if *fresh {
+                Some(PairwiseCredit::reserve(
+                    &self.pairwise_deliveries,
+                    &out.deliveries,
+                )?)
+            } else {
+                None
+            };
+            let queue = out.queue.clone().try_reserve_owned().ok()?;
+            admitted.push(PairwiseAdmission {
+                queue,
+                job,
+                delivery,
+            });
+        }
+        Some(admitted)
+    }
+
+    fn reserve_key_deliveries(
+        &mut self,
+        room: &Digest32,
+        peer: Digest32,
+        keys: &[crate::group::skdm::Skdm],
+        modern: bool,
+        history: bool,
+    ) -> Option<Vec<PairwiseAdmission>> {
+        let fresh: Vec<bool> = keys
+            .iter()
+            .map(|key| {
+                let id = (*room, peer, key.body.chain_id);
+                let key_ref = crate::governance::membership::skdm_ref(key);
+                // A changed consent names another key; its old opening cannot carry this one.
+                if self.deliveries.get(&id).is_some_and(|d| d.key != key_ref) {
+                    if let Some(old) = self.deliveries.remove(&id) {
+                        self.delivery_reserved.insert(id, old.reservation);
+                    }
+                }
+                modern
+                    && !self.deliveries.contains_key(&id)
+                    && !self.delivery_reserved.contains_key(&id)
+            })
+            .collect();
+        let mut admitted = self.reserve_pairwise(peer, &fresh);
+        if let Some(batch) = admitted.as_mut() {
+            for (key, admission) in keys.iter().zip(batch) {
+                let id = (*room, peer, key.body.chain_id);
+                if let Some(credit) = admission.delivery.take() {
+                    self.delivery_reserved.insert(
+                        id,
+                        DeliveryReservation {
+                            _credit: credit,
+                            history,
+                        },
+                    );
+                }
+                if history {
+                    if let Some(delivery) = self.deliveries.get_mut(&id) {
+                        delivery.reservation.history = true;
+                    }
+                    if let Some(reserved) = self.delivery_reserved.get_mut(&id) {
+                        reserved.history = true;
+                    }
+                }
+            }
+        } else {
+            self.key_waiting.insert(
+                (*room, peer),
+                "is owed your key in this room, which waits for local delivery capacity; \
+                 it is tried again without changing its sealed retry bytes"
+                    .to_owned(),
+            );
+        }
+        admitted
     }
 
     /// Count one key to `target` as **in flight** and return the [`Self::delivery_epoch`] its
@@ -14801,6 +15113,7 @@ impl Node {
         self.keys_in_flight.clear();
         // Sealed bytes, no key material; but the ring that opens the next ones is this identity's.
         self.deliveries.clear();
+        self.delivery_reserved.clear();
         self.key_waiting.clear();
         self.older.clear();
         self.older_probes.clear();
@@ -14809,6 +15122,7 @@ impl Node {
         self.packages_posted.clear();
         // And the watchers still running answer for what is no longer in flight.
         self.delivery_epoch = self.delivery_epoch.wrapping_add(1);
+        self.pairwise_epoch.send_replace(self.delivery_epoch);
         self.history_in_flight.clear();
         // What the boards held was learnt over the network that goes down with the lock; an address
         // asked for meanwhile is not handed out by a locked node (V210-96).
@@ -14844,8 +15158,9 @@ impl Node {
         // (their secrets zeroize on drop).
         self.sessions.clear();
         self.initiated.clear();
-        // Their writers end with their queues; what they hold is sealed bytes, no key material.
-        self.pairwise_out.clear();
+        // The epoch change cancels their writers/watchers. Keep their credit counters until
+        // they drop, so a quick unlock cannot escape either the node or per-peer allowance.
+        // The next admission prunes idle counters or starts a writer for this new epoch.
         self.accepted_hello.clear();
         self.taken_deliveries.clear();
         self.reopen.clear();
@@ -15922,6 +16237,10 @@ impl Node {
         if let Err(e) = profile.store().rewrite_fresh() {
             return Outcome::Failed(fault_of(&e));
         }
+        self.deliveries.retain(|(room, _, _), _| room != channel_id);
+        self.delivery_reserved
+            .retain(|(room, _, _), _| room != channel_id);
+        self.key_waiting.retain(|(room, _), _| room != channel_id);
         self.refresh_network_view().await;
         // Published before it is said: whoever is told the room is deleted and then looks
         // (`vox room list`) must not still see it.
@@ -15990,6 +16309,11 @@ impl Node {
             let gen = ch.generation().load(std::sync::atomic::Ordering::Relaxed);
             drop(ch);
             for d in &departed {
+                self.deliveries
+                    .retain(|(room, peer, _), _| *room != cid || peer != d);
+                self.delivery_reserved
+                    .retain(|(room, peer, _), _| *room != cid || peer != d);
+                self.key_waiting.remove(&(cid, *d));
                 if self.ports.contains_key(&(cid, *d)) {
                     self.drop_port(&cid, d);
                 }

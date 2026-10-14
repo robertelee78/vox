@@ -284,11 +284,14 @@ pub const WRITE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5
 ///
 /// # Errors
 /// The stream would not open or take the frames in time.
-pub async fn write_pairwise(conn: &VoxConnection, frames: &[Vec<u8>]) -> Result<RecvStream> {
+pub async fn write_pairwise(
+    conn: &VoxConnection,
+    frames: &[impl AsRef<[u8]>],
+) -> Result<RecvStream> {
     let written = async {
         let (mut send, recv) = open_typed(conn, StreamKind::Pairwise).await?;
         for f in frames {
-            write_frame(&mut send, f).await?;
+            write_frame(&mut send, f.as_ref()).await?;
         }
         let _ = send.finish();
         Ok::<RecvStream, Error>(recv)
