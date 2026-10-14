@@ -47,6 +47,9 @@ const T_REQ_COMPUTER_BEGIN: u64 = 4141;
 const T_REQ_COMPUTER_PREVIEW: u64 = 4142;
 const T_REQ_COMPUTER_APPROVE: u64 = 4143;
 const T_REQ_COMPUTER_CANCEL: u64 = 4144;
+const T_REQ_COMPUTER_PERSONAL: u64 = 4145;
+const T_REQ_COMPUTER_REMOVE: u64 = 4146;
+const T_REQ_COMPUTER_BINDING: u64 = 4147;
 const T_DAEMON_EVENT: u64 = 4007;
 const T_METRICS: u64 = 4008;
 const T_DAEMON_STATUS: u64 = 4009;
@@ -241,6 +244,29 @@ pub enum DaemonRequest {
     ComputerCancel {
         /// Displayed invitation or operation identity.
         operation: String,
+    },
+    /// Save the app's selected node after verifying its live local identity; empty clears it.
+    ComputerPersonal {
+        /// Local node name; resolved only through an attached actor.
+        node: String,
+    },
+    /// Operator confirms removal of this exact computer at the displayed policy frontier.
+    ComputerRemove {
+        /// Full management fingerprint.
+        computer: String,
+        /// Exact displayed frontier.
+        frontier: String,
+    },
+    /// Operator-approved source release or destination transfer/recovery.
+    ComputerBinding {
+        /// release / transfer / recover.
+        action: String,
+        /// Full retained node fingerprint.
+        node: String,
+        /// Active destination for release; empty otherwise.
+        destination: String,
+        /// Exact displayed policy frontier.
+        frontier: String,
     },
     /// Every node on disk, with its state: answered [`DaemonFrame::Nodes`].
     Nodes,
@@ -1199,6 +1225,28 @@ impl Opening {
                 DaemonRequest::ComputerCancel { operation } => {
                     e.array(2).uint(T_REQ_COMPUTER_CANCEL).text(operation);
                 }
+                DaemonRequest::ComputerBinding {
+                    action,
+                    node,
+                    destination,
+                    frontier,
+                } => {
+                    e.array(5)
+                        .uint(T_REQ_COMPUTER_BINDING)
+                        .text(action)
+                        .text(node)
+                        .text(destination)
+                        .text(frontier);
+                }
+                DaemonRequest::ComputerPersonal { node } => {
+                    e.array(2).uint(T_REQ_COMPUTER_PERSONAL).text(node);
+                }
+                DaemonRequest::ComputerRemove { computer, frontier } => {
+                    e.array(3)
+                        .uint(T_REQ_COMPUTER_REMOVE)
+                        .text(computer)
+                        .text(frontier);
+                }
                 DaemonRequest::Stop => {
                     e.array(1).uint(T_REQ_STOP);
                 }
@@ -1356,6 +1404,19 @@ impl Opening {
             }),
             (T_REQ_METRICS, 1) => Opening::Daemon(DaemonRequest::Metrics),
             (T_REQ_SUBSCRIBE, 1) => Opening::Daemon(DaemonRequest::Subscribe),
+            (T_REQ_COMPUTER_BINDING, 5) => Opening::Daemon(DaemonRequest::ComputerBinding {
+                action: text(&mut d, "binding action")?,
+                node: text(&mut d, "node fingerprint")?,
+                destination: text(&mut d, "destination computer")?,
+                frontier: text(&mut d, "computer frontier")?,
+            }),
+            (T_REQ_COMPUTER_PERSONAL, 2) => Opening::Daemon(DaemonRequest::ComputerPersonal {
+                node: text(&mut d, "selected node")?,
+            }),
+            (T_REQ_COMPUTER_REMOVE, 3) => Opening::Daemon(DaemonRequest::ComputerRemove {
+                computer: text(&mut d, "computer fingerprint")?,
+                frontier: text(&mut d, "computer frontier")?,
+            }),
             (T_REQ_COMPUTER_STATUS, 1) => Opening::Daemon(DaemonRequest::ComputerStatus),
             (T_REQ_COMPUTER_BEGIN, 1) => Opening::Daemon(DaemonRequest::ComputerBegin),
             (T_REQ_COMPUTER_PREVIEW, 2) => Opening::Daemon(DaemonRequest::ComputerPreview {

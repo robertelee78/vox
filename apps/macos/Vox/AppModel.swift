@@ -165,7 +165,7 @@ final class AppModel: ObservableObject {
             self.client = client
             let nodes = try await client.nodes()
             guard ownsNodeRequest(client, generation) else { return }
-            if let chosen = chosenNode(client), let node = nodes.first(where: { $0.name == chosen }) {
+            if let chosen = try await client.computerStatus().selectedName, let node = nodes.first(where: { $0.name == chosen }) {
                 guard ownsNodeRequest(client, generation) else { return }
             await use(node)
             } else {
@@ -318,7 +318,7 @@ final class AppModel: ObservableObject {
             guard ownsNodeRequest(client, generation) else { return }
             try await refreshNodeState(client, generation: generation)
             guard ownsNodeRequest(client, generation) else { return }
-            remember(name, client)
+            try await remember(name, client)
             enter(name, fingerprint, client)
         } catch {
             guard ownsNodeRequest(client, generation) else { return }
@@ -372,7 +372,7 @@ final class AppModel: ObservableObject {
             guard ownsNodeRequest(client, generation) else { return }
             try await refreshNodeState(client, generation: generation)
             guard ownsNodeRequest(client, generation) else { return }
-            remember(node, client)
+            try await remember(node, client)
             enter(node, fingerprint, client)
         } catch VoxError.WrongPassphrase(let reason) {
             guard ownsNodeRequest(client, generation) else { return }
@@ -709,7 +709,7 @@ final class AppModel: ObservableObject {
             guard ownsNodeRequest(client, generation) else { return }
             try await refreshNodeState(client, generation: generation)
             guard ownsNodeRequest(client, generation) else { return }
-            remember(node.name, client)
+            try await remember(node.name, client)
             enter(node.name, fingerprint, client)
         } catch VoxError.Busy(let reason) {
             guard ownsNodeRequest(client, generation) else { return }
@@ -742,27 +742,15 @@ final class AppModel: ObservableObject {
         URL(fileURLWithPath: client.configDir()).appendingPathComponent("app/node")
     }
 
-    private func chosenNode(_ client: VoxClient) -> String? {
-        guard let text = try? String(contentsOf: choiceFile(client), encoding: .utf8) else {
-            return nil
-        }
-        let name = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        return name.isEmpty ? nil : name
-    }
-
-    /// Forget the remembered node, if it is `node`.
-    private func forget(_ node: String, _ client: VoxClient) {
-        if chosenNode(client) == node {
-            try? FileManager.default.removeItem(at: choiceFile(client))
-        }
-    }
-
-    private func remember(_ node: String, _ client: VoxClient) {
+    private func remember(_ node: String, _ client: VoxClient) async throws {
+        // The daemon owns the saved identity and signed personal-role update. Saving a name
+        // in the app alone must never leave the old node's automatic drive authority active.
+        _ = try await client.selectPersonalNode(node: node)
         let file = choiceFile(client)
-        try? FileManager.default.createDirectory(
+        try FileManager.default.createDirectory(
             at: file.deletingLastPathComponent(), withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o700])
-        try? Data((node + "\n").utf8).write(to: file, options: .atomic)
+        try Data((node + "\n").utf8).write(to: file, options: .atomic)
     }
 
     func refreshAgentSetups() {
