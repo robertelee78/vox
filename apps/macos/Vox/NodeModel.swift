@@ -2871,14 +2871,18 @@ extension NodeModel {
 
     /// End on an older Session window reloads the actual newest page from disk.
     func readNewestTimeline() async {
-        guard let room = roomOnScreen, showingSession else { return }
+        guard let room = roomOnScreen else { return }
         let destination = showing, epoch = nodeObservationEpoch
-        sessionReloadNeeded = false
         timelineFollowingNewest = true
-        sessionWindowRevision = UUID()
-        await readSelectedSessionMetadata()
-        guard roomOnScreen == room, showing == destination, epoch == nodeObservationEpoch else { return }
-        await readSession()
+        if showingSession {
+            sessionReloadNeeded = false
+            sessionWindowRevision = UUID()
+            await readSelectedSessionMetadata()
+            guard roomOnScreen == room, showing == destination, epoch == nodeObservationEpoch else { return }
+            await readSession()
+        } else {
+            await readNewOnScreen()
+        }
     }
 
     /// The page of the Session on screen's entries before those held (ADR-034 FR-4): read when
