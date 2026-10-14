@@ -32,7 +32,7 @@ use std::time::Duration;
 
 use serde_json::{json, Map, Value};
 use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
-use tokio::sync::{mpsc, oneshot, Notify};
+use tokio::sync::{mpsc, oneshot, Notify, Semaphore};
 use vox_core::node::paths::NodeName;
 
 use crate::codex_mirror::Steer;
@@ -65,6 +65,7 @@ struct Connection {
 pub struct OpenCodeMirror {
     sink: Arc<Sink>,
     conns: Mutex<BTreeMap<String, Connection>>,
+    live: Arc<Semaphore>,
 }
 
 enum Cmd {
@@ -81,6 +82,7 @@ impl OpenCodeMirror {
         Arc::new(Self {
             sink,
             conns: Mutex::new(BTreeMap::new()),
+            live: Arc::new(Semaphore::new(MAX_FOLLOWS)),
         })
     }
 
@@ -98,10 +100,10 @@ impl OpenCodeMirror {
         if conns.contains_key(session) {
             return;
         }
-        if conns.len() >= MAX_FOLLOWS {
+        let Ok(permit) = Arc::clone(&self.live).try_acquire_owned() else {
             eprintln!("vox daemon: {node}: OpenCode Session {session} observation refused: {MAX_FOLLOWS} live followers already active");
             return;
-        }
+        };
         let (tx, rx) = mpsc::channel(MAX_COMMANDS);
         let stop = Arc::new(Notify::new());
         conns.insert(
@@ -129,6 +131,9 @@ impl OpenCodeMirror {
         let owner = Arc::downgrade(self);
         let session = session.to_owned();
         tokio::spawn(async move {
+            // end() may remove its registration while a durable post/write is finishing.
+            // The live-work slot belongs to the task, not that replaceable map entry.
+            let _permit = permit;
             follow.run(endpoint, token, rx, stop).await;
             if let Some(owner) = owner.upgrade() {
                 let mut conns = owner.conns();

@@ -393,7 +393,10 @@ function mirrorEvents(client) {
           if (!mirrorFailure) {
             const raw = JSON.parse(item.line)
             const owner = await ownerOf(client, raw)
-            const writers = (item.targets ?? item.followers.get(owner) ?? []).filter((write) => write.active)
+            // A title snapshot can wait behind a live rename's metadata lookup. Check
+            // again here, not only when that snapshot's HTTP response first arrives.
+            const writers = (item.targets ?? item.followers.get(owner) ?? [])
+              .filter((write) => write.active && (!item.targets || !write.titleUpdated))
             if (owner && writers.length) {
               const event = await enrich(raw)
               if (Buffer.byteLength(JSON.stringify({ type: "event", event })) + 1 > MAX_MIRROR_BYTES) {
@@ -418,8 +421,19 @@ function mirrorEvents(client) {
     }
   }
   return (event, targets = null) => {
+    // Only events consumed by the Session adapter need lineage. In particular, an unused
+    // deletion must not GET an already-deleted session and stop unrelated observations.
+    if (!["message.updated", "message.part.updated", "session.updated", "session.idle",
+      "permission.asked", "permission.replied", "question.asked", "question.replied",
+      "question.rejected"].includes(event?.type)) return Promise.resolve()
     if (mirrorFailure) return Promise.resolve()
     if (!targets && !followers.size) return Promise.resolve()
+    if (!targets && event.type === "session.updated") {
+      const sid = event.properties?.info?.id
+      // Exact subscribed id is already known; mark this before any asynchronous lineage
+      // work, so an older in-flight snapshot cannot overwrite its live rename.
+      for (const write of followers.get(sid) ?? []) write.titleUpdated = true
+    }
     const line = JSON.stringify(event)
     const size = Buffer.byteLength(line)
     // Admission is synchronous. A concurrent hook cannot create an unbounded chain of
@@ -644,6 +658,8 @@ function wakeChannel(client, relayed, mirrorEvent) {
           return write(JSON.stringify(reply) + "\n")
         }
         if (kind === "mirror") {
+          // A queued subscribe is not admitted after its close callback has already run.
+          if (!write.active) return
           if (msg?.type !== "subscribe" || typeof msg.session !== "string" || !msg.session || msg.session.length > 4096) {
             return answer({ error: "expected a subscribe frame" })
           }
@@ -686,18 +702,19 @@ function wakeChannel(client, relayed, mirrorEvent) {
         let retained = 0
         for (const [id, notes] of relayed) {
           retained += Buffer.byteLength(id)
-          for (const note of notes) retained += Buffer.byteLength(note)
+          for (const note of notes) retained += Buffer.byteLength(note.text)
         }
         if (prior.length >= MAX_RELAYED || (!relayed.has(msg.session) && relayed.size >= MAX_CONNECTIONS)
           || retained + Buffer.byteLength(msg.session) + Buffer.byteLength(msg.text) > MAX_RELAYED_BYTES) {
           return answer({ error: "Vox wake backlog is full; this notice was not relayed" })
         }
         done = true
-        const noted = [...prior, msg.text]
+        const ticket = { text: msg.text }
+        const noted = [...prior, ticket]
         relayed.set(msg.session, noted)
         const forget = () => {
           const left = relayed.get(msg.session) ?? []
-          const i = left.lastIndexOf(msg.text)
+          const i = left.indexOf(ticket)
           if (i >= 0) left.splice(i, 1)
           if (!left.length) relayed.delete(msg.session)
         }
@@ -828,7 +845,7 @@ export default async function vox({ $, client }) {
         // its text is one this session was relayed and has not had a turn on yet.
         const typed = output.parts.find((p) => p.type === "text" && typeof p.text === "string")
         const notes = relayed.get(sessionID) ?? []
-        const at = typed ? notes.indexOf(typed.text) : -1
+        const at = typed ? notes.findIndex((note) => note.text === typed.text) : -1
         const isWake = at >= 0
         if (isWake) notes.splice(at, 1)
         if (!notes.length) relayed.delete(sessionID)
