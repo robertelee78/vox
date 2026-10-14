@@ -200,17 +200,19 @@ pub(super) struct Descriptor {
     pub position: Position,
     pub name: Option<Field>,
     pub harness: Option<Field>,
+    pub cwd: Option<Field>,
     pub named_at: Position,
     pub ended: Option<Source>,
 }
 
 impl Descriptor {
     pub fn put(&self, e: &mut Encoder) {
-        e.array(9).uint(1).bytes(&self.node).text(&self.id);
+        e.array(10).uint(2).bytes(&self.node).text(&self.id);
         self.opening.put(e);
         self.position.put(e);
         optional_field(e, self.name);
         optional_field(e, self.harness);
+        optional_field(e, self.cwd);
         self.named_at.put(e);
         e.array(usize::from(self.ended.is_some()));
         if let Some(ended) = self.ended {
@@ -219,7 +221,10 @@ impl Descriptor {
     }
 
     pub fn read(d: &mut Decoder<'_>) -> Result<Self> {
-        if d.array()? != 9 || d.uint()? != 1 {
+        // Current saved v1 rows have no cwd. They remain readable until an ordinary
+        // registered opening supplies it; no reset or history-sized rebuild is needed.
+        let shape = (d.array()?, d.uint()?);
+        if !matches!(shape, (9, 1) | (10, 2)) {
             return Err(invalid("Session projection descriptor version"));
         }
         let node = digest(d)?;
@@ -232,6 +237,11 @@ impl Descriptor {
         let position = Position::read(d)?;
         let name = read_optional_field(d)?;
         let harness = read_optional_field(d)?;
+        let cwd = if shape == (10, 2) {
+            read_optional_field(d)?
+        } else {
+            None
+        };
         let named_at = Position::read(d)?;
         let ended = match d.array()? {
             0 => None,
@@ -242,6 +252,7 @@ impl Descriptor {
             || ended.is_some_and(|s| s.author != node)
             || name.is_some_and(|f| f.envelope.first.author != node)
             || harness.is_some_and(|f| f.envelope.first.author != node)
+            || cwd.is_some_and(|f| f.envelope.first.author != node)
         {
             return Err(invalid("Session projection author binding"));
         }
@@ -252,6 +263,7 @@ impl Descriptor {
             position,
             name,
             harness,
+            cwd,
             named_at,
             ended,
         })

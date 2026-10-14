@@ -12,6 +12,7 @@ pub(super) struct Metadata {
     pub kind: String,
     pub from: String,
     pub name: Option<StringRef>,
+    pub cwd: Option<StringRef>,
     pub harness: Option<StringRef>,
 }
 
@@ -40,7 +41,7 @@ enum Value {
     Boolean,
     Number(Option<u64>),
     Text(StringRef),
-    Object(Object),
+    Object(Box<Object>),
     Array(bool),
 }
 
@@ -173,7 +174,7 @@ fn object(reader: &mut Reader<'_, impl Input>, mode: Mode, depth: usize) -> Resu
     let mut result = Object::default();
     if reader.peek()? == Some(b'}') {
         reader.byte()?;
-        return Ok(Value::Object(result));
+        return Ok(Value::Object(Box::new(result)));
     }
     loop {
         let key = reader.string(32)?;
@@ -192,7 +193,7 @@ fn object(reader: &mut Reader<'_, impl Input>, mode: Mode, depth: usize) -> Resu
         property(&mut result, mode, key, parsed);
         whitespace(reader)?;
         match reader.byte()? {
-            b'}' => return Ok(Value::Object(result)),
+            b'}' => return Ok(Value::Object(Box::new(result))),
             b',' => whitespace(reader)?,
             _ => return Err(bad()),
         }
@@ -260,8 +261,13 @@ fn property(object: &mut Object, mode: Mode, key: &str, value: Value) {
             };
             let valid = matches!(&value, Value::Null | Value::Text(_));
             field(object, bit, valid);
-            if key == "session_name" {
-                object.fields.name = match value {
+            if key == "session_name" || key == "cwd" {
+                let target = if key == "cwd" {
+                    &mut object.fields.cwd
+                } else {
+                    &mut object.fields.name
+                };
+                *target = match value {
                     Value::Text(text) => Some(text),
                     _ => None,
                 };
@@ -307,10 +313,12 @@ fn envelope_property(object: &mut Object, key: &str, value: Value) {
             Value::Object(context) => {
                 field(object, 8, context.invalid == 0);
                 object.fields.name = context.fields.name;
+                object.fields.cwd = context.fields.cwd;
             }
             _ => {
                 field(object, 8, false);
                 object.fields.name = None;
+                object.fields.cwd = None;
             }
         },
         "data" => {

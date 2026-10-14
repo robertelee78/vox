@@ -233,14 +233,15 @@ struct Event {
     id: String,
     name: Option<Field>,
     harness: Option<Field>,
+    cwd: Option<Field>,
 }
 impl Event {
     fn bytes(&self) -> Vec<u8> {
         let mut e = Encoder::new();
-        e.array(5);
+        e.array(6);
         self.source.put(&mut e);
         e.uint(u64::from(self.kind)).text(&self.id);
-        for field in [self.name, self.harness] {
+        for field in [self.name, self.harness, self.cwd] {
             e.array(usize::from(field.is_some()));
             if let Some(field) = field {
                 field.put(&mut e);
@@ -250,7 +251,8 @@ impl Event {
     }
     fn read(bytes: &[u8]) -> Result<Self> {
         let mut d = Decoder::new(bytes);
-        if d.array()? != 5 {
+        let fields = d.array()?;
+        if !matches!(fields, 5 | 6) {
             return Err(invalid("Session event arity"));
         }
         let source = Source::read(&mut d)?;
@@ -272,6 +274,7 @@ impl Event {
         };
         let name = field()?;
         let harness = field()?;
+        let cwd = if fields == 6 { field()? } else { None };
         d.finish()?;
         Ok(Self {
             source,
@@ -279,6 +282,7 @@ impl Event {
             id,
             name,
             harness,
+            cwd,
         })
     }
 }
@@ -331,6 +335,7 @@ fn interpret(read: &Read<'_>, envelope: EnvelopeRef) -> Result<Option<Event>> {
         id: meta.from,
         name: meta.name.map(field),
         harness: meta.harness.map(field),
+        cwd: (kind == 1).then_some(meta.cwd).flatten().map(field),
     }))
 }
 
@@ -361,6 +366,9 @@ fn fold(index: &mut Write<'_, '_>, event: Event) -> Result<()> {
             if row.opening.position.created == event.source.position.created {
                 row.opening = event.source;
             }
+            if event.cwd.is_some() {
+                row.cwd = event.cwd;
+            }
             if event.name.is_some() {
                 row.name = event.name;
                 row.named_at = event.source.position;
@@ -375,6 +383,7 @@ fn fold(index: &mut Write<'_, '_>, event: Event) -> Result<()> {
                 position: event.source.position,
                 name: event.name,
                 harness: event.harness,
+                cwd: event.cwd,
                 named_at: event.source.position,
                 ended: None,
             });

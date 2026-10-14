@@ -3007,6 +3007,8 @@ final class NodeModel: ObservableObject {
                         let before = Set(self.members.map(\.id))
                         let came = rows.rows.filter { !before.contains($0.id) }
                         self.members = rows.rows
+                        let current = Set(rows.rows.map(\.id))
+                        self.joins.removeAll { !current.contains($0.fingerprint) }
                         if !before.isEmpty || !came.isEmpty {
                             let at = UInt64(Date().timeIntervalSince1970 * 1000)
                             for m in came where !self.joins.contains(where: { $0.fingerprint == m.id }) {
@@ -3016,18 +3018,31 @@ final class NodeModel: ObservableObject {
                     }
                 }
                 self.scheduleThreadRefresh()
-                // Each join said, and said again as the room's consent grants name more of the
-                // keyring's nodes trusting the newcomer.
-                for (i, line) in self.joins.enumerated() {
-                    if let said = try? await self.client.joinSaid(room: room, member: line.fingerprint),
-                       !Task.isCancelled, self.roomReadGeneration == generation, self.nodeObservationEpoch == scope.epoch,
-                       self.selection == .room(room), self.ended == nil, i < self.joins.count,
-                       self.joins[i].said != said {
-                        self.joins[i].said = said
-                    }
-                }
+                await self.refreshJoinCaptions(room)
             }
         }
+    }
+
+    private var joinCaptionRead = UUID()
+
+    /// Re-derive the existing membership line. A refused or interrupted private read must
+    /// remove its old directory, rather than leaving a once-authorized caption on screen.
+    private func refreshJoinCaptions(_ room: String) async {
+        let token = UUID(), generation = roomReadGeneration, epoch = nodeObservationEpoch
+        joinCaptionRead = token
+        for fingerprint in joins.map(\.fingerprint) {
+            let said = try? await client.joinSaid(room: room, member: fingerprint)
+            guard !Task.isCancelled, token == joinCaptionRead, generation == roomReadGeneration,
+                  epoch == nodeObservationEpoch, roomOnScreen == room, ended == nil else { return }
+            guard let i = joins.firstIndex(where: { $0.fingerprint == fingerprint }) else { continue }
+            let current = said ?? "\(nodeName(fingerprint)) joined."
+            if joins[i].said != current { joins[i].said = current }
+        }
+    }
+
+    private func clearPrivateJoinCaptions() {
+        joinCaptionRead = UUID()
+        for i in joins.indices { joins[i].said = "\(nodeName(joins[i].fingerprint)) joined." }
     }
 
     fileprivate func arrived(_ message: RoomMessage, in room: String, instance: Data,
@@ -3114,6 +3129,8 @@ final class NodeModel: ObservableObject {
     /// Recoverable history is reloaded from the node after leaving a view or losing its
     /// owner. Drafts are user working state and are preserved independently of these caches.
     private func releaseHistoryViews() {
+        joinCaptionRead = UUID()
+        joins = []
         invalidateMemberRoles()
         clearThreadState()
         messages = []
@@ -3644,6 +3661,9 @@ extension NodeModel {
 
     /// A Session in `room` opened, ended or was renamed, or what waits on this node changed.
     fileprivate func sessionsChanged(in room: String) async {
+        // A drive revocation uses this same change signal. Drop private wording before
+        // any suspension; the bounded current-author read may restore it afterward.
+        if roomOnScreen == room { clearPrivateJoinCaptions() }
         let epoch = nodeObservationEpoch
         let count = try? await client.sessionsWaiting(room: room)
         guard epoch == nodeObservationEpoch, !Task.isCancelled, ended == nil else { return }
@@ -3653,6 +3673,8 @@ extension NodeModel {
         await noteWaiting()
         guard epoch == nodeObservationEpoch, !Task.isCancelled, roomOnScreen == room else { return }
         await refreshSessionMetadata()
+        guard epoch == nodeObservationEpoch, !Task.isCancelled, roomOnScreen == room else { return }
+        await refreshJoinCaptions(room)
         guard epoch == nodeObservationEpoch, !Task.isCancelled, roomOnScreen == room else { return }
         await readSelectedSessionMetadata()
         guard epoch == nodeObservationEpoch, !Task.isCancelled, roomOnScreen == room else { return }

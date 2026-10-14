@@ -1311,6 +1311,7 @@ impl Router {
             id: reg.session.clone(),
             harness: reg.harness.clone(),
             name: reg.name.clone(),
+            cwd: reg.start.clone().filter(|cwd| !cwd.is_empty()),
         });
         let member = handle.view().channels.iter().any(|c| c.channel_id == room);
         let joins = Arc::clone(lock(&self.inner.joins).entry(node.clone()).or_default());
