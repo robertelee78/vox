@@ -1030,9 +1030,9 @@ fn render_attributed(out: &mut String, entry: &Digest32, author: &str, to: &str,
     out.push('\n');
 }
 
-/// Bytes kept back from a room's share for its one line counting chatter (V030-18): every
-/// [`CHATTER`] kind with a two-digit count, and the room's label, fit in it.
-const CHATTER_RESERVE: usize = 384;
+/// Bytes kept back for the chatter, sibling and other-thread lines (V030-18). Each may carry
+/// the complete read command, including a 64-byte local node name; reserve all three together.
+const CHATTER_RESERVE: usize = 768;
 
 /// Who this session is, as far as the drain asks whether a row is **for** it (V030-18).
 struct Reader {
