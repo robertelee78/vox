@@ -142,11 +142,11 @@ struct RoomAnchorsView: View {
         VStack(alignment: .leading, spacing: Space.s8) {
             if model.roomOnScreen == room {
                 if model.roomAnchorLoading { ProgressView("Reading anchors…") }
-                if model.roomAnchorAuthority != nil, !model.roomAnchorLoading,
-                   model.roomAnchorError == nil, model.roomAnchorEntries.isEmpty {
+                if model.roomAnchorSnapshotCurrent, !model.roomAnchorLoading,
+                   model.roomAnchorEntries.isEmpty {
                     Text("This room has no anchors.").secondaryText()
                 }
-                ForEach(model.roomAnchorEntries, id: \.fingerprint) { anchor in
+                ForEach(model.roomAnchorSnapshotKnown ? model.roomAnchorEntries : [], id: \.fingerprint) { anchor in
                     VStack(alignment: .leading, spacing: Space.s4) {
                         Text(String(anchor.fingerprint.prefix(12))).font(Theme.mono)
                         // Addresses come only from this room's authenticated configuration;
@@ -154,10 +154,10 @@ struct RoomAnchorsView: View {
                         Text(anchor.addresses.joined(separator: ", ")).font(Theme.mono)
                             .fixedSize(horizontal: false, vertical: true)
                         Text("from room " + model.roomName(room)
-                             + (model.roomAnchorError == nil ? "" : " (last known configuration)"))
+                             + (model.roomAnchorSnapshotCurrent ? "" : " (last known configuration)"))
                             .secondaryText()
                         Text("Identity reach across this machine's sources: "
-                             + (model.roomAnchorReachError == nil && model.roomAnchorError == nil
+                             + (model.roomAnchorSnapshotCurrent && model.roomAnchorReachError == nil
                                 ? (model.roomAnchorReach[anchor.fingerprint] ?? "No current observation.")
                                 : "unavailable; last known: " + (model.roomAnchorReach[anchor.fingerprint] ?? "none")))
                             .secondaryText().accessibilityIdentifier("anchor-reach-" + anchor.fingerprint)
@@ -165,6 +165,13 @@ struct RoomAnchorsView: View {
                     .textSelection(.enabled)
                     .accessibilityElement(children: .contain)
                     .accessibilityIdentifier("anchor-row-" + anchor.fingerprint)
+                }
+                if !model.roomAnchorSnapshotCurrent && model.roomAnchorSnapshotKnown {
+                    Text("Room configuration unavailable; showing last known configuration.").secondaryText()
+                }
+                if !model.roomAnchorSnapshotKnown && !model.roomAnchorLoading,
+                   (!model.daemonReachable || model.ended != nil) {
+                    Text("Room configuration unavailable; no saved snapshot for this room.").secondaryText()
                 }
                 if let problem = model.roomAnchorError ?? model.roomAnchorReachError {
                     Text(problem).secondaryText().fixedSize(horizontal: false, vertical: true)

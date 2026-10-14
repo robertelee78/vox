@@ -123,7 +123,7 @@ final class NodeModel: ObservableObject {
     @Published var selection: Selection? {
         didSet {
             roomReadGeneration = UUID()
-            invalidateRoomAnchorState()
+            invalidateRoomAnchorState(preservingSnapshot: oldValue == selection)
             individualTrustFacts = [:]
             individualTrustReads = [:]
             rejectedRoomMark = nil
@@ -253,6 +253,19 @@ final class NodeModel: ObservableObject {
     /// The sheet a menu, key or palette action opened.
     @Published private(set) var roomAnchorAuthority: RoomAnchorAuthority?
     @Published private(set) var roomAnchorEntries: [RoomAnchorEndpoint] = []
+    private var roomAnchorSnapshotRoom: String?
+    private var roomAnchorSnapshotNode: String?
+    private var roomAnchorSnapshotEpoch: UUID?
+    private var roomAnchorSnapshotGeneration: UUID?
+    var roomAnchorSnapshotKnown: Bool {
+        roomAnchorSnapshotRoom == roomOnScreen && roomAnchorSnapshotRoom != nil
+            && roomAnchorSnapshotNode == me
+    }
+    var roomAnchorSnapshotCurrent: Bool {
+        roomAnchorSnapshotKnown && daemonReachable && ended == nil && roomAnchorError == nil
+            && roomAnchorSnapshotEpoch == nodeObservationEpoch
+            && roomAnchorSnapshotGeneration == roomReadGeneration
+    }
     @Published private(set) var roomAnchorReach: [String: String] = [:]
     @Published private(set) var roomAnchorReachError: String?
     @Published private(set) var roomAnchorError: String?
@@ -722,7 +735,7 @@ final class NodeModel: ObservableObject {
             if fresh != nodes { nodes = fresh }
             if fresh.first(where: { $0.name == node })?.state != "attached" {
                 nodeObservationEpoch = UUID()
-                invalidateRoomAnchorState()
+                invalidateRoomAnchorState(preservingSnapshot: true)
                 daemonReachable = true
                 ended = fresh.first(where: { $0.name == node })?.status == "Locked"
                     ? "Node \(node) is Locked." : "Node \(node) is unavailable."
@@ -764,7 +777,7 @@ final class NodeModel: ObservableObject {
             individualTrustReads = [:]
             machineStateKnown = false
             nodeObservationEpoch = UUID()
-            invalidateRoomAnchorState()
+            invalidateRoomAnchorState(preservingSnapshot: true)
             daemonFailure = sentence(error)
             reportBackground(error)
             return
@@ -1646,16 +1659,28 @@ final class NodeModel: ObservableObject {
         }
     }
 
-    private func invalidateRoomAnchorState() {
+    private func invalidateRoomAnchorState(preservingSnapshot: Bool = false) {
         roomAnchorRead = UUID()
         roomAnchorAction = UUID()
         roomAnchorAuthority = nil
         roomAnchorAuthorityEpoch = nil
         roomAnchorAuthorityGeneration = nil
-        roomAnchorEntries = []
-        roomAnchorReach = [:]
-        roomAnchorReachError = nil
-        roomAnchorError = nil
+        // Retire every authority/action even when a same-identity read-only snapshot remains.
+        if preservingSnapshot && roomAnchorSnapshotKnown {
+            roomAnchorSnapshotEpoch = nil
+            roomAnchorSnapshotGeneration = nil
+            roomAnchorError = "Room configuration unavailable; showing last known configuration."
+            roomAnchorReachError = "Identity reach unavailable; showing last known observation."
+        } else {
+            roomAnchorEntries = []
+            roomAnchorReach = [:]
+            roomAnchorReachError = nil
+            roomAnchorError = nil
+            roomAnchorSnapshotRoom = nil
+            roomAnchorSnapshotNode = nil
+            roomAnchorSnapshotEpoch = nil
+            roomAnchorSnapshotGeneration = nil
+        }
         roomAnchorLoading = false
         roomAnchorChanging = false
         if sheet == .roomAnchors { sheet = nil }
@@ -1686,6 +1711,10 @@ final class NodeModel: ObservableObject {
                 throw VoxError.Failed(reason: "The anchor configuration belongs to another room or node.")
             }
             roomAnchorEntries = configuration.anchors
+            roomAnchorSnapshotRoom = room
+            roomAnchorSnapshotNode = me
+            roomAnchorSnapshotEpoch = epoch
+            roomAnchorSnapshotGeneration = generation
             roomAnchorError = nil
             // Reach is an identity-level observation across machine sources, not proof that
             // every address in this room's signed configuration is reachable.
@@ -2236,7 +2265,7 @@ final class NodeModel: ObservableObject {
     fileprivate func stopped(_ text: String) {
         nodeObservationEpoch = UUID()
         roomReadGeneration = UUID()
-        invalidateRoomAnchorState()
+        invalidateRoomAnchorState(preservingSnapshot: true)
         rejectedRoomMark = nil
         roomNeedsPage = false
         // An ended stream does not establish whether a protected node is Locked or a
