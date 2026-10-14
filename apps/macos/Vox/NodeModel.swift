@@ -665,7 +665,8 @@ final class NodeModel: ObservableObject {
                 await self.readFacts()
                 guard self.daemonReachable else { continue }
                 await self.readWaiting()
-                await self.readNewOnScreen()
+                if self.showingSession { await self.readSession() }
+                else { await self.readNewOnScreen() }
             }
         }
     }
@@ -2617,18 +2618,32 @@ extension NodeModel {
         }
         let revision = sessionWindowRevision
         let follows = timelineFollowingNewest
+        let epoch = nodeObservationEpoch, generation = roomReadGeneration
+        let heldIDs = sessionEntries.map(\.id)
+        let heldInstance = sessionPages.instance
+        func current() -> Bool {
+            roomOnScreen == room && shownSession?.nodeFingerprint == s.nodeFingerprint
+                && shownSession?.sessionId == s.sessionId && shownSession?.canDrive == true
+                && revision == sessionWindowRevision && follows == timelineFollowingNewest
+                && epoch == nodeObservationEpoch && generation == roomReadGeneration
+        }
         do {
-            // Its newest page (ADR-034 FR-4): an older page is read only when the person scrolls
-            // up to it (readOlderSession).
             let read = try await client.sessionRead(room: room, node: s.nodeFingerprint,
                                                     sessionId: s.sessionId)
-            // Drawn only for the destination it was read for, still on screen and still driven
-            // (D3): the room, the Session's node and its id, and drive held.
-            guard roomOnScreen == room, let now = shownSession, now.nodeFingerprint == s.nodeFingerprint,
-                  now.sessionId == s.sessionId, now.canDrive,
-                  revision == sessionWindowRevision,
-                  follows == timelineFollowingNewest else { return }
+            guard current() else { return }
+            var retained: FfiSessionRead?
+            if !follows, !heldIDs.isEmpty, let heldInstance {
+                guard heldInstance == read.instance else {
+                    throw VoxError.Failed(reason: "The saved room changed while its Session window was open.")
+                }
+                retained = try await client.sessionEntries(room: room, node: s.nodeFingerprint,
+                    sessionId: s.sessionId, instance: heldInstance, ids: heldIDs)
+            }
+            guard current() else { return }
             var pages = sessionPages
+            if let retained, !pages.revalidate(retained) {
+                throw VoxError.Failed(reason: "The saved room changed while refreshing held Session activity.")
+            }
             pages.newest(read, following: follows)
             if pages != sessionPages {
                 sessionPages = pages
@@ -2636,8 +2651,15 @@ extension NodeModel {
             }
             if read.note != sessionNote { sessionNote = read.note }
             sessionLoading = false
-            await refreshSessionRequests(room: room, session: now)
+            if let now = shownSession { await refreshSessionRequests(room: room, session: now) }
         } catch {
+            guard current() else { return }
+            // A failed protected read cannot authorize formerly cached bodies. Preserve
+            // destination identity and report the refusal, so a fresh valid read can recover.
+            sessionPages.clear()
+            sessionWindowRevision = UUID()
+            selectedEarlierRequest = nil
+            sessionNote = sentence(error)
             reportBackground(error)
             sessionLoading = false
         }
@@ -2678,6 +2700,7 @@ extension NodeModel {
     /// The daemon uses its request index; no transcript history is walked to find them.
     private func refreshSessionRequests(room: String, session s: FfiSession) async {
         let selected = selectedRequest
+        let revision = sessionWindowRevision
         var references = Set(sessionEntries.compactMap { $0.request?.reference })
         if let selected { references.insert(selected) }
         guard !references.isEmpty else {
@@ -2688,7 +2711,8 @@ extension NodeModel {
             let current = try await client.sessionRequests(room: room, node: s.nodeFingerprint,
                 sessionId: s.sessionId, references: references.sorted())
             guard roomOnScreen == room, let now = shownSession, now.nodeFingerprint == s.nodeFingerprint,
-                  now.sessionId == s.sessionId, now.canDrive, selectedRequest == selected else { return }
+                  now.sessionId == s.sessionId, now.canDrive, selectedRequest == selected,
+                  revision == sessionWindowRevision else { return }
             sessionPages.refreshRequests(current)
             selectedEarlierRequest = current.first { entry in
                 entry.request?.reference == selected && !sessionEntries.contains(where: { $0.id == entry.id })
