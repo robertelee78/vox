@@ -515,6 +515,7 @@ enum RoomTime {
 private struct TimelineKeys: NSViewRepresentable {
     /// Whether the keyboard is on the timeline, as this view says.
     @Binding var focused: Bool
+    var focusNotification: Notification.Name = .voxFocusTimeline
     /// A key, answered with whether it did anything (a key that does nothing goes on up).
     let key: (TimelineKey) -> Bool
     /// What ⌘C and Edit › Copy copy while the keyboard is on the timeline: the selected
@@ -523,6 +524,7 @@ private struct TimelineKeys: NSViewRepresentable {
 
     func makeNSView(context: Context) -> KeyView {
         let view = KeyView()
+        view.focusNotification = focusNotification
         view.onFocus = report
         view.onKey = key
         view.onCopy = copied
@@ -542,6 +544,7 @@ private struct TimelineKeys: NSViewRepresentable {
     }
 
     final class KeyView: NSView, NSMenuItemValidation {
+        var focusNotification: Notification.Name = .voxFocusTimeline
         var onFocus: ((Bool) -> Void)?
         var onKey: ((TimelineKey) -> Bool)?
         var onCopy: (() -> String?)?
@@ -591,7 +594,7 @@ private struct TimelineKeys: NSViewRepresentable {
             guard window != nil else { return }
             // View > Focus Timeline, or a click on a row: the keyboard comes here.
             asked = NotificationCenter.default.addObserver(
-                forName: .voxFocusTimeline, object: nil, queue: .main
+                forName: focusNotification, object: nil, queue: .main
             ) { [weak self] _ in
                 guard let self, let window = self.window else { return }
                 // Not while a sheet or popover is up: it has the keyboard, and keeps it.
@@ -1603,7 +1606,7 @@ private struct RoomView: View {
 
     /// The selected message, as the timeline shows it.
     private var selected: RoomMessage? {
-        model.messages.first { $0.id == model.selectedMessage }
+        model.selectedChatMessage
     }
 
     /// Return: the selected message's first action — its pulled file in Quick Look, else its link
@@ -2560,6 +2563,11 @@ private struct ThreadPanel: View {
     @ObservedObject var model: NodeModel
     let room: String
     let look: (URL) -> Void
+    @State private var focused = false
+
+    private var focusNotification: Notification.Name {
+        Notification.Name("voxFocusThread-" + model.me + "-" + room + "-" + (model.openThread ?? ""))
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: Space.s8) {
@@ -2578,19 +2586,21 @@ private struct ThreadPanel: View {
                 Text("The starting message is not on this room's retained page.").secondaryText()
             }
             ScrollViewReader { reader in
+                let root = model.openThread ?? ""
+                let generation = model.threadSelectionGeneration
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: Space.s8) {
                         ForEach(model.threadReplies, id: \.id) { message in
                             MessageRow(model: model, message: message, me: model.me,
                                 quote: model.quote(of: message),
-                                jump: { id in
-                                    if model.threadReplies.contains(where: { $0.id == id }) {
-                                        reader.scrollTo(id, anchor: .center)
-                                    } else { model.jumpTo = id }
-                                }, readBy: model.readBy[message.id] ?? [],
+                                jump: { id in jump(id, reader, root: root, generation: generation) }, readBy: model.readBy[message.id] ?? [],
                                 whereabouts: model.whereabouts[message.id],
                                 pulledBy: model.pulledBy[message.id] ?? [],
                                 pulled: model.pulled[message.id], look: look)
+                                .selectable(model.selectedMessages.contains(message.id),
+                                            focused: focused && model.selectedMessage == message.id) {
+                                    choose(message.id, root: root, generation: generation)
+                                }
                                 .id(message.id)
                                 .accessibilityIdentifier("thread-message-" + message.id)
                             Button("Reply in Thread") { model.replyTo = message }
@@ -2612,10 +2622,80 @@ private struct ThreadPanel: View {
                         }
                     }
                 }
+                .background(TimelineKeys(focused: $focused, focusNotification: focusNotification,
+                    key: { key in handle(key, reader, root: root, generation: generation) },
+                    copied: {
+                        guard model.threadSelectionIsCurrent(room: room, root: root, generation: generation) else { return nil }
+                        return model.threadReplies.filter { model.selectedMessages.contains($0.id) }
+                            .map { "\(NodeModel.author($0, me: model.me)), \(NodeModel.copiedTime($0.createdMillis)): \(NodeModel.body($0))" }
+                            .joined(separator: "\n")
+                    }))
             }
         }
         .padding(Space.s12)
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("thread-panel")
     }
+
+    private func select(_ id: String, root: String, generation: NodeModel.ThreadSelectionScope, extending: Bool = false) {
+        guard model.threadSelectionIsCurrent(room: room, root: root, generation: generation) else { return }
+        let ids = model.threadReplies.filter { !$0.owed && $0.thread == root }.map(\.id)
+        guard ids.contains(id) else { return }
+        if extending, let anchor = model.selectionAnchor, let a = ids.firstIndex(of: anchor),
+           let b = ids.firstIndex(of: id) {
+            model.selectedMessages = Set(ids[min(a, b)...max(a, b)])
+        } else {
+            model.selectedMessages = [id]
+            model.selectionAnchor = id
+        }
+        model.selectedMessage = id
+    }
+
+    private func choose(_ id: String, root: String, generation: NodeModel.ThreadSelectionScope) {
+        guard model.threadSelectionIsCurrent(room: room, root: root, generation: generation) else { return }
+        if NSEvent.modifierFlags.contains(.command) {
+            if model.selectedMessages.contains(id) { model.selectedMessages.remove(id) }
+            else { model.selectedMessages.insert(id) }
+            model.selectedMessage = id
+            model.selectionAnchor = id
+        } else { select(id, root: root, generation: generation, extending: NSEvent.modifierFlags.contains(.shift)) }
+        NotificationCenter.default.post(name: focusNotification, object: nil)
+    }
+
+    private func jump(_ id: String, _ reader: ScrollViewProxy, root: String, generation: NodeModel.ThreadSelectionScope) {
+        guard model.threadSelectionIsCurrent(room: room, root: root, generation: generation) else { return }
+        if model.threadReplies.contains(where: { $0.id == id && !$0.owed }) {
+            select(id, root: root, generation: generation)
+            reader.scrollTo(id, anchor: .center)
+            NotificationCenter.default.post(name: focusNotification, object: nil)
+        } else if model.messages.contains(where: { $0.id == id && !$0.owed && $0.thread.isEmpty }) {
+            // The existing General observer alone owns its scroll and keyboard focus.
+            model.jumpTo = id
+        }
+    }
+
+    private func handle(_ key: TimelineKey, _ reader: ScrollViewProxy, root: String, generation: NodeModel.ThreadSelectionScope) -> Bool {
+        guard model.threadSelectionIsCurrent(room: room, root: root, generation: generation) else { return false }
+        let ids = model.threadReplies.filter { !$0.owed && $0.thread == root }.map(\.id)
+        switch key {
+        case .quoted:
+            guard let selected = model.selectedChatMessage, let quoted = model.quote(of: selected) else { return false }
+            jump(quoted.id, reader, root: root, generation: generation)
+            return true
+        case .up, .down, .extendUp, .extendDown, .home, .end, .pageUp, .pageDown:
+            guard !ids.isEmpty else { return false }
+            let at = model.selectedMessage.flatMap { ids.firstIndex(of: $0) }
+            let upward = key == .up || key == .extendUp || key == .pageUp
+            let next = key == .home ? 0 : key == .end ? ids.count - 1
+                : upward ? at.map { max(0, $0 - 1) } ?? ids.count - 1
+                : at.map { min(ids.count - 1, $0 + 1) } ?? 0
+            select(ids[next], root: root, generation: generation,
+                   extending: key == .extendUp || key == .extendDown)
+            reader.scrollTo(ids[next], anchor: .center)
+            return true
+        case .close: model.closeThread(); return true
+        default: return false
+        }
+    }
+
 }

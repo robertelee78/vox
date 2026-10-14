@@ -2477,8 +2477,32 @@ extension NodeModel {
         }
     }
 
+    /// Only retained/readable messages of the currently displayed room can be acted on.
+    var selectedChatMessage: RoomMessage? {
+        guard roomOnScreen != nil, ended == nil, let id = selectedMessage else { return nil }
+        if let current = messages.first(where: { $0.id == id && !$0.owed }) { return current }
+        guard let root = openThread else { return nil }
+        return threadReplies.first { $0.id == id && $0.thread == root && !$0.owed }
+    }
+
+    struct ThreadSelectionScope: Equatable {
+        let room: UUID
+        let thread: UUID
+        let node: UUID
+    }
+    var threadSelectionGeneration: ThreadSelectionScope {
+        ThreadSelectionScope(room: roomReadGeneration, thread: threadGeneration, node: nodeObservationEpoch)
+    }
+    func threadSelectionIsCurrent(room: String, root: String, generation: ThreadSelectionScope) -> Bool {
+        roomOnScreen == room && openThread == root && threadSelectionGeneration == generation && ended == nil
+    }
+
     func showThread(_ message: RoomMessage) {
-        guard roomOnScreen != nil, ended == nil, !message.owed, message.thread.isEmpty else { return }
+        guard roomOnScreen != nil, ended == nil, !message.owed, message.thread.isEmpty,
+              messages.contains(where: { $0.id == message.id && !$0.owed }) else { return }
+        selectedMessage = message.id
+        selectedMessages = [message.id]
+        selectionAnchor = message.id
         threadGeneration = UUID()
         threadPageTask?.cancel()
         threadLoading = false
@@ -2495,6 +2519,10 @@ extension NodeModel {
     }
 
     func closeThread() {
+        let root = openThread.flatMap { id in messages.first { $0.id == id && !$0.owed } }
+        selectedMessage = root?.id
+        selectedMessages = Set(root.map { [$0.id] } ?? [])
+        selectionAnchor = root?.id
         threadGeneration = UUID()
         threadPageTask?.cancel()
         threadPagesLoaded = 1
