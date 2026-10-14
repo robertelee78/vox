@@ -838,7 +838,9 @@ impl AppStream {
     }
 
     fn check(&self) -> Result<()> {
-        if self.inner.withdrawn.load(Ordering::SeqCst) {
+        if self.inner.withdrawn.load(Ordering::SeqCst)
+            || !self.inner.reachers.borrow().contains(&self.inner.peer)
+        {
             Err(withdrawn_error())
         } else {
             Ok(())
@@ -855,8 +857,9 @@ impl AppStream {
         let read = {
             let mut recv = self.inner.recv.lock().await;
             tokio::select! {
-                r = recv.read(buf) => Some(r),
+                biased;
                 () = self.inner.withdrawal() => None,
+                r = recv.read(buf) => Some(r),
             }
         };
         match read {
@@ -887,8 +890,9 @@ impl AppStream {
         let wrote = {
             let mut send = self.inner.send.lock().await;
             tokio::select! {
-                r = send.write_all(data) => Some(r),
+                biased;
                 () = self.inner.withdrawal() => None,
+                r = send.write_all(data) => Some(r),
             }
         };
         match wrote {
@@ -927,8 +931,9 @@ impl AppStream {
             let mut flow = self.inner.flow.lock().await;
             let flow = flow.as_mut()?;
             tokio::select! {
-                d = flow.recv() => Some(d),
+                biased;
                 () = self.inner.withdrawal() => None,
+                d = flow.recv() => Some(d),
             }
         };
         match got {

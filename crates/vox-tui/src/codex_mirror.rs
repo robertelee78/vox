@@ -133,6 +133,7 @@ enum Cmd {
     Steer {
         session: String,
         steer: Steer,
+        guard: Option<crate::host::room_pause::InterruptGuard>,
         reply: oneshot::Sender<Result<String, String>>,
     },
 }
@@ -265,6 +266,16 @@ impl CodexMirror {
         session: &str,
         steer: Steer,
     ) -> Result<String, String> {
+        self.steer_guarded(codex_home, session, steer, None).await
+    }
+
+    pub(crate) async fn steer_guarded(
+        &self,
+        codex_home: &Path,
+        session: &str,
+        steer: Steer,
+        guard: Option<crate::host::room_pause::InterruptGuard>,
+    ) -> Result<String, String> {
         let bytes = match &steer {
             Steer::Text(text) => text.len(),
             Steer::Slash { cmd, args } => cmd.len().saturating_add(args.len()),
@@ -279,6 +290,7 @@ impl CodexMirror {
             .try_send(Cmd::Steer {
                 session: session.to_owned(),
                 steer,
+                guard,
                 reply,
             })
             .map_err(|_| "Codex's control queue is full or closed; nothing was sent".to_owned())?;
@@ -711,6 +723,25 @@ impl Conn {
     }
 
     async fn call(&mut self, ws: &mut Ws, method: &str, params: Value, p: Pending) -> Option<u64> {
+        self.call_guarded(ws, method, params, p, None).await
+    }
+
+    async fn call_guarded(
+        &mut self,
+        ws: &mut Ws,
+        method: &str,
+        params: Value,
+        p: Pending,
+        guard: Option<crate::host::room_pause::InterruptGuard>,
+    ) -> Option<u64> {
+        if guard.as_ref().is_some_and(|guard| !guard.allowed()) {
+            if let Pending::Steer(reply, _, _) = p {
+                let _ = reply.send(Err(
+                    "room pause, authority or Session changed; the interrupt was not sent".into(),
+                ));
+            }
+            return None;
+        }
         let id = self.next_id;
         let body = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
         let why = if self.calls.len() >= MAX_COMMANDS {
@@ -731,7 +762,16 @@ impl Conn {
             return None;
         }
         self.next_id += 1;
-        match send(ws, &body).await {
+        let sent = if let Some(guard) = guard {
+            tokio::select! {
+                biased;
+                () = guard.cancelled() => Err("room pause changed during the control write; its outcome is unknown".into()),
+                sent = send(ws, &body) => sent,
+            }
+        } else {
+            send(ws, &body).await
+        };
+        match sent {
             Ok(()) => {
                 self.calls
                     .insert(id, (tokio::time::Instant::now() + CALL_WITHIN, p));
@@ -793,8 +833,9 @@ impl Conn {
             Cmd::Steer {
                 session,
                 steer,
+                guard,
                 reply,
-            } => self.steer(ws, &session, steer, reply).await,
+            } => self.steer(ws, &session, steer, guard, reply).await,
         }
     }
 
@@ -803,8 +844,15 @@ impl Conn {
         ws: &mut Ws,
         session: &str,
         steer: Steer,
+        guard: Option<crate::host::room_pause::InterruptGuard>,
         reply: oneshot::Sender<Result<String, String>>,
     ) {
+        if guard.as_ref().is_some_and(|guard| !guard.allowed()) {
+            let _ = reply.send(Err(
+                "room pause, authority or Session changed; the interrupt was not sent".into(),
+            ));
+            return;
+        }
         let Some(t) = self.threads.get(session) else {
             let _ = reply.send(Err(
                 "this Codex session is not open here: it ended, or never registered with this \
@@ -887,11 +935,12 @@ impl Conn {
                 }
             },
         };
-        self.call(
+        self.call_guarded(
             ws,
             method,
             params,
             Pending::Steer(reply, done, session.to_owned()),
+            guard,
         )
         .await;
     }

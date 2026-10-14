@@ -560,7 +560,17 @@ pub async fn open(
     labels: Vec<String>,
     datagrams: bool,
 ) -> Result<(UnixStream, AppInfo)> {
-    let mut stream = connect(at).await?;
+    open_on(connect(at).await?, channel_id, peer, labels, datagrams).await
+}
+
+/// Open on an already authenticated node connection, preserving the caller's actor selection.
+pub(crate) async fn open_on(
+    mut stream: UnixStream,
+    channel_id: Digest32,
+    peer: Digest32,
+    labels: Vec<String>,
+    datagrams: bool,
+) -> Result<(UnixStream, AppInfo)> {
     match ask(
         &mut stream,
         &AppRequest::Open {

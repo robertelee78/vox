@@ -361,6 +361,40 @@ final class NodeModel: ObservableObject {
             && roomAnchorAuthorityGeneration == roomReadGeneration
     }
 
+    /// A pause sheet owns one room/attachment/observation selection. A reconnect only invalidates
+    /// the action; it never replays Pause or Resume into a replacement room.
+    var roomPauseContext: String {
+        "\(me)/\(roomOnScreen ?? "")/\(nodeObservationEpoch)/\(roomReadGeneration)/\(sheetInstance)/\(sheet?.rawValue ?? "")/\(ended ?? "")/\(daemonReachable)"
+    }
+
+    func roomPauseName(_ fingerprint: String) -> String {
+        if fingerprint == me { return "\(node) (you)" }
+        return members.first { $0.id == fingerprint }?.name ?? fingerprint
+    }
+
+    func captureRoomPause(context: String) async throws -> RoomPauseSelection {
+        guard context == roomPauseContext, let room = roomOnScreen, ended == nil,
+              daemonReachable, sheet == .pause || sheet == .resume else { throw CancellationError() }
+        let capture = try await client.roomPauseCapture(room: room, node: me)
+        guard context == roomPauseContext, !Task.isCancelled else { throw CancellationError() }
+        return capture
+    }
+
+    func readRoomPause(_ capture: RoomPauseSelection, member: String, context: String) async throws -> RoomPauseState {
+        guard context == roomPauseContext, !Task.isCancelled else { throw CancellationError() }
+        let state = try await client.roomPauseStatus(capture: capture, member: member)
+        guard context == roomPauseContext, !Task.isCancelled else { throw CancellationError() }
+        return state
+    }
+
+    func changeRoomPause(_ capture: RoomPauseSelection, member: String, paused: Bool,
+                         next: RoomPauseContinuation?, context: String) async throws -> RoomPausePage {
+        guard context == roomPauseContext, !Task.isCancelled else { throw CancellationError() }
+        let page = try await client.roomPauseChange(capture: capture, member: member, paused: paused, next: next)
+        guard context == roomPauseContext, !Task.isCancelled else { throw CancellationError() }
+        return page
+    }
+
     private var sheetInstance = UUID()
     @Published var sheet: NodeSheet? {
         didSet { if oldValue != sheet { sheetInstance = UUID() } }

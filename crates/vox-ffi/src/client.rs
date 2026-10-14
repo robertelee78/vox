@@ -1645,6 +1645,111 @@ fn stop_follow(following: &FollowSlot) {
     );
 }
 
+/// One captured pause selection. Its roster is bounded by the room's existing member limit;
+/// release/replacement of the app's attachment invalidates it even if the fingerprint is reused.
+#[derive(uniffi::Object)]
+pub struct RoomPauseSelection {
+    selected: vox_core::node::room_pause::Selection,
+    attachment: Arc<()>,
+}
+
+#[uniffi::export]
+impl RoomPauseSelection {
+    /// The exact room selected by the person.
+    pub fn room(&self) -> String {
+        b32_encode(&self.selected.room)
+    }
+    /// The acting node, not a target of another window.
+    pub fn node(&self) -> String {
+        b32_encode(&self.selected.actor)
+    }
+    /// All members captured for this action, including the acting node.
+    pub fn members(&self) -> Vec<String> {
+        self.selected.members.iter().map(b32_encode).collect()
+    }
+}
+
+/// An interruption continuation belongs to one target and one captured room/attachment.
+#[derive(uniffi::Object)]
+pub struct RoomPauseContinuation {
+    capture: Arc<RoomPauseSelection>,
+    peer: Digest32,
+    after: String,
+    expected: vox_agentcomms::drive::PauseSelection,
+}
+
+/// A confirmed durable receiver state. `at_millis == 0` means no change has ever been recorded.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct RoomPauseState {
+    pub paused: bool,
+    pub by: String,
+    pub at_millis: u64,
+}
+impl From<vox_agentcomms::drive::PauseState> for RoomPauseState {
+    fn from(state: vox_agentcomms::drive::PauseState) -> Self {
+        Self {
+            paused: state.paused,
+            by: if state.at_millis == 0 {
+                String::new()
+            } else {
+                b32_encode(&state.by)
+            },
+            at_millis: state.at_millis,
+        }
+    }
+}
+
+/// Admission and interruption are separate: Confirmed does not promise every Esc was delivered.
+#[derive(Debug, Clone, Copy, uniffi::Enum)]
+pub enum RoomPauseDelivery {
+    Confirmed,
+    Refused,
+    NotSent,
+    Unknown,
+}
+
+/// One bounded interruption page, summarized before crossing the FFI. Consumers drain `next`
+/// and retain counts/one diagnostic per target, never a lifetime list of Session results.
+#[derive(uniffi::Record)]
+pub struct RoomPausePage {
+    pub delivery: RoomPauseDelivery,
+    pub state: Option<RoomPauseState>,
+    pub interrupted: u32,
+    pub unconfirmed: u32,
+    pub interruption_error: Option<String>,
+    pub said: String,
+    pub next: Option<Arc<RoomPauseContinuation>>,
+}
+
+async fn pause_socket(held: &Slot, capture: &RoomPauseSelection) -> Result<NodeSocket, VoxError> {
+    let mut slot = held.lock().await;
+    let h = slot.as_mut().ok_or_else(not_attached)?;
+    h.mend().await?;
+    if !Arc::ptr_eq(&h.attachment, &capture.attachment)
+        || h.client.me() != Some(capture.selected.actor)
+    {
+        return Err(failed(
+            "The acting node attachment changed; select pause targets again.",
+        ));
+    }
+    match ask(
+        &mut h.client,
+        &Request::ArrivalHead {
+            channel_id: capture.selected.room,
+        },
+    )
+    .await?
+    {
+        Frame::ArrivalHead { head } if head.instance == capture.selected.instance => {
+            Ok(h.at.clone())
+        }
+        Frame::ArrivalHead { .. } => Err(failed(
+            "The saved room changed; select pause targets again.",
+        )),
+        other => Err(unexpected(&other)),
+    }
+}
+
 /// A client of the account's vox daemon.
 #[derive(uniffi::Object)]
 pub struct VoxClient {
@@ -5188,6 +5293,154 @@ impl VoxClient {
                 before: next.filter(|_| older > 0).map(|id| b32_encode(&id)),
             })
         })
+    }
+
+    /// Capture the current room roster without collecting Session history.
+    ///
+    /// # Errors
+    /// The actor, attachment or saved room is unavailable or changes during capture.
+    pub async fn room_pause_capture(
+        &self,
+        room: String,
+        node: String,
+    ) -> Result<Arc<RoomPauseSelection>, VoxError> {
+        let room = digest(&room, "room id")?;
+        let actor = input_fingerprint(&node)?;
+        let held = Arc::clone(&self.held);
+        self.on_rt(async move {
+            let (at, attachment) = {
+                let mut slot = held.lock().await;
+                let h = slot.as_mut().ok_or_else(not_attached)?;
+                h.mend().await?;
+                if h.client.me() != Some(actor) {
+                    return Err(failed(
+                        "The acting node changed before selecting pause targets.",
+                    ));
+                }
+                (h.at.clone(), Arc::clone(&h.attachment))
+            };
+            let selected = vox_core::node::room_pause::capture(&at, room)
+                .await
+                .map_err(failed)?;
+            if selected.actor != actor {
+                return Err(failed(
+                    "The acting node changed while selecting pause targets.",
+                ));
+            }
+            let capture = Arc::new(RoomPauseSelection {
+                selected,
+                attachment,
+            });
+            pause_socket(&held, &capture).await?;
+            Ok(capture)
+        })
+        .await
+    }
+
+    /// Read current state without reapplying a mutation after reconnect. A failure is not Resume.
+    ///
+    /// # Errors
+    /// The captured attachment/room changed, or the receiver could not be read.
+    pub async fn room_pause_status(
+        &self,
+        capture: Arc<RoomPauseSelection>,
+        member: String,
+    ) -> Result<RoomPauseState, VoxError> {
+        let peer = input_fingerprint(&member)?;
+        if !capture.selected.members.contains(&peer) {
+            return Err(failed("The node was not in the captured room roster."));
+        }
+        let held = Arc::clone(&self.held);
+        self.on_rt(async move {
+            let at = pause_socket(&held, &capture).await?;
+            let state = vox_core::node::room_pause::status(&at, capture.selected.room, peer)
+                .await
+                .map_err(|e| failed(e.to_string()))?;
+            pause_socket(&held, &capture).await?;
+            Ok(state.into())
+        })
+        .await
+    }
+
+    /// Change one exact selected member and return one interruption page. The app must drain
+    /// each continuation in the same action, retaining previous admission if a later page fails.
+    ///
+    /// # Errors
+    /// A malformed target, invalid continuation, or changed local attachment/room. A timeout may
+    /// follow a committed change; the caller must say outcome unknown and never replay it.
+    pub async fn room_pause_change(
+        &self,
+        capture: Arc<RoomPauseSelection>,
+        member: String,
+        paused: bool,
+        next: Option<Arc<RoomPauseContinuation>>,
+    ) -> Result<RoomPausePage, VoxError> {
+        use vox_core::node::room_pause::{self, Failure};
+        let peer = input_fingerprint(&member)?;
+        let continuation = match next {
+            Some(next) if Arc::ptr_eq(&capture, &next.capture) && peer == next.peer && paused => {
+                Some((next.after.clone(), next.expected))
+            }
+            Some(_) => {
+                return Err(failed(
+                    "This interruption continuation belongs to another pause selection.",
+                ))
+            }
+            None => None,
+        };
+        let held = Arc::clone(&self.held);
+        self.on_rt(async move {
+            let at = pause_socket(&held, &capture).await?;
+            let answer =
+                room_pause::change(&at, &capture.selected, peer, paused, continuation).await;
+            pause_socket(&held, &capture).await?;
+            match answer {
+                Ok(report) => {
+                    let interrupted =
+                        report.interrupts.iter().filter(|i| i.delivered).count() as u32;
+                    let unconfirmed = report.interrupts.len() as u32 - interrupted;
+                    let said = report
+                        .interrupts
+                        .iter()
+                        .find(|i| !i.delivered)
+                        .map(|i| format!("Session {}: {}", i.session, i.said))
+                        .unwrap_or_default();
+                    Ok(RoomPausePage {
+                        delivery: RoomPauseDelivery::Confirmed,
+                        state: Some(report.selection.state.into()),
+                        interrupted,
+                        unconfirmed,
+                        interruption_error: report.interrupt_error,
+                        said,
+                        next: report.next.map(|after| {
+                            Arc::new(RoomPauseContinuation {
+                                capture,
+                                peer,
+                                after,
+                                expected: report.selection,
+                            })
+                        }),
+                    })
+                }
+                Err(error) => {
+                    let delivery = match error {
+                        Failure::Refused(_) => RoomPauseDelivery::Refused,
+                        Failure::NotSent(_) => RoomPauseDelivery::NotSent,
+                        Failure::Unknown(_) => RoomPauseDelivery::Unknown,
+                    };
+                    Ok(RoomPausePage {
+                        delivery,
+                        state: None,
+                        interrupted: 0,
+                        unconfirmed: 0,
+                        interruption_error: None,
+                        said: error.to_string(),
+                        next: None,
+                    })
+                }
+            }
+        })
+        .await
     }
 
     /// Drive the open Session `session` (its whole id) of `room` (ADR-029 §3, #544): the input

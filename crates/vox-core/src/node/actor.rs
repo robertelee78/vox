@@ -332,6 +332,8 @@ fn detail_of(
         .collect::<crate::error::Result<Vec<_>>>()?;
     let consenting = trusted_by.get(&ch.me()).cloned().unwrap_or_default();
     Ok(ChannelDetail {
+        pause: ch.room_pause(),
+        pause_resume_after: ch.pause_resume_after(),
         channel_id: ch.channel_id(),
         name: ch.name().map(str::to_owned),
         epoch: ch.epoch(),
@@ -4166,6 +4168,36 @@ impl NodeHandle {
             .map_err(|_| crate::error::Error::Unreachable("the node has stopped"))?
     }
 
+    /// Current room pause, or a receiver-authorized durable change. `by` must come from
+    /// the authenticated app stream (or this actor's own socket), never a request body.
+    /// Changes must carry the hook-publication lock already acquired outside this actor.
+    pub async fn room_pause(
+        &self,
+        channel_id: Digest32,
+        by: Digest32,
+        paused: Option<bool>,
+        expected_instance: Option<[u8; 16]>,
+        expected: Option<vox_agentcomms::drive::PauseSelection>,
+        publication_guard: Option<std::fs::File>,
+    ) -> Result<vox_agentcomms::drive::PauseSelection, Fault> {
+        let (reply, rx) = oneshot::channel();
+        let outcome = self
+            .apply(NodeCommand::RoomPause {
+                channel_id,
+                by,
+                paused,
+                expected_instance,
+                expected,
+                publication_guard,
+                reply,
+            })
+            .await;
+        match outcome {
+            Outcome::Failed(fault) => Err(fault),
+            _ => rx.await.unwrap_or(Err(Fault::Internal)),
+        }
+    }
+
     /// The latest view (cheap clone of the watch value).
     #[must_use]
     pub fn view(&self) -> NodeView {
@@ -5827,6 +5859,25 @@ impl Node {
             return Outcome::Failed(Fault::ComputerPolicy);
         }
         match command {
+            NodeCommand::RoomPause {
+                channel_id,
+                by,
+                paused,
+                expected_instance,
+                expected,
+                publication_guard,
+                reply,
+            } => {
+                let result = if paused.is_some() && publication_guard.is_none() {
+                    Err(Fault::Internal)
+                } else {
+                    self.room_pause(&channel_id, by, paused, expected_instance, expected)
+                        .await
+                };
+                drop(publication_guard);
+                let _ = reply.send(result);
+                Outcome::Done
+            }
             NodeCommand::CreateIdentity { passphrase } => self.create_identity(&passphrase),
             NodeCommand::Unlock { passphrase } => self.unlock(&passphrase).await,
             NodeCommand::SetAnchors { anchors } => {
@@ -17397,7 +17448,10 @@ impl Node {
         if let Some(net) = self.net.as_ref() {
             self.sync_anchor_scopes(net);
         }
-        self.reachers.remove(channel_id);
+        if let Some(reachers) = self.reachers.remove(channel_id) {
+            crate::node::tunnel::publish_reachers(&reachers, std::collections::BTreeSet::new());
+        }
+        self.app.set_reachers(&self.reachers);
         crate::node::status::SyncBook::forget_room(&self.sync_book, channel_id);
         self.sched_rooms.remove(channel_id);
         self.discover_rooms.remove(channel_id);
@@ -18560,6 +18614,82 @@ impl Node {
             self.note_local_append(cid);
         }
         pruned > 0 || !checkpointed.is_empty() || applied
+    }
+
+    async fn room_pause(
+        &mut self,
+        channel_id: &Digest32,
+        by: Digest32,
+        paused: Option<bool>,
+        expected_instance: Option<[u8; 16]>,
+        expected: Option<vox_agentcomms::drive::PauseSelection>,
+    ) -> Result<vox_agentcomms::drive::PauseSelection, Fault> {
+        let profile = self
+            .profile
+            .as_ref()
+            .filter(|p| p.is_unlocked())
+            .ok_or(Fault::Locked)?;
+        // Status is metadata, not a write grant. The app gate has authenticated a trusted
+        // room member. A mutation, including a resumed interrupt pass, still needs drive.
+        if (paused.is_some() || expected.is_some())
+            && by != profile.fingerprint()
+            && !self.trust.has_drive(&by)
+        {
+            return Err(Fault::Refused);
+        }
+        let shared = self
+            .channels
+            .get(channel_id)
+            .ok_or(Fault::ChannelNotOpen)?
+            .clone();
+        let mut ch = shared.lock().await;
+        if ch.is_poisoned() {
+            return Err(fault_of(&ch.save_failure()));
+        }
+        if by != profile.fingerprint() && (!self.trust.is_trusted(&by) || !ch.is_member(&by)) {
+            return Err(Fault::Refused);
+        }
+        let instance = ch
+            .history_instance(profile.store())
+            .map_err(|e| fault_of(&e))?;
+        let current = vox_agentcomms::drive::PauseSelection {
+            instance,
+            state: ch.room_pause(),
+        };
+        if expected_instance.is_some_and(|expected| expected != instance)
+            || expected.is_some_and(|expected| expected != current)
+        {
+            return Err(Fault::ReadSelectionChanged);
+        }
+        if let Some(paused) = paused {
+            if let Err(error) =
+                ch.set_room_pause(profile.store(), paused, by, (self.millis_clock)())
+            {
+                ch.poison(&error);
+                return Err(fault_of(&error));
+            }
+        }
+        let selection = vox_agentcomms::drive::PauseSelection {
+            instance,
+            state: ch.room_pause(),
+        };
+        // A governance/Session refresh can retain a last-good detail. Its operational pause
+        // must nevertheless change now, before the durable command is acknowledged.
+        if let Some((_, detail)) = self.fresh_details.get_mut(channel_id) {
+            detail.pause = selection.state;
+            detail.pause_resume_after = ch.pause_resume_after();
+        }
+        self.view_tx.send_modify(|view| {
+            if let Some(detail) = view
+                .open_channels
+                .iter_mut()
+                .find(|d| d.channel_id == *channel_id)
+            {
+                detail.pause = selection.state;
+                detail.pause_resume_after = ch.pause_resume_after();
+            }
+        });
+        Ok(selection)
     }
 
     /// Done acknowledges durable local read state. Signed receipt publication is bounded

@@ -549,6 +549,8 @@ pub enum CommandStatus {
     /// refusal naming a node, a daemon that stopped. Never plaintext or key material: the daemon
     /// and the node word these for a person, from fixed texts and public facts.
     Said(String),
+    /// Complete bounded current-node results of one room pause/resume action, scrollable.
+    RoomPauseReport(Vec<String>),
 }
 
 impl CommandStatus {
@@ -557,6 +559,9 @@ impl CommandStatus {
     pub fn message(&self) -> String {
         match self {
             CommandStatus::Done | CommandStatus::SessionShown { .. } => "done".to_owned(),
+            CommandStatus::RoomPauseReport(_) => {
+                "room pause results: scroll to see every target; Esc closes".into()
+            }
             CommandStatus::NeedsNode => "needs a Ready node (unlock one to proceed)".to_owned(),
             CommandStatus::NotConnected => "not connected: action not performed".to_owned(),
             CommandStatus::Queued => "queued".to_owned(),
@@ -615,6 +620,15 @@ pub enum Command {
     SelectChannel {
         /// The channel now on screen, if any.
         channel_id: Option<Digest32>,
+    },
+    /// Pause/resume the whole active room or selected node names (ADR-033 PA-1).
+    RoomPause {
+        /// Exact active room.
+        channel_id: Digest32,
+        /// Empty selects its whole current roster; otherwise aliases/fingerprints.
+        nodes: Vec<String>,
+        /// Pause or resume.
+        paused: bool,
     },
     /// Drive the Session on screen (ADR-029 DR-1): what it is sent, said back in words.
     Drive {

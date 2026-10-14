@@ -72,6 +72,7 @@ pub mod pulls;
 pub mod resolver;
 pub mod retention;
 pub mod room_join;
+pub mod room_pause;
 pub mod seatstream;
 pub mod service_reach;
 pub mod session_ingress;
