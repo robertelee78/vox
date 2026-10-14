@@ -4335,15 +4335,19 @@ final class FirstRunProof: XCTestCase {
         guard tap(ui, Key.id("thread-summary-" + taggedRoot), "open the real tagged thread") else { return }
         let middleKey = Key.id("thread-message-" + fromBob)
         guard let panel = locate(ui, Key.id("thread-replies")),
+              panel.frame.origin.x.isFinite, panel.frame.origin.y.isFinite,
               panel.frame.width.isFinite, panel.frame.height.isFinite,
               panel.frame.width > 0, panel.frame.height > 0 else {
             throw Apparatus("the tagged thread has no finite visible viewport")
         }
         func visibleMiddle(_ row: XCUIElement) -> Bool {
             let frame = row.frame
-            guard let body = textSaying(ui, "TAGGED-THREAD-MIDDLE") else { return false }
+            let body = row.descendants(matching: .staticText)
+                .matching(NSPredicate(format: "value == %@ OR label == %@", "TAGGED-THREAD-MIDDLE", "TAGGED-THREAD-MIDDLE")).firstMatch
+            guard body.exists else { return false }
             let bodyFrame = body.frame
-            return frame.width.isFinite && frame.height.isFinite && frame.width > 0 && frame.height > 0
+            return frame.origin.x.isFinite && frame.origin.y.isFinite && frame.width.isFinite && frame.height.isFinite && frame.width > 0 && frame.height > 0
+                && bodyFrame.origin.x.isFinite && bodyFrame.origin.y.isFinite
                 && bodyFrame.width.isFinite && bodyFrame.height.isFinite && bodyFrame.width > 0 && bodyFrame.height > 0
                 && panel.frame.contains(bodyFrame)
                 && panel.frame.contains(CGPoint(x: frame.midX, y: frame.midY)) && inView(ui, row)
