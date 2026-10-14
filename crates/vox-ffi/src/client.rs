@@ -4415,6 +4415,18 @@ impl VoxClient {
                 } if instance == expected => (rows, instance),
                 other => return Err(unexpected(&answered(other)?)),
             };
+            // Authority, readiness and the room instance were checked by the successful
+            // exact selection. An opening-not-received Session may have no descriptor once
+            // its final held activity expires; that is a valid empty revalidation.
+            if rows.is_empty() {
+                return Ok(FfiSessionRead {
+                    instance: instance.to_vec(),
+                    entries: Vec::new(),
+                    note: None,
+                    older: 0,
+                    before: None,
+                });
+            }
             let r = read(
                 &sessions,
                 rows,
