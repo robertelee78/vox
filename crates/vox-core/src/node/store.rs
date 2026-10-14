@@ -27,7 +27,8 @@
 //! the node schedules it after pruning (ADR-016 §Consequences).
 
 use std::path::{Path, PathBuf};
-use std::sync::{PoisonError, RwLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, PoisonError, RwLock};
 
 use redb::{Database, ReadOnlyDatabase, ReadableDatabase, ReadableTable, TableDefinition};
 
@@ -47,14 +48,118 @@ const SEK_WRAPS: TableDefinition<Digest32, &[u8]> = TableDefinition::new("sek_wr
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const META_SCHEMA: &str = "schema_version";
 
-/// The cache budget for each open redb handle, not a node or process memory bound. A fresh
-/// rewrite temporarily opens two handles. This does not budget decoded room state.
+/// Cache credits are shared by all stores in this process, including temporary rewrite
+/// handles. Exhaustion opens another database uncached; it never refuses a node or waits.
+/// These are redb cache limits, not a bound on transaction scratch or process memory.
 const DATABASE_CACHE_BYTES: usize = 32 * 1024 * 1024;
+const ALL_DATABASE_CACHE_BYTES: usize = 256 * 1024 * 1024;
+static DATABASE_CACHE_USED: AtomicUsize = AtomicUsize::new(0);
 
-fn database_builder() -> redb::Builder {
+struct DatabaseCacheLease(usize);
+
+impl DatabaseCacheLease {
+    fn reserve() -> Self {
+        let reserved = DATABASE_CACHE_USED
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                used.checked_add(DATABASE_CACHE_BYTES)
+                    .filter(|next| *next <= ALL_DATABASE_CACHE_BYTES)
+            })
+            .is_ok();
+        Self(if reserved { DATABASE_CACHE_BYTES } else { 0 })
+    }
+}
+
+impl Drop for DatabaseCacheLease {
+    fn drop(&mut self) {
+        DATABASE_CACHE_USED.fetch_sub(self.0, Ordering::Relaxed);
+    }
+}
+
+/// Private redb ownership adapter. Transactions can outlive the database handle that made
+/// them: Snapshot does, and a reopen can overlap a read. Every such owner keeps the same
+/// lease. Field order frees redb's owner before returning its last cache credits.
+struct Cached<T> {
+    inner: T,
+    cache: Arc<DatabaseCacheLease>,
+}
+
+impl<T> std::ops::Deref for Cached<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.inner
+    }
+}
+
+impl<T> std::ops::DerefMut for Cached<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.inner
+    }
+}
+
+impl Cached<Database> {
+    fn begin_read(
+        &self,
+    ) -> std::result::Result<Cached<redb::ReadTransaction>, redb::TransactionError> {
+        Ok(Cached {
+            inner: self.inner.begin_read()?,
+            cache: Arc::clone(&self.cache),
+        })
+    }
+
+    fn begin_write(
+        &self,
+    ) -> std::result::Result<Cached<redb::WriteTransaction>, redb::TransactionError> {
+        Ok(Cached {
+            inner: self.inner.begin_write()?,
+            cache: Arc::clone(&self.cache),
+        })
+    }
+}
+
+impl Cached<ReadOnlyDatabase> {
+    fn begin_read(
+        &self,
+    ) -> std::result::Result<Cached<redb::ReadTransaction>, redb::TransactionError> {
+        Ok(Cached {
+            inner: self.inner.begin_read()?,
+            cache: Arc::clone(&self.cache),
+        })
+    }
+}
+
+impl Cached<redb::WriteTransaction> {
+    fn commit(self) -> std::result::Result<(), redb::CommitError> {
+        let Self { inner, cache } = self;
+        let result = inner.commit();
+        drop(cache);
+        result
+    }
+}
+
+fn database_builder() -> (redb::Builder, Arc<DatabaseCacheLease>) {
+    let cache = Arc::new(DatabaseCacheLease::reserve());
     let mut builder = redb::Builder::new();
-    builder.set_cache_size(DATABASE_CACHE_BYTES);
-    builder
+    // redb supports zero cache bytes; the file and its transactions remain usable.
+    builder.set_cache_size(cache.0);
+    (builder, cache)
+}
+
+fn open_database(path: &Path) -> std::result::Result<Cached<Database>, redb::DatabaseError> {
+    let (builder, cache) = database_builder();
+    Ok(Cached {
+        inner: builder.create(path)?,
+        cache,
+    })
+}
+
+fn open_read_only_database(
+    path: &Path,
+) -> std::result::Result<Cached<ReadOnlyDatabase>, redb::DatabaseError> {
+    let (builder, cache) = database_builder();
+    Ok(Cached {
+        inner: builder.open_read_only(path)?,
+        cache,
+    })
 }
 
 // Segment codes 6 and 7 (an anchor's ciphertext copy of a room, ADR-023 decision 6) are retired
@@ -113,14 +218,14 @@ pub struct Store {
 /// The single-writer rule is unchanged: a read-only open of a file some process holds open
 /// for writing is refused just as a second writable open is, as [`Error::ProfileBusy`].
 enum Backing {
-    Writable(Database),
-    ReadOnly(ReadOnlyDatabase),
+    Writable(Cached<Database>),
+    ReadOnly(Cached<ReadOnlyDatabase>),
     /// Only between releasing the read-only handle and taking the writable one.
     Closed,
 }
 
 impl Backing {
-    fn begin_read(&self) -> Result<redb::ReadTransaction> {
+    fn begin_read(&self) -> Result<Cached<redb::ReadTransaction>> {
         match self {
             Backing::Writable(db) => db.begin_read().map_err(storage("begin read")),
             Backing::ReadOnly(db) => db.begin_read().map_err(storage("begin read")),
@@ -148,7 +253,7 @@ impl Store {
     /// initialize or verify the schema version. A file this build cannot read
     /// (garbage, or a newer schema) is a [`Error::Storage`], never a panic.
     pub fn open(path: &Path) -> Result<Self> {
-        let db = database_builder().create(path).map_err(open_error)?;
+        let db = open_database(path).map_err(open_error)?;
         super::paths::set_private_file_mode(path)?;
         let store = Self {
             db: RwLock::new(Backing::Writable(db)),
@@ -167,7 +272,7 @@ impl Store {
     /// is opened writable instead, as [`Self::open`] would: that is a store that needs writing
     /// whoever opens it.
     pub fn open_read_only(path: &Path) -> Result<Self> {
-        let db = match database_builder().open_read_only(path) {
+        let db = match open_read_only_database(path) {
             Ok(db) => db,
             Err(redb::DatabaseError::DatabaseAlreadyOpen) => return Err(Error::ProfileBusy),
             Err(_) => return Self::open(path),
@@ -200,11 +305,11 @@ impl Store {
     pub fn reopen_after_write_failure(&self, channel: &Digest32) -> Result<()> {
         let mut backing = self.db.write().unwrap_or_else(PoisonError::into_inner);
         drop(std::mem::replace(&mut *backing, Backing::Closed));
-        let db = match database_builder().create(&self.path) {
+        let db = match open_database(&self.path) {
             Ok(db) => db,
             Err(e) => {
                 // A failed writable reopen must not hide saved rooms while waiting to retry.
-                if let Ok(db) = database_builder().open_read_only(&self.path) {
+                if let Ok(db) = open_read_only_database(&self.path) {
                     *backing = Backing::ReadOnly(db);
                 }
                 return Err(open_error(e));
@@ -263,14 +368,14 @@ impl Store {
         // The read-only handle is released first: redb refuses a writable open of a file this
         // process still holds open.
         drop(std::mem::replace(&mut *backing, Backing::Closed));
-        match database_builder().create(&self.path) {
+        match open_database(&self.path) {
             Ok(db) => {
                 super::paths::set_private_file_mode(&self.path)?;
                 *backing = Backing::Writable(db);
                 Ok(())
             }
             Err(e) => {
-                if let Ok(db) = database_builder().open_read_only(&self.path) {
+                if let Ok(db) = open_read_only_database(&self.path) {
                     *backing = Backing::ReadOnly(db);
                 }
                 Err(open_error(e))
@@ -307,7 +412,7 @@ impl Store {
         let fresh_path = PathBuf::from(fresh_path);
         let _ = std::fs::remove_file(&fresh_path);
         let copied = (|| -> Result<()> {
-            let fresh = database_builder().create(&fresh_path).map_err(open_error)?;
+            let fresh = open_database(&fresh_path).map_err(open_error)?;
             super::paths::set_private_file_mode(&fresh_path)?;
             let r = old.begin_read().map_err(storage("begin read"))?;
             let w = fresh.begin_write().map_err(storage("begin write"))?;
@@ -347,8 +452,7 @@ impl Store {
         drop(std::mem::replace(&mut *backing, Backing::Closed));
         if let Err(e) = std::fs::rename(&fresh_path, &self.path) {
             let _ = std::fs::remove_file(&fresh_path);
-            *backing =
-                Backing::Writable(database_builder().create(&self.path).map_err(open_error)?);
+            *backing = Backing::Writable(open_database(&self.path).map_err(open_error)?);
             return Err(Error::Path {
                 op: "replace store",
                 detail: format!("{}: {e}", self.path.display()),
@@ -356,12 +460,12 @@ impl Store {
         }
         // The store is open again before the directory's flush is reported, so a failed flush
         // leaves a usable store and says so, rather than being ignored (V210-55).
-        *backing = Backing::Writable(database_builder().create(&self.path).map_err(open_error)?);
+        *backing = Backing::Writable(open_database(&self.path).map_err(open_error)?);
         super::paths::sync_dir(&self.path)
     }
 
     /// Begin a read transaction on whichever handle is open.
-    fn begin_read(&self) -> Result<redb::ReadTransaction> {
+    fn begin_read(&self) -> Result<Cached<redb::ReadTransaction>> {
         self.db
             .read()
             .unwrap_or_else(PoisonError::into_inner)
@@ -369,7 +473,7 @@ impl Store {
     }
 
     /// Begin a write transaction — refused, writing nothing, while the store is read-only.
-    fn begin_write(&self) -> Result<redb::WriteTransaction> {
+    fn begin_write(&self) -> Result<Cached<redb::WriteTransaction>> {
         match &*self.db.read().unwrap_or_else(PoisonError::into_inner) {
             Backing::Writable(db) => db.begin_write().map_err(storage("begin write")),
             Backing::ReadOnly(_) | Backing::Closed => Err(Error::Storage {
@@ -683,7 +787,7 @@ fn source_table<K: redb::Key + 'static, V: redb::Value + 'static>(
 
 /// One consistent sealed-segment snapshot. It owns no Store or SEK reference.
 pub(crate) struct Snapshot {
-    txn: redb::ReadTransaction,
+    txn: Cached<redb::ReadTransaction>,
 }
 
 impl Snapshot {
@@ -762,7 +866,7 @@ impl Snapshot {
 
 /// An open write transaction over the store (see [`Store::batch`]).
 pub struct Batch<'a> {
-    txn: redb::WriteTransaction,
+    txn: Cached<redb::WriteTransaction>,
     _store: &'a Store,
 }
 

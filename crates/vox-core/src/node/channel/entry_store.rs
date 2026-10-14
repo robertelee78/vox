@@ -7,6 +7,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use zeroize::Zeroizing;
 
@@ -22,6 +23,10 @@ const PAGE_BYTES: usize = 16 * 1024;
 const PAGE_ITEMS: usize = 128;
 const CACHE_BYTES: usize = 4 * 1024 * 1024;
 const CACHE_ITEMS: usize = 128;
+/// Plaintext page-cache retention is shared across all rooms/nodes in this process. A full
+/// pool skips cache admission; saved pages remain readable from the sealed store as usual.
+const ALL_CACHE_BYTES: usize = 64 * 1024 * 1024;
+static CACHE_USED: AtomicUsize = AtomicUsize::new(0);
 const MAX_DEPTH: usize = 64;
 const DIRECTORY: u64 = 0;
 type Key = [u8; 64];
@@ -494,8 +499,9 @@ struct PageCache {
 
 impl PageCache {
     fn clear(&mut self) {
-        self.rows.clear();
-        self.bytes = 0;
+        // Free both page allocations and deque storage before returning shared credits.
+        self.rows = VecDeque::new();
+        CACHE_USED.fetch_sub(std::mem::take(&mut self.bytes), Ordering::Relaxed);
     }
     fn get(&mut self, id: u64) -> Option<Zeroizing<Vec<u8>>> {
         let at = self.rows.iter().position(|(key, _)| *key == id)?;
@@ -510,14 +516,37 @@ impl PageCache {
         if charge > CACHE_BYTES {
             return;
         }
+        let mut released = 0;
         while self.bytes + charge > CACHE_BYTES || self.rows.len() >= CACHE_ITEMS {
             let Some((_, old)) = self.rows.pop_front() else {
                 break;
             };
-            self.bytes -= old.capacity() + std::mem::size_of::<(u64, Zeroizing<Vec<u8>>)>() * 2;
+            let old_charge = old.capacity() + std::mem::size_of::<(u64, Zeroizing<Vec<u8>>)>() * 2;
+            self.bytes -= old_charge;
+            released += old_charge;
+            drop(old);
+        }
+        if released != 0 {
+            self.rows.shrink_to_fit();
+            CACHE_USED.fetch_sub(released, Ordering::Relaxed);
+        }
+        if CACHE_USED
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                used.checked_add(charge)
+                    .filter(|next| *next <= ALL_CACHE_BYTES)
+            })
+            .is_err()
+        {
+            return;
         }
         self.bytes += charge;
         self.rows.push_back((id, bytes));
+    }
+}
+
+impl Drop for PageCache {
+    fn drop(&mut self) {
+        self.clear();
     }
 }
 
