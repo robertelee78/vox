@@ -523,6 +523,13 @@ final class NodeModel: ObservableObject {
     /// Last-known states are never presented as current while the daemon cannot be reached.
     @Published private(set) var daemonReachable = true
     private var nodeObservationEpoch = UUID()
+    fileprivate var observationToken: UUID { nodeObservationEpoch }
+    fileprivate func acceptsObservation(_ token: UUID, actor: String) -> Bool {
+        token == nodeObservationEpoch && actor == me && ended == nil && !Task.isCancelled
+    }
+    fileprivate func acceptsArrivalInstance(_ instance: Data, room: String) -> Bool {
+        roomOnScreen != room || roomInstance == nil || roomInstance == instance
+    }
     @Published private(set) var machineStateKnown = false
     @Published private(set) var daemonFailure: String?
     var peerWords: String { daemonReachable ? (peers == 1 ? "1 peer" : "\(peers) peers") : "peers unknown" }
@@ -2663,7 +2670,13 @@ final class NodeModel: ObservableObject {
         }
     }
 
-    fileprivate func arrived(_ message: RoomMessage, in room: String) {
+    fileprivate func arrived(_ message: RoomMessage, in room: String) async {
+        let epoch = nodeObservationEpoch
+        if !rooms.contains(where: { $0.id == room }) {
+            await refresh()
+            guard epoch == nodeObservationEpoch, !Task.isCancelled,
+                  rooms.contains(where: { $0.id == room }) else { return }
+        }
         // Looked at: the room's own timeline (General or All) on screen in a window in front of
         // the person, following its newest message, so this one is drawn in view as it lands. A
         // room chosen but with a Session shown, scrolled up, or behind another window is not.
@@ -2706,15 +2719,6 @@ final class NodeModel: ObservableObject {
         }
         // Unread until drawn in view (this node's own never are), the room on screen too.
         guard message.author != me else { return }
-        guard rooms.contains(where: { $0.id == room }) else {
-            // A room joined or made since the rooms were read (by `vox room join`, say): read
-            // them again, then count it.
-            Task {
-                await refresh()
-                if rooms.contains(where: { $0.id == room }) { arrived(message, in: room) }
-            }
-            return
-        }
         count(message, in: room)
     }
 
@@ -2723,11 +2727,11 @@ final class NodeModel: ObservableObject {
     /// seen as it lands, so it is not notified.
     var lookingAt: String?
 
-    fileprivate func noticed(_ text: String) {
-        Task { await refresh() }
+    fileprivate func noticed(_ text: String) async {
+        await refresh()
     }
 
-    fileprivate func stopped(_ text: String) {
+    fileprivate func stopped(_ text: String) async {
         waitingLedger = nil
         nodeObservationEpoch = UUID()
         roomReadGeneration = UUID()
@@ -2742,7 +2746,7 @@ final class NodeModel: ObservableObject {
         daemonReachable = text.localizedCaseInsensitiveContains("detached")
             || text.localizedCaseInsensitiveContains("Locked")
         if !daemonReachable { daemonFailure = text }
-        Task { [weak self] in await self?.readFacts() }
+        await readFacts()
     }
 
     /// Recoverable history is reloaded from the node after leaving a view or losing its
@@ -2809,31 +2813,51 @@ final class NodeModel: ObservableObject {
     }
 }
 
-/// The node's events, handed to the model on the main actor.
-private final class Listener: ClientListener, @unchecked Sendable {
+/// Each delivery is consumed on the main actor before FFI advances its durable arrival
+/// cursor. The Rust observer releases its client lock across these awaited calls.
+@MainActor
+private final class Listener: ClientListener {
     private weak var model: NodeModel?
+    private let epoch: UUID
+    private let actor: String
 
-    init(model: NodeModel) { self.model = model }
+    init(model: NodeModel) {
+        self.model = model
+        epoch = model.observationToken
+        actor = model.me
+    }
 
-    func onMessage(room: String, message: RoomMessage) {
+    private func current() -> NodeModel? {
+        guard let model, model.acceptsObservation(epoch, actor: actor) else { return nil }
+        return model
+    }
+
+    func onMessage(room: String, instance: Data, message: RoomMessage) async -> Bool {
+        guard let model = current() else { return false }
+        guard model.acceptsArrivalInstance(instance, room: room) else {
+            await model.stopped("The saved room changed; refreshing its history and restarting observation.")
+            return false
+        }
         readLog.debug("follow: event message \(message.id, privacy: .public) in \(room, privacy: .public)")
-        Task { @MainActor [weak model] in model?.arrived(message, in: room) }
+        await model.arrived(message, in: room)
+        return current() != nil
     }
 
-    func onNotice(text: String) {
-        Task { @MainActor [weak model] in model?.noticed(text) }
+    func onNotice(text: String) async -> Bool {
+        guard let model = current() else { return false }
+        await model.noticed(text)
+        return current() != nil
     }
 
-    func onEnded(text: String) {
-        Task { @MainActor [weak model] in model?.stopped(text) }
+    func onEnded(text: String) async {
+        guard let model = current() else { return }
+        await model.stopped(text)
     }
 
-    func onSessions(room: String) {
-        Task { @MainActor [weak model] in await model?.sessionsChanged(in: room) }
-    }
-
-    func onSessionEntry(room: String, node: String, sessionId: String) {
-        Task { @MainActor [weak model] in await model?.sessionEntry(in: room, node: node, session: sessionId) }
+    func onSessions(room: String) async -> Bool {
+        guard let model = current() else { return false }
+        await model.sessionsChanged(in: room)
+        return current() != nil
     }
 }
 
@@ -3255,19 +3279,18 @@ extension NodeModel {
 
     /// A Session in `room` opened, ended or was renamed, or what waits on this node changed.
     fileprivate func sessionsChanged(in room: String) async {
-        if let count = try? await client.sessionsWaiting(room: room), let n = Int(exactly: count),
-           let i = rooms.firstIndex(where: { $0.id == room }) { rooms[i].waiting = n }
+        let epoch = nodeObservationEpoch
+        let count = try? await client.sessionsWaiting(room: room)
+        guard epoch == nodeObservationEpoch, !Task.isCancelled, ended == nil else { return }
+        if let count, let n = Int(exactly: count), let i = rooms.firstIndex(where: { $0.id == room }) {
+            rooms[i].waiting = n
+        }
         await noteWaiting()
-        guard roomOnScreen == room else { return }
+        guard epoch == nodeObservationEpoch, !Task.isCancelled, roomOnScreen == room else { return }
         await refreshSessionMetadata()
+        guard epoch == nodeObservationEpoch, !Task.isCancelled, roomOnScreen == room else { return }
         await readSelectedSessionMetadata()
-        await readSession()
-    }
-
-    /// A Session has a new entry, or a request in it was resolved.
-    fileprivate func sessionEntry(in room: String, node: String, session: String) async {
-        guard roomOnScreen == room, shownSession?.nodeFingerprint == node,
-              shownSession?.sessionId == session else { return }
+        guard epoch == nodeObservationEpoch, !Task.isCancelled, roomOnScreen == room else { return }
         await readSession()
     }
 
