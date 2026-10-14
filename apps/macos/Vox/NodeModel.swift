@@ -696,6 +696,43 @@ final class NodeModel: ObservableObject {
     /// not bring added as if it had: a missed or dead event stream hides a message for one turn of
     /// this loop at most (the walkthrough's WHERE-15, posted while every peer was offline, never
     /// came as an event to the reopened app).
+    /// Retained UTF-8/binary payload, separately from SwiftUI/allocator footprint.
+    /// One legal oversized message remains readable instead of truncating its body.
+    private static let roomWindowBytes = 8 * 1024 * 1024
+
+    private static func roomPayloadBytes(_ row: RoomMessage) -> Int {
+        var size = 512 + row.id.utf8.count + row.author.utf8.count + row.authorName.utf8.count
+            + row.kind.utf8.count + row.text.utf8.count + row.re.utf8.count + row.thread.utf8.count
+        for value in row.to + row.tags { size += value.utf8.count }
+        if let file = row.file {
+            size += file.name.utf8.count + file.sha256.utf8.count + file.note.utf8.count
+            for value in file.to { size += value.utf8.count }
+        }
+        if let image = row.image { size += image.thumb.count + image.blurhash.utf8.count }
+        if let card = row.card {
+            size += card.url.utf8.count + card.title.utf8.count + card.description.utf8.count
+                + (card.image?.count ?? 0)
+        }
+        if let platform = row.platform {
+            size += platform.os.utf8.count + platform.osVersion.utf8.count + platform.arch.utf8.count
+        }
+        return size
+    }
+
+    private static func boundedRoomRows(_ rows: [RoomMessage], newest: Bool) -> [RoomMessage] {
+        let ordered = newest ? Array(rows.reversed()) : rows
+        var kept: [RoomMessage] = []
+        var bytes = 0
+        for row in ordered {
+            let cost = roomPayloadBytes(row)
+            if !kept.isEmpty && (kept.count >= roomWindowLimit || cost > roomWindowBytes - bytes) { break }
+            kept.append(row)
+            bytes += cost
+            if bytes >= roomWindowBytes { break }
+        }
+        return newest ? Array(kept.reversed()) : kept
+    }
+
     private func retainedRoomEntries(room: String, instance: Data, ids: [String],
                                      current: () -> Bool) async throws -> [RoomMessage] {
         guard current(), !Task.isCancelled else { throw CancellationError() }
@@ -737,7 +774,9 @@ final class NodeModel: ObservableObject {
                 let rows = try await retainedRoomEntries(room: id, instance: instance,
                     ids: loaded, current: current)
                 guard current() else { return }
-                messages = rows
+                let bounded = Self.boundedRoomRows(rows, newest: false)
+                if bounded.count < rows.count { roomHasNewer = true }
+                messages = bounded
                 // Exact selection's zero metadata is not a new history cursor/count.
             } else {
                 let page = try await client.roomRead(room: id)
@@ -745,7 +784,10 @@ final class NodeModel: ObservableObject {
                 roomInstance = page.instance
                 roomOlder = page.older
                 roomBefore = page.before
-                messages = page.messages
+                let bounded = Self.boundedRoomRows(page.messages, newest: true)
+                roomOlder += UInt64(page.messages.count - bounded.count)
+                if roomOlder > 0 { roomBefore = bounded.first?.id }
+                messages = bounded
                 roomHasNewer = false
                 roomNeedsPage = false
                 rejectedRoomMark = nil
@@ -784,8 +826,9 @@ final class NodeModel: ObservableObject {
                 throw VoxError.Failed(reason: "The saved room changed while loading older messages.")
             }
             let joined = page.messages.filter { !held.contains($0.id) } + messages
-            if joined.count > Self.roomWindowLimit { roomHasNewer = true }
-            messages = Array(joined.prefix(Self.roomWindowLimit))
+            let bounded = Self.boundedRoomRows(joined, newest: false)
+            if bounded.count < joined.count { roomHasNewer = true }
+            messages = bounded
             roomOlder = page.older
             roomBefore = page.before
         } catch {
@@ -1122,7 +1165,10 @@ final class NodeModel: ObservableObject {
             roomBefore = page.before
             unreadFrom = unread.first
             unreadCount = Int(clamping: unread.addressed + unread.new + unread.coordination)
-            messages = read
+            let bounded = Self.boundedRoomRows(read, newest: true)
+            roomOlder += UInt64(read.count - bounded.count)
+            if roomOlder > 0 { roomBefore = bounded.first?.id }
+            messages = bounded
             roomNeedsPage = false
             roomServices = services.shared
             roomServicesNext = services.next
@@ -2566,15 +2612,20 @@ final class NodeModel: ObservableObject {
             // yet", owed) is shown, and read, once it has; before, it stayed owed until the room
             // was opened again, and was never read.
             if let i = messages.firstIndex(where: { $0.id == message.id }) {
-                messages[i] = message
+                var updated = messages
+                updated[i] = message
+                let bounded = Self.boundedRoomRows(updated, newest: timelineFollowingNewest)
+                if timelineFollowingNewest {
+                    roomOlder += UInt64(updated.count - bounded.count)
+                    if roomOlder > 0 { roomBefore = bounded.first?.id }
+                } else if bounded.count < updated.count { roomHasNewer = true }
+                messages = bounded
             } else if timelineFollowingNewest {
-                messages.append(message)
-                if messages.count > Self.roomWindowLimit {
-                    let dropped = messages.count - Self.roomWindowLimit
-                    messages = Array(messages.suffix(Self.roomWindowLimit))
-                    roomOlder += UInt64(dropped)
-                    roomBefore = messages.first?.id
-                }
+                let updated = messages + [message]
+                let bounded = Self.boundedRoomRows(updated, newest: true)
+                roomOlder += UInt64(updated.count - bounded.count)
+                if roomOlder > 0 { roomBefore = bounded.first?.id }
+                messages = bounded
             } else {
                 roomHasNewer = true
             }
