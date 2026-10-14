@@ -165,6 +165,8 @@ final class NodeModel: ObservableObject {
     private var threadAuthorRequests: [String: UUID] = [:]
     private var threadPageDirty = false
     private var threadRefreshDirty = false
+    private var threadDisplayRevision: String?
+    private var threadForcedSummaries: Set<String> = []
     private var threadPagesLoaded = 1
     private var threadRefreshTask: Task<Void, Never>?
     private var threadPageTask: Task<Void, Never>?
@@ -682,6 +684,7 @@ final class NodeModel: ObservableObject {
                 // or its watcher survived the interruption. Preserve its visible content
                 // until an authoritative page and roster replace it together.
                 if case .room = selection {
+                    threadDisplayRevision = nil
                     roomReadGeneration = UUID()
                     roomNeedsPage = true
                     watching?.cancel()
@@ -702,6 +705,7 @@ final class NodeModel: ObservableObject {
             daemonReachable = false
             machineStateKnown = false
             nodeObservationEpoch = UUID()
+            threadDisplayRevision = nil
             daemonFailure = sentence(error)
             reportBackground(error)
             return
@@ -2373,6 +2377,8 @@ extension NodeModel {
         threadRefreshTask = nil
         threadRefreshID = UUID()
         threadRefreshDirty = false
+        threadDisplayRevision = nil
+        threadForcedSummaries = []
         threadSummaryVersions = [:]
         threadAuthorRequests = [:]
         threadPageDirty = false
@@ -2388,9 +2394,13 @@ extension NodeModel {
         threadError = nil
     }
 
+    private func threadReadIsCurrent(room: String, generation: UUID, epoch: UUID, request: UUID) -> Bool {
+        roomReadGeneration == generation && nodeObservationEpoch == epoch
+            && roomOnScreen == room && ended == nil && threadRefreshID == request
+    }
+
     private func scheduleThreadRefresh() {
         guard let room = roomOnScreen, ended == nil else { return }
-        refreshOpenThread()
         threadRefreshDirty = true
         guard threadRefreshTask == nil else { return }
         let generation = roomReadGeneration
@@ -2407,19 +2417,49 @@ extension NodeModel {
             }
             repeat {
                 self.threadRefreshDirty = false
+                func current() -> Bool {
+                    !Task.isCancelled && self.threadReadIsCurrent(room: room, generation: generation,
+                        epoch: epoch, request: refreshID)
+                }
+                let revision: String
+                do {
+                    revision = try await self.client.roomDisplayRevision(room: room)
+                    guard current() else { return }
+                } catch {
+                    guard current() else { return }
+                    // A refused revision is not permission to retain formerly readable bodies.
+                    self.threadDisplayRevision = nil
+                    self.threadSummaries = [:]
+                    self.threadSummaryVersions = [:]
+                    self.threadAuthorRequests = [:]
+                    self.threadRootMessage = nil
+                    self.threadReplies = []
+                    self.threadHasMore = false
+                    self.threadGeneration = UUID()
+                    self.threadPageTask?.cancel()
+                    self.threadPageDirty = false
+                    self.threadLoading = false
+                    self.threadError = sentence(error)
+                    for root in self.messages.filter({ $0.thread.isEmpty && !$0.owed }).map(\.id) {
+                        self.threadSummaryErrors[root] = sentence(error)
+                    }
+                    return
+                }
+                let changed = self.threadDisplayRevision != revision
+                self.threadDisplayRevision = revision
+                if changed { self.refreshOpenThread() }
                 let roots = self.messages.filter { $0.thread.isEmpty && !$0.owed }.map(\.id)
                 let known = Set(roots)
                 self.threadSummaries = self.threadSummaries.filter { known.contains($0.key) }
                 self.threadSummaryErrors = self.threadSummaryErrors.filter { known.contains($0.key) }
-                for root in roots {
-                    guard !Task.isCancelled, self.roomReadGeneration == generation,
-                          self.nodeObservationEpoch == epoch, self.roomOnScreen == room,
-                          self.ended == nil else { return }
+                let forced = self.threadForcedSummaries
+                self.threadForcedSummaries = []
+                for root in roots where changed || forced.contains(root)
+                    || (self.threadSummaries[root] == nil && self.threadSummaryErrors[root] == nil) {
+                    guard current() else { return }
                     do {
                         let summary = try await self.client.threadSummary(room: room, root: root, afterAuthor: nil)
-                        guard !Task.isCancelled, self.roomReadGeneration == generation,
-                              self.nodeObservationEpoch == epoch, self.roomOnScreen == room,
-                              self.ended == nil else { return }
+                        guard current() else { return }
                         guard summary.root == root else {
                             throw VoxError.Failed(reason: "The reply summary belongs to another message.")
                         }
@@ -2427,9 +2467,7 @@ extension NodeModel {
                         self.threadSummaryVersions[root] = UUID()
                         self.threadSummaryErrors[root] = nil
                     } catch {
-                        guard !Task.isCancelled, self.roomReadGeneration == generation,
-                              self.nodeObservationEpoch == epoch, self.roomOnScreen == room,
-                              self.ended == nil else { return }
+                        guard current() else { return }
                         self.threadSummaries[root] = nil
                         self.threadSummaryVersions[root] = UUID()
                         self.threadSummaryErrors[root] = sentence(error)
@@ -2561,6 +2599,7 @@ extension NodeModel {
         if threadSummaries[root]?.nextAuthor != nil {
             Task { await moreThreadAuthors(root) }
         } else {
+            threadForcedSummaries.insert(root)
             scheduleThreadRefresh()
         }
     }
@@ -2592,6 +2631,7 @@ extension NodeModel {
             }
             // Only combine pages from the same authoritative count/time snapshot.
             guard page.replyCount == held.replyCount, page.lastReplyMillis == held.lastReplyMillis else {
+                threadForcedSummaries.insert(root)
                 scheduleThreadRefresh()
                 return
             }
