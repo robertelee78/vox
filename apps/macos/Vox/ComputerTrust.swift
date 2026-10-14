@@ -11,12 +11,30 @@ private final class ComputerTrustModel: ObservableObject {
     @Published private(set) var problem: String?
     @Published private(set) var actionProblem: String?
     private var client: VoxClient?
+    /// One operator action may wait behind the active refresh; refreshes never queue.
+    private var waitingOperator: CheckedContinuation<Void, Never>?
 
     func perform(refreshing: Bool = false, _ request: (VoxClient) async throws -> ComputerStatus) async {
-        guard !busy else { return }
-        busy = true
+        if busy {
+            if refreshing { return }
+            guard waitingOperator == nil else {
+                actionProblem = "Another computer change is already waiting. Try again when it finishes."
+                return
+            }
+            await withCheckedContinuation { waitingOperator = $0 }
+            // The prior operation keeps busy set while handing ownership directly to us.
+        } else {
+            busy = true
+        }
         if !refreshing { actionProblem = nil }
-        defer { busy = false }
+        defer {
+            if let next = waitingOperator {
+                waitingOperator = nil
+                next.resume()
+            } else {
+                busy = false
+            }
+        }
         do {
             let connection: VoxClient
             if let client { connection = client }
