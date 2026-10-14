@@ -2246,6 +2246,94 @@ fn room_window_bytes(rows: &[MessageRow]) -> Result<(), VoxError> {
 }
 
 impl VoxClient {
+    async fn post_selected(
+        &self,
+        room: String,
+        text: String,
+        to: Vec<String>,
+        re: String,
+        urgent: bool,
+        selected: Option<(Digest32, [u8; 16])>,
+    ) -> Result<(), VoxError> {
+        let channel_id = digest(&room, "room id")?;
+        if text.trim().is_empty() {
+            return Err(failed("refusing to post an empty message"));
+        }
+        let (to_fps, one_session) = addressed(&to)?;
+        if !re.is_empty() {
+            digest(&re, "message id")?;
+        }
+        let mut env = vox_agentcomms::envelope::Envelope::say(&text);
+        env.to = to_fps;
+        env.re = (!re.is_empty()).then(|| re.trim().to_owned());
+        env.urgent = urgent;
+        on_held!(self, |c| {
+            if selected.is_some_and(|(actor, _)| c.me() != Some(actor)) {
+                return Err(failed(
+                    "The acting node changed before sending. This message was not posted.",
+                ));
+            }
+            sessions_addressable(c, channel_id, &one_session).await?;
+            // **A reply spends a hop** (ADR-020 §9), by the one rule the CLI follows: its
+            // parent's budget less one, read up the `re` chain from the log.
+            if let Some(re) = env.re.clone() {
+                let chain = reply_chain(c, channel_id, &re).await?;
+                let parent = |h: &str| {
+                    let hash = vox_core::node::link::b32_decode(h.trim(), "re").ok()?;
+                    chain.get(&hash).cloned()
+                };
+                env.hops = vox_agentcomms::envelope::reply_hops_by(&re, parent);
+                env.thread = Some(
+                    vox_agentcomms::envelope::reply_thread_by(&re, parent).ok_or_else(|| {
+                        failed(format!(
+                            "cannot reply to {re}: this node cannot read that message; nothing was posted"
+                        ))
+                    })?,
+                );
+                if let Some(root) = env.thread.as_deref().and_then(|h| digest(h, "thread").ok()) {
+                    match ask(
+                        c,
+                        &Request::Find {
+                            channel_id,
+                            entries: vec![root],
+                        },
+                    )
+                    .await?
+                    {
+                        Frame::Rows { rows } => {
+                            if let Some(starting) =
+                                rows.iter().find(|r| r.entry_hash == root && !r.owed)
+                            {
+                                env.tags = vox_agentcomms::envelope::inherit_thread_tags(
+                                    &env.tags,
+                                    &starting.text,
+                                )
+                                .map_err(failed)?;
+                            }
+                        }
+                        other => return Err(unexpected(&other)),
+                    }
+                }
+            }
+            let text = env.to_text();
+            // A link card, fetched by this node (ADR-028 F-10).
+            let request = match selected {
+                Some((_, instance)) => Request::PostAt {
+                    channel_id,
+                    instance,
+                    text,
+                    card: true,
+                },
+                None => Request::Post {
+                    channel_id,
+                    text,
+                    card: true,
+                },
+            };
+            done(c, &request).await
+        })
+    }
+
     async fn room_page_read(
         &self,
         room: String,
@@ -3750,73 +3838,32 @@ impl VoxClient {
         re: String,
         urgent: bool,
     ) -> Result<(), VoxError> {
-        let channel_id = digest(&room, "room id")?;
-        if text.trim().is_empty() {
-            return Err(failed("refusing to post an empty message"));
-        }
-        let (to_fps, one_session) = addressed(&to)?;
-        if !re.is_empty() {
-            digest(&re, "message id")?;
-        }
-        let mut env = vox_agentcomms::envelope::Envelope::say(&text);
-        env.to = to_fps;
-        env.re = (!re.is_empty()).then(|| re.trim().to_owned());
-        env.urgent = urgent;
-        on_held!(self, |c| {
-            sessions_addressable(c, channel_id, &one_session).await?;
-            // **A reply spends a hop** (ADR-020 §9), by the one rule the CLI follows: its
-            // parent's budget less one, read up the `re` chain from the log.
-            if let Some(re) = env.re.clone() {
-                let chain = reply_chain(c, channel_id, &re).await?;
-                let parent = |h: &str| {
-                    let hash = vox_core::node::link::b32_decode(h.trim(), "re").ok()?;
-                    chain.get(&hash).cloned()
-                };
-                env.hops = vox_agentcomms::envelope::reply_hops_by(&re, parent);
-                env.thread = Some(
-                    vox_agentcomms::envelope::reply_thread_by(&re, parent).ok_or_else(|| {
-                        failed(format!(
-                            "cannot reply to {re}: this node cannot read that message; nothing was posted"
-                        ))
-                    })?,
-                );
-                if let Some(root) = env.thread.as_deref().and_then(|h| digest(h, "thread").ok()) {
-                    match ask(
-                        c,
-                        &Request::Find {
-                            channel_id,
-                            entries: vec![root],
-                        },
-                    )
-                    .await?
-                    {
-                        Frame::Rows { rows } => {
-                            if let Some(starting) =
-                                rows.iter().find(|r| r.entry_hash == root && !r.owed)
-                            {
-                                env.tags = vox_agentcomms::envelope::inherit_thread_tags(
-                                    &env.tags,
-                                    &starting.text,
-                                )
-                                .map_err(failed)?;
-                            }
-                        }
-                        other => return Err(unexpected(&other)),
-                    }
-                }
-            }
-            let text = env.to_text();
-            // A link card, fetched by this node (ADR-028 F-10).
-            done(
-                c,
-                &Request::Post {
-                    channel_id,
-                    text,
-                    card: true,
-                },
-            )
+        self.post_selected(room, text, to, re, urgent, None).await
+    }
+
+    /// Send only as the captured acting node and to the captured saved room incarnation.
+    /// The actor is checked while holding the client; the daemon checks the instance under
+    /// its append lock. A lost response remains Unknown, never a claim that nothing posted.
+    ///
+    /// # Errors
+    /// Invalid input, a changed actor/room, or the ordinary post refusal/unknown outcome.
+    #[allow(clippy::too_many_arguments)] // The existing post fields plus its exact UI selection.
+    pub async fn post_at(
+        &self,
+        room: String,
+        node: String,
+        instance: Vec<u8>,
+        text: String,
+        to: Vec<String>,
+        re: String,
+        urgent: bool,
+    ) -> Result<(), VoxError> {
+        let actor = input_fingerprint(&node)?;
+        let instance: [u8; 16] = instance
+            .try_into()
+            .map_err(|_| failed("The saved room identity must contain exactly 16 bytes."))?;
+        self.post_selected(room, text, to, re, urgent, Some((actor, instance)))
             .await
-        })
     }
 
     /// Create a room named `name`, its one shared name (ADR-028 R-1), under `passphrase`; returns

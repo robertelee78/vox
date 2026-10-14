@@ -15,8 +15,10 @@ let readLog = Logger(subsystem: "us.vox.app", category: "read")
 /// A room's composer as it was left: its text, To:, Urgent and the reply being written (D12).
 struct RoomDraft {
     var text = ""
+    var textRevision = UUID()
     var to: Set<String> = []
     var urgent = false
+    var urgencyRevision = UUID()
     var reply: RoomMessage?
 }
 
@@ -2486,15 +2488,38 @@ final class NodeModel: ObservableObject {
         }
     }
 
-    /// Post `text` to the room on screen; whether the node took it.
+    /// Notify a returned composer when an older view's send completes, without publishing
+    /// every keystroke through the whole node model. A later draft or urgency edit stays.
+    func clearSentDraft(in room: String, text: UUID, urgency: UUID) {
+        let clearText = roomDrafts[room]?.textRevision == text
+        let clearUrgency = roomDrafts[room]?.urgencyRevision == urgency
+        guard clearText || clearUrgency else { return }
+        objectWillChange.send()
+        if clearText { roomDrafts[room]?.text = "" }
+        if clearUrgency { roomDrafts[room]?.urgent = false }
+    }
+
+    /// The composer captures the same actor/attachment/room lifetime it is showing. A queued
+    /// button task must not reinterpret its draft after selection, reconnect, or room replacement.
+    var roomPostContext: String {
+        "\(me)/\(roomOnScreen ?? "")/\(nodeObservationEpoch)/\(roomReadGeneration)/\(roomInstance?.base64EncodedString() ?? "")"
+    }
+
+    /// Post `text` to the captured room; whether the node took it.
     @discardableResult
-    func post(_ text: String, to: [String] = [], urgent: Bool = false, re: String = "") async -> Bool {
+    func post(_ text: String, in room: String, context: String,
+              to: [String] = [], urgent: Bool = false, re: String = "") async -> Bool {
         let operation = "post"
         let attempt = begin(operation)
         defer { end(attempt) }
-        guard case let .room(id) = selection else { return false }
+        guard roomOnScreen == room, let instance = roomInstance, roomPostContext == context, !showingSession,
+              ended == nil, daemonReachable, !Task.isCancelled else {
+            report(VoxError.Failed(reason: "The room or node changed before sending. Your draft is kept."), operation: operation)
+            return false
+        }
         do {
-            try await client.post(room: id, text: text, to: to, re: re, urgent: urgent)
+            try await client.postAt(room: room, node: me, instance: instance,
+                                    text: text, to: to, re: re, urgent: urgent)
             report(operation: operation, done: "Sent the message.")
             return true
         } catch {
