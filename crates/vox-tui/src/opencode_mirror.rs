@@ -29,7 +29,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Map, Value};
-use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::sync::{mpsc, oneshot};
 use vox_core::node::paths::NodeName;
 
@@ -209,8 +209,16 @@ impl Follow {
             return;
         }
         let mut lines = BufReader::new(read);
-        let mut line = String::new();
+        let mut line = Vec::new();
+        let mut oversized = false;
         loop {
+            // A cancelled read may already have filled its bounded prefix. Retire it here
+            // before constructing the next Take, so zero remaining bytes is not read as EOF.
+            if line.len() > MAX_LINE {
+                oversized = !line.ends_with(b"\n");
+                line.clear();
+            }
+            let remaining = (MAX_LINE + 1 - line.len()) as u64;
             tokio::select! {
                 cmd = rx.recv() => match cmd {
                     None | Some(Cmd::End) => break,
@@ -229,12 +237,14 @@ impl Follow {
                         }
                     }
                 },
-                n = lines.read_line(&mut line) => {
+                n = async { (&mut lines).take(remaining).read_until(b'\n', &mut line).await } => {
                     match n {
                         Ok(0) | Err(_) => break,
-                        Ok(_) if line.len() > MAX_LINE => {}
+                        Ok(_) if line.len() > MAX_LINE || oversized => {
+                            oversized = !line.ends_with(b"\n");
+                        }
                         Ok(_) => {
-                            if let Ok(v) = serde_json::from_str::<Value>(line.trim_end()) {
+                            if let Ok(v) = serde_json::from_slice::<Value>(&line) {
                                 self.line(&v).await;
                             }
                         }
