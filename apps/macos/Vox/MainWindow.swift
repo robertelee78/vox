@@ -1838,7 +1838,7 @@ private struct MessageRow: View {
                             Text(tag.label).caption().secondaryText()
                         }
                         .buttonStyle(.plain)
-                        .help("Show the room's messages tagged \(tag)")
+                        .help("Show the room's messages tagged \(tag.label)")
                         .accessibilityIdentifier("tag-\(message.id)-\(tag.label)")
                     }
                 }

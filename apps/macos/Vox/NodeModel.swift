@@ -2820,12 +2820,12 @@ final class NodeModel: ObservableObject {
                 if let rows {
                     if rows.trustsMe != self.trustsMe { self.trustsMe = rows.trustsMe }
                     for (fingerprint, name) in rows.presented { self.rememberPresentation(fingerprint, name) }
+                    self.roomNeedsPage = false
                     if rows.rows != self.members {
                         // A member not listed before joined while the room was on screen (K-7).
                         let before = Set(self.members.map(\.id))
                         let came = rows.rows.filter { !before.contains($0.id) }
                         self.members = rows.rows
-                    self.roomNeedsPage = false
                         if !before.isEmpty || !came.isEmpty {
                             let at = UInt64(Date().timeIntervalSince1970 * 1000)
                             for m in came where !self.joins.contains(where: { $0.fingerprint == m.id }) {
