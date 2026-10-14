@@ -248,7 +248,8 @@ const SEG_DRIVE: u64 = 16;
 const SEG_BOARD_KEPT: u64 = 17;
 
 /// One current local room pause; sealed independently of Session activity and retention.
-const SEG_ROOM_PAUSE: u64 = 18;
+/// Slots 18 and 19 belong to the legacy Session announcement cursor and drive generations.
+const SEG_ROOM_PAUSE: u64 = 20;
 
 /// Encoding version of [`SEG_BOARD_KEPT`]: `[1, [notice wire..], [withdraw wire..]]`.
 const BOARD_KEPT_VERSION: u64 = 1;
