@@ -2674,6 +2674,7 @@ final class NodeModel: ObservableObject {
     }
 
     fileprivate func stopped(_ text: String) {
+        waitingLedger = nil
         nodeObservationEpoch = UUID()
         roomReadGeneration = UUID()
         invalidateRoomAnchorState(preservingSnapshot: true)
@@ -3743,7 +3744,8 @@ private final class PendingNotificationLedger {
         let key = sessionKey + "/" + reference
         try run("INSERT OR IGNORE INTO scan_refs VALUES (?)", [key])
         try run("INSERT OR IGNORE INTO scan_sessions VALUES (?)", [sessionKey])
-        if hasSnapshot && !(try exists(key)) {
+        let previouslyKnown = try exists(key)
+        if hasSnapshot && !previouslyKnown {
             try run("INSERT OR REPLACE INTO notifications VALUES (?,?,?,?,?,?)",
                     [sessionKey, room, node, session, reference, label])
         }
