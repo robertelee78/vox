@@ -152,6 +152,7 @@ final class NodeModel: ObservableObject {
             var said: [String: NodePlatform] = [:]
             for message in messages { if let p = message.platform { said[message.author] = p } }
             if said != platforms { platforms = said }
+            retireFileFactsOutsideWindows()
             scheduleThreadRefresh()
         }
     }
@@ -159,8 +160,12 @@ final class NodeModel: ObservableObject {
     @Published private(set) var threadSummaries: [String: ThreadSummary] = [:]
     @Published private(set) var threadSummaryErrors: [String: String] = [:]
     @Published private(set) var openThread: String?
-    @Published private(set) var threadRootMessage: RoomMessage?
-    @Published private(set) var threadReplies: [RoomMessage] = []
+    @Published private(set) var threadRootMessage: RoomMessage? {
+        didSet { retireFileFactsOutsideWindows() }
+    }
+    @Published private(set) var threadReplies: [RoomMessage] = [] {
+        didSet { retireFileFactsOutsideWindows() }
+    }
     @Published private(set) var threadLoading = false
     @Published private(set) var threadHasMore = false
     @Published private(set) var threadHasEarlier = false
@@ -1719,15 +1724,22 @@ final class NodeModel: ObservableObject {
     /// checks its SHA-256 before it keeps it, so the card shows a copy only once it is verified.
     /// How it goes is in `pulling`; where it landed, in `pulled`.
     func download(_ message: RoomMessage) async {
-        guard let room = roomOnScreen, let file = message.file else { return }
+        guard let room = roomOnScreen, let file = message.file,
+              displayedFileIDs.contains(message.id), ended == nil else { return }
+        let generation = roomReadGeneration, epoch = nodeObservationEpoch
+        func current() -> Bool {
+            roomOnScreen == room && roomReadGeneration == generation
+                && nodeObservationEpoch == epoch && ended == nil
+                && displayedFileIDs.contains(message.id) && !Task.isCancelled
+        }
         pulling[message.id] = .pulling(bytes: 0, of: file.size)
         do {
             let path = try await client.get(room: room, entry: message.id)
-            guard roomOnScreen == room else { return }
+            guard current() else { return }
             pulled[message.id] = path
             pulling[message.id] = nil
         } catch {
-            guard roomOnScreen == room else { return }
+            guard current() else { return }
             pulling[message.id] = .failed(why: sentence(error))
         }
     }
@@ -2541,6 +2553,12 @@ final class NodeModel: ObservableObject {
     private var displayedFileIDs: Set<String> {
         Set((messages + threadReplies + [threadRootMessage].compactMap { $0 })
             .filter { $0.file != nil }.map(\.id))
+    }
+
+    private func retireFileFactsOutsideWindows() {
+        let held = displayedFileIDs
+        pulled = pulled.filter { held.contains($0.key) }
+        pulling = pulling.filter { held.contains($0.key) }
     }
 
     private func displayedFileFacts(_ room: String, ids: Set<String>) async throws
