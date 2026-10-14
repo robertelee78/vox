@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 use tokio::runtime::{Handle, Runtime};
 use vox_core::error::Error;
@@ -1444,17 +1444,21 @@ pub struct NodeView {
 
 /// What the app hears from the node it acts as.
 #[uniffi::export(with_foreign)]
+#[async_trait::async_trait]
 pub trait ClientListener: Send + Sync {
-    /// A message became readable in `room`. Each is delivered once; a room's messages that were
-    /// readable when [`VoxClient::subscribe`] was called are not delivered (`read` has them).
-    fn on_message(&self, room: String, message: RoomMessage);
-    /// Anything else the node reports, as a sentence.
-    fn on_notice(&self, text: String);
-    /// The node was detached, or the daemon stopped: nothing more will come. Said as a sentence.
-    fn on_ended(&self, text: String);
-    /// A Session's metadata, activity or drive authority in `room` changed. Refresh both the
-    /// displayed Session page and the selected Session, preserving room/node/selection fences.
-    fn on_sessions(&self, room: String);
+    /// A message became readable in `room`, in the saved room `instance`. Each is delivered
+    /// once; messages readable when [`VoxClient::subscribe`] was called are not delivered.
+    /// Await actual consumption, without starting an unowned task. Return false when this
+    /// listener's captured actor/observation generation or room instance is no longer current.
+    async fn on_message(&self, room: String, instance: Vec<u8>, message: RoomMessage) -> bool;
+    /// Anything else the node reports. Await consumption; false retires an obsolete listener.
+    async fn on_notice(&self, text: String) -> bool;
+    /// The node was detached, or the daemon stopped: nothing more will come. Check the captured
+    /// actor/observation generation and cancellation before applying this terminal notification.
+    async fn on_ended(&self, text: String);
+    /// A Session's metadata, activity or drive authority in `room` changed. Await the bounded
+    /// refresh, preserving room/node/selection fences; false retires an obsolete listener.
+    async fn on_sessions(&self, room: String) -> bool;
 }
 
 /// One opaque projection token per open room; no Session records are retained for comparison.
@@ -1479,6 +1483,8 @@ async fn session_revisions(c: &mut IpcClient) -> Result<HashMap<Digest32, Digest
 
 /// The node this client holds attached, and the connection its requests go over.
 struct Held {
+    /// A release followed by reattaching the same name/fingerprint is still a new attachment.
+    attachment: Arc<()>,
     node: NodeName,
     client: IpcClient,
     /// For further connections as the same node; they attach nothing.
@@ -1546,6 +1552,29 @@ impl Held {
 const REQUEST_WITHIN: std::time::Duration = std::time::Duration::from_secs(60);
 
 type Slot = Arc<tokio::sync::Mutex<Option<Held>>>;
+type FollowSlot = Arc<Mutex<Option<Subscription>>>;
+
+/// Owned by VoxClient, never by its task. The task keeps only a weak reference to this slot,
+/// so dropping the client cancels an awaited foreign callback without a task/client cycle.
+struct Subscription {
+    identity: Arc<()>,
+    task: tokio::task::AbortHandle,
+}
+
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+fn stop_follow(following: &FollowSlot) {
+    drop(
+        following
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take(),
+    );
+}
 
 /// A client of the account's vox daemon.
 #[derive(uniffi::Object)]
@@ -1558,6 +1587,8 @@ pub struct VoxClient {
     data_root: PathBuf,
     config_dir: PathBuf,
     held: Slot,
+    /// At most one observer; release, detach and replacement cancel it, including UI waits.
+    following: FollowSlot,
     /// A connection to the daemon, kept while the client lives: a daemon a client started exits
     /// once no node is attached and no client is connected (ADR-026 L-8), and the app is its
     /// client from the moment it opens, before any node is attached.
@@ -2419,6 +2450,7 @@ impl VoxClient {
             data_root: account.data_root.clone(),
             config_dir: account.config_dir.clone(),
             held: Arc::new(tokio::sync::Mutex::new(None)),
+            following: Arc::new(Mutex::new(None)),
             daemon_hold: Mutex::new(Some(hold)),
         }))
     }
@@ -2683,9 +2715,11 @@ impl VoxClient {
             waiting: None,
         };
         let held = Arc::clone(&self.held);
+        let following = Arc::clone(&self.following);
         let socket = self.socket.clone();
         self.on_rt(async move {
             let mut slot = held.lock().await;
+            stop_follow(&following);
             // The node held before is let go first, so a switch never holds two.
             *slot = None;
             let client = IpcClient::open_at(&at)
@@ -2694,6 +2728,7 @@ impl VoxClient {
                 .with_answer_bound(REQUEST_WITHIN);
             let me = client.me().map(|f| b32_encode(&f)).unwrap_or_default();
             *slot = Some(Held {
+                attachment: Arc::new(()),
                 node: name,
                 client,
                 at: at.attached_only(),
@@ -2761,9 +2796,12 @@ impl VoxClient {
     /// Stop holding the node: the daemon detaches it unless it is kept or held by another client.
     pub async fn release(&self) {
         let held = Arc::clone(&self.held);
+        let following = Arc::clone(&self.following);
         let _ = self
             .on_rt(async move {
-                *held.lock().await = None;
+                let mut slot = held.lock().await;
+                stop_follow(&following);
+                *slot = None;
                 Ok(())
             })
             .await;
@@ -2779,10 +2817,12 @@ impl VoxClient {
             .daemon(DaemonRequest::Detach { node: name.clone() })
             .await?;
         let held = Arc::clone(&self.held);
+        let following = Arc::clone(&self.following);
         let _ = self
             .on_rt(async move {
                 let mut slot = held.lock().await;
                 if slot.as_ref().is_some_and(|h| h.node == name) {
+                    stop_follow(&following);
                     *slot = None;
                 }
                 Ok(())
@@ -5895,70 +5935,139 @@ impl VoxClient {
     /// No node attached, or the daemon would not stream its events.
     pub async fn subscribe(&self, listener: Arc<dyn ClientListener>) -> Result<(), VoxError> {
         let held = Arc::clone(&self.held);
+        let following = Arc::clone(&self.following);
         let socket = self.socket.clone();
-        // The cursors and the stream are set up before this returns, so nothing posted after it
-        // is missed.
-        let (stream, cursors, seen, owner, reanchor) = self
-            .on_rt({
-                let held = Arc::clone(&held);
-                async move {
-                    let mut slot = held.lock().await;
-                    let h = slot.as_mut().ok_or_else(not_attached)?;
-                    h.mend().await?;
-                    let mut cursors = HashMap::new();
-                    let seen = session_revisions(&mut h.client).await?;
-                    for (id, _, open, _) in room_ids(&mut h.client).await? {
-                        if !open {
-                            continue;
-                        }
-                        match ask(&mut h.client, &Request::ArrivalHead { channel_id: id }).await? {
-                            Frame::ArrivalHead { head } => {
-                                cursors.insert(id, head);
-                            }
-                            other => return Err(unexpected(&other)),
-                        }
-                    }
-                    let owner = FollowOwner {
-                        node: h.node.clone(),
-                        fingerprint: h.client.me(),
-                    };
-                    // Capture heads before registering: follow immediately reads the gap,
-                    // then queued events only wake reads after those same saved cursors.
-                    let mut stream = IpcClient::open_at(&h.at)
-                        .await
-                        .map_err(|e| said(&socket, e))?;
-                    if h.at.using.node != owner.node || stream.me() != owner.fingerprint {
-                        return Err(failed("the app's node identity changed"));
-                    }
-                    stream
-                        .subscribe()
-                        .await
-                        .map_err(|e| failed(format!("cannot follow the node's events: {e}")))?;
-                    // A room opened before registration has no queued Opened event. Its
-                    // snapshot must be reanchored too, rather than silently baselined late.
-                    let reanchor = room_ids(&mut h.client)
-                        .await?
-                        .into_iter()
-                        .any(|(id, _, open, _)| open && !cursors.contains_key(&id));
-                    Ok((stream, cursors, seen, owner, reanchor))
+        // Setup and installation share the attachment lock: release/reattach cannot install an
+        // obsolete observer after replacing this node. Nothing posted after return is missed.
+        self.on_rt(async move {
+            let mut slot = held.lock().await;
+            let h = slot.as_mut().ok_or_else(not_attached)?;
+            stop_follow(&following);
+            h.mend().await?;
+            let mut cursors = HashMap::new();
+            let seen = session_revisions(&mut h.client).await?;
+            for (id, _, open, _) in room_ids(&mut h.client).await? {
+                if !open {
+                    continue;
                 }
-            })
-            .await?;
-        self.rt.spawn(follow(
-            stream, cursors, seen, held, owner, reanchor, listener,
-        ));
-        Ok(())
+                match ask(&mut h.client, &Request::ArrivalHead { channel_id: id }).await? {
+                    Frame::ArrivalHead { head } => {
+                        cursors.insert(id, head);
+                    }
+                    other => return Err(unexpected(&other)),
+                }
+            }
+            let identity = Arc::new(());
+            let owner = FollowOwner {
+                node: h.node.clone(),
+                fingerprint: h.client.me(),
+                attachment: Arc::clone(&h.attachment),
+                identity: Arc::clone(&identity),
+                following: Arc::downgrade(&following),
+            };
+            // Capture heads before registering: follow immediately reads the gap, then queued
+            // events only wake reads after those same saved cursors.
+            let mut stream = IpcClient::open_at(&h.at)
+                .await
+                .map_err(|e| said(&socket, e))?;
+            if h.at.using.node != owner.node || stream.me() != owner.fingerprint {
+                return Err(failed("the app's node identity changed"));
+            }
+            stream
+                .subscribe()
+                .await
+                .map_err(|e| failed(format!("cannot follow the node's events: {e}")))?;
+            // A room opened before registration has no queued Opened event. Reanchor instead
+            // of silently baselining that room after messages have already arrived.
+            let reanchor = room_ids(&mut h.client)
+                .await?
+                .into_iter()
+                .any(|(id, _, open, _)| open && !cursors.contains_key(&id));
+            let task_held = Arc::clone(&held);
+            // The start signal is only an installation barrier, never a delivery queue. It
+            // keeps even the immediate terminal callback outside the setup's Slot guard.
+            let (start, ready) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(async move {
+                if ready.await.is_err() {
+                    return;
+                }
+                if let Err(why) = follow(
+                    stream,
+                    cursors,
+                    seen,
+                    task_held,
+                    &owner,
+                    reanchor,
+                    listener.as_ref(),
+                )
+                .await
+                {
+                    if owner.current() {
+                        listener.on_ended(why).await;
+                    }
+                }
+            });
+            *following.lock().unwrap_or_else(PoisonError::into_inner) = Some(Subscription {
+                identity,
+                task: task.abort_handle(),
+            });
+            drop(slot);
+            let _ = start.send(());
+            Ok(())
+        })
+        .await
     }
 }
 
-/// The subscription remains bound to the same attached name and full identity on every read.
+/// Name and fingerprint bind the actor; the attachment token also rejects release/reattach of
+/// that same actor. Only a weak subscription slot is held, never the owner of this task.
 struct FollowOwner {
     node: NodeName,
     fingerprint: Option<Digest32>,
+    attachment: Arc<()>,
+    identity: Arc<()>,
+    following: Weak<Mutex<Option<Subscription>>>,
 }
 impl FollowOwner {
     fn holds(&self, held: &Held) -> bool {
-        held.node == self.node && held.client.me() == self.fingerprint
+        Arc::ptr_eq(&held.attachment, &self.attachment)
+            && held.node == self.node
+            && held.client.me() == self.fingerprint
+    }
+
+    fn current(&self) -> bool {
+        let Some(following) = self.following.upgrade() else {
+            return false;
+        };
+        let registered = following.lock().unwrap_or_else(PoisonError::into_inner);
+        registered
+            .as_ref()
+            .is_some_and(|s| Arc::ptr_eq(&s.identity, &self.identity))
+    }
+
+    /// Serialize only this scalar commit with replacement/release. No foreign call or IPC
+    /// wait occurs under the registration lock; an obsolete observer cannot advance afterward.
+    fn advance(&self, cursor: &mut HistoryCursor, arrival: u64) -> bool {
+        let Some(following) = self.following.upgrade() else {
+            return false;
+        };
+        let registered = following.lock().unwrap_or_else(PoisonError::into_inner);
+        if !registered
+            .as_ref()
+            .is_some_and(|s| Arc::ptr_eq(&s.identity, &self.identity))
+        {
+            return false;
+        }
+        cursor.arrival = arrival;
+        true
+    }
+
+    async fn notice(&self, listener: &dyn ClientListener, text: String) -> bool {
+        self.current() && listener.on_notice(text).await && self.current()
+    }
+
+    async fn sessions(&self, listener: &dyn ClientListener, room: Digest32) -> bool {
+        self.current() && listener.on_sessions(b32_encode(&room)).await && self.current()
     }
 }
 
@@ -5985,116 +6094,165 @@ async fn follow_head(
     }
 }
 
-/// Deliver one sealed arrival page, retaining only its scalar cursor. Rows already delivered
-/// never reappear merely because their bodies expired, their canonical order changed, or a wake
-/// was duplicated. The room instance fences deletion/rejoin; its old cursor cannot name a new log.
+enum FollowPage {
+    More,
+    CaughtUp,
+    Obsolete,
+}
+
+/// Hold one sealed arrival page, release Slot, then await each consumer acknowledgement. No
+/// foreign callback holds an IPC mutex or synchronously waits on the native executor. The
+/// scalar cursor advances only after consumption; the instance travels with every delivery.
 async fn follow_page(
     held: &Slot,
     owner: &FollowOwner,
     room: Digest32,
     cursor: &mut HistoryCursor,
     listener: &dyn ClientListener,
-) -> Result<bool, String> {
-    let mut slot = held.lock().await;
-    let h = slot
-        .as_mut()
-        .filter(|h| owner.holds(h))
-        .ok_or_else(|| "the app released or changed its node".to_owned())?;
-    h.mend().await.map_err(|e| e.to_string())?;
-    if !owner.holds(h) {
-        return Err("the app's node identity changed".into());
+) -> Result<FollowPage, String> {
+    if !owner.current() {
+        return Ok(FollowPage::Obsolete);
     }
-    let (rows, instance, next) = match ask(
-        &mut h.client,
-        &Request::ArrivalPage {
-            channel_id: room,
-            after: *cursor,
-        },
-    )
-    .await
-    .map_err(|e| e.to_string())?
-    {
-        Frame::ArrivalPage {
-            rows,
-            instance,
-            next,
-        } => (rows, instance, next),
-        other => return Err(unexpected(&other).to_string()),
+    let (messages, instance, next, last) = {
+        let mut slot = held.lock().await;
+        let h = slot
+            .as_mut()
+            .filter(|h| owner.holds(h))
+            .ok_or_else(|| "the app released or changed its node".to_owned())?;
+        h.mend().await.map_err(|e| e.to_string())?;
+        if !owner.holds(h) {
+            return Err("the app's node identity changed".into());
+        }
+        let (rows, instance, next) = match ask(
+            &mut h.client,
+            &Request::ArrivalPage {
+                channel_id: room,
+                after: *cursor,
+            },
+        )
+        .await
+        .map_err(|e| e.to_string())?
+        {
+            Frame::ArrivalPage {
+                rows,
+                instance,
+                next,
+            } => (rows, instance, next),
+            other => return Err(unexpected(&other).to_string()),
+        };
+        if instance != cursor.instance {
+            return Err(
+                "the saved room changed; refreshing its history and restarting observation".into(),
+            );
+        }
+        let mut last = cursor.arrival;
+        for row in &rows {
+            if row.arrival <= last || row.owed {
+                return Err("the room's arrival page did not advance consistently".into());
+            }
+            last = row.arrival;
+        }
+        if next.is_some_and(|n| {
+            n.instance != instance || n.arrival <= cursor.arrival || n.arrival < last
+        }) {
+            return Err("the room's arrival continuation did not advance consistently".into());
+        }
+        let names = names(&mut h.client).await.map_err(|e| e.to_string())?;
+        // Names are a separate exchange. A close/rejoin between the page and that exchange
+        // must not publish the old page under the new saved room's metadata.
+        let head = match ask(&mut h.client, &Request::ArrivalHead { channel_id: room })
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            Frame::ArrivalHead { head } => head,
+            other => return Err(unexpected(&other).to_string()),
+        };
+        if head.instance != instance {
+            return Err(
+                "the saved room changed; refreshing its history and restarting observation".into(),
+            );
+        }
+        let me = h.client.me().map(|f| b32_encode(&f));
+        let messages: Vec<_> = rows
+            .into_iter()
+            .map(|row| rendered(&row, &names, me.as_deref()))
+            .collect();
+        (messages, instance, next, last)
     };
-    if instance != cursor.instance {
-        // Ending, rather than a notice alone, enters NodeModel's existing same-node recovery:
-        // refresh authoritative facts, mark the selected room for reload, then resubscribe.
+    for message in messages {
+        if !owner.current()
+            || !listener
+                .on_message(b32_encode(&room), instance.to_vec(), message)
+                .await
+            || !owner.current()
+        {
+            return Ok(FollowPage::Obsolete);
+        }
+    }
+    // UI consumption may await its own client calls. Fence the saved room again, without
+    // retaining Slot over the callback or rereading any bodies, before committing this page.
+    if !owner.current() {
+        return Ok(FollowPage::Obsolete);
+    }
+    let head = follow_head(held, owner, room).await?;
+    if !owner.current() {
+        return Ok(FollowPage::Obsolete);
+    }
+    if head.instance != instance {
         return Err(
             "the saved room changed; refreshing its history and restarting observation".into(),
         );
     }
-    let mut last = cursor.arrival;
-    for row in &rows {
-        if row.arrival <= last || row.owed {
-            return Err("the room's arrival page did not advance consistently".into());
-        }
-        last = row.arrival;
+    if !owner.advance(cursor, next.map_or(last, |n| n.arrival)) {
+        return Ok(FollowPage::Obsolete);
     }
-    if next
-        .is_some_and(|n| n.instance != instance || n.arrival <= cursor.arrival || n.arrival < last)
-    {
-        return Err("the room's arrival continuation did not advance consistently".into());
-    }
-    let names = names(&mut h.client).await.map_err(|e| e.to_string())?;
-    let me = h.client.me().map(|f| b32_encode(&f));
-    // Keep the held-node fence through these synchronous callbacks; a different attach cannot
-    // supply names for this node's page or receive its callbacks between the read and delivery.
-    for row in rows {
-        listener.on_message(b32_encode(&room), rendered(&row, &names, me.as_deref()));
-    }
-    cursor.arrival = next.map_or(last, |n| n.arrival);
-    Ok(next.is_some())
+    Ok(if next.is_some() {
+        FollowPage::More
+    } else {
+        FollowPage::CaughtUp
+    })
 }
 
-/// The event loop behind [`VoxClient::subscribe`]. Events wake a bounded durable arrival read;
-/// they are not a second delivery route requiring a lifetime set of every delivered hash.
+/// Events only wake durable arrival reads. Native consumption backpressures this one task;
+/// a slow listener does not create a body queue, task per message or lifetime dedup set.
 async fn follow(
     mut stream: IpcClient,
     mut cursors: HashMap<Digest32, HistoryCursor>,
     mut seen: HashMap<Digest32, Digest32>,
     held: Slot,
-    owner: FollowOwner,
+    owner: &FollowOwner,
     reanchor: bool,
-    listener: Arc<dyn ClientListener>,
-) {
-    if reanchor {
-        listener.on_ended(
-            "a room opened while observation started; refreshing its history and restarting observation"
-                .into(),
-        );
-        return;
+    listener: &dyn ClientListener,
+) -> Result<(), String> {
+    if !owner.current() {
+        return Ok(());
     }
-    // An arrival between the saved heads and subscription registration has no queued event.
-    // Catch it once without waiting for another message; event-driven reads use these same
-    // cursors, so a row also represented by a queued event is not delivered twice.
+    if reanchor {
+        return Err("a room opened while observation started; refreshing its history and restarting observation".into());
+    }
+    // Close the head-to-subscribe race once; queued events subsequently use these same cursors.
     let initial_rooms: Vec<_> = cursors.keys().copied().collect();
     for (&room, cursor) in &mut cursors {
         loop {
-            match follow_page(&held, &owner, room, cursor, listener.as_ref()).await {
-                Ok(true) => tokio::task::yield_now().await,
-                Ok(false) => break,
-                Err(why) => {
-                    listener.on_ended(why);
-                    return;
-                }
+            match follow_page(&held, owner, room, cursor, listener).await? {
+                FollowPage::More => tokio::task::yield_now().await,
+                FollowPage::CaughtUp => break,
+                FollowPage::Obsolete => return Ok(()),
             }
         }
     }
-    if !sessions_told(&initial_rooms, &mut seen, &held, &owner, listener.as_ref()).await {
-        return;
+    if !sessions_told(&initial_rooms, &mut seen, &held, owner, listener).await? {
+        return Ok(());
     }
     loop {
         let event = stream.next().await;
+        if !owner.current() {
+            return Ok(());
+        }
         {
             let slot = held.lock().await;
             if !slot.as_ref().is_some_and(|h| owner.holds(h)) {
-                listener.on_ended("the app released or changed its node".into());
-                return;
+                return Err("the app released or changed its node".into());
             }
         }
         let mut sessions_in = Vec::new();
@@ -6119,34 +6277,29 @@ async fn follow(
                     NodeEvent::SenderKeyReceived { channel_id, .. } => Some(*channel_id),
                     _ => None,
                 };
-                listener.on_notice(ev.words());
+                if !owner.notice(listener, ev.words()).await {
+                    return Ok(());
+                }
                 room.filter(|r| cursors.contains_key(r))
                     .into_iter()
                     .collect()
             }
             Ok(Some(Frame::Event(ev @ NodeEvent::ChannelOpened { channel_id }))) => {
                 let Some(previous) = cursors.get(&channel_id) else {
-                    // The event has no opening arrival baseline. A current head could skip
-                    // later queued arrivals; explicit recovery reloads the selected snapshot
-                    // before following this room, without replaying all its old messages.
-                    listener.on_ended(
+                    return Err(
                         "a room opened; refreshing its history and restarting observation".into(),
                     );
-                    return;
                 };
-                match follow_head(&held, &owner, channel_id).await {
-                    Ok(head) => {
-                        if previous.instance != head.instance {
-                            listener.on_ended("the saved room changed; refreshing its history and restarting observation".into());
-                            return;
-                        }
-                    }
-                    Err(why) => {
-                        listener.on_ended(why);
-                        return;
-                    }
+                let head = follow_head(&held, owner, channel_id).await?;
+                if previous.instance != head.instance {
+                    return Err(
+                        "the saved room changed; refreshing its history and restarting observation"
+                            .into(),
+                    );
                 }
-                listener.on_notice(ev.words());
+                if !owner.notice(listener, ev.words()).await {
+                    return Ok(());
+                }
                 sessions_in.push(channel_id);
                 vec![channel_id]
             }
@@ -6156,8 +6309,11 @@ async fn follow(
             ))) => {
                 cursors.remove(&channel_id);
                 seen.remove(&channel_id);
-                listener.on_notice(ev.words());
-                listener.on_sessions(b32_encode(&channel_id));
+                if !owner.notice(listener, ev.words()).await
+                    || !owner.sessions(listener, channel_id).await
+                {
+                    return Ok(());
+                }
                 Vec::new()
             }
             Ok(Some(Frame::Event(NodeEvent::SessionEntry { channel_id, .. }))) => {
@@ -6168,62 +6324,46 @@ async fn follow(
                 if matches!(ev, NodeEvent::CapabilityChanged { .. }) {
                     sessions_in.extend(cursors.keys().copied());
                 }
-                listener.on_notice(ev.words());
+                if !owner.notice(listener, ev.words()).await {
+                    return Ok(());
+                }
                 Vec::new()
             }
             Ok(Some(Frame::Lagged { .. })) => {
-                // A lost open/close event must not leave another room's cursor attached to the
-                // wrong incarnation. Existing rooms keep their exact arrival cursor; an unknown
-                // room needs explicit snapshot recovery rather than a silently advanced head.
+                // A lost open/close event must not silently attach an old cursor to a new log.
                 let open = {
                     let mut slot = held.lock().await;
-                    let Some(h) = slot.as_mut().filter(|h| owner.holds(h)) else {
-                        listener.on_ended("the app released or changed its node".into());
-                        return;
-                    };
-                    if let Err(error) = h.mend().await {
-                        listener.on_ended(error.to_string());
-                        return;
-                    }
+                    let h = slot
+                        .as_mut()
+                        .filter(|h| owner.holds(h))
+                        .ok_or_else(|| "the app released or changed its node".to_owned())?;
+                    h.mend().await.map_err(|e| e.to_string())?;
                     if !owner.holds(h) {
-                        listener.on_ended("the app's node identity changed".into());
-                        return;
+                        return Err("the app's node identity changed".into());
                     }
-                    match room_ids(&mut h.client).await {
-                        Ok(rooms) => rooms
-                            .into_iter()
-                            .filter(|r| r.2)
-                            .map(|r| r.0)
-                            .collect::<Vec<_>>(),
-                        Err(error) => {
-                            listener.on_ended(error.to_string());
-                            return;
-                        }
-                    }
+                    room_ids(&mut h.client)
+                        .await
+                        .map_err(|e| e.to_string())?
+                        .into_iter()
+                        .filter(|r| r.2)
+                        .map(|r| r.0)
+                        .collect::<Vec<_>>()
                 };
                 cursors.retain(|room, _| open.contains(room));
                 seen.retain(|room, _| open.contains(room));
                 if open.iter().any(|room| !cursors.contains_key(room)) {
-                    listener.on_ended(
-                        "a room opened while events were missed; refreshing its history and restarting observation".into(),
-                    );
-                    return;
+                    return Err("a room opened while events were missed; refreshing its history and restarting observation".into());
                 }
-                listener.on_notice(
-                    "room observation caught up after missed events; refreshing the visible rooms"
-                        .into(),
-                );
+                if !owner.notice(listener,
+                    "room observation caught up after missed events; refreshing the visible rooms".into()
+                ).await { return Ok(()); }
                 open
             }
             Ok(Some(Frame::NodeDetached { node })) => {
-                listener.on_ended(format!("the connection to node {node} ended"));
-                return;
+                return Err(format!("the connection to node {node} ended"));
             }
             Ok(Some(_)) => continue,
-            Ok(None) | Err(_) => {
-                listener.on_ended("the vox daemon stopped".to_owned());
-                return;
-            }
+            Ok(None) | Err(_) => return Err("the vox daemon stopped".into()),
         };
         sessions_in.extend(rooms.iter().copied());
         for room in rooms {
@@ -6231,67 +6371,61 @@ async fn follow(
                 continue;
             };
             loop {
-                match follow_page(&held, &owner, room, cursor, listener.as_ref()).await {
-                    Ok(true) => {
-                        tokio::task::yield_now().await;
-                    }
-                    Ok(false) => break,
-                    Err(why) => {
-                        listener.on_ended(why);
-                        return;
-                    }
+                match follow_page(&held, owner, room, cursor, listener).await? {
+                    FollowPage::More => tokio::task::yield_now().await,
+                    FollowPage::CaughtUp => break,
+                    FollowPage::Obsolete => return Ok(()),
                 }
             }
         }
         sessions_in.sort_unstable();
         sessions_in.dedup();
         sessions_in.retain(|r| cursors.contains_key(r));
-        if !sessions_told(&sessions_in, &mut seen, &held, &owner, listener.as_ref()).await {
-            return;
+        if !sessions_told(&sessions_in, &mut seen, &held, owner, listener).await? {
+            return Ok(());
         }
     }
 }
 
-/// Compare opaque room projection tokens, including activity and drive authority.
-/// Native clients refresh the displayed page and selected Session on this notification.
+/// Compare one projection token per room. No IPC guard crosses a foreign callback, including
+/// error notices; an obsolete consumer ends observation without notifying its replacement.
 async fn sessions_told(
     rooms: &[Digest32],
     seen: &mut HashMap<Digest32, Digest32>,
     held: &Slot,
     owner: &FollowOwner,
     listener: &dyn ClientListener,
-) -> bool {
+) -> Result<bool, String> {
     if rooms.is_empty() {
-        return true;
+        return Ok(owner.current());
     }
     let now = {
         let mut slot = held.lock().await;
-        let Some(h) = slot.as_mut().filter(|h| owner.holds(h)) else {
-            listener.on_ended("the app released its node".to_owned());
-            return false;
-        };
-        if let Err(error) = h.mend().await {
-            listener.on_notice(error.to_string());
-            return true;
-        }
-        if !owner.holds(h) {
-            listener.on_ended("the app's node identity changed".into());
-            return false;
-        }
-        match session_revisions(&mut h.client).await {
-            Ok(now) => now,
-            Err(error) => {
-                listener.on_notice(error.to_string());
-                return true;
+        let h = slot
+            .as_mut()
+            .filter(|h| owner.holds(h))
+            .ok_or_else(|| "the app released its node".to_owned())?;
+        match h.mend().await {
+            Err(error) => Err(error.to_string()),
+            Ok(()) => {
+                if !owner.holds(h) {
+                    return Err("the app's node identity changed".into());
+                }
+                session_revisions(&mut h.client)
+                    .await
+                    .map_err(|e| e.to_string())
             }
         }
     };
+    let now = match now {
+        Ok(now) => now,
+        Err(why) => return Ok(owner.notice(listener, why).await),
+    };
     for &room in rooms {
-        if seen.get(&room) != now.get(&room) {
-            listener.on_sessions(b32_encode(&room));
+        if seen.get(&room) != now.get(&room) && !owner.sessions(listener, room).await {
+            return Ok(false);
         }
-        // This callback covers only the requested room. Advancing another room's token
-        // here would swallow its later notification without refreshing its visible state.
+        // Only advance tokens whose invalidation has actually been consumed.
         match now.get(&room) {
             Some(revision) => {
                 seen.insert(room, *revision);
@@ -6301,5 +6435,5 @@ async fn sessions_told(
             }
         }
     }
-    true
+    Ok(owner.current())
 }
