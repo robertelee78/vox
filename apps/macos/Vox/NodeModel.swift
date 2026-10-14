@@ -179,6 +179,7 @@ final class NodeModel: ObservableObject {
     private var roomBefore: String?
     private var roomInstance: Data?
     @Published private var roomHasNewer = false
+    @Published private(set) var roomReloadNeeded = false
     private static let roomWindowLimit = 128
     @Published private var roomReadingOlder = false
 
@@ -760,7 +761,7 @@ final class NodeModel: ObservableObject {
     }
 
     private func readNewOnScreen() async {
-        guard case let .room(id) = selection, ended == nil else { return }
+        guard case let .room(id) = selection, ended == nil, !roomReloadNeeded else { return }
         let generation = roomReadGeneration, epoch = nodeObservationEpoch
         let revision = roomMessageRevision, follows = timelineFollowingNewest
         let loaded = messages.map(\.id), instance = roomInstance
@@ -796,8 +797,17 @@ final class NodeModel: ObservableObject {
             }
         } catch {
             guard current() else { return }
+            retireRefusedRoomRead(error)
             reportBackground(error)
         }
+    }
+
+    private func retireRefusedRoomRead(_ error: Error) {
+        guard case VoxError.Failed = error else { return }
+        messages = []
+        roomOlder = 0
+        roomBefore = nil
+        roomReloadNeeded = true
     }
 
     /// Only a refused forward history mark warrants reanchoring. A disconnect, permission
@@ -833,6 +843,7 @@ final class NodeModel: ObservableObject {
             roomBefore = page.before
         } catch {
             guard generation == roomReadGeneration, roomOnScreen == room, ended == nil else { return }
+            retireRefusedRoomRead(error)
             reportBackground(error)
         }
     }
@@ -1076,6 +1087,7 @@ final class NodeModel: ObservableObject {
         roomBefore = nil
         roomInstance = nil
         roomHasNewer = false
+        roomReloadNeeded = false
         unreadFrom = nil
         unreadCount = 0
         readBy = [:]
@@ -2607,7 +2619,7 @@ final class NodeModel: ObservableObject {
             let preview = Preview(message, me: me)
             if rooms[i].last != preview { rooms[i].last = preview }
         }
-        if case .room(room) = selection {
+        if case .room(room) = selection, !roomReloadNeeded {
             // A message already shown is replaced: one whose body had not arrived ("not received
             // yet", owed) is shown, and read, once it has; before, it stayed owed until the room
             // was opened again, and was never read.
@@ -2679,6 +2691,7 @@ final class NodeModel: ObservableObject {
         roomBefore = nil
         roomInstance = nil
         roomHasNewer = false
+        roomReloadNeeded = false
         unreadFrom = nil
         unreadCount = 0
         sessionPages.clear()
@@ -2949,6 +2962,7 @@ extension NodeModel {
             guard roomOnScreen == room, showing == destination, epoch == nodeObservationEpoch else { return }
             await readSession()
         } else {
+            roomReloadNeeded = false
             await readNewOnScreen()
         }
     }

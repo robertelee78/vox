@@ -1007,6 +1007,12 @@ private struct RoomView: View {
                                         }
                                         .accessibilityIdentifier("session-reload-newest")
                                     }
+                                    if !model.showingSession && model.roomReloadNeeded {
+                                        Button("Reload newest messages") {
+                                            Task { await model.readNewestTimeline() }
+                                        }
+                                        .accessibilityIdentifier("room-reload-newest")
+                                    }
                                     ForEach(items) { item in
                                         // A new day starts above the first line that falls on it.
                                         if let day = days[item.id] {
