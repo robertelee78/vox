@@ -1573,6 +1573,53 @@ final class NodeModel: ObservableObject {
         return nil
     }
 
+    /// A sheet's search results belong to this exact actor, room generation and sheet.
+    var anchorChoiceContext: String {
+        me + "/" + nodeObservationEpoch.uuidString + "/" + roomReadGeneration.uuidString
+            + "/" + (sheet?.rawValue ?? "closed")
+    }
+
+    func searchRoomAnchorChoices(context: String) async throws -> [RoomAnchorEndpoint] {
+        guard context == anchorChoiceContext, ended == nil,
+              sheet == .newRoom || sheet == .roomAnchors else { throw CancellationError() }
+        let found = try await client.searchAnchors()
+        guard !Task.isCancelled, context == anchorChoiceContext, ended == nil else { throw CancellationError() }
+        return found
+    }
+
+    func resolveRoomAnchorChoice(_ input: String, context: String) async throws -> RoomAnchorEndpoint {
+        guard context == anchorChoiceContext, ended == nil,
+              sheet == .newRoom || sheet == .roomAnchors else { throw CancellationError() }
+        let found = try await client.resolveAnchorEndpoint(input: input)
+        guard !Task.isCancelled, context == anchorChoiceContext, ended == nil else { throw CancellationError() }
+        return found
+    }
+
+    /// Create from a snapshot of explicitly kept, already numeric endpoints. Search and DNS
+    /// never hold this mutation, and closing/changing the sheet retires its UI publication.
+    func createRoom(_ name: String, passphrase secret: Secret, anchors: [RoomAnchorEndpoint],
+                    context: String) async -> Bool {
+        let operation = "create-room", attempt = begin("create-room")
+        defer { end(attempt) }
+        guard context == anchorChoiceContext, sheet == .newRoom, ended == nil else { secret.wipe(); return false }
+        do {
+            let passphrase = try secret.passphrase()
+            defer { passphrase.wipe() }
+            let room = try await client.createRoomWithAnchors(name: name, passphrase: passphrase,
+                                                             anchors: anchors, node: me)
+            guard !Task.isCancelled, context == anchorChoiceContext, ended == nil else { return false }
+            report(operation: operation, done: "Created the room.")
+            await refresh()
+            guard !Task.isCancelled, context == anchorChoiceContext, ended == nil else { return false }
+            await show(.room(room))
+            return true
+        } catch {
+            guard !Task.isCancelled, context == anchorChoiceContext, ended == nil else { return false }
+            report(error, operation: operation)
+            return false
+        }
+    }
+
     /// Create a room named `name` under `passphrase`, and show it.
     func createRoom(_ name: String, passphrase secret: Secret) async -> Bool {
         let operation = "create-room"

@@ -218,11 +218,13 @@ struct RoomAnchorEditor: View {
     @ObservedObject var model: NodeModel
     @Environment(\.dismiss) private var dismiss
     @State private var input = ""
+    @StateObject private var choices = RoomAnchorChoices()
     var body: some View {
         VStack(alignment: .leading, spacing: Space.s16) {
             Text("Room Anchors").font(.title2)
             Text("Anchors bridge peers that cannot connect directly. Changes apply to this room's members only; direct connections do not need one.")
                 .secondaryText().fixedSize(horizontal: false, vertical: true)
+            RoomAnchorSearch(model: model, choices: choices, applyingToRoom: true)
             RoomAnchorInput(input: $input, busy: model.roomAnchorChanging,
                             allowed: model.canManageRoomAnchors) {
                 let value = input.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -274,5 +276,113 @@ struct RoomAnchorEditor: View {
         .contentSurface()
         .accessibilityIdentifier("room-anchor-editor")
         .task { await model.loadRoomAnchorState() }
+    }
+}
+
+/// Optional, explicit discovery shared by New Room and the authorized room editor.
+@MainActor
+final class RoomAnchorChoices: ObservableObject {
+    @Published private(set) var found: [RoomAnchorEndpoint] = []
+    @Published private(set) var kept: [RoomAnchorEndpoint] = []
+    @Published private(set) var busy = false
+    @Published private(set) var searched = false
+    @Published private(set) var noSearchAnswers = false
+    @Published private(set) var problem: String?
+    private var generation = UUID()
+    func retire() {
+        generation = UUID(); found = []; kept = []; busy = false; searched = false; noSearchAnswers = false; problem = nil
+    }
+    func request(_ model: NodeModel, input: String? = nil) async {
+        guard !busy else { return }
+        let request = UUID(), context = model.anchorChoiceContext
+        generation = request; busy = true; problem = nil
+        defer { if generation == request { busy = false } }
+        do {
+            let result: [RoomAnchorEndpoint]
+            if let input { result = [try await model.resolveRoomAnchorChoice(input, context: context)] }
+            else { result = try await model.searchRoomAnchorChoices(context: context) }
+            guard !Task.isCancelled, generation == request, model.anchorChoiceContext == context else { return }
+            if input == nil {
+                searched = true
+                noSearchAnswers = result.isEmpty
+                found = kept
+            }
+            for endpoint in result where !kept.contains(where: { $0.fingerprint == endpoint.fingerprint }) {
+                found.removeAll { $0.fingerprint == endpoint.fingerprint }
+                found.append(endpoint)
+            }
+        } catch {
+            guard !Task.isCancelled, generation == request, model.anchorChoiceContext == context else { return }
+            problem = sentence(error)
+        }
+    }
+    func keep(_ endpoint: RoomAnchorEndpoint) {
+        kept.removeAll { $0.fingerprint == endpoint.fingerprint }; kept.append(endpoint)
+    }
+    func remove(_ endpoint: RoomAnchorEndpoint) { kept.removeAll { $0.fingerprint == endpoint.fingerprint } }
+}
+
+struct RoomAnchorSearch: View {
+    @ObservedObject var model: NodeModel
+    @ObservedObject var choices: RoomAnchorChoices
+    var applyingToRoom = false
+    @State private var input = ""
+    var body: some View {
+        VStack(alignment: .leading, spacing: Space.s8) {
+            Text("Anchors (optional)").fontWeight(.semibold)
+            Text("Directly reachable peers need no anchor. Search nearby only when you ask; keep only the fingerprints and addresses you want this room to use.")
+                .secondaryText().fixedSize(horizontal: false, vertical: true)
+            Button("Search Nearby Now") { Task { await choices.request(model) } }
+                .disabled(choices.busy || (applyingToRoom && !model.canManageRoomAnchors))
+                .accessibilityIdentifier("room-anchor-search")
+            HStack {
+                TextField("fingerprint@address or host:port", text: $input)
+                    .accessibilityIdentifier("room-anchor-choice-input")
+                Button("Resolve") {
+                    let value = input.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !value.isEmpty else { return }
+                    Task { await choices.request(model, input: value) }
+                }.disabled(choices.busy || input.isEmpty || (applyingToRoom && !model.canManageRoomAnchors))
+            }
+            if choices.busy { ProgressView("Looking for anchors…") }
+            if choices.searched && !choices.busy && choices.noSearchAnswers {
+                Text(applyingToRoom ? "No anchors found. This room's configuration is unchanged."
+                     : "No anchors found. You can create without one.").secondaryText()
+            }
+            ScrollView {
+                VStack(alignment: .leading, spacing: Space.s8) {
+                    ForEach(choices.found, id: \.fingerprint) { endpoint in
+                        VStack(alignment: .leading, spacing: Space.s4) {
+                            Text(endpoint.fingerprint).font(Theme.mono).textSelection(.enabled)
+                            Text(endpoint.addresses.joined(separator: ", ")).font(Theme.mono).textSelection(.enabled)
+                            if !applyingToRoom && choices.kept.contains(where: { $0.fingerprint == endpoint.fingerprint }) {
+                                Button("Remove") { choices.remove(endpoint) }
+                            } else {
+                                Button(applyingToRoom ? "Keep for This Room" : "Keep") {
+                                    if applyingToRoom {
+                                        let context = model.anchorChoiceContext
+                                        Task {
+                                            for address in endpoint.addresses {
+                                                guard !Task.isCancelled, model.anchorChoiceContext == context else { return }
+                                                guard await model.changeRoomAnchor(input: endpoint.fingerprint + "@" + address) else { return }
+                                                guard !Task.isCancelled, model.anchorChoiceContext == context else { return }
+                                            }
+                                        }
+                                    } else { choices.keep(endpoint) }
+                                }.disabled(applyingToRoom && (!model.canManageRoomAnchors || model.roomAnchorChanging))
+                            }
+                        }.accessibilityIdentifier("room-anchor-choice-" + endpoint.fingerprint)
+                    }
+                }
+            }.frame(maxHeight: 140)
+            if let problem = choices.problem { Text(problem).foregroundStyle(VoxTokens.Colors.danger) }
+            if !applyingToRoom {
+                Text(choices.kept.isEmpty ? "The room link will carry no anchors."
+                     : "The room link will carry: " + choices.kept.map { $0.fingerprint + "@" + $0.addresses.joined(separator: ", ") }.joined(separator: "; "))
+                    .secondaryText().fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .onChange(of: model.anchorChoiceContext) { _, _ in choices.retire() }
+        .onDisappear { choices.retire() }
     }
 }
