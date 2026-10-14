@@ -2765,13 +2765,22 @@ extension NodeModel {
     /// Each open room's approvals and questions waiting on this node (CL-2), as the TUI counts
     /// them: what its Sessions say waits on this node.
     func readWaiting() async {
+        let epoch = nodeObservationEpoch
         for room in rooms where room.open {
-            guard let listed = try? await client.sessions(room: room.id) else { continue }
-            let n = listed.reduce(0) { $0 + Int($1.pending) }
-            if let i = rooms.firstIndex(where: { $0.id == room.id }), rooms[i].waiting != n {
-                rooms[i].waiting = n
+            do {
+                let count = try await client.sessionsWaiting(room: room.id)
+                guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
+                guard let n = Int(exactly: count) else {
+                    throw VoxError.Failed(reason: "The node's waiting count cannot be displayed accurately.")
+                }
+                if let i = rooms.firstIndex(where: { $0.id == room.id && $0.open }),
+                   rooms[i].waiting != n { rooms[i].waiting = n }
+            } catch {
+                guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
+                reportBackground(error)
             }
         }
+        guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
         await noteWaiting()
     }
 
