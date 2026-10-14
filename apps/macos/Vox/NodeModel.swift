@@ -2804,27 +2804,39 @@ extension NodeModel {
         await noteWaiting()
     }
 
-    /// The requests open in `room`'s Sessions this node drives, waiting on it, in each Session's
-    /// order: `(node, session, reference, label)`.
+    /// Current pending targets come from the node's index; ended Session history and
+    /// resolution transcripts are never collected to discover them.
     private func waiting(in room: String) async -> [(node: String, session: String, reference: String, label: String)] {
-        guard let listed = try? await client.sessions(room: room) else { return [] }
+        let epoch = nodeObservationEpoch
+        var after: String?
         var found: [(node: String, session: String, reference: String, label: String)] = []
-        for s in listed where s.pending > 0 && s.canDrive && s.open {
-            guard let requests = try? await client.sessionRequests(room: room, node: s.nodeFingerprint,
-                sessionId: s.sessionId, references: []) else { continue }
-            for e in requests {
-                if let r = e.request, r.state == nil {
-                    found.append((s.nodeFingerprint, s.sessionId, r.reference, s.label))
+        do {
+            repeat {
+                let page = try await client.sessionsPendingPage(room: room, after: after)
+                guard epoch == nodeObservationEpoch, !Task.isCancelled else { return [] }
+                for target in page.targets {
+                    guard let session = try await client.session(room: room, node: target.node,
+                        sessionId: target.sessionId), session.open, session.canDrive else { continue }
+                    let head = try await client.sessionRead(room: room, node: target.node,
+                        sessionId: target.sessionId)
+                    let held = try await client.sessionEntries(room: room, node: target.node,
+                        sessionId: target.sessionId, instance: head.instance, ids: [target.entry])
+                    guard epoch == nodeObservationEpoch, !Task.isCancelled else { return [] }
+                    if let request = held.entries.first(where: { $0.id == target.entry })?.request,
+                       request.state == nil {
+                        found.append((target.node, target.sessionId, request.reference, session.label))
+                    }
                 }
-            }
+                if let next = page.next, next == after {
+                    throw VoxError.Failed(reason: "The pending request page did not advance.")
+                }
+                after = page.next
+            } while after != nil
+        } catch {
+            guard epoch == nodeObservationEpoch, !Task.isCancelled else { return [] }
+            reportBackground(error)
         }
         return found
-    }
-
-    /// The first request waiting in `room`, for ⌘J.
-    private func firstWaiting(in room: String) async -> (node: String, session: String, reference: String)? {
-        guard let w = await waiting(in: room).first else { return nil }
-        return (w.node, w.session, w.reference)
     }
 
     /// A request that is new since the last look notifies, once per Session, replacing that
