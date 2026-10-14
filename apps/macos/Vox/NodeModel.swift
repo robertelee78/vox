@@ -3231,13 +3231,9 @@ extension NodeModel {
             guard current() else { return }
             selectedSessionMetadata = found
             selectedSessionMetadataKnown = true
-            if found == nil {
-                sessionPages.clear()
-                sessionWindowRevision = UUID()
-                selectedEarlierRequest = nil
-                sessionNote = "This Session's opening is no longer available."
-                sessionLoading = false
-            }
+            // Only this successful exact lookup can revoke the selected tab. Its absence
+            // from a bounded open/history page is not evidence that access disappeared.
+            if found == nil || found?.canDrive == false { showing = .general }
         } catch {
             guard current() else { return }
             selectedSessionMetadata = nil
