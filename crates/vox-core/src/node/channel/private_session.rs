@@ -766,7 +766,8 @@ impl ChannelState {
         self.private_sessions.pending_active = true;
         self.private_sessions.pending_after = None;
         self.private_sessions.pending_through = self.private_sessions.next;
-        if !self.private_sessions.upgrading
+        if self.private_policy_ready(store, now)?
+            && !self.private_sessions.upgrading
             && !self.private_sessions.restoring
             && self.private_sessions.legacy_work.is_none()
             && self.private_sessions.legacy_pending.is_empty()
@@ -785,6 +786,9 @@ impl ChannelState {
     fn advance_pending_private(&mut self, store: &Store, now: u64) -> Result<bool> {
         if !self.private_sessions.pending_active {
             return Ok(true);
+        }
+        if !self.private_policy_ready(store, now)? {
+            return Ok(false);
         }
         let mut bytes = 0usize;
         for _ in 0..WORK_ROWS {
@@ -812,6 +816,11 @@ impl ChannelState {
                 ))
             {
                 if let Err(error) = self.take_private_record(store, &saved.record.wire(), now) {
+                    // A policy replay is not a verdict on the saved wire. Keep both the
+                    // record and the last completed cursor so the same row can be retried.
+                    if super::governance::refreshing(&error) {
+                        return Ok(false);
+                    }
                     if self.poisoned {
                         return Err(error);
                     }
@@ -1662,7 +1671,10 @@ impl ChannelState {
     }
 
     fn take_private_record(&mut self, store: &Store, wire: &[u8], now: u64) -> Result<()> {
-        self.require_governance_ready(store, crate::time::Ms(now))?;
+        if let Err(error) = self.require_governance_ready(store, crate::time::Ms(now)) {
+            self.private_save_failed(&error);
+            return Err(error);
+        }
         let record = Record::read(wire)?;
         let hash = record.hash();
         let known = (|| {
