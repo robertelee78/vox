@@ -1,6 +1,7 @@
 //! Fixed-size sealed retention facts. Age indexes select a bounded due prefix; changing
 //! the local/shared TTL changes only the cutoff, never rewrites every retained row.
 
+use super::dag_facts::successor;
 use super::*;
 use crate::node::retention::Tracked;
 
