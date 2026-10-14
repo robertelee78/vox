@@ -2353,14 +2353,16 @@ final class NodeModel: ObservableObject {
             readMarkEpoch = nodeObservationEpoch
         }
         guard case .room(room) = selection, byID[message.id] != nil, message.author != me,
-              !message.owed, !marked.contains(message.id),
-              !pendingReadIDs.contains(message.id) else { return }
+              !message.owed, let instance = roomInstance else { return }
+        let context = ReadContext(room: room, actor: me, instance: instance)
+        let mark = ReadMark(context: context, id: message.id)
+        guard !marked.contains(mark), !pendingReadIDs.contains(mark) else { return }
         // Backpressure leaves the row unread. A later visible-row pass retries it;
         // no unread badge is decremented and no successful mark is claimed here.
         guard pendingReadIDs.count < Self.pendingReadLimit else { return }
-        pendingReadIDs.insert(message.id)
-        if unmarked[room] == nil { readRoomOrder.append(room) }
-        unmarked[room, default: []].append(message.id)
+        pendingReadIDs.insert(mark)
+        if unmarked[context] == nil { readRoomOrder.append(context) }
+        unmarked[context, default: []].append(mark)
         guard flushing == nil else { return }
         let epoch = nodeObservationEpoch
         flushing = Task { [weak self] in
@@ -2378,11 +2380,17 @@ final class NodeModel: ObservableObject {
             // their slots in the shared 1024 budget, so a slow daemon cannot grow a backlog.
             while epoch == self.nodeObservationEpoch, !Task.isCancelled,
                   !self.readRoomOrder.isEmpty {
-                let room = self.readRoomOrder.removeFirst()
-                guard let ids = self.unmarked.removeValue(forKey: room) else { continue }
+                let context = self.readRoomOrder.removeFirst()
+                guard let pending = self.unmarked.removeValue(forKey: context) else { continue }
+                let ids = Array(pending.prefix(Self.roomWindowLimit))
+                if pending.count > ids.count {
+                    self.unmarked[context] = Array(pending.dropFirst(ids.count))
+                    self.readRoomOrder.append(context)
+                }
                 var acknowledged = false
                 do {
-                    try await self.client.markRead(room: room, ids: ids)
+                    try await self.client.markReadAt(room: context.room, node: context.actor,
+                        instance: context.instance, ids: ids.map(\.id))
                     guard epoch == self.nodeObservationEpoch, !Task.isCancelled else { return }
                     for id in ids {
                         if self.marked.insert(id).inserted { self.markedOrder.append(id) }
@@ -2391,8 +2399,8 @@ final class NodeModel: ObservableObject {
                         self.marked.remove(self.markedOrder.removeFirst())
                     }
                     acknowledged = true
-                    self.scheduleUnread(room)
-                    readLog.debug("marked read: \(ids.count) in \(room, privacy: .public)")
+                    self.scheduleUnread(context.room)
+                    readLog.debug("marked read: \(ids.count) in \(context.room, privacy: .public)")
                 } catch {
                     if epoch == self.nodeObservationEpoch && !Task.isCancelled {
                         self.reportBackground(error)
@@ -2410,11 +2418,20 @@ final class NodeModel: ObservableObject {
     private static let recentReadLimit = 1024
     private static let pendingReadLimit = 1024
     private var readMarkEpoch = UUID()
-    private var marked: Set<String> = []
-    private var markedOrder: [String] = []
-    private var pendingReadIDs: Set<String> = []
-    private var unmarked: [String: [String]] = [:]
-    private var readRoomOrder: [String] = []
+    private struct ReadContext: Hashable {
+        let room: String
+        let actor: String
+        let instance: Data
+    }
+    private struct ReadMark: Hashable {
+        let context: ReadContext
+        let id: String
+    }
+    private var marked: Set<ReadMark> = []
+    private var markedOrder: [ReadMark] = []
+    private var pendingReadIDs: Set<ReadMark> = []
+    private var unmarked: [ReadContext: [ReadMark]] = [:]
+    private var readRoomOrder: [ReadContext] = []
     private var flushing: Task<Void, Never>?
 
     /// The members of `room` other than this node, with the trust each has here.
@@ -2563,7 +2580,7 @@ final class NodeModel: ObservableObject {
             }
         }
         // Unread until drawn in view (this node's own never are), the room on screen too.
-        guard message.author != me, !marked.contains(message.id) else { return }
+        guard message.author != me else { return }
         guard rooms.contains(where: { $0.id == room }) else {
             // A room joined or made since the rooms were read (by `vox room join`, say): read
             // them again, then count it.
