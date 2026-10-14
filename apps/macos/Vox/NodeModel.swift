@@ -3465,7 +3465,7 @@ extension NodeModel {
     }
 
     private func refreshOpenThread() {
-        guard openThread != nil else { return }
+        guard openThread != nil, threadError == nil else { return }
         if threadLoading {
             threadPageDirty = true
             return
