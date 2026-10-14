@@ -325,6 +325,11 @@ const T_COUNT_REQ: u64 = 122;
 const T_TAGGED: u64 = 636;
 /// A thread's readable replies, by its root (ADR-033 TH-4).
 const T_THREAD: u64 = 755;
+/// The retained, readable replies behind a thread summary (#754).
+const T_THREAD_SUMMARY_REQ: u64 = 7540;
+const T_THREAD_SUMMARY: u64 = 7541;
+const T_ROOM_DISPLAY_REVISION_REQ: u64 = 7542;
+const T_ROOM_DISPLAY_REVISION: u64 = 7543;
 // ADR-028 RR-1: entries shown or drained, for a read record. Numbered by its story (#503).
 const T_MARK_READ: u64 = 503;
 // V210-164: leaving a room over the socket, as joining and creating one are. Numbered by its item,
@@ -902,8 +907,9 @@ pub enum Request {
         /// Return only matching rows **after** this one. Absent reads from the first.
         since: Option<Digest32>,
     },
-    /// A thread's replies, indexed by its General message, in arrival order. The root is
-    /// read with `Find`. Existing row pages bound each reply; nothing reads another room.
+    /// A thread's readable replies, indexed by its General message, in arrival order. The
+    /// root is read with `Find`. Opaque owed rows cannot establish thread membership and
+    /// are neither replies nor cursors. Pages are bounded by both row count and bytes.
     Thread {
         /// The room.
         channel_id: Digest32,
@@ -911,6 +917,21 @@ pub enum Request {
         root: Digest32,
         /// Only replies after this matching row.
         since: Option<Digest32>,
+    },
+    /// A thread's exact readable reply count and latest send time, with one bounded page of
+    /// authors in fingerprint order. The room's existing thread index supplies the summary.
+    ThreadSummary {
+        /// The room.
+        channel_id: Digest32,
+        /// The General message's entry hash.
+        root: Digest32,
+        /// Only authors after this fingerprint; absent starts the author list.
+        after_author: Option<Digest32>,
+    },
+    /// One open room's opaque published-display token, without reading its history.
+    RoomDisplayRevision {
+        /// The selected node's room.
+        channel_id: Digest32,
     },
     /// How many rows of a room follow `since` (all of them when absent), as [`Frame::Count`]
     /// (V210-120): what a reader that reads a page at a time says is still waiting.
@@ -1019,11 +1040,27 @@ impl Request {
                     .bytes(root)
                     .bytes(since.as_ref().map_or(&[][..], |d| &d[..]));
             }
+            Request::ThreadSummary {
+                channel_id,
+                root,
+                after_author,
+            } => {
+                e.array(4)
+                    .uint(T_THREAD_SUMMARY_REQ)
+                    .bytes(channel_id)
+                    .bytes(root)
+                    .bytes(after_author.as_ref().map_or(&[][..], |d| &d[..]));
+            }
             Request::Count { channel_id, since } => {
                 e.array(3)
                     .uint(T_COUNT_REQ)
                     .bytes(channel_id)
                     .bytes(since.as_ref().map_or(&[][..], |d| &d[..]));
+            }
+            Request::RoomDisplayRevision { channel_id } => {
+                e.array(2)
+                    .uint(T_ROOM_DISPLAY_REVISION_REQ)
+                    .bytes(channel_id);
             }
             Request::Unread { channel_id } => {
                 e.array(2).uint(T_UNREAD_REQ).bytes(channel_id);
@@ -1587,12 +1624,30 @@ impl Request {
                     since,
                 })
             }
+            (T_THREAD_SUMMARY_REQ, 4) => {
+                let channel_id = digest(&mut d)?;
+                let root = digest(&mut d)?;
+                let after_author = optional_digest(&mut d)?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::ThreadSummary {
+                    channel_id,
+                    root,
+                    after_author,
+                })
+            }
             (T_COUNT_REQ, 3) => {
                 let channel_id = digest(&mut d)?;
                 let since = optional_digest(&mut d)?;
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Count { channel_id, since })
+            }
+            (T_ROOM_DISPLAY_REVISION_REQ, 2) => {
+                let channel_id = digest(&mut d)?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::RoomDisplayRevision { channel_id })
             }
             (T_UNREAD_REQ, 2) => {
                 let channel_id = digest(&mut d)?;
@@ -2146,6 +2201,22 @@ pub enum Frame {
         /// The entry hash of the room's newest row, if it has any.
         last: Option<Digest32>,
     },
+    /// The answer to [`Request::ThreadSummary`], independent of the client's loaded timeline.
+    ThreadSummary {
+        /// All retained readable replies, excluding the starting message.
+        reply_count: u64,
+        /// Latest reply send time in milliseconds, zero when no reply is retained.
+        last_reply_millis: u64,
+        /// At most [`PAGE_ENTRIES`] distinct author fingerprints.
+        authors: Vec<Digest32>,
+        /// Continue after this author when another page remains.
+        next_author: Option<Digest32>,
+    },
+    /// The selected room's display token; only comparable on the same held node connection.
+    RoomDisplayRevision {
+        /// Opaque equality token, never an authorization grant or a read cursor.
+        revision: Digest32,
+    },
     /// The rows a [`Request::Read`] asked for, oldest first.
     Rows {
         /// The rendered entries.
@@ -2339,6 +2410,22 @@ impl Frame {
                     .uint(*n)
                     .bytes(last.as_ref().map_or(&[][..], |d| &d[..]));
             }
+            Frame::ThreadSummary {
+                reply_count,
+                last_reply_millis,
+                authors,
+                next_author,
+            } => {
+                e.array(5)
+                    .uint(T_THREAD_SUMMARY)
+                    .uint(*reply_count)
+                    .uint(*last_reply_millis)
+                    .array(authors.len());
+                for author in authors {
+                    e.bytes(author);
+                }
+                e.bytes(next_author.as_ref().map_or(&[][..], |d| &d[..]));
+            }
             Frame::Rows { rows } => {
                 e.array(2).uint(T_ROWS).array(rows.len());
                 for r in rows {
@@ -2351,6 +2438,9 @@ impl Frame {
                         .uint(u64::from(r.late))
                         .uint(u64::from(r.owed));
                 }
+            }
+            Frame::RoomDisplayRevision { revision } => {
+                e.array(2).uint(T_ROOM_DISPLAY_REVISION).bytes(revision);
             }
             Frame::Order { entries } => {
                 e.array(2).uint(T_ORDER_ROWS).array(entries.len());
@@ -2962,6 +3052,36 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             let n = d.uint().map_err(|_| Error::MalformedIpc("ipc count"))?;
             let last = optional_digest(d)?;
             return Ok(Frame::Count { n, last });
+        }
+        (T_THREAD_SUMMARY, 5) => {
+            let reply_count = d
+                .uint()
+                .map_err(|_| Error::MalformedIpc("ipc thread count"))?;
+            let last_reply_millis = d
+                .uint()
+                .map_err(|_| Error::MalformedIpc("ipc thread time"))?;
+            let n = d
+                .array()
+                .map_err(|_| Error::MalformedIpc("ipc thread authors"))?;
+            if n > PAGE_ENTRIES {
+                return Err(Error::MalformedIpc("ipc too many thread authors"));
+            }
+            let mut authors = Vec::with_capacity(n);
+            for _ in 0..n {
+                authors.push(digest(d)?);
+            }
+            let next_author = optional_digest(d)?;
+            return Ok(Frame::ThreadSummary {
+                reply_count,
+                last_reply_millis,
+                authors,
+                next_author,
+            });
+        }
+        (T_ROOM_DISPLAY_REVISION, 2) => {
+            return Ok(Frame::RoomDisplayRevision {
+                revision: digest(d)?,
+            });
         }
         (T_ROOM_PAGE, 3) => {
             let body = d
@@ -5304,26 +5424,72 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             let Some(detail) = view.open_channels.iter().find(|d| d.channel_id == channel_id) else {
                 return Frame::Error { reason: "room not open".into() };
             };
-            let mut matched: Vec<&MessageRow> = detail.structured.by_thread.get(&root)
-                .into_iter().flat_map(|positions| positions.iter())
-                .filter_map(|i| detail.timeline.get(*i as usize)).collect();
-            matched.sort_by_key(|r| r.arrival);
-            if let Some(cursor) = since {
-                let Some(mark) = matched.iter().find(|r| r.entry_hash == cursor && !r.owed)
+            let positions = detail.structured.by_thread.get(&root);
+            let mark = if let Some(cursor) = since {
+                let Some(mark) = positions.into_iter().flat_map(|p| p.iter())
+                    .filter_map(|i| detail.timeline.get(*i as usize))
+                    .find(|r| r.entry_hash == cursor && !r.owed && r.entry_hash != root)
                     .map(|r| r.arrival) else {
                     return Frame::Error { reason: "cursor not among this room's thread replies".into() };
                 };
-                matched.retain(|r| r.arrival > mark);
+                Some(mark)
+            } else { None };
+            // Select one page without allocating/sorting every reply in a long thread.
+            // The position breaks arrival ties in the same order as the room's index.
+            let mut page = std::collections::BTreeSet::new();
+            for i in positions.into_iter().flat_map(|p| p.iter()) {
+                let Some(r) = detail.timeline.get(*i as usize) else { continue };
+                if r.owed || r.entry_hash == root || mark.is_some_and(|m| r.arrival <= m) {
+                    continue;
+                }
+                page.insert((r.arrival, *i));
+                if page.len() > PAGE_ENTRIES { page.pop_last(); }
             }
             let mut rows = Vec::new();
             let mut bytes = 0usize;
-            for r in matched {
+            for (_, i) in page {
+                let Some(r) = detail.timeline.get(i as usize) else { continue };
                 let cost = r.text.len() + ROW_OVERHEAD;
                 if !rows.is_empty() && bytes + cost > rows_budget() { break; }
                 bytes += cost;
                 rows.push(r.clone());
             }
             Frame::Rows { rows }
+        }
+        Request::RoomDisplayRevision { channel_id } => {
+            match handle.room_display_revision(&channel_id) {
+                Some(revision) => Frame::RoomDisplayRevision { revision },
+                None => Frame::Error { reason: "room not open".into() },
+            }
+        }
+        Request::ThreadSummary { channel_id, root, after_author } => {
+            let view = handle.view();
+            let Some(detail) = view.open_channels.iter().find(|d| d.channel_id == channel_id) else {
+                return Frame::Error { reason: "room not open".into() };
+            };
+            let mut reply_count = 0u64;
+            let mut last_reply_millis = 0;
+            let mut authors = std::collections::BTreeSet::new();
+            for row in detail.structured.by_thread.get(&root).into_iter()
+                .flat_map(|positions| positions.iter())
+                .filter_map(|i| detail.timeline.get(*i as usize))
+                .filter(|r| !r.owed && r.entry_hash != root)
+            {
+                reply_count += 1;
+                last_reply_millis = last_reply_millis.max(row.created_millis);
+                if after_author.is_none_or(|after| row.author > after) {
+                    authors.insert(row.author);
+                    // One lookahead author establishes whether another page exists; the
+                    // aggregate never allocates a list of every reply or every author.
+                    if authors.len() > PAGE_ENTRIES + 1 { authors.pop_last(); }
+                }
+            }
+            let more = authors.len() > PAGE_ENTRIES;
+            if more { authors.pop_last(); }
+            let next_author = if more { authors.last().copied() } else { None };
+            Frame::ThreadSummary {
+                reply_count, last_reply_millis, authors: authors.into_iter().collect(), next_author,
+            }
         }
         // #636: a room's messages by tag, found through the room's index of the tags of the
         // messages this node can read; never the whole room.

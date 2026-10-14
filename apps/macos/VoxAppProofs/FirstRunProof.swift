@@ -296,6 +296,7 @@ final class FirstRunProof: XCTestCase {
     /// Set while the proof itself has hidden or quit Vox (⌘H, ⌘Q), until Vox is active again:
     /// what takes the foreground meanwhile was handed it by the proof, not taken.
     private var handedOff = false
+    private var readingNonUIOutcome = false
     private var immutableScratchFiles: [String] = []
     /// The person's clipboard as it was before the case: every item, every type, restored exactly
     /// in tearDown, red or green (app-proofs.sh restores it too, should the runner itself die).
@@ -374,6 +375,8 @@ final class FirstRunProof: XCTestCase {
     /// foreground, and a click or key in that time went elsewhere. It is recorded as APPARATUS,
     /// naming when and to what, with the read it would have been.
     override func record(_ issue: XCTIssue) {
+        // CLI and recipient outcomes do not depend on which app owns the desktop.
+        if readingNonUIOutcome { super.record(issue); return }
         let words = issue.compactDescription
         let product = words.range(of: "PRODUCT")
         let apparatus = words.range(of: "APPARATUS")
@@ -392,6 +395,12 @@ final class FirstRunProof: XCTestCase {
             return
         }
         super.record(moved)
+    }
+
+    private func checkNonUI(_ assertion: () -> Void) {
+        readingNonUIOutcome = true
+        defer { readingNonUIOutcome = false }
+        assertion()
     }
 
     /// Another app's window in front of Vox's main window and over a quarter of it (a person's
