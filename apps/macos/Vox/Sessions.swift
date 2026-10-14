@@ -215,7 +215,9 @@ struct SessionEntryRow: View {
                     summary
                 }
                 if fullContent && !entry.details.isEmpty {
-                    Text(entry.details).voxFont(VoxTokens.Fonts.appMono)
+                    // Approval Details are the tool's input; replies and questions are prose.
+                    Text(entry.details).voxFont(entry.kind == "approval"
+                        ? VoxTokens.Fonts.appMono : VoxTokens.Fonts.appText)
                         .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
                         .accessibilityIdentifier("entry-content-\(entry.id)")
                 }
@@ -250,7 +252,8 @@ struct SessionEntryRow: View {
     }
 
     private var summary: some View {
-        Text(entry.line).voxFont(VoxTokens.Fonts.appMono).textSelection(.enabled)
+        Text(entry.line).voxFont(fullContent ? VoxTokens.Fonts.appText : VoxTokens.Fonts.appMono)
+            .textSelection(.enabled)
             .accessibilityIdentifier("entry-line-\(entry.id)")
     }
 
