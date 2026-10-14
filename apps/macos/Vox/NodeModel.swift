@@ -2806,14 +2806,13 @@ extension NodeModel {
 
     /// Current pending targets come from the node's index; ended Session history and
     /// resolution transcripts are never collected to discover them.
-    private func waiting(in room: String) async -> [(node: String, session: String, reference: String, label: String)] {
+    private func waiting(in room: String) async throws -> [(node: String, session: String, reference: String, label: String)] {
         let epoch = nodeObservationEpoch
         var after: String?
         var found: [(node: String, session: String, reference: String, label: String)] = []
-        do {
-            repeat {
+        repeat {
                 let page = try await client.sessionsPendingPage(room: room, after: after)
-                guard epoch == nodeObservationEpoch, !Task.isCancelled else { return [] }
+                guard epoch == nodeObservationEpoch, !Task.isCancelled else { throw CancellationError() }
                 for target in page.targets {
                     guard let session = try await client.session(room: room, node: target.node,
                         sessionId: target.sessionId), session.open, session.canDrive else { continue }
@@ -2821,7 +2820,7 @@ extension NodeModel {
                         sessionId: target.sessionId)
                     let held = try await client.sessionEntries(room: room, node: target.node,
                         sessionId: target.sessionId, instance: head.instance, ids: [target.entry])
-                    guard epoch == nodeObservationEpoch, !Task.isCancelled else { return [] }
+                    guard epoch == nodeObservationEpoch, !Task.isCancelled else { throw CancellationError() }
                     if let request = held.entries.first(where: { $0.id == target.entry })?.request,
                        request.state == nil {
                         found.append((target.node, target.sessionId, request.reference, session.label))
@@ -2831,11 +2830,7 @@ extension NodeModel {
                     throw VoxError.Failed(reason: "The pending request page did not advance.")
                 }
                 after = page.next
-            } while after != nil
-        } catch {
-            guard epoch == nodeObservationEpoch, !Task.isCancelled else { return [] }
-            reportBackground(error)
-        }
+        } while after != nil
         return found
     }
 
@@ -2843,16 +2838,25 @@ extension NodeModel {
     /// Session's earlier one; a Session no longer waiting has its notification withdrawn (P1).
     /// Never the request's text (R-10).
     private func noteWaiting() async {
+        let epoch = nodeObservationEpoch
         var now: Set<String> = []
         var bySession: [String: (room: String, node: String, session: String, reference: String, label: String)] = [:]
+        do {
         for room in rooms where room.open {
-            for w in await waiting(in: room.id) {
+            let targets = try await waiting(in: room.id)
+            guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
+            for w in targets {
                 let key = "\(room.id)/\(w.node)/\(w.session)/\(w.reference)"
                 now.insert(key)
                 if !knownWaiting.contains(key) && waitingSeen {
                     bySession["\(room.id)/\(w.node)/\(w.session)"] = (room.id, w.node, w.session, w.reference, w.label)
                 }
             }
+        }
+        } catch {
+            guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
+            reportBackground(error)
+            return // No notification withdrawal from an incomplete scan.
         }
         for (_, w) in bySession {
             let name = rooms.first { $0.id == w.room }?.name ?? "a room"
