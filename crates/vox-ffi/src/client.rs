@@ -2560,6 +2560,25 @@ impl VoxClient {
         })
     }
 
+    /// Opaque equality token for the selected room's published display. It changes when the
+    /// readable timeline changes (including late fills and expiry), on room reopen, or when
+    /// display names change. Actor restart changes the token even when this client repairs its
+    /// connection internally. It reads no historical messages or full node snapshot.
+    /// Compare only within this held client's lifetime; discard cached tokens on a new client,
+    /// node change, detach or refusal. A newly loaded root still needs its initial summary.
+    ///
+    /// # Errors
+    /// A malformed room id, a closed room, or the node's refusal.
+    pub async fn room_display_revision(&self, room: String) -> Result<String, VoxError> {
+        let channel_id = digest(&room, "room id")?;
+        on_held!(self, |c| {
+            match ask(c, &Request::RoomDisplayRevision { channel_id }).await? {
+                Frame::RoomDisplayRevision { revision } => Ok(b32_encode(&revision)),
+                other => Err(unexpected(&other)),
+            }
+        })
+    }
+
     /// The complete readable reply count and latest time, with a bounded author page.
     /// Pass `next_author` back as `after_author` only when more author names are needed.
     ///

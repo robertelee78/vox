@@ -3825,6 +3825,8 @@ const fn worth_another_responder(fault: Fault) -> bool {
 /// and none of them can starve another (ADR-020 §7).
 #[derive(Debug, Clone)]
 pub struct NodeHandle {
+    /// Fresh for each actor lifetime, so a repaired client cannot reuse an old display token.
+    display_incarnation: Digest32,
     computer: Option<Arc<crate::node::computer::Computer>>,
     computer_revision: Arc<std::sync::atomic::AtomicU64>,
     cmd_tx: mpsc::Sender<(NodeCommand, oneshot::Sender<Outcome>)>,
@@ -4017,6 +4019,36 @@ impl NodeHandle {
             }
         }
         view
+    }
+
+    /// An opaque cache token for one open room's published rows and display names (#754).
+    /// Borrows the watch: no timeline scan, snapshot construction or retained view clone.
+    /// Name hashing is proportional to the current keyring/presentations, not room history.
+    /// Callers discard tokens when replacing their selected-node connection.
+    pub(crate) fn room_display_revision(&self, channel_id: &Digest32) -> Option<Digest32> {
+        use sha2::{Digest, Sha256};
+        let view = self.view_rx.borrow();
+        let detail = view
+            .open_channels
+            .iter()
+            .find(|d| &d.channel_id == channel_id)?;
+        let mut hash = Sha256::new();
+        hash.update(b"vox-room-display-revision-v1");
+        hash.update(self.display_incarnation);
+        hash.update(view.identity.as_ref()?.fingerprint);
+        hash.update(channel_id);
+        hash.update(detail.display_revision.to_be_bytes());
+        // Alias collisions depend on the whole keyring. A name change can alter a shown
+        // author's suffix even when the renamed fingerprint is not a thread participant.
+        for names in [&view.trusted, &view.presented] {
+            hash.update((names.len() as u64).to_be_bytes());
+            for (fingerprint, name) in names {
+                hash.update(fingerprint);
+                hash.update((name.len() as u64).to_be_bytes());
+                hash.update(name.as_bytes());
+            }
+        }
+        Some(hash.finalize().into())
     }
 
     /// A receiver that resolves whenever the view changes.
@@ -4894,6 +4926,7 @@ impl Node {
         paths: Paths,
         cfg: NodeConfig,
     ) -> crate::error::Result<(NodeHandle, tokio::task::JoinHandle<()>)> {
+        let display_incarnation = crate::identity::rng::random_array::<32>()?;
         let NodeConfig {
             clock,
             millis_clock,
@@ -5164,6 +5197,7 @@ impl Node {
         let computer_revision = Arc::clone(&node.computer_revision);
         let actor = tokio::spawn(node.run(cmd_rx, net_rx));
         let handle = NodeHandle {
+            display_incarnation,
             computer,
             computer_revision,
             cmd_tx,

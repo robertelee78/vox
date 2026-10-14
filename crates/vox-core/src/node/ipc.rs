@@ -328,6 +328,8 @@ const T_THREAD: u64 = 755;
 /// The retained, readable replies behind a thread summary (#754).
 const T_THREAD_SUMMARY_REQ: u64 = 7540;
 const T_THREAD_SUMMARY: u64 = 7541;
+const T_ROOM_DISPLAY_REVISION_REQ: u64 = 7542;
+const T_ROOM_DISPLAY_REVISION: u64 = 7543;
 // ADR-028 RR-1: entries shown or drained, for a read record. Numbered by its story (#503).
 const T_MARK_READ: u64 = 503;
 // V210-164: leaving a room over the socket, as joining and creating one are. Numbered by its item,
@@ -919,6 +921,11 @@ pub enum Request {
         /// Only authors after this fingerprint; absent starts the author list.
         after_author: Option<Digest32>,
     },
+    /// One open room's opaque published-display token, without reading its history.
+    RoomDisplayRevision {
+        /// The selected node's room.
+        channel_id: Digest32,
+    },
     /// How many rows of a room follow `since` (all of them when absent), as [`Frame::Count`]
     /// (V210-120): what a reader that reads a page at a time says is still waiting.
     Count {
@@ -1042,6 +1049,11 @@ impl Request {
                     .uint(T_COUNT_REQ)
                     .bytes(channel_id)
                     .bytes(since.as_ref().map_or(&[][..], |d| &d[..]));
+            }
+            Request::RoomDisplayRevision { channel_id } => {
+                e.array(2)
+                    .uint(T_ROOM_DISPLAY_REVISION_REQ)
+                    .bytes(channel_id);
             }
             Request::Unread { channel_id } => {
                 e.array(2).uint(T_UNREAD_REQ).bytes(channel_id);
@@ -1621,6 +1633,12 @@ impl Request {
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Count { channel_id, since })
             }
+            (T_ROOM_DISPLAY_REVISION_REQ, 2) => {
+                let channel_id = digest(&mut d)?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::RoomDisplayRevision { channel_id })
+            }
             (T_UNREAD_REQ, 2) => {
                 let channel_id = digest(&mut d)?;
                 d.finish()
@@ -2178,6 +2196,11 @@ pub enum Frame {
         /// Continue after this author when another page remains.
         next_author: Option<Digest32>,
     },
+    /// The selected room's display token; only comparable on the same held node connection.
+    RoomDisplayRevision {
+        /// Opaque equality token, never an authorization grant or a read cursor.
+        revision: Digest32,
+    },
     /// The rows a [`Request::Read`] asked for, oldest first.
     Rows {
         /// The rendered entries.
@@ -2392,6 +2415,9 @@ impl Frame {
                         .uint(u64::from(r.late))
                         .uint(u64::from(r.owed));
                 }
+            }
+            Frame::RoomDisplayRevision { revision } => {
+                e.array(2).uint(T_ROOM_DISPLAY_REVISION).bytes(revision);
             }
             Frame::Order { entries } => {
                 e.array(2).uint(T_ORDER_ROWS).array(entries.len());
@@ -3021,6 +3047,11 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 last_reply_millis,
                 authors,
                 next_author,
+            });
+        }
+        (T_ROOM_DISPLAY_REVISION, 2) => {
+            return Ok(Frame::RoomDisplayRevision {
+                revision: digest(d)?,
             });
         }
         (T_ROOM_PAGE, 3) => {
@@ -5389,6 +5420,12 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 rows.push(r.clone());
             }
             Frame::Rows { rows }
+        }
+        Request::RoomDisplayRevision { channel_id } => {
+            match handle.room_display_revision(&channel_id) {
+                Some(revision) => Frame::RoomDisplayRevision { revision },
+                None => Frame::Error { reason: "room not open".into() },
+            }
         }
         Request::ThreadSummary { channel_id, root, after_author } => {
             let view = handle.view();
