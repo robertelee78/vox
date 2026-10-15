@@ -191,7 +191,7 @@ private struct SharedServiceBox: View {
                 HStack(alignment: .firstTextBaseline) {
                     Text(command.what).eyebrow().secondaryText()
                         .lineLimit(1).fixedSize(horizontal: true, vertical: false)
-                        .frame(minWidth: Theme.scaled(56), alignment: .leading)
+                        .frame(minWidth: Theme.scaled(80), alignment: .leading)
                     Text(command.command.replacingOccurrences(of: service.canonical, with: service.address))
                         .font(Theme.mono).lineLimit(1).truncationMode(.middle)
                     Spacer()
