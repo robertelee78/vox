@@ -167,8 +167,12 @@ async fn offer_save(
     if !std::io::stdin().is_terminal() {
         println!(
             "vox: to also save {} → room {room} in the room map, so a session started there works \
-             in it, run this in a terminal: vox agent room {room} --node {node} --session {session}",
-            start.display()
+             in it, run this in a terminal: {}",
+            start.display(),
+            vox_text::shell::node_command(
+                &["vox", "agent", "room", &room, "--session", session],
+                node.as_str()
+            )
         );
         return Ok(());
     }
