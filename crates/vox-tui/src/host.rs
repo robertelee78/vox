@@ -2361,15 +2361,13 @@ impl Router {
             }
             Ok(())
         };
-        // Subscribe before the first attempt: a projection can become ready while
-        // its refusal is returning. Retain only this already validated native
-        // observation; a publication wakes a checked retry, never another input.
-        let mut publication = handle.watch();
+        // Retain only this already validated native observation. Readiness
+        // refusals precede mutation, so the same receipt can be checked again
+        // without repeating an input or admitting another notice.
         let observe = async {
             for receipt in &observation.receipts {
                 let recipient = &receipt.recipient;
                 loop {
-                    publication.borrow_and_update();
                     current(recipient.room, recipient.instance)?;
                     match handle
                         .attention(
@@ -2381,9 +2379,10 @@ impl Router {
                         .await
                     {
                         Ok(Reply::Done) => break,
-                        // These refusals precede the receipt transaction. The
-                        // existing actor publishes bounded projection progress;
-                        // wait for that progress within the original total bound.
+                        // Every Attention command publishes a view, even on
+                        // refusal; that notification cannot prove readiness and
+                        // would wake its own retry. Use the attention scanner's
+                        // two-second cadence within the original total bound.
                         // Stale authority/openings and malformed observations are
                         // deliberately not retryable.
                         Err(reason)
@@ -2393,10 +2392,8 @@ impl Router {
                                     | "node: room governance is refreshing; try again when it is ready"
                             ) =>
                         {
-                            publication.changed().await.map_err(|_| {
-                                "attention observation node stopped; receipt outcome is unconfirmed"
-                                    .to_owned()
-                            })?;
+                            let retry_at = tokio::time::Instant::now() + Duration::from_secs(2);
+                            tokio::time::sleep_until(retry_at).await;
                         }
                         Err(reason) => return Err(reason),
                         _ => return Err("unexpected attention observation answer".into()),
