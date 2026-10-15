@@ -280,6 +280,7 @@ private struct RoomMenuAnchor: NSViewRepresentable {
     }
 }
 
+@MainActor
 private final class RoomRowMenu: NSMenu, NSMenuItemValidation {
     private let model: NodeModel
     private let room: NodeModel.Room
