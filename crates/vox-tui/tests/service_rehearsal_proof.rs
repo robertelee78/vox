@@ -650,7 +650,7 @@ fn a_room_bound_service_carries_real_bytes_through_the_real_binaries() {
     let host_name = host_as(&guest_list);
     let want = [
         format!("✓ .vox proxy running at {bound}"),
-        "✓ node attached".to_owned(),
+        "✓ node Ready".to_owned(),
         format!("✓ {host_name} trusts you"),
         format!("✓ {host_name} online"),
     ];
