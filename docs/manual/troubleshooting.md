@@ -1,5 +1,7 @@
 # Troubleshooting by symptom
 
+Applies to Vox v0.4.5.
+
 Find the message or behaviour you see, then follow its steps. Each entry says what the symptom
 means, what to check, how to fix it, and how to confirm the fix.
 
@@ -266,10 +268,20 @@ asks the agent's daemon which sessions it holds. If the agent's node cannot read
 connectivity first. A session in a repository with no room works in none
 ([the room a session works in](sessions.md#the-room-a-session-works-in)).
 
-**Fix:** follow the doctor's `fix:` lines. Reload the harness after any change to its settings.
-Codex reads messages at its next turn, even urgent ones.
+**Fix:** follow the doctor's `fix:` lines. Reload the harness after a settings change. OpenCode
+needs both its server and current TUI client integrations; a server alone cannot admit attention
+to a closed client. Claude needs the complete generated native-attention hook configuration.
+Codex reads messages at its next normal turn, even urgent ones; do not try to wake it through a
+second harness or synthetic turn. Check whether this receiver's room is paused before reposting.
 
-**Confirm:** the agent's session shows the question, and its reply appears in the room.
+With Drive, select the actual open Session and inspect `vox room session --attention`, keeping
+the node/room/Session from its complete read command. A next-turn or paused reason is queued,
+not delivered. Unknown acceptance is not permission to retry a notice. Delivered means context
+was released; Answering needs an observed turn, and Answered needs a correlated room answer.
+A source removed by retention cannot be recovered by repeating the wake.
+
+**Confirm:** the actual harness shows the attributed question, and its correlated reply appears
+in the room. Model relevance and a reply are not guaranteed by delivery.
 
 ## A claim is uncertain or coordination is refused
 

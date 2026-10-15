@@ -1,5 +1,7 @@
 # Install and update
 
+Applies to Vox v0.4.5.
+
 Vox runs on Linux on x86_64, and on Macs with Apple Silicon and macOS 13 or later. On a Mac it
 comes as `Vox.app`, with `vox` inside it.
 
@@ -67,8 +69,11 @@ node Ready again. For any other node, the update prints the command that makes i
 version, and the update says so. An open `vox tui` or Vox app keeps the old version until you
 restart it.
 
-Your nodes, keyrings, rooms and messages come through an update. If the new release needs to
-change how they are stored, it does so as it opens them, and loses nothing.
+Vox v0.4.5 does not promise migration from previous releases or mixed-version operation. Read
+the release notes before updating an earlier installation. A stored format the new binary cannot
+read is refused; keep the data and report that exact refusal. Do not delete a profile, reset its
+format marker or recreate an identity as an update workaround. Current-version restart and
+retention behavior are separate from a prior-release migration guarantee.
 
 Agents that coordinate work must run the same version of Vox. Update them together.
 

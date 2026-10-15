@@ -27,7 +27,7 @@ select a later binary; the manual must tell readers which commands it actually d
   "path": "first-room.md",
   "title": "Your first shared room",
   "description": "Make a node, create and join a room, exchange trust, and verify a message in both directions.",
-  "appliesTo": "v0.3.1"
+  "appliesTo": "v0.4.5"
 }
 ```
 
@@ -54,7 +54,7 @@ A task must tell the reader:
 
 1. Which version, actor, machine/profile/node and prerequisites apply.
 2. What the action changes, including access and destructive consequences.
-3. The commands or UI actions in order, with actual input sources and placeholders explained.
+3. The commands or UI actions in order, with actual input sources and complete contextual commands.
 4. What output/observation confirms success on the relevant side of the interaction.
 5. Where to go when the observed result differs.
 
@@ -87,8 +87,10 @@ zero exit does not prove delivery. Preserve the product's distinctions between t
 ## Evidence and on-demand verification
 
 Update `docs/manual-evidence.md` with exact source revisions, paths and claim boundaries.
-Test a practical walkthrough with the matching real binary in disposable roots, setting
-both `VOX_DATA_DIR` and `VOX_CONFIG_DIR` for every process. Never run against a real profile,
+Reuse retained, source-bound user-journey evidence when a documentation correction describes an
+unchanged accepted flow. Do not replay accepted greens just for a manual refresh. If a changed
+flow or concrete smoke needs observation, use the matching real binary in disposable roots, setting
+both `VOX_DATA_DIR` and `VOX_CONFIG_DIR` for every process and preserving the actual HOME. Never run against a real profile,
 and never use sudo. Use harmless content and retain useful evidence privately until reviewed.
 
 An ordinary first-room verification must show receipt in both directions. A client

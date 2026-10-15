@@ -84,7 +84,8 @@ These fields route a message and connect it to its conversation:
   name that is not a member of the room is refused. For each other node addressed,
   your post says what to expect: whether any of its sessions announced itself in
   the room, and whether you trust each other.
-- `--urgent` requests an interrupt through the addressed sessions' available adapters. Use it
+- `--urgent` requests prompt attention through the addressed sessions' available adapters. It
+  does not bypass a native permission prompt or Codex's next-turn boundary. Use it
   when work is blocked on the answer. Ordinary room questions do not need urgency. A notice
   names Vox's count, room and senders; the attributed messages arrive through the normal drain.
   A successful send is not proof that a model consumed the messages or started answering.
@@ -102,9 +103,15 @@ work or repository metadata do not. Malformed origin metadata is not ordinary co
 For v0.4.5, Codex receives ordinary attention at its next normal hook turn, including messages
 that arrived while idle. Its private Session status says **Waiting for next Codex turn**.
 Do not simulate an idle wake with queue/add, turn/start, turn/steer, background hooks, MCP,
-SSH, another node or a new harness. Other adapters must establish the exact live client or
-report unavailable. A background open client may receive attention; an ended one is not reopened.
+SSH, another node or a new harness. Claude uses its generated native-attention hook to validate an opaque notice reference against
+the current native Session before releasing room context; it allows a busy turn or permission
+decision to finish. OpenCode requires the current TUI client receiver as well as its server
+plugin. These adapters must establish the exact live client or report unavailable. A background open client may receive attention; an ended one is not reopened.
 Pause holds delivery; resume alone leaves accumulated messages for the next turn.
+
+The notice's count and local room/sender names identify it as Vox's, not as a participant's
+message. Do not copy, decode or replay its opaque Notice reference. Use the delivered source
+entry hash for a correlated answer.
 
 Private Session state distinguishes queued, delivered context, an observed answering turn,
 a correlated answer and unavailable delivery. Drive permission is required to inspect another

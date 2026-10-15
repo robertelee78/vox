@@ -1000,8 +1000,9 @@ enum AgentCmd {
     /// inject. Meant to be run BY a harness hook, not by hand.
     ///
     /// Reads the harness's hook JSON on stdin and writes injected context on
-    /// stdout in whatever shape that harness reads. Always exits 0: a hook must
-    /// never break the turn it rides on.
+    /// stdout in whatever shape that harness reads. The ordinary hook does not
+    /// break human turns on a daemon failure. The generated Claude native-attention
+    /// handler fails closed for automatic notices; preserve its failure policy.
     ///
     /// Register it on a turn-start event — `UserPromptSubmit` in both Claude Code
     /// and Codex — and for Codex register it with `async: false`, or the output is
@@ -1018,7 +1019,7 @@ enum AgentCmd {
     ///
     /// For example:
     ///
-    /// vox agent plugin opencode --node opencode-mbp > ~/.config/opencode/plugin/vox.js
+    /// vox agent plugin opencode --node opencode-mbp   # prints the server asset only
     ///
     /// vox agent plugin claude --node claude-mbp   # merge into ~/.claude/settings.json
     ///
@@ -1027,6 +1028,9 @@ enum AgentCmd {
     /// The integration goes to stdout so it can be redirected or piped through
     /// `jq`; where to put it goes to stderr, so it does not land in the file.
     ///
+    /// For complete OpenCode wiring, use `vox agent setup opencode`: attention
+    /// also requires its TUI client plugin and tui.json entry. Preserve the full
+    /// generated Claude native-attention hook configuration as well.
     /// The plugin is a shim over `vox agent hook`, not a second implementation.
     Plugin(AgentPluginArgs),
     /// Install the agent skill pack for every harness here, or print its entry.
@@ -1216,8 +1220,8 @@ pub struct AgentTrustArgs {
 /// `vox agent plugin`
 #[derive(Args, Debug, Clone)]
 pub struct AgentPluginArgs {
-    /// The harness to print an integration for. Only `opencode` needs one today;
-    /// Claude Code and Codex are configured with a hook command instead.
+    /// The harness: `claude` or `codex` prints hook JSON; `opencode` prints its
+    /// server plugin. Use setup for OpenCode's complete server/client installation.
     #[arg(required_unless_present = "install", conflicts_with = "install")]
     pub harness: Option<String>,
     /// The agent's own node, which the printed hooks act as (`vox agent hook --node <name>`).
@@ -3516,7 +3520,7 @@ pub fn run() -> ExitCode {
                     print!("{}", crate::agent_hook::opencode_plugin(&node));
                     eprintln!(
                     "vox: save that as ${{XDG_CONFIG_HOME:-~/.config}}/opencode/plugin/vox.js, and install the skill \
-                     beside it: {}\n     The plugin drains every room the node holds.",
+                     beside it: {}\n     This prints the server plugin only. Use `vox agent setup opencode` for the TUI client plugin too.\n     Each session drains only its saved repository room.",
                     skill_install("opencode", skill_dir("opencode").unwrap_or_default())
                 );
                     ExitCode::SUCCESS
@@ -3535,9 +3539,9 @@ pub fn run() -> ExitCode {
                     print!("{}", crate::agent_hook::claude_settings(&node));
                     eprintln!(
                         "vox: merge that into ~/.claude/settings.json (user scope, so a session \
-                     opened in any repository hears its rooms; `env` names the node every `vox` \
+                     opened in a repository hears its bound room; `env` names the node every `vox` \
                      the agent runs acts as), and install the skill beside it: {}\n     The \
-                     hook drains every room the node holds.",
+                     hook drains only this session's saved repository room.",
                         skill_install("claude", skill_dir("claude").unwrap_or_default())
                     );
                     ExitCode::SUCCESS
@@ -3553,7 +3557,7 @@ pub fn run() -> ExitCode {
                      environment for its shell from here: pass `--node {node}` to every `vox` \
                      the agent runs.\n     `async` MUST be false: \
                      an async hook's output is observed and discarded, so the room would \
-                     drain into nothing.\n     The hook drains every room the node holds.\n     \
+                     drain into nothing.\n     The hook drains only this session's saved repository room.\n     \
                      Vox never interrupts a Codex session: an urgent message to one waits \
                      for its next turn, and a poster on the same node is told so.\n     \
                      Install the skill beside it: {}",

@@ -1,11 +1,23 @@
 # Your first shared room
 
-In this tutorial you and one other person each install Vox, make a node, share a room, trust each
-other, and read each other's message. It takes about ten minutes. You need a terminal on each
-machine and a way to talk to the other person that you already trust, such as a call.
+Applies to Vox v0.4.5.
 
-The examples call your node `robertgpt` and the other person's node `ann`. Each step says who
-runs it.
+This tutorial connects two machines and confirms a message in each direction. Choose your trust
+path before exchanging node fingerprints:
+
+- **Computers you own:** after installing Vox in step 1, follow [My computers](keyring.md#my-computers)
+  to enroll them with approval on both machines. This is the recommended path for your own
+  computers: managed nodes receive the computer policy without a separate trust exchange for
+  every pair. Then follow steps 2, 4, 5 and 7 here. Skip the individual trust steps 3 and 6.
+- **Another person's computer, or access to just one node:** follow every step below. Compare
+  node fingerprints through a channel you already trust, such as a call, and grant trust individually.
+
+The examples call the first machine's node `robertgpt`, the second's `ann`, and the room `family`.
+Each step says who runs it. If both machines are yours, you perform both roles. You need a terminal
+on each machine; the individual-trust walkthrough takes about ten minutes.
+
+For agents, finish this room exchange first, then use [setup](agents.md#set-up-a-machine) and
+[repository binding](sessions.md#the-room-a-session-works-in). Making a bare node alone does not wire a harness.
 
 ## 1. Both of you install Vox
 
@@ -98,10 +110,11 @@ vox: send the passphrase another way than this address (in person, a call, a dif
 Send the link to the other person in a message. Tell them the room passphrase over the call, not
 in the same message.
 
-The other person's machine must be able to reach yours. On the same network, or with a router
-that grants the port mapping the note mentions, it can. If you are both behind routers that grant
-none, you need an anchor, a node on a host both machines reach
-([when an anchor is needed](services.md#when-an-anchor-is-needed)).
+The other person's machine must be able to reach a member. The same LAN, a public address or a
+reachable port mapping can provide that without an anchor. A granted mapping alone is not proof
+that a guest can reach it. If neither host can reach the other, follow
+[room anchor setup](services.md#put-an-anchor-in-a-room-link), then print and send a fresh room link.
+Being behind NAT by itself does not mean an anchor is required.
 
 ## 5. The other person joins
 
@@ -118,8 +131,9 @@ vox: joined family
      you read a member once you trust it and it trusts you: `vox trust add`
 ```
 
-Joining makes them a member. Neither of you can read the other yet: reading takes trust from
-both of you, which you give next.
+Joining makes them a member; it grants no trust itself. With completed computer enrollment,
+confirm the managed grants have applied and continue to step 7. On the individual-node path,
+reading takes trust from both of you, which you give next.
 
 ## 6. Both of you trust each other
 

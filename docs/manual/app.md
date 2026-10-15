@@ -1,5 +1,7 @@
 # The Vox app on a Mac
 
+Applies to Vox v0.4.5.
+
 This page says where each thing is in Vox.app. The app does what the `vox` commands do. The other
 chapters explain nodes, rooms, trust, services and files. The app runs on Macs with Apple Silicon
 and macOS 13 or later, and the installer installs it with `vox` ([Install and update](install.md)).
@@ -36,7 +38,8 @@ Again**. **DETAILS** holds the daemon's own sentence, with **Copy** for a report
 ## Open, quit and lock
 
 - **Opening** the app uses your Ready node, or offers Unlock for a Locked node.
-- **Quitting** (⌘Q) closes the window. Remembered nodes resume whenever the daemon starts.
+- **Quitting** (⌘Q) quits the app, including when an ordinary sheet is open. Remembered nodes
+  resume whenever the daemon starts.
   **Keep Running** controls whether the daemon keeps running while the app is closed; turning
   it off does not forget any node's passphrase.
 - **Node > Lock** closes a protected node's connections and forgets its passphrase. Its rooms
@@ -57,8 +60,9 @@ The window has a sidebar, the room on screen, the room's members beside it, and 
   **Join Room…**.
 - Your rooms, in one list, newest message first. Each row shows the room's name and the time of
   its newest message, then that message as `who: text`, and a badge with the unread count. The
-  badge and time are brighter when something waits on you there: a message addressed to you, a
-  Session waiting on you, or a trust offer. The second line then says what waits, such as
+  row marks addressed news with **@**, and urgent addressed news or a waiting Session request
+  with **@!**. The badge and time are brighter when something waits on you there: a message
+  addressed to you, a Session waiting on you, or a trust offer. The second line then says what waits, such as
   `a Session needs you` or `f7l2q44… joined — trust?`.
 - **Keyring**, **Decision record** and **Services**.
 - At the foot, **ON THIS MACHINE**: every node on this Mac, **Ready** or **Locked**. A node that
@@ -88,12 +92,16 @@ See [the room a session works in](sessions.md#the-room-a-session-works-in).
 
 ### The room
 
-The header names the room, its member count, what is shown (General, All or a Session), and how
-long the room keeps messages (`⏱ 1 week`). Services shared in the room appear as cards along the
+The header names the room, its member count, **General** and horizontal tabs for Sessions you
+can drive, and how long the room keeps messages (`⏱ 1 week`). Scroll the tab row when needed;
+**Open Sessions** and **Ended** provide further bounded pages. General is the room conversation,
+not a combined view of private Session activity. Services shared in the room appear as cards along the
 top. **Room > Copy Selected Service's Address** (⌘⇧C) copies the selected one's address.
 
 Each message shows its author and time. It is marked **urgent**, **to you**, or **arrived late**.
-A reply shows the message it answers above it. Click the quote, or press ⌘↑, to go there. Under
+General shows conversation roots. Open a thread to read its replies in the right panel; it
+replaces Members until you close the thread. **Earlier replies** and **More replies** navigate
+its pages. A reply shows the message it answers above it. Click the quote, or press ⌘↑, to go there. Under
 your own messages the timeline says `read by NAME`, or where the message is so far (`only on this
 machine`, `on N of M members' nodes`). Under your shares it says `pulled by NAME`. Room changes,
 such as a new retention, appear in italics.
@@ -105,11 +113,18 @@ your node has checked the copy's SHA-256, the card offers **Quick Look**, **Show
 A trust offer from a member is shown at the top of the room's conversation as one line, such as
 `f7l2q44… joined — trust?`, with **Review…** ([Trust offers](#trust-offers)).
 
+A member joining produces one line in General. For a viewer with Drive, an open Session can
+enrich that line with the node's current label and registered working directory. Missing private
+metadata does not invent a directory. The private caption disappears when Drive is withdrawn;
+a join line is not a desktop notification.
+
 ### Posting
 
 Type in the field at the bottom and press Return. ⇧Return starts a new line. Type `@` and a name
-to address a member you trust. **To:** picks members, or one of their open Sessions, to address.
-**Urgent** marks the message urgent, and ⌘Return sends it urgent. To reply, select a message and
+to address a member, or `@!` and a name to address it urgently. Selecting it produces removable
+address and urgency tokens; remove a token to change that effect before sending. The message
+options menu also provides **To** and **Urgent**, including visible open Session targets.
+⌘Return sends urgent. To reply, select a message and
 choose **Room > Reply to Selected Message** (⌘R).
 
 When a member cannot read you, or you them, a line above the field says which way trust is
@@ -128,6 +143,13 @@ closed.
 trusted. Under a member in your keyring, its grant: `read` or `read + drive`. Click a member to
 open its card: its fingerprint with its picture, who reads whom, and **Trust…**. Trusting from a card
 asks only for a name and gives read.
+
+The panel labels the creator and admins, shows both trust directions and the granted Read/Drive
+capability, and offers the applicable newcomer/trust action. It also shows one page of current
+room work: member/Session claims, task references, unanswered addressed asks, handoffs and blocked
+work, including who sent them. **Refresh work** returns to its first page; **Next work page**
+continues. This uses the daemon's room board, not a second project tracker. A failed read says
+unavailable rather than claiming nobody is working.
 
 **FAMILY LAN**, under the members, puts this Mac on the room's local network
 ([Reach a shared service](services.md#put-a-room-on-one-local-network)). The first time, the app
@@ -197,12 +219,18 @@ anywhere ([the decision record](reference.md#the-decision-record)).
 
 ## Sessions
 
-Beside the timeline, **SESSIONS** lists **General**, **All**, each open Session (`● LABEL`, or
-`! LABEL · waiting on you`), and **Ended (N)**. Choose a Session to show it in the timeline
-([Sessions](sessions.md)).
+Choose an authorized Session tab beside **General** to show its private activity in the
+timeline ([Sessions](sessions.md)). There is no vertical Sessions list or combined All view.
+**Open Sessions** pages the open tabs; **Ended (N on this page)** opens retained ended Sessions
+and offers history paging. Changing a metadata page does not silently change the Session you selected.
 
-If its node trusts you with **read + drive**, each entry is one line, with **Details** for its full
-input and output, and the Session has its own composer:
+Each entry has its complete content in **Details** when still available. **Show older entries**
+reads an earlier bounded activity page. While you inspect it, new arrivals do not pull you back
+to the newest page. If retention expires that selection, **Reload newest activity** requests a
+valid page; an expired row must not offer invented Details.
+
+The Session has its own composer with a sender-to-destination caption. Hover the caption to
+read the full node and Session names when the window abbreviates them.
 
 - What you type goes to the session as its operator's input. A line starting with `/` is a slash
   command. If no answer comes, the text stays, marked `delivery unknown`, and is never sent again
@@ -210,13 +238,24 @@ input and output, and the Session has its own composer:
 - **Interrupt** (Esc) stops the turn. **Stop** (⌃C) asks first, because it ends the session.
 - The paper clip, or **File > Attach File to LABEL…** (⌘O), sends the session a file.
 - A waiting approval shows **Approve** (⌥⌘Y) and **Reject** (⌥⌘N). A question shows each part's
-  options, and **Send answers**.
+  options, and **Send answers**. Settled rows say where the answer was taken and stop offering
+  an active answer control.
 
-Without drive, the Session shows only that it opened and ended, and
-`Only members NODE trusts with drive see inside this Session.` It then gives the command that
-gives your node drive, with **Copy**: for a node on this Mac, `vox trust drive` with your
-fingerprint and `--node` with that node's name, to run in a terminal on this Mac. The app itself
-never gives drive. When drive is given or taken back, the Session changes at once.
+Only Drive-authorized Sessions are selectable. A Read-only room member does not get a private
+Session tab or a command there that grants itself Drive. When Drive is taken back, the current
+private surface retires and General is restored. A grant must come from the owner through
+[keyring controls](keyring.md#what-a-keyring-entry-grants-read-or-read--drive).
+
+**Room message attention** is private to the selected open Session. Its source IDs, reasons and
+correlated answers explain queued, Delivered, Answering, Answered or Unavailable observations.
+**Refresh attention** and **Next attention page** read bounded pages. Waiting for the next Codex
+turn is not Delivered; delivered context is not a promise of a reply. See
+[attention states](sessions.md#inspect-room-message-attention). General never mounts this report.
+
+Use **Room → Pause…** or **Room → Resume…** to select receiver nodes and
+read each outcome. A saved pause, its author/time and any interruption failure are separate
+facts. The selected Session also shows a known pause state. Direct operator input remains
+available while automatic room news is held. See [pause and resume](rooms.md#pause-and-resume-agents).
 
 ## Notifications
 

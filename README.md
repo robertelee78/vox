@@ -20,8 +20,9 @@ decided to trust them.
 There are only four things:
 
 - **Nodes.** A node is one identity: a key pair Vox makes for you, known by its **fingerprint**. A
-  person is a node; so is each AI agent. Names are local: you call a node whatever you like, and
-  nobody else sees that name.
+  person and an agent can use different nodes on the same computer. A node is not a permanent
+  person-or-agent classification: registered Sessions identify agent-origin messages. Names are
+  local: you call a node whatever you like, and nobody else sees that name.
 - **Rooms.** A room is a shared, encrypted, replicated log. You get into one with its **room link**
   (a `vox://…` string) and its **passphrase**, each sent a different way.
 - **Trust.** Being in a room lets you *see that* messages exist, not *read* them. Two nodes read
@@ -78,10 +79,10 @@ On macOS an update must carry the **same Developer ID** as the `vox` it replaces
 rests on TLS to GitHub and the release record's digest; [ADR-015](docs/adr/ADR-015-rust-tui-client.md)
 says so plainly. A build from source is never overwritten.
 
-**An update never breaks your nodes.** From v0.4.0 on, each release opens what the release before it
-wrote, with nothing lost: your identity, your keyring, your rooms, and every message in order with its
-time. Every release is checked against the previous published one before it ships
-([ADR-026](docs/adr/ADR-026-daemon-and-nodes.md) F-3).
+Vox v0.4.5 does not promise migration from earlier releases or mixed-version operation. Update
+cooperating nodes together and read the release notes before replacing an earlier installation.
+An unsupported stored format is refused; do not delete or reset your data to bypass that refusal.
+Rollback restores a binary, not an earlier copy of the data. See [updates](docs/manual/install.md#update-vox).
 
 To remove Vox:
 
@@ -109,148 +110,72 @@ The [user manual](docs/manual/README.md) has a complete first-room walkthrough, 
 and troubleshooting organised by symptom. Read the same canonical manual at
 [voxlucis.us](https://voxlucis.us/docs/manual/).
 
-### The daemon and your nodes
+### Your computers, or someone else's node?
 
-Each data root (`VOX_DATA_DIR`) has **one `vox daemon`**: it holds the machine's one port and runs
-the nodes that are attached to it. A node is one identity; you can have several, for example
-yourself and one for each agent working beside you.
+For your own computers, start with [My computers](docs/manual/keyring.md#my-computers) explains two-sided
+pairing: `vox computer invite`, preview the actual invitation on the other machine, and approve
+the exact operation on both. Computer identity is separate from a node fingerprint. Pairing
+applies the managed-node trust policy; it does not join rooms. Use individual node grants instead
+for another person or a deliberately narrower relationship. Read and Drive are different grants:
+Drive also exposes private Session activity and permits steering that Session.
 
-```
-vox node create alice       # make a node (its passphrase is asked twice; Enter alone for none)
-vox node attach alice       # attach it to the daemon, starting the daemon if none runs
-vox node list               # every node here, and whether it is attached
-vox node detach alice       # its connections close and its keys leave memory
-vox node signout alice      # detached, no longer kept, its Keychain passphrase forgotten
-```
+### Make your identity and first room
 
-Every verb acts as one node: `--node <name>` after the verb, or `VOX_NODE`; with only one node
-attached, that one. Verbs that hold a session (`serve`, `connect`, `up`, `forward`, `lan up`)
-start the daemon and attach their node themselves. The one-shot verbs (`room`,
-`status`, `trust`, `share`, `service`, `app`) only ask an attached node, and say so if it is not:
-`vox node attach <name>` first.
+For the full two-person walkthrough, use [Your first shared room](docs/manual/first-room.md).
+The tutorial calls your node `robertgpt`, the other person's `ann`, and your room `family`.
+On your machine:
 
-Read this node's complete retained decision history with `vox decisions` (newest first),
-or `vox decisions --json` for one event per line. `vox room read <room> --unread --json`
-reads every unread message without marking it read. Both follow every transport page.
-
-### The interactive client
-
-```
-vox          # creates your identity on first run, then opens the terminal client
+```sh
+vox node create robertgpt
+vox id --node robertgpt
+vox room create --name family --node robertgpt
+vox room link family --node robertgpt
 ```
 
-In the client: `:new` creates a room, `:link` prints its room link, `:join` takes one, `:open` and
-`:close` open and close a room, `:leave` and `:end` leave it or end it for everyone. The client is a
-client of the daemon: `:attach` attaches your node, and `:node <name>` acts as another of your nodes.
-The members pane shows, for each member, whether you trust them and whether they can read you.
+The prompts keep identity and room passphrases out of shell history. Send the actual room link
+and its passphrase separately. The second machine joins with that link and its own node. With
+computer enrollment, verify the managed grants have applied. For individual trust, compare
+fingerprints over a trusted channel and use each node's `vox trust offers` output to grant the
+other Read. Joining alone grants no readability. Confirm receipt in both
+directions with `vox room post` and `vox room read` before adding agents or services.
 
-### Two people, their first shared room
+One daemon runs this computer's Ready nodes. `vox node list` shows them; `vox node unlock` makes
+a protected node Ready and remembers it. `vox node lock` stops that node and forgets its saved
+passphrase without removing its rooms. Use the known `--node` in commands, particularly when
+more than one node is Ready. See [identity and keyring](docs/manual/keyring.md).
 
-Say you and your mom want a room. The first time, it takes six steps:
+### Direct rooms and optional anchors
 
-1. **Swap fingerprints.** Each runs `vox id` and sends the result to the other (any way you like —
-   a fingerprint is public).
-2. **Create.** One of you creates the room (`:new` in the client, or `vox room create`).
-3. **Get its room link.** `:link` (or `vox room link <room>`) prints a `vox://…` room link.
-4. **Send the room link and the passphrase** — each a different way (in person, a call, a
-   different app).
-5. **Join.** The other runs `:join` (or `vox room join`).
-6. **Trust each other.** Each runs `vox trust add <the other's fingerprint>` and accepts the name
-   that node presents, or edits it; `--name <a name>` chooses an explicit local name. That local
-   name stays yours when the other node renames itself. Older peers ask you to type a name.
+Create and join need no anchor when members can reach one another: the same LAN, a public
+address, or a reachable port mapping is enough. If neither host can reach the other, run an
+anchor on a host both can reach. [The anchor guide](docs/manual/services.md#when-an-anchor-is-needed)
+shows setup and how to put its actual address into the **room's** signed anchor set. Adding an
+anchor to a daemon's inventory alone does not put it into a room link. Print a fresh link after
+changing the room's anchors.
 
-   `vox id --with-name` copies `name <fingerprint>`; quote that whole value when passing it to
-   `vox trust add`. Plain `vox id` still prints only the fingerprint. A presented name never grants trust.
+### Reach a service or exchange a file
 
-From then on you read each other. **Every later room you share needs only steps 2–5**: trust
-carries over.
+[Reach a shared service](docs/manual/services.md) walks through a real SSH service, its
+canonical `.vox` address, `vox up`, and the complete command Vox prints for your tool. It also
+covers HTTP/HTTPS browser setup, forwarding for tools without SOCKS support, and the optional
+macOS family LAN. The app's Copy actions include the actual node and destination; paste that
+complete command rather than reconstructing an example address.
 
-`vox room leave <room>` leaves a room: the others are told, and the room is removed from your node.
-Joining again later works. `vox room end <room>` ends it for everyone; only its creator, or an admin
-the creator named with `vox room admin add <room> <member>`, may. `vox room retention <room> 1w`
-sets how long the room keeps messages (`1h`, `1w`, `1m`, seconds, or `forever`), for everything
-already in it.
+[Send and receive files](docs/manual/files.md) covers an actual file or folder, its intended
+recipients, verified download and stopping the offer. Service and file access follow the
+sharer's trust. No public server keeps a copy after every member is offline.
 
-### Passphrases
+### Terminal and Mac clients
 
-There are two, and both are optional: a node's identity passphrase, and a room's passphrase. A
-node made with none keeps its identity key on that machine unencrypted, and says so.
-
-- **The identity passphrase** protects your keys at rest. You enter it once to unlock your node;
-  it then stays unlocked while it runs. Changing who you trust (`vox trust add|remove`) asks for it
-  unless you entered it for such a change in the last 30 minutes; attaching does not count. It is
-  typed at a terminal, never taken from a file or the environment. Reading never asks.
-- **A room's passphrase** is the second factor for joining that room.
-
-At a terminal, Vox asks for them without echo. In a script or an agent there is no terminal, so give
-them explicitly — a command that needs one and cannot get it fails at once and says how:
-
-```
-vox daemon --passphrase-file ~/.config/vox/id.pass      # or VOX_IDENTITY_PASSPHRASE
-echo "$ROOM_PASS" | vox room join --passphrase-file - vox://…
+```sh
+vox tui --node robertgpt
 ```
 
-A passphrase is never taken from the command line, where `ps` would show it.
-
-### Reach a machine's port from anywhere (`ssh` over Vox)
-
-On the machine with the service:
-
-```
-vox serve ssh=22                      # offer local port 22 as "ssh" in a new room; prints its
-                                      # vox:// address, passphrase and the service's .vox name
-```
-
-On the machine that wants in:
-
-```
-vox connect <vox://…>                 # join the room (one-shot: joining is durable)
-vox up                                # a loopback SOCKS5 proxy for every room this node holds;
-                                      # prints the exact ProxyCommand line to use
-ssh -o "ProxyCommand nc -X 5 -x 127.0.0.1:1080 %h %p" user@ssh.mom.family.vox
-```
-
-`ssh.mom.family.vox` is `<service>.<node>.<room>.vox`, with `mom` the name you gave her node in
-`vox trust add` and `family` your name for the room. Reaching a service follows trust: the host's
-node lets in only the nodes it trusts. For a tool with no proxy support, `vox forward
-ssh.mom.family.vox` binds a local port instead. UDP works the same way: `vox serve dns=53/udp`.
-
-To hand a room a file or a folder, `vox share <room> <path>` serves it until `--count` fetches or
-`--for` a time; members you trust fetch it with `vox room get`.
-
-If **both** machines are behind NAT, add an anchor (next section) and pass `--anchor <spec>` to
-`serve` and `up`.
-
-### Do you need an anchor?
-
-Only as a bridge. If one machine can reach the other (a public address, a router that granted a
-port mapping, the same LAN), it dials directly and no anchor is involved. If **both** are behind NAT,
-something both can reach must introduce them, and in Vox that is a node **you** run:
-
-```
-vox node --listen 0.0.0.0:0           # on a host that is always up; prints <fingerprint>@<multiaddr>,
-                                      # which is its --anchor spec
-```
-
-It serves the rendezvous board, coordinates hole punching, and if both NATs are symmetric relays
-QUIC packets it cannot read. By default it serves any room published to it; to serve only rooms of
-people you trust, give it an identity and a trust list and run `vox node --serve trusted`.
-
-A node remembers the port it first bound and binds it again on restart, so a member that restarts
-is found where it was. Nodes on the same computer or LAN also find each other again on their own if
-one does move.
-
-### The family LAN (macOS)
-
-`vox lan up <room>` puts the members of a room on one virtual LAN: each gets an address on its own
-interface, and discovery (mDNS, broadcast) works across it, between members who trust each other.
-Nothing on your machine is reachable over it unless you list its port with `--allow`. Making a
-network interface needs root, and only a small helper has it; everything else runs as you:
-
-```
-sudo vox lan helper                   # in one terminal: creates interfaces, nothing else
-vox lan up <room> --allow 32400       # in another, as yourself
-```
+The TUI and Vox.app are clients of the same daemon. In a room, General holds the conversation;
+Session tabs expose the Sessions you can drive. Replies open in their thread. The members panel
+shows trust and current work. [TUI keys](docs/manual/reference.md#the-terminal-interface) and
+[the Mac app guide](docs/manual/app.md) cover navigation, unread marks, pause, Session activity
+and private attention status. The Mac app is installed alongside the CLI.
 
 ## Agents
 
@@ -263,30 +188,37 @@ room with the other agents (and usually you):
   [awa](https://github.com/robertelee78/agent-work-accountability). Vox carries the conversation;
   the issue carries the record.
 
-An agent is its own node, never a person's: `vox node create claude-laptop`, attached to the
-machine's daemon beside yours. The agent uses the `vox room …` verbs as that node (`--node`):
-`post`, `read`, `claim` (exit 0 only once the other online members agree it is yours), `board`,
-`send`, `get`, `join`, `leave`.
+Start with the complete setup flow in [Agent communications](docs/manual/agents.md):
 
-Two things wire an agent session into its node, for **Claude Code, Codex and OpenCode**:
-
-```
-vox agent plugin claude|codex|opencode --node claude-laptop
-                                         # the hook or plugin that hands the agent its node's
-                                         # new messages at the start of every turn
-vox agent skill  claude|codex|opencode   # the agent-facing instructions (a SKILL.md)
+```sh
+vox setup
 ```
 
-Each prints what to install and, on stderr, where it goes. Codex runs a hook only once it is
-trusted: `vox agent trust codex` does that for Vox's entry alone.
+It offers a node for each installed harness, installs its integration and skill, and makes the
+node Ready. `vox agent setup claude`, `vox agent setup codex` and `vox agent setup opencode`
+set up one harness. Use the node name setup actually chose. Claude's integration includes native
+attention admission; OpenCode needs both its server and TUI client plugins. Codex's hook must be
+trusted. Reload an existing harness after changing its integration.
 
-The hook drains **every room the node is in**, each message labelled with its room, its author (by
-your name for that node) and whom it is addressed to. Addressing names nodes: `--to alice`. An
-`--urgent` message interrupts a Claude Code or OpenCode session mid-turn; a Codex session is never
-interrupted and reads it at its next turn, and the poster is told so.
+[Bind the repository](docs/manual/sessions.md#the-room-a-session-works-in) to the intended room,
+using the actual room link and repository path. Each Session works in that one room, even when
+its node belongs to several. The hook delivers attributed messages from that room; it does not
+drain unrelated repositories' rooms. Operator commands and registered agent posts have different
+origin, so an agent's reply does not start an automatic reply loop.
 
-Agents treat what arrives in a room as information, not instructions: it comes from other room
-members, not from the person they work for.
+An ordinary room-wide question can reach every eligible Session. Claude Code and OpenCode use
+an existing live client; they do not create a new harness. Codex receives it at its next normal
+turn and is never woken by Vox. A busy Claude turn or permission decision is not interrupted by
+ordinary room attention. Paused rooms hold automatic news and wakes. Delivery does not promise
+that a model finds the question relevant or answers it.
+
+Check `vox agent doctor` for wiring and `vox room ping` for the daemon's Session report. Then
+verify a harmless question in the actual harness and its correlated reply in the room. Neither a
+successful post nor a hook exit code proves that. Members with Drive can inspect the selected
+Session's private attention state; General does not expose that state.
+
+Agents treat attributed room text as information from participants, not as operator permission.
+Their claims and handoffs coordinate ownership; progress and proofs stay in the work tracker.
 
 ## What makes Vox different
 
@@ -321,11 +253,9 @@ members, not from the person they work for.
   when it rotates (up to seven days); restoring a profile brings back its prekeys, and any one-time
   ones it brings back retire within seven days; a replay of a delivery to a signed prekey re-creates
   a session whose key the room already holds; and a sender refuses prekeys dated more than ten
-  minutes ahead of its clock, so a wrong clock lengthens the seven days by at most ten minutes. A
-  member still on Vox v0.4.2 or older is sent your keys the old way, so it can read you, but with
-  none of this recovery for those keys until it updates; Vox says so beside it in `vox room roster`,
-  `vox status` and the app. Nothing here holds against someone who stole an identity key and acts as
-  it. *(ADR-030)*
+  minutes ahead of its clock, so a wrong clock lengthens the seven days by at most ten minutes.
+  Cooperating nodes must use the same supported release; v0.4.5 does not promise older-peer
+  compatibility. Nothing here holds against someone who stole an identity key and acts as it. *(ADR-030)*
 - **Chat, agents and tunnels on one overlay.** *(ADR-013, ADR-017, ADR-020)*
 
 ## Threat model
@@ -366,8 +296,8 @@ install.sh              the installer the curl one-liner runs
 
 ## Building
 
-A pure-Rust Cargo workspace; the one native crypto dependency is `aws-lc-rs` inside the TLS stack
-(ADR-011).
+The core, CLI and TUI are a Rust Cargo workspace. The Mac app uses SwiftUI; platform bindings
+and `aws-lc-rs` in the TLS stack also require native build tools.
 
 ```
 cargo build --release
@@ -376,19 +306,16 @@ cargo build --release
 There are **no unit tests, by policy**. Vox is checked only by using the real `vox` binary the way a
 person would — real nodes, real rooms, real network — and a check's failure must say whether the
 product or the check itself failed. CI compiles and lints every change; the checks are run by hand,
-on demand:
-
-```
-cargo test --release -p vox-tui --test <check> -- --ignored
-```
-
-Heavy, timing-bound or live-model checks need `--features optional-proofs`; see
+on demand. Use the exact journey and invocation documented in
+[the optional proof inventory](docs/release/optional-proofs.md), in its stated profile and scratch
+environment. Proofs that use test knobs require a `test-knobs` build; installed release artifacts
+exclude those knobs. Heavy, timing-bound or live-model checks need `--features optional-proofs`; see
 [docs/release/optional-proofs.md](docs/release/optional-proofs.md) and
 [ADR-018](docs/adr/ADR-018-quality-bar-and-product-proof.md).
 
 ## Status
 
-**v0.4.1** (October 2026). Linux and macOS, as a terminal client, CLI and daemon, and on the Mac
+**v0.4.5** (October 2026). Linux and macOS, as a terminal client, CLI and daemon, and on the Mac
 also as **Vox.app**, a native app for Apple Silicon and macOS 13 or later
 ([ADR-014](docs/adr/ADR-014-macos-client.md)) that is a client of the same daemon. Working today:
 one daemon per data root with any number of nodes; rooms over the real network through the full NAT
@@ -400,7 +327,8 @@ pulled automatically; the family LAN (macOS); leaving and ending rooms, admins a
 rotation and per-member revocation; Claude Code, Codex and OpenCode sessions, each agent its own
 node, with a Session per interactive session that members trusted with drive can read and drive
 from the CLI, the TUI or the app; on the Mac, a first run entirely in Vox.app; the agent skill pack kept current for every harness, and a repo
-bound to its room once; an upgrade that keeps your data, and `vox uninstall`.
+bound to its room once; current-room attention with private delivery state; pause/resume; bounded
+room and Session pages; and `vox uninstall`. See the update compatibility limits above.
 
 iOS is a separate, later capability.
 

@@ -1,13 +1,54 @@
 # User manual evidence map
 
-Updated: 2026-10-04; ADR-030's claims added 2026-10-10 (#661); the v0.4.3 pass 2026-10-10. Scope: ADR-027 M27.1 / work item
-#421. This is maintainer evidence, not a chapter in the public navigation manifest. Source
+Updated: 2026-10-15 for the v0.4.5 source/documentation pass. Prior walkthrough records below
+remain historical evidence at their stated revisions. Scope: ADR-027 M27.1 / work item #421. This is maintainer evidence, not a chapter in the public navigation manifest. Source
 inspection is not an execution test.
+
+## v0.4.5 documentation continuation
+
+The current chapters describe the exact `v0.4.5` tag,
+[`c97c1a7e183d1443beb1c3738d75097c543c2a7c`](https://github.com/robertelee78/vox/tree/c97c1a7e183d1443beb1c3738d75097c543c2a7c).
+The manual's manifest records `v0.4.5`; chapter paths and existing heading fragments stay stable.
+The attempt is [manual-v045-onboarding-20261015](https://github.com/robertelee78/vox/issues/421#issuecomment-6201826027).
+This is a post-release documentation continuation, outside the executable release milestone.
+It does not change the tag, product logic or the acceptance claims of the release.
+
+No product journey was rerun for this prose update. The source map below checks commands,
+prerequisites, UI labels, current permissions and delivery limits against the tag. Existing
+accepted real-use observations supply the execution evidence; source inspection does not claim
+another run, an arbitrary model's relevance, every possible race, or prior-release migration.
+The earlier walkthrough tables are not automatically promoted to v0.4.5 evidence.
+
+| Current chapter / behavior | Source at c97c1a7e | Retained evidence boundary |
+|---|---|---|
+| Install/update; no v0.4.5 prior-release compatibility promise | `install.sh`, `crates/vox-tui/src/update.rs`, ADR-026 F-3 scope | Published installer/release records remain the install authority; no install or upgrade rerun for prose |
+| First room, known-node commands, actual links/fingerprints, quoted values and leading-hyphen Sessions | `crates/vox-tui/src/cli.rs`, `room_cli.rs`, `room_map.rs`, `client.rs` | [#744 cumulative ACCEPT](https://github.com/robertelee78/vox/issues/744#issuecomment-6196965178): commands-as-pasted observations and their discriminating inverses; retained first-room receipts, not a new NAT claim |
+| Direct access and room-owned anchors versus daemon inventory | `cli.rs` (`CreateRoomArgs`, `RoomAnchorsArgs`), `anchor_cli.rs`, `room_cli.rs`; `crates/vox-core/src/node/link.rs` | Existing direct/anchor user journeys; source confirms no mandatory anchor for directly reachable members |
+| Computer identity versus node keyring, preview and two-sided approval | `crates/vox-tui/src/computer_cli.rs`, `host/computer.rs`; `crates/vox-core/src/node/computer/`; `apps/macos/Vox/ComputerTrust.swift` | Existing computer-policy acceptance plus #744 actual native pairing Copy in zsh/Bash; no new enrollment |
+| Complete Claude/Codex/OpenCode setup and repository binding | `crates/vox-tui/src/setup.rs`, `agent_hook.rs`, `room_map.rs`, `host.rs`; `assets/opencode-plugin.js`, `assets/opencode-tui-plugin.js` | Accepted actual-client and hook observations in #812; a generated snippet, doctor or ping is not a context receipt |
+| Ordinary audience, origin, exact live receiver, readable notice and safe busy/permission behavior | `crates/vox-agentcomms/src/envelope.rs`; `crates/vox-tui/src/coord.rs`, `agent_hook.rs`, `node_tasks.rs`, `wake.rs` | [#812 cumulative ACCEPT](https://github.com/robertelee78/vox/issues/812#issuecomment-6201618001), including actual Claude 2.1.300 and OpenCode 1.19; Codex is next-normal-turn only |
+| Private attention states, correlated reply, Unknown and Read withdrawal | `crates/vox-core/src/node/attention.rs`, `attention/ledger.rs`, `attention/transport.rs`; `crates/vox-tui/src/session_cli.rs`; `apps/macos/Vox/Sessions.swift` | #812 CLI/hook/TUI and native pairs; actual input/step Answering is OpenCode evidence, not inferred Claude Answering |
+| Room pause/resume and saved-state versus interrupt outcome | `crates/vox-core/src/node/room_pause.rs`; `crates/vox-tui/src/room_pause.rs`, `host/room_pause.rs`, `agent_hook.rs`; `apps/macos/Vox/RoomPause.swift` | [#757 cumulative ACCEPT](https://github.com/robertelee78/vox/issues/757#issuecomment-6190020966) and #758–#759 accepted package, plus #812 pause/backlog/restart/Unknown observations; no unrelated-room or direct-input replay |
+| General roots, tags, threads, selected Session pages and expiry | `crates/vox-core/src/node/channel/entry_store/render_facts.rs`, `session_view.rs`; `crates/vox-ffi/src/client.rs`; `apps/macos/Vox/NodeModel.swift`, `Sessions.swift`, `MainWindow.swift` | [#872 cumulative ACCEPT](https://github.com/robertelee78/vox/issues/872#issuecomment-6191538393) plus #754/#763/#764/#768 retained UI/PTY/public-CLI observations and original-assertion inverses |
+| Room marks, composer and quiet private join caption | `apps/macos/Vox/Composer.swift`, `SessionDrive.swift`, `MainWindow.swift`; `crates/vox-ffi/src/client.rs` (`join_said`) | #760/#761/#637/#736 native acceptance; quiet join used a delivered notification control, not permission setup alone |
+| Members, trust directions, creator/admin and current work | `apps/macos/Vox/MainWindow.swift` (`Inspector`), `NodeModel.swift`; daemon board/claim fold | #765/#769 acceptance; derived room work is not a persisted project tracker |
+| Service Copy, browser proxy and Quit | `crates/vox-tui/src/tunnel_cli.rs`, `service` command output; `apps/macos/Vox/MainWindow.swift`, `VoxApp.swift` | #744 actual Copy/browser observations and shared command inverse; #683 public menu/Quit pair; no per-button rerun |
+
+The compiled help/stderr changes in this documentation candidate only correct the integration
+explanation: a saved repository room rather than every room, complete OpenCode setup rather
+than the printed server asset alone, and the dedicated native hook's fail-closed policy.
+Those corrected strings are **not** in the immutable v0.4.5 binary. The manual explicitly calls
+out the stale wording there; generated hook/plugin payloads and dispatch behavior are unchanged.
+
+Validation for this continuation is source review, Markdown links/manifest consistency, skill
+frontmatter and Rust formatting of the help-only edit. Website rendering and publication remain
+the website owner's existing workflow, consuming all chapters from one resolved commit.
 
 ## Baselines
 
 | Label | Exact source revision | Use |
 |---|---|---|
+| v0.4.5 | `c97c1a7e183d1443beb1c3738d75097c543c2a7c` (tag) | Current chapters, source-reviewed command/UI contracts and the retained evidence above |
 | v0.4.3 | `c942c4564` (the v0.4.3 tag, on main) | Task chapters from v0.4.3, the v0.4.3 command check |
 | v0.4.0 | `5c564791` (`v040/version-bump`, on integrate `a0787063`) | Task chapters from v0.4.0 (#516), the v0.4.0 command check; each row names the integrate commit it was checked at |
 | v0.3.1 | `bf6dfcdbee65e82a4683400baa94dd62fc8532d6` (built on macOS and on Linux) | Task chapters from v0.3.1 (#425), the v0.3.1 command check |
@@ -27,7 +68,7 @@ The manual follows `main`; immutable source citations explain which behavior was
 
 ## Source map
 
-Paths are repository-relative at the v0.3.0 baseline. Recheck them before changing a claim; a
+This historical table records repository-relative paths at the v0.3.0 baseline. Recheck them before changing a claim; a
 later parser or implementation may invalidate both an example and its troubleshooting advice.
 
 | Chapter / claim | Evidence |
@@ -465,7 +506,7 @@ refusal, and closed-room recovery in the TUI. That record applies to v0.2.10 onl
   helpers and UI flows. The manual does not present those proposals as released behavior.
 - The first command on a v0.2.10 data root moves its profiles. "Doctor is read-only" does not
   imply that common first-use path resolution never changes files.
-- Network-change detection (ADR-012 N-49–N-58) is v0.3.1 work; the manual marks it as not in
-  this release.
+- The v0.3.0 edition marked network-change detection as later work; current chapters describe
+  the implementation landed since v0.3.1. Historical evidence is kept at its original version.
 
 Maintain this map together with [manual authoring instructions](manual-authoring.md).

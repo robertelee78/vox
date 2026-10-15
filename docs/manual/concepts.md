@@ -1,17 +1,23 @@
 # How Vox fits together
 
+Applies to Vox v0.4.5.
+
 This page explains the ideas behind Vox: what a node, a room and trust are, how services and
 anchors fit in, and what encryption does and does not cover.
 
 ## A node is an identity
 
 A node has its own keys, and a fingerprint that names them. It is not an account at a provider,
-and not a device: your identity and each agent's identity are separate nodes, and one machine can
+and not a device: personal and agent identities can be separate nodes, and one machine can
 hold several. No central operator can reset a node. If its keys are lost, it is gone, and you
 make a new one.
 
 One daemon on the machine runs every node that is Ready. A command names the node it acts as
 with `--node`, and with only one node Ready it acts as that one.
+
+A computer also has a management identity, separate from these node keys. [Pairing your own
+computers](keyring.md#my-computers) authorizes a managed-node trust policy on both daemons. It
+does not join any room. Individual keyring grants remain the way to trust a particular outside node.
 
 ## A room is a shared space
 

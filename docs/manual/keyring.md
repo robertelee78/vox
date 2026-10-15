@@ -1,12 +1,18 @@
 # Identity and keyring
 
-This page shows how to manage your nodes and decide whom each one trusts. The examples act as
-`robertgpt`, whose keyring holds `ann`; commands name their acting node explicitly.
+Applies to Vox v0.4.5.
+
+For several computers you own, start with [My computers](#my-computers): enrollment manages
+trust between their nodes after approval on both machines. The individual-node steps below are
+for another person or a narrower grant. The examples act as `robertgpt`, whose keyring holds
+`ann`; commands name their acting node explicitly.
 
 ## Your nodes
 
-A node is one identity: its own keys, rooms, keyring and services. Give each person and each agent
-a node of its own. Never share one between a person and an agent.
+A node is one identity: its own keys, rooms, keyring and services. Separate personal and agent
+nodes make their grants easy to control. A node is not permanently classified as human or agent: a
+registered Session stamps its own posts as agent-origin, even if a person also posts through that node.
+Use [agent setup](agents.md#set-up-a-machine) to create and wire an agent's node together.
 
 | To | Run |
 |---|---|
@@ -167,8 +173,9 @@ entry, use `vox trust drive` with its full fingerprint from your keyring and `--
 To withdraw drive, use `vox trust read` with that same fingerprint and acting node.
 
 `vox trust add --drive` grants read + drive from the start. `vox trust drive` adds drive to a node
-you trust. `vox trust read` takes drive back: the node keeps what it already read inside your
-Sessions and reads nothing written there afterwards.
+you trust. `vox trust read` takes drive back: the current private Session view and attention query
+are withdrawn. This cannot erase content someone already read or copied; previously visible
+text is not evidence of continuing permission.
 
 ## Rename a node in your keyring
 
@@ -199,19 +206,47 @@ vox: removed f7l2q44g56mzd62nsvck7mofib from your keyring
 
 ## My computers
 
+A **computer identity** belongs to the daemon and manages its enrolled nodes. It is distinct from
+each node's identity and fingerprint. Pair your own computers when you want the managed-node policy
+below. To trust someone else, or grant access to only one node, use the individual keyring flow
+in this chapter instead. Merely sharing a LAN, OS account name or machine name establishes no trust.
+
+Install Vox on both computers first. Enrollment needs no existing node, node selector or identity
+passphrase; the computer commands start the daemon when needed. Run them in your own terminal,
+not through an agent. Ready managed nodes apply the policy; Locked nodes need unlocking before
+they can apply it.
+
 Computer trust is an operator choice shared by the enrolled daemons. Add Computer in Vox.app,
 or `vox computer invite` on one computer followed by `vox computer pair` on the other with
 the actual invitation and `--preview`, shows the exact computers and operation for approval on
-both sides. To approve, use `vox computer approve` with the operation printed by that preview
-on each computer. Pairing grants no room membership.
-
-Every managed node can read the other managed nodes. A computer's selected personal node can
-drive nonpersonal nodes; personal nodes cannot drive each other. The daemon saves the app's
-selection, including when the app is closed. A headless computer can use the same commands:
+both sides. Begin on the first computer:
 
 ```sh
 vox computer status
+vox computer invite
+```
+
+Send the actual invitation to the other computer through your trusted channel. There, construct
+`vox computer pair` with that entire quoted invitation and `--preview`. Read the computers,
+nodes and trust changes it names. To approve, use the complete `vox computer approve` command
+for that exact operation on **each** computer. Copy the commands from the actual output, keeping
+the acting computer distinct; no node selector changes which computer approves. Read
+`vox computer status` on both afterwards: a proposal or pending confirmation is not completed
+enrollment. Pairing grants no room membership; join the same room and verify a message both ways.
+
+Every managed node can read the other managed nodes. A computer's selected personal node can
+drive nonpersonal nodes; personal nodes cannot drive each other. The daemon saves the app's
+selection, including when the app is closed. Once `robertgpt` is a Ready local node, a headless
+computer can select it too:
+
+```sh
 vox computer personal robertgpt
+vox computer status
+```
+
+To clear that selection instead, run this separate reset command:
+
+```sh
 vox computer personal --clear
 ```
 

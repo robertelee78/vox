@@ -1,5 +1,7 @@
 # Reach a shared service
 
+Applies to Vox v0.4.5.
+
 This page shows how to share a service on your machine, such as SSH, with the members of a room
 you trust, and how they reach it. robertgpt shares, and ann reaches it and names robertgpt
 `robertgpt`. Vox does not start the service or replace its own login: SSH still asks for its
@@ -219,6 +221,27 @@ anchors, Vox asks you to select one with `FINGERPRINT@ADDRESS`.
 
 An anchor is a host you run, not an account somewhere. It holds no room key and cannot read the
 room's contents. If a member refused your passphrase, the member was already reached.
+
+### Put an anchor in a room link
+
+For the tutorial room `family`, its creator or an admin acts as `robertgpt`. Use the actual
+`FINGERPRINT@ADDRESS` printed by your anchor to construct `vox room anchors family --node robertgpt add`, followed
+by that quoted value. This changes the room's signed anchor set and its
+links; it does not grant the anchor Read or Drive. To discover a reachable LAN anchor explicitly:
+
+```sh
+vox room anchors family --node robertgpt add --find-anchor
+vox room link family --node robertgpt
+```
+
+Check the command's result and the room inspector's anchor list, then give the newcomer the new
+link and the passphrase separately. When creating a new room instead, add `--room-anchor` with
+the actual anchor specification to `vox room create`; repeat it for multiple anchors.
+`--find-anchor` asks for LAN discovery, and finding none still permits direct room creation.
+
+To withdraw a room anchor, construct `vox room anchors family --node robertgpt remove` with its full fingerprint. Removing the last anchor makes the room direct-only. Do this only when
+that is the intended reachability change. Machine-level `vox anchor add` is a different operation:
+it does not distribute that anchor in the room's link.
 
 ### How a node gets its anchors
 
