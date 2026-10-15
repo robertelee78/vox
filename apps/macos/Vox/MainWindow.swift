@@ -2386,7 +2386,7 @@ private struct Inspector: View {
                     }
                     if let page = model.memberWork {
                         if page.coordinationRefused { Text("Work coordination refused: participating Vox versions differ.").secondaryText() }
-                        Text("Showing one page of room work. Refresh returns to the first page.").caption().secondaryText()
+                        Text("Showing one page of room work. Refresh returns to the first page.").font(Theme.text).secondaryText()
                         HStack {
                             Button("Refresh work") { Task { await model.loadMemberWork(room, force: true) } }
                                 .accessibilityIdentifier("member-work-refresh")
@@ -2395,8 +2395,8 @@ private struct Inspector: View {
                                     .accessibilityIdentifier("member-work-next")
                             }
                         }.disabled(model.memberWorkLoading)
-                        if page.next != nil { Text("More room work is on the next page.").caption().secondaryText() }
-                        if page.rows.isEmpty { Text("No current claims or unanswered addressed work.").caption().secondaryText() }
+                        if page.next != nil { Text("More room work is on the next page.").font(Theme.text).secondaryText() }
+                        if page.rows.isEmpty { Text("No current claims or unanswered addressed work.").font(Theme.text).secondaryText() }
                         let listed = Set(model.members.map(\.id)).union([model.me])
                         ForEach(Array(page.rows.enumerated()).filter { !listed.contains($0.element.member) }, id: \.offset) { _, row in
                             VStack(alignment: .leading) {
@@ -2405,7 +2405,7 @@ private struct Inspector: View {
                             }
                         }
                     } else {
-                        Text(model.memberWorkLoading ? "Reading room work…" : "Room work unavailable").caption().secondaryText()
+                        Text(model.memberWorkLoading ? "Reading room work…" : "Room work unavailable").font(Theme.text).secondaryText()
                     }
                     if let problem = model.memberRolesError {
                         Text(problem).secondaryText().fixedSize(horizontal: false, vertical: true)
@@ -2417,7 +2417,7 @@ private struct Inspector: View {
                             .accessibilityIdentifier("member-\(member.name)")
                         role(member.id)
                         work(member.id)
-                        Text(member.trust.sentence(member.name)).caption().secondaryText()
+                        Text(member.trust.sentence(member.name)).font(Theme.text).secondaryText()
                             .fixedSize(horizontal: false, vertical: true)
                             .accessibilityIdentifier("member-trust-directions-" + member.id)
                         MemberTrustActions(model: model, fingerprint: member.id, name: member.name, room: room)
