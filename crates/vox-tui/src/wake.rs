@@ -5,8 +5,9 @@
 //! is not admission authority. Ordinary news and addressed urgency use this same boundary.
 //! A lost acknowledgment remains unknown; a timer never resubmits it.
 //!
-//! Claude's shared messaging endpoint carries only an opaque notice. Its actual native prompt
-//! hook checks the exact Session and consumes the sealed notice before reading room context.
+//! Claude's shared messaging endpoint carries readable counts/names and an opaque notice reference.
+//! Its actual native prompt hook checks the exact Session and consumes the sealed notice before
+//! reading room context.
 //! The socket alone is never conversation admission. Codex is always next-turn-only:
 //! Vox never starts, adds to, or steers a Codex turn for room attention.
 //!
@@ -79,41 +80,53 @@ impl AttentionRoute {
     }
 }
 
-/// Body-free native prompt capability. Authentication secrets never enter the transcript.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
+/// Internal admitted context, reconstructed from the actual native Session and sealed attempt.
+/// Only the opaque notice id and readable announcement enter the transcript, never these routes.
 pub(crate) struct NativeNotice {
     pub recipient: vox_core::node::attention::Recipient,
     pub notice_id: [u8; 16],
     pub route: Digest32,
 }
 impl NativeNotice {
-    const PREFIX: &str = "Vox attention notice v1: ";
+    const PREFIX: &str = "Vox attention notice: ";
+    const REFERENCE: &str = "\nNotice reference: ";
 
-    pub(crate) fn parse(prompt: &str) -> Result<Option<Self>, String> {
+    pub(crate) fn parse(prompt: &str) -> Result<Option<[u8; 16]>, String> {
         use base64::Engine as _;
-        let Some(encoded) = prompt.strip_prefix(Self::PREFIX) else {
+        if !prompt.starts_with("Vox attention notice") {
             return Ok(None);
-        };
-        if encoded.len() > 4096 {
+        }
+        if prompt.len() > 4096 {
             return Err("attention notice exceeds its bound".into());
         }
+        // Presentation is not an authority selector. Old serialized envelopes and malformed
+        // reserved notices fail closed rather than becoming ordinary prompts.
+        let (_, encoded) = prompt
+            .strip_prefix(Self::PREFIX)
+            .and_then(|text| text.split_once(Self::REFERENCE))
+            .filter(|(text, id)| {
+                !text.is_empty() && !text.chars().any(vox_text::breaks_lines) && id.len() == 22
+            })
+            .ok_or("malformed attention notice")?;
         let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(encoded)
             .map_err(|_| "malformed attention notice")?;
-        serde_json::from_slice(&bytes)
+        <[u8; 16]>::try_from(bytes)
             .map(Some)
             .map_err(|_| "malformed attention notice".into())
     }
 
-    fn prompt(&self) -> Result<String, String> {
+    fn prompt(notice_id: [u8; 16], announcement: &str) -> Result<String, String> {
         use base64::Engine as _;
-        let bytes = serde_json::to_vec(self).map_err(|error| error.to_string())?;
-        Ok(format!(
-            "{}{}",
-            Self::PREFIX,
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
-        ))
+        let prompt = format!(
+            "{announcement}{}{}",
+            Self::REFERENCE,
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(notice_id)
+        );
+        if Self::parse(&prompt)? != Some(notice_id) {
+            return Err("malformed attention announcement".into());
+        }
+        Ok(prompt)
     }
 }
 
@@ -1609,15 +1622,11 @@ pub(crate) async fn claude_attention(
     session: &Session,
     route: &AttentionRoute,
     attempt: &vox_core::node::attention::Attempt,
+    text: &str,
 ) -> vox_core::node::attention::DispatchOutcome {
     use tokio::io::AsyncWriteExt as _;
     use vox_core::node::attention::DispatchOutcome as Outcome;
-    let notice = NativeNotice {
-        recipient: attempt.recipient.clone(),
-        notice_id: attempt.notice_id,
-        route: route.route,
-    };
-    let prompt = match notice.prompt() {
+    let prompt = match NativeNotice::prompt(attempt.notice_id, text) {
         Ok(prompt) => prompt,
         Err(error) => return Outcome::NotSent(error),
     };

@@ -1649,13 +1649,14 @@ pub async fn run(
     }
     if native_attention {
         let admitted = async {
-            let notice = notice
+            let notice_id = notice
                 .map_err(AppError::Usage)?
                 .ok_or_else(|| AppError::Usage("missing native attention notice".into()))?;
             if !input.claude
                 || input.codex
                 || input.event != "UserPromptSubmit"
-                || input.session_id != notice.recipient.session
+                || input.session_id.is_empty()
+                || input.session_id == "unknown-session"
             {
                 return Err(AppError::Usage(
                     "Vox attention notice belongs to a different native conversation".into(),
@@ -1671,11 +1672,6 @@ pub async fn run(
                     != Ok(saved.endpoint.as_str())
                 || std::env::var("CLAUDE_CODE_MESSAGING_TOKEN").as_deref()
                     != Ok(saved.token.as_str())
-                || saved.room.as_deref() != Some(b32_encode(&notice.recipient.room).as_str())
-                || saved
-                    .attention
-                    .as_ref()
-                    .is_none_or(|route| route.route != notice.route)
                 || crate::wake::AttentionRoute::claude(&saved).as_ref() != saved.attention.as_ref()
             {
                 return Err(AppError::Usage("Vox attention registration changed".into()));
@@ -1685,6 +1681,52 @@ pub async fn run(
             let owner = client
                 .me()
                 .ok_or_else(|| AppError::Usage("Vox node is locked".into()))?;
+            let room = vox_core::node::link::b32_decode(
+                saved.room.as_deref().ok_or_else(|| {
+                    AppError::Usage("Vox attention conversation has no saved room".into())
+                })?,
+                "attention room",
+            )?;
+            let route = saved
+                .attention
+                .as_ref()
+                .ok_or_else(|| AppError::Usage("Vox attention registration changed".into()))?
+                .route;
+            // The prompt contains no recipient selector. Resolve only the actual native Session
+            // in its saved room; Admit then matches this exact opening against the sealed attempt.
+            // An A notice presented in B (or a replacement A) cannot select or reopen A.
+            let recipient = match vox_core::node::attention::local(
+                &at,
+                owner,
+                room,
+                None,
+                vox_core::node::attention::Operation::Resolve {
+                    session: input.session_id.clone(),
+                },
+            )
+            .await
+            .map_err(AppError::Usage)?
+            {
+                vox_core::node::attention::Reply::Resolved { recipient, .. } => recipient,
+                _ => {
+                    return Err(AppError::Usage(
+                        "unexpected native attention selection answer".into(),
+                    ));
+                }
+            };
+            if recipient.room != room
+                || recipient.session != input.session_id
+                || !crate::wake::pause_registration(paths, &input.session_id)
+                    .map_err(AppError::Usage)?
+                    .is_some_and(|current| current.same(&saved))
+            {
+                return Err(AppError::Usage("Vox attention registration changed".into()));
+            }
+            let notice = crate::wake::NativeNotice {
+                recipient,
+                notice_id,
+                route,
+            };
             let reply = vox_core::node::attention::local(
                 &at,
                 owner,
