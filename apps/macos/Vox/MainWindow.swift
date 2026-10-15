@@ -1955,17 +1955,17 @@ private struct MessageRow: View {
                 // No label of its own: a selectable Text with one sends SwiftUI's accessibility
                 // into endless recursion. Its words are what it says.
                 Text("pulled by \(pulledBy.joined(separator: ", "))")
-                    .caption().secondaryText()
+                    .font(Theme.text).secondaryText()
                     .accessibilityIdentifier("pulled-by-\(message.id)")
             }
             if !readBy.isEmpty {
                 Text("read by \(readBy.joined(separator: ", "))")
-                    .caption().secondaryText()
+                    .font(Theme.text).secondaryText()
                     .accessibilityIdentifier("read-by-\(message.id)")
             } else if let whereabouts, message.author == me {
                 // No label of its own, as above: its words are what it says.
                 Text(whereabouts)
-                    .caption().secondaryText()
+                    .font(Theme.text).secondaryText()
                     .accessibilityIdentifier("whereabouts-\(message.id)")
             }
             if model.hasRecipientNavigation(message.id) {
@@ -2484,13 +2484,14 @@ private struct Inspector: View {
 
     private func workRow(_ row: MemberWork) -> some View {
         VStack(alignment: .leading, spacing: Space.s4) {
-            Text("\(row.kind.capitalized)\(row.session.isEmpty ? "" : " · " + row.session)").fontWeight(.semibold)
+            Text(row.kind.capitalized).font(Theme.text).fontWeight(.semibold)
+            if !row.session.isEmpty { Text(row.session).font(Theme.mono).textSelection(.enabled) }
             if ["ask", "assign", "handoff"].contains(row.kind) {
-                Text("From \(model.nodeName(row.author))\(row.from.isEmpty ? "" : " · " + row.from)")
-                    .textSelection(.enabled)
+                Text("From \(model.nodeName(row.author))").font(Theme.text)
+                if !row.from.isEmpty { Text(row.from).font(Theme.mono).textSelection(.enabled) }
             }
             if !row.resource.isEmpty { Text(row.resource).textSelection(.enabled) }
-            if !row.text.isEmpty { Text(row.text).fixedSize(horizontal: false, vertical: true) }
+            if !row.text.isEmpty { Text(row.text).font(Theme.text).fixedSize(horizontal: false, vertical: true) }
             if !row.work.isEmpty { Text(row.work).textSelection(.enabled) }
             ForEach(row.tags, id: \.self) { Text($0).textSelection(.enabled) }
         }
@@ -2507,7 +2508,7 @@ private struct Inspector: View {
             }
         } else {
             Text(model.memberRolesLoading ? "Checking room role…" : "Room role unavailable")
-                .caption().secondaryText()
+                .font(Theme.text).secondaryText()
                 .accessibilityIdentifier("member-role-" + fingerprint)
         }
     }
