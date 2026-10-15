@@ -282,22 +282,7 @@ pub(crate) async fn post(
     }
     let mut client = attach(paths).await?;
     let channel_id = room_of(&mut client, room).await?;
-    // A raw envelope may name another authoring session. The command still acts inside the
-    // caller's registered working room; its supplied `from` cannot bypass that boundary.
-    if let Some(session) = session.as_deref() {
-        vox_core::node::sessions::check_working_room(paths, session, &channel_id)
-            .map_err(AppError::Usage)?;
-    }
-    // **A message from a harness session says which** (ADR-029 MD-1, MD-2): its `from` is the
-    // session's id, whatever the agent wrote, and the node fills in its name. A message that
-    // already names a session, and one no session sends (a person's), is posted as given.
-    let body = match (session, vox_agentcomms::envelope::Envelope::parse(&body)) {
-        (Some(s), Ok(mut env)) if env.from.trim().is_empty() => {
-            env.from = s;
-            env.to_text()
-        }
-        _ => body,
-    };
+    let body = prepare_post_origin(paths, channel_id, &body, session.as_deref())?;
     let body = prepare_reply(&mut client, channel_id, &body).await?;
     match client
         .request(&Request::Post {
@@ -312,6 +297,38 @@ pub(crate) async fn post(
         Ok(other) => Err(crate::client::unexpected(&other)),
         Err(e) => Err(AppError::Usage(e.to_string())),
     }
+}
+
+/// Stamp the actual sender before either the CLI or TUI appends prose/raw JSON (RA-3).
+/// Outside a harness, a person's supplied message retains its origin; an explicit Session
+/// still has its existing coordination meaning. A harness cannot post as a different Session
+/// or escape its registered room with a caller-built `from`.
+pub(crate) fn prepare_post_origin(
+    paths: &Paths,
+    channel_id: Digest32,
+    body: &str,
+    supplied: Option<&str>,
+) -> Result<String, AppError> {
+    let Some(session) = coord::posting_session(paths, supplied)? else {
+        return Ok(body.to_owned());
+    };
+    vox_core::node::sessions::check_working_room(paths, &session, &channel_id)
+        .map_err(AppError::Usage)?;
+    let mut env =
+        Envelope::parse(body).map_err(|e| AppError::Usage(format!("refusing to post it: {e}")))?;
+    if !env.from.is_empty() && env.from != session {
+        return Err(AppError::Usage(format!(
+            "message from {} conflicts with the sending session {}; nothing was posted",
+            vox_agentcomms::envelope::shown(&env.from, vox_agentcomms::envelope::SHOWN_NAME),
+            vox_agentcomms::envelope::shown(&session, vox_agentcomms::envelope::SHOWN_NAME)
+        )));
+    }
+    env.from = session;
+    if coord::agent_marked() {
+        // The node fills the actual registered name. A raw model-written envelope does not.
+        env.at.session_name = None;
+    }
+    Ok(env.to_text())
 }
 
 /// The structured half of `vox room post` (ADR-021 §7).
@@ -604,9 +621,9 @@ pub(crate) async fn post_structured(
     let coordinates =
         kind != vox_agentcomms::envelope::SAY || work.is_some() || opts.attempt.is_some();
     let session = if coordinates {
-        coord::require_session(opts.coord.session.as_deref())?
+        coord::require_posting_session(paths, opts.coord.session.as_deref())?
     } else {
-        coord::session(opts.coord.session.as_deref()).unwrap_or_default()
+        coord::posting_session(paths, opts.coord.session.as_deref())?.unwrap_or_default()
     };
     let op = match &opts.coord.op {
         Some(op) if vox_agentcomms::ops::is_valid_op(op) => op.clone(),
@@ -618,6 +635,7 @@ pub(crate) async fn post_structured(
         None => coord::new_op()?,
     };
     let (mut client, cid, room_key) = open_room(paths, room).await?;
+    vox_core::node::sessions::check_working_room(paths, &session, &cid).map_err(AppError::Usage)?;
     let to = addressees(&mut client, cid, &opts.to).await?;
     let snap = if work.is_some() {
         coord::participate(paths, &mut client, cid, &room_key, &session).await?
@@ -932,7 +950,8 @@ pub async fn post_cmd(
             // structured post takes, and two agents answering each other that way woke each
             // other for ever.
             if env.urgent && env.re.is_none() {
-                if let Some(session) = coord::session(opts.coord.session.as_deref()) {
+                if let Some(session) = coord::posting_session(paths, opts.coord.session.as_deref())?
+                {
                     let (mut client, cid, room_key) = open_room(paths, room).await?;
                     let me = client
                         .me()
@@ -958,7 +977,7 @@ pub async fn post_cmd(
             room,
             Some(&body),
             !opts.no_card,
-            coord::session(opts.coord.session.as_deref()),
+            opts.coord.session.clone(),
         )
         .await;
     }
@@ -2931,7 +2950,7 @@ async fn run_op(
     data: serde_json::Map<String, serde_json::Value>,
     body: String,
 ) -> Result<Done, AppError> {
-    let session = coord::require_session(opts.session.as_deref())?;
+    let session = coord::require_posting_session(paths, opts.session.as_deref())?;
     // Every node folds these names and prints them into its agents' contexts, so a name
     // that would not stay on one line is refused here, before anything is posted, as the
     // fold refuses it there (V210-123).
@@ -2958,6 +2977,7 @@ async fn run_op(
         None => coord::new_op()?,
     };
     let (mut client, cid, room_key) = open_room(paths, room).await?;
+    vox_core::node::sessions::check_working_room(paths, &session, &cid).map_err(AppError::Usage)?;
     let snap = coord::participate(paths, &mut client, cid, &room_key, &session).await?;
     let before = data
         .get("resource")
@@ -3875,7 +3895,7 @@ pub async fn renew_resource(
     resource: &str,
     opts: &CoordOpts,
 ) -> Result<(), AppError> {
-    let session = coord::require_session(opts.session.as_deref())?;
+    let session = coord::require_posting_session(paths, opts.session.as_deref())?;
     let acquisition = {
         let (mut client, cid, _) = open_room(paths, room).await?;
         let snap = coord::snapshot(&mut client, cid).await?;

@@ -1037,6 +1037,8 @@ pub struct FfiSession {
     pub node_alias: String,
     /// The harness's own session id, as its node claims it.
     pub session_id: String,
+    /// The authenticated opening of this exact Session incarnation.
+    pub opening: String,
     /// The first 8 characters of the id.
     pub short_id: String,
     /// The session's current name, as its node last gave it.
@@ -1067,6 +1069,7 @@ fn ffi_session(
         short_id: s.id.chars().take(8).collect(),
         label: known.label(s),
         session_id: s.id.clone(),
+        opening: b32_encode(&s.opening),
         name: s.name.clone(),
         open: s.open,
         opened_at_ms: s.opened_millis,
@@ -1755,6 +1758,63 @@ impl SessionPauseRead {
     }
 }
 
+/// An observed delivery state, not a promise that an agent will answer (ADR-020 RA-7).
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum SessionAttentionState {
+    Queued,
+    Delivered,
+    Answering,
+    Answered,
+    Unavailable,
+}
+
+/// Why a particular ordinary room message is still waiting for this Session.
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum SessionAttentionWait {
+    Paused,
+    NextCodexTurn,
+    NextTurnAfterResume,
+    AdapterUnavailable,
+    Unknown,
+}
+
+/// One observation for the privately selected Session and a durable room message.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct SessionAttentionRow {
+    pub source: String,
+    pub state: SessionAttentionState,
+    pub wait: Option<SessionAttentionWait>,
+    pub observed_at_ms: u64,
+    pub answer: Option<String>,
+    pub reason: Option<String>,
+}
+
+/// An opaque continuation belongs to one attachment and exact authorized Session selection.
+#[derive(Debug, uniffi::Object)]
+pub struct SessionAttentionCursor {
+    actor: Digest32,
+    room: Digest32,
+    owner: Digest32,
+    session: String,
+    opening: Digest32,
+    local_instance: [u8; 16],
+    attachment: Arc<()>,
+    after: vox_core::node::attention::Cursor,
+}
+
+/// At most one bounded page; following next replaces it rather than accumulating history.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct SessionAttentionPage {
+    /// The caller's saved room instance, distinct from the receiver's private cursor instance.
+    pub instance: Vec<u8>,
+    pub opening: String,
+    pub revision: u64,
+    /// Thread audiences remain unresolved; an empty page is not a complete absence.
+    pub preparing: bool,
+    pub rows: Vec<SessionAttentionRow>,
+    pub next: Option<Arc<SessionAttentionCursor>>,
+}
+
 /// One captured pause selection. Its roster is bounded by the room's existing member limit;
 /// release/replacement of the app's attachment invalidates it even if the fingerprint is reused.
 #[derive(uniffi::Object)]
@@ -1875,6 +1935,8 @@ pub struct VoxClient {
     following: FollowSlot,
     /// One selected-owner pause read, with no waiting queue or per-history state.
     session_pause_read: Arc<tokio::sync::Semaphore>,
+    /// One private attention page; never queues behind the selected owner pause read.
+    session_attention_read: Arc<tokio::sync::Semaphore>,
     /// A connection to the daemon, kept while the client lives: a daemon a client started exits
     /// once no node is attached and no client is connected (ADR-026 L-8), and the app is its
     /// client from the moment it opens, before any node is attached.
@@ -3054,6 +3116,7 @@ impl VoxClient {
             held: Arc::new(tokio::sync::Mutex::new(None)),
             following: Arc::new(Mutex::new(None)),
             session_pause_read: Arc::new(tokio::sync::Semaphore::new(1)),
+            session_attention_read: Arc::new(tokio::sync::Semaphore::new(1)),
             daemon_hold: Mutex::new(Some(hold)),
         }))
     }
@@ -5639,6 +5702,131 @@ impl VoxClient {
         let _cancel = CancelRead(read);
         task.await
             .map_err(|_| failed("The Session pause read was cancelled."))?
+    }
+
+    /// One private attention page for the exact selected Session. This uses an independent,
+    /// cancellable control connection and never holds Slot while waiting for a remote owner.
+    /// The existing single-use status-read cancellation handle owns only this request.
+    ///
+    /// # Errors
+    /// Selection, attachment or drive authority changed, the cursor is stale, or no page arrived.
+    #[allow(clippy::too_many_arguments)] // Exact actor/room/Session fences, as for core attention.
+    pub async fn session_attention_page(
+        &self,
+        room: String,
+        actor: String,
+        node: String,
+        session_id: String,
+        opening: String,
+        instance: Vec<u8>,
+        after: Option<Arc<SessionAttentionCursor>>,
+        read: Arc<SessionPauseRead>,
+    ) -> Result<SessionAttentionPage, VoxError> {
+        use vox_core::node::attention::{self, State, Wait};
+        let room = digest(&room, "room id")?;
+        let actor = input_fingerprint(&actor)?;
+        let node = input_fingerprint(&node)?;
+        let opening = digest(&opening, "Session opening")?;
+        let expected_instance: [u8; 16] = instance
+            .try_into()
+            .map_err(|_| failed("The selected Session has no saved room instance."))?;
+        let permit = Arc::clone(&self.session_attention_read)
+            .try_acquire_owned()
+            .map_err(|_| failed("The selected Session's attention is still being read."))?;
+        let held = Arc::clone(&self.held);
+        let task = {
+            let mut control = read.control.lock().unwrap_or_else(PoisonError::into_inner);
+            if control.cancelled || control.started {
+                return Err(failed(
+                    "The Session attention read was cancelled or already used.",
+                ));
+            }
+            control.started = true;
+            let task = self.rt.spawn(async move {
+                let _permit = permit;
+                tokio::time::timeout(REQUEST_WITHIN, async {
+                    let (at, attachment) = {
+                        let slot = held.lock().await;
+                        let h = slot.as_ref().ok_or_else(not_attached)?;
+                        if h.client.me() != Some(actor) {
+                            return Err(failed("The acting node changed while reading Session attention."));
+                        }
+                        (h.at.clone(), Arc::clone(&h.attachment))
+                    };
+                    if after.as_ref().is_some_and(|c| c.actor != actor || c.room != room
+                        || c.owner != node || c.session != session_id || c.opening != opening
+                        || c.local_instance != expected_instance || !Arc::ptr_eq(&c.attachment, &attachment))
+                    {
+                        return Err(failed("The attention page belongs to another selection. Refresh attention."));
+                    }
+                    let mut client = IpcClient::open_at(&at).await
+                        .map_err(|e| listing_failed("Session attention", e))?;
+                    if client.me() != Some(actor) {
+                        return Err(failed("The acting node changed while reading Session attention."));
+                    }
+                    if pause_session_context(&mut client, room, node, &session_id).await?
+                        != (expected_instance, opening)
+                    {
+                        return Err(failed("The selected Session changed while reading its attention."));
+                    }
+                    let page = attention::page_checked(&at, room, node, &session_id, opening,
+                        actor, expected_instance, after.as_ref().map(|c| c.after)).await.map_err(failed)?;
+                    if page.opening != opening || page.rows.len() > attention::PAGE_SIZE {
+                        return Err(failed("The Session attention page did not match its bounded selection."));
+                    }
+                    if pause_session_context(&mut client, room, node, &session_id).await?
+                        != (expected_instance, opening)
+                    {
+                        return Err(failed("The selected Session changed while reading its attention."));
+                    }
+                    let slot = held.lock().await;
+                    let h = slot.as_ref().ok_or_else(not_attached)?;
+                    if !Arc::ptr_eq(&attachment, &h.attachment) || h.client.me() != Some(actor) {
+                        return Err(failed("The acting node attachment changed while reading Session attention."));
+                    }
+                    let next = page.next.map(|after| Arc::new(SessionAttentionCursor {
+                        actor, room, owner: node, session: session_id, opening,
+                        local_instance: expected_instance, attachment, after,
+                    }));
+                    Ok(SessionAttentionPage {
+                        instance: expected_instance.to_vec(), opening: b32_encode(&opening),
+                        revision: page.revision, preparing: page.preparing,
+                        rows: page.rows.into_iter().map(|row| SessionAttentionRow {
+                            source: b32_encode(&row.source),
+                            state: match row.state {
+                                State::Queued => SessionAttentionState::Queued,
+                                State::Delivered => SessionAttentionState::Delivered,
+                                State::Answering => SessionAttentionState::Answering,
+                                State::Answered => SessionAttentionState::Answered,
+                                State::Unavailable => SessionAttentionState::Unavailable,
+                            },
+                            wait: row.wait.map(|w| match w {
+                                Wait::Paused => SessionAttentionWait::Paused,
+                                Wait::NextCodexTurn => SessionAttentionWait::NextCodexTurn,
+                                Wait::NextTurnAfterResume => SessionAttentionWait::NextTurnAfterResume,
+                                Wait::AdapterUnavailable => SessionAttentionWait::AdapterUnavailable,
+                                Wait::Unknown => SessionAttentionWait::Unknown,
+                            }),
+                            observed_at_ms: row.at_millis,
+                            answer: row.answer.map(|id| b32_encode(&id)), reason: row.reason,
+                        }).collect(), next,
+                    })
+                }).await.unwrap_or_else(|_| Err(failed(
+                    "Attention status is unknown: the Session's owner or local node did not answer within 60 seconds.",
+                )))
+            });
+            control.task = Some(task.abort_handle());
+            task
+        };
+        struct CancelRead(Arc<SessionPauseRead>);
+        impl Drop for CancelRead {
+            fn drop(&mut self) {
+                self.0.cancel();
+            }
+        }
+        let _cancel = CancelRead(read);
+        task.await
+            .map_err(|_| failed("The Session attention read was cancelled."))?
     }
 
     /// Capture the current room roster without collecting Session history.

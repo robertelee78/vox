@@ -184,6 +184,7 @@ const fn kind_code(kind: SegmentKind) -> u8 {
         SegmentKind::SessionIndex => 14,
         SegmentKind::GovernanceIndex => 15,
         SegmentKind::SessionIngress => 13,
+        SegmentKind::SessionAttention => 16,
     }
 }
 

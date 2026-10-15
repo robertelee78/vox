@@ -1290,6 +1290,9 @@ pub struct AgentHookArgs {
     /// wanted the other.
     #[arg(long, default_value = "auto")]
     pub format: String,
+    /// Register an exact OpenCode client route without draining news or starting a turn.
+    #[arg(long, requires = "session", conflicts_with = "light")]
+    pub attention_register: bool,
     /// The harness session this drain is for, overriding the one on stdin.
     ///
     /// The session id is the cursor key: it is what stops two agent sessions on
@@ -1349,6 +1352,12 @@ pub struct RoomSessionArgs {
     /// it, the newest page.
     #[arg(long, value_name = "ENTRY")]
     pub before: Option<String>,
+    /// Read one private ordinary-room attention page instead of activity.
+    #[arg(long, conflicts_with_all = ["details", "raw", "before", "SessionDriveArgs", "note"])]
+    pub attention: bool,
+    /// Continue the exact attention page; use the command printed by --attention.
+    #[arg(long, requires = "attention", value_name = "CURSOR")]
+    pub attention_after: Option<String>,
     /// Drive the session instead of reading it, as a member its node trusts with
     /// drive. Each input reaches that session alone, or is refused with the reason.
     #[command(flatten)]
@@ -2778,6 +2787,16 @@ pub fn run() -> ExitCode {
                             )
                             .await
                         }
+                        RoomCmd::Session(a) if a.attention => {
+                            crate::session_cli::show_attention(
+                                &paths,
+                                &a.room,
+                                &a.session,
+                                a.json,
+                                a.attention_after.as_deref(),
+                            )
+                            .await
+                        }
                         RoomCmd::Session(a) => match a.drive.action() {
                             Err(e) => Err(crate::app::AppError::Usage(e)),
                             Ok(Some(action)) => {
@@ -3273,17 +3292,34 @@ pub fn run() -> ExitCode {
                 .enable_all()
                 .build()
             else {
-                // Even this is not worth failing a turn over.
-                return ExitCode::SUCCESS;
+                // Ordinary hooks cannot fail a turn; registration-only callers need a truthful ACK.
+                return if args.attention_register {
+                    ExitCode::FAILURE
+                } else {
+                    ExitCode::SUCCESS
+                };
             };
-            let _ = rt.block_on(crate::agent_hook::run(
+            let result = rt.block_on(crate::agent_hook::run(
                 &paths,
                 &daemon,
                 args.room.as_deref(),
                 format,
                 args.session.as_deref(),
+                args.attention_register,
             ));
-            // Always success: a hook that fails must not break the turn.
+            if args.attention_register {
+                return match result {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(error) => {
+                        eprintln!("vox: {error}");
+                        ExitCode::FAILURE
+                    }
+                };
+            }
+            // An ordinary hook failure must not break the turn, but remains visible.
+            if let Err(error) = result {
+                eprintln!("vox: {error}");
+            }
             ExitCode::SUCCESS
         }
         Cmd::Daemon(args) => match crate::daemon::run(&args) {

@@ -87,6 +87,100 @@ pub fn session_if_named() -> Option<String> {
         .filter(|s| is_valid_name(s, MAX_NAME))
 }
 
+/// Resolve a posting identity without borrowing an inherited harness's Session (RA-3).
+/// Native and adapter marks must agree; a registration alone cannot tell which nested
+/// harness process is speaking. Producers clear inherited parent IDs; ambiguous marks refuse.
+/// An unmarked person's explicit `--session` keeps its existing coordination meaning.
+///
+/// # Errors
+/// Invalid/missing registrations, ambiguous harness marks, or a conflicting supplied Session.
+pub(crate) fn posting_session(
+    paths: &vox_core::node::paths::Paths,
+    flag: Option<&str>,
+) -> Result<Option<String>, AppError> {
+    let mark = |key: &str| -> Result<Option<String>, AppError> {
+        match std::env::var(key) {
+            // OpenCode shell.env merges inherited variables: an explicit empty override
+            // removes a parent's native marker without removing the actual VOX_SESSION.
+            Ok(value) if value.is_empty() => Ok(None),
+            Ok(value) if !value.trim().is_empty() && is_valid_name(&value, MAX_NAME) => {
+                Ok(Some(value))
+            }
+            Ok(_) | Err(std::env::VarError::NotUnicode(_)) => Err(AppError::Usage(format!(
+                "{key} does not name a valid sending session; nothing was posted"
+            ))),
+            Err(std::env::VarError::NotPresent) => Ok(None),
+        }
+    };
+    let codex = mark("CODEX_THREAD_ID")?;
+    let vox = mark("VOX_SESSION")?;
+    let claude = mark("CLAUDE_CODE_SESSION_ID")?;
+    let native = codex.as_ref().or(claude.as_ref()).or(vox.as_ref());
+    if [codex.as_ref(), claude.as_ref(), vox.as_ref()]
+        .into_iter()
+        .flatten()
+        .any(|value| Some(value) != native)
+    {
+        return Err(AppError::Usage(
+            "inherited harness session marks disagree; cannot establish the sending session, so nothing was posted. Use this harness's own tool environment without a parent's session marks".into()
+        ));
+    }
+    let inherited = vox.or_else(|| claude.clone());
+    let Some(actual) = codex.clone().or(inherited) else {
+        // These markers identify a harness, not an individual Session. A caller-chosen flag
+        // cannot turn them into proof of which of that harness's registrations is speaking.
+        if [
+            "CLAUDE_CODE_ENTRYPOINT",
+            "VOX_OPENCODE_WAKE_SOCKET",
+            "VOX_OPENCODE_MIRROR_SOCKET",
+            "VOX_HARNESS",
+        ]
+        .iter()
+        .any(|key| std::env::var_os(key).is_some_and(|v| !v.is_empty()))
+        {
+            return Err(AppError::Usage(
+                "this harness did not supply its sending session ID; nothing was posted. Use its registered session's normal tool environment".into()
+            ));
+        }
+        return flag.map(|_| require_session(flag)).transpose();
+    };
+    let registered = crate::wake::registration(paths, &actual).ok_or_else(|| {
+        AppError::Usage(format!(
+            "sending session {} is not registered on this node; nothing was posted",
+            shown(&actual, SHOWN_NAME)
+        ))
+    })?;
+    if registered.session != actual
+        || (codex.is_some() && registered.harness != "codex")
+        || (claude.is_some() && registered.harness != "claude")
+    {
+        return Err(AppError::Usage(
+            "the sending session's registration does not match this harness; nothing was posted"
+                .into(),
+        ));
+    }
+    if let Some(supplied) = flag {
+        if supplied != actual {
+            return Err(AppError::Usage(format!(
+                "--session {} conflicts with this harness's sending session {}; nothing was posted",
+                shown(supplied, SHOWN_NAME),
+                shown(&actual, SHOWN_NAME)
+            )));
+        }
+    }
+    Ok(Some(actual))
+}
+
+/// Posting variant of `require_session`: the flag may not replace a harness's actual sender.
+pub(crate) fn require_posting_session(
+    paths: &vox_core::node::paths::Paths,
+    flag: Option<&str>,
+) -> Result<String, AppError> {
+    posting_session(paths, flag)?.ok_or_else(|| AppError::Usage(
+        "no sending session: work coordination is owned per session; use the harness's registered tool environment or pass --session in your own terminal".into()
+    ))
+}
+
 /// Whether the process carries a harness's session mark. A malformed mark is still an agent
 /// mark; this is not validation of a displayed session name (ADR-031 LT-8, NC-4).
 pub(crate) fn agent_marked() -> bool {
@@ -731,6 +825,10 @@ pub async fn post_once(
     before: &Snapshot,
 ) -> Result<Posting, AppError> {
     let env = envelope(draft, session, op);
+    // Caller-supplied data may also contain recognized origin metadata. Do not sign a
+    // malformed envelope that readers would have to exclude from ordinary attention.
+    Envelope::parse(&env.to_text())
+        .map_err(|e| AppError::Usage(format!("refusing to post it: {e}")))?;
     let mine = ops::semantic(&env);
     // This operation's group, read by its id (V210-120): not every row of the room.
     let group = op_group(client, channel_id, op).await?;

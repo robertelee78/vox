@@ -247,3 +247,266 @@ pub async fn show(
     }
     Ok(())
 }
+
+/// Exact private selection; a page can never be carried to another room incarnation or opening.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct AttentionSelection {
+    pub actor: Digest32,
+    pub room: Digest32,
+    pub owner: Digest32,
+    pub session: String,
+    pub opening: Digest32,
+    pub instance: [u8; 16],
+}
+
+/// Read current authorization and incarnation through local IPC, without fetching activity.
+pub(crate) async fn attention_context(
+    client: &mut vox_core::node::ipc::IpcClient,
+    room: Digest32,
+    owner: Digest32,
+    session: &str,
+) -> Result<AttentionSelection, String> {
+    use vox_core::node::ipc::{Frame, Request};
+    let actor = client.me().ok_or("the selected node is not Ready")?;
+    let instance = match client
+        .request(&Request::ArrivalHead { channel_id: room })
+        .await
+    {
+        Ok(Frame::ArrivalHead { head }) => head.instance,
+        Ok(Frame::Error { reason }) => return Err(reason),
+        Err(e) => return Err(format!("cannot read the saved room: {e}")),
+        _ => return Err("the daemon did not answer the saved room selection".into()),
+    };
+    let opening = match client.session_lookup(room, owner, session.to_owned()).await {
+        Ok(Frame::SessionsPage {
+            sessions,
+            summaries,
+            more: false,
+        }) if sessions.len() == 1 && summaries.len() == 1 => {
+            let row = &sessions[0];
+            if row.node != owner || row.id != session || !row.can_drive || !row.open {
+                return Err("the selected open Session is no longer readable with drive".into());
+            }
+            row.opening
+        }
+        Ok(Frame::Error { reason }) => return Err(reason),
+        _ => return Err("the selected open Session is no longer readable with drive".into()),
+    };
+    match client
+        .request(&Request::ArrivalHead { channel_id: room })
+        .await
+    {
+        Ok(Frame::ArrivalHead { head }) if head.instance == instance => {}
+        Ok(Frame::Error { reason }) => return Err(reason),
+        _ => return Err("the saved room changed while selecting attention".into()),
+    }
+    Ok(AttentionSelection {
+        actor,
+        room,
+        owner,
+        session: session.to_owned(),
+        opening,
+        instance,
+    })
+}
+
+/// An independent, cancellable read. Dropping this future closes its private IPC connections.
+/// Local drive permission and exact selection are checked on both sides of the remote query.
+pub(crate) async fn attention_page(
+    at: &vox_core::node::ipc::NodeSocket,
+    selected: &AttentionSelection,
+    after: Option<vox_core::node::attention::Cursor>,
+) -> Result<vox_core::node::attention::Page, String> {
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        let mut client = vox_core::node::ipc::IpcClient::open_at(at)
+            .await
+            .map_err(|e| e.to_string())?;
+        if attention_context(
+            &mut client,
+            selected.room,
+            selected.owner,
+            &selected.session,
+        )
+        .await?
+            != *selected
+        {
+            return Err("the selected Session changed before reading attention".into());
+        }
+        let page = vox_core::node::attention::page_checked(
+            at,
+            selected.room,
+            selected.owner,
+            &selected.session,
+            selected.opening,
+            selected.actor,
+            selected.instance,
+            after,
+        )
+        .await?;
+        if attention_context(
+            &mut client,
+            selected.room,
+            selected.owner,
+            &selected.session,
+        )
+        .await?
+            != *selected
+        {
+            return Err("the selected Session changed while reading attention".into());
+        }
+        Ok(page)
+    })
+    .await
+    .map_err(|_| "attention query timed out; current state is unknown".to_owned())?
+}
+
+/// Shared CLI/TUI wording: transport acceptance is never a promise of an answer.
+#[must_use]
+pub(crate) fn attention_words(row: &vox_core::node::attention::Row) -> &'static str {
+    use vox_core::node::attention::{State, Wait};
+    match (row.state, row.wait) {
+        (State::Queued, Some(Wait::NextCodexTurn)) => "Waiting for next Codex turn",
+        (State::Queued, Some(Wait::Paused)) => "Queued — room paused",
+        (State::Queued, Some(Wait::NextTurnAfterResume)) => {
+            "Queued — waiting for the next turn after resume"
+        }
+        (State::Queued, Some(Wait::AdapterUnavailable)) => "Queued — input adapter unavailable",
+        (State::Queued, Some(Wait::Unknown)) => {
+            "Queued — notice acceptance unknown; awaiting a receipt"
+        }
+        (State::Queued, None) => "Queued — awaiting delivery",
+        (State::Delivered, _) => "Delivered to harness — running turn not observed",
+        (State::Answering, _) => "Answering — running turn observed",
+        (State::Answered, _) => "Answered",
+        (State::Unavailable, _) => "Unavailable",
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct AttentionContinuation {
+    selection: AttentionSelection,
+    after: vox_core::node::attention::Cursor,
+}
+
+/// One explicitly requested private attention page. Activity NDJSON is a separate mode.
+///
+/// # Errors
+/// Refuses unreadable/ended selections, stale cursors and an unavailable current observation.
+pub async fn show_attention(
+    paths: &vox_core::node::paths::Paths,
+    room: &str,
+    session: &str,
+    json: bool,
+    after: Option<&str>,
+) -> Result<(), crate::app::AppError> {
+    use crate::app::AppError;
+    use vox_core::node::link::b32_encode;
+    let mut client = crate::room_cli::attach(paths).await?;
+    let room = crate::room_cli::room_of(&mut client, room).await?;
+    let row =
+        vox_core::node::sessions::selection::resolve(&mut client, room, None, session, true, |s| {
+            vox_agentcomms::envelope::session_label(
+                &crate::ident::name_of(&s.node),
+                s.name.as_deref(),
+                &s.id,
+            )
+        })
+        .await
+        .map_err(AppError::Usage)?;
+    let selected = attention_context(&mut client, room, row.node, &row.id)
+        .await
+        .map_err(AppError::Usage)?;
+    if selected.opening != row.opening {
+        return Err(AppError::Usage(
+            "the selected Session reopened; select it again before reading attention".into(),
+        ));
+    }
+    let after = after.map(|raw| {
+        if raw.len() > 4096 { return Err(AppError::Usage("attention continuation is too long".into())); }
+        let cursor: AttentionContinuation = serde_json::from_str(raw)
+            .map_err(|_| AppError::Usage("invalid attention continuation; refresh the first page".into()))?;
+        if cursor.selection != selected {
+            return Err(AppError::Usage("attention continuation belongs to a different selection; refresh the first page".into()));
+        }
+        Ok(cursor.after)
+    }).transpose()?;
+    let at = crate::client::one_shot(paths)?;
+    let page = attention_page(&at, &selected, after)
+        .await
+        .map_err(AppError::Usage)?;
+    let next = page
+        .next
+        .map(|after| {
+            serde_json::to_string(&AttentionContinuation {
+                selection: selected.clone(),
+                after,
+            })
+        })
+        .transpose()
+        .map_err(|e| AppError::Usage(e.to_string()))?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema": "vox-session-attention/v1", "room": b32_encode(&room),
+                "node": b32_encode(&row.node), "session": row.id, "opening": b32_encode(&row.opening),
+                "revision": page.revision, "preparing": page.preparing,
+                "rows": page.rows.iter().map(|r| serde_json::json!({
+                    "source": b32_encode(&r.source), "state": r.state, "wait": r.wait,
+                    "observed_at_ms": r.at_millis, "answer": r.answer.map(|a| b32_encode(&a)),
+                    "reason": r.reason, "line": attention_words(r),
+                })).collect::<Vec<_>>(), "next": next,
+            })
+        );
+    } else {
+        println!(
+            "Private room attention · {} · {}",
+            crate::ident::name_of(&row.node),
+            row.id
+        );
+        if page.preparing {
+            println!("Thread audience is still being checked");
+        } else if page.rows.is_empty() {
+            println!("No observations on this page.");
+        }
+        for r in &page.rows {
+            println!(
+                "{} · {} · observed {} ms since Unix epoch",
+                b32_encode(&r.source),
+                attention_words(r),
+                r.at_millis
+            );
+            if let Some(answer) = r.answer {
+                println!("  answer: {}", b32_encode(&answer));
+            }
+            if let Some(reason) = &r.reason {
+                println!(
+                    "  {}",
+                    vox_text::shown(reason, vox_core::node::attention::MAX_BYTES)
+                );
+            }
+        }
+        println!("Delivery does not promise a reply. This is one private page, not a room-wide response count.");
+    }
+    if let Some(next) = next {
+        let room = b32_encode(&room);
+        let mut words = vec![
+            "vox",
+            "room",
+            "session",
+            &room,
+            &row.id,
+            "--attention",
+            "--attention-after",
+            &next,
+        ];
+        if json {
+            words.push("--json");
+        }
+        eprintln!(
+            "Next attention page: {}",
+            vox_text::shell::node_command(&words, crate::client::name_of(paths)?.as_str())
+        );
+    }
+    Ok(())
+}

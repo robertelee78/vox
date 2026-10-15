@@ -106,11 +106,16 @@ pub(crate) async fn offer(
     opts: &ShareOpts,
     before: impl FnOnce(&str, &str, &[String]),
 ) -> Result<Offered, AppError> {
+    let session = crate::coord::posting_session(paths, None)?;
     // The daemon reads the path, from wherever it was started: it is made absolute here.
     let path = std::fs::canonicalize(path)
         .map_err(|e| AppError::Usage(format!("{}: {e}", path.display())))?;
     let mut client = attach(paths).await?;
     let channel_id = room_of(&mut client, room).await?;
+    if let Some(session) = session.as_deref() {
+        vox_core::node::sessions::check_working_room(paths, session, &channel_id)
+            .map_err(AppError::Usage)?;
+    }
     let to = addressees(&mut client, channel_id, &opts.to).await?;
     // Who it is to reach, said before it is offered (ADR-028 E-5).
     let which = crate::room_cli::room_named(&mut client, channel_id).await;
@@ -127,7 +132,6 @@ pub(crate) async fn offer(
     };
     before(&what, &which, &reach);
     let note = opts.note.as_deref().map(str::trim).unwrap_or_default();
-    let session = crate::coord::session_if_named();
     let me = client
         .me()
         .ok_or_else(|| AppError::Usage("the node did not say who it is".into()))?;

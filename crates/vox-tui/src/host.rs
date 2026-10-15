@@ -25,6 +25,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 mod anchor_discovery;
+mod attention;
 mod computer;
 mod local_trust;
 pub(crate) mod room_pause;
@@ -2933,6 +2934,7 @@ impl Router {
                             }
                             // Drive input from members with drive (ADR-029 §3), while attached.
                             self.serve_drive(node, &a.handle, a.detached.subscribe());
+                            self.serve_attention(&a.handle, a.detached.subscribe());
                             slots.insert(node.clone(), Slot::Attached(a));
                             drop(slots);
                             drop(manual);
@@ -4397,6 +4399,7 @@ impl vox_core::node::ipc::Extension for DaemonExtension {
         crate::lan_cli::LanUp.claims(body)
             || (self.proxy.is_some() && crate::daemon_proxy::ProxyReport::claims(body))
             || vox_core::node::drive_input::OwnDrive::parse(body).is_some()
+            || vox_core::node::attention::OwnRequest::parse(body).is_some()
     }
 
     fn serve(
@@ -4405,6 +4408,16 @@ impl vox_core::node::ipc::Extension for DaemonExtension {
         stream: tokio::net::UnixStream,
         handle: NodeHandle,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        if let Some(request) = vox_core::node::attention::OwnRequest::parse(&body) {
+            let weak = self.drive.0.clone();
+            return Box::pin(async move {
+                if let Some(inner) = weak.upgrade() {
+                    Router { inner }
+                        .attention_own(&handle, request, stream)
+                        .await;
+                }
+            });
+        }
         if let Some(own) = vox_core::node::drive_input::OwnDrive::parse(&body) {
             let (inner, node) = self.drive.clone();
             return Box::pin(async move {

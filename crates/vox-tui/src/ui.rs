@@ -186,6 +186,42 @@ pub fn render(frame: &mut Frame, vm: &ViewModel, ui: &mut UiState) {
     match ui.mode {
         Mode::CommandPalette(ref buf) => render_palette(frame, area, buf),
         Mode::Prompt(ref p) => render_prompt(frame, area, p),
+        Mode::AttentionReport { scroll } => {
+            let selected =
+                crate::state::showing_session(ui, vm).filter(|s| s.can_drive && s.ended.is_none());
+            let page = selected.and_then(|_| vm.active.as_ref()?.session_attention.as_ref());
+            let mut lines = vec!["Private room attention · r Refresh first page · n Next page · ↑/↓ scroll · Esc close".to_owned()];
+            if let Some(selected) = selected {
+                lines.push(selected.label.clone());
+            }
+            match page {
+                None => lines.push("Current attention is not available for this selection; open a readable Session with drive access.".into()),
+                Some(page) => {
+                    if page.loading { lines.push("Reading current attention; state is not yet known.".into()); }
+                    if let Some(error) = &page.error { lines.push(format!("Current state unknown: {error}")); }
+                    if page.preparing { lines.push("Thread audience is still being checked".into()); }
+                    lines.extend(page.lines.iter().cloned());
+                    if !page.loading && page.error.is_none() {
+                        if page.more { lines.push("More observations: n Next page".into()); }
+                        else if !page.preparing && !page.lines.is_empty() { lines.push("No continuation in this observed page.".into()); }
+                    }
+                    if page.later { lines.push("Later page · r returns to first".into()); }
+                }
+            }
+            lines.push("Delivery does not promise a reply. This is one private page, not a room-wide response count.".into());
+            frame.render_widget(ratatui::widgets::Clear, area);
+            frame.render_widget(
+                Paragraph::new(lines.join("\n"))
+                    .wrap(Wrap { trim: false })
+                    .scroll((scroll, 0))
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(" Selected Session attention "),
+                    ),
+                area,
+            );
+        }
         Mode::PauseReport {
             ref nodes,
             selected,
@@ -713,6 +749,36 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
             split[1]
         }
         None => body[0],
+    };
+    // This private action is visible only inside the exact selected drive-authorized Session.
+    let area = if session.is_some_and(|s| s.can_drive && s.ended.is_none()) {
+        let split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(2), Constraint::Min(1)])
+            .split(area);
+        let status = match channel.session_attention.as_ref() {
+            Some(page) if page.loading => "Reading attention; current state unknown".to_owned(),
+            Some(page) if page.error.is_some() => {
+                "Attention state unknown · refresh in :attention".to_owned()
+            }
+            Some(page) if page.preparing => "Thread audience is still being checked".to_owned(),
+            Some(page) => page
+                .lines
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "Attention not yet observed".into()),
+            None => "Attention not yet observed".into(),
+        };
+        frame.render_widget(
+            Paragraph::new(format!(
+                "Private room attention · :attention opens Refresh / Next\n{status}"
+            ))
+            .wrap(Wrap { trim: false }),
+            split[0],
+        );
+        split[1]
+    } else {
+        area
     };
     // Inside a Session, for a member with drive: its activity, a line each (SC-1).
     let inside = session.filter(|x| x.can_drive || !channel.session_lines.is_empty());

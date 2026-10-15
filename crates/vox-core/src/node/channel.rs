@@ -46,8 +46,9 @@ fn key_package_for(entry: &Entry, recipient: &Digest32) -> bool {
         .is_some_and(|package| package.recipient == *recipient)
 }
 
+mod attention;
 mod diagnostics;
-mod entry_store;
+pub(crate) mod entry_store;
 mod governance;
 pub(crate) mod history;
 pub(crate) mod key_package_queue;

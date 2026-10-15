@@ -85,6 +85,14 @@ enum Ev {
     Daemon(DaemonEvent),
     /// The daemon closed its connection: it stopped.
     DaemonGone,
+    /// Completion from one independent private read; the token rejects A → B → A races.
+    Attention(Box<AttentionResult>),
+}
+
+struct AttentionResult {
+    token: std::sync::Arc<()>,
+    selected: crate::session_cli::AttentionSelection,
+    result: Result<vox_core::node::attention::Page, String>,
 }
 
 /// The node this TUI is acting as, once it is attached.
@@ -120,6 +128,7 @@ fn session_view(
         label: vox_agentcomms::envelope::session_label(&node_alias, row.name.as_deref(), &row.id),
         node_alias,
         opened: row.opened_millis,
+        opening: row.opening,
         ended: (!row.open).then(|| row.ended_millis.unwrap_or(row.opened_millis)),
         can_drive: row.can_drive,
         waiting,
@@ -185,6 +194,15 @@ pub struct DaemonCore {
     ended_listing: Option<SessionListing>,
     selected_session: Option<vox_core::node::sessions::SessionRow>,
     session_before: Option<Digest32>,
+    session_instance: Option<[u8; 16]>,
+    attention_token: std::sync::Arc<()>,
+    attention_task: Option<tokio::task::JoinHandle<()>>,
+    attention_selected: Option<crate::session_cli::AttentionSelection>,
+    attention_page: Option<vox_core::node::attention::Page>,
+    attention_pending: Option<Result<vox_core::node::attention::Page, String>>,
+    attention_error: Option<String>,
+    attention_later: bool,
+    attention_dirty: bool,
     /// Its lines, as last read, for a member with drive (SC-1).
     session_lines: Vec<crate::viewmodel::SessionLineView>,
     /// Its currently displayed page, oldest first. An older page replaces this one; End
@@ -618,6 +636,15 @@ impl DaemonCore {
             ended_listing: None,
             selected_session: None,
             session_before: None,
+            session_instance: None,
+            attention_token: std::sync::Arc::new(()),
+            attention_task: None,
+            attention_selected: None,
+            attention_page: None,
+            attention_pending: None,
+            attention_error: None,
+            attention_later: false,
+            attention_dirty: true,
             session_lines: Vec::new(),
             session_rows: Vec::new(),
             session_older: 0,
@@ -774,6 +801,8 @@ impl DaemonCore {
                 // anchor), in the TUI's notice line: the daemon writes it only to its log (R23).
                 let mut notes = unlock_notes;
                 notes.extend_from_slice(conn.client.attach_notes());
+                self.invalidate_attention();
+                self.session_instance = None;
                 self.conn = Some(conn);
                 self.has_identity = true;
                 self.asked = None;
@@ -883,7 +912,7 @@ impl DaemonCore {
         room: Digest32,
         which: vox_core::node::drive::SessionFilter,
         before: Option<Digest32>,
-    ) -> Option<(Vec<vox_core::node::drive::SessionRow>, u64)> {
+    ) -> Option<(Vec<vox_core::node::drive::SessionRow>, u64, [u8; 16])> {
         let conn = self.conn.as_mut()?;
         let answer = until_stopped(
             &self.rt,
@@ -891,13 +920,17 @@ impl DaemonCore {
             conn.client.session_page(room, which, before),
         )?;
         match self.answered(answer) {
-            Ok(Frame::SessionPage { rows, older, .. }) => {
+            Ok(Frame::SessionPage {
+                rows,
+                older,
+                instance,
+            }) => {
                 let next = rows.first().map(|r| r.entry_hash);
                 if older > 0 && (next.is_none() || next == before) {
                     self.notice = Some("the Session activity page made no progress".into());
                     None
                 } else {
-                    Some((rows, older))
+                    Some((rows, older, instance))
                 }
             }
             Ok(Frame::Error { reason }) => {
@@ -957,6 +990,8 @@ impl DaemonCore {
 
     /// The node detached: forget its connection and what was drawn of it.
     fn detached(&mut self) {
+        self.invalidate_attention();
+        self.session_instance = None;
         self.conn = None;
         self.active = None;
         self.timeline = None;
@@ -1060,7 +1095,21 @@ impl DaemonCore {
             };
             match ev {
                 Ev::Node(ev) => self.on_node_event(ev),
+                Ev::Attention(result) => {
+                    let AttentionResult {
+                        token,
+                        selected,
+                        result,
+                    } = *result;
+                    if std::sync::Arc::ptr_eq(&token, &self.attention_token)
+                        && self.attention_selected.as_ref() == Some(&selected)
+                    {
+                        self.attention_task = None;
+                        self.attention_pending = Some(result);
+                    }
+                }
                 Ev::Lagged => {
+                    self.invalidate_attention();
                     lagged = true;
                     self.threads_stale = true;
                     self.asked = None;
@@ -1100,6 +1149,7 @@ impl DaemonCore {
                     }
                 }
                 Ev::DaemonGone => {
+                    self.invalidate_attention();
                     self.ended
                         .get_or_insert_with(|| "the vox daemon stopped".to_owned());
                 }
@@ -1114,6 +1164,23 @@ impl DaemonCore {
     }
 
     fn on_node_event(&mut self, ev: NodeEvent) {
+        let invalidates_attention = match &ev {
+            NodeEvent::CapabilityChanged { .. } | NodeEvent::Shutdown => true,
+            NodeEvent::SessionEntry { channel_id, .. }
+            | NodeEvent::NewEntry { channel_id, .. }
+            | NodeEvent::Synced { channel_id, .. }
+            | NodeEvent::SenderKeyReceived { channel_id, .. }
+            | NodeEvent::Consented { channel_id, .. }
+            | NodeEvent::Revoked { channel_id, .. }
+            | NodeEvent::ChannelClosed { channel_id }
+            | NodeEvent::RoomEnded { channel_id, .. }
+            | NodeEvent::RoomRemoved { channel_id, .. } => self.active == Some(*channel_id),
+            _ => false,
+        };
+        if invalidates_attention {
+            self.invalidate_attention();
+            self.session_stale = true;
+        }
         // Most events change what is drawn: ask for the snapshot again on the next frame.
         self.asked = None;
         let rows_in = |me: &mut Self, channel_id: Digest32, n: usize| {
@@ -1862,6 +1929,7 @@ impl DaemonCore {
                     self.session_listing = None;
                 }
             }
+            self.invalidate_attention();
             self.session_stale = true;
         }
     }
@@ -1918,6 +1986,169 @@ impl DaemonCore {
         }
     }
 
+    fn invalidate_attention(&mut self) {
+        if let Some(task) = self.attention_task.take() {
+            task.abort();
+        }
+        self.attention_token = std::sync::Arc::new(());
+        self.attention_selected = None;
+        self.attention_page = None;
+        self.attention_pending = None;
+        self.attention_error = None;
+        self.attention_later = false;
+        self.attention_dirty = true;
+    }
+
+    fn attention_current(&self) -> Option<crate::session_cli::AttentionSelection> {
+        if self.conn.is_none() || self.ended.is_some() || self.session_stale {
+            return None;
+        }
+        let (room, owner, id) = self.shown_session.as_ref()?;
+        if self.active != Some(*room) {
+            return None;
+        }
+        let row = self.selected_session.as_ref()?;
+        if row.node != *owner || row.id != *id || !row.open || !row.can_drive {
+            return None;
+        }
+        Some(crate::session_cli::AttentionSelection {
+            actor: self.snapshot.me?,
+            room: *room,
+            owner: *owner,
+            session: id.clone(),
+            opening: row.opening,
+            instance: self.session_instance?,
+        })
+    }
+
+    fn request_attention(&mut self, next: bool) {
+        let Some(selected) = self.attention_current() else {
+            self.invalidate_attention();
+            self.attention_error = Some("select an open Session with drive access first".into());
+            return;
+        };
+        let after = if next {
+            if self.attention_selected.as_ref() != Some(&selected) {
+                return;
+            }
+            let Some(after) = self.attention_page.as_ref().and_then(|p| p.next) else {
+                return;
+            };
+            Some(after)
+        } else {
+            None
+        };
+        self.invalidate_attention();
+        self.attention_dirty = false;
+        self.attention_later = next;
+        self.attention_selected = Some(selected.clone());
+        let paths = match self.account.node_paths(&self.node) {
+            Ok(paths) => paths,
+            Err(e) => {
+                self.attention_error = Some(e.to_string());
+                return;
+            }
+        };
+        let mut at = match crate::client::one_shot(&paths) {
+            Ok(at) => at,
+            Err(e) => {
+                self.attention_error = Some(e.to_string());
+                return;
+            }
+        };
+        at.expected_identity = Some(selected.actor);
+        at.waiting = None; // A worker must not write diagnostic text over the terminal UI.
+        let token = self.attention_token.clone();
+        let tx = self.tx.clone();
+        self.attention_task = Some(self.rt.spawn(async move {
+            let result = crate::session_cli::attention_page(&at, &selected, after).await;
+            let _ = tx
+                .send(Ev::Attention(Box::new(AttentionResult {
+                    token,
+                    selected,
+                    result,
+                })))
+                .await;
+        }));
+    }
+
+    fn update_attention(&mut self) {
+        let Some(current) = self.attention_current() else {
+            if self.attention_selected.is_some() {
+                self.invalidate_attention();
+            }
+            return;
+        };
+        if self
+            .attention_selected
+            .as_ref()
+            .is_some_and(|old| *old != current)
+        {
+            self.invalidate_attention();
+        }
+        if self.attention_dirty {
+            self.request_attention(false);
+        } else if let Some(result) = self.attention_pending.take() {
+            if self.attention_selected.as_ref() == Some(&current) {
+                match result {
+                    Ok(page) => {
+                        self.attention_page = Some(page);
+                        self.attention_error = None;
+                    }
+                    Err(why) => {
+                        self.attention_page = None;
+                        self.attention_error =
+                            Some(vox_text::shown(&why, vox_core::node::attention::MAX_BYTES));
+                    }
+                }
+            }
+        }
+    }
+
+    fn attention_view(&self, room: Digest32) -> Option<crate::viewmodel::SessionAttentionView> {
+        let current = self.attention_current()?;
+        if current.room != room {
+            return None;
+        }
+        let mut lines = Vec::new();
+        if let Some(page) = &self.attention_page {
+            if page.rows.is_empty() && !page.preparing {
+                lines.push("No observations on this page.".into());
+            }
+            for row in &page.rows {
+                lines.push(format!(
+                    "{} · message {}",
+                    crate::session_cli::attention_words(row),
+                    vox_core::node::link::b32_encode(&row.source)
+                ));
+                lines.push(format!("  observed {} ms since Unix epoch", row.at_millis));
+                if let Some(answer) = row.answer {
+                    lines.push(format!(
+                        "  answer: {}",
+                        vox_core::node::link::b32_encode(&answer)
+                    ));
+                }
+                if let Some(reason) = &row.reason {
+                    lines.push(format!(
+                        "  {}",
+                        vox_text::shown(reason, vox_core::node::attention::MAX_BYTES)
+                    ));
+                }
+            }
+        }
+        Some(crate::viewmodel::SessionAttentionView {
+            lines,
+            preparing: self.attention_page.as_ref().is_some_and(|p| p.preparing),
+            loading: self.attention_task.is_some(),
+            error: self.attention_error.clone(),
+            more: self
+                .attention_page
+                .as_ref()
+                .is_some_and(|p| p.next.is_some()),
+            later: self.attention_later,
+        })
+    }
+
     /// Read the shown Session's entries when they are stale, and draw them as `vox room
     /// session` does (ADR-029 SC-1, CL-1). Entries this node cannot open are not among them: a
     /// member without drive reads none (SC-2).
@@ -1934,7 +2165,10 @@ impl DaemonCore {
         let which = vox_core::node::drive::SessionFilter::Session(id.clone());
         if std::mem::take(&mut self.session_want_older) && self.session_older > 0 {
             if let Some(first) = self.session_rows.first().map(|r| r.entry_hash) {
-                if let Some((rows, older)) = self.session_page(room, which.clone(), Some(first)) {
+                if let Some((rows, older, instance)) =
+                    self.session_page(room, which.clone(), Some(first))
+                {
+                    self.session_instance = Some(instance);
                     self.session_before = Some(first);
                     self.session_rows = rows;
                     self.session_older = older;
@@ -1950,10 +2184,12 @@ impl DaemonCore {
                     return;
                 }
             };
-            let Some((rows, older)) = self.session_page(room, which, self.session_before) else {
+            let Some((rows, older, instance)) = self.session_page(room, which, self.session_before)
+            else {
                 self.session_stale = true;
                 return;
             };
+            self.session_instance = Some(instance);
             self.selected_session = selected;
             self.session_rows = rows;
             self.session_older = older;
@@ -3019,6 +3255,7 @@ impl DaemonCore {
                         .session_listing
                         .as_ref()
                         .is_some_and(|p| p.room == d.channel_id && p.next.is_some()),
+                    session_attention: self.attention_view(d.channel_id),
                     selected_session: self
                         .selected_session
                         .as_ref()
@@ -3306,6 +3543,9 @@ impl DaemonCore {
 
 impl Drop for DaemonCore {
     fn drop(&mut self) {
+        if let Some(task) = self.attention_task.take() {
+            task.abort();
+        }
         self.rx.close();
         self.daemon_events.abort();
     }
@@ -3381,6 +3621,7 @@ impl CoreHandle for DaemonCore {
         self.read_sessions_page();
         self.read_governance();
         self.read_session();
+        self.update_attention();
         self.count_waiting();
         self.count_unread();
         self.project()
@@ -3639,11 +3880,27 @@ impl CoreHandle for DaemonCore {
                 session: (node, id),
                 act,
             } => self.drive(channel_id, node, &id, act),
+            Command::SessionAttention {
+                channel_id,
+                session: (node, id),
+                next,
+            } => {
+                if self.active == Some(channel_id)
+                    && self.shown_session.as_ref() == Some(&(channel_id, node, id))
+                {
+                    self.request_attention(next);
+                    CommandStatus::Done
+                } else {
+                    CommandStatus::Said("select an open Session with drive access first".into())
+                }
+            }
             Command::ShowSession {
                 channel_id,
                 session,
                 view,
             } => {
+                self.invalidate_attention();
+                self.session_instance = None;
                 if self.room_view != view {
                     self.timeline = None;
                     self.thread_summaries.clear();
@@ -3691,6 +3948,8 @@ impl CoreHandle for DaemonCore {
                 );
                 match selected {
                     Some(Ok(row)) => {
+                        self.invalidate_attention();
+                        self.session_instance = None;
                         let node = row.node;
                         let id = row.id.clone();
                         self.thread = None;
@@ -3831,6 +4090,9 @@ impl CoreHandle for DaemonCore {
                 CommandStatus::Done
             }
             Command::SelectChannel { channel_id } => {
+                self.invalidate_attention();
+                self.session_instance = None;
+                self.session_stale = true;
                 if self.active != channel_id {
                     self.room_view = vox_core::node::api::RoomView::General;
                     self.ended_listing = None;
@@ -3991,6 +4253,14 @@ impl CoreHandle for DaemonCore {
                 })
             }
             Command::SendText { channel_id, text } => {
+                let Ok(paths) = self.account.node_paths(&self.node) else {
+                    return CommandStatus::Failed(UiError::NotAttached);
+                };
+                let text =
+                    match crate::room_cli::prepare_post_origin(&paths, channel_id, &text, None) {
+                        Ok(text) => text,
+                        Err(error) => return CommandStatus::Said(error.to_string()),
+                    };
                 let Some(conn) = self.conn.as_mut() else {
                     return CommandStatus::NotConnected;
                 };

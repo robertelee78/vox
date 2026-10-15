@@ -140,6 +140,7 @@ final class NodeModel: ObservableObject {
         didSet {
             cancelSidebarSelection()
             invalidateSessionPause()
+            invalidateSessionAttention()
         }
     }
     private var roomViewGeneration = UUID() { didSet { cancelSidebarSelection() } }
@@ -259,6 +260,7 @@ final class NodeModel: ObservableObject {
         didSet {
             guard showing != oldValue else { return }
             invalidateSessionPause()
+            invalidateSessionAttention()
             roomViewGeneration = UUID()
             messages = []
             roomBefore = nil
@@ -400,6 +402,100 @@ final class NodeModel: ObservableObject {
         }
     }
 
+    /// One private page for the selected Session; no General roster/count or per-session cache.
+    @Published private(set) var sessionAttention: SessionAttentionPage?
+    @Published private(set) var sessionAttentionError: String?
+    @Published private(set) var sessionAttentionLoading = false
+    @Published private(set) var sessionAttentionPaged = false
+    private var sessionAttentionTask: Task<Void, Never>?
+    private var sessionAttentionRequest: SessionPauseRead?
+    private var sessionAttentionRead = UUID()
+    private var sessionAttentionAfter: SessionAttentionCursor?
+    private struct SessionAttentionContext: Equatable {
+        let selected: SessionPauseContext
+        let opening: String
+    }
+    private var sessionAttentionContext: SessionAttentionContext? {
+        guard let selected = sessionPauseContext, let session = shownSession,
+              !session.opening.isEmpty else { return nil }
+        return .init(selected: selected, opening: session.opening)
+    }
+    private var observedSessionAttention: SessionAttentionContext?
+    var sessionAttentionIsCurrent: Bool {
+        sessionAttentionContext != nil && sessionAttentionContext == observedSessionAttention
+    }
+
+    private func invalidateSessionAttention() {
+        sessionAttentionRequest?.cancel()
+        sessionAttentionRequest = nil
+        sessionAttentionTask?.cancel()
+        sessionAttentionTask = nil
+        sessionAttentionRead = UUID()
+        observedSessionAttention = nil
+        sessionAttention = nil
+        sessionAttentionError = nil
+        sessionAttentionLoading = false
+        sessionAttentionAfter = nil
+        sessionAttentionPaged = false
+    }
+
+    /// The same bounded refresh events as pause status, on its own cancellable connection.
+    /// A stale continuation is visible and requires Refresh; it never silently starts over.
+    private func scheduleSessionAttentionRead() {
+        guard let context = sessionAttentionContext else { invalidateSessionAttention(); return }
+        if observedSessionAttention != context { invalidateSessionAttention() }
+        guard sessionAttentionTask == nil else { return }
+        observedSessionAttention = context
+        let token = UUID(), client = client, actor = me, after = sessionAttentionAfter
+        let selected = context.selected
+        sessionAttentionRead = token
+        sessionAttentionLoading = true
+        let request = SessionPauseRead()
+        sessionAttentionRequest = request
+        sessionAttentionTask = Task { [weak self] in
+            guard !Task.isCancelled else { request.cancel(); return }
+            let result: Result<SessionAttentionPage, Error>
+            do {
+                result = .success(try await client.sessionAttentionPage(room: selected.room,
+                    actor: actor, node: selected.owner, sessionId: selected.session,
+                    opening: context.opening, instance: selected.instance, after: after, read: request))
+            } catch { result = .failure(error) }
+            guard !Task.isCancelled, let self, self.sessionAttentionRead == token,
+                  self.sessionAttentionContext == context else { return }
+            self.sessionAttentionTask = nil
+            self.sessionAttentionRequest = nil
+            self.sessionAttentionLoading = false
+            switch result {
+            case let .success(page):
+                guard page.instance == selected.instance, page.opening == context.opening else {
+                    self.sessionAttention = nil
+                    self.sessionAttentionError = "The selected Session changed. Refresh attention."
+                    return
+                }
+                self.sessionAttention = page
+                self.sessionAttentionError = nil
+            case let .failure(error):
+                self.sessionAttention = nil
+                self.sessionAttentionError = sentence(error)
+            }
+        }
+    }
+
+    func refreshSessionAttention() {
+        invalidateSessionAttention()
+        scheduleSessionAttentionRead()
+    }
+
+    func nextSessionAttention() {
+        guard sessionAttentionIsCurrent, !sessionAttentionLoading,
+              let next = sessionAttention?.next else { return }
+        sessionAttentionAfter = next
+        sessionAttentionPaged = true
+        sessionAttention = nil
+        sessionAttentionError = nil
+        scheduleSessionAttentionRead()
+    }
+
     /// The Session on screen's entries, oldest first, to a member with drive (SC-1): its newest
     /// page, and the older pages the person scrolled up to (ADR-034 FR-4); never its whole
     /// history.
@@ -504,7 +600,9 @@ final class NodeModel: ObservableObject {
         guard context == roomPauseContext, !Task.isCancelled else { throw CancellationError() }
         if shownSession?.nodeFingerprint == member {
             invalidateSessionPause()
+            invalidateSessionAttention()
             scheduleSessionPauseRead()
+            scheduleSessionAttentionRead()
         }
         return page
     }
@@ -701,6 +799,7 @@ final class NodeModel: ObservableObject {
         didSet {
             cancelSidebarSelection()
             invalidateSessionPause()
+            invalidateSessionAttention()
         }
     }
     fileprivate var observationToken: UUID { nodeObservationEpoch }
@@ -787,6 +886,7 @@ final class NodeModel: ObservableObject {
                 cancelSidebarSelection()
                 clearThreadState()
                 invalidateSessionPause()
+                invalidateSessionAttention()
             }
         }
     }
@@ -818,6 +918,8 @@ final class NodeModel: ObservableObject {
         sidebarSelectionTask?.cancel()
         sessionPauseRequest?.cancel()
         sessionPauseTask?.cancel()
+        sessionAttentionRequest?.cancel()
+        sessionAttentionTask?.cancel()
     }
 
     /// The rooms in `need`, urgent first, then by name.
@@ -3146,6 +3248,7 @@ final class NodeModel: ObservableObject {
                 guard !Task.isCancelled, self.roomReadGeneration == generation, self.nodeObservationEpoch == scope.epoch,
                       self.selection == .room(room), self.ended == nil else { return }
                 self.scheduleSessionPauseRead()
+                self.scheduleSessionAttentionRead()
                 let visibleFiles = self.displayedFileIDs
                 if visibleFiles == fileIDs, let copies = fileFacts?.copies {
                     let now = Dictionary(copies.filter { visibleFiles.contains($0.entry) }
@@ -3289,6 +3392,7 @@ final class NodeModel: ObservableObject {
     /// owner. Drafts are user working state and are preserved independently of these caches.
     private func releaseHistoryViews() {
         invalidateSessionPause()
+        invalidateSessionAttention()
         joinCaptionRead = UUID()
         joins = []
         invalidateMemberRoles()
@@ -3429,6 +3533,7 @@ extension NodeModel {
             guard token == sessionsMetadataRead, epoch == nodeObservationEpoch,
                   generation == roomReadGeneration, roomOnScreen == room else { return }
             invalidateSessionPause()
+            invalidateSessionAttention()
             reportBackground(error)
         }
     }
@@ -3478,6 +3583,7 @@ extension NodeModel {
             // from a bounded open/history page is not evidence that access disappeared.
             if found == nil || found?.canDrive == false { showing = .general }
             scheduleSessionPauseRead()
+            scheduleSessionAttentionRead()
         } catch {
             guard current() else { return }
             selectedSessionMetadata = nil
@@ -3490,6 +3596,7 @@ extension NodeModel {
     /// invalidates its paging, independently of which read reported the refusal.
     private func discardSessionWindow(after error: Error, requiresReload: Bool = false) {
         invalidateSessionPause()
+        invalidateSessionAttention()
         sessionReloadNeeded = sessionReloadNeeded || requiresReload || sessionPages.instance != nil
         sessionPages.clear()
         sessionWindowRevision = UUID()
@@ -3594,6 +3701,7 @@ extension NodeModel {
             }
             sessionLoading = false
             scheduleSessionPauseRead()
+            scheduleSessionAttentionRead()
             if !sessionReloadNeeded, let now = shownSession {
                 await refreshSessionRequests(room: room, session: now)
             }
@@ -3842,6 +3950,7 @@ extension NodeModel {
         // any suspension; bounded reads may restore it afterward.
         if roomOnScreen == room {
             invalidateSessionPause()
+            invalidateSessionAttention()
             clearPrivateJoinCaptions()
         }
         let epoch = nodeObservationEpoch

@@ -61,11 +61,20 @@ pub(super) fn is_support(body: &[u8]) -> bool {
         && d.finish().is_ok()
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct AttentionOpening {
+    pub(super) after: crate::node::api::HistoryCursor,
+    pub(super) identity: Digest32,
+}
+
 pub(super) struct Stored {
     pub(super) record: Record,
     // An authorized legacy body can arrive before its drive key package is installed.
     pub(super) row: Option<SessionRow>,
     pub(super) first_seen: u64,
+    // Own lifecycle records retain the public arrival boundary of their publication.
+    // This stays local, is copied on grant refresh, and is never transmitted to peers.
+    attention_after: Option<AttentionOpening>,
 }
 
 #[derive(Default)]
@@ -96,17 +105,26 @@ pub(super) struct PrivateSessions {
 impl Stored {
     fn bytes(&self) -> Zeroizing<Vec<u8>> {
         let mut e = Encoder::new();
-        e.array(4)
-            .uint(1)
+        e.array(7)
+            .uint(2)
             .bytes(&self.record.wire())
             .bytes(&self.row.as_ref().map_or_else(Vec::new, session_cache_bytes))
             .uint(self.first_seen);
+        if let Some(after) = self.attention_after {
+            e.bytes(&after.after.instance)
+                .uint(after.after.arrival)
+                .bytes(&after.identity);
+        } else {
+            e.bytes(&[]).uint(0).bytes(&[]);
+        }
         Zeroizing::new(e.finish())
     }
 
     pub(super) fn read(bytes: &[u8]) -> Result<Self> {
         let mut d = Decoder::new(bytes);
-        if d.array()? != 4 || d.uint()? != 1 {
+        let fields = d.array()?;
+        let version = d.uint()?;
+        if !matches!((fields, version), (4, 1) | (7, 2)) {
             return Err(Error::MalformedAtRest("private Session state version"));
         }
         let record = Record::read(d.bytes()?)?;
@@ -120,6 +138,27 @@ impl Stored {
             }
         };
         let first_seen = d.uint()?;
+        let attention_after = if version == 2 {
+            let instance = d.bytes()?;
+            let arrival = d.uint()?;
+            let identity = d.bytes()?;
+            match (instance, identity) {
+                ([], []) if arrival == 0 => None,
+                (bytes, identity) => Some(AttentionOpening {
+                    after: crate::node::api::HistoryCursor {
+                        instance: bytes.try_into().map_err(|_| {
+                            Error::MalformedAtRest("private Session attention instance")
+                        })?,
+                        arrival,
+                    },
+                    identity: identity.try_into().map_err(|_| {
+                        Error::MalformedAtRest("private Session attention identity")
+                    })?,
+                }),
+            }
+        } else {
+            None
+        };
         d.finish()?;
         if row.as_ref().is_some_and(|row| {
             row.entry_hash != record.hash() || row.author != record.message.header.author_id
@@ -130,6 +169,7 @@ impl Stored {
             record,
             row,
             first_seen,
+            attention_after,
         })
     }
 }
@@ -146,6 +186,23 @@ impl ChannelState {
     pub(super) fn private_id(&self, store: &Store, hash: &Digest32) -> Result<Option<u64>> {
         let snapshot = store.snapshot()?;
         private_index::find(&snapshot, &self.sek, &self.channel_id, hash)
+    }
+
+    pub(super) fn private_attention_after(
+        &self,
+        store: &Store,
+        opening: &Digest32,
+    ) -> Result<Option<AttentionOpening>> {
+        let Some(id) = self.private_id(store, opening)? else {
+            return Ok(None);
+        };
+        let saved = self.private_at(store, id)?.ok_or(Error::MalformedAtRest(
+            "Session attention opening source missing",
+        ))?;
+        if saved.record.hash() != *opening || saved.record.message.header.author_id != self.me() {
+            return Err(Error::MalformedAtRest("Session attention opening binding"));
+        }
+        Ok(saved.attention_after)
     }
 
     fn private_at(&self, store: &Store, id: u64) -> Result<Option<Stored>> {
@@ -750,6 +807,7 @@ impl ChannelState {
                     record,
                     row: cached,
                     first_seen: tracked.first_seen_ms,
+                    attention_after: None,
                 };
                 let id = next;
                 next = id
@@ -1330,6 +1388,7 @@ impl ChannelState {
                                 row.created_millis,
                                 &session,
                                 &row.text,
+                                row.entry_hash,
                                 now,
                             )?;
                         }
@@ -1368,6 +1427,7 @@ impl ChannelState {
                                     row.created_millis,
                                     &row.session_id,
                                     &row.body,
+                                    row.entry_hash,
                                     now,
                                 )?;
                             }
@@ -1407,6 +1467,7 @@ impl ChannelState {
         created: u64,
         session: &str,
         body: &str,
+        source: Digest32,
         now: u64,
     ) -> Result<()> {
         let matched = private_index::matching_lifecycle(
@@ -1417,6 +1478,8 @@ impl ChannelState {
             created,
             body,
         )?;
+        let mut attention_after = None;
+        let mut identity = source;
         if let Some(id) = matched {
             let saved = self
                 .private_at(profile.store(), id)?
@@ -1426,6 +1489,8 @@ impl ChannelState {
             }) {
                 return Err(Error::MalformedAtRest("Session refresh locator binding"));
             }
+            attention_after = saved.attention_after;
+            identity = saved.record.hash();
             if !self.private_expired(&saved, now) {
                 let mut all = true;
                 for peer in owed {
@@ -1439,8 +1504,18 @@ impl ChannelState {
                 }
             }
         }
+        let attention_after = match attention_after {
+            Some(boundary) => boundary,
+            None => AttentionOpening {
+                after: crate::node::api::HistoryCursor {
+                    instance: self.history_instance(profile.store())?,
+                    arrival: self.last_arrival(profile.store())?.unwrap_or(0),
+                },
+                identity,
+            },
+        };
         let content = crate::node::content::SessionEntry::new(created, session, body)?;
-        self.append_private_content(profile, content, holders, now, None)?;
+        self.append_private_content(profile, content, holders, now, None, Some(attention_after))?;
         Ok(())
     }
 
@@ -1454,7 +1529,7 @@ impl ChannelState {
         now: u64,
     ) -> Result<Digest32> {
         let content = crate::node::content::SessionEntry::new(now, session_id, body)?;
-        self.append_private_content(profile, content, holders, now, None)
+        self.append_private_content(profile, content, holders, now, None, None)
     }
 
     pub(crate) fn append_ingress_session(
@@ -1467,7 +1542,7 @@ impl ChannelState {
         completion: &crate::node::session_ingress::Completion,
     ) -> Result<Digest32> {
         let content = crate::node::content::SessionEntry::new(now, session_id, body)?;
-        self.append_private_content(profile, content, holders, now, Some(completion))
+        self.append_private_content(profile, content, holders, now, Some(completion), None)
     }
 
     fn append_private_content(
@@ -1477,6 +1552,7 @@ impl ChannelState {
         holders: &BTreeSet<Digest32>,
         now: u64,
         completion: Option<&crate::node::session_ingress::Completion>,
+        attention_after: Option<AttentionOpening>,
     ) -> Result<Digest32> {
         self.require_governance_ready(profile.store(), crate::time::Ms(now))?;
         if self.poisoned {
@@ -1500,6 +1576,17 @@ impl ChannelState {
             self.begin_drive(profile.store(), holders, now)?;
         }
         self.ensure_session_floors(profile, holders, now)?;
+        let new_boundary =
+            if attention_after.is_none() && crate::node::sessions::is_record(&content.body) {
+                Some(crate::node::api::HistoryCursor {
+                    instance: self.history_instance(profile.store())?,
+                    arrival: self.last_arrival(profile.store())?.unwrap_or(0),
+                })
+            } else {
+                None
+            };
+        // The actor cannot accept another public arrival between this sample and keep_private's
+        // Batch commit. Multipart openings use their first part's source and boundary.
         // Every failure after encrypting poisons the in-memory chain. Nothing may reuse its
         // iteration when either the record or its advanced state failed to commit.
         let result = (|| {
@@ -1510,6 +1597,12 @@ impl ChannelState {
                 .ok_or(Error::Profile("drive key missing"))?
                 .encrypt(&Zeroizing::new(content.to_canonical_vec()))?;
             let record = Record::new(profile.signer()?, self.channel_id, message)?;
+            let attention_after = attention_after.or_else(|| {
+                new_boundary.map(|after| AttentionOpening {
+                    after,
+                    identity: record.hash(),
+                })
+            });
             let row = SessionRow {
                 entry_hash: record.hash(),
                 author: self.me(),
@@ -1523,6 +1616,7 @@ impl ChannelState {
                     record,
                     row: Some(row),
                     first_seen: now,
+                    attention_after,
                 },
                 completion,
             )
@@ -1777,6 +1871,7 @@ impl ChannelState {
                 record,
                 row: Some(row),
                 first_seen,
+                attention_after: None,
             },
             None,
         )?;

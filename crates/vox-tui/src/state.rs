@@ -250,6 +250,11 @@ pub enum Mode {
     CommandPalette(String),
     /// A masked onboarding/attach prompt is open (modal).
     Prompt(Prompt),
+    /// The exact selected Session's private, explicitly paged attention observations.
+    AttentionReport {
+        /// Scroll within the current private page; selections and drafts are unchanged.
+        scroll: u16,
+    },
     /// Current-node outcomes of one completed room action; a selected result is rendered.
     PauseReport {
         /// One bounded result per selected current node.
@@ -592,6 +597,33 @@ impl UiState {
         match self.mode {
             Mode::CommandPalette(_) => return self.on_palette_key(key, vm),
             Mode::Prompt(_) => return self.on_prompt_key(key),
+            Mode::AttentionReport { ref mut scroll } => {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Enter => self.mode = Mode::Normal,
+                    KeyCode::Up => *scroll = scroll.saturating_sub(1),
+                    KeyCode::Down => *scroll = scroll.saturating_add(1),
+                    KeyCode::PageUp => *scroll = scroll.saturating_sub(10),
+                    KeyCode::PageDown => *scroll = scroll.saturating_add(10),
+                    KeyCode::Home => *scroll = 0,
+                    KeyCode::Char('r' | 'n') => {
+                        *scroll = 0;
+                        let next = key.code == KeyCode::Char('n');
+                        if let (Some(room), Some(session)) =
+                            (vm.active.as_ref(), showing_session(self, vm))
+                        {
+                            if session.can_drive && session.ended.is_none() {
+                                return Action::Dispatch(Command::SessionAttention {
+                                    channel_id: room.channel_id,
+                                    session: (session.node, session.id.clone()),
+                                    next,
+                                });
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                return Action::Redraw;
+            }
             Mode::PauseReport {
                 ref nodes,
                 ref mut selected,
@@ -1691,6 +1723,12 @@ impl UiState {
                             urgent,
                         })
                     }
+                    Some(Parsed::Attention) => {
+                        self.mode = Mode::AttentionReport { scroll: 0 };
+                        // The selected Session already starts its first bounded observation.
+                        // Opening this report does not silently requery an unchanged page.
+                        Action::Redraw
+                    }
                     Some(Parsed::Show(showing)) => self.show(showing, vm),
                     Some(Parsed::Drive(channel_id, session, act)) => {
                         // A file's note is the composer's words: spent with it.
@@ -1944,6 +1982,8 @@ pub enum Parsed {
     To(String),
     /// Switch the composer's urgent on or off (W-4).
     Urgent,
+    /// Open the current private attention page without touching the composer.
+    Attention,
     /// Show General, a tag or one Session in the room's timeline (ADR-029 CL-2).
     Show(Showing),
     /// Drive the Session on screen (ADR-029 DR-1).
@@ -2157,6 +2197,15 @@ pub fn parse_command(line: &str, ui: &UiState, vm: &ViewModel) -> Option<Parsed>
         )));
     }
     match verb {
+        "attention" => {
+            return Some(
+                if showing_session(ui, vm).is_some_and(|s| s.can_drive && s.ended.is_none()) {
+                    Parsed::Attention
+                } else {
+                    Parsed::Refused("select an open Session with drive access first".into())
+                },
+            )
+        }
         "general" => return Some(Parsed::Show(Showing::General)),
         // A thread of the room's messages by tag (#636); `:general` returns to the room.
         "tag" if rest.is_empty() => {

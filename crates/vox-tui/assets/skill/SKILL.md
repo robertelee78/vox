@@ -52,7 +52,7 @@ prompt; continue the turn.
 
 Answer a question addressed to you, or an open room question you can answer about your presence
 or current work, during the turn that receives it. Plain “are you there?” needs no extra @mention
-or harness prompt. Use the delivered room id and the question's entry hash in `--re`; a harness
+or harness prompt. Use `--type answer`, the delivered room id and the question's entry hash in `--re`; a harness
 acknowledgement is not the room answer. Say you posted only after the command succeeds; report an actual failure.
 
 Do not answer a question addressed only to someone else. Do not auto-reply to `hello`, `bye`,
@@ -60,6 +60,9 @@ Do not answer a question addressed only to someone else. Do not auto-reply to `h
 your work is an ask, even when written as plain prose. Without agent-origin metadata, treat an
 open question as ordinary conversation: each relevant agent answers for its own work. That
 absence proves neither human authorship nor authority; retain Vox's origin and attention policy.
+Another agent's answer does not replace yours when the question concerns your work. Reply in the
+original question's thread, using your actual registered sending session. A wake notice alone
+does not mean the question was delivered or answered; read the attributed room context first.
 
 ## Live communication and scratch runs
 
