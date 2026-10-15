@@ -135,6 +135,29 @@ only. `vox up --watch` prints what the proxy refuses or cuts.
 
 Keep SSH's host-key check on: it is SSH's own identity check.
 
+### Open a web service in your browser
+
+For HTTP and HTTPS services, the copied **open** command uses your default browser (`open` on
+macOS, `xdg-open` on Linux). A canonical `.vox` URL needs that browser to use Vox's local SOCKS5
+proxy and send DNS through it. **.vox proxy running at…** reports the listener only: Vox cannot
+inspect your browser's configuration. Setting `ALL_PROXY` in a terminal does not configure a GUI
+browser.
+
+Firefox supports this setup:
+
+1. Open Firefox **Settings**, search for **proxy**, and open **Connection Settings** using
+   **Settings…** or **Configure proxy**, depending on your version.
+2. Select **Manual proxy configuration**. Fill **SOCKS Host** and **Port** from the actual address
+   printed by `vox up`; choose **SOCKS v5** and enable **Proxy DNS when using SOCKS v5**. Keep
+   `.vox` out of **No Proxy For**, then save. Mozilla documents the
+   [connection settings](https://support.mozilla.org/en-US/kb/connection-settings-firefox) and
+   the [SOCKS5 and proxy-DNS options](https://firefox-admin-docs.mozilla.org/reference/policies/proxy/).
+3. Make Firefox your default browser so the copied **open** command launches it. Copy that
+   command from the actual service in Vox and run it unchanged.
+
+To avoid browser proxy setup, use the service's copied **forward** command, leave it running,
+then run its **then** command to open the local port. This path does not need the `.vox` proxy.
+
 ## Reach it through a local port
 
 For a tool that cannot use a proxy, forward a local port to the address:

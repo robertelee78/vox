@@ -785,8 +785,8 @@ final class NodeModel: ObservableObject {
             invalidateMemberPlatforms()
         }
     }
-    fileprivate var observationToken: UUID { nodeObservationEpoch }
-    fileprivate func acceptsObservation(_ token: UUID, actor: String) -> Bool {
+    var observationToken: UUID { nodeObservationEpoch }
+    func acceptsObservation(_ token: UUID, actor: String) -> Bool {
         token == nodeObservationEpoch && actor == me && ended == nil && !Task.isCancelled
     }
     fileprivate func acceptsArrivalInstance(_ instance: Data, room: String) -> Bool {

@@ -935,6 +935,8 @@ pub struct SharedService {
     pub commands: Vec<ServiceCommand>,
     /// What reaching it from here needs, and whether each holds (S-3).
     pub needs: Vec<ServiceNeed>,
+    /// Browser setup guidance for HTTP/HTTPS, separate from checked readiness facts.
+    pub browser_hint: Option<String>,
 }
 
 /// One ready-to-copy command for a shared service (ADR-028 S-3), as `vox service list` gives it.
@@ -5163,8 +5165,9 @@ impl VoxClient {
                     shared: shared
                         .into_iter()
                         .map(|s| {
-                            use vox_core::node::service_reach::{commands, needs};
+                            use vox_core::node::service_reach::{browser_hint, commands, needs};
                             SharedService {
+                                browser_hint: browser_hint(&s, Some(&proxy)),
                                 commands: commands(&s, node.as_str())
                                     .into_iter()
                                     .map(|(what, command)| ServiceCommand {

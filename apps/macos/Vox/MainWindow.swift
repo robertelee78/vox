@@ -184,7 +184,7 @@ private struct Sidebar: View {
                     RoomRow(room: room, selected: model.sidebarSelection == .room(room.id), health: model.roomHealth(room.id))
                         .tag(NodeModel.Selection.room(room.id))
                         .sidebarRow(model.sidebarSelection == .room(room.id))
-                        .contextMenu { roomContextMenu(room) }
+                        .modifier(RoomContextMenu(model: model, room: room))
                 }
             }
         }
@@ -206,20 +206,128 @@ private struct Sidebar: View {
         }
         }
     }
-    @ViewBuilder
-    private func roomContextMenu(_ room: NodeModel.Room) -> some View {
-        Button("Copy Room Link") {
-            Task { await model.copyRoomLink(room: room.id) }
+}
+
+/// The generated SwiftUI context item was observed with an empty native key equivalent even
+/// with .keyboardShortcut attached. Own this row's native menu so Cmd-C belongs to that menu,
+/// not every row or the window's ordinary Copy command. AppKit still tracks and dispatches it.
+private struct RoomContextMenu: ViewModifier {
+    @ObservedObject var model: NodeModel
+    let room: NodeModel.Room
+    @State private var anchor = RoomMenuAnchor.Reference()
+
+    func body(content: Content) -> some View {
+        content
+            .overlay { RoomMenuAnchor(model: model, room: room, reference: anchor).accessibilityHidden(true) }
+            // Keep the standard Show Menu action on the existing accessible room row. Keyboard
+            // and accessibility invocation use the same menu without inventing a mouse event.
+            .accessibilityAction(.showMenu) { anchor.view?.showMenu() }
+    }
+}
+
+private struct RoomMenuAnchor: NSViewRepresentable {
+    let model: NodeModel
+    let room: NodeModel.Room
+    let reference: Reference
+
+    final class Reference {
+        weak var view: MenuView?
+    }
+
+    func makeCoordinator() -> Reference { reference }
+    func makeNSView(context: Context) -> MenuView {
+        let view = MenuView()
+        reference.view = view
+        return view
+    }
+    func updateNSView(_ view: MenuView, context: Context) {
+        view.model = model
+        view.room = room
+    }
+    static func dismantleNSView(_ view: MenuView, coordinator: Reference) {
+        if coordinator.view === view { coordinator.view = nil }
+        view.model = nil
+        view.room = nil
+    }
+
+    final class MenuView: NSView {
+        weak var model: NodeModel?
+        var room: NodeModel.Room?
+
+        override func hitTest(_ point: NSPoint) -> NSView? {
+            guard let event = NSApp.currentEvent,
+                  event.type == .rightMouseDown
+                    || (event.type == .leftMouseDown && event.modifierFlags.contains(.control)) else { return nil }
+            return super.hitTest(point)
         }
-        .keyboardShortcut("c", modifiers: .command)
-        Button("Mark as Read") {
-            Task { await model.markRoomRead(room.id) }
+        override func menu(for event: NSEvent) -> NSMenu? { roomMenu() }
+        override func rightMouseDown(with event: NSEvent) {
+            guard let menu = roomMenu() else { return }
+            NSMenu.popUpContextMenu(menu, with: event, for: self)
         }
-        .disabled(model.progress(of: "mark-room-read") != nil)
-        Button("Copy Name") {
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(room.name, forType: .string)
+        override func mouseDown(with event: NSEvent) {
+            if event.modifierFlags.contains(.control) { rightMouseDown(with: event) }
+            else { super.mouseDown(with: event) }
         }
+        func showMenu() {
+            guard window != nil, let menu = roomMenu() else { return }
+            menu.popUp(positioning: nil, at: NSPoint(x: bounds.midX, y: bounds.midY), in: self)
+        }
+        private func roomMenu() -> NSMenu? {
+            guard let model, let room, model.rooms.contains(where: { $0.id == room.id }) else { return nil }
+            return RoomRowMenu(model: model, room: room)
+        }
+    }
+}
+
+@MainActor
+private final class RoomRowMenu: NSMenu, NSMenuItemValidation {
+    private let model: NodeModel
+    private let room: NodeModel.Room
+    private let actor: String
+    private let epoch: UUID
+
+    init(model: NodeModel, room: NodeModel.Room) {
+        self.model = model
+        self.room = room
+        actor = model.me
+        epoch = model.observationToken
+        super.init(title: "")
+        for (title, action, key) in [
+            ("Copy Room Link", #selector(copyLink), "c"),
+            ("Mark as Read", #selector(markRead), ""),
+            ("Copy Name", #selector(copyName), "")
+        ] {
+            let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
+            item.keyEquivalentModifierMask = key.isEmpty ? [] : .command
+            item.target = self
+            addItem(item)
+        }
+    }
+    required init(coder: NSCoder) { fatalError("Room menus are built for a current row") }
+
+    private var current: Bool {
+        model.acceptsObservation(epoch, actor: actor) && model.rooms.contains { $0.id == room.id }
+    }
+    func validateMenuItem(_ item: NSMenuItem) -> Bool {
+        current && (item.action != #selector(markRead) || model.progress(of: "mark-room-read") == nil)
+    }
+    @objc private func copyLink() {
+        Task {
+            guard current else { return }
+            await model.copyRoomLink(room: room.id)
+        }
+    }
+    @objc private func markRead() {
+        Task {
+            guard current else { return }
+            await model.markRoomRead(room.id)
+        }
+    }
+    @objc private func copyName() {
+        guard current else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(room.name, forType: .string)
     }
 }
 

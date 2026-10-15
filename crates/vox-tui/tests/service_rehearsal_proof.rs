@@ -649,8 +649,8 @@ fn a_room_bound_service_carries_real_bytes_through_the_real_binaries() {
     };
     let host_name = host_as(&guest_list);
     let want = [
-        "✓ proxy configured".to_owned(),
-        "✓ node attached".to_owned(),
+        format!("✓ .vox proxy running at {bound}"),
+        "✓ node Ready".to_owned(),
         format!("✓ {host_name} trusts you"),
         format!("✓ {host_name} online"),
     ];
@@ -844,11 +844,11 @@ fn a_room_bound_service_carries_real_bytes_through_the_real_binaries() {
     );
     let guest_list = listing(
         &guest_dir,
-        "\"missing: proxy configured — …\" with its proxy port taken",
+        "\"missing: .vox proxy running — …\" with its proxy port taken",
         &|o| {
             ticks(o)
                 .iter()
-                .any(|t| t.starts_with("missing: proxy configured — "))
+                .any(|t| t.starts_with("missing: .vox proxy running — "))
         },
     );
     eprintln!(

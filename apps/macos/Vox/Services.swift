@@ -189,7 +189,9 @@ private struct SharedServiceBox: View {
             Text("by \(service.by) in \(room)  ·  \(service.kind)").caption().secondaryText()
             ForEach(Array(service.commands.enumerated()), id: \.offset) { _, command in
                 HStack(alignment: .firstTextBaseline) {
-                    Text(command.what).eyebrow().secondaryText().frame(width: Theme.scaled(56), alignment: .leading)
+                    Text(command.what).eyebrow().secondaryText()
+                        .lineLimit(1).fixedSize(horizontal: true, vertical: false)
+                        .frame(minWidth: Theme.scaled(80), alignment: .leading)
                     Text(command.command.replacingOccurrences(of: service.canonical, with: service.address))
                         .font(Theme.mono).lineLimit(1).truncationMode(.middle)
                     Spacer()
@@ -211,6 +213,11 @@ private struct SharedServiceBox: View {
                 } else {
                     StateMark(kind: .attention, words: "missing: \(need.need) — \(need.otherwise)")
                 }
+            }
+            if let hint = service.browserHint {
+                Text(hint).font(Theme.text).secondaryText().textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("service-browser-hint-\(service.address)")
             }
         }
         .padding(Space.s12)

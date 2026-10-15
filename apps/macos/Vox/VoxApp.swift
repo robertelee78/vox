@@ -77,6 +77,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var quitTimer: Timer?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Vox's sheets ask for an action; quitting cancels the question. AppKit otherwise may
+        // refuse terminate(_:) before consulting this delegate while a sheet is open. Apply
+        // the native policy when each window becomes key, including SwiftUI-created sheets,
+        // so menu, Dock and signal termination all reach the same detach path below.
+        NotificationCenter.default.addObserver(self, selector: #selector(windowBecameKey(_:)),
+                                               name: NSWindow.didBecomeKeyNotification, object: nil)
+        for window in NSApp.windows {
+            window.preventsApplicationTerminationWhenModal = false
+        }
         // **A stop signal quits the app as ⌘Q does** (ADR-026 S-4): the node is let go of by the
         // same rule, rather than the process ending under it.
         for sig in [SIGTERM, SIGHUP, SIGINT] {
@@ -100,6 +109,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var services: ServicesProvider?
 
+    @objc private func windowBecameKey(_ notification: Notification) {
+        (notification.object as? NSWindow)?.preventsApplicationTerminationWhenModal = false
+    }
+
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         true
     }
@@ -107,9 +120,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Quitting lets go of the node before the app exits (A-4), so the daemon has detached it
     /// when the app is gone.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard model.holdsNode else { return .terminateNow }
         guard !quitting else { return .terminateLater }
         quitting = true
+        // Cancel pending presentation, never its protected action. The return code also gives
+        // AppKit-owned panels their normal cancellation completion. Set quitting first because
+        // dismissing a sheet can itself cause window/lifecycle callbacks.
+        for window in sender.windows {
+            if let parent = window.sheetParent {
+                parent.endSheet(window, returnCode: .cancel)
+            }
+        }
+        guard model.holdsNode else { return .terminateNow }
         // An independent run-loop deadline: cancellation of a stuck FFI call cannot hold quit.
         let timer = Timer(timeInterval: 3, repeats: false) { [weak self] _ in
             MainActor.assumeIsolated { self?.finishQuitting(sender) }

@@ -42,10 +42,36 @@ pub fn commands(s: &SharedService, node: &str) -> Vec<(&'static str, String)> {
     }
 }
 
+/// Browser setup is guidance, not a checked readiness fact: Vox knows its proxy's listener,
+/// but cannot inspect the default browser's proxy or DNS settings.
+#[must_use]
+pub fn browser_hint(
+    s: &SharedService,
+    proxy: Option<&Result<SocketAddr, String>>,
+) -> Option<String> {
+    if !matches!(s.kind.as_str(), "http" | "https") {
+        return None;
+    }
+    let at = match proxy {
+        Some(Ok(at)) => format!(" at {at}"),
+        _ => String::new(),
+    };
+    let unknown = if proxy.is_none() {
+        " vox up shows the local proxy address."
+    } else {
+        ""
+    };
+    Some(format!(
+        "The open command needs your default browser to use the .vox SOCKS5 proxy{at}, \
+         with DNS through the proxy. Vox cannot inspect browser settings. \
+         The forward and then commands use a local port without browser proxy setup.{unknown}"
+    ))
+}
+
 /// **What one shared service needs to be reached from here, and whether each holds** (ADR-028
 /// S-3, the App Study's readiness ticks): `(the fact, holds, what to do when it does not)`, in the
-/// order a person checks them, and in the words every client shows: `proxy configured`, `node
-/// attached`, `<host> trusts you`, `<host> online`. `proxy` is whether the `.vox` proxy runs, or
+/// order a person checks them: `.vox proxy running at <address>`, `node Ready`, `<host> trusts
+/// you`, `<host> online`. `proxy` is whether the `.vox` proxy runs, or
 /// `None` where that is not known here (its fact is then not said).
 ///
 /// Each fact is this node's own knowledge; nothing is asked of anyone for it. `<host> trusts you`
@@ -64,9 +90,9 @@ pub fn needs(
     // A forward carries without the proxy; ssh by address and a URL go through it.
     if let Some(proxy) = proxy.filter(|_| matches!(s.kind.as_str(), "ssh" | "http" | "https")) {
         needs.push(match proxy {
-            Ok(_) => ("proxy configured".to_owned(), true, String::new()),
+            Ok(at) => (format!(".vox proxy running at {at}"), true, String::new()),
             Err(why) => (
-                "proxy configured".to_owned(),
+                ".vox proxy running".to_owned(),
                 false,
                 format!("the .vox proxy is not running: {why}; use the forward command shown for this service without it"),
             ),
