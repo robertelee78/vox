@@ -1092,9 +1092,16 @@ impl RenderView<'_> {
         if row.entry_hash != *hash {
             return Err(invalid("render cache hash differs"));
         }
-        let current_epoch = self.order.read.directory.render_epoch;
         row.arrival = fact.cache;
-        row.shown_at_ms = if fact.epoch == current_epoch {
+        (row.shown_at_ms, row.late) = self.display_timing(key, fact)?;
+        Ok(Some(row))
+    }
+
+    /// Visible timing depends on the selected fact and the indexed display suffix. Share
+    /// this calculation with selected-window fences without loading any plaintext body.
+    pub(crate) fn display_timing(&self, key: OrderKey, fact: RenderFact) -> Result<(u64, bool)> {
+        let current_epoch = self.order.read.directory.render_epoch;
+        let shown_at_ms = if fact.epoch == current_epoch {
             fact.shown
         } else {
             0
@@ -1112,12 +1119,12 @@ impl RenderView<'_> {
         } else {
             suffix.earliest.1
         };
-        row.late = row.shown_at_ms != 0
+        let late = shown_at_ms != 0
             && suffix.count != 0
             && earliest
                 .checked_add(super::super::LATE_AFTER_MS)
-                .is_some_and(|seen| row.shown_at_ms >= seen);
-        Ok(Some(row))
+                .is_some_and(|seen| shown_at_ms >= seen);
+        Ok((shown_at_ms, late))
     }
 }
 impl EntryIndex {

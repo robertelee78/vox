@@ -721,7 +721,8 @@ impl View<'_> {
                         hash.update([0]);
                         continue;
                     }
-                    if let Some(fact) = self.rendered.fact(&entry)? {
+                    let fact = self.rendered.fact(&entry)?;
+                    if let Some(fact) = fact {
                         // The immutable entry/cache binding identifies the body without
                         // decrypting every selected body just to fingerprint the window.
                         hash.update([1]);
@@ -738,13 +739,20 @@ impl View<'_> {
                         hash.update([0]);
                         continue;
                     }
-                    let (clock, id) = self
+                    let key = self
                         .rendered
                         .order()
                         .key(&entry)?
                         .ok_or(Error::MalformedAtRest("held selection order missing"))?;
-                    hash.update(clock.to_be_bytes());
-                    hash.update(id);
+                    if let Some(fact) = fact {
+                        // Reordering elsewhere can alter the visible late label while this
+                        // entry's own locator/order stays fixed. Hash only the derived bit,
+                        // not the unrelated suffix root/count that produced it.
+                        let (_, late) = self.rendered.display_timing(key, fact)?;
+                        hash.update([u8::from(late)]);
+                    }
+                    hash.update(key.0.to_be_bytes());
+                    hash.update(key.1);
                 }
                 Ok(Reply::DisplayRevision(hash.finalize().into()))
             }
