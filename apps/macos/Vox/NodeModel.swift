@@ -136,8 +136,25 @@ final class NodeModel: ObservableObject {
             if case .room = selection { roomNeedsPage = true } else { roomNeedsPage = false }
         }
     }
-    private var roomReadGeneration = UUID() { didSet { invalidateSessionPause() } }
-    private var roomViewGeneration = UUID()
+    private var roomReadGeneration = UUID() {
+        didSet {
+            cancelSidebarSelection()
+            invalidateSessionPause()
+        }
+    }
+    private var roomViewGeneration = UUID() { didSet { cancelSidebarSelection() } }
+    /// UI intent only: changing this inside List's binding must not publish model state.
+    private struct SidebarSelection {
+        var destination: Selection?
+        let token: UUID
+        let actor: String
+        let observation: UUID
+        let read: UUID
+        let view: UUID
+        let currentOwner: @MainActor () -> Bool
+    }
+    private var pendingSidebarSelection: SidebarSelection?
+    private var sidebarSelectionTask: Task<Void, Never>?
     private var rejectedRoomMark: String?
     private var roomMessageRevision = UUID()
     @Published private var roomNeedsPage = false
@@ -680,7 +697,12 @@ final class NodeModel: ObservableObject {
     @Published private(set) var peers = 0
     /// Last-known states are never presented as current while the daemon cannot be reached.
     @Published private(set) var daemonReachable = true
-    private var nodeObservationEpoch = UUID() { didSet { invalidateSessionPause() } }
+    private var nodeObservationEpoch = UUID() {
+        didSet {
+            cancelSidebarSelection()
+            invalidateSessionPause()
+        }
+    }
     fileprivate var observationToken: UUID { nodeObservationEpoch }
     fileprivate func acceptsObservation(_ token: UUID, actor: String) -> Bool {
         token == nodeObservationEpoch && actor == me && ended == nil && !Task.isCancelled
@@ -762,6 +784,7 @@ final class NodeModel: ObservableObject {
     @Published private(set) var ended: String? {
         didSet {
             if ended != nil {
+                cancelSidebarSelection()
                 clearThreadState()
                 invalidateSessionPause()
             }
@@ -792,6 +815,7 @@ final class NodeModel: ObservableObject {
     }
 
     deinit {
+        sidebarSelectionTask?.cancel()
         sessionPauseRequest?.cancel()
         sessionPauseTask?.cancel()
     }
@@ -1288,9 +1312,57 @@ final class NodeModel: ObservableObject {
         }
     }
 
+    private func acceptsSidebarSelection(_ pending: SidebarSelection) -> Bool {
+        pending.actor == me && pending.observation == nodeObservationEpoch
+            && pending.read == roomReadGeneration && pending.view == roomViewGeneration
+            && ended == nil && pending.currentOwner()
+    }
+
+    /// Keep List's binding from bouncing back while its latest choice waits for publication.
+    var sidebarSelection: Selection? {
+        if let pending = pendingSidebarSelection, acceptsSidebarSelection(pending) {
+            return pending.destination
+        }
+        return selection
+    }
+
+    func selectFromSidebar(_ destination: Selection?, currentOwner: @escaping @MainActor () -> Bool) {
+        guard currentOwner(), ended == nil, destination != selection else {
+            cancelSidebarSelection()
+            return
+        }
+        if let pending = pendingSidebarSelection, acceptsSidebarSelection(pending) {
+            // One deferred commit, even when List changes its choice repeatedly in this update.
+            pendingSidebarSelection?.destination = destination
+            return
+        }
+        cancelSidebarSelection()
+        let token = UUID()
+        pendingSidebarSelection = SidebarSelection(destination: destination, token: token, actor: me,
+            observation: nodeObservationEpoch, read: roomReadGeneration, view: roomViewGeneration,
+            currentOwner: currentOwner)
+        sidebarSelectionTask = Task { @MainActor [weak self] in
+            guard let self, let pending = self.pendingSidebarSelection, pending.token == token else { return }
+            let current = self.acceptsSidebarSelection(pending)
+            self.pendingSidebarSelection = nil
+            self.sidebarSelectionTask = nil
+            guard !Task.isCancelled, current else { return }
+            // show selects and clears synchronously before its first read; keep all its fences.
+            await self.show(pending.destination)
+        }
+    }
+
+    func cancelSidebarSelection() {
+        pendingSidebarSelection = nil
+        sidebarSelectionTask?.cancel()
+        sidebarSelectionTask = nil
+    }
+
     /// Put `selection` on screen at once: a room switched to shows nothing of the last one while
     /// its own is read (show reads it).
     func select(_ selection: Selection?) {
+        // An external choice supersedes queued UI intent even when it selects the current row.
+        cancelSidebarSelection()
         guard selection != self.selection else { return }
         // Preserve the room's reply draft when leaving it (D12).
         if case let .room(left) = self.selection {
