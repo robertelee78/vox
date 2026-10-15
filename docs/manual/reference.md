@@ -28,7 +28,7 @@ command, give the exact arguments of the `vox` you run. `vox man` prints the sam
 
 ## Commands
 
-| Task | Command | Needs |
+| Task | Command family | Needs |
 |---|---|---|
 | Set up this machine for its harnesses | `vox setup` | a terminal |
 | Make, unlock, list or lock a node | `vox node create`, `unlock`, `list`, `lock` | the node's passphrase, if it has one |
@@ -50,11 +50,36 @@ command, give the exact arguments of the `vox` you run. `vox man` prints the sam
 | Sessions | `vox room sessions`, `vox room session`, `vox agent room`, `vox agent send` | read + drive, to drive |
 | Install, update, remove | `vox update`, `vox uninstall`, `vox shell-setup` | |
 
+## Commands you can paste
+
+Command blocks in the tutorials use the node and room established in their preceding steps.
+Keep the named `--node` when copying one, even if only one node happens to be Ready. If your
+setup uses other names, construct the command with those actual names first.
+
+Room links, fingerprints, Session IDs, waiting references and entry hashes are created by your
+running Vox. Use values from its actual output, or the complete contextual command it prints;
+there is no reusable example identity. When a value is not known yet, follow the described
+lookup or selection step before constructing the action. The command-family table above names
+verbs, not complete commands to paste.
+
+In a POSIX shell, single-quote each dynamic argument, including links, paths, names and text.
+For a literal apostrophe, close the quotes, write `\'`, then reopen them: the sequence is `'\''`.
+Construct from raw argument values instead of substituting text inside existing quotes.
+Double quotes still allow shell expansions. Never put a passphrase in a constructed command.
+
 ## How a command picks its node
 
 A command acts as the first of these that names a node: `--node`, then `VOX_NODE`, then the only
 Ready node, then the only node on disk. If none settles it, the command refuses and lists the
 nodes. Name the node explicitly in scripts and agent setups.
+
+When the intended acting node's full fingerprint is known but its local name is not, use a
+`--node` value formed from `fp:` followed by that actual full fingerprint. This selects only
+that exact Ready identity attached to the executing daemon. An absent or ambiguous match is
+refused; it never falls back to another node. Local node names continue to work as before. This
+selector is for node-scoped CLI verbs such as trust, room, share and service commands; opening
+the interactive TUI, running an anchor, and creating or managing local nodes still take their
+local names.
 
 `vox node unlock`, `serve`, `connect`, `up`, `forward` and `lan up` start the daemon if none runs,
 and unlock their node. Other commands only ask an Ready node, and say so if it is Locked,

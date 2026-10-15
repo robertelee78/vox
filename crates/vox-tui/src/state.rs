@@ -222,8 +222,8 @@ pub enum Focus {
     Members,
     /// What is shared in the room (ADR-028 S-3): Up/Down select, `y` copies its command.
     Shared,
-    /// The room's Sessions (ADR-029 CL-2): Up/Down select, Enter shows the one selected.
-    Sessions,
+    /// Horizontal room tabs: Left/Right select, Enter opens a tab or the Ended menu.
+    Tabs,
 }
 
 impl Focus {
@@ -234,8 +234,8 @@ impl Focus {
             Focus::Timeline => Focus::Composer,
             Focus::Composer => Focus::Members,
             Focus::Members => Focus::Shared,
-            Focus::Shared => Focus::Sessions,
-            Focus::Sessions => Focus::Timeline,
+            Focus::Shared => Focus::Tabs,
+            Focus::Tabs => Focus::Timeline,
         }
     }
 }
@@ -250,6 +250,15 @@ pub enum Mode {
     CommandPalette(String),
     /// A masked onboarding/attach prompt is open (modal).
     Prompt(Prompt),
+    /// Current-node outcomes of one completed room action; a selected result is rendered.
+    PauseReport {
+        /// One bounded result per selected current node.
+        nodes: Vec<String>,
+        /// Result currently visible.
+        selected: usize,
+        /// Vertical scroll within that one result.
+        scroll: u16,
+    },
 }
 
 impl Mode {
@@ -282,8 +291,6 @@ pub enum Showing {
     /// The room's own conversation: **General**.
     #[default]
     General,
-    /// **All**: the room's conversation with each Session's opening and end, in time order.
-    All,
     /// One Session, by its node and the harness's session id.
     Session(Digest32, String),
     /// The room's messages tagged so (#636): a thread of one task, project or milestone.
@@ -302,7 +309,6 @@ pub fn room_messages<'a>(
         .filter(move |message| match showing {
             Showing::General => message.thread.is_none(),
             Showing::Tag(tag) => message.tags.contains(tag),
-            Showing::All => true,
             Showing::Session(..) => false,
         })
         .flat_map(move |message| {
@@ -316,42 +322,72 @@ pub fn room_messages<'a>(
         })
 }
 
-/// One row of a room's Sessions pane, top to bottom (ADR-029 CL-2).
+/// One choice in the bounded tab row or its Ended menu.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionRow {
     /// The room's own conversation.
     General,
-    /// Everything merged.
-    All,
-    /// The Session at this index of the room's `sessions`.
+    /// An open, drivable Session in the live page.
     Session(usize),
-    /// The ended Sessions, apart (SE-5): this many; Enter shows or hides them.
-    Ended(usize),
+    /// The exact selected open Session, when it is outside the current live page.
+    Selected,
+    /// An ended, drivable Session in the requested history page.
+    History(usize),
+    /// Open the Ended menu, or close it when already open.
+    Ended,
+    /// Return to this listing's first page.
+    First,
+    /// Read this listing's next bounded page.
+    Next,
 }
 
-/// The Sessions pane's rows: General, All, the open Sessions, then "Ended (N)" when any has
-/// ended, with the ended ones under it while `ended_open`.
+/// Live tabs and ended history never replace each other's bounded metadata page.
 #[must_use]
-pub fn session_rows(sessions: &[SessionView], ended_open: bool) -> Vec<SessionRow> {
-    let mut rows = vec![SessionRow::General, SessionRow::All];
-    rows.extend(
-        sessions
-            .iter()
-            .enumerate()
-            .filter(|(_, x)| x.ended.is_none())
-            .map(|(i, _)| SessionRow::Session(i)),
-    );
-    let ended: Vec<usize> = sessions
-        .iter()
-        .enumerate()
-        .filter(|(_, x)| x.ended.is_some())
-        .map(|(i, _)| i)
-        .collect();
-    if !ended.is_empty() {
-        rows.push(SessionRow::Ended(ended.len()));
-        if ended_open {
-            rows.extend(ended.into_iter().map(SessionRow::Session));
+pub fn session_rows(channel: &crate::viewmodel::ChannelView, ended_open: bool) -> Vec<SessionRow> {
+    let mut rows = if ended_open {
+        let mut rows = vec![SessionRow::Ended];
+        rows.extend(
+            channel
+                .ended_sessions
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.can_drive && s.ended.is_some())
+                .map(|(i, _)| SessionRow::History(i)),
+        );
+        rows
+    } else {
+        let mut rows = vec![SessionRow::General];
+        rows.extend(
+            channel
+                .sessions
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.can_drive && s.ended.is_none())
+                .map(|(i, _)| SessionRow::Session(i)),
+        );
+        if channel.selected_session.as_ref().is_some_and(|selected| {
+            selected.can_drive
+                && selected.ended.is_none()
+                && !channel
+                    .sessions
+                    .iter()
+                    .any(|s| s.node == selected.node && s.id == selected.id)
+        }) {
+            rows.push(SessionRow::Selected);
         }
+        rows.push(SessionRow::Ended);
+        rows
+    };
+    // First also retries a refused history page without making the empty menu final.
+    if ended_open || channel.sessions_first {
+        rows.push(SessionRow::First);
+    }
+    if if ended_open {
+        channel.ended_more
+    } else {
+        channel.sessions_more
+    } {
+        rows.push(SessionRow::Next);
     }
     rows
 }
@@ -382,6 +418,10 @@ pub struct UiState {
     pub selected_member: Option<Digest32>,
     /// How many lines the timeline is scrolled up from its newest; 0 follows new messages.
     pub timeline_scroll: usize,
+    /// The last draw reached the oldest line of this bounded page.
+    pub timeline_at_top: bool,
+    room_page: Option<crate::viewmodel::RoomPagePosition>,
+    session_before: Option<Digest32>,
     /// The message selected in the timeline, **by entry** (ADR-028 R-9, #485): what `r` replies
     /// to, and whose quote Enter jumps to. `None` follows the newest.
     pub selected_message: Option<Digest32>,
@@ -411,11 +451,11 @@ pub struct UiState {
     pub to: Vec<Digest32>,
     /// The composer's next message is urgent (W-4, ADR-020 4.5): `:urgent`.
     pub urgent: bool,
-    /// What the room's timeline shows: General, All or one Session (ADR-029 CL-2).
+    /// What the room's timeline shows: General, a tag or one Session (ADR-029 CL-2).
     pub showing: Showing,
-    /// The row selected in the Sessions pane, by position.
+    /// The focused choice in the tab row or Ended menu, by position.
     pub selected_session_row: usize,
-    /// The ended Sessions are listed under "Ended (N)" (SE-5).
+    /// The bounded Ended menu is open.
     pub ended_open: bool,
     /// The line selected in the Session on screen, by position; `None` follows the newest.
     pub selected_session_line: Option<usize>,
@@ -437,6 +477,9 @@ impl Default for UiState {
             selected_share: 0,
             selected_member: None,
             timeline_scroll: 0,
+            timeline_at_top: false,
+            room_page: None,
+            session_before: None,
             selected_message: None,
             reveal_selected: false,
             replying: None,
@@ -482,6 +525,22 @@ impl UiState {
             self.ended_open = false;
             self.selected_session_line = None;
             self.details_open = false;
+            self.room_page = None;
+            self.session_before = None;
+        }
+        if let Some(active) = vm.active.as_ref() {
+            if self.room_page != Some(active.page) {
+                self.room_page = Some(active.page);
+                self.timeline_scroll = 0;
+                self.timeline_at_top = false;
+                self.selected_message = None;
+                self.reveal_selected = false;
+            }
+            if self.session_before != active.session_before {
+                self.session_before = active.session_before;
+                self.selected_session_line = None;
+                self.details_open = false;
+            }
         }
         match self
             .selected_room
@@ -533,6 +592,39 @@ impl UiState {
         match self.mode {
             Mode::CommandPalette(_) => return self.on_palette_key(key, vm),
             Mode::Prompt(_) => return self.on_prompt_key(key),
+            Mode::PauseReport {
+                ref nodes,
+                ref mut selected,
+                ref mut scroll,
+            } => {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Enter => self.mode = Mode::Normal,
+                    KeyCode::Left => {
+                        *selected = selected.saturating_sub(1);
+                        *scroll = 0;
+                    }
+                    KeyCode::Right => {
+                        *selected = selected
+                            .saturating_add(1)
+                            .min(nodes.len().saturating_sub(1));
+                        *scroll = 0;
+                    }
+                    KeyCode::Up => *scroll = scroll.saturating_sub(1),
+                    KeyCode::Down => *scroll = scroll.saturating_add(1),
+                    KeyCode::PageUp => *scroll = scroll.saturating_sub(10),
+                    KeyCode::PageDown => *scroll = scroll.saturating_add(10),
+                    KeyCode::Home => {
+                        *selected = 0;
+                        *scroll = 0;
+                    }
+                    KeyCode::End => {
+                        *selected = nodes.len().saturating_sub(1);
+                        *scroll = 0;
+                    }
+                    _ => {}
+                }
+                return Action::Redraw;
+            }
             Mode::Normal => {}
         }
         // The composer, when focused, owns printable keys, Backspace and Enter.
@@ -714,24 +806,58 @@ impl UiState {
                 }
                 Action::Redraw
             }
-            KeyCode::Enter if self.screen == Screen::Channel && self.focus == Focus::Sessions => {
+            KeyCode::Enter if self.screen == Screen::Channel && self.focus == Focus::Tabs => {
                 let rows = vm
                     .active
                     .as_ref()
-                    .map(|c| session_rows(&c.sessions, self.ended_open))
+                    .map(|c| session_rows(c, self.ended_open))
                     .unwrap_or_default();
                 match rows.get(self.selected_session_row) {
                     Some(SessionRow::General) => self.show(Showing::General, vm),
-                    Some(SessionRow::All) => self.show(Showing::All, vm),
                     Some(SessionRow::Session(i)) => {
                         match vm.active.as_ref().and_then(|c| c.sessions.get(*i)) {
                             Some(x) => self.show(Showing::Session(x.node, x.id.clone()), vm),
                             None => Action::Redraw,
                         }
                     }
-                    Some(SessionRow::Ended(_)) => {
+                    Some(SessionRow::History(i)) => {
+                        match vm.active.as_ref().and_then(|c| c.ended_sessions.get(*i)) {
+                            Some(x) => self.show(Showing::Session(x.node, x.id.clone()), vm),
+                            None => Action::Redraw,
+                        }
+                    }
+                    Some(SessionRow::Selected) => {
+                        match vm.active.as_ref().and_then(|c| c.selected_session.as_ref()) {
+                            Some(x) => self.show(Showing::Session(x.node, x.id.clone()), vm),
+                            None => Action::Redraw,
+                        }
+                    }
+                    Some(SessionRow::Ended) => {
                         self.ended_open = !self.ended_open;
+                        self.selected_session_row = 0;
+                        if self.ended_open {
+                            if let Some(channel_id) = self.active_channel_id(vm) {
+                                return Action::Dispatch(Command::SessionsPage {
+                                    channel_id,
+                                    first: true,
+                                    ended: true,
+                                });
+                            }
+                        }
                         Action::Redraw
+                    }
+                    Some(SessionRow::First | SessionRow::Next) => {
+                        let first =
+                            matches!(rows.get(self.selected_session_row), Some(SessionRow::First));
+                        self.selected_session_row = 0;
+                        match self.active_channel_id(vm) {
+                            Some(channel_id) => Action::Dispatch(Command::SessionsPage {
+                                channel_id,
+                                first,
+                                ended: self.ended_open,
+                            }),
+                            None => Action::Redraw,
+                        }
                     }
                     None => Action::Redraw,
                 }
@@ -838,10 +964,15 @@ impl UiState {
                 Action::Redraw
             }
             KeyCode::Tab if self.screen == Screen::Channel => {
+                self.ended_open = false;
+                self.selected_session_row = 0;
                 self.focus = self.focus.next();
                 // The Shared pane is there only when something is shared.
                 if self.focus == Focus::Shared
-                    && vm.active.as_ref().is_none_or(|c| c.shared.is_empty())
+                    && vm
+                        .active
+                        .as_ref()
+                        .is_none_or(|c| c.shared.is_empty() && !c.shared_more)
                 {
                     self.focus = self.focus.next();
                 }
@@ -854,6 +985,29 @@ impl UiState {
                 }
                 Action::Redraw
             }
+            KeyCode::Char(key @ ('n' | 'r'))
+                if self.screen == Screen::Channel && self.focus == Focus::Shared =>
+            {
+                self.selected_share = 0;
+                vm.active.as_ref().map_or(Action::Redraw, |c| {
+                    Action::Dispatch(Command::GovernancePage {
+                        channel_id: c.channel_id,
+                        notices: false,
+                        first: key == 'r',
+                    })
+                })
+            }
+            KeyCode::Char(key @ ('N' | 'R'))
+                if self.screen == Screen::Channel && self.focus == Focus::Timeline =>
+            {
+                vm.active.as_ref().map_or(Action::Redraw, |c| {
+                    Action::Dispatch(Command::GovernancePage {
+                        channel_id: c.channel_id,
+                        notices: true,
+                        first: key == 'R',
+                    })
+                })
+            }
             KeyCode::Char('y') if self.screen == Screen::Channel && self.focus == Focus::Shared => {
                 match vm
                     .active
@@ -863,6 +1017,17 @@ impl UiState {
                     Some(s) if !s.copy.is_empty() => Action::Copy(s.copy.clone()),
                     _ => Action::Redraw,
                 }
+            }
+            KeyCode::Esc if self.ended_open => {
+                self.ended_open = false;
+                self.selected_session_row = 0;
+                Action::Redraw
+            }
+            KeyCode::Left | KeyCode::Right
+                if self.screen == Screen::Channel && self.focus == Focus::Tabs =>
+            {
+                self.move_selection(vm, if key.code == KeyCode::Left { -1 } else { 1 });
+                Action::Redraw
             }
             KeyCode::Esc => {
                 // Out of the share flow's preview, then out of the flow, back to the room.
@@ -962,6 +1127,13 @@ impl UiState {
                 self.timeline_scroll = 0;
                 self.selected_message = None;
                 self.selected_session_line = None;
+                if matches!(self.showing, Showing::Session(..)) {
+                    if let Some(channel_id) = self.active_channel_id(vm) {
+                        return Action::Dispatch(Command::LatestSession { channel_id });
+                    }
+                } else if let Some(channel_id) = self.active_channel_id(vm) {
+                    return Action::Dispatch(Command::LatestRoom { channel_id });
+                }
                 Action::Redraw
             }
             _ => Action::Redraw,
@@ -1371,11 +1543,11 @@ impl UiState {
                     self.selected_share = step(self.selected_share.min(len - 1), len);
                 }
             }
-            Screen::Channel if self.focus == Focus::Sessions => {
+            Screen::Channel if self.focus == Focus::Tabs => {
                 let len = vm
                     .active
                     .as_ref()
-                    .map_or(0, |c| session_rows(&c.sessions, self.ended_open).len());
+                    .map_or(0, |c| session_rows(c, self.ended_open).len());
                 if len > 0 {
                     self.selected_session_row = step(self.selected_session_row.min(len - 1), len);
                 }
@@ -1597,8 +1769,8 @@ impl UiState {
         })
     }
 
-    /// Show General, All or one Session; the composer is not a Session's (ADR-029 DR-1).
-    fn show(&mut self, showing: Showing, vm: &ViewModel) -> Action {
+    /// Show General, a tag or one Session; the composer is not a Session's (ADR-029 DR-1).
+    pub(crate) fn show(&mut self, showing: Showing, vm: &ViewModel) -> Action {
         if matches!(showing, Showing::Session(..)) && self.focus == Focus::Composer {
             self.focus = Focus::Timeline;
         }
@@ -1610,14 +1782,19 @@ impl UiState {
         self.replying = None;
         let session = match &showing {
             Showing::Session(node, id) => Some((*node, id.clone())),
-            Showing::General | Showing::All | Showing::Tag(_) => None,
+            Showing::General | Showing::Tag(_) => None,
         };
+        self.ended_open = false;
         self.showing = showing;
         // The core reads the Session's entries while it is shown (SC-1).
         match self.active_channel_id(vm) {
             Some(channel_id) => Action::Dispatch(Command::ShowSession {
                 channel_id,
                 session,
+                view: match &self.showing {
+                    Showing::Tag(tag) => vox_core::node::api::RoomView::Tag(tag.clone()),
+                    _ => vox_core::node::api::RoomView::General,
+                },
             }),
             None => Action::Redraw,
         }
@@ -1767,54 +1944,29 @@ pub enum Parsed {
     To(String),
     /// Switch the composer's urgent on or off (W-4).
     Urgent,
-    /// Show General, All or one Session in the room's timeline (ADR-029 CL-2).
+    /// Show General, a tag or one Session in the room's timeline (ADR-029 CL-2).
     Show(Showing),
     /// Drive the Session on screen (ADR-029 DR-1).
     Drive(Digest32, (Digest32, String), DriveAct),
 }
 
-/// The Session the room's timeline shows, while it shows one that the room still lists.
+/// The exact selected Session, independent of the currently displayed metadata page.
 #[must_use]
 pub fn showing_session<'a>(ui: &UiState, vm: &'a ViewModel) -> Option<&'a SessionView> {
     let Showing::Session(node, id) = &ui.showing else {
         return None;
     };
-    vm.active
-        .as_ref()?
-        .sessions
-        .iter()
-        .find(|x| x.node == *node && x.id == *id)
-}
-
-/// The one Session `name` names: its whole id, the first 8 or more characters of it, or its
-/// name. One that names none, or more than one, is refused, never guessed (ADR-029 DR-5).
-fn find_session<'a>(sessions: &'a [SessionView], name: &str) -> Result<&'a SessionView, String> {
-    if name.is_empty() {
-        return Err("which Session? :session <name or short id>".into());
-    }
-    let by_id: Vec<&SessionView> = sessions
-        .iter()
-        .filter(|x| x.id == name || (name.len() >= 8 && x.id.starts_with(name)))
-        .collect();
-    let found = if by_id.is_empty() {
-        sessions
-            .iter()
-            .filter(|x| x.name.as_deref() == Some(name))
-            .collect()
-    } else {
-        by_id
-    };
-    match found.as_slice() {
-        [one] => Ok(one),
-        [] => Err(format!("no Session in this room is named {name}")),
-        many => Err(format!(
-            "more than one Session is named {name}: {}",
-            many.iter()
-                .map(|x| x.label.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )),
-    }
+    let channel = vm.active.as_ref()?;
+    channel
+        .selected_session
+        .as_ref()
+        .filter(|x| x.node == *node && x.id == *id)
+        .or_else(|| {
+            channel
+                .sessions
+                .iter()
+                .find(|x| x.node == *node && x.id == *id)
+        })
 }
 
 /// Parse a `:`-command line, resolving selection-relative targets from `ui`/`vm`.
@@ -1904,6 +2056,13 @@ pub fn parse_command(line: &str, ui: &UiState, vm: &ViewModel) -> Option<Parsed>
     }
     // Channel-scoped verbs require an active channel.
     let channel = ui.active_channel_id(vm)?;
+    if matches!(verb, "pause" | "resume") {
+        return Some(Parsed::Core(Command::RoomPause {
+            channel_id: channel,
+            nodes: rest.split_whitespace().map(str::to_owned).collect(),
+            paused: verb == "pause",
+        }));
+    }
     // Interrupting or stopping is driving the Session on screen (DR-1.3); without drive it is
     // refused (CL-3), and outside a Session there is nothing to send it to.
     if let (Showing::Session(..), "interrupt" | "stop" | "approve" | "reject" | "answer") =
@@ -1999,7 +2158,6 @@ pub fn parse_command(line: &str, ui: &UiState, vm: &ViewModel) -> Option<Parsed>
     }
     match verb {
         "general" => return Some(Parsed::Show(Showing::General)),
-        "all" => return Some(Parsed::Show(Showing::All)),
         // A thread of the room's messages by tag (#636); `:general` returns to the room.
         "tag" if rest.is_empty() => {
             return Some(Parsed::Refused(
@@ -2015,11 +2173,42 @@ pub fn parse_command(line: &str, ui: &UiState, vm: &ViewModel) -> Option<Parsed>
         }
         "tag" => return Some(Parsed::Show(Showing::Tag(rest.to_owned()))),
         "session" => {
-            let sessions = vm.active.as_ref().map_or(&[][..], |c| &c.sessions[..]);
-            return Some(match find_session(sessions, rest) {
-                Ok(x) => Parsed::Show(Showing::Session(x.node, x.id.clone())),
-                Err(why) => Parsed::Refused(why),
-            });
+            return Some(Parsed::Core(Command::FindSession {
+                channel_id: channel,
+                typed: rest.to_owned(),
+            }))
+        }
+        "latest" => {
+            return Some(Parsed::Core(
+                if matches!(ui.showing, Showing::Session(..)) {
+                    Command::LatestSession {
+                        channel_id: channel,
+                    }
+                } else {
+                    Command::LatestRoom {
+                        channel_id: channel,
+                    }
+                },
+            ));
+        }
+        "sessions-first" => {
+            return Some(Parsed::Core(Command::SessionsPage {
+                channel_id: channel,
+                first: true,
+                ended: ui.ended_open,
+            }))
+        }
+        "sessions-next" => {
+            return Some(Parsed::Core(Command::SessionsPage {
+                channel_id: channel,
+                first: false,
+                ended: ui.ended_open,
+            }))
+        }
+        "session-latest" => {
+            return Some(Parsed::Core(Command::LatestSession {
+                channel_id: channel,
+            }))
         }
         "send" if !rest.is_empty() => return Some(Parsed::Send(channel, rest.to_owned())),
         // Share a file or folder here, from the composer (F-1): its words the note. `share`, as

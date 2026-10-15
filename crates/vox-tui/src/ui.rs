@@ -186,6 +186,28 @@ pub fn render(frame: &mut Frame, vm: &ViewModel, ui: &mut UiState) {
     match ui.mode {
         Mode::CommandPalette(ref buf) => render_palette(frame, area, buf),
         Mode::Prompt(ref p) => render_prompt(frame, area, p),
+        Mode::PauseReport {
+            ref nodes,
+            selected,
+            scroll,
+        } => {
+            let title = format!(
+                " Room pause/resume result {}/{} · ←/→ target · ↑/↓ scroll · Esc close ",
+                selected.saturating_add(1),
+                nodes.len()
+            );
+            let text = nodes
+                .get(selected)
+                .map_or("No nodes were selected", String::as_str);
+            frame.render_widget(ratatui::widgets::Clear, area);
+            frame.render_widget(
+                Paragraph::new(text)
+                    .wrap(Wrap { trim: false })
+                    .scroll((scroll, 0))
+                    .block(Block::default().borders(Borders::ALL).title(title)),
+                area,
+            );
+        }
         Mode::Normal => {}
     }
 }
@@ -348,9 +370,16 @@ fn render_sidebar(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &UiState) {
         };
         // In words, never a padlock (ADR-028 L-8).
         let closed = if c.open { "" } else { " (closed)" };
+        let attention = if c.waiting > 0 || (c.to_you > 0 && c.urgent > 0) {
+            " @!"
+        } else if c.to_you > 0 {
+            " @"
+        } else {
+            ""
+        };
         let (reach, reach_style) = reachability_label(c.reachability);
         items.push(ListItem::new(Line::from(vec![
-            Span::raw(format!("{marker}{}{closed}{unread}  [", c.name)),
+            Span::raw(format!("{marker}{}{attention}{closed}{unread}  [", c.name)),
             Span::styled(reach, reach_style),
             Span::raw("]"),
         ])));
@@ -574,13 +603,19 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
         return;
     };
 
+    let regions = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(1)])
+        .split(area);
+    render_tabs(frame, regions[0], channel, ui);
+
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
             Constraint::Min(1),
             Constraint::Length(inspector_cols(area.width)),
         ])
-        .split(area);
+        .split(regions[1]);
 
     // A Session has a composer only for a driver: typing into one is driving (ADR-029 DR-1,
     // CL-3).
@@ -595,8 +630,8 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
         ])
         .split(cols[0]);
 
-    // What the timeline shows (ADR-029 CL-2): the room's conversation (General); that and each
-    // Session's opening and end (All); or one Session, whose activity is never the room's (SC-4).
+    // General and tag pages are selected by the daemon before their page budget. Session
+    // activity stays separate; lifecycle notices never enter General (ADR-033 LY-4).
     let timeline = crate::state::room_messages(channel, &ui.showing);
     let (notices, shown) = match &ui.showing {
         Showing::Tag(tag) => (
@@ -614,25 +649,6 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
                 String::new()
             },
         ),
-        Showing::All => {
-            let mut notices = channel.notices.clone();
-            for x in &channel.sessions {
-                notices.push(NoticeView {
-                    timestamp: x.opened,
-                    after: None,
-                    text: format!("{} opened", x.label),
-                });
-                if let Some(at) = x.ended {
-                    notices.push(NoticeView {
-                        timestamp: at,
-                        after: None,
-                        text: format!("{} ended", x.label),
-                    });
-                }
-            }
-            notices.sort_by_key(|n| n.timestamp);
-            (notices, " — All".to_owned())
-        }
         Showing::Session(..) => {
             let mut notices = Vec::new();
             if let Some(x) = session {
@@ -718,7 +734,7 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
             focused(ui, Focus::Timeline),
         );
     } else {
-        (ui.timeline_scroll, ui.on_screen) = render_timeline(
+        (ui.timeline_scroll, ui.on_screen, ui.timeline_at_top) = render_timeline(
             frame,
             area,
             &channel.held_back,
@@ -797,18 +813,8 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
     // wrapped, since it is longer than a line (ADR-028 S-3).
     let inner = usize::from(cols[1].width.saturating_sub(2)).max(20);
     let shared_lines = shared_lines(&channel.shared, ui.selected_share, shared_focus, inner);
-    // The room's Sessions on top (ADR-029 CL-2), at most a third of the column.
-    let rows = session_rows(&channel.sessions, ui.ended_open);
-    let tall = u16::try_from(rows.len().saturating_add(2))
-        .unwrap_or(u16::MAX)
-        .min(cols[1].height / 3);
-    let column = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(tall), Constraint::Min(3)])
-        .split(cols[1]);
-    render_sessions(frame, column[0], channel, &rows, ui);
-    let side = if channel.shared.is_empty() {
-        vec![column[1]]
+    let side = if channel.shared.is_empty() && !channel.shared_more {
+        vec![cols[1]]
     } else {
         Layout::default()
             .direction(Direction::Vertical)
@@ -818,7 +824,7 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
                     u16::try_from(shared_lines.len().saturating_add(2)).unwrap_or(u16::MAX),
                 ),
             ])
-            .split(column[1])
+            .split(cols[1])
             .to_vec()
     };
     render_members(
@@ -831,9 +837,19 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
     if let Some(area) = side.get(1) {
         let items: Vec<ListItem> = shared_lines.into_iter().map(ListItem::new).collect();
         frame.render_widget(
-            List::new(items).block(pane_block("Shared", shared_focus)),
+            List::new(items).block(pane_block(
+                if channel.shared_more {
+                    "Shared · n: next · r: first"
+                } else {
+                    "Shared · r: first"
+                },
+                shared_focus,
+            )),
             *area,
         );
+    }
+    if ui.ended_open {
+        render_ended_menu(frame, regions[1], channel, ui);
     }
 }
 
@@ -902,46 +918,130 @@ fn render_session(
     frame.render_widget(Paragraph::new(shown).block(pane_block(title, focus)), area);
 }
 
-/// **The Sessions pane** (ADR-029 CL-2): General, All, each open Session by its label, and the
-/// ended ones apart under "Ended (N)" (SE-5). What the timeline shows is marked `▸`.
-fn render_sessions(
-    frame: &mut Frame,
-    area: Rect,
-    channel: &ChannelView,
-    rows: &[SessionRow],
-    ui: &UiState,
-) {
-    let focus = focused(ui, Focus::Sessions);
+fn tab_label(x: &crate::viewmodel::SessionView, ui: &UiState) -> (String, bool) {
+    // Keep alias first. The name disambiguates same-node Sessions without collecting
+    // every live metadata page merely to count that node's Sessions.
+    let name = x.name.as_deref().filter(|name| !name.is_empty());
+    let label = name.map_or_else(
+        || x.label.clone(),
+        |name| format!("{} · {name}", x.node_alias),
+    );
+    (
+        format!(
+            "{}{}",
+            if x.waiting { "@! " } else { "" },
+            vox_agentcomms::envelope::shown(&label, 48)
+        ),
+        ui.showing == Showing::Session(x.node, x.id.clone()),
+    )
+}
+
+/// The room's tab row is independent of history: one bounded live page and explicit paging.
+fn render_tabs(frame: &mut Frame, area: Rect, channel: &ChannelView, ui: &UiState) {
+    let rows = session_rows(channel, false);
+    let labels: Vec<(String, bool)> = rows
+        .iter()
+        .map(|row| match row {
+            SessionRow::General => ("General".into(), ui.showing == Showing::General),
+            SessionRow::Session(i) => tab_label(&channel.sessions[*i], ui),
+            SessionRow::Selected => channel
+                .selected_session
+                .as_ref()
+                .map(|x| tab_label(x, ui))
+                .unwrap_or_default(),
+            SessionRow::Ended => ("Ended…".into(), ui.ended_open),
+            SessionRow::First => ("First tabs".into(), false),
+            SessionRow::Next => ("More tabs →".into(), false),
+            SessionRow::History(_) => (String::new(), false),
+        })
+        .collect();
+    let focused = focused(ui, Focus::Tabs);
+    let selected = if focused && !ui.ended_open {
+        ui.selected_session_row.min(labels.len().saturating_sub(1))
+    } else {
+        labels.iter().position(|(_, on)| *on).unwrap_or(0)
+    };
+    let width = usize::from(area.width.saturating_sub(4));
+    let cost = |i: usize| Line::from(labels[i].0.as_str()).width() + 5;
+    let mut first = 0;
+    while first < selected && (first..=selected).map(cost).sum::<usize>() > width {
+        first += 1;
+    }
+    let mut spans = Vec::new();
+    let mut used = 0;
+    if first > 0 {
+        spans.push(Span::raw("‹ "));
+        used += 2;
+    }
+    for (i, (label, on)) in labels.iter().enumerate().skip(first) {
+        let text = format!("{}{}", if *on { "▸ " } else { "" }, label);
+        let len = Line::from(text.as_str()).width() + if i > first { 3 } else { 0 };
+        if used + len > width && i > first {
+            spans.push(Span::raw(" ›"));
+            break;
+        }
+        if i > first {
+            spans.push(Span::raw(" │ "));
+        }
+        let style = if focused && !ui.ended_open && selected == i {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else if *on {
+            Style::default().add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        spans.push(Span::styled(text, style));
+        used += len;
+    }
+    let title = format!(
+        "{} · {} members · Tabs",
+        channel.name,
+        channel.members.len()
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).block(pane_block(&title, focused)),
+        area,
+    );
+}
+
+/// A requested history page, never a permanent vertical Session list. Empty pages still expose
+/// Next because the authoritative history may contain live rows between ended Sessions.
+fn render_ended_menu(frame: &mut Frame, area: Rect, channel: &ChannelView, ui: &UiState) {
+    let rows = session_rows(channel, true);
     let items: Vec<ListItem> = rows
         .iter()
         .enumerate()
         .map(|(i, row)| {
-            let (text, on) = match row {
-                SessionRow::General => ("General".to_owned(), ui.showing == Showing::General),
-                SessionRow::All => ("All".to_owned(), ui.showing == Showing::All),
-                SessionRow::Session(at) => {
-                    let x = &channel.sessions[*at];
-                    let on = ui.showing == Showing::Session(x.node, x.id.clone());
-                    if x.ended.is_some() {
-                        (format!("  {} · ended", x.label), on)
-                    } else if x.waiting {
-                        (format!("! {} · waiting on you", x.label), on)
-                    } else {
-                        (format!("● {}", x.label), on)
-                    }
-                }
-                SessionRow::Ended(n) => (format!("Ended ({n})"), false),
+            let text = match row {
+                SessionRow::History(at) => format!("{} · ended", channel.ended_sessions[*at].label),
+                SessionRow::Ended => "Back to tabs · Esc".into(),
+                SessionRow::First => "First history page".into(),
+                SessionRow::Next => "Next history page →".into(),
+                _ => String::new(),
             };
-            let mark = if on { "▸ " } else { "  " };
-            let style = if focus && i == ui.selected_session_row {
-                Style::default().add_modifier(Modifier::REVERSED)
-            } else {
-                Style::default()
-            };
-            ListItem::new(Line::from(Span::styled(format!("{mark}{text}"), style)))
+            ListItem::new(format!(
+                "{}{}",
+                if i == ui.selected_session_row {
+                    "▶ "
+                } else {
+                    "  "
+                },
+                text
+            ))
         })
         .collect();
-    frame.render_widget(List::new(items).block(pane_block("Sessions", focus)), area);
+    let height = u16::try_from(items.len().saturating_add(2))
+        .unwrap_or(u16::MAX)
+        .min(area.height);
+    let menu = Rect::new(area.x, area.y, area.width.min(80), height);
+    let mut selection =
+        ratatui::widgets::ListState::default().with_selected(Some(ui.selected_session_row));
+    frame.render_widget(ratatui::widgets::Clear, menu);
+    frame.render_stateful_widget(
+        List::new(items).block(pane_block("Ended · history page", true)),
+        menu,
+        &mut selection,
+    );
 }
 
 /// The Shared pane's lines (ADR-028 S-3): each service, and under the one selected while the pane
@@ -970,6 +1070,9 @@ fn shared_lines(
                     r.clone()
                 };
                 lines.push(Line::from(format!("    {r}")));
+            }
+            if let Some(hint) = &s.browser_hint {
+                lines.extend(wrap(Line::from(format!("    {hint}")), width));
             }
             lines.push(Line::from("    y copies:"));
             let chars: Vec<char> = s.copy.chars().collect();
@@ -1003,11 +1106,11 @@ fn render_timeline<'a>(
     held_back: &[String],
     timeline: impl DoubleEndedIterator<Item = &'a MessageView> + Clone,
     // What happened to the room, its retention, and what is shown beyond the room's own
-    // conversation (" — All", " — <a Session's label>"), for the header.
+    // conversation (" — <a Session's label>"), for the header.
     (room_notices, channel, showing, general): (&[NoticeView], &ChannelView, &str, bool),
     at: Selection,
     images: &mut crate::images::Images,
-) -> (usize, Vec<Digest32>) {
+) -> (usize, Vec<Digest32>, bool) {
     let retention = &channel.retention;
     let thread = channel.expanded_thread.as_ref().filter(|_| general);
     let indented: std::collections::HashSet<_> = thread
@@ -1268,10 +1371,18 @@ fn render_timeline<'a>(
     let title = if scroll > 0 {
         format!("Timeline{showing} · {RETENTION} {retention} (scrolled — End: newest)")
     } else {
-        format!("Timeline{showing} · {RETENTION} {retention}")
+        format!(
+            "Timeline{showing} · {RETENTION} {retention}{}",
+            if channel.notices_more {
+                " · N: older notices · R: latest"
+            } else {
+                " · R: latest notices"
+            }
+        )
     };
     let p = Paragraph::new(shown).block(pane_block(&title, focus));
     frame.render_widget(p, area);
+    images.retain_visible(&on_screen, area.width.saturating_sub(2));
     // Each image whose rows are all in the window is drawn over them; one cut by its edge is not.
     for (at, (entry, img)) in drawn.iter().enumerate() {
         let mine: Vec<usize> = window.clone().filter(|i| pics[*i] == Some(at)).collect();
@@ -1286,7 +1397,7 @@ fn render_timeline<'a>(
             images.draw(frame, rect, *entry, img);
         }
     }
-    (scroll, on_screen)
+    (scroll, on_screen, reached_oldest && window.start == 0)
 }
 
 /// One message as the timeline draws it: who, to whom, and what it says; `chosen` marks it
@@ -1429,6 +1540,12 @@ fn render_members(
                         theme::fg(theme::TEXT_SECONDARY),
                     )));
                 }
+                if let Some(note) = &m.machine_note {
+                    lines.push(Line::from(Span::styled(
+                        format!("    {note}"),
+                        theme::fg(theme::TEXT_SECONDARY),
+                    )));
+                }
                 for row in vox_text::fingerprint::card(&vox_core::node::link::b32_encode(&m.id)) {
                     lines.push(Line::from(format!("    {row}")));
                 }
@@ -1564,19 +1681,19 @@ fn hint_text(ui: &UiState, vm: &ViewModel) -> String {
         Screen::ChannelList => {
             " ↑/↓ select · Enter open · t tunnels · k keyring · d decisions · :new <name> · :join · :unlock · Ctrl-C quit"
         }
-        Screen::Channel if ui.focus == Focus::Sessions => {
-            " A step is one thing an agent did in its Session: a message, a command it ran, or a file it edited. · ↑/↓ select · Enter open · Tab switch pane · :general · :all · Esc back"
+        Screen::Channel if ui.focus == Focus::Tabs => {
+            " A step is one thing an agent did in its Session: a message, a command it ran, or a file it edited. · ←/→ tabs · ↑/↓ menu · Enter open/page · :sessions-first / :sessions-next · Tab switch pane · :general · Esc back"
         }
         // A Session's own help line (ADR-029 §8): its driving words join it as they are built,
         // for a member with drive only (CL-3).
         Screen::Channel if showing_session(ui, vm).is_some_and(|x| x.can_drive) => {
-            " Tab switch pane · ↑/↓ select a line · Enter or d: Details · a approve · r reject · 1-9 answer · type to the session, /command · :share <path> · :interrupt · :stop · :general · : command · Esc back"
+            " Tab switch pane · ↑/↓ select a line · End latest · Enter or d: Details · a approve · r reject · 1-9 answer · type to the session, /command · :share <path> · :interrupt · :stop · :general · : command · Esc back"
         }
         Screen::Channel if matches!(ui.showing, Showing::Session(..)) => {
-            " Tab switch pane · ↑/↓ select · Enter show · :general · :all · :session <name> · : command · Esc back"
+            " Tab switch pane · ↑/↓ select · Enter show · :general · :session <name> · : command · Esc back"
         }
         Screen::Channel => {
-            " Tab switch pane · ↑/↓ select · Ctrl-R reply in thread · Enter open thread / go to quote · → next replies · ← close thread · PgUp/PgDn scroll · :to <name> · :urgent · :share <path> · :link · :general · :all · :session <name> · :tag <tag> · : command · Esc back"
+            " Tab switch pane · ↑/↓ select · Ctrl-R reply in thread · Enter open thread / go to quote · → next replies · ← close thread · PgUp/PgDn page/scroll · End/:latest newest · :to <name> · :urgent · :pause [nodes] · :resume [nodes] · :share <path> · :link · :general · :session <name> · :tag <tag> · : command · Esc back"
         }
         Screen::Tunnels => " ↑/↓ select · x close the selected tunnel · : command · Esc back",
         Screen::Serve if vm.serve_preview.is_some() => " Enter share it · Esc back to the list",

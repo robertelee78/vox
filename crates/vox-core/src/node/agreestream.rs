@@ -50,7 +50,7 @@
 //! or reaches within [`REACH_PATIENCE`]. One it cannot reach, or that does not answer within
 //! [`ASK_PATIENCE`], is reported as such, and the client does not claim success.
 //!
-//! The node knows no `type`'s meaning (see [`crate::node::api::StructuredIndex`]): it moves entry
+//! The node knows no `type`'s meaning (see [`crate::node::api::structured_kind`]): it moves entry
 //! hashes, and the client folds them. Only members may open this stream (`PeerPolicy::allows`),
 //! and only a member of the room asked about is answered.
 

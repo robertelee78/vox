@@ -387,7 +387,6 @@ pub(crate) async fn addressees(
     }
     let members = members_of(client, channel_id).await?;
     let member = |w: &str| crate::ident::resolve_member(w, &members, crate::ident::names());
-    let mut sessions: Option<Vec<vox_core::node::sessions::SessionRow>> = None;
     let mut to: Vec<String> = Vec::new();
     for w in words {
         let entry = match w
@@ -395,10 +394,8 @@ pub(crate) async fn addressees(
             .and_then(|(m, s)| Some((member(m).ok()?, s)))
         {
             Some((fp, typed)) => {
-                if sessions.is_none() {
-                    sessions = Some(sessions_of(client, channel_id).await?);
-                }
-                let session = session_of(sessions.as_deref().unwrap_or_default(), &fp, typed)
+                let session = session_of(client, channel_id, &fp, typed)
+                    .await
                     .map_err(|e| AppError::Usage(format!("refusing --to {w}: {e}")))?;
                 format!("{}/{session}", b32_encode(&fp))
             }
@@ -413,33 +410,21 @@ pub(crate) async fn addressees(
     Ok(to)
 }
 
-/// The room's Sessions, as its log says.
-async fn sessions_of(
+/// One current open Session of this exact node, selected with bounded metadata pages.
+async fn session_of(
     client: &mut IpcClient,
-    channel_id: Digest32,
-) -> Result<Vec<vox_core::node::sessions::SessionRow>, AppError> {
-    match client.sessions(channel_id).await {
-        Ok(Frame::SessionsPage { sessions, .. }) => Ok(sessions),
-        Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
-        Ok(other) => Err(crate::client::unexpected(&other)),
-        Err(e) => Err(AppError::Usage(e.to_string())),
-    }
-}
-
-/// The id of the one open Session of the node `fp` that `typed` names (ADR-029 TA-1, TA-5), as
-/// [`vox_core::node::sessions::addressable`] finds it, labelled as this node labels it.
-fn session_of(
-    rows: &[vox_core::node::sessions::SessionRow],
+    room: Digest32,
     fp: &Digest32,
     typed: &str,
 ) -> Result<String, String> {
-    vox_core::node::sessions::addressable(rows, fp, typed, |s| {
+    vox_core::node::sessions::selection::addressable(client, room, *fp, typed, |s| {
         vox_agentcomms::envelope::session_label(
             &crate::ident::name_of(&s.node),
             s.name.as_deref(),
             &s.id,
         )
     })
+    .await
 }
 
 /// What a structured post did, for its caller to say (`vox room post`, the TUI's composer).
@@ -606,7 +591,7 @@ pub(crate) async fn post_structured(
     }
     if coord::is_claim_type(&kind, &serde_json::Value::Object(data.clone())) {
         return Err(AppError::Usage(format!(
-            "`{kind}` is a claim-protocol operation; use `vox room {kind}`"
+            "`{kind}` is a claim-protocol operation; use its room subcommand with the room, work key and acting node"
         )));
     }
     if body.trim().is_empty() && data.is_empty() {
@@ -763,9 +748,11 @@ pub(crate) async fn post_structured(
     let reach = if others.is_empty() {
         Vec::new()
     } else {
-        let (outbound, inbound) = match client.request(&Request::Consents { channel_id: cid }).await
+        let (outbound, inbound) = match client
+            .request(&Request::MemberConsents { channel_id: cid })
+            .await
         {
-            Ok(Frame::Consents { outbound, inbound }) => (outbound, inbound),
+            Ok(Frame::MemberConsents { outbound, inbound }) => (outbound, inbound),
             Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
             Ok(other) => return Err(crate::client::unexpected(&other)),
             Err(e) => return Err(AppError::Usage(e.to_string())),
@@ -912,17 +899,13 @@ pub async fn post_cmd(
                     )));
                 }
                 // One session addressed is one of the member's open Sessions here (TA-1, TA-5).
-                let mut sessions = None;
                 for t in &env.to {
                     let (Some(fp), (_, Some(id))) =
                         (node_of(t), vox_agentcomms::envelope::addressee(t))
                     else {
                         continue;
                     };
-                    if sessions.is_none() {
-                        sessions = Some(sessions_of(&mut client, cid).await?);
-                    }
-                    match session_of(sessions.as_deref().unwrap_or_default(), &fp, id) {
+                    match session_of(&mut client, cid, &fp, id).await {
                         Ok(found) if found == id => {}
                         Ok(_) => {
                             return Err(AppError::Usage(format!(
@@ -1328,52 +1311,208 @@ async fn names_in(client: &mut IpcClient) -> vox_core::node::resolver::VoxResolv
     }
 }
 
-/// Who has read this node's own recent messages in `room`, and who has pulled its shares there
-/// whole (ADR-028 R-6, F-7), by entry, from one snapshot of the node. Empty when it does not say.
-async fn own_in(
+async fn footer_instance(
     client: &mut IpcClient,
-    room: &Digest32,
-) -> (
-    std::collections::BTreeMap<Digest32, Vec<Digest32>>,
-    std::collections::BTreeMap<Digest32, Vec<Digest32>>,
-) {
-    let body = vox_core::node::snapshot::request_body();
-    let Ok(reply) = client.exchange(&body).await else {
-        return Default::default();
-    };
-    let Ok(Some(snap)) = vox_core::node::snapshot::NodeSnapshot::from_bytes(&reply) else {
-        return Default::default();
-    };
-    snap.open
-        .into_iter()
-        .find(|o| o.channel_id == *room)
-        .map(|o| {
-            (
-                o.read_by.into_iter().collect(),
-                o.pulled_by.into_iter().collect(),
-            )
+    channel_id: Digest32,
+) -> Result<[u8; 16], AppError> {
+    match client.request(&Request::ArrivalHead { channel_id }).await? {
+        Frame::ArrivalHead { head } => Ok(head.instance),
+        Frame::Error { reason } => Err(AppError::Usage(reason)),
+        other => Err(crate::client::unexpected(&other)),
+    }
+}
+async fn footer_page(
+    client: &mut IpcClient,
+    channel_id: Digest32,
+    instance: [u8; 16],
+    entry: Digest32,
+    read_after: Option<Digest32>,
+    pulled_after: Option<u64>,
+) -> Result<vox_core::node::api::MessageFooter, AppError> {
+    match client
+        .request(&Request::Footers {
+            channel_id,
+            instance,
+            limit: 64,
+            entries: vec![vox_core::node::api::FooterSelection {
+                entry,
+                read_after,
+                pulled_after,
+            }],
         })
-        .unwrap_or_default()
+        .await?
+    {
+        Frame::Footers {
+            instance: actual,
+            mut rows,
+        } if actual == instance && rows.len() == 1 && rows[0].entry == entry => Ok(rows.remove(0)),
+        Frame::Error { reason } => Err(AppError::Usage(reason)),
+        other => Err(crate::client::unexpected(&other)),
+    }
+}
+/// First footer pages for one displayed chunk. Remote authors cannot have own-message
+/// footers and incur neither footer IPC nor temporary files.
+async fn footer_first(
+    client: &mut IpcClient,
+    channel_id: Digest32,
+    instance: [u8; 16],
+    shown: impl Iterator<Item = (Digest32, Digest32)>,
+) -> Result<std::collections::BTreeMap<Digest32, vox_core::node::api::MessageFooter>, AppError> {
+    let me = client.me();
+    let entries: Vec<_> = shown
+        .filter(|(_, author)| Some(*author) == me)
+        .map(|(entry, _)| vox_core::node::api::FooterSelection {
+            entry,
+            read_after: None,
+            pulled_after: None,
+        })
+        .collect();
+    if entries.is_empty() {
+        return Ok(Default::default());
+    }
+    match client
+        .request(&Request::Footers {
+            channel_id,
+            instance,
+            entries: entries.clone(),
+            limit: 8,
+        })
+        .await?
+    {
+        Frame::Footers {
+            instance: actual,
+            rows,
+        } if actual == instance
+            && rows.len() == entries.len()
+            && rows
+                .iter()
+                .zip(&entries)
+                .all(|(row, selected)| row.entry == selected.entry) =>
+        {
+            Ok(rows.into_iter().map(|row| (row.entry, row)).collect())
+        }
+        Frame::Error { reason } => Err(AppError::Usage(reason)),
+        other => Err(crate::client::unexpected(&other)),
+    }
+}
+fn footer_fields(row: &mut serde_json::Value, page: &vox_core::node::api::MessageFooter) {
+    for (key, members) in [("read_by", &page.read_by), ("pulled_by", &page.pulled_by)] {
+        if !members.is_empty() {
+            let mut names: Vec<_> = members.iter().map(crate::ident::name_of).collect();
+            names.sort();
+            row[key] = names.into();
+        }
+    }
+}
+
+/// Stream complete recipient arrays into anonymous per-row files before exposing a JSON line.
+/// Neither the CLI nor the daemon retains a share's lifetime recipient set in RAM.
+async fn footer_spools(
+    client: &mut IpcClient,
+    room: Digest32,
+    instance: [u8; 16],
+    first: vox_core::node::api::MessageFooter,
+) -> Result<(std::fs::File, std::fs::File), AppError> {
+    use std::io::{Seek, SeekFrom, Write};
+    let mut readers = tempfile::tempfile()?;
+    let mut pullers = tempfile::tempfile()?;
+    readers.write_all(b"[")?;
+    pullers.write_all(b"[")?;
+    let (mut read_after, mut pulled_after) = (None, None);
+    let (mut reads_done, mut pulls_done) = (false, false);
+    let (mut first_read, mut first_pull) = (true, true);
+    let entry = first.entry;
+    let mut page = first;
+    loop {
+        if !reads_done {
+            for member in page.read_by {
+                if !first_read {
+                    readers.write_all(b",")?;
+                }
+                first_read = false;
+                serde_json::to_writer(&mut readers, &crate::ident::name_of(&member))
+                    .map_err(|e| AppError::Usage(e.to_string()))?;
+            }
+            if page.read_after.is_some() && page.read_after == read_after {
+                return Err(AppError::Usage("reader cursor did not advance".into()));
+            }
+            read_after = page.read_after;
+            reads_done = read_after.is_none();
+        }
+        if !pulls_done {
+            for member in page.pulled_by {
+                if !first_pull {
+                    pullers.write_all(b",")?;
+                }
+                first_pull = false;
+                serde_json::to_writer(&mut pullers, &crate::ident::name_of(&member))
+                    .map_err(|e| AppError::Usage(e.to_string()))?;
+            }
+            if page.pulled_after.is_some() && page.pulled_after == pulled_after {
+                return Err(AppError::Usage(
+                    "completed-pull cursor did not advance".into(),
+                ));
+            }
+            pulled_after = page.pulled_after;
+            pulls_done = pulled_after.is_none();
+        }
+        if reads_done && pulls_done {
+            break;
+        }
+        page = footer_page(client, room, instance, entry, read_after, pulled_after).await?;
+    }
+    readers.write_all(b"]")?;
+    pullers.write_all(b"]")?;
+    readers.seek(SeekFrom::Start(0))?;
+    pullers.seek(SeekFrom::Start(0))?;
+    Ok((readers, pullers))
 }
 
 /// What was done to `room` (its retention set, its name changed), in the room's order, each with
 /// the row it follows (ADR-028 R-1, R-7): from the node's view; none when it does not answer.
-async fn notices_in(
+async fn write_notices_after(
     client: &mut IpcClient,
-    room: &Digest32,
-) -> Vec<vox_core::node::channel::RoomNotice> {
-    let body = vox_core::node::snapshot::request_body();
-    let Ok(reply) = client.exchange(&body).await else {
-        return Vec::new();
-    };
-    let Ok(Some(snap)) = vox_core::node::snapshot::NodeSnapshot::from_bytes(&reply) else {
-        return Vec::new();
-    };
-    snap.open
-        .into_iter()
-        .find(|o| o.channel_id == *room)
-        .map(|o| o.notices)
-        .unwrap_or_default()
+    room: Digest32,
+    room_key: &str,
+    entry: Option<Digest32>,
+    revision: &mut Option<u64>,
+    out: &mut impl std::io::Write,
+) -> Result<(), AppError> {
+    use vox_core::node::api::{GovernancePage, GovernanceQuery};
+    let mut after = None;
+    loop {
+        match client
+            .request(&Request::GovernancePage {
+                channel_id: room,
+                query: GovernanceQuery::NoticesAfter {
+                    entry,
+                    after,
+                    revision: *revision,
+                },
+            })
+            .await?
+        {
+            Frame::GovernancePage {
+                page:
+                    GovernancePage::NoticesAfter {
+                        rows,
+                        next,
+                        revision: current,
+                    },
+            } => {
+                *revision = Some(current);
+                for notice in rows {
+                    writeln!(out, "{}", notice_value(room_key, &notice)).map_err(AppError::Io)?;
+                }
+                match next {
+                    Some(next) => after = Some(next),
+                    None => return Ok(()),
+                }
+            }
+            Frame::Error { reason } => return Err(AppError::Usage(reason)),
+            other => return Err(crate::client::unexpected(&other)),
+        }
+    }
 }
 
 /// A notice as `vox room read --json` gives it, among the rows: its own schema, so a program that
@@ -1595,9 +1734,23 @@ async fn rows_of(
                 vox_core::node::ipc::Frame::RoomPage { rows, older } => {
                     if let Some(first) = rows.first().filter(|_| older > 0) {
                         eprintln!(
-                            "{older} older messages not shown: vox room read {} --before {}",
-                            id(&channel_id),
-                            id(&first.entry_hash)
+                            "{older} older messages not shown: {}",
+                            vox_text::shell::node_command(
+                                &[
+                                    "vox",
+                                    "room",
+                                    "read",
+                                    &id(&channel_id),
+                                    "--before",
+                                    &id(&first.entry_hash)
+                                ],
+                                client
+                                    .node_name()
+                                    .ok_or_else(|| AppError::Usage(
+                                        "the room reader has no acting node".into()
+                                    ))?
+                                    .as_str()
+                            )
                         );
                     }
                     Ok(Some(rows))
@@ -1618,9 +1771,23 @@ async fn rows_of(
             .and_then(|r| r.last())
         {
             eprintln!(
-                "For the next page: vox room read {} --since {}",
-                id(&channel_id),
-                id(&last.entry_hash)
+                "For the next page: {}",
+                vox_text::shell::node_command(
+                    &[
+                        "vox",
+                        "room",
+                        "read",
+                        &id(&channel_id),
+                        "--since",
+                        &id(&last.entry_hash)
+                    ],
+                    client
+                        .node_name()
+                        .ok_or_else(|| AppError::Usage(
+                            "the room reader has no acting node".into()
+                        ))?
+                        .as_str()
+                )
             );
         }
         return Ok(rows);
@@ -1706,6 +1873,7 @@ pub async fn read(
     tagged: &Tagged,
 ) -> Result<(), AppError> {
     let (mut client, channel_id, room_key) = open_room(paths, room).await?;
+    let footer_instance = footer_instance(&mut client, channel_id).await?;
     let since = match since {
         None => None,
         Some(s) => Some(parse_cursor(s)?),
@@ -1735,7 +1903,6 @@ pub async fn read(
             )));
         };
         let held_back = equivocations_in(paths, &channel_id).await;
-        let (_, pulled_by) = own_in(&mut client, &channel_id).await;
         let mut out = std::io::stdout().lock();
         // **A member held back for equivocating is said first** (V210-63), named as the rows
         // below name it. `vox status --json` carries the same, in full, for agents.
@@ -1752,16 +1919,73 @@ pub async fn read(
         // room's conversation (ADR-029 CL-2): `vox room sessions` lists Sessions; `--json` keeps
         // every row for programs.
         let names = names_in(&mut client).await;
-        for r in rows
+        let mut selected = rows
             .iter()
             .filter(|r| r.late || !only_late)
             .filter(|r| !crate::agent_hook::is_session_record(r))
-            .take(take)
-        {
-            let _ = writeln!(out, "{}", names.readable_in(&plain_row(r)));
-            // Under a share this node sent, who has pulled it whole (ADR-028 F-7).
-            if let Some(line) = pulled_by.get(&r.entry_hash).and_then(|w| pulled_by_line(w)) {
-                let _ = writeln!(out, "  {line}");
+            .take(take);
+        loop {
+            let chunk: Vec<_> = selected.by_ref().take(128).collect();
+            if chunk.is_empty() {
+                break;
+            }
+            let mut footers = footer_first(
+                &mut client,
+                channel_id,
+                footer_instance,
+                chunk.iter().map(|row| (row.entry_hash, row.author)),
+            )
+            .await?;
+            for r in chunk {
+                let text = plain_row(r);
+                let mut selected_names = names.clone();
+                for (room, host, selector) in vox_core::node::resolver::canonical_services(&text) {
+                    match client
+                        .request(&Request::GovernancePage {
+                            channel_id: room,
+                            query: vox_core::node::api::GovernanceQuery::Service { host, selector },
+                        })
+                        .await?
+                    {
+                        Frame::GovernancePage {
+                            page:
+                                vox_core::node::api::GovernancePage::Service {
+                                    share: Some(share), ..
+                                },
+                        } => selected_names.add_share(room, share.host, &share.name, share.udp),
+                        Frame::GovernancePage {
+                            page: vox_core::node::api::GovernancePage::Service { share: None, .. },
+                        } => {}
+                        Frame::Error { reason } => return Err(AppError::Usage(reason)),
+                        other => return Err(crate::client::unexpected(&other)),
+                    }
+                }
+                let _ = writeln!(out, "{}", selected_names.readable_in(&text));
+                // Under a share this node sent, who has pulled it whole (ADR-028 F-7).
+                if let Some(mut page) = footers.remove(&r.entry_hash) {
+                    loop {
+                        if let Some(line) = pulled_by_line(&page.pulled_by) {
+                            let _ = writeln!(out, "  {line}");
+                        }
+                        let Some(after) = page.pulled_after else {
+                            break;
+                        };
+                        page = footer_page(
+                            &mut client,
+                            channel_id,
+                            footer_instance,
+                            r.entry_hash,
+                            None,
+                            Some(after),
+                        )
+                        .await?;
+                        if page.pulled_after == Some(after) {
+                            return Err(AppError::Usage(
+                                "completed-pull cursor did not advance".into(),
+                            ));
+                        }
+                    }
+                }
             }
         }
         return Ok(());
@@ -1806,38 +2030,71 @@ pub async fn read(
     ids.dedup();
     let group = coord::structured(&mut client, channel_id, &[], &ids).await?;
     let ops = coord::index_of(&coord::posted_of(&group));
-    let (read_by, pulled_by) = own_in(&mut client, &channel_id).await;
     // Asked for (`--notices`), what was done to the room, each right after the row it follows in
     // the room's order (a notice before every row only when reading from the start; one after a
     // row not read here is not this page's).
-    let notices = if with_notices {
-        notices_in(&mut client, &channel_id).await
-    } else {
-        Vec::new()
-    };
+    let mut notice_revision = None;
     let mut out = std::io::stdout().lock();
-    if since.is_none() {
-        for n in notices.iter().filter(|n| n.after.is_none()) {
-            let _ = writeln!(out, "{}", notice_value(&room_key, n));
-        }
+    if with_notices && since.is_none() {
+        write_notices_after(
+            &mut client,
+            channel_id,
+            &room_key,
+            None,
+            &mut notice_revision,
+            &mut out,
+        )
+        .await?;
     }
-    for r in &shown {
-        let mut row = row_value(&room_key, r, &ops, None);
-        // Under a share this node sent, who has pulled it whole (ADR-028 F-7).
-        if let Some(who) = pulled_by.get(&r.entry_hash) {
-            let mut names: Vec<String> = who.iter().map(crate::ident::name_of).collect();
-            names.sort();
-            row["pulled_by"] = names.into();
-        }
-        // Under a message this node sent, who has read it, by this node's names (ADR-028 R-6).
-        if let Some(who) = read_by.get(&r.entry_hash) {
-            let mut names: Vec<String> = who.iter().map(crate::ident::name_of).collect();
-            names.sort();
-            row["read_by"] = names.into();
-        }
-        let _ = writeln!(out, "{row}");
-        for n in notices.iter().filter(|n| n.after == Some(r.entry_hash)) {
-            let _ = writeln!(out, "{}", notice_value(&room_key, n));
+    for chunk in shown.chunks(128) {
+        let mut footers = footer_first(
+            &mut client,
+            channel_id,
+            footer_instance,
+            chunk.iter().map(|row| (row.entry_hash, row.author)),
+        )
+        .await?;
+        for r in chunk {
+            let mut row = row_value(&room_key, r, &ops, None);
+            let first = footers.remove(&r.entry_hash);
+            if let Some(page) = first.filter(|page| page.present) {
+                if page.read_after.is_none() && page.pulled_after.is_none() {
+                    footer_fields(&mut row, &page);
+                    writeln!(out, "{row}")?;
+                } else {
+                    let (mut readers, mut pullers) =
+                        footer_spools(&mut client, channel_id, footer_instance, page).await?;
+                    // Complete arrays are disk-spooled first; no IPC call can split this output line.
+                    if let Some(object) = row.as_object_mut() {
+                        object.remove("read_by");
+                        object.remove("pulled_by");
+                    }
+                    let text = row.to_string();
+                    write!(out, "{}", text.strip_suffix('}').unwrap_or(&text))?;
+                    if readers.metadata()?.len() > 2 {
+                        write!(out, ",\"read_by\":")?;
+                        std::io::copy(&mut readers, &mut out)?;
+                    }
+                    if pullers.metadata()?.len() > 2 {
+                        write!(out, ",\"pulled_by\":")?;
+                        std::io::copy(&mut pullers, &mut out)?;
+                    }
+                    writeln!(out, "}}")?;
+                }
+            } else {
+                writeln!(out, "{row}")?;
+            }
+            if with_notices && !r.owed {
+                write_notices_after(
+                    &mut client,
+                    channel_id,
+                    &room_key,
+                    Some(r.entry_hash),
+                    &mut notice_revision,
+                    &mut out,
+                )
+                .await?;
+            }
         }
     }
     Ok(())
@@ -1910,17 +2167,39 @@ async fn equivocations_in(paths: &Paths, room: &Digest32) -> Vec<(Digest32, u64)
 pub async fn order(paths: &Paths, room: &str) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
     let channel_id = room_of(&mut client, room).await?;
-    match client.request(&Request::Order { channel_id }).await {
-        Ok(Frame::Order { entries }) => {
-            let mut out = std::io::stdout().lock();
-            for (h, clock) in entries {
-                let _ = writeln!(out, "{} {clock}", id(&h));
+    let mut after = None;
+    let mut revision = None;
+    loop {
+        match client
+            .request(&Request::Order {
+                channel_id,
+                after,
+                revision,
+            })
+            .await
+        {
+            Ok(Frame::Order {
+                entries,
+                next,
+                revision: current,
+            }) => {
+                {
+                    let mut out = std::io::stdout().lock();
+                    for (h, clock) in entries {
+                        let _ = writeln!(out, "{} {clock}", id(&h));
+                    }
+                }
+                let Some(next) = next else { return Ok(()) };
+                if after.is_some_and(|prior| next <= prior) {
+                    return Err(AppError::Usage("room order page did not advance".into()));
+                }
+                after = Some(next);
+                revision = Some(current);
             }
-            Ok(())
+            Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
+            Ok(other) => return Err(crate::client::unexpected(&other)),
+            Err(e) => return Err(AppError::Usage(e.to_string())),
         }
-        Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
-        Ok(other) => Err(crate::client::unexpected(&other)),
-        Err(e) => Err(AppError::Usage(e.to_string())),
     }
 }
 
@@ -1977,7 +2256,9 @@ pub async fn sessions(paths: &Paths, room: &str, json: bool) -> Result<(), AppEr
     let mut client = attach(paths).await?;
     let channel_id = room_of(&mut client, room).await?;
     crate::ident::load_names(&mut client).await;
-    let rows = sessions_of(&mut client, channel_id).await?;
+    let stamp = vox_core::node::sessions::selection::revision(&mut client, channel_id)
+        .await
+        .map_err(AppError::Usage)?;
     let label = |s: &vox_core::node::sessions::SessionRow| {
         vox_agentcomms::envelope::session_label(
             &crate::ident::name_of(&s.node),
@@ -1985,58 +2266,73 @@ pub async fn sessions(paths: &Paths, room: &str, json: bool) -> Result<(), AppEr
             &s.id,
         )
     };
-    if json {
-        for s in &rows {
-            println!(
-                "{}",
-                serde_json::json!({
-                    "node": id(&s.node),
-                    "id": s.id,
-                    "name": s.name,
-                    "harness": s.harness,
-                    "label": label(s),
-                    "open": s.open,
-                    "opened_millis": s.opened_millis,
-                    "ended_millis": s.ended_millis,
-                    "can_drive": s.can_drive,
-                })
-            );
+    let mut any = false;
+    let mut ended_heading = false;
+    // Preserve the terminal's open-then-ended grouping with two bounded passes,
+    // rather than retaining every completed Session until the open list finishes.
+    for pass in 0..if json { 1 } else { 2 } {
+        let mut after = None;
+        loop {
+            let (rows, more) = match client.sessions_page(channel_id, after).await {
+                Ok(Frame::SessionsPage { sessions, more, .. }) => (sessions, more),
+                Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
+                Ok(other) => return Err(crate::client::unexpected(&other)),
+                Err(e) => return Err(AppError::Usage(e.to_string())),
+            };
+            if vox_core::node::sessions::selection::revision(&mut client, channel_id)
+                .await
+                .map_err(AppError::Usage)?
+                != stamp
+            {
+                return Err(AppError::Usage(
+                    "the room's Sessions changed while listing; run the command again".into(),
+                ));
+            }
+            let next = rows.last().map(|s| s.opening);
+            if more && (next.is_none() || next == after) {
+                return Err(AppError::Usage("the Session page did not advance".into()));
+            }
+            for s in rows {
+                any = true;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({"node":id(&s.node),"id":s.id,"name":s.name,"harness":s.harness,"label":label(&s),"open":s.open,"opened_millis":s.opened_millis,"ended_millis":s.ended_millis,"can_drive":s.can_drive})
+                    );
+                } else if pass == 0 && s.open {
+                    println!("open   {}", label(&s));
+                } else if pass == 1 && !s.open {
+                    if !ended_heading {
+                        println!("ended:");
+                        ended_heading = true;
+                    }
+                    println!("ended  {}", label(&s));
+                }
+            }
+            if !more {
+                break;
+            }
+            after = next;
         }
-        return Ok(());
     }
-    if rows.is_empty() {
+    if !json && !any {
         println!("(no Sessions in this room)");
-        return Ok(());
     }
-    for s in rows.iter().filter(|s| s.open) {
-        println!("open   {}", label(s));
-    }
-    // **An ended Session is set apart** (SE-5), kept as long as the room keeps messages.
-    let ended: Vec<_> = rows.iter().filter(|s| !s.open).collect();
-    if !ended.is_empty() {
-        println!("ended:");
-        for s in ended {
-            println!("ended  {}", label(s));
-        }
-    }
+
     Ok(())
 }
 
-/// `vox room tail` — every row after a cursor, then every row as it lands, **with no
-/// gap across a lag or a restart** (ADR-021 §7).
+/// `vox room tail` — every row after a cursor, then every readable arrival (ADR-021 §7).
+/// Capture the saved arrival position before subscribing and immediately catch up after
+/// registration. Events only wake that one cursor; late rows, repeated wakes and retention
+/// need neither a second delivery route nor a lifetime set of already printed hashes.
 ///
-/// How the gap is closed: subscribe **first**, then read from the cursor, then emit
-/// the read rows followed by the live ones, dropping any entry already emitted. A row
-/// that lands between the subscription and the read arrives twice and is emitted once;
-/// a row cannot land in neither. On `Lagged` — the node dropped events for this
-/// subscriber — re-read from the last emitted entry rather than trusting the stream.
+/// Duplicates across a restart are permitted and gaps are not: the caller persists its last
+/// entry hash after processing and resumes with `--since`. A removed room instance refuses
+/// explicitly rather than applying an old arrival position to a new room.
 ///
-/// Duplicates across a *restart* are permitted and gaps are not: the caller persists
-/// its cursor after processing, and resumes from it.
-///
-/// With `--json`, rows are `vox.room.row/1`, and an arrival that turns an operation
-/// into a conflict re-emits every earlier row of that operation with `conflict`, so a
-/// consumer learns of the change from the stream alone.
+/// With `--json`, rows are `vox.room.row/1`; a newly conflicting operation also re-emits its
+/// earlier rows with `conflict`, so the consumer learns of the change from the stream alone.
 ///
 /// # Errors
 /// If the node cannot be reached, the room is unknown, or the cursor is not in it.
@@ -2046,23 +2342,56 @@ pub async fn tail(
     since: Option<&str>,
     json: bool,
 ) -> Result<(), AppError> {
-    let (mut lookup, channel_id, room_key) = open_room(paths, room).await?;
-    let cursor = match since {
-        None => None,
-        Some(s) => Some(parse_cursor(s)?),
-    };
+    use vox_core::node::api::NodeEvent;
 
-    // Subscribe BEFORE reading. Subscribing is terminal for a connection, so the
-    // stream gets a connection of its own and `lookup` keeps answering reads.
+    let (mut lookup, channel_id, room_key) = open_room(paths, room).await?;
+    let mut cursor = tail_head(&mut lookup, channel_id).await?;
+    let mut shown = TailRows::default();
+    if let Some(since) = since {
+        let hash = parse_cursor(since)?;
+        let row = match lookup
+            .request(&Request::Find {
+                channel_id,
+                entries: vec![hash],
+            })
+            .await
+            .map_err(|e| AppError::Usage(e.to_string()))?
+        {
+            Frame::Rows { mut rows } if rows.len() == 1 && rows[0].entry_hash == hash => {
+                rows.remove(0)
+            }
+            Frame::Rows { .. } => {
+                return Err(AppError::Usage("cursor not in this room's timeline".into()))
+            }
+            Frame::Error { reason } => return Err(AppError::Usage(reason)),
+            other => return Err(crate::client::unexpected(&other)),
+        };
+        if row.owed || row.arrival == 0 {
+            return Err(AppError::Usage(
+                "cursor is not a readable arrival in this room".into(),
+            ));
+        }
+        if tail_head(&mut lookup, channel_id).await?.instance != cursor.instance {
+            return Err(AppError::Usage(
+                "the saved room changed while locating the cursor; run the command again".into(),
+            ));
+        }
+        cursor.arrival = row.arrival;
+        shown.last = Some(hash);
+    }
+
+    // Both connections are held as the same node. The head predates registration, and the
+    // first page below closes that gap even when no further event ever arrives.
     let mut stream = attach(paths).await?;
+    if lookup.me().is_none() || stream.me() != lookup.me() {
+        return Err(AppError::Usage(
+            "the attached node changed while starting this tail".into(),
+        ));
+    }
     stream
         .subscribe()
         .await
         .map_err(|e| AppError::Usage(e.to_string()))?;
-    // **Test-only: a pause between the subscription and the read** (V030-31, #368), read from
-    // `VOX_TEST_TAIL_HOLD_MS` in a build with the `test-knobs` feature; no shipped build reads it
-    // (V210-105). Rows posted in it land between the two steps every time, which is the moment
-    // the order exists for.
     #[cfg(feature = "test-knobs")]
     if let Some(ms) = std::env::var("VOX_TEST_TAIL_HOLD_MS")
         .ok()
@@ -2072,138 +2401,163 @@ pub async fn tail(
         tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
     }
 
-    // Start at the live edge, or stream the requested backlog one bounded page at a time.
-    let mut read_to = cursor;
-    if cursor.is_none() {
-        read_to = match lookup
-            .request(&Request::Count {
-                channel_id,
-                since: None,
-            })
-            .await
-            .map_err(|e| AppError::Usage(e.to_string()))?
-        {
-            Frame::Count { last, .. } => last,
-            other => return Err(crate::client::unexpected(&other)),
-        };
-    }
-    let mut shown = TailRows::default();
     let mut out = std::io::stdout().lock();
-    if cursor.is_some() {
+    loop {
         loop {
-            let rows = coord::read_upto(&mut lookup, channel_id, read_to, 200)
-                .await?
-                .ok_or_else(|| AppError::Usage("cursor not in this room's timeline".into()))?;
-            let Some(next) = rows.last().map(|r| r.entry_hash) else {
-                break;
+            let (rows, instance, next) = match lookup
+                .request(&Request::ArrivalPage {
+                    channel_id,
+                    after: cursor,
+                })
+                .await
+                .map_err(|e| tail_stopped(paths, room, shown.last, json, &e.to_string()))?
+            {
+                Frame::ArrivalPage {
+                    rows,
+                    instance,
+                    next,
+                } => (rows, instance, next),
+                Frame::Error { reason } => {
+                    return Err(tail_stopped(paths, room, shown.last, json, &reason))
+                }
+                other => return Err(crate::client::unexpected(&other)),
             };
-            if Some(next) == read_to {
-                return Err(AppError::Usage("the tail's page did not advance".into()));
+            if instance != cursor.instance {
+                return Err(AppError::Usage("the saved room changed; this tail stopped rather than applying its old cursor to the replacement room".into()));
             }
-            read_to = Some(next);
+            let mut last = cursor.arrival;
+            for row in &rows {
+                if row.owed || row.arrival <= last {
+                    return Err(AppError::Usage(
+                        "the tail's arrival page did not advance consistently".into(),
+                    ));
+                }
+                last = row.arrival;
+            }
+            if next.is_some_and(|n| {
+                n.instance != instance || n.arrival <= cursor.arrival || n.arrival < last
+            }) {
+                return Err(AppError::Usage(
+                    "the tail's arrival continuation did not advance consistently".into(),
+                ));
+            }
             for row in rows {
+                let arrival = row.arrival;
                 shown
-                    .deliver(&mut lookup, channel_id, &room_key, row, &mut out, json)
-                    .await?;
+                    .deliver(
+                        &mut lookup,
+                        channel_id,
+                        &room_key,
+                        cursor.instance,
+                        row,
+                        &mut out,
+                        json,
+                    )
+                    .await
+                    .map_err(|e| tail_stopped(paths, room, shown.last, json, &e.to_string()))?;
+                cursor.arrival = arrival;
+            }
+            if let Some(next) = next {
+                cursor = next;
+                tokio::task::yield_now().await;
+            } else {
+                break;
             }
         }
-    }
-
-    // **An event is a wake, never the data** (ADR-020 §6). Only this node's own posts
-    // arrive as `NewEntry`; an entry that arrives from another member by sync is
-    // announced as `Synced`, and one that becomes readable when a sender key arrives as
-    // `SenderKeyReceived` — neither carries the row. So on any of them, and on
-    // `Lagged`, the room is read from where this stream last read it, and whatever it has
-    // not emitted is emitted.
-    //
-    // **From where it last read, never the whole room** (V210-113): a whole re-read made
-    // every arriving message cost the room's history (one run: 122 re-reads of ~7.4 MB).
-    // It is complete because a node's timeline only grows at its end: an entry rendered
-    // late (its key arrived after it did) is appended when it is rendered, so it sits
-    // after every row any earlier read returned — though not necessarily after the last
-    // row *emitted*, which may be an own post that came as `NewEntry`; hence `read_to`.
-    // If retention removed the cursor, resume through the retained rows in bounded pages.
-    loop {
-        let reread = match stream.next().await {
-            Ok(Some(Frame::Event(vox_core::node::api::NodeEvent::NewEntry {
-                channel_id: c,
-                row,
-            }))) if c == channel_id => {
-                shown
-                    .deliver(&mut lookup, channel_id, &room_key, row, &mut out, json)
-                    .await?;
-                false
-            }
-            Ok(Some(Frame::Event(
-                vox_core::node::api::NodeEvent::Synced { channel_id: c, .. }
-                | vox_core::node::api::NodeEvent::SenderKeyReceived { channel_id: c, .. },
-            ))) => c == channel_id,
-            Ok(Some(Frame::Lagged { missed })) => {
-                eprintln!("vox: this stream fell behind by {missed} events; re-reading the room");
-                true
-            }
-            Ok(Some(_)) => false,
-            // **The node stopping is a failure, not the end of the room** (V210-83). It exited 0
-            // here, so a supervisor restarting a tail on failure never did, and a script read a
-            // stream that had silently stopped as one that had finished.
-            Ok(None) => {
-                return Err(AppError::Usage(match shown.last {
-                    Some(h) => format!(
-                        "the node stopped, so this tail stopped with it\n       start the node \
-                         again, then resume with `vox room tail {room} --since {}`",
-                        b32_encode(&h)
-                    ),
-                    None => format!(
-                        "the node stopped, so this tail stopped with it\n       start the node \
-                         again, then run `vox room tail {room}`"
-                    ),
-                }))
-            }
-            Err(e) => return Err(AppError::Usage(e.to_string())),
-        };
-        if reread {
-            loop {
-                let rows = match lookup
-                    .request(&Request::Read {
-                        channel_id,
-                        since: read_to,
-                        after: None,
-                        limit: 200,
-                    })
-                    .await
-                    .map_err(|e| AppError::Usage(e.to_string()))?
+        // The stream carries wakes only: never print its embedded NewEntry a second way.
+        loop {
+            match stream.next().await {
+                Ok(Some(Frame::Event(
+                    NodeEvent::NewEntry { channel_id: c, .. }
+                    | NodeEvent::Synced { channel_id: c, .. }
+                    | NodeEvent::SenderKeyReceived { channel_id: c, .. }
+                    | NodeEvent::ChannelOpened { channel_id: c },
+                ))) if c == channel_id => break,
+                Ok(Some(Frame::Event(NodeEvent::ChannelClosed { channel_id: c })))
+                    if c == channel_id =>
                 {
-                    Frame::Rows { rows } => rows,
-                    Frame::Error { .. } if read_to.is_some() => {
-                        read_to = None;
-                        continue;
-                    }
-                    other => return Err(crate::client::unexpected(&other)),
-                };
-                let Some(next) = rows.last().map(|r| r.entry_hash) else {
+                    return Err(tail_stopped(
+                        paths,
+                        room,
+                        shown.last,
+                        json,
+                        "the room closed on this node",
+                    ));
+                }
+                Ok(Some(Frame::Event(NodeEvent::RoomRemoved { channel_id: c })))
+                    if c == channel_id =>
+                {
+                    return Err(AppError::Usage(
+                        "the room was removed from this node, so this tail stopped".into(),
+                    ));
+                }
+                Ok(Some(Frame::Lagged { missed })) => {
+                    eprintln!("vox: this stream fell behind by {missed} events; resuming its saved arrival cursor");
                     break;
-                };
-                if Some(next) == read_to {
-                    return Err(AppError::Usage("the tail's page did not advance".into()));
                 }
-                read_to = Some(next);
-                for row in rows {
-                    shown
-                        .deliver(&mut lookup, channel_id, &room_key, row, &mut out, json)
-                        .await?;
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return Err(tail_stopped(
+                        paths,
+                        room,
+                        shown.last,
+                        json,
+                        "the node stopped",
+                    ))
                 }
+                Err(e) => return Err(tail_stopped(paths, room, shown.last, json, &e.to_string())),
             }
         }
     }
 }
 
-/// A tail retains its output's identities and operation context, never the room's prose history.
+async fn tail_head(
+    lookup: &mut IpcClient,
+    channel_id: Digest32,
+) -> Result<vox_core::node::api::HistoryCursor, AppError> {
+    match lookup
+        .request(&Request::ArrivalHead { channel_id })
+        .await
+        .map_err(|e| AppError::Usage(e.to_string()))?
+    {
+        Frame::ArrivalHead { head } => Ok(head),
+        Frame::Error { reason } => Err(AppError::Usage(reason)),
+        other => Err(crate::client::unexpected(&other)),
+    }
+}
+
+fn tail_stopped(
+    paths: &Paths,
+    room: &str,
+    last: Option<Digest32>,
+    json: bool,
+    reason: &str,
+) -> AppError {
+    let node = paths
+        .profile_dir
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy();
+    let mut words = vec![
+        "vox".to_owned(),
+        "room".to_owned(),
+        "tail".to_owned(),
+        room.to_owned(),
+    ];
+    if let Some(hash) = last {
+        words.extend(["--since".to_owned(), b32_encode(&hash)]);
+    }
+    if json {
+        words.push("--json".to_owned());
+    }
+    let resume = vox_text::shell::node_command(&words, &node);
+    AppError::Usage(format!("{reason}, so this tail stopped\n       restore the node and room, then resume with `{resume}`"))
+}
+
+/// Only a resume hint survives delivery. Operation context is bounded and scoped to one
+/// arriving row, then dropped; unchanged event wakes never query that context again.
 #[derive(Default)]
 struct TailRows {
-    ops: vox_agentcomms::ops::OpIndex,
-    seen: std::collections::HashSet<Digest32>,
-    loaded: std::collections::HashSet<String>,
-    by_hash: std::collections::HashMap<Digest32, vox_core::node::api::MessageRow>,
     last: Option<Digest32>,
 }
 
@@ -2214,80 +2568,249 @@ impl TailRows {
         lookup: &mut IpcClient,
         channel_id: Digest32,
         room_key: &str,
+        instance: [u8; 16],
         row: vox_core::node::api::MessageRow,
         out: &mut std::io::StdoutLock<'_>,
         json: bool,
     ) -> Result<(), AppError> {
-        if row.owed || !self.seen.insert(row.entry_hash) {
-            return Ok(());
+        if row.owed {
+            return Err(AppError::Usage(
+                "the tail received an unreadable arrival".into(),
+            ));
         }
-        let parsed = Envelope::parse(&row.text).ok();
-        let mut newly_conflicted = false;
-        if let Some(envelope) = &parsed {
-            if let Some(op) = vox_agentcomms::ops::op_of(envelope) {
-                if self.loaded.insert(op.to_owned()) {
-                    // Only rows relevant to this operation are needed to label it or a conflict.
-                    for earlier in
-                        coord::structured(lookup, channel_id, &[], &[op.to_owned()]).await?
-                    {
-                        if let Ok(e) = Envelope::parse(&earlier.text) {
-                            if vox_agentcomms::ops::op_of(&e) == Some(op) {
-                                self.ops.insert(
-                                    earlier.entry_hash,
-                                    earlier.author,
-                                    earlier.created_millis,
-                                    &e,
-                                );
-                                self.by_hash.insert(earlier.entry_hash, earlier);
-                            }
-                        }
-                    }
-                }
-                newly_conflicted =
-                    self.ops
-                        .insert(row.entry_hash, row.author, row.created_millis, envelope);
-                self.by_hash.insert(row.entry_hash, row.clone());
+        if !json {
+            // Session lifecycle records remain absent from the plain conversation.
+            if !crate::agent_hook::is_session_record(&row) {
+                writeln!(out, "{}", plain_row(&row))?;
+                out.flush()?;
             }
-        }
-        emit_row(out, room_key, &row, &self.ops, json, None);
-        if newly_conflicted && json {
-            if let Some(e) = &parsed {
-                for earlier in self.ops.group_of(row.author, e) {
-                    if earlier == row.entry_hash {
-                        continue;
-                    }
-                    if let Some(earlier) = self.by_hash.get(&earlier) {
-                        emit_row(out, room_key, earlier, &self.ops, json, Some("conflict"));
-                    }
-                }
-            }
+        } else if let Some(envelope) = Envelope::parse(&row.text)
+            .ok()
+            .filter(|e| vox_agentcomms::ops::op_of(e).is_some())
+        {
+            let mut operation =
+                TailOperation::load(lookup, channel_id, room_key, instance, &row, &envelope)
+                    .await?;
+            operation.emit(room_key, &row, out)?;
+        } else {
+            writeln!(
+                out,
+                "{}",
+                row_json(room_key, &row, &vox_agentcomms::ops::OpIndex::new(), None)
+            )?;
+            out.flush()?;
         }
         self.last = Some(row.entry_hash);
         Ok(())
     }
 }
 
-fn emit_row(
-    out: &mut std::io::StdoutLock<'_>,
-    room_key: &str,
-    r: &vox_core::node::api::MessageRow,
-    ops: &vox_agentcomms::ops::OpIndex,
-    json: bool,
-    status: Option<&str>,
-) {
-    // A Session's opening and end are not the room's conversation (ADR-029 CL-2), as in `vox
-    // room read`: a rename re-posts the record, which printed here read as a second "opened".
-    // `--json` keeps every row for programs.
-    if !json && crate::agent_hook::is_session_record(r) {
-        return;
+/// One exact operation's completed disk staging. Only one bounded row page and scalar
+/// verdict are resident. The canonical group is read once, then replayed for conflict rows;
+/// no network request or normal revision failure can occur inside an output JSON line.
+struct TailOperation {
+    op: String,
+    group: std::fs::File,
+    prior: std::fs::File,
+    first: Option<Digest32>,
+    conflict: bool,
+    new_conflict: bool,
+}
+
+impl TailOperation {
+    async fn load(
+        lookup: &mut IpcClient,
+        room: Digest32,
+        room_key: &str,
+        instance: [u8; 16],
+        row: &vox_core::node::api::MessageRow,
+        envelope: &Envelope,
+    ) -> Result<Self, AppError> {
+        let through = tail_head(lookup, room).await?;
+        if through.instance != instance || through.arrival < row.arrival {
+            return Err(AppError::Usage("the saved room changed during tail operation lookup; retry from the last completed row".into()));
+        }
+        let mut result = Self {
+            op: vox_agentcomms::ops::op_of(envelope)
+                .unwrap_or_default()
+                .to_owned(),
+            group: tempfile::tempfile()?,
+            prior: tempfile::tempfile()?,
+            first: None,
+            conflict: false,
+            new_conflict: false,
+        };
+        write!(result.group, "[")?;
+        let mut revision = None;
+        let mut conflict_at = None;
+        let mut after = None;
+        let mut found = false;
+        let mut comma = false;
+        loop {
+            let (rows, next, current, conflict) = match lookup
+                .request(&Request::OperationPage {
+                    channel_id: room,
+                    author: row.author,
+                    op: result.op.clone(),
+                    through,
+                    after,
+                    revision,
+                })
+                .await
+                .map_err(|e| AppError::Usage(e.to_string()))?
+            {
+                Frame::OperationPage {
+                    rows,
+                    next,
+                    revision,
+                    conflict_at,
+                } => (rows, next, revision, conflict_at),
+                Frame::Error { reason } => return Err(AppError::Usage(reason)),
+                other => return Err(crate::client::unexpected(&other)),
+            };
+            if revision.is_some_and(|old| old != current)
+                || (revision.is_some() && conflict != conflict_at)
+                || conflict.is_some_and(|arrival| arrival > through.arrival)
+            {
+                return Err(AppError::Usage(
+                    "the selected operation changed; retry from the last completed row".into(),
+                ));
+            }
+            revision = Some(current);
+            conflict_at = conflict;
+            let mut last = after;
+            for member in rows {
+                let key = (member.created_millis, member.entry_hash);
+                if member.owed
+                    || member.author != row.author
+                    || member.arrival > through.arrival
+                    || last.is_some_and(|last| key <= last)
+                {
+                    return Err(AppError::Usage(
+                        "the operation page did not advance consistently".into(),
+                    ));
+                }
+                let env = Envelope::parse(&member.text)
+                    .map_err(|_| AppError::Usage("invalid operation row".into()))?;
+                if vox_agentcomms::ops::op_of(&env) != Some(result.op.as_str()) {
+                    return Err(AppError::Usage(
+                        "the operation page changed identity".into(),
+                    ));
+                }
+                last = Some(key);
+                result.first.get_or_insert(member.entry_hash);
+                found |= member.entry_hash == row.entry_hash;
+                if comma {
+                    write!(result.group, ",")?;
+                }
+                write!(result.group, "\"{}\"", b32_encode(&member.entry_hash))?;
+                comma = true;
+                if conflict == Some(row.arrival) && member.arrival < row.arrival {
+                    // Each staged prefix has one bounded message body, never the N-member group.
+                    writeln!(result.prior, "{}", tail_row_prefix(room_key, &member)?)?;
+                }
+            }
+            if next.is_some_and(|next| {
+                after.is_some_and(|after| next <= after) || last.is_some_and(|last| next < last)
+            }) {
+                return Err(AppError::Usage(
+                    "the operation continuation did not advance consistently".into(),
+                ));
+            }
+            match next {
+                Some(next) => after = Some(next),
+                None => break,
+            }
+        }
+        if !found {
+            return Err(AppError::Usage(
+                "the arriving operation is no longer readable; retry from the last completed row"
+                    .into(),
+            ));
+        }
+        write!(result.group, "]")?;
+        result.group.flush()?;
+        result.prior.flush()?;
+        result.conflict = conflict_at.is_some();
+        result.new_conflict = conflict_at == Some(row.arrival);
+        Ok(result)
     }
-    let line = if json {
-        row_json(room_key, r, ops, status)
-    } else {
-        plain_row(r)
-    };
-    let _ = writeln!(out, "{line}");
-    let _ = out.flush();
+
+    fn emit(
+        &mut self,
+        room_key: &str,
+        row: &vox_core::node::api::MessageRow,
+        out: &mut std::io::StdoutLock<'_>,
+    ) -> Result<(), AppError> {
+        use std::io::{BufRead as _, Seek as _};
+        if self.new_conflict {
+            self.prior.rewind()?;
+            let mut reader = std::io::BufReader::new(&mut self.prior);
+            let mut prefix = String::new();
+            while reader.read_line(&mut prefix)? != 0 {
+                // JSON escapes any newlines in the bounded message body. The final group
+                // array stays on disk and is never read into this String.
+                let prefix_without_newline = prefix.strip_suffix('\n').unwrap_or(&prefix);
+                emit_tail_operation(
+                    out,
+                    prefix_without_newline,
+                    &self.op,
+                    "conflict",
+                    &mut self.group,
+                )?;
+                prefix.clear();
+            }
+        }
+        let status = if self.conflict {
+            "conflict"
+        } else if self.first == Some(row.entry_hash) {
+            "ok"
+        } else {
+            "duplicate"
+        };
+        emit_tail_operation(
+            out,
+            &tail_row_prefix(room_key, row)?,
+            &self.op,
+            status,
+            &mut self.group,
+        )
+    }
+}
+
+fn tail_row_prefix(
+    room_key: &str,
+    row: &vox_core::node::api::MessageRow,
+) -> Result<String, AppError> {
+    let mut value = row_value(room_key, row, &vox_agentcomms::ops::OpIndex::new(), None);
+    value
+        .as_object_mut()
+        .ok_or_else(|| AppError::Usage("invalid tail row object".into()))?
+        .remove("op");
+    let mut prefix = value.to_string();
+    prefix.pop(); // row_value returns one JSON object; the caller supplies its final field.
+    Ok(prefix)
+}
+
+fn emit_tail_operation(
+    out: &mut std::io::StdoutLock<'_>,
+    prefix: &str,
+    op: &str,
+    status: &str,
+    group: &mut std::fs::File,
+) -> Result<(), AppError> {
+    use std::io::Seek as _;
+    group.rewind()?;
+    write!(
+        out,
+        "{prefix},\"op\":{{\"id\":{},\"status\":{},\"group\":",
+        serde_json::Value::String(op.into()),
+        serde_json::Value::String(status.into())
+    )?;
+    std::io::copy(group, out)?;
+    writeln!(out, "}}}}")?;
+    out.flush()?;
+    Ok(())
 }
 
 /// Parse a full entry hash, in the same base32 the first column prints.
@@ -2478,7 +3001,7 @@ async fn run_op(
     })
 }
 
-fn millis_as_time(ms: u64) -> String {
+pub(crate) fn millis_as_time(ms: u64) -> String {
     held_since(ms / 1_000)
 }
 
@@ -3095,7 +3618,7 @@ pub async fn service_add(
             );
             if reach.is_empty() {
                 println!(
-                    "     it is dark until you `vox trust add` someone — and they join this room"
+                    "     it is dark until you trust a member from the room's trust offers — and they join this room"
                 );
             } else {
                 println!("     {} can reach it now", listed(&reach, ""));
@@ -3173,31 +3696,53 @@ pub async fn service_remove(paths: &Paths, room: &str, tag: &str) -> Result<(), 
 pub async fn service_list(paths: &Paths, room: &str, json: bool) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
     let channel_id = room_of(&mut client, room).await?;
-    match client.request(&Request::Services { channel_id }).await {
-        Ok(Frame::Services {
-            room,
-            services,
-            shared,
-        }) => {
-            // Whether the `.vox` proxy runs, for the needs of ssh by address and of a URL.
-            let proxy = match crate::client::one_shot(paths) {
-                Ok(at) => vox_core::node::nameipc::proxy(&at)
-                    .await
-                    .map_err(|e| match e {
-                        vox_core::error::Error::AppRefused(reason) => reason,
-                        other => other.to_string(),
-                    }),
-                Err(e) => Err(e.to_string()),
-            };
-            crate::tunnel_cli::print_services(&room, &channel_id, &services, &shared, &proxy, json);
-            Ok(())
+    let proxy = match crate::client::one_shot(paths) {
+        Ok(at) => vox_core::node::nameipc::proxy(&at)
+            .await
+            .map_err(|e| e.to_string()),
+        Err(e) => Err(e.to_string()),
+    };
+    let mut printer = crate::tunnel_cli::ServiceListPrinter::new(
+        channel_id,
+        proxy,
+        json,
+        crate::client::name_of(paths)?.to_string(),
+    );
+    let mut after = None;
+    let mut revision = None;
+    loop {
+        match client
+            .request(&Request::Services {
+                channel_id,
+                after,
+                revision,
+            })
+            .await?
+        {
+            Frame::Services {
+                room,
+                services,
+                shared,
+                next,
+                revision: current,
+            } => {
+                printer.page(&room, &services, &shared);
+                revision = Some(current);
+                match next {
+                    Some(next) => after = Some(next),
+                    None => {
+                        printer.finish();
+                        return Ok(());
+                    }
+                }
+            }
+            Frame::Error { reason } => {
+                return Err(AppError::Usage(format!(
+                    "cannot list that room's services: {reason}"
+                )))
+            }
+            other => return Err(crate::client::unexpected(&other)),
         }
-        // The node's reason, as `vox service list` without a daemon gives it.
-        Ok(Frame::Error { reason }) => Err(AppError::Usage(format!(
-            "cannot list that room's services: {reason}"
-        ))),
-        Ok(other) => Err(crate::client::unexpected(&other)),
-        Err(e) => Err(AppError::Usage(e.to_string())),
     }
 }
 
@@ -3402,148 +3947,215 @@ pub async fn board(
     json: bool,
     session: Option<&str>,
 ) -> Result<(), AppError> {
+    use vox_core::node::work_board::{Row, Section};
     let (mut client, cid, room_key) = open_room(paths, room).await?;
-    let snap = coord::snapshot(&mut client, cid).await?;
-    // The board's position is the whole room's: its row count and newest row, which the node
-    // counts rather than this reading every row (V210-120).
-    let (entries, last) = if json {
-        match client
-            .request(&vox_core::node::ipc::Request::Count {
-                channel_id: cid,
-                since: None,
-            })
-            .await
-            .map_err(|e| AppError::Usage(e.to_string()))?
-        {
-            vox_core::node::ipc::Frame::Count { n, last } => (n, last),
-            vox_core::node::ipc::Frame::Error { reason } => return Err(AppError::Usage(reason)),
-            other => return Err(crate::client::unexpected(&other)),
-        }
-    } else {
-        (0, None)
-    };
     let session = coord::session(session).unwrap_or_default();
+    let first = board_page(&mut client, cid, Section::Claims, None).await?;
     let me = Owner {
-        author: snap.me,
+        author: first.me,
         session: session.clone(),
     };
-
-    if json {
-        let resources: Vec<serde_json::Value> = snap
-            .fold
-            .resources
-            .iter()
-            .map(|(r, s)| state_json(r, s, &me))
-            .collect();
-        let by_hash: std::collections::BTreeMap<[u8; 32], &Posted> =
-            snap.posted.iter().map(|p| (p.entry_hash, p)).collect();
-        let violations: Vec<serde_json::Value> = snap
-            .fold
-            .outcomes
-            .iter()
-            .filter(|(_, o)| !matches!(o, Outcome::Applied | Outcome::Lost))
-            .map(|(h, o)| {
-                let p = by_hash.get(h);
-                serde_json::json!({
-                    "entry_hash": claim::b32(h),
-                    "author": p.map(|p| claim::b32(&p.author)),
-                    "session": p.map(|p| p.envelope.from.clone()),
-                    "type": p.map(|p| p.envelope.kind.clone()),
-                    "outcome": outcome_json(Some(o)),
-                })
-            })
-            .collect();
-        let participants: Vec<serde_json::Value> = snap
-            .table
-            .participants
-            .iter()
-            .map(|p| {
-                serde_json::json!({
-                    "author": claim::b32(&p.author),
-                    "session": p.session,
-                    "stamp": p.stamp.token(),
-                    "version": p.stamp.carried(&snap.table.mine),
-                    "last_millis": p.last_millis,
-                    "entry_hash": claim::b32(&p.entry_hash),
-                })
-            })
-            .collect();
-        println!(
-            "{}",
-            serde_json::json!({
-                "schema": "vox.room.board/1",
-                "room": room_key,
-                "me": { "author": claim::b32(&snap.me), "session": session },
-                "version": coord::VERSION,
-                "coordination": if snap.table.refused() { "refused" } else { "ok" },
-                "participants": participants,
-                "resources": resources,
-                "violations": violations,
-                "position": {
-                    // A cursor, so never a message not received yet (V030-10): the node's
-                    // `last` is the row that arrived last.
-                    "entries": entries,
-                    "last": last.map(|h| claim::b32(&h)),
-                },
-                "now_millis": snap.now_millis,
-            })
-        );
-        return Ok(());
-    }
-
+    let anchor = first.cursor.clone();
     let mut out = std::io::stdout().lock();
-    if snap.table.refused() {
-        writeln!(out, "{}", coord::refusal(&room_key, &snap.table)).map_err(AppError::Io)?;
+    if json {
+        let mut header = serde_json::json!({
+            "schema": "vox.room.board/1", "room": room_key,
+            "me": {"author": claim::b32(&me.author), "session": session},
+            "version": first.version,
+            "coordination": if first.refused { "refused" } else { "ok" },
+            "position": {"entries": first.entries, "last": first.last.as_ref().map(claim::b32)},
+            "now_millis": first.cursor.now_millis,
+        })
+        .to_string();
+        header.pop();
+        write!(out, "{header}")?;
     }
-    if snap.fold.resources.is_empty() {
-        writeln!(out, "nothing is claimed").map_err(AppError::Io)?;
-    }
-    for (resource, s) in &snap.fold.resources {
-        let line = match s {
-            State::Held {
-                owner,
-                expires_millis,
-                ..
-            } => {
-                let mine = if *owner == me { " (you)" } else { "" };
-                let expiry = match expires_millis {
-                    // Time remaining, not an absolute time: "in 240s" is actionable.
-                    Some(e) if *e > snap.now_millis => {
-                        format!(" expires in {}s", (e - snap.now_millis).div_ceil(1_000))
-                    }
-                    Some(_) => " expired".to_owned(),
-                    None => String::new(),
-                };
-                format!("{}\t{}{mine}{expiry}", name(resource), who(owner))
-            }
-            State::Pending {
-                from,
-                to_fp,
-                to_session,
-                deadline_millis,
-                ..
-            } => format!(
-                "{}\tpending handoff from {} to {}{}{} (lapses in {}s)",
-                name(resource),
-                who(from),
-                &crate::ident::name_of(to_fp),
-                to_session
-                    .as_ref()
-                    .map(|s| format!("/{}", session_name(s)))
-                    .unwrap_or_default(),
-                if s.is_eligible(&me) {
-                    " — you may claim or decline it"
-                } else {
-                    ""
-                },
-                deadline_millis
-                    .saturating_sub(snap.now_millis)
-                    .div_ceil(1_000)
-            ),
+    let mut first_page = Some(first);
+    for (section, field) in [
+        (Section::Claims, "resources"),
+        (Section::Participants, "participants"),
+        (Section::Violations, "violations"),
+        (Section::Work, "work"),
+    ] {
+        if !json && section == Section::Violations {
+            continue;
+        }
+        if json {
+            write!(out, ",\"{field}\":[")?;
+        }
+        let mut cursor = anchor.clone();
+        cursor.section = section;
+        let mut page = match first_page.take() {
+            Some(page) => page,
+            None => board_page(&mut client, cid, section, Some(cursor)).await?,
         };
-        writeln!(out, "{line}").map_err(AppError::Io)?;
+        let mut count = 0usize;
+        loop {
+            for row in page.rows {
+                match row {
+                    Row::Claim { resource, state } => {
+                        if json {
+                            if count != 0 {
+                                write!(out, ",")?;
+                            }
+                            write!(out, "{}", state_json(&resource, &state, &me))?;
+                        } else {
+                            let line = match &state {
+                                State::Held {
+                                    owner,
+                                    expires_millis,
+                                    ..
+                                } => {
+                                    let mine = if *owner == me { " (you)" } else { "" };
+                                    let expiry = expires_millis
+                                        .map(|e| {
+                                            format!(
+                                                " expires in {}s",
+                                                e.saturating_sub(anchor.now_millis).div_ceil(1_000)
+                                            )
+                                        })
+                                        .unwrap_or_default();
+                                    format!("{}\t{}{mine}{expiry}", name(&resource), who(owner))
+                                }
+                                State::Pending {
+                                    from,
+                                    to_fp,
+                                    to_session,
+                                    deadline_millis,
+                                    ..
+                                } => format!(
+                                    "{}\tpending handoff from {} to {}{}{} (lapses in {}s)",
+                                    name(&resource),
+                                    who(from),
+                                    crate::ident::name_of(to_fp),
+                                    to_session
+                                        .as_ref()
+                                        .map(|s| format!("/{}", session_name(s)))
+                                        .unwrap_or_default(),
+                                    if state.is_eligible(&me) {
+                                        " — you may claim or decline it"
+                                    } else {
+                                        ""
+                                    },
+                                    deadline_millis
+                                        .saturating_sub(anchor.now_millis)
+                                        .div_ceil(1_000)
+                                ),
+                            };
+                            writeln!(out, "{line}")?;
+                        }
+                        count += 1;
+                    }
+                    Row::Participant(p) => {
+                        if json {
+                            if count != 0 {
+                                write!(out, ",")?;
+                            }
+                            write!(
+                                out,
+                                "{}",
+                                serde_json::json!({"author": claim::b32(&p.author), "session": p.session,
+                                "stamp": p.stamp.token(), "version": p.stamp.carried(&page.version),
+                                "last_millis": p.last_millis, "entry_hash": claim::b32(&p.entry_hash)})
+                            )?;
+                        } else if p.stamp != vox_agentcomms::version::Stamp::Match {
+                            writeln!(out, "work coordination refused: worker {} session {} runs vox {}; required {}",
+                                crate::ident::name_of(&p.author), session_name(&p.session), p.stamp.describe(&page.version), page.version)?;
+                        }
+                        count += 1;
+                    }
+                    Row::Violation { first, text, .. } => {
+                        if json {
+                            if first {
+                                if count != 0 {
+                                    write!(out, ",")?;
+                                }
+                                count += 1;
+                            }
+                            write!(out, "{text}")?;
+                        }
+                    }
+                    Row::Work(work) => {
+                        if json {
+                            if count != 0 {
+                                write!(out, ",")?;
+                            }
+                            write!(
+                                out,
+                                "{}",
+                                serde_json::json!({"member": claim::b32(&work.member), "session": work.session,
+                                "type": work.kind, "entry_hash": claim::b32(&work.entry), "author": claim::b32(&work.author),
+                                "from": work.from, "resource": work.resource, "tags": work.tags, "work": work.work, "body": work.body})
+                            )?;
+                        } else if !["claim", "handoff"].contains(&work.kind.as_str()) {
+                            writeln!(
+                                out,
+                                "{}\t{}{}: {} {} {}",
+                                work.kind,
+                                crate::ident::name_of(&work.member),
+                                if work.session.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!("/{}", session_name(&work.session))
+                                },
+                                vox_agentcomms::envelope::shown(&work.body, 512),
+                                name(&work.work),
+                                work.tags
+                                    .iter()
+                                    .map(|t| name(t))
+                                    .collect::<Vec<_>>()
+                                    .join(" ")
+                            )?;
+                        }
+                        count += 1;
+                    }
+                }
+            }
+            let Some(next) = page.next else {
+                break;
+            };
+            page = board_page(&mut client, cid, section, Some(next)).await?;
+        }
+        if json {
+            write!(out, "]")?;
+        } else if section == Section::Claims && count == 0 {
+            writeln!(out, "nothing is claimed")?;
+        }
+    }
+    if json {
+        writeln!(out, "}}")?;
     }
     Ok(())
+}
+
+async fn board_page(
+    client: &mut vox_core::node::ipc::IpcClient,
+    room: vox_core::hash::Digest32,
+    section: vox_core::node::work_board::Section,
+    after: Option<vox_core::node::work_board::Cursor>,
+) -> Result<vox_core::node::work_board::Page, AppError> {
+    use vox_core::node::{
+        ipc::{Frame, Request},
+        work_board::Query,
+    };
+    let query = serde_json::to_string(&Query {
+        section,
+        member: None,
+        after,
+    })
+    .map_err(|e| AppError::Usage(e.to_string()))?;
+    match client
+        .request(&Request::WorkBoard {
+            channel_id: room,
+            query,
+        })
+        .await
+        .map_err(|e| AppError::Usage(e.to_string()))?
+    {
+        Frame::WorkBoard { page } => serde_json::from_str(&page)
+            .map_err(|e| AppError::Usage(format!("invalid daemon work board: {e}"))),
+        other => Err(crate::client::unexpected(&other)),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3727,7 +4339,7 @@ pub async fn get_file(
     'pages: while offers.is_empty() {
         let which = vox_core::node::drive::SessionFilter::FilesOut;
         let (rows, older) = match client.session_page(channel_id, which, before).await {
-            Ok(Frame::SessionPage { rows, older }) => (rows, older),
+            Ok(Frame::SessionPage { rows, older, .. }) => (rows, older),
             Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
             Ok(other) => return Err(crate::client::unexpected(&other)),
             Err(error) => {
@@ -3790,8 +4402,11 @@ pub async fn get_file(
     }
     if offers.is_empty() {
         return Err(AppError::Usage(format!(
-            "no offer in this room matches {selector:?} — `vox room read` shows what was \
-             announced"
+            "no offer in this room matches {selector:?} — `{}` shows what was announced",
+            vox_text::shell::node_command(
+                &["vox", "room", "read", &id(&channel_id)],
+                crate::client::name_of(paths)?.as_str()
+            )
         )));
     }
 
@@ -3856,7 +4471,10 @@ pub async fn get_file(
             let _ = write!(
                 said,
                 "\n       the same file is also offered by {who}: `{}`",
-                vox_text::shell::command(&["vox", "room", "get", room, &o.tag])
+                vox_text::shell::node_command(
+                    &["vox", "room", "get", room, &o.tag],
+                    crate::client::name_of(paths)?.as_str()
+                )
             );
         } else {
             let _ = write!(
@@ -4097,13 +4715,10 @@ async fn collect_folder(
             d
         }
     };
-    let (target, prior) = if managed {
+    let target = if managed {
         vox_core::node::pulls::folder_dir(paths, &base, &channel_id, &offer.author, &offer.name)
     } else {
-        (
-            base.join(safe_file_name(&offer.name)),
-            std::collections::BTreeMap::new(),
-        )
+        base.join(safe_file_name(&offer.name))
     };
     if let Some(why) = vox_core::node::pulls::short_of_space(&base, offer.size) {
         return Err(AppError::Usage(format!(
@@ -4135,6 +4750,11 @@ async fn collect_folder(
     };
     let pulled = match &listed {
         Ok(list) => {
+            let prior = if managed {
+                vox_core::node::pulls::folder_prior(paths, &target, list)
+            } else {
+                std::collections::BTreeMap::new()
+            };
             // **A get cut short is resumed in the same place** (F-8): recorded before it starts,
             // in the node's files directory; one the person put elsewhere is theirs.
             pull.files = list
@@ -4746,9 +5366,14 @@ pub async fn join(
                     None => println!("vox: bound {}", dir.display()),
                 }
             }
-            println!("     you read a member once you trust it and it trusts you: `vox trust add`");
+            println!("     you read a member once you trust it and it trusts you:");
             if let Ok(parsed) = vox_core::node::link::InviteLink::parse(link) {
-                who_reads_whom(&mut client, parsed.channel_id).await;
+                who_reads_whom(
+                    &mut client,
+                    parsed.channel_id,
+                    crate::client::name_of(paths)?.as_str(),
+                )
+                .await;
             }
             Ok(())
         }
@@ -4777,7 +5402,7 @@ const CONSENT_SETTLES: std::time::Duration = std::time::Duration::from_secs(1);
 /// member, by this node's name for it, trusted both ways, waiting for the other side, or not in
 /// keyring, with what is still to do ([`crate::ident::Reading`]). Best effort: a node that does not
 /// say leaves the join's own lines standing.
-async fn who_reads_whom(client: &mut IpcClient, channel_id: Digest32) {
+async fn who_reads_whom(client: &mut IpcClient, channel_id: Digest32, node: &str) {
     let Ok(Frame::Members { members }) = client.request(&Request::Roster { channel_id }).await
     else {
         return;
@@ -4792,8 +5417,9 @@ async fn who_reads_whom(client: &mut IpcClient, channel_id: Digest32) {
     // node trusts has not; after that, what is missing is said as not having reached this node.
     let deadline = std::time::Instant::now() + CONSENT_SETTLES;
     let inbound = loop {
-        let Ok(Frame::Consents { inbound, .. }) =
-            client.request(&Request::Consents { channel_id }).await
+        let Ok(Frame::MemberConsents { inbound, .. }) = client
+            .request(&Request::MemberConsents { channel_id })
+            .await
         else {
             return;
         };
@@ -4819,7 +5445,7 @@ async fn who_reads_whom(client: &mut IpcClient, channel_id: Digest32) {
         println!(
             "     {} {name} — {}",
             reading.glyph(),
-            reading.say(&name, &b32_encode(&m), &me_fp)
+            reading.say(&name, &b32_encode(&m), &me_fp, node)
         );
     }
 }
@@ -4968,7 +5594,13 @@ pub async fn create(
                     Err(e) => return Err(AppError::Usage(e.to_string())),
                 }
             }
-            println!("     `vox room list` shows its id; that id is what agents pass as --room");
+            println!(
+                "     `{}` shows its id; that id is what agents pass as --room",
+                vox_text::shell::node_command(
+                    &["vox", "room", "list"],
+                    crate::client::name_of(paths)?.as_str()
+                )
+            );
             Ok(())
         }
         Ok(Frame::Error { reason }) => Err(AppError::Usage(format!("cannot create: {reason}"))),
@@ -5297,7 +5929,9 @@ pub async fn link(paths: &Paths, room: &str) -> Result<(), AppError> {
                 eprintln!("vox: {note}");
             }
             eprintln!("vox: send the passphrase another way than this address (in person, a call, a different app)");
-            eprintln!("     joining grants nothing — use `vox trust add` to decide who reads you");
+            eprintln!(
+                "     joining grants nothing — choose who reads you from this room's trust offers"
+            );
             Ok(())
         }
         Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
@@ -5328,7 +5962,15 @@ async fn keyring_change(
                 return Err(AppError::Usage(format!(
                     "{}\n       {}",
                     reason.lines().next().unwrap_or_default(),
-                    typed_only()
+                    typed_only(
+                        client
+                            .node_name()
+                            .ok_or_else(|| AppError::Usage(
+                                "the acting node is unknown; select its node before changing trust"
+                                    .into()
+                            ))?
+                            .as_str()
+                    )
                 )));
             }
             if std::env::var_os("VOX_IDENTITY_PASSPHRASE").is_some() {
@@ -5350,7 +5992,7 @@ async fn keyring_change(
 
 /// What a keyring change that needs the passphrase says with no terminal to type it at: the
 /// command, to run in a terminal (ADR-028 K-13).
-pub(crate) fn typed_only() -> String {
+pub(crate) fn typed_only(node: &str) -> String {
     let command: Vec<String> = std::iter::once("vox".to_owned())
         .chain(std::env::args().skip(1))
         .collect();
@@ -5358,7 +6000,14 @@ pub(crate) fn typed_only() -> String {
         "it is typed at a terminal, and taken from nothing else (not VOX_IDENTITY_PASSPHRASE, not \
          a file). Run it in a terminal: {}",
         // Each argument as one shell word: a name like "Ben's Mac & co" pastes whole.
-        vox_text::shell::command(&command)
+        if command
+            .iter()
+            .any(|word| word == "--node" || word.starts_with("--node="))
+        {
+            vox_text::shell::command(&command)
+        } else {
+            vox_text::shell::node_command(&command, node)
+        }
     )
 }
 
@@ -5425,7 +6074,14 @@ pub(crate) async fn trusted_in(client: &mut IpcClient, channel_id: Digest32) -> 
 
 /// The services this node offers in `channel_id`, by tag, as `vox service list` names them.
 async fn offered_in(client: &mut IpcClient, channel_id: Digest32) -> Vec<String> {
-    match client.request(&Request::Services { channel_id }).await {
+    match client
+        .request(&Request::Services {
+            channel_id,
+            after: None,
+            revision: None,
+        })
+        .await
+    {
         Ok(Frame::Services { services, .. }) => services.into_iter().map(|(tag, _)| tag).collect(),
         _ => Vec::new(),
     }
@@ -5594,7 +6250,13 @@ pub async fn trust_add(
                     "every service you bind to a room you are both in"
                 )
             );
-            println!("     `vox trust remove` undoes it and changes the lock everywhere");
+            println!(
+                "     `{}` undoes it and changes the lock everywhere",
+                vox_text::shell::node_command(
+                    &["vox", "trust", "remove", &id(&target)],
+                    crate::client::name_of(paths)?.as_str()
+                )
+            );
             if drive {
                 println!(
                     "Next: from node {petname:?}, vox room sessions with the id of a room you share \
@@ -5602,8 +6264,12 @@ pub async fn trust_add(
                 );
             } else {
                 println!(
-                    "Next: send {petname:?} this node's fingerprint (`vox id`), so it trusts you \
-                     too and you read what it writes"
+                    "Next: send {petname:?} this node's fingerprint (`{}`), so it trusts you \
+                     too and you read what it writes",
+                    vox_text::shell::node_command(
+                        &["vox", "id"],
+                        crate::client::name_of(paths)?.as_str()
+                    )
                 );
             }
             Ok(())
@@ -5868,9 +6534,14 @@ pub async fn trust_dismiss(paths: &Paths, fingerprint: &str) -> Result<(), AppEr
     let mut client = attach(paths).await?;
     let offers = offers_of(&mut client).await?;
     let ids: Vec<Digest32> = offers.iter().map(|o| o.member).collect();
+    let offers_command = vox_text::shell::node_command(
+        &["vox", "trust", "offers"],
+        crate::client::name_of(paths)?.as_str(),
+    );
     let member = resolve_fingerprint(fingerprint, &ids).map_err(|_| {
         AppError::Usage(format!(
-            "no offer matches {fingerprint:?}; `vox trust offers` lists them"
+            "no offer matches {fingerprint:?}; `{}` lists them",
+            offers_command
         ))
     })?;
     println!(
@@ -5899,7 +6570,7 @@ pub async fn trust_list(paths: &Paths) -> Result<(), AppError> {
         Ok(Frame::Trusted { entries }) => {
             if entries.is_empty() {
                 println!("no trusted identities");
-                println!("     nobody can read what you write until you `vox trust add` them");
+                println!("     nobody can read what you write until you trust them; choose members from this room's trust offers");
                 return Ok(());
             }
             // What each entry grants, read or read + drive (ADR-028 K-14).
@@ -5931,14 +6602,27 @@ pub async fn trust_list(paths: &Paths) -> Result<(), AppError> {
 /// so it starts no daemon and attaches nothing.
 ///
 /// # Errors
-/// The node's files cannot be read, or a new identity's passphrase cannot be had.
+/// The node's files cannot be read, or a new identity's passphrase cannot be had. An explicit
+/// fingerprint selector requires its pinned live connection and never uses those fallbacks.
 pub fn print_identity(
     paths: &Paths,
     flag: Option<String>,
     file: Option<std::path::PathBuf>,
     with_name: bool,
 ) -> Result<(), AppError> {
-    let fingerprint = if vox_core::node::profile::Profile::exists(paths) {
+    let fingerprint = if paths.expected_identity.is_some() {
+        // A fingerprint selector names an attached identity, not a disk profile. Never turn
+        // a failed pin (or a detached/replaced node) into a disk read or identity creation.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let at = crate::client::one_shot(paths)?;
+        rt.block_on(async {
+            crate::client::open(&at).await?.me().ok_or_else(|| {
+                AppError::Usage("the selected attached node supplied no fingerprint".into())
+            })
+        })?
+    } else if vox_core::node::profile::Profile::exists(paths) {
         let attached = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -6095,17 +6779,42 @@ pub async fn admin(
     let mut client = attach(paths).await?;
     let channel_id = room_of(&mut client, room).await?;
     if action == "list" {
-        return match client.request(&Request::Admins { channel_id }).await {
-            Ok(Frame::Members { members }) => {
-                for (i, m) in members.iter().enumerate() {
-                    println!("{}{}", id(m), if i == 0 { "  (creator)" } else { "" });
+        use vox_core::node::api::{GovernancePage, GovernanceQuery};
+        let mut after = None;
+        let mut revision = None;
+        loop {
+            match client
+                .request(&Request::GovernancePage {
+                    channel_id,
+                    query: GovernanceQuery::Admins { after, revision },
+                })
+                .await?
+            {
+                Frame::GovernancePage {
+                    page:
+                        GovernancePage::Admins {
+                            creator,
+                            members,
+                            next,
+                            revision: current,
+                        },
+                } => {
+                    if revision.is_none() {
+                        println!("{}  (creator)", id(&creator));
+                    }
+                    for member in members {
+                        println!("{}", id(&member));
+                    }
+                    revision = Some(current);
+                    match next {
+                        Some(next) => after = Some(next),
+                        None => return Ok(()),
+                    }
                 }
-                Ok(())
+                Frame::Error { reason } => return Err(AppError::Usage(reason)),
+                other => return Err(crate::client::unexpected(&other)),
             }
-            Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
-            Ok(other) => Err(crate::client::unexpected(&other)),
-            Err(e) => Err(AppError::Usage(e.to_string())),
-        };
+        }
     }
     let add = match action {
         "add" => true,
@@ -6118,7 +6827,11 @@ pub async fn admin(
     };
     let Some(member) = member else {
         return Err(AppError::Usage(format!(
-            "`vox room admin {action}` needs the member's fingerprint (`vox room roster` lists them)"
+            "the room admin {action} action needs the member's fingerprint (`{}` lists them)",
+            vox_text::shell::node_command(
+                &["vox", "room", "roster", &id(&channel_id)],
+                crate::client::name_of(paths)?.as_str()
+            )
         )));
     };
     let members = match client.request(&Request::Roster { channel_id }).await {

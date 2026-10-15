@@ -54,13 +54,13 @@
 //! A wake is a **notice**: how many urgent messages and replies wait, from whom, in which room,
 //! and never a byte of any of them (`agent_hook::render_wake`). The messages arrive once, in the
 //! drain of the turn the notice starts. The daemon counts what is owed just before it sends
-//! ([`unread`], [`tend`]), keeps at most one notice outstanding per session in its saved room,
+//! ([`crate::node_tasks`], [`tend`]), keeps at most one notice outstanding per session in its saved room,
 //! and announces an unread reply to an idle session on a schedule ([`Settings`]). What it owes
 //! each session is kept in [`Notices`], beside the registration, so a restart resumes it.
 
 use std::path::Path;
 
-use vox_agentcomms::envelope::{Envelope, DEFAULT_HOPS};
+use vox_agentcomms::envelope::Envelope;
 use vox_core::hash::Digest32;
 use vox_core::node::api::MessageRow;
 use vox_core::node::paths::Paths;
@@ -336,7 +336,7 @@ impl Session {
 
     /// Whether `other` is this same registration: the same session, room and endpoint. What the
     /// harness says about its turns does not make it another one.
-    fn same(&self, other: &Session) -> bool {
+    pub(crate) fn same(&self, other: &Session) -> bool {
         self.session == other.session
             && self.harness == other.harness
             && self.endpoint == other.endpoint
@@ -775,6 +775,121 @@ pub fn registered(paths: &Paths) -> Vec<Session> {
         .collect()
 }
 
+/// One bounded page of current registrations in `room`, ordered by complete Session id.
+/// Files are inspected one at a time; no saved Session transcript or activity is read.
+/// A malformed registration is reported, never counted as successfully interrupted.
+pub(crate) fn registered_page(
+    paths: &Paths,
+    room: &str,
+    after: Option<&str>,
+    limit: usize,
+) -> Result<(Vec<Session>, Option<String>), String> {
+    let entries = match std::fs::read_dir(paths.session_dir()) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), None)),
+        Err(e) => return Err(format!("cannot read live Session registrations: {e}")),
+    };
+    let mut page: Vec<Session> = Vec::with_capacity(limit + 1);
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
+        if entry.path().extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(session) = pause_registration_file(&entry.path())? else {
+            continue;
+        };
+        if !session.interactive
+            || session.room.as_deref() != Some(room)
+            || after.is_some_and(|after| session.session.as_str() <= after)
+        {
+            continue;
+        }
+        if session.session.len() > vox_core::node::content::MAX_SESSION_ID_LEN {
+            return Err(
+                "a registration has an invalid Session id; interruption is incomplete".into(),
+            );
+        }
+        let index = page.partition_point(|old| old.session < session.session);
+        if index <= limit {
+            page.insert(index, session);
+            page.truncate(limit + 1);
+        }
+    }
+    let more = page.len() > limit;
+    page.truncate(limit);
+    let next = if more {
+        page.last().map(|s| s.session.clone())
+    } else {
+        None
+    };
+    Ok((page, next))
+}
+
+/// Only the live routing fields needed to interrupt. Large current titles and transcript
+/// metadata are skipped by the streaming JSON decoder rather than copied into every page.
+#[derive(serde::Deserialize)]
+struct PauseRegistration {
+    session: String,
+    harness: String,
+    #[serde(default)]
+    endpoint: String,
+    #[serde(default)]
+    token: String,
+    #[serde(default)]
+    room: Option<String>,
+    #[serde(default)]
+    first_seen_ms: u64,
+    #[serde(default = "interactive_by_default")]
+    interactive: bool,
+    #[serde(default)]
+    tmux: Option<TmuxPane>,
+    #[serde(default)]
+    tmux_why: Option<String>,
+    #[serde(default)]
+    codex_home: String,
+    #[serde(default)]
+    mirror: String,
+}
+fn pause_registration_file(path: &std::path::Path) -> Result<Option<Session>, String> {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("cannot read live Session registration: {e}")),
+    };
+    let reg: PauseRegistration =
+        serde_json::from_reader(std::io::BufReader::new(file)).map_err(|e| {
+            format!(
+                "cannot read live Session registration {}: {e}",
+                path.display()
+            )
+        })?;
+    Ok(Some(Session {
+        session: reg.session,
+        harness: reg.harness,
+        endpoint: reg.endpoint,
+        token: reg.token,
+        room: reg.room,
+        first_seen_ms: reg.first_seen_ms,
+        interactive: reg.interactive,
+        tmux: reg.tmux,
+        tmux_why: reg.tmux_why,
+        codex_home: reg.codex_home,
+        mirror: reg.mirror,
+        state: String::new(),
+        state_ms: 0,
+        last_drained_ms: 0,
+        start: None,
+        name: None,
+        transcript: String::new(),
+        tmux_claim: None,
+    }))
+}
+
+/// Revalidate a selected live routing record without loading its current title/transcript.
+pub(crate) fn pause_registration(paths: &Paths, session: &str) -> Result<Option<Session>, String> {
+    pause_registration_file(&paths.session_file(session))
+}
+
 /// Drop `session`'s registration, **if it is still the one that failed**.
 ///
 /// A registration is rewritten every turn, but nothing ever removed one: a session that
@@ -880,17 +995,6 @@ pub fn first_detached_notice(paths: &Paths, session: &str) -> bool {
     true
 }
 
-/// The hop budget `envelope` really has left, given the `rows` of its room (ADR-020 §9): see
-/// [`vox_agentcomms::envelope::hops_left_by`], the one rule.
-#[must_use]
-pub fn hops_left<'a, R>(envelope: &Envelope, rows: &'a R) -> u32
-where
-    R: ?Sized,
-    &'a R: IntoIterator<Item = &'a MessageRow>,
-{
-    vox_agentcomms::envelope::hops_left_by(envelope, |h| find(rows, h).map(|r| r.text.clone()))
-}
-
 /// The budget a reply to entry `re` starts with: its parent's less one, or the default when the
 /// room does not hold that entry.
 #[must_use]
@@ -979,34 +1083,6 @@ pub fn open_wakes(
         }
     }
     open
-}
-
-/// Whether `session`, a session of this node (`me`), already spoke in the `re` chain
-/// `envelope` answers (V210-121): a parent, grandparent and so on, signed by `me` and
-/// naming `session` in `from`. Waking it again would answer it with its own conversation,
-/// which is how two agents keep each other awake; the message still queues for its next turn.
-#[must_use]
-pub fn in_chain<'a, R>(envelope: &Envelope, rows: &'a R, me: &Digest32, session: &str) -> bool
-where
-    R: ?Sized,
-    &'a R: IntoIterator<Item = &'a MessageRow>,
-{
-    let mut re = envelope.re.clone();
-    let mut depth: u32 = 0;
-    while let Some(parent) = re.as_deref().and_then(|h| find(rows, h)) {
-        depth += 1;
-        if depth > DEFAULT_HOPS {
-            break;
-        }
-        let Ok(p) = Envelope::parse(&parent.text) else {
-            break;
-        };
-        if parent.author == *me && p.from == session {
-            return true;
-        }
-        re = p.re;
-    }
-    false
 }
 
 fn find<'a, R>(rows: &'a R, re: &str) -> Option<&'a MessageRow>
@@ -1192,63 +1268,6 @@ pub fn is_reply(
             .as_deref()
             .and_then(|re| vox_core::node::link::b32_decode(re.trim(), "re").ok())
             .is_some_and(|h| asked.contains(&h))
-}
-
-/// What `session` has not been given yet in one room that it is owed a notice for: the urgent
-/// messages addressed to its node `me` that may still interrupt it (hops left, ADR-020 §9; not a
-/// reply chain it already spoke in, V210-121), and the replies to its posts (V030-20), each oldest
-/// first.
-///
-/// "Not given yet" is the drain's own rule: past the session's `cursor` by arrival (a cursor the
-/// room no longer holds starts from the first message, as the drain does), not the session's own,
-/// not a message not received yet, and not one its drain already showed ahead of the cursor.
-pub fn unread<'a>(
-    timeline: &'a vox_core::node::api::Timeline,
-    me: Option<vox_core::hash::Digest32>,
-    session: &Session,
-    cursor: Option<vox_core::hash::Digest32>,
-    ahead: &std::collections::BTreeSet<vox_core::hash::Digest32>,
-) -> (Vec<&'a MessageRow>, Vec<&'a MessageRow>) {
-    let mark = cursor.and_then(|c| {
-        timeline
-            .iter()
-            .rev()
-            .find(|r| r.entry_hash == c && !r.owed)
-            .map(|r| r.arrival)
-    });
-    let asked = asked(timeline.iter(), me, &session.session);
-    // `to` names nodes, by whole fingerprint (V210-161).
-    let me_fp = me.map(|m| vox_core::node::link::b32_encode(&m));
-    let mut rows: Vec<&MessageRow> = timeline
-        .iter()
-        .filter(|r| !r.owed && mark.is_none_or(|m| r.arrival > m))
-        .filter(|r| !ahead.contains(&r.entry_hash))
-        .collect();
-    rows.sort_by_key(|r| r.arrival);
-    let (mut urgent, mut replies) = (Vec::new(), Vec::new());
-    for r in rows {
-        let Ok(e) = Envelope::parse(&r.text) else {
-            continue;
-        };
-        if me == Some(r.author) && !e.from.is_empty() && e.from == session.session {
-            continue;
-        }
-        let for_me = me_fp
-            .as_deref()
-            .is_some_and(|fp| wakes(&e, fp, &session.session));
-        if for_me
-            && hops_left(&e, timeline) > 0
-            && !me.is_some_and(|m| in_chain(&e, timeline, &m, &session.session))
-        {
-            urgent.push(r);
-        } else if is_reply(&e, &asked) && hops_left(&e, timeline) > 0 {
-            // **A reply with no hops left is announced to nobody** (ADR-020 §9): two sessions
-            // answering each other's answers would otherwise wake each other for ever. It is
-            // still read at the next turn.
-            replies.push(r);
-        }
-    }
-    (urgent, replies)
 }
 
 /// The timings of a session's notices, from the profile's settings file (`vox daemon` reads it

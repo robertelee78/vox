@@ -1243,7 +1243,7 @@ pub struct SyncBook {
     /// holds no ring.
     prekeys: Option<PrekeyCounts>,
     /// Each open room's stored entries set aside when it opened (V210-74), as `author#seq: why`.
-    set_aside: BTreeMap<Digest32, Vec<String>>,
+    set_aside: BTreeMap<Digest32, crate::node::channel::SetAside>,
     /// The node's connections, read when a status is asked for, so each peer's row can say which
     /// connection this node holds for it (V29-15, #50): two ends that name different ones are
     /// using connections the other has retired. Weak: the book outlives no network.
@@ -1383,12 +1383,16 @@ impl SyncBook {
     }
 
     /// What `room` set aside when it opened (V210-74); nothing, and the room is not listed.
-    pub fn note_set_aside(book: &SharedSyncBook, room: Digest32, entries: &[String]) {
+    pub fn note_set_aside(
+        book: &SharedSyncBook,
+        room: Digest32,
+        entries: &crate::node::channel::SetAside,
+    ) {
         let mut b = book.lock().unwrap_or_else(PoisonError::into_inner);
         if entries.is_empty() {
             b.set_aside.remove(&room);
         } else {
-            b.set_aside.insert(room, entries.to_vec());
+            b.set_aside.insert(room, entries.clone());
         }
     }
 
@@ -1608,12 +1612,13 @@ impl SyncBook {
             if i > 0 {
                 s.push(',');
             }
-            let list: Vec<String> = entries.iter().map(|e| q(e)).collect();
+            let list: Vec<String> = entries.entries().iter().map(|e| q(e)).collect();
             let _ = write!(
                 s,
-                "{{\"room\":\"{}\",\"entries\":[{}]}}",
+                "{{\"room\":\"{}\",\"entries\":[{}],\"omitted\":{}}}",
                 b32_encode(room),
-                list.join(",")
+                list.join(","),
+                entries.omitted()
             );
         }
         // **Every live tunnel** (V210-81): the member, the service, which way it was opened, and

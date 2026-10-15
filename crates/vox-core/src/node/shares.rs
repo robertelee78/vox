@@ -263,102 +263,23 @@ enum Verdict {
     Stop(String),
 }
 
-/// Who has pulled one share whole (ADR-028 F-7): the members whose fetch of it completed, by the
-/// tunnel each came through, never by what a client says.
-#[derive(Debug, Clone, Default)]
-struct PulledBy {
-    room: Digest32,
-    /// The announcement's entry, base32; empty until it is known.
-    entry: String,
-    who: Vec<Digest32>,
-}
+mod pulled_book;
+use pulled_book::PulledBook;
 
-/// Every share's [`PulledBy`], by tag: kept past the share's end, so its card still says who
-/// pulled it, and on disk, so a restart does too.
-#[derive(Debug, Default)]
-struct PulledBook {
-    file: PathBuf,
-    by_tag: BTreeMap<String, PulledBy>,
-}
-
-impl PulledBook {
-    fn load(file: PathBuf) -> Self {
-        let by_tag = std::fs::read(&file)
-            .ok()
-            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-            .and_then(|v| v.as_object().cloned())
-            .map(|o| {
-                o.into_iter()
-                    .filter_map(|(tag, v)| {
-                        let room = b32_decode(v.get("room")?.as_str()?, "pulled-by room").ok()?;
-                        let entry = v.get("entry")?.as_str()?.to_owned();
-                        let who = v
-                            .get("who")?
-                            .as_array()?
-                            .iter()
-                            .filter_map(|w| b32_decode(w.as_str()?, "pulled-by member").ok())
-                            .collect();
-                        Some((tag, PulledBy { room, entry, who }))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        Self { file, by_tag }
-    }
-
-    fn save(&self) {
-        let v: serde_json::Map<String, serde_json::Value> = self
-            .by_tag
-            .iter()
-            .map(|(tag, p)| {
-                (
-                    tag.clone(),
-                    serde_json::json!({
-                        "room": b32_encode(&p.room),
-                        "entry": p.entry,
-                        "who": p.who.iter().map(b32_encode).collect::<Vec<_>>(),
-                    }),
-                )
-            })
-            .collect();
-        if let Some(dir) = self.file.parent() {
-            let _ = crate::node::paths::create_private_dir(dir);
-        }
-        let _ = crate::node::paths::write_private_file(
-            &self.file,
-            serde_json::Value::Object(v).to_string().as_bytes(),
-        );
-    }
-
-    /// `member` pulled the share `tag` in `room` whole.
-    fn pulled(&mut self, tag: &str, room: Digest32, member: Digest32) {
-        let p = self
-            .by_tag
-            .entry(tag.to_owned())
-            .or_insert_with(|| PulledBy {
-                room,
-                ..PulledBy::default()
-            });
-        if !p.who.contains(&member) {
-            p.who.push(member);
-            self.save();
-        }
-    }
-
-    /// The share `tag`'s announcement is `entry`.
-    fn announced(&mut self, tag: &str, room: Digest32, entry: &str) {
-        let p = self
-            .by_tag
-            .entry(tag.to_owned())
-            .or_insert_with(|| PulledBy {
-                room,
-                ..PulledBy::default()
-            });
-        if p.entry != entry {
-            entry.clone_into(&mut p.entry);
-            self.save();
-        }
-    }
+/// All receipt mutex and disk work stays on a blocking worker. Callers await durability;
+/// no detached completion can publish a later receipt out of order.
+async fn receipt_work<T: Send + 'static>(
+    book: Arc<std::sync::Mutex<PulledBook>>,
+    work: impl FnOnce(&mut PulledBook) -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    tokio::task::spawn_blocking(move || {
+        let mut book = book
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        work(&mut book)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 /// The shares one node serves.
@@ -414,10 +335,10 @@ impl Shares {
     ) -> Arc<Self> {
         let shares = Arc::new(Self {
             computer,
-            pulled: Arc::new(std::sync::Mutex::new(PulledBook::load(
+            pulled: Arc::new(std::sync::Mutex::new(PulledBook::new(
                 // Beside the share records, not among them: `restore` reads every `*.json` there
                 // as one, and removes what is not.
-                paths.shares_dir().join("pulled-by").join("book.json"),
+                paths.shares_dir().join("pulled-by"),
             ))),
             paths,
             cmd,
@@ -427,8 +348,33 @@ impl Shares {
         });
         let tending = Arc::clone(&shares);
         tokio::spawn(async move {
-            tending.restore().await;
             let mut view = tending.view.clone();
+            loop {
+                let writable = {
+                    let state = view.borrow();
+                    state.identity.is_some() && !state.locked && !state.locking
+                };
+                if writable {
+                    break;
+                }
+                if view.changed().await.is_err() {
+                    return;
+                }
+            }
+            let ready = receipt_work(Arc::clone(&tending.pulled), |book| {
+                let ready = PulledBook::initialize(&book.root());
+                book.set_ready(ready.clone());
+                ready
+            })
+            .await;
+            if let Err(error) = ready {
+                tending.say(format!("completed-pull receipts unavailable: {error}"));
+                return;
+            }
+            if view.has_changed().is_err() {
+                return;
+            }
+            tending.restore().await;
             loop {
                 tokio::select! {
                     changed = view.changed() => if changed.is_err() { break },
@@ -453,19 +399,19 @@ impl Shares {
         rx.await.unwrap_or(Outcome::Failed(Fault::ShuttingDown))
     }
 
-    /// Who has pulled each of this node's shares in `room` whole, by announcement (ADR-028 F-7):
-    /// `(entry, members)`, from this daemon's own record of completed fetches.
-    #[must_use]
-    pub fn pulled_by(&self, room: &Digest32) -> Vec<(Digest32, Vec<Digest32>)> {
-        let book = self
-            .pulled
+    /// One bounded page of completed fetches for an exact retained announcement.
+    pub(crate) fn pulled_page(
+        &self,
+        room: Digest32,
+        entry: Digest32,
+        tag: &str,
+        after: Option<u64>,
+        limit: usize,
+    ) -> std::result::Result<(Vec<Digest32>, Option<u64>), String> {
+        self.pulled
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        book.by_tag
-            .values()
-            .filter(|p| p.room == *room && !p.who.is_empty())
-            .filter_map(|p| Some((b32_decode(&p.entry, "pulled-by entry").ok()?, p.who.clone())))
-            .collect()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .page(tag, room, entry, after, limit)
     }
 
     /// What `serve` needs to record who pulled the share `tag` in `room`, and to tell whom it
@@ -542,6 +488,7 @@ impl Shares {
         let (served, name) = (req.path.clone(), base);
         // The tag names the content and **this share**: two shares of the same file are two
         // services, and stopping one never withdraws the other (V210-72).
+        receipt_work(Arc::clone(&self.pulled), |book| book.check()).await?;
         let tag = format!("file-{}-{}", &sha256[..16], hex(&nonce));
         if let Some(obj) = envelope.as_object_mut() {
             let body_empty = obj
@@ -590,10 +537,7 @@ impl Shares {
         let (stop, stopping) = watch::channel(false);
         let fetched = Arc::new(AtomicU64::new(0));
         let what = if folder {
-            let by_path: BTreeMap<_, _> = files
-                .iter()
-                .map(|f| (f.listed.path.clone(), f.clone()))
-                .collect();
+            let by_path = indexed_files(&files);
             Served::Folder {
                 root: served.clone(),
                 list: list_bytes(&by_path),
@@ -655,10 +599,16 @@ impl Shares {
             }
         };
         if !entry.is_empty() {
-            self.pulled
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .announced(&tag, req.channel_id, &entry);
+            let (tag, entry, room) = (tag.clone(), entry.clone(), req.channel_id);
+            if let Err(error) = receipt_work(Arc::clone(&self.pulled), move |book| {
+                book.announced(&tag, room, &entry)
+            })
+            .await
+            {
+                self.say(format!(
+                    "completed-pull receipt could not be saved: {error}"
+                ));
+            }
         }
         let record = Record {
             tag: tag.clone(),
@@ -1070,11 +1020,17 @@ impl Witness {
         }
     }
 
-    fn pulled(&self, member: Digest32) {
-        self.book
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .pulled(&self.tag, self.room, member);
+    async fn pulled(&self, member: Digest32) {
+        let (tag, room) = (self.tag.clone(), self.room);
+        if let Err(error) = receipt_work(Arc::clone(&self.book), move |book| {
+            book.pulled(&tag, room, member)
+        })
+        .await
+        {
+            let _ = self.events.send(NodeEvent::NodeNote {
+                note: format!("completed-pull receipt could not be saved: {error}"),
+            });
+        }
     }
 }
 
@@ -1090,7 +1046,7 @@ enum Served {
     /// path, read from the folder (ADR-028 F-8).
     Folder {
         root: PathBuf,
-        files: BTreeMap<String, crate::node::folder::Found>,
+        files: BTreeMap<String, (crate::node::folder::Found, usize)>,
         /// The list, as it is served.
         list: Arc<Vec<u8>>,
     },
@@ -1104,9 +1060,22 @@ enum Body {
     Bytes(Arc<Vec<u8>>),
 }
 
+fn indexed_files(
+    files: &[crate::node::folder::Found],
+) -> BTreeMap<String, (crate::node::folder::Found, usize)> {
+    let mut out: BTreeMap<_, _> = files
+        .iter()
+        .map(|file| (file.listed.path.clone(), (file.clone(), 0)))
+        .collect();
+    for (ordinal, (_, index)) in out.values_mut().enumerate() {
+        *index = ordinal;
+    }
+    out
+}
+
 /// A folder's list as it is served: the canonical `[[path, size, sha256], …]`.
-fn list_bytes(files: &BTreeMap<String, crate::node::folder::Found>) -> Arc<Vec<u8>> {
-    let list: Vec<_> = files.values().map(|f| f.listed.clone()).collect();
+fn list_bytes(files: &BTreeMap<String, (crate::node::folder::Found, usize)>) -> Arc<Vec<u8>> {
+    let list: Vec<_> = files.values().map(|(f, _)| f.listed.clone()).collect();
     Arc::new(crate::node::folder::to_json(&list).to_string().into_bytes())
 }
 
@@ -1119,11 +1088,7 @@ impl Served {
                 size: record.size,
             }
         } else {
-            let files: BTreeMap<_, _> = record
-                .files
-                .iter()
-                .map(|f| (f.listed.path.clone(), f.clone()))
-                .collect();
+            let files = indexed_files(&record.files);
             Self::Folder {
                 root: record.served.clone(),
                 list: list_bytes(&files),
@@ -1143,7 +1108,7 @@ impl Served {
             )),
             Self::Folder { root, files, .. } => {
                 let path = crate::node::folder::from_url_path(target).ok_or(Refused::NotListed)?;
-                let f = files.get(&path).ok_or(Refused::NotListed)?;
+                let (f, _) = files.get(&path).ok_or(Refused::NotListed)?;
                 let file = root.join(&path);
                 // **Announced content or nothing** (F-8): a file whose size or time moved since
                 // it was listed is not served under the announcement.
@@ -1160,14 +1125,6 @@ impl Served {
             }
         }
     }
-
-    /// How many files a member must fetch whole to have pulled it.
-    fn count(&self) -> usize {
-        match self {
-            Self::File { .. } => 1,
-            Self::Folder { files, .. } => files.len(),
-        }
-    }
 }
 
 /// Why a request was not answered with a file.
@@ -1176,6 +1133,29 @@ enum Refused {
     NotListed,
     /// It names a listed file that changed since it was listed.
     Changed(String),
+}
+
+/// One bit per manifest ordinal, shared across ordinary connection retries. No copied
+/// path per recipient: the largest 100000-file folder uses 12504 bitmap bytes.
+struct FolderProgress {
+    bits: Vec<u64>,
+    complete: usize,
+}
+impl FolderProgress {
+    fn new(files: usize) -> Self {
+        Self {
+            bits: vec![0; files.div_ceil(64)],
+            complete: 0,
+        }
+    }
+    fn mark(&mut self, ordinal: usize) {
+        let bit = 1u64 << (ordinal % 64);
+        let word = &mut self.bits[ordinal / 64];
+        if *word & bit == 0 {
+            *word |= bit;
+            self.complete += 1;
+        }
+    }
 }
 
 async fn serve(
@@ -1192,8 +1172,7 @@ async fn serve(
         .map_err(|e| format!("cannot read the local address: {e}"))?;
     let what = Arc::new(what);
     // Which of a folder's files each member has fetched whole, since it last fetched them all.
-    let got: Arc<std::sync::Mutex<BTreeMap<Digest32, std::collections::BTreeSet<String>>>> =
-        Arc::default();
+    let got: Arc<std::sync::Mutex<BTreeMap<Digest32, FolderProgress>>> = Arc::default();
     let server = tokio::spawn(async move {
         while let Ok((sock, from)) = listener.accept().await {
             let (what, fetched, witness, stopping, got) = (
@@ -1218,27 +1197,32 @@ async fn serve(
                 let complete = match (&*what, member) {
                     (Served::File { .. }, _) => true,
                     (Served::Folder { .. }, None) => false,
-                    (Served::Folder { .. }, Some(m)) => {
-                        let mut got = got
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        let set = got.entry(m).or_default();
-                        // The list is not a file of the folder.
-                        if !path.is_empty() {
-                            set.insert(path);
-                        }
-                        let all = set.len() >= what.count();
-                        if all {
-                            got.remove(&m);
-                        }
-                        all
+                    (Served::Folder { files, .. }, Some(m)) => {
+                        if files.is_empty() {
+                            true
+                        } else if let Some((_, ordinal)) = files.get(&path) {
+                            let mut got = got
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let progress = got
+                                .entry(m)
+                                .or_insert_with(|| FolderProgress::new(files.len()));
+                            progress.mark(*ordinal);
+                            let all = progress.complete == files.len();
+                            if all {
+                                got.remove(&m);
+                            }
+                            all
+                        } else {
+                            false
+                        } // The folder list is not a manifest file.
                     }
                 };
                 if complete {
-                    fetched.fetch_add(1, Ordering::SeqCst);
                     if let Some(m) = member {
-                        witness.pulled(m);
+                        witness.pulled(m).await;
                     }
+                    fetched.fetch_add(1, Ordering::SeqCst);
                 }
             });
         }

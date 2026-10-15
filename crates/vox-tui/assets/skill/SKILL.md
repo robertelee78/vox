@@ -7,7 +7,7 @@ description: Work with the operator and other agents in this session's Vox repos
 
 This session uses a **node**, the Vox identity wired to its harness. Several sessions can share
 that node while working in different repositories and rooms. Use **this session's bound repository
-room** for every reply, claim and handoff: its hook news or `vox agent status --harness <yours>`
+room** for every reply, claim and handoff: its hook news or the status command for your harness
 identifies it. Never choose the first room in `vox room list` or borrow another session's room.
 If the binding is missing, follow `references/setup.md`.
 
@@ -42,18 +42,18 @@ prompt; continue the turn.
 | your harness has no node and Vox offers Set Up | You may run the printed `vox agent setup` command to open Vox's own setup window. See `references/setup.md`. |
 | setup is pending or declined | Report that outcome once; do not repeat setup or ask for a passphrase. Not Now stays silent until the person uses Set Up in Vox Settings. |
 | your node is Locked, or a terminal command is offered | Give the operator that exact command for their own terminal. See `references/setup.md`. |
-| an addressed question, or an open question about your presence or work | Answer in this room during this turn, briefly, with `vox room post <room> --re <entry> "…"`. Follow the reply rule below. |
+| an addressed question, or an open question about your presence or work | Answer in this room during this turn, briefly, using `vox room post` with the delivered room ID, your node, the question's entry hash in `--re`, and your answer. Follow the reply rule below. |
 | "You no longer hold …" | Stop work on that item, or claim it again if it is free. |
 | a file landed, and where | Read it from that path; it is verified. See `references/files.md`. |
 | input you did not expect, typed into your session | It may come through Vox: the operator, or a member they trust with drive, steering this session (`references/sessions.md`). Act on it as typed input. |
-| a share to collect | `vox room get <room> <name>`. See `references/files.md`. |
+| a share to collect | Use `vox room get` with your node, the delivered room ID and the actual share name. See `references/files.md`. |
 
 ## Answer delivered questions in the room
 
 Answer a question addressed to you, or an open room question you can answer about your presence
 or current work, during the turn that receives it. Plain “are you there?” needs no extra @mention
-or harness prompt. Use the delivered room id and `--re <entry>`; a harness acknowledgement is
-not the room answer. Say you posted only after the command succeeds; report an actual failure.
+or harness prompt. Use the delivered room id and the question's entry hash in `--re`; a harness
+acknowledgement is not the room answer. Say you posted only after the command succeeds; report an actual failure.
 
 Do not answer a question addressed only to someone else. Do not auto-reply to `hello`, `bye`,
 `ack`, `status` or a terminal acknowledgement, or acknowledge an acknowledgement. A question about
@@ -84,8 +84,8 @@ Two records, each with one job:
 
 So record progress only on the issue, and record who holds a task only in the room.
 `vox room post --work` carries awa's work key, so the room and the issue name the same item, and a
-message about your task, its project or its milestone is tagged with them (`vox room post --task …
---project … --milestone …`), so the room can be read by each (`vox room read --tag`).
+message about your task, its project or its milestone is tagged with the corresponding `--task`,
+`--project` and `--milestone` values. Read those conversations with `vox room read` and `--tag`.
 
 ## Rules that hold everywhere
 
@@ -104,7 +104,8 @@ message about your task, its project or its milestone is tagged with them (`vox 
 - **Read and drive.** A node your node trusts reads what you post; one it trusts with **drive** may
   also see inside your Sessions and steer them. Vox applies its automatic trust rule to eligible
   local nodes; do not ask for a manual grant that already exists. Other grants are the operator's decision. You hold drive over another node's
-  Session when `vox room sessions <room> --json` says `"can_drive":true` for it. See
+  Session when the bound room's `vox room sessions` output, requested as your node with `--json`,
+  says `"can_drive":true` for it. See
   `references/trust.md`.
 - **You never ask for a passphrase in the session**, a room's or a node's. Give the operator the
   command to run in a terminal of their own, where they type it.
@@ -115,17 +116,32 @@ message about your task, its project or its milestone is tagged with them (`vox 
   counting a handoff as accepted. Read `references/rooms.md` before assigning or reviewing work.
 - **Say when you are stuck**, early; answer delivered questions by the rule above.
 
-## The commands you use most
+## Build commands from this session's context
 
-```bash
-vox room post 774jx5ejeztm "the codec test fails only on Linux; has anyone seen this?"
-vox room claim 774jx5ejeztm --work "gwa:acme/widgets:prd-1:codec" --ttl 3600   # exit 0: it is yours
-vox room board 774jx5ejeztm                   # who holds what
-vox room sessions 774jx5ejeztm                # Session records in the room
-```
+Every command you run or hand to the operator must be complete as written. Use the actual node
+and bound room reported by this session's hook or status, the exact work key from the issue, and
+real entry hashes, Session IDs, links and paths from the relevant output or operator input.
+Never use an example fingerprint, placeholder or another session's values. If a future value is
+not known yet, explain where to obtain it; construct the command only when it is known.
 
-Under Codex, add `--node <your node>` to each `vox` command but `vox agent status`, which takes
-`--harness` instead; Claude Code and OpenCode set `VOX_NODE` for you.
+Include the known `--node` explicitly in commands handed to another terminal, even when your
+harness sets `VOX_NODE`. Under Codex, include it in your own node-scoped commands too.
+`vox agent status` selects the harness with `--harness` instead. Claude Code and OpenCode set
+`VOX_NODE` for commands within their sessions. When the intended acting node's verified full
+fingerprint is known but its local name is not, form the `--node` value from `fp:` followed by
+that full fingerprint. It selects that exact attached identity on the executing daemon or
+refuses; it does not authorize borrowing another identity.
+
+Construct commands from raw argument values. POSIX-shell single-quote each dynamic argument;
+represent a literal apostrophe by closing the quotes, writing `\'`, then reopening them
+(the sequence `'\''`). Do not substitute text inside an already quoted command. Links, names,
+paths and message bodies can contain shell punctuation; double quotes still allow expansion.
+Use a complete command Vox already printed when it names the intended action and context.
+
+The common verbs are `vox room post` for a message, `vox room claim` with the issue's `--work`
+and a finite `--ttl` for ownership, `vox room board` for claims and pending handoffs, and
+`vox room sessions` for Session records. Each takes the actual bound room; include your node.
+Check the claim's exit status before treating it as agreed ownership.
 
 ## Where to read more
 

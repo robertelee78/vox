@@ -89,9 +89,14 @@ impl ChannelState {
         }
         let previous = self.legacy_announced_through(profile.store())?;
         let mut readers = BTreeMap::new();
-        for peer in self.consented() {
+        // A peer advertises private support through its admitted feed. Unknown
+        // consent targets cannot have advertised it and are kept on disk by the
+        // governance index; this audience needs only the bounded admitted roster.
+        let peers: Vec<_> = self.authors.keys().copied().collect();
+        for peer in peers {
             if peer == me
                 || self.has_left(&peer)
+                || !self.has_consented(profile.store(), &peer)?
                 || !self.supports_private(profile.store(), &peer)?
             {
                 continue;
@@ -121,18 +126,15 @@ impl ChannelState {
             for seq in
                 through.saturating_add(1)..=verified.min(through.saturating_add(SCAN_PER_TURN))
             {
-                let Some(entry) = feed.get(
-                    &self
-                        .entries
-                        .read(profile.store(), &self.sek, &self.channel_id)?,
-                    seq,
-                )?
-                else {
+                let entries = self
+                    .entries
+                    .read(profile.store(), &self.sek, &self.channel_id)?;
+                let Some(entry) = feed.get(&entries, seq)? else {
                     break;
                 };
                 scanned = seq;
                 let hash = entry.entry_hash();
-                if self.step_bodies.contains(&hash) {
+                if self.entry_steps_in(entries.transaction(), &entry)? {
                     steps.push(hash);
                     if steps.len() == MAX_LEGACY_SESSION_HASHES {
                         break;
@@ -202,13 +204,14 @@ impl ChannelState {
                     &signer.public_key(),
                     now_ms,
                 )?;
-                Some((hash, id, log, sender, seen))
+                Some((entry, hash, id, log, sender, seen))
             } else {
                 None
             };
             let mut batch = profile.store().batch()?;
-            let posted = if let Some((hash, id, log, sender, seen)) = prepared {
-                self.publish_entry_into(&mut batch)?;
+            let posted = if let Some((entry, hash, id, log, sender, seen)) = prepared {
+                self.publish_entry_into(&mut batch, &entry)?;
+                self.observe_governance_into(profile.store(), &mut batch, &entry, id)?;
                 batch.put_segment(&self.channel_id, SegmentKind::LogDb, id, &log)?;
                 batch.put_segment(&self.channel_id, SegmentKind::Index, id, &seen)?;
                 batch.put_segment(
@@ -216,6 +219,17 @@ impl ChannelState {
                     SegmentKind::KeyMaterial,
                     SEG_SENDER,
                     &sender,
+                )?;
+                self.queue_retention(
+                    &mut batch,
+                    hash,
+                    Some(Tracked {
+                        log_id: id,
+                        first_seen_ms: now_ms,
+                        steps: false,
+                        claimed_ms: Some(now_ms),
+                        cache_id: None,
+                    }),
                 )?;
                 Some((hash, id))
             } else {
@@ -242,19 +256,10 @@ impl ChannelState {
             through: scanned,
             readers,
         });
-        if let Some((hash, id)) = posted {
+        if let Some((_, id)) = posted {
             self.entries.committed();
             self.next_log_id = id.saturating_add(1);
-            self.retention.track(
-                hash,
-                Tracked {
-                    log_id: id,
-                    first_seen_ms: now_ms,
-                    steps: false,
-                    claimed_ms: Some(now_ms),
-                    cache_id: None,
-                },
-            );
+
             self.gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.finish_entry_publication(profile.store())?;
         }

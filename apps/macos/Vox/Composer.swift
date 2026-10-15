@@ -1,5 +1,4 @@
-// The composer's To: and urgent (ADR-014 M-15): who a message is addressed to, and whether it may
-// interrupt their agents mid-turn.
+// The slim room composer's address/urgency tokens and field menu (ADR-033 CO-1, CO-2).
 
 import AppKit
 import SwiftUI
@@ -50,39 +49,38 @@ struct ComposerAddress: View {
     @State private var choosing = false
 
     var body: some View {
-        HStack(spacing: Space.s8 * scale) {
-            // A button that opens the members to tick, not a menu: macOS draws a menu's label in
-            // its own fixed size, and To: must follow the app's text size (WCAG 1.4.4).
-            Button { choosing.toggle() } label: {
-                Text(addressed).lineLimit(1).truncationMode(.tail)
-            }
-            // As wide as what it says ("To: the room", one name, or how many): a fixed width
-            // cut it ("TO: THE…").
-            .fixedSize()
-            .accessibilityLabel(addressedInFull)
-            .accessibilityIdentifier("compose-to")
-            .popover(isPresented: $choosing, arrowEdge: .top) {
-                VStack(alignment: .leading, spacing: Space.s8 * scale) {
-                    Text("To").eyebrow().secondaryText().accessibilityAddTraits(.isHeader)
-                    if model.members.isEmpty { Text("No other members yet").secondaryText() }
-                    ForEach(model.members) { member in
-                        tick(member.id, member.name, id: "to-\(member.name)")
-                        // Its open Sessions, under it: one of them alone can be written to.
-                        ForEach(openSessions(of: member.id), id: \.sessionId) { s in
-                            tick("\(member.id)/\(s.sessionId)", s.label,
-                                 id: "to-\(member.name)-\(s.shortId)")
-                                .voxPadding(.leading, Space.s20)
+        Button { choosing.toggle() } label: {
+            Image(systemName: "ellipsis.circle")
+        }
+        .buttonStyle(.borderless)
+        .help("Message options: To and Urgent")
+        .accessibilityLabel(addressedInFull)
+        .accessibilityIdentifier("compose-to")
+        .popover(isPresented: $choosing, arrowEdge: .top) {
+            VStack(alignment: .leading, spacing: Space.s8 * scale) {
+                Toggle(isOn: $urgent) { Text("Urgent") }
+                    .accessibilityIdentifier("compose-urgent")
+                    .accessibilityLabel(urgent ? "Urgent, on" : "Urgent, off")
+                Hairline()
+                ScrollView {
+                    VStack(alignment: .leading, spacing: Space.s8 * scale) {
+                        Text("To").eyebrow().secondaryText().accessibilityAddTraits(.isHeader)
+                        if model.members.isEmpty { Text("No other members yet").secondaryText() }
+                        ForEach(model.members) { member in
+                            tick(member.id, member.name, id: "to-\(member.name)")
+                            // Its open Sessions, under it: one of them alone can be written to.
+                            ForEach(openSessions(of: member.id), id: \.sessionId) { s in
+                                tick("\(member.id)/\(s.sessionId)", s.label,
+                                     id: "to-\(member.name)-\(s.shortId)")
+                                    .voxPadding(.leading, Space.s20)
+                            }
                         }
                     }
                 }
-                // Part of the composer, so at the conversation's text size (L-1b).
-                .conversationScale(Theme.scale)
-                .voxPadding(Space.s12)
+                .frame(maxHeight: 280 * scale)
             }
-            Toggle(isOn: $urgent) { Text("Urgent") }
-                .fixedSize()
-                .accessibilityIdentifier("compose-urgent")
-                .accessibilityLabel(urgent ? "Urgent, on" : "Urgent, off")
+            .conversationScale(Theme.scale)
+            .voxPadding(Space.s12)
         }
         .caption()
     }
@@ -102,26 +100,108 @@ struct ComposerAddress: View {
     }
 
     /// What is ticked, by name: each member, and each Session by its label.
-    private var names: [String] {
-        model.members.flatMap { member -> [String] in
-            (to.contains(member.id) ? [member.name] : [])
-                + openSessions(of: member.id)
-                .filter { to.contains("\(member.id)/\($0.sessionId)") }
-                .map(\.label)
-        }
-    }
-
-    /// Short enough for the composer's row at the window's narrowest: one name, or how many.
-    private var addressed: String {
-        switch names.count {
-        case 0: return "To: the room"
-        case 1: return "To: \(names[0])"
-        default: return "To: \(names.count) addressees"
-        }
-    }
+    private var names: [String] { to.sorted().map { Self.name($0, model: model) } }
 
     /// Every name, for VoiceOver and the proofs.
     private var addressedInFull: String {
         names.isEmpty ? "To: the room" : "To: " + names.joined(separator: ", ")
+    }
+
+    /// A saved target never silently disappears when its member or Session leaves the roster.
+    static func name(_ address: String, model: NodeModel) -> String {
+        let parts = address.split(separator: "/", maxSplits: 1).map(String.init)
+        guard let member = parts.first else { return address }
+        let name = model.members.first { $0.id == member }?.name ?? String(member.prefix(12))
+        guard parts.count == 2 else { return name }
+        let session = model.sessions.first { $0.nodeFingerprint == member && $0.sessionId == parts[1] }
+        return "\(name) / \(session?.label ?? String(parts[1].prefix(8)))"
+    }
+}
+
+/// Tokens are the selected effects, not a second copy of syntax that send could parse again.
+struct ComposerTokens: View {
+    @Environment(\.voxTextScale) private var scale
+    @ObservedObject var model: NodeModel
+    @Binding var to: Set<String>
+    @Binding var urgent: Bool
+
+    var body: some View {
+        if urgent || !to.isEmpty {
+            ScrollView(.horizontal) {
+                HStack(spacing: Space.s4 * scale) {
+                    if urgent {
+                        token("! Urgent", id: "compose-remove-urgent", help: "Remove urgency") { urgent = false }
+                    }
+                    ForEach(to.sorted(), id: \.self) { address in
+                        let name = ComposerAddress.name(address, model: model)
+                        token("@\(name)", id: "compose-remove-to-\(address)", help: "Remove address to \(name)") {
+                            to.remove(address)
+                        }
+                    }
+                }
+            }
+            .scrollIndicators(.hidden)
+            // Keep a usable viewport beside the elastic text field, even in a narrow room.
+            .frame(minWidth: 96 * scale, idealWidth: 160 * scale, maxWidth: 160 * scale)
+            .frame(height: Space.s24 * scale)
+        }
+    }
+
+    private func token(_ title: String, id: String, help: String, remove: @escaping () -> Void) -> some View {
+        Button(action: remove) {
+            HStack(spacing: Space.s4 * scale) {
+                Text(title).lineLimit(1)
+                Image(systemName: "xmark")
+            }
+            .caption()
+            .voxPadding(.horizontal, Space.s8)
+            .voxPadding(.vertical, Space.s4)
+            .background(RoundedRectangle(cornerRadius: Radius.control * scale).fill(VoxTokens.Colors.bgPanel))
+            .cardOutline()
+        }
+        .buttonStyle(.plain)
+        .help(help)
+        .accessibilityLabel(help)
+        .accessibilityIdentifier(id)
+    }
+}
+
+/// Convert completed person-input syntax to exact targets. A partial alias stays editable;
+/// submission also completes the final word. Unknown or ambiguous names remain ordinary text.
+enum ComposerInput {
+    static func tokens(_ input: String, members: [NodeModel.MemberRow], finish: Bool)
+        -> (text: String, to: Set<String>, urgent: Bool) {
+        var text = input, urgent = false, leading = true
+        let aliases = Dictionary(grouping: members, by: { $0.name.lowercased() })
+        var addressed: Set<String> = [], removed: [Range<String.Index>] = []
+        var start = text.startIndex
+        while start < text.endIndex {
+            if text[start].isWhitespace { start = text.index(after: start); continue }
+            let end = text[start...].firstIndex(where: \.isWhitespace) ?? text.endIndex
+            var content = start
+            // Consume the complete leading syntax once. After removing its token, sending
+            // must not find another leading ! left behind by a pasted "!! @name message".
+            if leading {
+                while content < end, text[content] == "!" {
+                    urgent = true
+                    content = text.index(after: content)
+                }
+            }
+            let word = text[content..<end]
+            if (end < text.endIndex || finish), word.first == "@" {
+                let alias = word.dropFirst().trimmingCharacters(in: .punctuationCharacters.subtracting(["#"]))
+                if let matches = aliases[alias.lowercased()], matches.count == 1 {
+                    addressed.insert(matches[0].id)
+                    removed.append(start..<end)
+                    start = end
+                    continue
+                }
+            }
+            if content != start { removed.append(start..<content) }
+            if content < end { leading = false }
+            start = end
+        }
+        for range in removed.reversed() { text.removeSubrange(range) }
+        return (text, addressed, urgent)
     }
 }

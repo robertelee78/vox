@@ -112,7 +112,7 @@ pub fn answers(ask: &RoomAsk, data_root: &std::path::Path) -> Vec<(&'static str,
         return vec![match link {
             Some(link) => (
                 "to join it",
-                vox_text::shell::command(&["vox", "room", "join", &link, "--node", node]),
+                vox_text::shell::node_command(&["vox", "room", "join", &link], node),
                 true,
             ),
             None => (
@@ -124,7 +124,23 @@ pub fn answers(ask: &RoomAsk, data_root: &std::path::Path) -> Vec<(&'static str,
     }
     vec![
         (
-            "to bind it",
+            "to create and bind a room",
+            vox_text::shell::node_command(
+                &[
+                    "vox",
+                    "room",
+                    "create",
+                    "--name",
+                    &crate::room_map::suggested_name(std::path::Path::new(&ask.dir)),
+                    "--bind",
+                    &ask.dir,
+                ],
+                node,
+            ),
+            true,
+        ),
+        (
+            "to bind an existing room",
             format!(
                 "run vox room join with the room's link, --node {node} and --bind {}",
                 ask.dir
@@ -133,16 +149,16 @@ pub fn answers(ask: &RoomAsk, data_root: &std::path::Path) -> Vec<(&'static str,
         ),
         (
             "to say no",
-            vox_text::shell::command(&[
-                "vox",
-                "agent",
-                "room",
-                "--none",
-                "--node",
+            vox_text::shell::node_command(
+                &[
+                    "vox",
+                    "agent",
+                    "room",
+                    "--none",
+                    &format!("--session={}", first.session),
+                ],
                 node,
-                "--session",
-                first.session.as_str(),
-            ]),
+            ),
             true,
         ),
     ]

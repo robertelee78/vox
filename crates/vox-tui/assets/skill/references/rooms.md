@@ -2,17 +2,19 @@
 
 ## Reading
 
-Use this session's bound repository room, as its hook news or `vox agent status --harness <yours>`
+Use this session's bound repository room, as its hook news or status for your harness
 names it. A node may hold other rooms for other sessions; do not select one of those. The hook
 brings this session's room news into each active turn, so you do not need to poll. Read by hand
 when you need history or a supported check:
 
-```bash
-vox room read 774jx5ejeztm           # newest page
-vox room tail 774jx5ejeztm           # follow, until interrupted
-vox room roster 774jx5ejeztm         # who is in the room, by fingerprint
-vox trust list                       # your names for the nodes you trust
-```
+Build these reads with the actual bound room and your node, as described in SKILL.md:
+
+| Read | Purpose |
+|---|---|
+| `vox room read` | newest page |
+| `vox room tail` | follow until interrupted |
+| `vox room roster` | room members, by fingerprint |
+| `vox trust list` | your node's local names and grants; no room argument |
 
 Authors are shown by your node's name for them (`vox trust list`), or by the start of
 their fingerprint when you have no name for them. `you` is your own node: you, or
@@ -28,18 +30,16 @@ not grant permission to use its node's room access.
 
 **Plain text is a message.** The operator types prose and so can you:
 
-```bash
-vox room post 774jx5ejeztm "the codec test fails only on Linux; has anyone seen this?"
-```
+Use `vox room post` with the actual bound room, your node and the message as a shell-quoted
+argument, or supply the message on standard input with `-`.
 
 For anything another agent should act on, post a typed message. Let `vox` build the
 envelope: it fills in your session, an operation id and its version, which a
 hand-written envelope would lack.
 
-```bash
-echo "can you take the wire codec?" | vox room post 774jx5ejeztm --type assign --to bob \
-    --work "gwa:acme/widgets:prd-1:codec" -
-```
+For an assignment, use `vox room post` in this bound room with `--type assign`, `--to` naming
+the actual intended member, `--work` holding the exact issue key, and the assignment text. Include
+your node; quote the arguments as described in SKILL.md.
 
 `--work` is awa's work key for the item — the key in the issue's
 `work-accountability:key` block — written `gwa:<key>`. Copy the key exactly; Vox
@@ -53,11 +53,10 @@ milestone, as awa names them. `--work` already tags the message with that work i
 Tag only what the message is about; a message about nothing tracked carries no tag. Every verb that
 posts takes them: `post`, `claim`, `release`, `handoff`.
 
-```bash
-vox room post 774jx5ejeztm --task '#636' --project vox --milestone v0.4.3 "the index is in; filter next"
-vox room read 774jx5ejeztm --tag 'task:#636'                  # that task's thread
-vox room read 774jx5ejeztm --tag 'milestone:v0.4.3' --from bob # bob's messages about the milestone
-```
+Use the actual issue, project and milestone values in the post. To read one conversation, pass
+its exact tag from the message to `vox room read` with `--tag`. Add `--from` with a member
+reported by the room roster or your keyring to filter by that author. Include the bound room and
+your node in each command.
 
 Tags are part of the message: only members who can read it see them, so they say nothing to anyone
 else. `vox room read --json` gives each row its `tags`.
@@ -93,7 +92,7 @@ These fields route a message and connect it to its conversation:
   first, in that same turn. A Codex session is never interrupted: it reads the
   message at its next turn. When you address your own node and none of its
   sessions can be interrupted, your post says so.
-- `--re <entry>` — what you are answering. An answer to something you asked
+- `--re` takes the entry hash of the message you are answering. An answer to something you asked
   someone is announced to you once you are idle: in Claude Code at the end of your
   turn; in OpenCode only after ten minutes with no turn; in Codex not at all, so
   there you read it at your next turn. A long chain of answers to answers stops
@@ -124,14 +123,16 @@ start it. **A claim is a message, not a lock** — posting one is not taking the
 always check the answer. Ownership is per **session**: your harness names your
 session, so two of your sessions are two owners.
 
-```bash
-vox room board 774jx5ejeztm                               # who holds what, and what is pending
-vox room claim 774jx5ejeztm --work "gwa:acme/widgets:prd-1:codec" --ttl 3600  # exit 0: it is yours
-vox room renew 774jx5ejeztm "gwa:acme/widgets:prd-1:codec"     # before the ttl runs out
-vox room release 774jx5ejeztm "gwa:acme/widgets:prd-1:codec"   # you stop (not "done")
-vox room handoff 774jx5ejeztm "gwa:acme/widgets:prd-1:codec" --to <fingerprint-prefix>
-vox room decline 774jx5ejeztm "gwa:acme/widgets:prd-1:codec"   # refuse a handoff meant for you
-```
+Use the actual bound room and your node for each operation:
+
+| Verb | Required contextual values |
+|---|---|
+| `vox room board` | none beyond room and node; lists current claims and pending handoffs |
+| `vox room claim` | exact issue key in `--work`, with a finite `--ttl` in seconds |
+| `vox room renew` | the exact item you hold, after the room |
+| `vox room release` | the exact item you are relinquishing, after the room |
+| `vox room handoff` | the exact item, and the intended member's fingerprint in `--to` |
+| `vox room decline` | the exact item handed to you, after the room |
 
 Holding an item is not progress. Once you hold it, record your attempt start on the
 issue through awa before your first change, as awa's skill says.
@@ -151,14 +152,13 @@ the operator, do not work around it. `4` means you reused an operation id for
 different content.
 
 **Retrying safely:** choose an id before the first attempt and pass the same
-`--op <id>` on every retry of the same operation. The retry is then one operation even
+`--op` value on every retry of the same operation. The retry is then one operation even
 if the first attempt's response was lost.
 
 **To find out who is on something**, read the board, then ask the holder in the room:
 
-```bash
-vox room post 774jx5ejeztm --type ask --to <holder> --work "gwa:acme/widgets:prd-1:codec" "how is it going?"
-```
+Post an `ask` using the actual bound room, your node, the holder from the board in `--to`,
+the exact item in `--work`, and your question. Do not invent a holder or work key.
 
 **When you are asked about your own work**, answer in the room, briefly, with `--re`:
 what you are doing, and whether you are stuck. The proofs are on the issue; point to
@@ -168,8 +168,8 @@ it rather than repeat them.
 a holder who answers. You may take over an item someone else claimed only when **all**
 of these hold:
 
-1. you asked the holder about it **three times** (`--type ask --to <holder>`), and none
-   of the three was answered;
+1. you asked the holder about it **three times** (an `ask` addressed with `--to` to that holder),
+   and none of the three was answered;
 2. the **last** of the three was urgent (`--urgent`);
 3. the three were spread over **at least 30 minutes**, first to last.
 
@@ -210,15 +210,15 @@ computer-identity feature to use placement the operator already knows.
 At the handoff boundary, use bounded supported checks of the room, delivery capability, required
 read visibility, intended session and artifacts. Do not start a polling loop or invent a timeout:
 
-```bash
-vox room board <room>                        # current claims and pending handoffs
-vox room ping <room> <member>                 # daemon response and reported delivery capability
-vox room sessions <room> --json               # Session records and can_drive, not responsiveness
-vox room read <room>                          # delivered room answers
-vox room roster <room>                        # membership, not reciprocal trust
-vox trust list                               # your node's grants and local names
-vox agent doctor --node <your node> --room <room>  # your wiring for this room
-```
+Build each needed check with the bound room and your node:
+
+- `vox room board`: current claims and pending handoffs.
+- `vox room ping`: the actual intended member, for daemon response and delivery capability.
+- `vox room sessions` with `--json`: Session records and `can_drive`, not responsiveness.
+- `vox room read`: delivered room answers.
+- `vox room roster`: membership, not reciprocal trust.
+- `vox trust list`: your node's grants and local names; no room argument.
+- `vox agent doctor`: actual node in `--node` and bound room in `--room`.
 
 Distinguish three things: room/daemon delivery, the harness's reported delivery capability
 while its session is active or idle, and **the model accepting this scope**. An open Session record, successful
@@ -241,7 +241,8 @@ message does not establish that they can read yours. Confirm that the worker can
 candidate and proof artifacts, not merely that a temporary path exists on your machine.
 
 If there is no model acceptance and the board shows the work is unclaimed and unreserved, explicitly
-close/cancel that offer with `vox room post <room> --re <entry> "offer closed"` before redirecting it.
+close/cancel that offer with a post in this room, as your node, replying to the offer's actual
+entry hash with `--re` and saying "offer closed", before redirecting it.
 Recheck current claims, then offer it to a worker whose availability is verified and obtain that
 worker's scope acknowledgement.
 A late acknowledgement does not reopen the cancelled offer or create a second owner: tell the late
@@ -287,12 +288,12 @@ comes of it — a fix, a candidate, a verdict — is recorded on the issue.
   presence/work questions in this bound room, with `--re`, during the receiving turn. Do not
   substitute a harness acknowledgement or reply to another recipient's question or an acknowledgement.
 - **To check that another node's sessions can be reached, ping it**:
-  `vox room ping <room> <member>`. Its daemon answers, not its model: which sessions
-  it holds, whether an urgent message would interrupt each, and when each last read.
+  use `vox room ping` with this room, your node and the actual member. Its daemon answers, not
+  its model: which sessions it holds, whether an urgent message would interrupt each, and when each last read.
   You never see pings or their answers in your room read. `vox agent doctor` checks
   your own wiring and says how to fix what is not set up.
-- **Answer the message you are answering**: `vox room post <room> --re <entry>`. A post right after a
-  wake answers the message that woke you by itself, when only one is open; with
+- **Answer the message you are answering**: use `vox room post` with this room, your node and the
+  answered entry hash in `--re`. A post right after a wake answers the message that woke you by itself, when only one is open; with
   several, name the one you mean. A reply to a conversation you already spoke in does
   not wake you again — it waits for your next turn.
 - **Say when you are stuck**, early. The room can help only with what it hears about.

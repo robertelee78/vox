@@ -27,6 +27,7 @@ use std::collections::{BTreeMap, BTreeSet};
 mod anchor_discovery;
 mod computer;
 mod local_trust;
+pub(crate) mod room_pause;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
@@ -297,18 +298,22 @@ impl Router {
                         move |node: NodeName,
                               session: String,
                               room: Digest32,
-                              bodies: Vec<String>| {
+                              bodies: Vec<String>,
+                              effects: Option<crate::session_sink::SourceEffects>| {
                             let weak = weak.clone();
                             Box::pin(async move {
                                 match weak.upgrade() {
                                     Some(inner) => {
-                                        Router { inner }
-                                            .post_session(&node, &session, room, bodies)
-                                            .await
+                                        let mut fresh = false;
+                                        let admission = Router { inner }
+                                            .post_session(&node, &session, room, bodies, effects, &mut fresh)
+                                            .await;
+                                        crate::session_sink::Posted { admission, fresh }
                                     }
                                     None => vox_core::node::daemonipc::SessionAdmission::Refused(
                                         "the daemon stopped".into(),
-                                    ),
+                                    )
+                                    .into(),
                                 }
                             })
                         },
@@ -1252,14 +1257,31 @@ impl Router {
         }
         // **New** is new to this node: no registration before, and no Session of it in any room
         // its log holds, so a daemon restarted mid-session still knows it (ADR-029 RB-5).
-        let seen = handle.as_ref().is_some_and(|h| {
-            let me = h.view().identity.as_ref().map(|i| i.fingerprint);
-            h.view().open_channels.iter().any(|d| {
-                vox_core::node::sessions::fold(d)
-                    .iter()
-                    .any(|s| Some(s.node) == me && s.id == id)
-            })
-        });
+        let seen = if let Some(handle) = &handle {
+            let rooms: Vec<_> = handle
+                .view()
+                .open_channels
+                .iter()
+                .map(|d| d.channel_id)
+                .collect();
+            let mut seen = false;
+            for room in rooms {
+                if handle
+                    .session_seen(room, &id)
+                    .await
+                    .map_err(|why| Refusal::Failed {
+                        node: node.clone(),
+                        why,
+                    })?
+                {
+                    seen = true;
+                    break;
+                }
+            }
+            seen
+        } else {
+            false
+        };
         Ok(DaemonFrame::SessionRegistered {
             info: g.info,
             room,
@@ -1289,6 +1311,7 @@ impl Router {
             id: reg.session.clone(),
             harness: reg.harness.clone(),
             name: reg.name.clone(),
+            cwd: reg.start.clone().filter(|cwd| !cwd.is_empty()),
         });
         let member = handle.view().channels.iter().any(|c| c.channel_id == room);
         let joins = Arc::clone(lock(&self.inner.joins).entry(node.clone()).or_default());
@@ -1629,6 +1652,7 @@ impl Router {
                 ok: false,
                 said: "this node is locked; nothing was sent".into(),
                 code: None,
+                pause: None,
             },
         };
         let _ = vox_core::node::ipc::write_frame(
@@ -1664,16 +1688,19 @@ impl Router {
                 ok: false,
                 said: "no drive request arrived in time".into(),
                 code: None,
+                pause: None,
             },
-            (_, Err(_)) if buf.len() > MAX_REQUEST => Answer {
+            (_, _) if buf.len() > MAX_REQUEST => Answer {
                 ok: false,
                 said: "the drive request is too long".into(),
                 code: None,
+                pause: None,
             },
             (_, Err(_)) => Answer {
                 ok: false,
                 said: "not a drive request this vox reads".into(),
                 code: None,
+                pause: None,
             },
             (Ok(()), Ok(req)) => self.drive(node, handle, &info, req).await,
         };
@@ -1698,6 +1725,7 @@ impl Router {
             ok: false,
             said,
             code: None,
+            pause: None,
         };
         if req.v != 1 {
             return refuse(format!(
@@ -1731,16 +1759,50 @@ impl Router {
         // operator (SC-2), which reaches here only from its own socket (`drive_own`).
         // Said without this node's name for itself, which the driver may not know it by: the
         // driver names it (`code`).
-        if me != Some(info.peer) && !view.drive.contains(&info.peer) {
+        if !matches!(
+            &req.action,
+            Action::RoomPause {
+                paused: None,
+                expected_instance: None,
+                after: None,
+                expected: None
+            }
+        ) && me != Some(info.peer)
+            && !view.drive.contains(&info.peer)
+        {
             return Answer {
                 ok: false,
                 said: vox_agentcomms::drive::no_drive("the session's node"),
                 code: Some(vox_agentcomms::drive::NO_DRIVE.to_owned()),
+                pause: None,
             };
         }
         let Ok(paths) = self.inner.account.node_paths(node) else {
             return refuse("this node's files cannot be read".into());
         };
+        if let Action::RoomPause {
+            paused,
+            expected_instance,
+            after,
+            expected,
+        } = &req.action
+        {
+            if !req.session.is_empty() {
+                return refuse("a room pause must not select a Session".into());
+            }
+            return self
+                .pause_room(
+                    node,
+                    handle,
+                    info,
+                    generation,
+                    *paused,
+                    *expected_instance,
+                    after.as_deref(),
+                    *expected,
+                )
+                .await;
+        }
         // DR-5 and TA-5: exactly this session, open on this node, and none other.
         let Some(reg) = crate::wake::registration(&paths, &req.session) else {
             return refuse(
@@ -1784,7 +1846,7 @@ impl Router {
             | Action::Answer { r#ref, .. } => {
                 copy.insert("ref".into(), serde_json::json!(r#ref));
             }
-            Action::Interrupt | Action::Stop => {}
+            Action::Interrupt | Action::Stop | Action::RoomPause { .. } => {}
             Action::File {
                 name,
                 size,
@@ -1836,6 +1898,7 @@ impl Router {
                 ok: false,
                 said: vox_agentcomms::drive::no_drive("the session's node"),
                 code: Some(vox_agentcomms::drive::NO_DRIVE.to_owned()),
+                pause: None,
             };
         }
         let Some(current_reg) = crate::wake::registration(&paths, &req.session) else {
@@ -1950,11 +2013,13 @@ impl Router {
                 ok: true,
                 said,
                 code: None,
+                pause: None,
             },
             Err(said) => Answer {
                 ok: false,
                 said,
                 code: None,
+                pause: None,
             },
         }
     }
@@ -2038,6 +2103,16 @@ impl Router {
         reg: &crate::wake::Session,
         action: &crate::drive::Action,
     ) -> Result<String, String> {
+        self.steer_guarded(node, reg, action, None).await
+    }
+
+    async fn steer_guarded(
+        &self,
+        node: &NodeName,
+        reg: &crate::wake::Session,
+        action: &crate::drive::Action,
+        guard: Option<room_pause::InterruptGuard>,
+    ) -> Result<String, String> {
         use crate::codex_mirror::Steer;
         use crate::drive::Action;
         let steer = match action {
@@ -2050,18 +2125,36 @@ impl Router {
             }
             _ => return Err("not an input for the session's terminal".into()),
         };
-        let typed = match &steer {
-            Steer::Text(t) => Some(t.clone()),
+        // Reserve before the harness can emit its prompt echo. A full echo window refuses the
+        // send, and an attempted send's unknown outcome retains the marker even on cancellation.
+        let mut delivery = match &steer {
+            Steer::Text(t) => Some(self.inner.sink.reserve_delivery(node, &reg.session, t)?),
             _ => None,
         };
         let done = match reg.harness.as_str() {
             "codex" if !reg.codex_home.is_empty() => {
+                if let Some(reservation) = &mut delivery {
+                    reservation.attempting();
+                }
                 self.inner
                     .codex
-                    .steer(std::path::Path::new(&reg.codex_home), &reg.session, steer)
+                    .steer_guarded(
+                        std::path::Path::new(&reg.codex_home),
+                        &reg.session,
+                        steer,
+                        guard,
+                    )
                     .await
             }
-            "opencode" => self.inner.opencode.steer(&reg.session, steer).await,
+            "opencode" => {
+                if let Some(reservation) = &mut delivery {
+                    reservation.attempting();
+                }
+                self.inner
+                    .opencode
+                    .steer_guarded(&reg.session, steer, guard)
+                    .await
+            }
             "claude" => {
                 use crate::claude_injector::Act;
                 let act = match steer {
@@ -2072,10 +2165,15 @@ impl Router {
                     Steer::Slash { cmd, args } => Act::Slash(format!("/{cmd} {args}")),
                 };
                 let reg = reg.clone();
-                tokio::task::spawn_blocking(move || crate::claude_injector::drive(&reg, &act))
-                    .await
-                    .unwrap_or_else(|_| Err("the delivery to the terminal failed".into()))
-                    .map(|()| "delivered to its terminal".to_owned())
+                if let Some(reservation) = &mut delivery {
+                    reservation.attempting();
+                }
+                tokio::task::spawn_blocking(move || {
+                    crate::claude_injector::drive_guarded(&reg, &act, guard.as_ref())
+                })
+                .await
+                .unwrap_or_else(|_| Err("the delivery to the terminal failed".into()))
+                .map(|()| "delivered to its terminal".to_owned())
             }
             "codex" => Err(
                 "this Codex session registered no CODEX_HOME, so Vox cannot reach its app-server"
@@ -2083,9 +2181,9 @@ impl Router {
             ),
             other => Err(format!("Vox cannot drive a {other} session")),
         };
-        if let (Ok(_), Some(t)) = (&done, typed) {
-            self.inner.sink.delivered_text(node, &reg.session, &t);
-        }
+        // Backend string errors do not establish that no bytes reached the harness. Preserve
+        // attempted markers for their full 30 seconds; only a never-attempted route rolls back.
+        drop(delivery);
         done
     }
 
@@ -2199,6 +2297,8 @@ impl Router {
         session: &str,
         room: Digest32,
         bodies: Vec<String>,
+        effects: Option<crate::session_sink::SourceEffects>,
+        fresh: &mut bool,
     ) -> vox_core::node::daemonipc::SessionAdmission {
         use vox_core::node::{
             daemonipc::SessionAdmission,
@@ -2243,46 +2343,72 @@ impl Router {
             // Try the retained tail first after recovery. One bounded batch frees enough room
             // for one ordinary admission; if a room boundary needs more work, refuse the new
             // batch truthfully rather than evicting old work while saving is possible.
-            let (removed, progressed) = flush_session_hold(&handle, &key, session_hold).await;
-            let still_held = !session_hold.items.is_empty();
-            let would_overflow = session_hold.bytes + bodies.iter().map(held_charge).sum::<usize>()
-                > HELD_BYTES
-                || session_hold.items.len() + bodies.len() > HELD_ITEMS;
+            let (removed, progressed, committed) =
+                flush_session_hold(&handle, &key, session_hold).await;
+            let empty = session_hold.items.is_empty();
             held.bytes -= removed;
-            if !still_held {
+            if empty {
                 held.sessions.remove(&key);
-            } else if progressed && would_overflow {
-                return SessionAdmission::Refused(
-                    "earlier Session activity is recovering; this batch was not retained".into(),
-                );
-            } else {
+            }
+            if let Some((saved_room, effects)) = committed {
+                let resolutions = self.inner.sink.committed_source(node, session, effects);
+                save_source_resolutions(&handle, &mut held, &key, saved_room, resolutions).await;
+            }
+            if let Some(session_hold) = held.sessions.get(&key) {
+                let would_overflow = session_hold.bytes
+                    + bodies.iter().map(held_charge).sum::<usize>()
+                    + effects
+                        .as_ref()
+                        .map_or(0, crate::session_sink::SourceEffects::charge)
+                    > HELD_BYTES
+                    || session_hold.items.len() + bodies.len() > HELD_ITEMS;
+                if progressed && would_overflow {
+                    return SessionAdmission::Refused(
+                        "earlier Session activity is recovering; this batch was not retained"
+                            .into(),
+                    );
+                }
                 return held.hold(
                     key,
                     room,
                     bodies,
                     "earlier activity is held only in memory".into(),
+                    effects,
                 );
             }
         }
         // Reserve enough volatile capacity for a lost receipt before handing ownership to
         // the actor. An ambiguous copy must stay bounded and must never be retried.
-        if !held.can_hold_new(&key, &bodies) {
+        if !held.can_hold_new(&key, &bodies, effects.as_ref()) {
             return SessionAdmission::Refused(
                 "Session admission recovery capacity is full; this batch was not retained".into(),
             );
         }
         match save_session_batch(&handle, room, session, bodies.clone()).await {
-            Ok(saved) => SessionAdmission::Committed {
-                first: saved.first,
-                last: saved.last,
-            },
+            Ok(saved) => {
+                *fresh = saved.fresh;
+                if saved.fresh {
+                    if let Some(effects) = effects {
+                        let resolutions = self.inner.sink.committed_source(node, session, effects);
+                        save_source_resolutions(&handle, &mut held, &key, room, resolutions).await;
+                    }
+                }
+                if saved.first == 0 && saved.last == 0 {
+                    SessionAdmission::Skipped
+                } else {
+                    SessionAdmission::Committed {
+                        first: saved.first,
+                        last: saved.last,
+                    }
+                }
+            }
             Err(SessionSaveError::Save(error))
                 if matches!(error, vox_core::error::Error::Storage { .. }) =>
             {
-                held.hold(key, room, bodies, error.to_string())
+                held.hold(key, room, bodies, error.to_string(), effects)
             }
             Err(SessionSaveError::Save(error)) => SessionAdmission::Refused(error.to_string()),
-            Err(SessionSaveError::Unconfirmed(why)) => held.freeze(key, room, bodies, why),
+            Err(SessionSaveError::Unconfirmed(why)) => held.freeze(key, room, bodies, why, effects),
         }
     }
 
@@ -2384,10 +2510,14 @@ impl Router {
                     continue;
                 };
                 let Some(held) = holds.sessions.get_mut(&key) else { continue; };
-                let (removed, made_progress) = flush_session_hold(&handle, &key, held).await;
+                let (removed, made_progress, committed) = flush_session_hold(&handle, &key, held).await;
                 let empty = held.items.is_empty();
                 holds.bytes -= removed;
                 if empty { holds.sessions.remove(&key); }
+                if let Some((room, effects)) = committed {
+                    let resolutions = router.inner.sink.committed_source(&key.0, &key.1, effects);
+                    save_source_resolutions(&handle, &mut holds, &key, room, resolutions).await;
+                }
                 progressed = made_progress;
             }
         });
@@ -3742,6 +3872,13 @@ fn held_charge(body: &String) -> usize {
     body.capacity()
         .saturating_add(4 * std::mem::size_of::<HeldItem>() + 32)
 }
+fn held_item_charge(item: &HeldItem) -> usize {
+    held_charge(&item.body)
+        + item
+            .effects
+            .as_ref()
+            .map_or(0, crate::session_sink::SourceEffects::charge)
+}
 const HELD_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
 
 #[derive(Default)]
@@ -3763,6 +3900,7 @@ struct HeldItem {
     room: vox_core::hash::Digest32,
     body: String,
     ordinal: u64,
+    effects: Option<crate::session_sink::SourceEffects>,
 }
 struct HeldLoss {
     room: vox_core::hash::Digest32,
@@ -3779,7 +3917,7 @@ impl SessionHolds {
             let before = held.bytes;
             held.items.retain(|item| item.room != *room);
             held.items.shrink_to_fit();
-            held.bytes = held.items.iter().map(|item| held_charge(&item.body)).sum();
+            held.bytes = held.items.iter().map(held_item_charge).sum();
             self.bytes -= before - held.bytes;
             if held.loss.as_ref().is_some_and(|loss| loss.room == *room) { held.loss = None; }
             if held.unconfirmed_room == Some(*room) { held.unconfirmed_room = None; }
@@ -3803,8 +3941,14 @@ impl SessionHolds {
         });
     }
 
-    fn can_hold_new(&self, key: &(NodeName, String), bodies: &[String]) -> bool {
-        let added = bodies.iter().map(held_charge).sum::<usize>();
+    fn can_hold_new(
+        &self,
+        key: &(NodeName, String),
+        bodies: &[String],
+        effects: Option<&crate::session_sink::SourceEffects>,
+    ) -> bool {
+        let added = bodies.iter().map(held_charge).sum::<usize>()
+            + effects.map_or(0, crate::session_sink::SourceEffects::charge);
         (self.sessions.contains_key(key) || self.sessions.len() < HELD_SESSIONS)
             && added <= HELD_BYTES
             && bodies.len() <= HELD_ITEMS
@@ -3825,8 +3969,9 @@ impl SessionHolds {
         room: vox_core::hash::Digest32,
         bodies: Vec<String>,
         why: String,
+        effects: Option<crate::session_sink::SourceEffects>,
     ) -> vox_core::node::daemonipc::SessionAdmission {
-        let _ = self.hold(key.clone(), room, bodies, why.clone());
+        let _ = self.hold(key.clone(), room, bodies, why.clone(), effects);
         if let Some(held) = self.sessions.get_mut(&key) {
             held.unconfirmed_room = Some(room);
         }
@@ -3839,6 +3984,7 @@ impl SessionHolds {
         room: vox_core::hash::Digest32,
         bodies: Vec<String>,
         why: String,
+        mut effects: Option<crate::session_sink::SourceEffects>,
     ) -> vox_core::node::daemonipc::SessionAdmission {
         use vox_core::node::daemonipc::SessionAdmission;
         if !self.sessions.contains_key(&key) && self.sessions.len() == HELD_SESSIONS {
@@ -3854,7 +4000,10 @@ impl SessionHolds {
                 ));
             }
         }
-        let added: usize = bodies.iter().map(held_charge).sum();
+        let added = bodies.iter().map(held_charge).sum::<usize>()
+            + effects
+                .as_ref()
+                .map_or(0, crate::session_sink::SourceEffects::charge);
         let prior = self.sessions.get(&key).map_or(0, |s| s.bytes);
         let retained = prior.saturating_add(added).min(HELD_BYTES);
         let prior_count = self.sessions.get(&key).map_or(0, |held| held.items.len());
@@ -3882,11 +4031,23 @@ impl SessionHolds {
                 if must_drop == 0 && must_drop_items == 0 {
                     break;
                 }
+                // Exact source admission requires every accepted split coordinate. Losing
+                // an earlier part would pin later retained parts at the retry head forever.
+                // This entire loop is preflight: refuse the newcomer before dropping even
+                // an unkeyed row that precedes the protected source or its effects ticket.
+                if serde_json::from_str::<serde_json::Value>(&item.body)
+                    .is_ok_and(|value| value.get("_vox_source").is_some())
+                {
+                    return SessionAdmission::Refused(
+                        "source activity fills the volatile hold; this new batch was not retained"
+                            .into(),
+                    );
+                }
                 if loss_room.is_some_and(|old| old != item.room) {
                     return SessionAdmission::Refused("unsaved activity from an earlier room fills the volatile hold; this batch was not retained".into());
                 }
                 loss_room = Some(item.room);
-                must_drop = must_drop.saturating_sub(held_charge(&item.body));
+                must_drop = must_drop.saturating_sub(held_item_charge(item));
                 must_drop_items = must_drop_items.saturating_sub(1);
             }
         }
@@ -3894,20 +4055,22 @@ impl SessionHolds {
         held.why = why.clone();
         for body in bodies {
             held.ordinal = held.ordinal.saturating_add(1);
-            held.bytes += held_charge(&body);
-            self.bytes += held_charge(&body);
-            held.items.push_back(HeldItem {
+            let item = HeldItem {
                 room,
                 body,
                 ordinal: held.ordinal,
-            });
+                effects: effects.take(),
+            };
+            held.bytes += held_item_charge(&item);
+            self.bytes += held_item_charge(&item);
+            held.items.push_back(item);
         }
         while held.bytes > HELD_BYTES || held.items.len() > HELD_ITEMS {
             let Some(old) = held.items.pop_front() else {
                 break;
             };
-            held.bytes -= held_charge(&old.body);
-            self.bytes -= held_charge(&old.body);
+            held.bytes -= held_item_charge(&old);
+            self.bytes -= held_item_charge(&old);
             let v = serde_json::from_str::<serde_json::Value>(&old.body).unwrap_or_default();
             let named = format!(
                 "{} at {} (uncommitted held item {})",
@@ -3939,12 +4102,16 @@ async fn flush_session_hold(
     handle: &vox_core::node::actor::NodeHandle,
     key: &(NodeName, String),
     held: &mut HeldSession,
-) -> (usize, bool) {
+) -> (
+    usize,
+    bool,
+    Option<(Digest32, crate::session_sink::SourceEffects)>,
+) {
     if held.unconfirmed_room.is_some() {
-        return (0, false);
+        return (0, false, None);
     }
     let Some(front) = held.items.front() else {
-        return (0, false);
+        return (0, false, None);
     };
     let room = held.loss.as_ref().map_or(front.room, |loss| loss.room);
     let notice = held.loss.as_ref().map(|loss| serde_json::json!({
@@ -3960,6 +4127,9 @@ async fn flush_session_hold(
     } else {
         for item in &held.items {
             if item.room != room
+                // Freshness is one boolean for the admission. An item carrying source
+                // effects gets its own receipt, never a duplicate/new-source mixture.
+                || (!bodies.is_empty() && (front.effects.is_some() || item.effects.is_some()))
                 || bytes + item.body.len() > vox_core::node::session_ingress::MAX_BATCH_BYTES
                 || bodies.len() == vox_core::node::session_ingress::MAX_BATCH_ITEMS
             {
@@ -3971,32 +4141,96 @@ async fn flush_session_hold(
     }
     let count = bodies.len();
     match save_session_batch(handle, room, &key.1, bodies).await {
-        Ok(_) => {
+        Ok(saved) => {
             if notice_only {
                 held.loss = None;
-                return (0, true);
+                return (0, true, None);
             }
             let mut released = 0;
+            let mut committed = None;
             for _ in 0..count {
-                if let Some(item) = held.items.pop_front() {
-                    released += held_charge(&item.body);
+                if let Some(mut item) = held.items.pop_front() {
+                    released += held_item_charge(&item);
+                    if saved.fresh {
+                        committed = item.effects.take().map(|effects| (item.room, effects));
+                    }
                 }
             }
             // Returning credits also releases now-unused deque slots; a drained queue cannot
             // keep a history-sized allocation while lending those credits to another session.
             held.items.shrink_to_fit();
             held.bytes -= released;
-            (released, true)
+            (released, true, committed)
         }
         Err(SessionSaveError::Save(error)) => {
             held.why = error.to_string();
-            (0, false)
+            (0, false, None)
         }
         Err(SessionSaveError::Unconfirmed(why)) => {
             held.unconfirmed_room = Some(room);
             held.why = why;
-            (0, false)
+            (0, false, None)
         }
+    }
+}
+
+// Source admission has already committed. Retiring its exact request tickets is not undone
+// by a later transcript-storage problem. Resolution rows use the existing charged hold and
+// one bounded storage attempt; this path never re-enters the Poster/admission mutex.
+async fn save_source_resolutions(
+    handle: &NodeHandle,
+    holds: &mut SessionHolds,
+    key: &(NodeName, String),
+    room: Digest32,
+    bodies: Vec<String>,
+) {
+    use vox_core::node::daemonipc::SessionAdmission;
+    if bodies.is_empty() {
+        return;
+    }
+    // An ask may still be awaiting its own admission when the source snapshot is captured.
+    // Refuse an unpublishable resolution explicitly rather than pinning the retry head with
+    // a row that can never pass the same Session size/shape checks as ordinary activity.
+    for body in &bodies {
+        let checked = serde_json::from_str::<serde_json::Value>(body)
+            .map_err(|error| error.to_string())
+            .and_then(|mut value| {
+                let object = value.as_object_mut().ok_or("resolution is not an object")?;
+                object.insert("seq".into(), u64::MAX.into());
+                object.insert("session".into(), key.1.clone().into());
+                vox_core::node::content::SessionEntry::new(0, &key.1, &value.to_string())
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            });
+        if let Err(why) = checked {
+            eprintln!("vox daemon: {}: session {}: source activity is committed, but its request resolutions cannot be saved: {why}", key.0, key.1);
+            return;
+        }
+    }
+    let already_held = holds.sessions.contains_key(key);
+    let outcome = holds.hold(
+        key.clone(),
+        room,
+        bodies,
+        "source activity committed; its request resolutions are awaiting storage".into(),
+        None,
+    );
+    if !matches!(outcome, SessionAdmission::Held(_)) {
+        eprintln!("vox daemon: {}: session {}: source activity is committed, but its request resolutions were not saved: {outcome:?}", key.0, key.1);
+        return;
+    }
+    if !already_held {
+        if let Some(held) = holds.sessions.get_mut(key) {
+            let (removed, _, _) = flush_session_hold(handle, key, held).await;
+            let empty = held.items.is_empty();
+            holds.bytes -= removed;
+            if empty {
+                holds.sessions.remove(key);
+            }
+        }
+    }
+    if let Some(held) = holds.sessions.get(key) {
+        eprintln!("vox daemon: {}: session {}: source activity is committed; request resolutions remain only in the bounded volatile hold: {}", key.0, key.1, held.why);
     }
 }
 
@@ -4091,8 +4325,9 @@ async fn enqueue_session_end(
             room,
             bodies,
             "earlier activity is held only in memory".into(),
+            None,
         )
-    } else if !held.can_hold_new(&key, &bodies) {
+    } else if !held.can_hold_new(&key, &bodies, None) {
         vox_core::node::daemonipc::SessionAdmission::Refused(
             "Session admission recovery capacity is full; end record was not retained".into(),
         )
@@ -4105,12 +4340,12 @@ async fn enqueue_session_end(
             Err(SessionSaveError::Save(error))
                 if matches!(error, vox_core::error::Error::Storage { .. }) =>
             {
-                held.hold(key, room, bodies, error.to_string())
+                held.hold(key, room, bodies, error.to_string(), None)
             }
             Err(SessionSaveError::Save(error)) => {
                 vox_core::node::daemonipc::SessionAdmission::Refused(error.to_string())
             }
-            Err(SessionSaveError::Unconfirmed(why)) => held.freeze(key, room, bodies, why),
+            Err(SessionSaveError::Unconfirmed(why)) => held.freeze(key, room, bodies, why, None),
         }
     };
     if !matches!(
@@ -4200,47 +4435,113 @@ const TITLE_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
 /// Claude Code's own title only while there is none, as the hooks read them
 /// (`agent_hook::session_name`).
 ///
-/// Nothing else of the transcript is kept: each read's lines are dropped once their titles are
-/// taken, and only a line not yet ended is held until the next read ends it.
+/// Nothing else of the transcript is kept. The scanner retains offsets and a tiny marker
+/// match, including across incomplete lines. A complete title line is parsed from the file;
+/// unrelated JSON values are skipped, never collected as a transcript body.
 #[derive(Default)]
 struct Titles {
-    /// Bytes read so far.
+    /// Bytes scanned so far, including a line not yet ended.
     offset: u64,
-    /// A line read only in part, finished by the next read.
-    partial: String,
+    /// Start of the unfinished line. Its bytes remain in the transcript, not in memory.
+    line_start: u64,
+    marker_match: usize,
+    has_title: bool,
     custom: Option<String>,
     made: Option<String>,
+}
+
+/// Deserialize just the current name fields. Unknown fields use Serde's streaming skip path,
+/// so even a title record beside a large tool result does not allocate that result.
+#[derive(serde::Deserialize)]
+struct TranscriptTitle {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default, rename = "customTitle")]
+    custom: Option<String>,
+    #[serde(default, rename = "aiTitle")]
+    made: Option<String>,
+}
+
+/// A hook uses the same streaming title reader as the daemon. Tool-result lines are
+/// skipped from fixed-size buffers, never allocated as a complete transcript line.
+pub(crate) fn transcript_name(path: &std::path::Path) -> Option<String> {
+    Titles::default().read(path).name()
 }
 
 impl Titles {
     fn read(mut self, path: &std::path::Path) -> Self {
         use std::io::{Read as _, Seek as _, SeekFrom};
+        const MARKER: &[u8] = b"-title\"";
         let Ok(mut file) = std::fs::File::open(path) else {
             return self;
         };
-        // A transcript that got shorter was written anew: read from its start.
-        if file.metadata().is_ok_and(|m| m.len() < self.offset) {
-            self = Self::default();
-        }
-        if file.seek(SeekFrom::Start(self.offset)).is_err() {
-            return self;
-        }
-        let mut bytes = Vec::new();
-        let Ok(n) = file.read_to_end(&mut bytes) else {
+        let Ok(metadata) = file.metadata() else {
             return self;
         };
-        self.offset += n as u64;
-        self.partial.push_str(&String::from_utf8_lossy(&bytes));
-        let done = self.partial.rfind('\n').map_or(0, |i| i + 1);
-        let lines: String = self.partial.drain(..done).collect();
-        for line in lines.lines().filter(|l| l.contains("-title\"")) {
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-                continue;
+        // A transcript that got shorter was written anew: read from its start.
+        if metadata.len() < self.offset {
+            self = Self::default();
+        }
+        // A fixed end avoids following a busy writer forever during this blocking read.
+        let end = metadata.len();
+        let mut bytes = [0_u8; 8192];
+        while self.offset < end {
+            if file.seek(SeekFrom::Start(self.offset)).is_err() {
+                break;
+            }
+            let take = bytes
+                .len()
+                .min(usize::try_from(end - self.offset).unwrap_or(usize::MAX));
+            let n = match file.read(&mut bytes[..take]) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
             };
-            match v["type"].as_str() {
-                Some("custom-title") => self.custom = v["customTitle"].as_str().map(str::to_owned),
-                Some("ai-title") => self.made = v["aiTitle"].as_str().map(str::to_owned),
-                _ => {}
+            for byte in &bytes[..n] {
+                self.offset += 1;
+                if *byte != b'\n' {
+                    if !self.has_title {
+                        if *byte == MARKER[self.marker_match] {
+                            self.marker_match += 1;
+                            self.has_title = self.marker_match == MARKER.len();
+                        } else {
+                            // The marker has no '-' after its first byte, so this is also its
+                            // only possible overlapping start.
+                            self.marker_match = usize::from(*byte == MARKER[0]);
+                        }
+                    }
+                    continue;
+                }
+                if self.has_title {
+                    // Reread only a complete candidate, with fixed-size I/O buffers. There is
+                    // no maximum line length that could silently discard a valid rename.
+                    if file.seek(SeekFrom::Start(self.line_start)).is_err() {
+                        self.offset = self.line_start;
+                        self.marker_match = 0;
+                        self.has_title = false;
+                        return self;
+                    }
+                    let line = (&mut file).take(self.offset - self.line_start);
+                    match serde_json::from_reader::<_, TranscriptTitle>(std::io::BufReader::new(
+                        line,
+                    )) {
+                        Ok(title) => match title.kind.as_str() {
+                            "custom-title" => self.custom = title.custom,
+                            "ai-title" => self.made = title.made,
+                            _ => {}
+                        },
+                        // Retry an I/O failure from this line's beginning on the next read.
+                        Err(e) if e.is_io() => {
+                            self.offset = self.line_start;
+                            self.marker_match = 0;
+                            self.has_title = false;
+                            return self;
+                        }
+                        Err(_) => {}
+                    }
+                }
+                self.line_start = self.offset;
+                self.marker_match = 0;
+                self.has_title = false;
             }
         }
         self

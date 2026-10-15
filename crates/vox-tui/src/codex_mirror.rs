@@ -33,11 +33,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use futures_util::{SinkExt as _, StreamExt as _};
 use serde_json::{json, Map, Value};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 use tokio_tungstenite::tungstenite::Message;
+use tokio_util::sync::CancellationToken;
 use vox_core::node::paths::NodeName;
 
 use vox_agentcomms::activity::{one_line, VERSION};
@@ -46,7 +48,18 @@ use vox_core::node::content::MAX_TEXT_LEN;
 fn split(m: Map<String, Value>, big: &str) -> Vec<String> {
     vox_agentcomms::activity::split(m, big, MAX_TEXT_LEN)
 }
-use crate::session_sink::{Given, Sink};
+use crate::session_sink::{Given, RequestTicket, Sink};
+
+const MAX_CONNECTIONS: usize = 64;
+const MAX_THREADS: usize = 64;
+const MAX_COMMANDS: usize = 32;
+const MAX_COMMAND_BYTES: usize = 64 << 10;
+const MAX_MESSAGE_BYTES: usize = 4 << 20;
+const MAX_ASKS: usize = 64;
+const MAX_ASK_BYTES: usize = 4 << 20;
+const MAX_STARTED: usize = 128;
+const MAX_ID_BYTES: usize = 4096;
+const CALL_WITHIN: Duration = Duration::from_secs(30);
 
 /// Where a `CODEX_HOME`'s app-server listens.
 #[must_use]
@@ -96,9 +109,17 @@ pub enum Steer {
 /// The daemon's Codex observers, one per app-server.
 pub struct CodexMirror {
     sink: Arc<Sink>,
-    conns: Mutex<BTreeMap<PathBuf, mpsc::UnboundedSender<Cmd>>>,
+    conns: Mutex<BTreeMap<PathBuf, Connection>>,
+    /// Includes stopped connections still reporting their final notice.
+    live: Arc<Semaphore>,
     /// Sessions a connection is subscribed to now: their hook activity is not posted again.
     subscribed: Arc<Mutex<BTreeSet<String>>>,
+}
+
+#[derive(Clone)]
+struct Connection {
+    tx: mpsc::Sender<Cmd>,
+    stop: CancellationToken,
 }
 
 enum Cmd {
@@ -112,6 +133,7 @@ enum Cmd {
     Steer {
         session: String,
         steer: Steer,
+        guard: Option<crate::host::room_pause::InterruptGuard>,
         reply: oneshot::Sender<Result<String, String>>,
     },
 }
@@ -123,25 +145,43 @@ impl CodexMirror {
         Arc::new(Self {
             sink,
             conns: Mutex::new(BTreeMap::new()),
+            live: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
             subscribed: Arc::default(),
         })
     }
 
-    fn conn(&self, codex_home: &Path) -> mpsc::UnboundedSender<Cmd> {
+    fn conn(&self, codex_home: &Path) -> Result<Connection, String> {
         let socket = control_socket(codex_home);
+        if socket.as_os_str().len() > MAX_ID_BYTES {
+            return Err("Codex socket path exceeds 4 KiB; observation was not started".into());
+        }
         let mut conns = self
             .conns
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(tx) = conns.get(&socket).filter(|tx| !tx.is_closed()) {
-            return tx.clone();
+        conns.retain(|_, conn| !conn.tx.is_closed());
+        if let Some(conn) = conns.get(&socket) {
+            if conn.stop.is_cancelled() {
+                return Err("Codex observation is stopping; nothing was queued".into());
+            }
+            return Ok(conn.clone());
         }
-        let (tx, rx) = mpsc::unbounded_channel();
-        conns.insert(socket.clone(), tx.clone());
-        let (answers, answers_rx) = mpsc::unbounded_channel();
+        if conns.len() >= MAX_CONNECTIONS {
+            return Err(
+                "Vox already observes 64 Codex app-servers; observation was not started".into(),
+            );
+        }
+        let permit = Arc::clone(&self.live).try_acquire_owned().map_err(|_| {
+            "Vox already has 64 active Codex observers; observation was not started".to_owned()
+        })?;
+        let (tx, rx) = mpsc::channel(MAX_COMMANDS);
+        let control = Connection {
+            tx,
+            stop: CancellationToken::new(),
+        };
+        conns.insert(socket.clone(), control.clone());
         let conn = Conn {
-            told: BTreeSet::new(),
-            answers,
+            _permit: permit,
             socket,
             sink: Arc::clone(&self.sink),
             subscribed: Arc::clone(&self.subscribed),
@@ -149,29 +189,60 @@ impl CodexMirror {
             next_id: 1,
             calls: BTreeMap::new(),
             asks: BTreeMap::new(),
+            failed: None,
         };
-        tokio::spawn(conn.run(rx, answers_rx));
-        tx
+        tokio::spawn(conn.run(rx, control.stop.clone()));
+        Ok(control)
     }
 
     /// A Codex session of `node` registered from `codex_home` (ADR-020 6.10): watch its thread.
     pub fn watch(&self, codex_home: &Path, node: &NodeName, session: &str) {
-        let _ = self.conn(codex_home).send(Cmd::Watch {
-            node: node.clone(),
-            session: session.to_owned(),
-        });
+        if session.is_empty() || session.len() > MAX_ID_BYTES {
+            eprintln!(
+                "vox daemon: {node}: Codex observation refused: invalid or oversized session ID"
+            );
+            return;
+        }
+        let conn = match self.conn(codex_home) {
+            Ok(conn) => conn,
+            Err(why) => {
+                eprintln!("vox daemon: {node}: Codex Session {session}: {why}");
+                return;
+            }
+        };
+        if conn
+            .tx
+            .try_send(Cmd::Watch {
+                node: node.clone(),
+                session: session.to_owned(),
+            })
+            .is_err()
+        {
+            eprintln!("vox daemon: {node}: Codex Session {session}: observation stopped because its command queue is full or closed; hooks remain available");
+            conn.stop.cancel();
+        }
     }
 
     /// The session ended (its `SessionEnd`): stop watching and driving it.
     pub fn end(&self, session: &str) {
+        // An ID outside this bound could never enter a watched thread or command queue.
+        if session.len() > MAX_ID_BYTES {
+            return;
+        }
         let conns = self
             .conns
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for tx in conns.values() {
-            let _ = tx.send(Cmd::End {
-                session: session.to_owned(),
-            });
+        for conn in conns.values() {
+            if conn
+                .tx
+                .try_send(Cmd::End {
+                    session: session.to_owned(),
+                })
+                .is_err()
+            {
+                conn.stop.cancel();
+            }
         }
     }
 
@@ -195,16 +266,36 @@ impl CodexMirror {
         session: &str,
         steer: Steer,
     ) -> Result<String, String> {
+        self.steer_guarded(codex_home, session, steer, None).await
+    }
+
+    pub(crate) async fn steer_guarded(
+        &self,
+        codex_home: &Path,
+        session: &str,
+        steer: Steer,
+        guard: Option<crate::host::room_pause::InterruptGuard>,
+    ) -> Result<String, String> {
+        let bytes = match &steer {
+            Steer::Text(text) => text.len(),
+            Steer::Slash { cmd, args } => cmd.len().saturating_add(args.len()),
+            Steer::Interrupt | Steer::Stop => 0,
+        };
+        if session.len() > MAX_ID_BYTES || bytes > MAX_COMMAND_BYTES {
+            return Err("Codex control exceeds its byte bound; nothing was sent".into());
+        }
         let (reply, rx) = oneshot::channel();
-        self.conn(codex_home)
-            .send(Cmd::Steer {
+        self.conn(codex_home)?
+            .tx
+            .try_send(Cmd::Steer {
                 session: session.to_owned(),
                 steer,
+                guard,
                 reply,
             })
-            .map_err(|_| "Vox's connection to Codex's app-server has stopped".to_owned())?;
+            .map_err(|_| "Codex's control queue is full or closed; nothing was sent".to_owned())?;
         rx.await
-            .unwrap_or_else(|_| Err("Vox's connection to Codex's app-server stopped".to_owned()))
+            .unwrap_or_else(|_| Err("Codex's connection stopped; the control outcome is unknown, do not assume it is safe to repeat".to_owned()))
     }
 }
 
@@ -216,8 +307,11 @@ struct Thread {
     status: String,
     /// The turn running now, from `turn/started`.
     turn: Option<String>,
-    /// Tool items whose start was posted, so a completion seen alone still posts one.
+    /// At most 128 unmatched starts, each ID at most 4 KiB. Preserve across reconnect and
+    /// unload so a late completion does not synthesize a second start; End retires the set.
     started: BTreeSet<String>,
+    /// The offline notice is scoped to this live thread and retires with it.
+    told: bool,
     /// Subscriptions refused since the thread last changed status. A refusal that crossed the
     /// status change to active (the moment its rollout appears) is retried, at most a few times.
     refused: u8,
@@ -225,7 +319,9 @@ struct Thread {
 
 /// An approval or a question Codex asked, held until it settles.
 struct Ask {
+    node: NodeName,
     session: String,
+    ticket: RequestTicket,
     /// The JSON-RPC id Codex is waiting on.
     rpc: Value,
     of: &'static str,
@@ -235,28 +331,30 @@ struct Ask {
     answered: Option<Given>,
     /// `serverRequest/resolved` arrived; for an approval the outcome waits for its item.
     resolved: bool,
+    receiver: Option<oneshot::Receiver<Given>>,
+    /// Serialized metadata and bounded answer bytes retained for this request.
+    bytes: usize,
 }
 
 /// What a JSON-RPC call Vox made is waiting for.
 enum Pending {
     Resume(String),
-    Steer(oneshot::Sender<Result<String, String>>, String),
+    Steer(oneshot::Sender<Result<String, String>>, String, String),
     Ignore,
 }
 
 struct Conn {
+    _permit: OwnedSemaphorePermit,
     socket: PathBuf,
     sink: Arc<Sink>,
     subscribed: Arc<Mutex<BTreeSet<String>>>,
     threads: BTreeMap<String, Thread>,
     next_id: u64,
-    calls: BTreeMap<u64, Pending>,
+    calls: BTreeMap<u64, (tokio::time::Instant, Pending)>,
     /// By the ref the Session shows: the item id Codex's request names.
     asks: BTreeMap<String, Ask>,
-    /// Where a member's first answer to a request comes back to this connection's loop.
-    answers: mpsc::UnboundedSender<(String, Given)>,
-    /// Sessions already told that Codex's app-server could not be reached.
-    told: BTreeSet<String>,
+    /// A capacity or uncertain-write failure stops observation explicitly.
+    failed: Option<String>,
 }
 
 type Ws = tokio_tungstenite::WebSocketStream<tokio::net::UnixStream>;
@@ -272,35 +370,63 @@ fn unreachable(socket: &Path, e: impl std::fmt::Display) -> String {
 
 impl Conn {
     async fn connect(&self) -> Result<Ws, String> {
-        let stream = tokio::net::UnixStream::connect(&self.socket)
+        let connect = async {
+            let stream = tokio::net::UnixStream::connect(&self.socket)
+                .await
+                .map_err(|e| unreachable(&self.socket, e))?;
+            let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+                .read_buffer_size(8 * 1024)
+                .write_buffer_size(0)
+                .max_write_buffer_size(2 * MAX_COMMAND_BYTES)
+                .max_message_size(Some(MAX_MESSAGE_BYTES))
+                .max_frame_size(Some(MAX_MESSAGE_BYTES));
+            tokio_tungstenite::client_async_with_config("ws://localhost/", stream, Some(config))
+                .await
+                .map(|(ws, _)| ws)
+                .map_err(|e| unreachable(&self.socket, e))
+        };
+        tokio::time::timeout(CALL_WITHIN, connect)
             .await
-            .map_err(|e| unreachable(&self.socket, e))?;
-        let (ws, _) = tokio_tungstenite::client_async("ws://localhost/", stream)
-            .await
-            .map_err(|e| unreachable(&self.socket, e))?;
-        Ok(ws)
+            .map_err(|_| unreachable(&self.socket, "connection timed out"))?
     }
 
-    /// Serve commands; connect when there is something to watch or steer, and again after the
-    /// app-server goes away, at the next command.
-    async fn run(
-        mut self,
-        mut rx: mpsc::UnboundedReceiver<Cmd>,
-        mut answers: mpsc::UnboundedReceiver<(String, Given)>,
-    ) {
+    /// Each connection retains only bounded active work. A stopped observation reports the
+    /// gap and leaves already admitted Session activity intact; queued controls are not sent.
+    async fn run(mut self, mut rx: mpsc::Receiver<Cmd>, stop: CancellationToken) {
         let mut ws: Option<Ws> = None;
+        let mut timer = tokio::time::interval(Duration::from_millis(250));
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
+            if self.failed.is_some() || stop.is_cancelled() {
+                break;
+            }
             let Some(ws_now) = ws.as_mut() else {
-                let Some(cmd) = rx.recv().await else { return };
+                let cmd = tokio::select! {
+                    () = stop.cancelled() => break,
+                    cmd = rx.recv() => match cmd { Some(cmd) => cmd, None => break },
+                };
+                // End always retires immediately, even while the app-server is offline.
+                if let Cmd::End { session } = cmd {
+                    self.end(&session).await;
+                    if self.threads.is_empty() {
+                        break;
+                    }
+                    continue;
+                }
                 match self.connect().await {
                     Ok(mut w) => {
-                        if self.hello(&mut w).await.is_ok() {
+                        if matches!(
+                            tokio::time::timeout(CALL_WITHIN, self.hello(&mut w)).await,
+                            Ok(Ok(()))
+                        ) {
                             ws = Some(w);
+                        } else {
+                            self.gone().await;
                         }
                     }
                     Err(why) => {
                         if let Cmd::Steer { reply, .. } = cmd {
-                            let _ = reply.send(Err(why));
+                            let _ = reply.send(Err(format!("{why}; the control was not sent")));
                             continue;
                         }
                     }
@@ -314,46 +440,153 @@ impl Conn {
                 continue;
             };
             tokio::select! {
+                () = stop.cancelled() => break,
                 cmd = rx.recv() => {
-                    let Some(cmd) = cmd else { return };
+                    let Some(cmd) = cmd else { break };
                     self.command(ws_now, cmd).await;
+                    if self.threads.is_empty() { break; }
                 }
-                Some((r, given)) = answers.recv() => self.answer(ws_now, &r, given).await,
+                _ = timer.tick(), if !self.calls.is_empty() || !self.asks.is_empty() => {
+                    if self.calls.values().any(|(expires, _)| *expires <= tokio::time::Instant::now()) {
+                        self.failed = Some("Codex did not answer within 30 seconds; pending control outcomes are unknown, do not assume it is safe to repeat".into());
+                    } else if let Some((id, given)) = self.take_answer() {
+                        self.answer(ws_now, &id, given).await;
+                    }
+                }
                 frame = ws_now.next() => {
                     match frame {
-                        Some(Ok(Message::Text(t))) => {
-                            if let Ok(v) = serde_json::from_str::<Value>(t.as_str()) {
-                                self.frame(ws_now, v).await;
+                        Some(Ok(Message::Text(text))) => {
+                            match serde_json::from_str::<Value>(text.as_str()) {
+                                Ok(value) => self.frame(ws_now, value).await,
+                                Err(_) => self.failed = Some("Codex supplied malformed event JSON".into()),
                             }
+                            self.resubscribe(ws_now).await;
+                        }
+                        Some(Ok(Message::Close(_))) | None => {
+                            ws = None;
+                            self.gone().await;
+                            self.notice_all("Codex disconnected; pending request/control outcomes are unknown; hooks remain available").await;
+                        }
+                        Some(Err(error)) => {
+                            self.failed = Some(format!("Codex event transport failed: {error}; pending outcomes are unknown"));
                         }
                         Some(Ok(_)) => {}
-                        Some(Err(_)) | None => {
-                            ws = None;
-                            self.gone();
-                        }
                     }
                 }
             }
         }
+        rx.close();
+        while let Ok(cmd) = rx.try_recv() {
+            match cmd {
+                Cmd::Steer { reply, .. } => {
+                    let _ = reply.send(Err(
+                        "Codex observation stopped before this queued control was sent".into(),
+                    ));
+                }
+                Cmd::Watch { node, session } => {
+                    eprintln!("vox daemon: {node}: Codex Session {session}: observation stopped before this subscription was admitted; hooks remain available");
+                }
+                Cmd::End { .. } => {}
+            }
+        }
+        self.gone().await;
+        let why = self.failed.take().unwrap_or_else(|| {
+            "the observation command queue closed or could not accept lifecycle work".into()
+        });
+        self.notice_all(&format!("Codex observation stopped: {why}"))
+            .await;
     }
 
-    /// The app-server went away: nothing is subscribed, every pending call and request fails.
-    fn gone(&mut self) {
-        for (_, p) in std::mem::take(&mut self.calls) {
-            if let Pending::Steer(reply, _) = p {
-                let _ = reply.send(Err(unreachable(&self.socket, "the connection closed")));
+    /// Pending controls have unknown outcomes after disconnect. Drop exact ask waiters so a
+    /// later drive cannot claim delivery through them; bounded unmatched starts survive reconnect.
+    fn disconnected(&mut self) {
+        for (_, (_, pending)) in std::mem::take(&mut self.calls) {
+            if let Pending::Steer(reply, _, _) = pending {
+                let _ = reply.send(Err("Codex disconnected; the control outcome is unknown, do not assume it is safe to repeat".into()));
             }
         }
         for t in self.threads.values_mut() {
             t.subscribed = false;
             t.turn = None;
+            t.refused = 0;
         }
-        let mut s = self
+        let mut subscribed = self
             .subscribed
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for id in self.threads.keys() {
-            s.remove(id);
+            subscribed.remove(id);
+        }
+    }
+
+    async fn gone(&mut self) {
+        self.disconnected();
+        self.retire_asks(
+            None,
+            "Codex disconnected before the request outcome was observed",
+        )
+        .await;
+    }
+
+    async fn retire_asks(&mut self, session: Option<&str>, why: &str) {
+        // At most MAX_ASKS exact tickets; cleanup retains this observer's live permit.
+        let ids: Vec<_> = self
+            .asks
+            .iter()
+            .filter(|(_, ask)| session.is_none_or(|id| ask.session == id))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ids {
+            let Some(ask) = self.asks.remove(&id) else {
+                continue;
+            };
+            self.sink
+                .retire_observation(&ask.node, &ask.session, &id, &ask.ticket, why)
+                .await;
+        }
+    }
+
+    async fn notice_all(&self, why: &str) {
+        eprintln!("vox daemon: {why}");
+        for (session, thread) in &self.threads {
+            let mut entry = envelope(session, "notice", None);
+            entry.insert("text".into(), json!(why));
+            self.sink
+                .activity(&thread.node, session, split(entry, "text"), None)
+                .await;
+        }
+    }
+
+    fn take_answer(&mut self) -> Option<(String, Given)> {
+        let mut answer = None;
+        self.asks.retain(|id, ask| {
+            if answer.is_some() {
+                return true;
+            }
+            let Some(receiver) = ask.receiver.as_mut() else {
+                return true;
+            };
+            match receiver.try_recv() {
+                Ok(given) => {
+                    ask.receiver = None;
+                    answer = Some((id.clone(), given));
+                    true
+                }
+                Err(oneshot::error::TryRecvError::Empty) => true,
+                Err(oneshot::error::TryRecvError::Closed) => false,
+            }
+        });
+        answer
+    }
+
+    async fn post(&mut self, node: &NodeName, session: &str, bodies: Vec<String>) -> bool {
+        use vox_core::node::daemonipc::SessionAdmission;
+        match self.sink.activity(node, session, bodies, None).await {
+            SessionAdmission::Refused(why) | SessionAdmission::Unconfirmed(why) => {
+                self.failed = Some(format!("Session activity admission failed: {why}; already admitted activity is retained"));
+                false
+            }
+            _ => true,
         }
     }
 
@@ -364,7 +597,15 @@ impl Conn {
             Cmd::Watch { node, session } => {
                 // Said once in the Session: what it shows comes from the session's hooks alone,
                 // and what cannot be done from Vox (the decider, 2026-10-06).
-                if self.told.insert(session.clone()) {
+                if !self.watch(node.clone(), session.clone()) {
+                    return;
+                }
+                let tell = self.threads.get_mut(&session).is_some_and(|thread| {
+                    let tell = !thread.told;
+                    thread.told = true;
+                    tell
+                });
+                if tell {
                     let mut e = Map::new();
                     e.insert("v".into(), json!(VERSION));
                     e.insert("session".into(), json!(session));
@@ -384,33 +625,68 @@ impl Conn {
                         .activity(&node, &session, split(e, "text"), None)
                         .await;
                 }
-                self.watch(node, session);
             }
-            Cmd::End { session } => self.end(&session),
+            Cmd::End { session } => self.end(&session).await,
             Cmd::Steer { reply, .. } => {
                 let _ = reply.send(Err(unreachable(&self.socket, "no connection")));
             }
         }
     }
 
-    fn watch(&mut self, node: NodeName, session: String) {
+    fn watch(&mut self, node: NodeName, session: String) -> bool {
+        if self
+            .threads
+            .get(&session)
+            .is_some_and(|thread| thread.node != node)
+        {
+            self.failed = Some("Codex reused a live session ID for a different node".into());
+            return false;
+        }
+        if !self.threads.contains_key(&session) && self.threads.len() >= MAX_THREADS {
+            self.failed =
+                Some("Codex has 64 watched threads; observation cannot admit another".into());
+            return false;
+        }
         self.threads.entry(session).or_insert(Thread {
             node,
             subscribed: false,
             status: String::new(),
             turn: None,
             started: BTreeSet::new(),
+            told: false,
             refused: 0,
         });
+        true
     }
 
-    fn end(&mut self, session: &str) {
+    async fn end(&mut self, session: &str) {
+        self.retire_asks(
+            Some(session),
+            "the Session ended before Codex's request outcome was observed",
+        )
+        .await;
         self.threads.remove(session);
         self.subscribed
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(session);
-        self.asks.retain(|_, a| a.session != session);
+        let calls: Vec<_> = self
+            .calls
+            .iter()
+            .filter_map(|(id, (_, pending))| match pending {
+                Pending::Resume(thread) | Pending::Steer(_, _, thread) if thread == session => {
+                    Some(*id)
+                }
+                _ => None,
+            })
+            .collect();
+        for id in calls {
+            if let Some((_, Pending::Steer(reply, _, _))) = self.calls.remove(&id) {
+                let _ = reply.send(Err(
+                    "the Session ended while Codex's control outcome was unknown".into(),
+                ));
+            }
+        }
     }
 
     async fn hello(&mut self, ws: &mut Ws) -> Result<(), ()> {
@@ -421,14 +697,19 @@ impl Conn {
                 json!({"clientInfo": {"name": "vox", "version": env!("CARGO_PKG_VERSION")}}),
                 Pending::Ignore,
             )
-            .await;
+            .await
+            .ok_or(())?;
         // `initialize` must be answered before anything else is asked.
         loop {
             match ws.next().await {
                 Some(Ok(Message::Text(t))) => {
                     let v: Value = serde_json::from_str(t.as_str()).unwrap_or(Value::Null);
-                    if v.get("id").and_then(Value::as_u64) == id && v.get("method").is_none() {
-                        self.calls.remove(&id.unwrap_or_default());
+                    if v.get("id").and_then(Value::as_u64) == Some(id) && v.get("method").is_none()
+                    {
+                        self.calls.remove(&id);
+                        if v.get("error").is_some() {
+                            return Err(());
+                        }
                         break;
                     }
                 }
@@ -442,22 +723,67 @@ impl Conn {
     }
 
     async fn call(&mut self, ws: &mut Ws, method: &str, params: Value, p: Pending) -> Option<u64> {
-        let id = self.next_id;
-        self.next_id += 1;
-        let ok = send(
-            ws,
-            &json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}),
-        )
-        .await
-        .is_ok();
-        if ok {
-            self.calls.insert(id, p);
-            Some(id)
-        } else {
-            if let Pending::Steer(reply, _) = p {
-                let _ = reply.send(Err(unreachable(&self.socket, "the send failed")));
+        self.call_guarded(ws, method, params, p, None).await
+    }
+
+    async fn call_guarded(
+        &mut self,
+        ws: &mut Ws,
+        method: &str,
+        params: Value,
+        p: Pending,
+        guard: Option<crate::host::room_pause::InterruptGuard>,
+    ) -> Option<u64> {
+        if guard.as_ref().is_some_and(|guard| !guard.allowed()) {
+            if let Pending::Steer(reply, _, _) = p {
+                let _ = reply.send(Err(
+                    "room pause, authority or Session changed; the interrupt was not sent".into(),
+                ));
             }
+            return None;
+        }
+        let id = self.next_id;
+        let body = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+        let why = if self.calls.len() >= MAX_COMMANDS {
+            Some("Codex has 32 unanswered controls; nothing was sent")
+        } else if id == u64::MAX {
+            Some("Codex control sequence exhausted; nothing was sent")
+        } else if body.to_string().len() > MAX_COMMAND_BYTES {
+            Some("encoded Codex control exceeds 64 KiB; nothing was sent")
+        } else {
             None
+        };
+        if let Some(why) = why {
+            if let Pending::Steer(reply, _, _) = p {
+                let _ = reply.send(Err(why.into()));
+            } else {
+                self.failed = Some(why.into());
+            }
+            return None;
+        }
+        self.next_id += 1;
+        let sent = if let Some(guard) = guard {
+            tokio::select! {
+                biased;
+                () = guard.cancelled() => Err("room pause changed during the control write; its outcome is unknown".into()),
+                sent = send(ws, &body) => sent,
+            }
+        } else {
+            send(ws, &body).await
+        };
+        match sent {
+            Ok(()) => {
+                self.calls
+                    .insert(id, (tokio::time::Instant::now() + CALL_WITHIN, p));
+                Some(id)
+            }
+            Err(why) => {
+                if let Pending::Steer(reply, _, _) = p {
+                    let _ = reply.send(Err(why.clone()));
+                }
+                self.failed = Some(why);
+                None
+            }
         }
     }
 
@@ -465,10 +791,13 @@ impl Conn {
         let want: Vec<String> = self
             .threads
             .iter()
-            .filter(|(_, t)| !t.subscribed)
+            .filter(|(_, t)| !t.subscribed && t.refused == 0)
             .map(|(id, _)| id.clone())
             .collect();
         for id in want {
+            if self.calls.len() >= MAX_COMMANDS || self.failed.is_some() {
+                break;
+            }
             self.subscribe(ws, &id).await;
         }
     }
@@ -477,8 +806,8 @@ impl Conn {
         let already = self
             .calls
             .values()
-            .any(|p| matches!(p, Pending::Resume(t) if t == thread));
-        if already {
+            .any(|(_, p)| matches!(p, Pending::Resume(t) if t == thread));
+        if already || self.calls.len() >= MAX_COMMANDS || self.failed.is_some() {
             return;
         }
         self.call(
@@ -493,17 +822,20 @@ impl Conn {
     async fn command(&mut self, ws: &mut Ws, cmd: Cmd) {
         match cmd {
             Cmd::Watch { node, session } => {
-                self.watch(node, session.clone());
+                if !self.watch(node, session.clone()) {
+                    return;
+                }
                 if !self.threads.get(&session).is_some_and(|t| t.subscribed) {
                     self.subscribe(ws, &session).await;
                 }
             }
-            Cmd::End { session } => self.end(&session),
+            Cmd::End { session } => self.end(&session).await,
             Cmd::Steer {
                 session,
                 steer,
+                guard,
                 reply,
-            } => self.steer(ws, &session, steer, reply).await,
+            } => self.steer(ws, &session, steer, guard, reply).await,
         }
     }
 
@@ -512,8 +844,15 @@ impl Conn {
         ws: &mut Ws,
         session: &str,
         steer: Steer,
+        guard: Option<crate::host::room_pause::InterruptGuard>,
         reply: oneshot::Sender<Result<String, String>>,
     ) {
+        if guard.as_ref().is_some_and(|guard| !guard.allowed()) {
+            let _ = reply.send(Err(
+                "room pause, authority or Session changed; the interrupt was not sent".into(),
+            ));
+            return;
+        }
         let Some(t) = self.threads.get(session) else {
             let _ = reply.send(Err(
                 "this Codex session is not open here: it ended, or never registered with this \
@@ -596,8 +935,14 @@ impl Conn {
                 }
             },
         };
-        self.call(ws, method, params, Pending::Steer(reply, done))
-            .await;
+        self.call_guarded(
+            ws,
+            method,
+            params,
+            Pending::Steer(reply, done, session.to_owned()),
+            guard,
+        )
+        .await;
     }
 
     async fn frame(&mut self, ws: &mut Ws, v: Value) {
@@ -605,7 +950,7 @@ impl Conn {
         match (method, v.get("id")) {
             // A reply to a call Vox made.
             (None, Some(id)) => {
-                let Some(p) = id.as_u64().and_then(|id| self.calls.remove(&id)) else {
+                let Some((_, p)) = id.as_u64().and_then(|id| self.calls.remove(&id)) else {
                     return;
                 };
                 let err = v.get("error").map(|e| {
@@ -636,14 +981,14 @@ impl Conn {
                         // next mentions the thread, or now if it went active meanwhile.
                         let retry = err.is_some()
                             && self.threads.get_mut(&thread).is_some_and(|t| {
-                                t.refused += 1;
+                                t.refused = t.refused.saturating_add(1);
                                 t.status == "active" && t.refused <= 3
                             });
                         if retry {
                             self.subscribe(ws, &thread).await;
                         }
                     }
-                    Pending::Steer(reply, done) => {
+                    Pending::Steer(reply, done, _) => {
                         let _ = reply.send(match err {
                             None => Ok(done),
                             Some(e) => Err(format!("Codex refused it: {e}")),
@@ -694,8 +1039,17 @@ impl Conn {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_owned();
+                if t.status.len() > MAX_ID_BYTES {
+                    self.failed = Some("Codex supplied an oversized thread status".into());
+                    return;
+                }
                 if t.status == "notLoaded" {
                     unsubscribed(t, &self.subscribed, &thread);
+                    self.retire_asks(
+                        Some(&thread),
+                        "Codex unloaded the thread before its request outcome was observed",
+                    )
+                    .await;
                 }
             }
             // Unloaded or closed, the thread's subscription is gone with it: a resume (`codex
@@ -704,23 +1058,45 @@ impl Conn {
             "thread/closed" => {
                 t.status = "closed".into();
                 unsubscribed(t, &self.subscribed, &thread);
+                self.retire_asks(
+                    Some(&thread),
+                    "Codex unloaded the thread before its request outcome was observed",
+                )
+                .await;
             }
             "turn/started" => {
                 t.turn = p
                     .pointer("/turn/id")
                     .and_then(Value::as_str)
                     .map(str::to_owned);
+                if t.turn.as_ref().is_some_and(|id| id.len() > MAX_ID_BYTES) {
+                    self.failed = Some("Codex supplied an oversized turn ID".into());
+                    return;
+                }
                 t.status = "active".into();
             }
             "turn/completed" => {
                 t.turn = None;
                 let e = envelope(&thread, "turn-end", None);
-                self.sink.activity(&node, &thread, split(e, ""), None).await;
+                self.post(&node, &thread, split(e, "")).await;
             }
             "item/started" => {
                 if let Some(e) = tool_start(&thread, &p["item"]) {
-                    t.started.insert(item_id(&p["item"]));
-                    self.sink.activity(&node, &thread, e, None).await;
+                    let id = item_id(&p["item"]);
+                    if id.is_empty() || id.len() > MAX_ID_BYTES {
+                        self.failed =
+                            Some("Codex supplied an invalid or oversized tool item ID".into());
+                        return;
+                    }
+                    if t.started.contains(&id) {
+                        return;
+                    }
+                    if t.started.len() >= MAX_STARTED {
+                        self.failed = Some("Codex has 128 unmatched tool starts; observation stopped before another start was admitted".into());
+                        return;
+                    }
+                    t.started.insert(id);
+                    self.post(&node, &thread, e).await;
                 }
             }
             "item/completed" => self.item_completed(&node, &thread, &p["item"]).await,
@@ -735,6 +1111,10 @@ impl Conn {
 
     async fn item_completed(&mut self, node: &NodeName, thread: &str, item: &Value) {
         let id = item_id(item);
+        if id.is_empty() || id.len() > MAX_ID_BYTES {
+            self.failed = Some("Codex supplied an invalid or oversized completed item ID".into());
+            return;
+        }
         let kind = item.get("type").and_then(Value::as_str).unwrap_or_default();
         match kind {
             "agentMessage" => {
@@ -742,9 +1122,7 @@ impl Conn {
                 if !text.trim().is_empty() {
                     let mut e = envelope(thread, "reply", None);
                     e.insert("text".into(), json!(text));
-                    self.sink
-                        .activity(node, thread, split(e, "text"), None)
-                        .await;
+                    self.post(node, thread, split(e, "text")).await;
                 }
             }
             // The prompt comes from the hook (see the module's notes); reasoning and plans are
@@ -758,18 +1136,20 @@ impl Conn {
                 // the start is posted first, so the call is not lost.
                 if !t.started.remove(&id) {
                     if let Some(e) = tool_start(thread, item) {
-                        self.sink.activity(node, thread, e, None).await;
+                        if !self.post(node, thread, e).await {
+                            return;
+                        }
                     }
                 }
-                self.sink
-                    .activity(node, thread, tool_done(thread, item), None)
-                    .await;
+                if !self.post(node, thread, tool_done(thread, item)).await {
+                    return;
+                }
                 // An approval of this call settles with the call: Codex's item says what took
                 // effect.
                 if self
                     .asks
                     .get(&id)
-                    .is_some_and(|a| a.resolved && a.of == "approval")
+                    .is_some_and(|a| a.session == thread && a.resolved && a.of == "approval")
                 {
                     let outcome = match item.get("status").and_then(Value::as_str) {
                         Some("declined") => "denied",
@@ -802,51 +1182,92 @@ impl Conn {
             .get("itemId")
             .and_then(Value::as_str)
             .map_or_else(|| format!("rpc-{rpc}"), str::to_owned);
+        // Never replace an active receiver with another request sharing only its item ID.
+        if let Some(old) = self.asks.get(&r) {
+            if old.session != thread
+                || old.rpc != rpc
+                || old.method != method
+                || old.params != params
+            {
+                self.failed =
+                    Some("Codex reused an active request identity with different contents".into());
+            }
+            return;
+        }
+        let bytes = r
+            .len()
+            .saturating_add(thread.len())
+            .saturating_add(method.len())
+            .saturating_add(rpc.to_string().len())
+            .saturating_add(params.to_string().len());
+        let retained: usize = self.asks.values().map(|ask| ask.bytes).sum();
+        if r.is_empty()
+            || r.len() > MAX_ID_BYTES
+            || self.asks.len() >= MAX_ASKS
+            || bytes > MAX_ASK_BYTES.saturating_sub(retained)
+        {
+            self.failed = Some("Codex pending requests exceed 64 requests or 4 MiB; the new request was not admitted".into());
+            return;
+        }
         let entry = if of == "question" {
             question_entry(&thread, &r, &params)
         } else {
             approval_entry(&thread, &r, method, &params)
         };
-        let Some(rx) = self.sink.request(&node, &thread, entry).await else {
+        let Some((receiver, ticket)) = self.sink.request_observed(&node, &thread, entry).await
+        else {
+            self.failed = Some("Codex request could not be admitted to the Session".into());
             return;
         };
         self.asks.insert(
-            r.clone(),
+            r,
             Ask {
+                node,
                 session: thread,
-                rpc: rpc.clone(),
+                ticket,
+                rpc,
                 of,
                 method: method.to_owned(),
-                params: params.clone(),
+                params,
                 answered: None,
                 resolved: false,
+                receiver: Some(receiver),
+                bytes,
             },
         );
-        // The first answer from a member with drive comes back to this connection's loop,
-        // which gives it to Codex ([`Conn::answer`]).
-        let tx = self.answers.clone();
-        tokio::spawn(async move {
-            if let Ok(given) = rx.await {
-                let _ = tx.send((r, given));
-            }
-        });
     }
 
-    /// Give Codex a member's answer to request `r`. Whether it took effect is Codex's to say
-    /// (`serverRequest/resolved`, then the item), never this send's (DR-4).
+    /// A written answer is still waiting for Codex's resolution; a failed write is uncertain.
     async fn answer(&mut self, ws: &mut Ws, r: &str, given: Given) {
-        let Some(a) = self.asks.get_mut(r) else {
-            return; // settled meanwhile
+        let bytes = given_bytes(&given);
+        let retained: usize = self.asks.values().map(|ask| ask.bytes).sum();
+        if bytes > MAX_COMMAND_BYTES || bytes > MAX_ASK_BYTES.saturating_sub(retained) {
+            self.failed = Some("Codex answer exceeds its byte bound; it was not sent".into());
+            return;
+        }
+        let Some(ask) = self.asks.get_mut(r) else {
+            return;
         };
-        let result = response(&a.method, &a.params, &given);
-        let rpc = a.rpc.clone();
-        a.answered = Some(given);
-        let _ = send(ws, &json!({"jsonrpc": "2.0", "id": rpc, "result": result})).await;
+        let result = response(&ask.method, &ask.params, &given);
+        let body = json!({"jsonrpc": "2.0", "id": ask.rpc, "result": result});
+        if body.to_string().len() > MAX_COMMAND_BYTES {
+            self.failed = Some("encoded Codex answer exceeds 64 KiB; it was not sent".into());
+            return;
+        }
+        ask.bytes += bytes;
+        ask.answered = Some(given);
+        if let Err(why) = send(ws, &body).await {
+            self.failed = Some(why);
+        }
     }
 
     async fn resolved_request(&mut self, node: &NodeName, thread: &str, p: &Value) {
         let rpc = p.get("requestId").cloned().unwrap_or(Value::Null);
-        let Some((r, a)) = self.asks.iter_mut().find(|(_, a)| a.rpc == rpc) else {
+        let Some((r, a)) = self
+            .asks
+            .iter_mut()
+            .find(|(_, a)| a.session == thread && a.rpc == rpc)
+        else {
             return;
         };
         let r = r.clone();
@@ -874,6 +1295,12 @@ impl Conn {
     }
 }
 
+impl Drop for Conn {
+    fn drop(&mut self) {
+        self.disconnected();
+    }
+}
+
 /// `t`'s subscription has ended with its thread's load.
 fn unsubscribed(t: &mut Thread, subscribed: &Mutex<BTreeSet<String>>, thread: &str) {
     t.subscribed = false;
@@ -884,8 +1311,24 @@ fn unsubscribed(t: &mut Thread, subscribed: &Mutex<BTreeSet<String>>, thread: &s
         .remove(thread);
 }
 
-async fn send(ws: &mut Ws, v: &Value) -> Result<(), tokio_tungstenite::tungstenite::Error> {
-    ws.send(Message::text(v.to_string())).await
+async fn send(ws: &mut Ws, value: &Value) -> Result<(), String> {
+    let text = value.to_string();
+    if text.len() > MAX_COMMAND_BYTES {
+        return Err("encoded Codex control exceeds 64 KiB; nothing was sent".into());
+    }
+    match tokio::time::timeout(CALL_WITHIN, ws.send(Message::text(text))).await {
+        Ok(Ok(())) => Ok(()),
+        _ => Err("Codex control write failed or timed out; its outcome is unknown, do not assume it is safe to repeat".into()),
+    }
+}
+
+fn given_bytes(given: &Given) -> usize {
+    match given {
+        Given::Approve { why, .. } => why.as_ref().map_or(0, String::len),
+        Given::Answer(answers) => answers.iter().fold(0usize, |n, (q, a)| {
+            n.saturating_add(q.len()).saturating_add(a.len())
+        }),
+    }
 }
 
 fn item_id(item: &Value) -> String {

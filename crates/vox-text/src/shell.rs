@@ -48,3 +48,16 @@ pub fn command<S: AsRef<str>>(words: &[S]) -> String {
         .collect::<Vec<_>>()
         .join(" ")
 }
+
+/// A node-scoped command carries its acting node into the operator's other terminal.
+#[must_use]
+pub fn node_command<S: AsRef<str>>(words: &[S], node: &str) -> String {
+    let mut words: Vec<String> = words.iter().map(|w| w.as_ref().to_owned()).collect();
+    // A legal node name may start with `-`; an option's attached value stays a value.
+    if node.starts_with('-') {
+        words.push(format!("--node={node}"));
+    } else {
+        words.extend(["--node".to_owned(), node.to_owned()]);
+    }
+    command(&words)
+}

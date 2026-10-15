@@ -70,13 +70,14 @@ async fn first_missing(args: &NodeArgs, key: &str, dir: &Path) -> Result<String,
     let hook = wiring.hook_file();
     let wired = wiring.wired_node().and_then(|n| NodeName::parse(&n).ok());
     let setup = |name: &str, what: &str| {
+        let command = vox_text::shell::node_command(&["vox", "agent", "setup", h.key], name);
         if crate::agent_onboarding::declined(&account, h.key) {
             return String::new();
         }
         if crate::agent_onboarding::local_app(&account).is_some() {
             return format!(
-                "Vox: {} has no Vox node on this machine. Vox offers Set Up in its app; you may start `vox agent setup {} --node {name}` to ask there. Never ask for a passphrase in this session.\n",
-                h.name, h.key
+                "Vox: {} has no Vox node on this machine. Vox offers Set Up in its app; you may start `{command}` to ask there. Never ask for a passphrase in this session.\n",
+                h.name
             );
         }
         format!(
@@ -84,12 +85,11 @@ async fn first_missing(args: &NodeArgs, key: &str, dir: &Path) -> Result<String,
              \"{} has no Vox node on this machine. Choose a name for it and run this in a \
              terminal of your own; it asks there for the new node's passphrase, makes the node, \
              wires {}'s hook to it in {} with the agent skill beside it, and makes it Ready. Then \
-             start a new session.\"\n    vox agent setup {} --node {name}\n\
+             start a new session.\"\n    {command}\n\
              Never run it yourself, and never ask for the passphrase here.\n",
             h.name,
             h.name,
-            hook.display(),
-            h.key
+            hook.display()
         )
     };
     let Some(node) = wired else {
@@ -114,12 +114,13 @@ async fn first_missing(args: &NodeArgs, key: &str, dir: &Path) -> Result<String,
         ));
     }
     if status == Some(vox_core::node::daemonipc::NodeStatus::Locked) {
+        let unlock = vox_text::shell::command(&["vox", "node", "unlock", "--", node.as_str()]);
         return Ok(format!(
             "Vox: {} is node {node} here, and {node} is Locked, so this session is in no \
              Vox room. Tell the operator, in these words: \"Node {node} is Locked. Run \
              this in a terminal of your own; it asks there for the node's passphrase once, and \
              Vox then remembers it and makes the node Ready by itself after every restart. Then \
-             start a new session.\"\n    vox node unlock {node}\n\
+             start a new session.\"\n    {unlock}\n\
              Never run it yourself, and never ask for the passphrase here.\n",
             h.name
         ));
@@ -137,8 +138,16 @@ async fn first_missing(args: &NodeArgs, key: &str, dir: &Path) -> Result<String,
             in_bound_room(&account, &node, h.name, dir, &e.room).await
         });
     }
-    let ask = crate::room_map::note(None, true, None, &account.data_root, dir, node.as_str())
-        .unwrap_or_default();
+    let ask = crate::room_map::note(
+        None,
+        true,
+        None,
+        &account.data_root,
+        dir,
+        node.as_str(),
+        None,
+    )
+    .unwrap_or_default();
     Ok(format!("Vox: {} is node {node}, Ready.\n{ask}", h.name))
 }
 
@@ -225,9 +234,9 @@ pub async fn setup(args: &NodeArgs, key: &str, name: Option<&str>) -> Result<(),
     // passphrase. Running setup for its own node below also repairs Codex's hook trust.
     if let Some(wired) = &wired {
         if wired != &name {
+            let unlock = vox_text::shell::command(&["vox", "node", "unlock", "--", wired.as_str()]);
             println!(
-                "vox: {} is connected to node {wired}; left as it is. `vox node unlock {wired}` \
-                 attaches it",
+                "vox: {} is connected to node {wired}; left as it is. `{unlock}` attaches it",
                 h.name
             );
             return Ok(());
@@ -236,18 +245,17 @@ pub async fn setup(args: &NodeArgs, key: &str, name: Option<&str>) -> Result<(),
     if crate::agent_onboarding::request_in_app(args, h.key, &name)? {
         return Ok(());
     }
+    let setup = vox_text::shell::node_command(&["vox", "agent", "setup", h.key], name.as_str());
     if crate::coord::agent_marked() {
         return Err(AppError::Usage(format!(
-            "run `vox agent setup {}` in a terminal of your own outside the agent session; \
-             the node's passphrase is asked only there.",
-            h.key
+            "run `{setup}` in a terminal of your own outside the agent session; \
+             the node's passphrase is asked only there."
         )));
     }
     if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
         return Err(AppError::Usage(format!(
-            "vox agent setup {} asks for the node's passphrase only in a terminal of your own; \
-             run it there, outside the agent session",
-            h.key
+            "`{setup}` asks for the node's passphrase only in a terminal of your own; \
+             run it there, outside the agent session"
         )));
     }
     // Setup cannot leave Codex's new hook waiting for a separate manual trust command.

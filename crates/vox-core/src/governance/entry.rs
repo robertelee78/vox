@@ -128,6 +128,27 @@ impl GovBody {
         }
     }
 
+    /// Verify the body's signature independently of the containing log entry.
+    /// A verified log skeleton does not make an unverified nested statement an
+    /// authority fact. The persistent governance index calls this once before
+    /// publishing its locator.
+    pub(crate) fn verify(&self, author_key: &CompositePublicKey) -> Result<()> {
+        match self {
+            Self::Genesis(g) => g.verify(),
+            Self::AdminCert(c) => c.verify(author_key),
+            Self::AdminRevocation(r) => r.verify(author_key),
+            Self::ConsentGrant(g) => g.verify(author_key),
+            Self::ConsentRevocation(r) => r.verify(author_key),
+            Self::PolicyUpdate(p) => p.verify(author_key),
+            Self::StepPolicyUpdate(p) => p.verify(author_key),
+            Self::Lifecycle(l) => l.verify(author_key),
+            Self::Presence(p) => p.verify(author_key),
+            Self::ServiceShare(s) => s.verify(author_key),
+            Self::RoomName(n) => n.verify(author_key),
+            Self::RoomAnchors(a) => a.verify(author_key),
+        }
+    }
+
     /// The `(channelID, epoch)` this body is bound to (genesis has epoch 0 by
     /// definition — it predates any epoch bump).
     #[must_use]

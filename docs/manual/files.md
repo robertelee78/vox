@@ -10,22 +10,16 @@ against that SHA-256 before it is kept.
 
 ## Share a file or a folder
 
+With the file you intend to share saved as `report.txt` in your current directory:
+
 ```sh
-vox share family ./report.txt -m 'the report'
+vox share family ./report.txt -m 'the report' --node robertgpt
 ```
 
-Vox says who is to fetch it, hands the file to the daemon, and returns once the daemon serves it:
-
-```text
-vox: sharing report.txt (21 bytes) as file-696123c9184755c8-36d75aac38e972eb
-     sha256 696123c9184755c8eac0e8e8efb05b8864e76c829101f48308e7cc54358888bf
-     collect it with: vox room get family report.txt
-     or a member fetches it through the proxy `vox up` names, at the service file-696123c9184755c8-36d75aac38e972eb of this node in this room
-     served until its message expires, `vox share stop family report.txt`, you leave the room, or it ends
-```
-
-A file name with a space or a character a shell acts on is single-quoted in these commands, such
-as `vox room get family 'q3 report.txt'`.
+Vox says who is to fetch it, hands the file to the daemon, and returns once the daemon serves it.
+The output names its actual share tag, SHA-256 and collection command. Use the command from your
+own output; a recipient uses their own node when collecting it. File names with spaces or shell
+punctuation are quoted by the [same rule](reference.md#commands-you-can-paste).
 
 Nothing has to keep running in your terminal. The daemon serves the share until the first of:
 
@@ -68,8 +62,10 @@ addressed to someone else has a `(to …)` line, and your node does not pull it 
 
 ## Pull a share by hand
 
+After `notes.txt` has actually been offered in `family`, ann can pull it with:
+
 ```sh
-vox room get family notes.txt
+vox room get family notes.txt --node ann
 ```
 
 Name the share by its file name, a SHA-256 prefix, or its tag. Vox prints where the file landed:
@@ -87,8 +83,8 @@ SHA-256 match. A match proves these are the announced bytes, not that the file i
 ## See and stop your shares
 
 ```sh
-vox share list family
-vox share stop family report.txt
+vox share list family --node robertgpt
+vox share stop family report.txt --node robertgpt
 ```
 
 `vox share list` shows each of your shares in the room, with its tag, size and fetch count.

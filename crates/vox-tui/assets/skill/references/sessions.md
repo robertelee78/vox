@@ -16,11 +16,10 @@ operator grant is needed are in `trust.md`.
 
 ## Following
 
-```bash
-vox room sessions 774jx5ejeztm                 # every Session: node, session name, short id; open first
-vox room session 774jx5ejeztm 3f0c25bf         # one Session, by its id (8+ characters) or its name
-vox room session 774jx5ejeztm 3f0c25bf --details   # each entry's full input and output
-```
+List Sessions with `vox room sessions`, the actual bound room and your node. It returns the
+node, Session name and short ID, open first. Read the intended one with `vox room session`,
+that room, its returned ID (8+ characters) or name, and your node. Add `--details` for full input
+and output. Construct these commands from actual output using SKILL.md's quoting rule.
 
 A Session is named by its session's own name (Claude Code's `/rename`, Codex's thread name,
 OpenCode's title) and its short id. A waiting approval or question is shown with the ref to answer
@@ -31,16 +30,19 @@ it by, and the command that answers it.
 Driving reaches exactly the session you name, or is refused with the reason: never another
 session of that node. It needs the session's node to trust **your** node with drive.
 
-```bash
-vox room session <room> <session> --say "carry on with e2"     # typed and submitted, as its operator
-vox room session <room> <session> --interrupt                  # stop the turn it is running (Esc)
-vox room session <room> <session> --stop                       # stop it (Ctrl-C)
-vox room session <room> <session> --slash "/compact"           # a slash command, as typed
-vox room session <room> <session> --approve <ref>              # approve the tool call waiting under ref
-vox room session <room> <session> --reject <ref> "why not"     # reject it, saying why
-vox room session <room> <session> --answer <ref> "Which colour?=Blue"   # answer a waiting question
-vox room session <room> <session> --file ./spec.md --note "read this first"   # it lands on its node
-```
+Start with the complete read command for that actual room, Session and your node, then add the
+chosen input. Use the waiting request's real reference, never a sample ID:
+
+| Input | Values and effect |
+|---|---|
+| `--say` | your text, typed and submitted as the operator |
+| `--interrupt` | interrupt its running turn (Esc) |
+| `--stop` | stop it (Ctrl-C) |
+| `--slash` | the supported slash command you intend to send |
+| `--approve` | exact reference of the tool call currently waiting |
+| `--reject` | exact waiting reference, followed by your reason |
+| `--answer` | exact waiting reference, followed by the actual question and chosen answer in the shown answer format |
+| `--file` | an existing file path; `--note` adds your message; the file lands on the Session's node |
 
 What came of it is said at once: delivered, handed to the session (which decides), or not
 delivered and why. The harness's own record decides an approval: if its terminal answered first,
@@ -53,5 +55,5 @@ Typing into another session is acting as its operator.
 
 Your session works in one room at a time; its Session is there. Use this repository's saved room,
 not another room the node holds. If it has no binding, follow `setup.md`; do not choose a room
-yourself. Once the operator has selected the room or authorized a move, use `vox agent room <room>`
-from this session: its Session ends in the old room and opens in the selected one.
+yourself. Once the operator has selected the room or authorized a move, use `vox agent room`
+with the selected room and this session's actual `--node` from this session: its Session ends in the old room and opens in the selected one.

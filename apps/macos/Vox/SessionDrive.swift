@@ -31,7 +31,7 @@ extension NodeModel {
             return .refused("you cannot drive this Session: \(s.nodeAlias) has not given you drive")
         }
         do {
-            let answer = try await drive(room: room, session: s.sessionId, action: action)
+            let answer = try await drive(room: room, node: s.nodeFingerprint, session: s.sessionId, action: action)
             switch answer.delivery {
             case .answered:
                 return answer.ok ? .taken("\(s.label): \(answer.said)")
@@ -97,6 +97,9 @@ struct SessionComposer: View {
                 // Who types, into which Session (E-4, CL-1): never read as the room's composer.
                 Text("\(model.node) ▸ \(session.label)").font(Theme.mono).secondaryText()
                     .lineLimit(1).truncationMode(.middle)
+                    .frame(minWidth: 120 * scale, idealWidth: 160 * scale, maxWidth: 160 * scale, alignment: .leading)
+                    .layoutPriority(1)
+                    .help("\(model.node) ▸ \(session.label)")
                     // No label of its own (a selectable Text with one recurses); the field's says it.
                     .accessibilityIdentifier("session-compose-as")
                 // Up to 12 lines, so a pasted stack trace or a long prompt is read before it goes;
@@ -108,8 +111,7 @@ struct SessionComposer: View {
                     .help("Return sends; ⇧Return starts a new line")
                     .accessibilityLabel("Message to \(session.label), as \(model.node)")
                     .textFieldStyle(.plain)
-                    .frame(minWidth: Theme.scaled(160), maxWidth: .infinity)
-                    .layoutPriority(1)
+                    .frame(minWidth: 80 * scale, maxWidth: .infinity)
                     .onSubmit(send)
                     // Esc interrupts the turn it is running, as the tooltip says (D13).
                     .onExitCommand { interrupt() }
@@ -229,18 +231,22 @@ struct RequestView: View {
     let request: FfiRequest
     /// What the request asks, as its entry's line says it: its buttons name it to VoiceOver.
     let about: String
+    /// False when the containing row already shows every question and option description.
+    let showsQuestionText: Bool
     @State private var why = ""
     /// Each part's chosen option, by its index, for a question of several parts.
     @State private var chosen: [Int: String] = [:]
     @State private var said = ""
     @State private var busy = false
 
-    init(model: NodeModel, room: String, session: FfiSession, request: FfiRequest, about: String = "") {
+    init(model: NodeModel, room: String, session: FfiSession, request: FfiRequest, about: String = "",
+         showsQuestionText: Bool = true) {
         self.model = model
         self.room = room
         self.session = session
         self.request = request
         self.about = about
+        self.showsQuestionText = showsQuestionText
     }
 
     var body: some View {
@@ -288,7 +294,7 @@ struct RequestView: View {
         return VStack(alignment: .leading, spacing: Space.s8 * scale) {
             ForEach(parts.indices, id: \.self) { i in
                 VStack(alignment: .leading, spacing: Space.s4 * scale) {
-                    Text(parts[i].text)
+                    if showsQuestionText { Text(parts[i].text) }
                     HStack(spacing: Space.s8 * scale) {
                         ForEach(parts[i].options.indices, id: \.self) { n in
                             let option = parts[i].options[n]

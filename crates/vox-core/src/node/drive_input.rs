@@ -8,7 +8,7 @@
 //! node's own control socket instead ([`OwnDrive`]), which only this user's processes reach, and
 //! the daemon hands it to the same drive handler a member's stream reaches.
 
-use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _};
 use vox_agentcomms::drive::{Answer, Request, LABEL, PATIENCE};
 
 use crate::cbor::{Decoder, Encoder};
@@ -101,32 +101,98 @@ pub async fn send(
     peer: Digest32,
     request: &Request,
 ) -> Result<Answer, Unsent> {
-    if let Ok((stream, Some(me))) = crate::node::ipc::open_as(at).await {
-        if me == peer {
-            return send_own(stream, room, request).await;
+    send_checked(at, room, peer, request, None).await
+}
+
+/// Drive input bound to the caller's captured identity and saved room instance. Used for a
+/// multi-target room operation so reconnecting never silently selects a replacement actor/room.
+pub(crate) async fn send_checked(
+    at: &NodeSocket,
+    room: Digest32,
+    peer: Digest32,
+    request: &Request,
+    selected: Option<(Digest32, [u8; 16])>,
+) -> Result<Answer, Unsent> {
+    let (mut stream, me) = crate::node::ipc::open_as(at)
+        .await
+        .map_err(|e| Unsent::Unreachable(format!("the selected node could not be reached: {e}")))?;
+    if let Some((actor, instance)) = selected {
+        if me != Some(actor) {
+            return Err(Unsent::Unreachable(
+                "the selected node changed; refresh and retry".into(),
+            ));
+        }
+        write_frame(
+            &mut stream,
+            &crate::node::ipc::Request::ArrivalHead { channel_id: room }.to_bytes(),
+        )
+        .await
+        .map_err(|e| Unsent::Unreachable(e.to_string()))?;
+        let body = read_frame(&mut stream)
+            .await
+            .map_err(|e| Unsent::Unreachable(e.to_string()))?
+            .ok_or_else(|| {
+                Unsent::Unreachable("the selected node closed before checking the room".into())
+            })?;
+        match Frame::from_bytes(&body) {
+            Ok(Frame::ArrivalHead { head }) if head.instance == instance => {}
+            Ok(Frame::Error { reason }) => return Err(Unsent::Unreachable(reason)),
+            _ => {
+                return Err(Unsent::Unreachable(
+                    "the selected room changed; refresh and retry".into(),
+                ))
+            }
         }
     }
-    let (stream, _) = crate::node::appipc::open(at, room, peer, vec![LABEL.to_owned()], false)
-        .await
-        .map_err(|e| {
-            Unsent::Unreachable(format!(
-                "the session's node could not be reached, or would not take drive input from \
-                 this node ({e}); nothing was sent"
-            ))
-        })?;
+    if me == Some(peer) {
+        return send_own(stream, room, request).await;
+    }
+    let (stream, _) = crate::node::appipc::open_on(stream, room, peer, vec![LABEL.to_owned()], false)
+        .await.map_err(|e| Unsent::Unreachable(format!("the session's node could not be reached, or would not take drive input ({e}); nothing was sent")))?;
+    // The stream now retains the exact room gate it opened under. A replacement before
+    // that open is caught here; one after it empties that retained gate and resets the stream.
+    if let Some((actor, instance)) = selected {
+        let mut current = crate::node::ipc::IpcClient::open_at(at)
+            .await
+            .map_err(|error| Unsent::Unreachable(error.to_string()))?;
+        if current.me() != Some(actor) {
+            return Err(Unsent::Unreachable(
+                "the selected node changed; nothing was sent".into(),
+            ));
+        }
+        match current
+            .request(&crate::node::ipc::Request::ArrivalHead { channel_id: room })
+            .await
+        {
+            Ok(Frame::ArrivalHead { head }) if head.instance == instance => {}
+            Ok(Frame::Error { reason }) => return Err(Unsent::Unreachable(reason)),
+            _ => {
+                return Err(Unsent::Unreachable(
+                    "the selected room changed; nothing was sent".into(),
+                ))
+            }
+        }
+    }
     let (r, mut w) = stream.into_split();
     let mut line = serde_json::to_string(request)
         .map_err(|e| Unsent::Unreachable(format!("the request could not be written: {e}")))?;
     line.push('\n');
+    if line.len() > vox_agentcomms::drive::MAX_REQUEST {
+        return Err(Unsent::Unreachable(
+            "the request exceeds the drive transport limit; nothing was sent".into(),
+        ));
+    }
     w.write_all(line.as_bytes()).await.map_err(|e| {
-        Unsent::Unreachable(format!(
-            "the request could not be sent ({e}); nothing was delivered"
+        Unsent::NoAnswer(format!(
+            "the request write failed ({e}); whether it was delivered is unknown"
         ))
     })?;
     let mut answer = String::new();
     let read = tokio::time::timeout(
         PATIENCE + std::time::Duration::from_secs(5),
-        tokio::io::BufReader::new(r).read_line(&mut answer),
+        tokio::io::BufReader::new(r)
+            .take((vox_agentcomms::drive::MAX_REQUEST + 1) as u64)
+            .read_line(&mut answer),
     )
     .await;
     match read {
@@ -146,6 +212,11 @@ pub async fn send(
             ))
         }
     }
+    if answer.len() > vox_agentcomms::drive::MAX_REQUEST {
+        return Err(Unsent::NoAnswer(
+            "the receiver's answer exceeds the transport bound; the outcome is unknown".into(),
+        ));
+    }
     serde_json::from_str(answer.trim()).map_err(|_| {
         Unsent::NoAnswer("the session's node answered in a form this vox does not read".into())
     })
@@ -164,8 +235,8 @@ async fn send_own(
     .to_bytes()
     .ok_or_else(|| Unsent::Unreachable("the request could not be written".into()))?;
     write_frame(&mut stream, &body).await.map_err(|e| {
-        Unsent::Unreachable(format!(
-            "the request could not be handed to this node ({e}); nothing was sent"
+        Unsent::NoAnswer(format!(
+            "the request write to this node failed ({e}); whether it was delivered is unknown"
         ))
     })?;
     let read = tokio::time::timeout(

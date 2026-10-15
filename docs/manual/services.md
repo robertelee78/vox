@@ -18,24 +18,15 @@ gives `robertgpt` in the address. Your keyring names other nodes, not your own,
 - The **canonical address**, made of the service ID, the node's fingerprint and the room ID. It is
   the same for every member, so it is the one to copy and send.
 
-`vox service list` shows both, with the commands for each service's kind and what reaching it
-needs:
+`vox service list` shows both addresses, complete commands for the service's kind, and what
+reaching it needs: the proxy, a Ready node, the sharer's trust and an online sharer. Copy from
+your actual service list. The addresses contain your real identities; this manual supplies no
+reusable canonical address. Each command that uses Vox names the acting node.
 
-```text
-  ssh.robertgpt.family.vox  by robertgpt  ssh
-    mffm4sohl2j7kaefpvwk3jwrwc3xoynh3q2w5xesjcoteicf26ua.ek46r5zf3r7m6fevgu6ghilzamowcaj66qdmw27zxvozxr4m2z4a.gkpeyuly4m4ezlidyid3vocosfzpec2o7um5dleicv2aacz6z2ja.vox
-      ssh     ssh $USER@mffm4sohl2j7kaefpvwk3jwrwc3xoynh3q2w5xesjcoteicf26ua.ek46r5zf3r7m6fevgu6ghilzamowcaj66qdmw27zxvozxr4m2z4a.gkpeyuly4m4ezlidyid3vocosfzpec2o7um5dleicv2aacz6z2ja.vox
-      forward vox forward mffm4sohl2j7kaefpvwk3jwrwc3xoynh3q2w5xesjcoteicf26ua.ek46r5zf3r7m6fevgu6ghilzamowcaj66qdmw27zxvozxr4m2z4a.gkpeyuly4m4ezlidyid3vocosfzpec2o7um5dleicv2aacz6z2ja.vox 127.0.0.1:2222
-      then    ssh -p 2222 $USER@127.0.0.1
-      ✓ proxy configured
-      ✓ node Ready
-      ✓ robertgpt trusts you
-      ✓ robertgpt online
-```
-
-The printed commands use `$USER`, your user name on this machine. If your account on the sharer's
-machine has another name, use that. A line that does not hold says `missing:` and what to do, such as `missing: robertgpt online —
-robertgpt is not reachable now; it is reached when it comes back`. A canonical address inside a
+The printed SSH commands use SSH's default user and configuration for that destination. To use
+a different remote account, add `-l` followed by the actual account name to the copied SSH
+command, quoting that name as one shell argument. A missing prerequisite is named with what to do;
+for example, an offline sharer is reached when it comes back. A canonical address inside a
 message is shown in its readable form.
 
 ## Share a service in a room you have
@@ -44,8 +35,8 @@ The service must already run. For SSH on a Mac, turn on Remote Login in System S
 Sharing. Share it at `127.0.0.1:22`, whichever interfaces SSH listens on. On robertgpt, run:
 
 ```sh
-vox service add family ssh 127.0.0.1:22
-vox service list family
+vox service add family ssh 127.0.0.1:22 --node robertgpt
+vox service list family --node robertgpt
 ```
 
 Vox prints `offering "ssh" at 127.0.0.1:22 in room gkpeyuly4m4e`, then who can reach it now,
@@ -59,7 +50,7 @@ stays reachable on your network without Vox.
 To stop sharing, run:
 
 ```sh
-vox service remove family ssh
+vox service remove family ssh --node robertgpt
 ```
 
 It withdraws the offer and cuts the live connections to it. Leaving or ending the room, or
@@ -68,7 +59,7 @@ removing a member from your keyring, also cuts that member's reach.
 ## Share a service in a new room
 
 ```sh
-vox serve ssh=22
+vox serve ssh=22 --node robertgpt
 ```
 
 `vox serve` creates a room, shares `127.0.0.1:22` in it as `ssh`, and keeps sharing until you
@@ -76,7 +67,7 @@ press Ctrl-C. It prints the room's ID, its link, a generated room passphrase, an
 canonical address. Send the link and the passphrase separately, and protect this output: it holds
 the passphrase. As members join, it says who can reach the service: only members you trust.
 
-Name several services at once, such as `vox serve ssh=22 dns=53/udp`. `--at` names an address
+Name several services at once, such as `vox serve ssh=22 dns=53/udp --node robertgpt`. `--at` names an address
 other than `127.0.0.1`, and `--name` names the room (`service` by default). Before it creates the
 room, `vox serve` warns about a service that listens on every interface, or on a port such as
 PostgreSQL's.
@@ -86,13 +77,10 @@ suggests a name, shows the address members will use and who can reach it, and as
 `share it? [y/N]`. Anything but `y` shares nothing. Run as yourself, the list may miss another
 user's services. Name such a service as `ssh=22`.
 
-The other person joins with `vox connect`, with the link in single quotes, and lists what is
-shared:
-
-```sh
-vox connect 'vox://gkpeyuly4m4ezlidyid3vocosfzpec2o7um5dleicv2aacz6z2ja?a=ek46r5zf3r7m6fevgu6ghilzamowcaj66qdmw27zxvozxr4m2z4a&b=/ip4/203.0.113.7/udp/53213&m=ek46r5zf3r7m6fevgu6ghilzamowcaj66qdmw27zxvozxr4m2z4a&r=ek46r5zf3r7m6fevgu6ghilzamowcaj66qdmw27zxvozxr4m2z4a'
-vox service list family
-```
+On ann's machine, construct `vox connect` with the actual link the sharer sent, quoted as one
+argument, and `--node ann`. The default room from `serve` is named `service`; after joining it,
+list its offers with `vox service list service --node ann`. If the sharer used `--name`, use the
+actual resulting room name instead.
 
 Then you trust each other as in [Identity and keyring](keyring.md). The sharer must trust the
 other person's fingerprint before they reach anything.
@@ -120,7 +108,7 @@ addresses. Nothing else needs starting. On ann's machine, run this to see where 
 it starts nothing:
 
 ```sh
-vox up
+vox up --node ann
 ```
 
 It prints the proxy's address and a block to add to `~/.ssh/config` once:
@@ -147,28 +135,52 @@ only. `vox up --watch` prints what the proxy refuses or cuts.
 
 Keep SSH's host-key check on: it is SSH's own identity check.
 
+### Open a web service in your browser
+
+For HTTP and HTTPS services, the copied **open** command uses your default browser (`open` on
+macOS, `xdg-open` on Linux). A canonical `.vox` URL needs that browser to use Vox's local SOCKS5
+proxy and send DNS through it. **.vox proxy running at…** reports the listener only: Vox cannot
+inspect your browser's configuration. Setting `ALL_PROXY` in a terminal does not configure a GUI
+browser.
+
+Firefox supports this setup:
+
+1. Open Firefox **Settings**, search for **proxy**, and open **Connection Settings** using
+   **Settings…** or **Configure proxy**, depending on your version.
+2. Select **Manual proxy configuration**. Fill **SOCKS Host** and **Port** from the actual address
+   printed by `vox up`; choose **SOCKS v5** and enable **Proxy DNS when using SOCKS v5**. Keep
+   `.vox` out of **No Proxy For**, then save. Mozilla documents the
+   [connection settings](https://support.mozilla.org/en-US/kb/connection-settings-firefox) and
+   the [SOCKS5 and proxy-DNS options](https://firefox-admin-docs.mozilla.org/reference/policies/proxy/).
+3. Make Firefox your default browser so the copied **open** command launches it. Copy that
+   command from the actual service in Vox and run it unchanged.
+
+To avoid browser proxy setup, use the service's copied **forward** command, leave it running,
+then run its **then** command to open the local port. This path does not need the `.vox` proxy.
+
 ## Reach it through a local port
 
 For a tool that cannot use a proxy, forward a local port to the address:
 
 ```sh
-vox forward ssh.robertgpt.family.vox 127.0.0.1:2222
+vox forward ssh.robertgpt.family.vox 127.0.0.1:2222 --node ann
 ```
 
 It prints `vox: forwarding 127.0.0.1:2222 to ssh on ssh.robertgpt.family.vox (ek46r5zf3r7m)` and
 runs until Ctrl-C. Point the tool at the local port: `ssh -p 2222 robert@127.0.0.1`. Keep the
 forward on loopback unless you mean others on your network to use it.
 
-`vox status` lists live tunnels with their numbers. `vox tunnel close` closes all of one member's
-tunnels (`vox tunnel close f7l2q44g56mz`), those to one service (`vox tunnel close f7l2q44g56mz
-ssh`), or one by its number (`vox tunnel close --id 1`).
+`vox status --node ann` lists live tunnels with their actual numbers and peers. To close one,
+use `vox tunnel close` with its number in `--id` and `--node ann`. To close all tunnels to one
+member, use that member's actual fingerprint after `close`; add the actual service name to
+restrict it to that service. Keep the acting node explicit in each command.
 
 ## Put a room on one local network
 
-`vox lan up family` puts this machine on a network interface on which the room's trusted members
+`vox lan up family --node ann` puts this machine on a network interface on which the room's trusted members
 form one subnet, so local discovery, such as media servers and game lobbies, works across Vox.
 Creating an interface needs root, which only a separate helper has. On Linux, run
-`sudo vox lan helper` in another terminal, then `vox lan up family` as yourself. On a Mac, turn on
+`sudo vox lan helper` in another terminal, then `vox lan up family --node ann` as yourself. On a Mac, turn on
 the room's **FAMILY LAN** switch in the app and allow the helper in System Settings
 ([the app](app.md#members-and-trust)).
 
@@ -188,16 +200,18 @@ with no subcommand runs a node as an anchor, in the foreground.
 
 Use a port the other hosts can reach, here 4433. The anchor prints its `FINGERPRINT@ADDRESS`
 lines, one per address, and writes them on its own machine so local nodes can use it.
-On another machine, open **Settings › Network** or use:
+On another machine, open **Settings › Network**, or construct `vox anchor add` with the actual
+fingerprint-and-address line the anchor printed. To discover an anchor by host and port instead,
+pass its actual reachable hostname and port to `vox anchor add`; the endpoint must answer so Vox
+can verify it. Inspect the result with:
 
 ```sh
-vox anchor add FINGERPRINT@anchor.example:4433
-# Or look up and verify the anchor at a host and port:
-vox anchor add anchor.example 4433
 vox anchor list
 vox anchor list --json
-vox anchor remove FINGERPRINT
 ```
+
+To remove a configured anchor, use `vox anchor remove` with its actual fingerprint from that list.
+These commands manage the machine's anchor inventory, so they do not select a node.
 
 A fingerprint supplied explicitly can be added while the anchor is offline. Host-and-port lookup
 must reach the endpoint and verify its answer before adding it. If that endpoint serves several

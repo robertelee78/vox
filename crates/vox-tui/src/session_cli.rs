@@ -47,7 +47,7 @@ impl Names for ByIdent {
     }
 }
 
-/// `vox room session ROOM SESSION [--details] [--json] [--before ENTRY]`: one page of the
+/// `vox room session ROOM SESSION [--details | --raw] [--json] [--before ENTRY]`: one page of the
 /// Session, the newest or the one before ENTRY, and under it how to print the page before it
 /// (ADR-034 FR-4): never the whole history.
 ///
@@ -60,18 +60,18 @@ pub async fn show(
     session: &str,
     details: bool,
     json: bool,
+    raw: bool,
     before: Option<&str>,
 ) -> Result<(), crate::app::AppError> {
     use crate::app::AppError;
     use vox_core::node::ipc::Frame;
     let mut client = crate::room_cli::attach(paths).await?;
     let channel_id = crate::room_cli::room_of(&mut client, room).await?;
-    let sessions = match client.sessions(channel_id).await {
-        Ok(Frame::SessionsPage { sessions, .. }) => sessions,
-        Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
-        Ok(other) => return Err(crate::client::unexpected(&other)),
-        Err(e) => return Err(AppError::Usage(e.to_string())),
-    };
+    let room_id = vox_core::node::link::b32_encode(&channel_id);
+    let acting_node = crate::client::name_of(paths)?;
+    let actor = client
+        .me()
+        .ok_or_else(|| AppError::Usage("the selected node is locked".into()))?;
     let label_of = |s: &vox_core::node::sessions::SessionRow| {
         vox_agentcomms::envelope::session_label(
             &crate::ident::name_of(&s.node),
@@ -81,15 +81,35 @@ pub async fn show(
     };
     // The Session the room's Sessions name; else the daemon looks among its entries for the one
     // `session` names, whose opening has not arrived yet.
-    let named = vox_core::node::sessions::resolve(&sessions, session, true, label_of)
-        .map_or_else(|_| session.trim().to_owned(), |s| s.id.clone());
+    let selected = vox_core::node::sessions::selection::lookup(
+        &mut client,
+        channel_id,
+        None,
+        session,
+        true,
+        label_of,
+    )
+    .await
+    .map_err(AppError::Usage)?;
+    let named = selected
+        .as_ref()
+        .map_or_else(|| session.trim().to_owned(), |s| s.id.clone());
+    let sessions: Vec<_> = selected.into_iter().collect();
     let before = before
         .map(|b| vox_core::node::link::b32_decode(b.trim(), "entry"))
         .transpose()
         .map_err(|_| AppError::Usage(format!("--before {}: not an entry", before.unwrap_or(""))))?;
-    let which = vox_core::node::drive::SessionFilter::Session(named);
-    let (rows, older) = match client.session_page(channel_id, which, before).await {
-        Ok(Frame::SessionPage { rows, older }) => (rows, older),
+    let which = if raw {
+        vox_core::node::drive::SessionFilter::SessionRaw(named.clone())
+    } else {
+        vox_core::node::drive::SessionFilter::Session(named.clone())
+    };
+    let (rows, older, instance) = match client.session_page(channel_id, which, before).await {
+        Ok(Frame::SessionPage {
+            rows,
+            older,
+            instance,
+        }) => (rows, older, instance),
         Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
         Ok(other) => return Err(crate::client::unexpected(&other)),
         Err(e) => return Err(AppError::Usage(e.to_string())),
@@ -97,46 +117,133 @@ pub async fn show(
     let first = rows
         .first()
         .map(|r| vox_core::node::link::b32_encode(&r.entry_hash));
+    if raw {
+        if let (Some(first), true) = (&first, older > 0) {
+            let mut words = vec![
+                "vox", "room", "session", &room_id, &named, "--raw", "--before", first,
+            ];
+            if json {
+                words.push("--json");
+            }
+            eprintln!(
+                "{older} older raw records not shown: {}",
+                vox_text::shell::node_command(&words, acting_node.as_str())
+            );
+        }
+        use std::io::Write as _;
+        let mut out = std::io::stdout().lock();
+        for row in rows {
+            let entry = vox_core::node::link::b32_encode(&row.entry_hash);
+            let author = vox_core::node::link::b32_encode(&row.author);
+            if json {
+                writeln!(
+                    out,
+                    "{}",
+                    serde_json::json!({
+                        "entry": entry, "author": author, "created_millis": row.created_millis,
+                        "session": row.session_id, "body": row.body,
+                    })
+                )
+                .map_err(|e| AppError::Usage(e.to_string()))?;
+            } else {
+                writeln!(out, "{entry} {author} {}\n{}", row.created_millis, row.body)
+                    .map_err(|e| AppError::Usage(e.to_string()))?;
+            }
+        }
+        return Ok(());
+    }
     let read =
         vox_core::node::session_view::read(&sessions, rows, session, None, &label_of, &ByIdent)
             .map_err(AppError::Usage)?;
     // What is not shown, and how to show it, on stderr: stdout stays the page.
     if let (Some(first), true) = (&first, older > 0 && read.hidden.is_none()) {
+        let mut words = vec![
+            "vox", "room", "session", &room_id, &read.id, "--before", first,
+        ];
+        if details {
+            words.push("--details");
+        }
+        if json {
+            words.push("--json");
+        }
         eprintln!(
-            "{older} older {} not shown: vox room session {} {} --before {first}",
+            "{older} older {} not shown: {}",
             if older == 1 { "entry" } else { "entries" },
-            room.trim(),
-            read.id
+            vox_text::shell::node_command(&words, acting_node.as_str())
         );
     }
     use std::io::Write as _;
-    let mut out = std::io::stdout().lock();
-    if let Some(hidden) = &read.hidden {
-        let _ = writeln!(out, "{} · {}", read.label, read.state);
-        let _ = writeln!(out, "{hidden}");
-        return Ok(());
-    }
-    if json {
-        for l in &read.lines {
-            let d: serde_json::Map<String, Value> = l
-                .details
-                .iter()
-                .map(|(k, v)| (k.clone(), Value::String(v.clone())))
-                .collect();
-            let _ = writeln!(
-                out,
-                "{}",
-                serde_json::json!({
-                    "seq": l.seq, "kind": l.kind, "line": l.text, "ref": l.reference,
-                    "waiting": l.waiting.is_some(),
-                    "details": if details { Value::Object(d) } else { Value::Null },
-                })
-            );
+    {
+        let mut out = std::io::stdout().lock();
+        if let Some(hidden) = &read.hidden {
+            let _ = writeln!(out, "{} · {}", read.label, read.state);
+            let _ = writeln!(out, "{hidden}");
+            return Ok(());
         }
+        if json {
+            for l in &read.lines {
+                let d: serde_json::Map<String, Value> = l
+                    .details
+                    .iter()
+                    .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+                    .collect();
+                let _ = writeln!(
+                    out,
+                    "{}",
+                    serde_json::json!({
+                        "seq": l.seq, "kind": l.kind, "line": l.text, "ref": l.reference,
+                        "waiting": l.waiting.is_some(),
+                        "details": if details { Value::Object(d) } else { Value::Null },
+                    })
+                );
+            }
+        } else {
+            let _ = writeln!(out, "{} · {}", read.label, read.state);
+            let answer_with = vox_text::shell::node_command(
+                &["vox", "room", "session", &room_id, &read.id],
+                acting_node.as_str(),
+            );
+            let _ = write!(out, "{}", render(&read.lines, details, &answer_with));
+        }
+        // A live owner may be unreachable. Deliver locally readable history before that wait,
+        // including when stdout is a pipe. Do not retain the stdout lock across network I/O.
+        out.flush().map_err(|e| AppError::Usage(e.to_string()))?;
+    }
+    // This is the owner's durable room state, not a flag inferred from the saved transcript.
+    // A disconnected owner does not prevent reading history, and never implies Resume.
+    let pause = if read.hidden.is_none() {
+        let at = crate::client::one_shot(paths)?;
+        Some(
+            vox_core::node::room_pause::status_checked(&at, channel_id, read.node, actor, instance)
+                .await,
+        )
     } else {
-        let _ = writeln!(out, "{} · {}", read.label, read.state);
-        let answer_with = format!("vox room session {} {}", room.trim(), read.id);
-        let _ = write!(out, "{}", render(&read.lines, details, &answer_with));
+        None
+    };
+    // Preserve NDJSON activity records; status is metadata on stderr in --json mode.
+    let pause_words = match pause {
+        Some(Ok(state)) if state.paused => {
+            let when = if state.at_millis < 253_402_300_800_000 {
+                crate::room_cli::millis_as_time(state.at_millis)
+            } else {
+                format!("{} ms since Unix epoch", state.at_millis)
+            };
+            Some(format!(
+                "Paused by {} at {when}",
+                crate::ident::name_of(&state.by)
+            ))
+        }
+        Some(Err(why)) => Some(format!("Pause status unknown: {why}")),
+        _ => None,
+    };
+    if let Some(pause) = pause_words {
+        if json {
+            eprintln!("{pause}");
+        } else {
+            let mut out = std::io::stdout().lock();
+            writeln!(out, "{pause}").map_err(|e| AppError::Usage(e.to_string()))?;
+            out.flush().map_err(|e| AppError::Usage(e.to_string()))?;
+        }
     }
     Ok(())
 }

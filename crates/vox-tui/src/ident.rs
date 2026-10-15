@@ -401,27 +401,22 @@ impl Reading {
     /// `fp` and `me` the member's and this node's whole fingerprints, as `vox trust add` takes
     /// them.
     #[must_use]
-    pub fn say(self, name: &str, fp: &str, me: &str) -> String {
+    pub fn say(self, name: &str, fp: &str, me: &str, node: &str) -> String {
         match self {
             Reading::BothWays => "trusted both ways: you read each other".to_owned(),
             Reading::Waiting => format!(
                 "waiting for the other side: you trust {name}; {name}'s trust in you has not \
-                 reached this node yet. Until it does neither reads the other; if they have not \
-                 trusted you, they run `{}`",
-                vox_text::shell::command(&["vox", "trust", "add", me])
+                 reached this node yet. Ask its operator, on the computer hosting node {fp}, \
+                 to accept your fingerprint {me} from that node's trust offers"
             ),
-            // Their trust in this node, when it has reached it, is said; when it has not, only what
-            // each still runs, never that they have or have not given it.
-            // Whole commands, to paste: `vox trust add` asks there for a name.
             Reading::NotInKeyring { trusts_you: true } => format!(
                 "not in keyring, trusts you: to read each other, you run `{}`",
-                vox_text::shell::command(&["vox", "trust", "add", fp])
+                vox_text::shell::node_command(&["vox", "trust", "add", fp], node)
             ),
             Reading::NotInKeyring { trusts_you: false } => format!(
-                "not in keyring: to read each other, you run `{}`; if they have not trusted you, \
-                 they run `{}`",
-                vox_text::shell::command(&["vox", "trust", "add", fp]),
-                vox_text::shell::command(&["vox", "trust", "add", me])
+                "not in keyring: to read each other, you run `{}`; ask the operator on the \
+                 computer hosting node {fp} to accept your fingerprint {me} from that node's trust offers",
+                vox_text::shell::node_command(&["vox", "trust", "add", fp], node)
             ),
         }
     }

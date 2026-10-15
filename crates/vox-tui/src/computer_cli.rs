@@ -216,7 +216,10 @@ pub async fn run(command: ComputerCmd) -> Result<(), AppError> {
                     "computer pairing was not approved; no new local approval was made".into(),
                 ));
             }
-            status = ask(&mut client, DaemonRequest::ComputerApprove { operation }).await?;
+            // A daemon control connection answers one opening request. Preview consumed it;
+            // approval uses a fresh authenticated connection after the person's confirmation.
+            let mut approval = DaemonClient::open(&root.socket()).await?;
+            status = ask(&mut approval, DaemonRequest::ComputerApprove { operation }).await?;
         }
     }
     show(&status, json)
@@ -262,10 +265,16 @@ fn show(status: &ComputerStatus, json: bool) -> Result<(), AppError> {
         );
     }
     if let Some(link) = &status.invite_link {
-        println!("Run in the other computer's own terminal:\n  vox computer pair '{link}'");
+        println!(
+            "Run in the other computer's own terminal:\n  {}",
+            vox_text::shell::command(&["vox", "computer", "pair", link])
+        );
     }
     if let Some(id) = &status.invite_id {
-        println!("Cancel: vox computer cancel {id}");
+        println!(
+            "Cancel: {}",
+            vox_text::shell::command(&["vox", "computer", "cancel", id])
+        );
     }
     for application in &status.applications {
         println!(

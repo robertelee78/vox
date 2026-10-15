@@ -70,7 +70,7 @@ restore_clipboard() {
 }
 collect_results() {
     local status=0
-    for artifact in xcodebuild.log real-touch.log; do
+    for artifact in xcodebuild.log real-touch.log real-watch.log; do
         if [ -f "$SCRATCH/$artifact" ] && ! cp "$SCRATCH/$artifact" "$RESULTS/"; then
             echo "app-proofs: APPARATUS: could not collect $artifact" >&2
             status=2
@@ -120,7 +120,7 @@ proof_marks() {
     for n in $PROOF_NAMES; do [ -e "$REAL/nodes/$n" ] && echo "$REAL/nodes/$n"; done
     [ -e "$REAL/moved-aside" ] && echo "$REAL/moved-aside"
     if [ -f "$REAL/app/node" ]; then
-        chosen="$(head -c 64 "$REAL/app/node" | tr -d '[:space:]')"
+        chosen="$(head -c 64 "$REAL/app/node" | tr -d '[:space:]')" || return 2
         for n in $PROOF_NAMES; do [ "$chosen" = "$n" ] && echo "$REAL/app/node names $n"; done
     fi
     true
@@ -129,27 +129,90 @@ MARKS_BEFORE="$(proof_marks)"
 # While the suite runs, every 2 s: a proof process (its command under this run's derived data or
 # scratch root) with a file open under the real data root.
 REAL_TOUCH="$SCRATCH/real-touch.log"
-watch_real() {
-    while true; do
-        pids="$(pgrep -f "$DERIVED/|$SCRATCH" | tr '\n' ',' | sed 's/,$//')"
-        if [ -n "$pids" ] && [ -e "$REAL" ]; then
-            lsof -a -p "$pids" -Fpn 2>/dev/null | awk -v real="$(cd "$REAL" && pwd -P)/" '
-                /^p/ { p = substr($0, 2) } /^n/ && index(substr($0, 2), real) == 1 { print "pid " p ": " substr($0, 2) }' \
-                >> "$REAL_TOUCH"
+REAL_WATCH_LOG="$SCRATCH/real-watch.log"
+REAL_WATCH_STOP="$SCRATCH/real-watch.stop"
+# A missing process is an ordinary sample, not a failed monitor. Inspect one PID at a time:
+# lsof's no-match status is safe only when that particular process has disappeared.
+sample_real() {
+    local pids code pid real
+    local -a sample_status
+    if pids="$(pgrep -f "$DERIVED/|$SCRATCH")"; then
+        :
+    else
+        code=$?
+        [ "$code" -eq 1 ] && return 0
+        echo "app-proofs: APPARATUS: real-profile monitor pgrep failed ($code)" >&2
+        return 2
+    fi
+    [ -n "$pids" ] && [ -e "$REAL" ] || return 0
+    real="$(cd "$REAL" && pwd -P)" || {
+        echo "app-proofs: APPARATUS: real-profile monitor cannot resolve $REAL" >&2
+        return 2
+    }
+    for pid in $pids; do
+        if lsof -a -p "$pid" -Fpn | awk -v real="$real/" '
+            /^p/ { p = substr($0, 2) } /^n/ && index(substr($0, 2), real) == 1 { print "pid " p ": " substr($0, 2) }' \
+            >> "$REAL_TOUCH"; then
+            continue
+        else
+            sample_status=("${PIPESTATUS[@]}")
         fi
+        if [ "${sample_status[0]}" -eq 1 ] && [ "${sample_status[1]}" -eq 0 ] \
+            && ! kill -0 "$pid" 2>/dev/null; then
+            continue
+        fi
+        echo "app-proofs: APPARATUS: real-profile monitor sample failed for pid $pid (lsof ${sample_status[0]}, filter ${sample_status[1]})" >&2
+        return 2
+    done
+}
+watch_real() {
+    # This child must never run the parent's EXIT cleanup.
+    trap - EXIT
+    while [ ! -e "$REAL_WATCH_STOP" ]; do
+        sample_real || return 2
         sleep 2
     done
+    # A request arriving during a sample still gets a fresh final sample, after teardown.
+    sample_real
 }
 check_real() {
     local marks touched
-    marks="$(proof_marks)"
-    touched="$(sort -u "$REAL_TOUCH" 2>/dev/null)"
+    if [ ! -f "$REAL_TOUCH" ] || [ ! -r "$REAL_TOUCH" ]; then
+        echo "app-proofs: APPARATUS: real-profile monitor log is missing or unreadable" >&2
+        return 2
+    fi
+    if ! marks="$(proof_marks)" || ! touched="$(sort -u "$REAL_TOUCH")"; then
+        echo "app-proofs: APPARATUS: real-profile monitor evidence could not be read" >&2
+        return 2
+    fi
     if [ "$marks" != "$MARKS_BEFORE" ] || [ -n "$touched" ]; then
         echo "app-proofs: APPARATUS: a proof reached the real profile ($REAL):" >&2
         [ "$marks" != "$MARKS_BEFORE" ] && echo "  what a proof stages appeared there: $marks" >&2
         [ -n "$touched" ] && echo "  a proof process held a file there: $touched" >&2
         return 1
     fi
+    return 0
+}
+finish_real() {
+    local status=0 watch_status=0 alive=0
+    if kill -0 "$WATCH_REAL" 2>/dev/null; then
+        alive=1
+    else
+        echo "app-proofs: APPARATUS: real-profile monitor ended before final verification" >&2
+        status=2
+    fi
+    if ! : > "$REAL_WATCH_STOP"; then
+        echo "app-proofs: APPARATUS: cannot request the real-profile monitor's final sample" >&2
+        status=2
+        [ "$alive" -eq 0 ] || kill "$WATCH_REAL" 2>/dev/null || true
+    fi
+    wait "$WATCH_REAL" || watch_status=$?
+    if [ "$watch_status" -ne 0 ]; then
+        echo "app-proofs: APPARATUS: real-profile monitor exited $watch_status; see real-watch.log" >&2
+        status=2
+    fi
+    check_real || status=2
+    return "$status"
 }
 
 # **Preflight: everything this run needs, checked in seconds, before any build.**
@@ -262,45 +325,23 @@ trap_unregister() {
     "$LSREGISTER" -u "$APP" >/dev/null 2>&1 || true
 }
 
-# The launch proof (#438) drives no UI, so it needs no automation approval: it runs first, alone
-# when asked for by name.
-launch_status=0
-watch_real &
-WATCH_REAL=$!
-trap 'restore_clipboard; kill "$WATCH_REAL" 2>/dev/null || true; collect_results || exit 2; rm -rf "$SCRATCH"' EXIT
-if [ "$#" -eq 0 ] || [ "$*" = "LaunchProof" ]; then
-    python3 scripts/app-launch-proof.py "$APP" || launch_status=$?
-    if [ "$*" = "LaunchProof" ]; then
-        trap_unregister
-        check_real || exit 2
-        exit "$launch_status"
-    fi
-else
-    # Loud when not run: an optional proof never reads as a pass.
-    echo "app-proofs: OPTIONAL PROOF NOT RUN: LaunchProof (scripts/app-launch-proof.py);" \
-        "run it with: scripts/app-proofs.sh LaunchProof" >&2
-fi
-
-# The stager (apparatus): Xcode signs the UI-test runner into the app sandbox, and whatever a test
-# starts inherits it, so a test's `vox daemon` could not write its scratch data root. The stager
-# runs, outside the sandbox, what the proofs stage, on loopback, for whoever holds its token.
-TOKEN="$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
-# The walkthrough types a keyring change's passphrase at a terminal, as a person does (ADR-028
-# K-13), with this driver, run by the stager from the scratch directory.
-cp scripts/type-passphrase.py "$SCRATCH/type-passphrase.py"
-python3 scripts/app-proof-stager.py "$SCRATCH/stager.port" "$TOKEN" &
-STAGER=$!
+WATCH_REAL=""
+STAGER=""
 # A run that goes red keeps its scratch data root (the daemon's log, every node's files) for
 # reading the red; a green run removes it.
 finish() {
     local status=$?
-    restore_clipboard
+    trap - EXIT
+    trap '' INT TERM HUP
+    restore_clipboard || status=2
     # Each may have ended already (the stager stops itself with its run): under `set -e` a
     # failed kill or wait would become the run's exit status, a green run exiting 1.
-    kill "$WATCH_REAL" 2>/dev/null || true
-    kill "$STAGER" 2>/dev/null || true
-    wait "$STAGER" 2>/dev/null || true
+    if [ -n "$STAGER" ]; then
+        kill "$STAGER" 2>/dev/null || true
+        wait "$STAGER" 2>/dev/null || true
+    fi
     trap_unregister
+    if [ -n "$WATCH_REAL" ]; then finish_real || status=2; fi
     collect_results || status=2
     if [ "$status" -ne 0 ]; then
         # restore_clipboard ran first: its saved contents are never copied to results.
@@ -322,6 +363,36 @@ finish() {
     exit "$status"
 }
 trap finish EXIT
+
+# The launch proof (#438) drives no UI, so it needs no automation approval: it runs first, alone
+# when asked for by name.
+launch_status=0
+if ! : > "$REAL_TOUCH"; then
+    echo "app-proofs: APPARATUS: cannot initialize the real-profile monitor log" >&2
+    exit 2
+fi
+watch_real > "$REAL_WATCH_LOG" 2>&1 &
+WATCH_REAL=$!
+if [ "$#" -eq 0 ] || [ "$*" = "LaunchProof" ]; then
+    python3 scripts/app-launch-proof.py "$APP" || launch_status=$?
+    if [ "$*" = "LaunchProof" ]; then
+        exit "$launch_status"
+    fi
+else
+    # Loud when not run: an optional proof never reads as a pass.
+    echo "app-proofs: OPTIONAL PROOF NOT RUN: LaunchProof (scripts/app-launch-proof.py);" \
+        "run it with: scripts/app-proofs.sh LaunchProof" >&2
+fi
+
+# The stager (apparatus): Xcode signs the UI-test runner into the app sandbox, and whatever a test
+# starts inherits it, so a test's `vox daemon` could not write its scratch data root. The stager
+# runs, outside the sandbox, what the proofs stage, on loopback, for whoever holds its token.
+TOKEN="$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
+# The walkthrough types a keyring change's passphrase at a terminal, as a person does (ADR-028
+# K-13), with this driver, run by the stager from the scratch directory.
+cp scripts/type-passphrase.py "$SCRATCH/type-passphrase.py"
+python3 scripts/app-proof-stager.py "$SCRATCH/stager.port" "$TOKEN" &
+STAGER=$!
 for _ in $(seq 1 100); do [ -s "$SCRATCH/stager.port" ] && break; sleep 0.1; done
 [ -s "$SCRATCH/stager.port" ] || {
     echo "app-proofs: APPARATUS: the stager did not start" >&2
@@ -356,7 +427,6 @@ TEST_RUNNER_VOX_PROOF_APP="$APP" TEST_RUNNER_VOX_PROOF_SCRATCH="$SCRATCH" \
     -derivedDataPath "$DERIVED" -resultBundlePath "$RESULTS/AppProofs.xcresult" \
     ${only[@]+"${only[@]}"} test-without-building \
     2>&1 | tee "$SCRATCH/xcodebuild.log" || status=$?
-check_real || exit 2
 if grep -q "Failed to get matching snapshots: Timed out while evaluating UI query" "$SCRATCH/xcodebuild.log"; then
     echo "app-proofs: APPARATUS (UI query timeout): XCTest could not read the app's accessibility" \
         "snapshot; this runner failure proves no product behavior. See $RESULTS/AppProofs.xcresult." >&2

@@ -107,7 +107,7 @@ impl Posted {
 }
 
 /// Who holds something: a harness key and one session under it.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct Owner {
     /// The harness identity's fingerprint — proven by the log's signature.
     pub author: [u8; 32],
@@ -267,7 +267,7 @@ pub fn parse_op(env: &Envelope) -> Result<ClaimOp, String> {
 }
 
 /// The state of one resource that is not free.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum State {
     /// Owned by one session.
     Held {
@@ -348,7 +348,7 @@ pub enum Outcome {
     /// effect.
     Conflict {
         /// Every entry in the group, in canonical order.
-        group: Vec<[u8; 32]>,
+        group: std::sync::Arc<[[u8; 32]]>,
     },
 }
 
@@ -390,6 +390,9 @@ pub fn fold(messages: &[Posted], mine: &str, now_millis: u64) -> Fold {
             .then_with(|| a.entry_hash.cmp(&b.entry_hash))
     });
 
+    // A conflict invalidates every member, but its complete identity list is shared.
+    // Storing the same n hashes n times made one large operation consume quadratic RAM.
+    let mut conflicts = BTreeMap::new();
     for posted in ours {
         let op = match parse_op(&posted.envelope) {
             Ok(op) => op,
@@ -399,6 +402,19 @@ pub fn fold(messages: &[Posted], mine: &str, now_millis: u64) -> Fold {
                 continue;
             }
         };
+        let key = (
+            posted.author,
+            ops::op_of(&posted.envelope).unwrap_or_default().to_owned(),
+        );
+        if let Some(group) = conflicts.get(&key) {
+            out.outcomes.insert(
+                posted.entry_hash,
+                Outcome::Conflict {
+                    group: std::sync::Arc::clone(group),
+                },
+            );
+            continue;
+        }
         match index.verdict(posted.author, &posted.envelope, posted.entry_hash) {
             Some(Verdict::Effective) | None => {}
             Some(Verdict::Duplicate { of }) => {
@@ -407,6 +423,8 @@ pub fn fold(messages: &[Posted], mine: &str, now_millis: u64) -> Fold {
                 continue;
             }
             Some(Verdict::Conflict { group }) => {
+                let group: std::sync::Arc<[[u8; 32]]> = group.into();
+                conflicts.insert(key, std::sync::Arc::clone(&group));
                 out.outcomes
                     .insert(posted.entry_hash, Outcome::Conflict { group });
                 continue;

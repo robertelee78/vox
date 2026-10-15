@@ -1880,24 +1880,15 @@ mod journey {
         // ---- the person answers the first ask: one answer is the repo's room, for every
         // harness started in it ----
         let bound_by = match (room_ok, asks.first()) {
-            (true, Some((key, node, said))) => {
-                let join = said
-                    .split('`')
-                    .skip(1)
-                    .step_by(2)
-                    .map(str::to_owned)
-                    .chain(commands_in(said))
-                    .find(|c| c.starts_with("vox room join"))
-                    .unwrap_or_else(|| {
-                        format!(
-                            "vox room join '<link>' --node {node} --bind {}",
-                            w.repo.display()
-                        )
-                    });
-                let join = join.replace("<link>", &link);
-                // Its words as a shell reads them: Vox prints arguments in single quotes (v0.4.3).
-                let words = super::shell_words(&join);
-                let args: Vec<&str> = words.iter().skip(1).map(String::as_str).collect();
+            (true, Some((key, node, _said))) => {
+                // The person supplies the invite they obtained above. The ask cannot know
+                // that future choice, so it explains how to join rather than printing a fake
+                // link. This retained feature leg is not PC-1 shell-paste evidence.
+                let repo = w.repo.display().to_string();
+                let args = ["room", "join", &link, "--node", node, "--bind", &repo];
+                let join = vox_text::shell::command(&[
+                    "vox", "room", "join", &link, "--node", node, "--bind", &repo,
+                ]);
                 let (_, out) = w.follow(&args, node);
                 l.claim(
                     &format!("J8.{key}.room-join"),
@@ -2718,37 +2709,4 @@ mod journey {
             with Claude Code, Codex and OpenCode against a stand-in model"]
 fn a_fresh_user_gets_from_install_to_an_agent_working_in_a_room() {
     journey::run();
-}
-
-/// `line`'s words as a POSIX shell splits them, for the single quoting Vox prints (v0.4.3): a word
-/// ends at unquoted white space; inside `'…'` every character is itself; `\'` outside quotes is a
-/// `'`. Enough for the commands Vox prints, which use no other quoting.
-#[cfg(feature = "optional-proofs")]
-fn shell_words(line: &str) -> Vec<String> {
-    let (mut words, mut word, mut quoted, mut any) = (Vec::new(), String::new(), false, false);
-    let mut chars = line.chars();
-    while let Some(c) = chars.next() {
-        match (quoted, c) {
-            (true, '\'') => quoted = false,
-            (true, c) => word.push(c),
-            (false, '\'') => (quoted, any) = (true, true),
-            (false, '\\') => {
-                if let Some(n) = chars.next() {
-                    word.push(n);
-                    any = true;
-                }
-            }
-            (false, c) if c.is_whitespace() => {
-                if any || !word.is_empty() {
-                    words.push(std::mem::take(&mut word));
-                }
-                any = false;
-            }
-            (false, c) => word.push(c),
-        }
-    }
-    if any || !word.is_empty() {
-        words.push(word);
-    }
-    words
 }

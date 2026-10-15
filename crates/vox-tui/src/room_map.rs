@@ -75,9 +75,9 @@ pub fn read(data_root: &Path) -> Result<Vec<Entry>, AppError> {
     if mode & 0o077 != 0 {
         return Err(AppError::Usage(format!(
             "the room map {} holds room passphrases and others may read it (mode {mode:o}); \
-             make it yours alone with `chmod 600 {}`",
+             make it yours alone with `{}`",
             file.display(),
-            file.display()
+            vox_text::shell::command(&["chmod", "600", &file.display().to_string()])
         )));
     }
     parse(&text).map_err(|(n, why)| {
@@ -279,6 +279,7 @@ pub fn note(
     data_root: &Path,
     start: &Path,
     node: &str,
+    session: Option<&str>,
 ) -> Option<String> {
     if let Err(e) = read(data_root) {
         return Some(format!("Vox: {e}\n"));
@@ -291,46 +292,68 @@ pub fn note(
     }
     // As the map will hold it: the directory itself, a symlink to it resolved.
     let dir = std::fs::canonicalize(start).unwrap_or_else(|_| start.to_path_buf());
-    let bind = vox_text::shell::command(&[
-        "vox",
-        "room",
-        "join",
-        "<link>",
-        "--node",
+    let create = vox_text::shell::node_command(
+        &[
+            "vox",
+            "room",
+            "create",
+            "--name",
+            &suggested_name(&dir),
+            "--bind",
+            &dir.display().to_string(),
+        ],
         node,
-        "--bind",
-        &dir.display().to_string(),
-    ]);
-    let create = vox_text::shell::command(&[
-        "vox",
-        "room",
-        "create",
-        "--name",
-        "<name>",
-        "--node",
-        node,
-        "--bind",
-        &dir.display().to_string(),
-    ]);
-    let into = vox_text::shell::command(&["vox", "agent", "room", "<room>", "--node", node]);
-    let none = vox_text::shell::command(&["vox", "agent", "room", "--none", "--node", node]);
+    );
+    let decline = session.map_or_else(
+        || "If they say no, decline the repository's room offer in Vox, or use the session-specific decline command shown under Vox needs you.".to_owned(),
+        |session| format!("If they say no: run {}, and no session started here is asked again.",
+            vox_text::shell::node_command(&["vox", "agent", "room", "--none", &format!("--session={session}")], node)),
+    );
     let dir = dir.display();
     Some(format!(
         "Vox: this repo ({dir}) isn't tied to a Vox room. Tell the operator once, and do not ask \
          again on later turns: \"This repo isn't tied to a Vox room. You can create one for it, \
          paste an existing room's link here, or say no.\"\n\
-         Give them these commands to run in a terminal of their own; never ask for a room \
-         passphrase in this session. Each command asks for it in their terminal and binds this \
-         repo for every later session started here.\n\
-         - Create a room: choose its name in place of <name>, inside the single quotes:\n    \
+         Give them the create command to run in a terminal of their own; never ask for a room \
+         passphrase in this session. It asks there and binds this repo for every later session.\n\
+         - Create a room for this repository:\n    \
          {create}\n\
-         - Use an existing room: put the pasted link in place of <link>, inside its single quotes:\n    \
-         {bind}\n\
-         Once it says bound, put this session in the room: {into}\n\
+         - Use an existing room: ask the operator to paste its link here. Once they do, give \
+         them a complete room join command with that link, node {node} and --bind pointing to \
+         {dir}; quote each argument for the shell. Do not print a command before its link is known.\n\
+         Once it says bound, Vox joins this session on its next turn.\n\
          If Vox.app is running, they can also answer its room dialog; Vox puts this session in \
          that room itself.\n\
-         - If they say no: run {none}, and no session started here is asked again.\n"
+         - {decline}\n"
     ))
+}
+
+/// The repository directory as a valid room name, matching the app's Create Room suggestion.
+#[must_use]
+pub fn suggested_name(dir: &Path) -> String {
+    let directory = dir.file_name().unwrap_or_default().to_string_lossy();
+    let folded: String = directory
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_lowercase() || c.is_ascii_digit() {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let name = folded
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    let capped = name[..name.len().min(63)].trim_matches('-');
+    if capped.is_empty() {
+        "repo".to_owned()
+    } else {
+        capped.to_owned()
+    }
 }
 
 /// Add a `repo` block to `data_root`'s room map: `repo` works in the room `link` names, joined with

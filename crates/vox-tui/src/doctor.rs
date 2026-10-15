@@ -97,6 +97,7 @@ fn not_checked(id: &str, what: &str) -> Check {
 /// Exit 1 when any check fails; the report is printed first.
 pub async fn doctor(paths: &Paths, room: Option<&str>, json: bool) -> Result<(), AppError> {
     let mut checks = Vec::new();
+    let acting_node = crate::client::name_of(paths)?;
 
     // ---- the node, and the room ----
     let mut client = match crate::room_cli::attach(paths).await {
@@ -114,7 +115,13 @@ pub async fn doctor(paths: &Paths, room: Option<&str>, json: bool) -> Result<(),
                 match paths.profile_dir.file_name() {
                     Some(n) => format!(
                         "unlock this node: {} (it starts the daemon if none runs)",
-                        vox_text::shell::command(&["vox", "node", "unlock", &n.to_string_lossy()])
+                        vox_text::shell::command(&[
+                            "vox",
+                            "node",
+                            "unlock",
+                            "--",
+                            &n.to_string_lossy()
+                        ])
                     ),
                     None => "unlock this node with vox node unlock and its name (it starts the \
                              daemon if none runs)"
@@ -134,7 +141,13 @@ pub async fn doctor(paths: &Paths, room: Option<&str>, json: bool) -> Result<(),
                 checks.push(fail(
                     "room",
                     e.to_string(),
-                    "name the room with --room or VOX_ROOM; `vox room list` shows them",
+                    format!(
+                        "name the room with --room or VOX_ROOM; `{}` shows them",
+                        vox_text::shell::node_command(
+                            &["vox", "room", "list"],
+                            acting_node.as_str()
+                        )
+                    ),
                 ));
                 None
             }
@@ -168,7 +181,8 @@ pub async fn doctor(paths: &Paths, room: Option<&str>, json: bool) -> Result<(),
                     id,
                     format!(
                         "{name} is wired to node {wired}, its own node here, not this one \
-                         ({node}); `vox agent doctor --node {wired}` checks it"
+                         ({node}); `{}` checks it",
+                        vox_text::shell::node_command(&["vox", "agent", "doctor"], wired.as_str())
                     ),
                 )
             };
@@ -388,7 +402,8 @@ fn claude_hooks(node: &vox_core::node::paths::NodeName) -> Vec<Check> {
                 }
             }
             let total = at_user + at_project.iter().map(|(_, n)| n).sum::<usize>();
-            let plugin = format!("vox agent plugin claude --node {node}");
+            let plugin =
+                vox_text::shell::node_command(&["vox", "agent", "plugin", "claude"], node.as_str());
             match (at_user, total) {
                 (1, 1) => match wrong_node(&user_commands[0], node) {
                     None => ok(
@@ -504,7 +519,9 @@ fn codex_hook(node: &vox_core::node::paths::NodeName) -> Check {
         );
     }
     let hooks_file = dir.join("hooks.json");
-    let plugin = format!("merge what `vox agent plugin codex --node {node}` prints into");
+    let plugin_command =
+        vox_text::shell::node_command(&["vox", "agent", "plugin", "codex"], node.as_str());
+    let plugin = format!("merge what `{plugin_command}` prints into");
     let hooks: serde_json::Value = match std::fs::read_to_string(&hooks_file) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::Value::Null,
         Err(e) => {
@@ -558,7 +575,7 @@ fn codex_hook(node: &vox_core::node::paths::NodeName) -> Check {
                      not run: an entry belongs inside a group's `hooks` list",
                     hooks_file.display()
                 ),
-                format!("replace it with what `vox agent plugin codex --node {node}` prints"),
+                format!("replace it with what `{plugin_command}` prints"),
             )
         } else {
             warn(
@@ -582,7 +599,7 @@ fn codex_hook(node: &vox_core::node::paths::NodeName) -> Check {
                 hooks_file.display()
             ),
             format!(
-                "replace it with what `vox agent plugin codex --node {node}` prints, then run \
+                "replace it with what `{plugin_command}` prints, then run \
                  `vox agent trust codex`"
             ),
         );
@@ -832,7 +849,7 @@ async fn sessions(paths: &Paths) -> Vec<Check> {
                 format!(
                     "{what}; Vox could not tell which harness ran it, so it cannot be interrupted"
                 ),
-                "for OpenCode, install the plugin (`vox agent plugin opencode`); for Claude Code, \
+                "for OpenCode, install the node's plugin through Vox agent setup; for Claude Code, \
                  run the hook from Claude Code itself",
             ),
         });
@@ -845,8 +862,11 @@ async fn sessions(paths: &Paths) -> Vec<Check> {
 /// Trust in each direction with every other member of the room, from the room's log through the
 /// node (`Consents`, V030-17).
 async fn trust(client: &mut IpcClient, channel_id: Digest32) -> Vec<Check> {
-    let (outbound, inbound) = match client.request(&Request::Consents { channel_id }).await {
-        Ok(Frame::Consents { outbound, inbound }) => (outbound, inbound),
+    let (outbound, inbound) = match client
+        .request(&Request::MemberConsents { channel_id })
+        .await
+    {
+        Ok(Frame::MemberConsents { outbound, inbound }) => (outbound, inbound),
         Ok(other) => {
             return vec![warn(
                 "trust",
@@ -880,6 +900,7 @@ async fn trust(client: &mut IpcClient, channel_id: Digest32) -> Vec<Check> {
         }
     };
     let me = client.me();
+    let node = client.node_name().map(|n| n.as_str().to_owned());
     let others: Vec<Digest32> = members.into_iter().filter(|m| Some(*m) != me).collect();
     if others.is_empty() {
         return vec![ok("trust", "you are this room's only member")];
@@ -897,7 +918,9 @@ async fn trust(client: &mut IpcClient, channel_id: Digest32) -> Vec<Check> {
                     "you have not trusted it: it cannot read you, and you do not read it",
                     format!(
                         "{} (asks for a name for it and your identity passphrase)",
-                        vox_text::shell::command(&["vox", "trust", "add", &full])
+                        node.as_deref().map_or_else(
+                            || "select this node and accept this fingerprint from its trust offers".to_owned(),
+                            |node| vox_text::shell::node_command(&["vox", "trust", "add", &full], node))
                     ),
                 ),
                 (true, false) => warn(
@@ -905,8 +928,8 @@ async fn trust(client: &mut IpcClient, channel_id: Digest32) -> Vec<Check> {
                     "you trust it, but it has not trusted you: it cannot read you",
                     match me {
                         Some(m) => format!(
-                            "ask its operator to trust you: {}",
-                            vox_text::shell::command(&["vox", "trust", "add", &b32_encode(&m)])
+                            "on the computer hosting node {full}, ask its operator to accept your fingerprint {} from that node's trust offers",
+                            b32_encode(&m)
                         ),
                         None => "ask its operator to trust you, with your fingerprint (vox id)"
                             .to_owned(),

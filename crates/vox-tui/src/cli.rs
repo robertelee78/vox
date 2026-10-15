@@ -417,6 +417,12 @@ enum RoomCmd {
     Tail(RoomTailArgs),
     /// Print the fingerprints of the room's members.
     Roster(RoomRefArgs),
+    /// Hold room news and autonomous wakes, interrupting the selected nodes' Sessions as Esc.
+    /// With no node names, selects the whole current room. Direct operator input still works.
+    Pause(RoomPauseArgs),
+    /// Release a room pause for the whole room or the named nodes. Ordinary held news waits
+    /// for the next turn; addressed urgent news may wake a Session under its existing policy.
+    Resume(RoomPauseArgs),
     /// The room's Sessions: one per harness session working in the room, each by your
     /// name for its node, the session's name and its short id; open ones first, ended ones apart.
     Sessions(RoomSessionsArgs),
@@ -1307,6 +1313,20 @@ pub struct RoomRefArgs {
     pub room: String,
 }
 
+/// One room pause/resume action; no nodes means the whole current roster.
+#[derive(Args, Debug, Clone)]
+pub struct RoomPauseArgs {
+    #[command(flatten)]
+    pub profile: NodeArgs,
+    /// The room name or a unique room-id prefix.
+    pub room: String,
+    /// One or more node aliases or fingerprints. Omit to select the whole room.
+    pub nodes: Vec<String>,
+    /// Print each bounded receiver result as JSON, including separate interrupt outcomes.
+    #[arg(long)]
+    pub json: bool,
+}
+
 /// `vox room session`
 #[derive(Args, Debug, Clone)]
 pub struct RoomSessionArgs {
@@ -1319,6 +1339,9 @@ pub struct RoomSessionArgs {
     /// Print each entry's full input and output under its line.
     #[arg(long)]
     pub details: bool,
+    /// Print saved records without joining multipart activities. Pages remain bounded.
+    #[arg(long, conflicts_with = "details")]
+    pub raw: bool,
     /// Print one JSON object per line instead.
     #[arg(long)]
     pub json: bool,
@@ -2661,6 +2684,7 @@ pub fn run() -> ExitCode {
                 RoomCmd::Post(a) => &a.profile,
                 RoomCmd::Read(a) => &a.profile,
                 RoomCmd::Roster(a) => &a.profile,
+                RoomCmd::Pause(a) | RoomCmd::Resume(a) => &a.profile,
                 RoomCmd::Sessions(a) => &a.profile,
                 RoomCmd::Session(a) => &a.profile,
                 RoomCmd::Ping(a) => &a.profile,
@@ -2766,11 +2790,18 @@ pub fn run() -> ExitCode {
                                     &a.session,
                                     a.details,
                                     a.json,
+                                    a.raw,
                                     a.before.as_deref(),
                                 )
                                 .await
                             }
                         },
+                        RoomCmd::Pause(a) => {
+                            crate::room_pause::run(&paths, &a.room, &a.nodes, true, a.json).await
+                        }
+                        RoomCmd::Resume(a) => {
+                            crate::room_pause::run(&paths, &a.room, &a.nodes, false, a.json).await
+                        }
                         RoomCmd::Sessions(a) => {
                             crate::room_cli::sessions(&paths, &a.room, a.json).await
                         }

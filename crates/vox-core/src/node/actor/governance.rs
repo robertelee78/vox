@@ -1,0 +1,226 @@
+//! One bounded governance turn, shared with the actor's ordinary command loop.
+
+use super::*;
+
+#[derive(Default)]
+pub(super) struct Maintenance {
+    pub pending: bool,
+    after: Option<Digest32>,
+    again: bool,
+    pub(super) removal: Option<Removal>,
+}
+
+pub(super) struct Removal {
+    room: Digest32,
+    member: Digest32,
+    instance: std::sync::Weak<tokio::sync::Mutex<ChannelState>>,
+    after: Option<Digest32>,
+    count: usize,
+    done: bool,
+    reply: oneshot::Sender<Outcome>,
+}
+
+impl Node {
+    pub(super) fn begin_admin_removal(
+        &mut self,
+        room: Digest32,
+        member: Digest32,
+        reply: oneshot::Sender<Outcome>,
+    ) {
+        let failure = if self.profile.is_none() {
+            Some(Fault::NoIdentity)
+        } else if self.governance_work.removal.is_some() {
+            Some(Fault::AdminChangePending)
+        } else if !self.channels.contains_key(&room) {
+            Some(Fault::ChannelNotOpen)
+        } else {
+            None
+        };
+        if let Some(fault) = failure {
+            let _ = reply.send(Outcome::Failed(fault));
+            return;
+        }
+        let Some(shared) = self.channels.get(&room) else {
+            return;
+        };
+        self.governance_work.removal = Some(Removal {
+            room,
+            member,
+            instance: Arc::downgrade(shared),
+            after: None,
+            count: 0,
+            done: false,
+            reply,
+        });
+        self.governance_work.pending = true;
+    }
+
+    /// At most one certificate is inspected and one revocation written. The weak room
+    /// reference fences close/reopen and retains no room secrets across lock.
+    async fn advance_admin_removal(&mut self) {
+        let Some(mut work) = self.governance_work.removal.take() else {
+            return;
+        };
+        let Some(profile) = self.profile.as_ref() else {
+            let _ = work.reply.send(Outcome::Failed(Fault::Locked));
+            return;
+        };
+        let shared = match (self.channels.get(&work.room), work.instance.upgrade()) {
+            (Some(current), Some(old)) if Arc::ptr_eq(current, &old) => Arc::clone(current),
+            _ => {
+                let _ = work.reply.send(Outcome::Failed(Fault::ChannelNotOpen));
+                return;
+            }
+        };
+        let Ok(mut channel) = shared.try_lock() else {
+            self.governance_work.removal = Some(work);
+            return; // The regular tick retries a busy room; do not spin on its mutex.
+        };
+        if work.done {
+            match channel.is_admin(profile.store(), &work.member, self.now_ms()) {
+                Err(error) if ChannelState::governance_refreshing(&error) => {
+                    self.governance_work.removal = Some(work);
+                    return;
+                }
+                Err(error) => {
+                    let _ = work.reply.send(Outcome::Failed(fault_of(&error)));
+                    return;
+                }
+                Ok(true) => {
+                    // Another effective certificate may have arrived while the removal was
+                    // being folded. Finish only after the current authority says it is gone.
+                    work.after = None;
+                    work.done = false;
+                    self.governance_work.removal = Some(work);
+                    self.governance_work.again = true;
+                    return;
+                }
+                Ok(false) => {}
+            }
+            drop(channel);
+            self.publish_admin_roster(&work.room).await;
+            self.publish().await;
+            let _ = work.reply.send(Outcome::Done);
+            return;
+        }
+        let result = channel.remove_admin(profile, &work.member, work.after, self.now_ms());
+        drop(channel);
+        match result {
+            Err(error) if ChannelState::governance_refreshing(&error) => {
+                self.governance_work.removal = Some(work);
+            }
+            Err(error) => {
+                let _ = work.reply.send(Outcome::Failed(fault_of(&error)));
+            }
+            Ok((count, next)) => {
+                work.count = work.count.saturating_add(count);
+                if count > 0 {
+                    self.note_local_append(&work.room);
+                    self.governance_work.again = true;
+                }
+                if let Some(next) = next {
+                    work.after = Some(next);
+                    self.governance_work.removal = Some(work);
+                    self.governance_work.again = true;
+                } else if work.count == 0 {
+                    let _ = work.reply.send(Outcome::Failed(Fault::NotAnAdmin));
+                } else {
+                    work.done = true;
+                    self.governance_work.removal = Some(work);
+                    self.governance_work.again = true;
+                }
+            }
+        }
+    }
+
+    /// One room's fixed-size disk work per selection. A cycle retains only its cursor and a
+    /// retry bit; ordinary commands and network events remain eligible between turns.
+    pub(super) async fn advance_governance_turn(&mut self) {
+        self.advance_admin_removal().await;
+        let Some(store) = self.profile.as_ref().map(Profile::store_handle) else {
+            self.governance_work.pending = false;
+            self.governance_work.after = None;
+            return;
+        };
+        use std::ops::Bound::{Excluded, Unbounded};
+        let next = match self.governance_work.after {
+            Some(after) => self.channels.range((Excluded(after), Unbounded)).next(),
+            None => self.channels.iter().next(),
+        }
+        .map(|(room, shared)| (*room, Arc::clone(shared)));
+        let Some((room, shared)) = next else {
+            self.governance_work.after = None;
+            self.governance_work.pending = std::mem::take(&mut self.governance_work.again);
+            return;
+        };
+        self.governance_work.after = Some(room);
+        let Ok(mut channel) = shared.try_lock() else {
+            return;
+        };
+        let progress = match channel.advance_governance(&store, self.now_ms()) {
+            Ok(progress) => progress,
+            Err(error) => {
+                channel.poison(&error);
+                return;
+            }
+        };
+        self.governance_work.again |= progress.pending;
+        let backfilled = match channel.advance_governance_backfill(&store, self.now_ms()) {
+            Ok(count) => count,
+            Err(error) => {
+                channel.poison(&error);
+                0
+            }
+        };
+        match channel.governance_backfill_pending(&store) {
+            Ok(pending) => self.governance_work.again |= pending,
+            Err(error) => channel.poison(&error),
+        }
+        // Classification has no authority until governance is current. Continue its
+        // bounded sealed scan in this same round-robin room turn; a quiet room must not
+        // need another sync to finish, and an unresolved absent target is not busy work.
+        let mut legacy_finished = false;
+        if progress.ready {
+            let was_pending = channel.legacy_classification_pending(&store);
+            match was_pending.and_then(|pending| {
+                channel
+                    .advance_legacy_sessions(&store, self.now_ms().get())
+                    .map(|more| (pending, more))
+            }) {
+                Ok((was_pending, more)) => {
+                    self.governance_work.again |= more;
+                    legacy_finished = was_pending && !more;
+                }
+                Err(error) if ChannelState::legacy_classification_refreshing(&error) => {
+                    self.governance_work.again = true;
+                }
+                Err(error) => channel.poison(&error),
+            }
+        }
+        let mut views_finished = false;
+        if progress.ready {
+            match channel.advance_room_views(&store) {
+                Ok((more, finished)) => {
+                    self.governance_work.again |= more;
+                    views_finished = finished;
+                }
+                Err(error) => channel.poison(&error),
+            }
+        }
+        drop(channel);
+        if progress.ready {
+            // Discover stale consent from disk a page at a time. A quiet room must finish
+            // this work too; it cannot depend on another join or trust command arriving.
+            let more_consents = self.revoke_untrusted_consents(&room).await;
+            self.governance_work.again |= more_consents;
+        }
+        if progress.ready && progress.changed {
+            self.adopt_channel_anchors(&room).await;
+            self.refresh_network_view().await;
+            self.publish_admin_roster(&room).await;
+        }
+        if progress.changed || backfilled > 0 || legacy_finished || views_finished {
+            self.publish().await;
+        }
+    }
+}

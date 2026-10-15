@@ -140,6 +140,12 @@ impl Images {
         self.picker.is_some()
     }
 
+    /// Drop protocols for images or widths no longer drawn on the current page.
+    pub fn retain_visible(&mut self, entries: &[Digest32], width: u16) {
+        self.drawn
+            .retain(|(entry, at_width), _| *at_width == width && entries.contains(entry));
+    }
+
     /// Draw `img`, the verified and decoded image shared by `entry`, into `area`: fitted once per
     /// width, from an image already scaled to at most [`DECODED_EDGE`].
     pub fn draw(&mut self, frame: &mut Frame, area: Rect, entry: Digest32, img: &DynamicImage) {
