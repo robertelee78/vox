@@ -92,7 +92,9 @@ final class WindowSeen: ObservableObject {
             self.updateToken = nil
             // Never replay a Bool captured during attachment or a window notification.
             let visible = self.isVisible ? attachment : nil
-            if self.visibleAttachment != visible { self.visibleAttachment = visible }
+            // A view may have sampled live visibility while it was false and then true again
+            // before this coalesced update. Publish even when the attachment is unchanged.
+            self.visibleAttachment = visible
         }
     }
 
