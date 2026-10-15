@@ -2444,7 +2444,7 @@ private struct Inspector: View {
                             // endless recursion, and the app crashed when read.
                             HStack {
                                 Text("says it runs on \(Platform.words(platform))")
-                                    .font(Theme.mono).secondaryText()
+                                    .font(Theme.text).secondaryText()
                             }
                             .padding(.leading, Space.s20)
                             .accessibilityElement(children: .ignore)
