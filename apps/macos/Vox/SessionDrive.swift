@@ -97,6 +97,9 @@ struct SessionComposer: View {
                 // Who types, into which Session (E-4, CL-1): never read as the room's composer.
                 Text("\(model.node) ▸ \(session.label)").font(Theme.mono).secondaryText()
                     .lineLimit(1).truncationMode(.middle)
+                    .frame(minWidth: 120 * scale, idealWidth: 160 * scale, maxWidth: 160 * scale, alignment: .leading)
+                    .layoutPriority(1)
+                    .help("\(model.node) ▸ \(session.label)")
                     // No label of its own (a selectable Text with one recurses); the field's says it.
                     .accessibilityIdentifier("session-compose-as")
                 // Up to 12 lines, so a pasted stack trace or a long prompt is read before it goes;
@@ -108,8 +111,7 @@ struct SessionComposer: View {
                     .help("Return sends; ⇧Return starts a new line")
                     .accessibilityLabel("Message to \(session.label), as \(model.node)")
                     .textFieldStyle(.plain)
-                    .frame(minWidth: Theme.scaled(160), maxWidth: .infinity)
-                    .layoutPriority(1)
+                    .frame(minWidth: 80 * scale, maxWidth: .infinity)
                     .onSubmit(send)
                     // Esc interrupts the turn it is running, as the tooltip says (D13).
                     .onExitCommand { interrupt() }
