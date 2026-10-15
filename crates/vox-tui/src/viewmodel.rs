@@ -318,6 +318,8 @@ pub struct SharedView {
     /// What reaching it needs, each fact `✓ <fact>` or `missing: <fact> — <fix>` (ADR-028 S-3,
     /// the readiness ticks `vox service list` and the app show).
     pub ready: Vec<String>,
+    /// Browser setup guidance, without claiming the browser's configuration was checked.
+    pub browser_hint: Option<String>,
 }
 
 /// One Session in a room, as the TUI lists it (ADR-029 SE-3, CL-2).

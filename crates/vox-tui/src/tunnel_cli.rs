@@ -389,7 +389,8 @@ pub fn named_spec(spec: &str) -> Result<(u16, String), AppError> {
 // The commands and the needs of a shared service (ADR-028 S-3) are said from one place for the
 // CLI, the TUI and the app (`vox_core::node::service_reach`).
 pub use vox_core::node::service_reach::{
-    commands as service_commands, needs as service_needs, tick as service_tick,
+    browser_hint as service_browser_hint, commands as service_commands, needs as service_needs,
+    tick as service_tick,
 };
 
 /// What `vox service list` prints, from the daemon: the services shared in the room by every
@@ -472,6 +473,7 @@ impl ServiceListPrinter {
                     "address":s.canonical,"readable":s.address,"by":s.by,"kind":s.kind,"udp":s.udp,
                     "commands":service_commands(s, &self.node).into_iter().map(|(what,command)|serde_json::json!({"what":what,"command":command})).collect::<Vec<_>>(),
                     "needs":service_needs(s,Some(&self.proxy)).into_iter().map(|(need,holds,otherwise)|serde_json::json!({"need":need,"holds":holds,"otherwise":otherwise})).collect::<Vec<_>>(),
+                    "browser_hint":service_browser_hint(s,Some(&self.proxy)),
                 });
                 print!("{row}");
             } else {
@@ -486,6 +488,9 @@ impl ServiceListPrinter {
                 }
                 for (need, holds, otherwise) in service_needs(s, Some(&self.proxy)) {
                     println!("      {}", service_tick(&need, holds, &otherwise));
+                }
+                if let Some(hint) = service_browser_hint(s, Some(&self.proxy)) {
+                    println!("      {hint}");
                 }
             }
             self.any = true;

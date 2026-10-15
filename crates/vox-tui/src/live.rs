@@ -172,7 +172,7 @@ pub struct DaemonCore {
     /// When the snapshot was last asked for; `None` asks now.
     asked: Option<Instant>,
     /// Whether the daemon's `.vox` proxy runs, and where, as last asked: the Shared pane's
-    /// `proxy configured` fact (ADR-028 S-3). `None` until asked.
+    /// proxy-running fact (ADR-028 S-3). `None` until asked.
     proxy: Option<Result<std::net::SocketAddr, String>>,
     /// When the proxy was last asked about.
     proxy_asked: Option<Instant>,
@@ -1624,7 +1624,7 @@ impl DaemonCore {
     }
 
     /// Ask the daemon whether its `.vox` proxy runs, every [`PROXY_EVERY`], on a connection of
-    /// its own that attaches nothing: the Shared pane's `proxy configured` fact.
+    /// its own that attaches nothing: the Shared pane's proxy-running fact.
     fn ask_proxy(&mut self) {
         if self
             .proxy_asked
@@ -3078,6 +3078,10 @@ impl DaemonCore {
                                 };
                                 crate::viewmodel::SharedView {
                                     line,
+                                    browser_hint: crate::tunnel_cli::service_browser_hint(
+                                        &svc,
+                                        self.proxy.as_ref(),
+                                    ),
                                     copy: crate::tunnel_cli::service_commands(
                                         &svc,
                                         self.node.as_str(),

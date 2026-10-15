@@ -214,6 +214,11 @@ private struct SharedServiceBox: View {
                     StateMark(kind: .attention, words: "missing: \(need.need) — \(need.otherwise)")
                 }
             }
+            if let hint = service.browserHint {
+                Text(hint).font(Theme.text).secondaryText().textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("service-browser-hint-\(service.address)")
+            }
         }
         .padding(Space.s12)
         .cardOutline()

@@ -1071,6 +1071,9 @@ fn shared_lines(
                 };
                 lines.push(Line::from(format!("    {r}")));
             }
+            if let Some(hint) = &s.browser_hint {
+                lines.extend(wrap(Line::from(format!("    {hint}")), width));
+            }
             lines.push(Line::from("    y copies:"));
             let chars: Vec<char> = s.copy.chars().collect();
             for chunk in chars.chunks(width.saturating_sub(6).max(10)) {
