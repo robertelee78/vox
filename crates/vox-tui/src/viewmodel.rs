@@ -54,6 +54,8 @@ pub struct MemberView {
     /// The machine its newest `hello` in the room says it runs on (ADR-020 §4.9b), its own claim:
     /// `macOS 26.2 (aarch64)`. `None` when none of its sessions has said.
     pub machine: Option<String>,
+    /// Pending or unavailable is distinct from a complete scan with no platform claim.
+    pub machine_note: Option<String>,
 }
 
 /// One line the timeline tells about the room, not a message (ADR-028 E-5).

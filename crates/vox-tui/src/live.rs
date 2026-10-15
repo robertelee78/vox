@@ -230,6 +230,7 @@ pub struct DaemonCore {
     clashes_said: std::collections::BTreeSet<String>,
     /// The room on screen's rows, as read.
     timeline: Option<Timeline>,
+    member_platforms: Option<MemberPlatforms>,
     /// Summaries are refreshed with room changes, never from a draw or a loaded-row count.
     thread_summaries: BTreeMap<Digest32, ThreadSummary>,
     threads_stale: bool,
@@ -338,9 +339,6 @@ struct Timeline {
     stale: bool,
     /// The projection, and what it was projected with.
     projected: Option<Projected>,
-    /// The machine each member's newest `hello` here says it runs on (ADR-020 §4.9b), and when
-    /// that hello was posted: folded as rows arrive, so a frame never reads the room for it.
-    machines: std::collections::HashMap<Digest32, (u64, String)>,
 }
 
 enum PageFailure {
@@ -414,30 +412,16 @@ fn thread_root(row: &MessageRow) -> Option<Digest32> {
         .and_then(|root| b32_decode(root.trim(), "thread").ok())
 }
 
-/// Fold `row` into `machines` if it is a `hello` that says which machine it runs on, newer than
-/// the one held for its author.
-fn note_machine(
-    machines: &mut std::collections::HashMap<Digest32, (u64, String)>,
-    row: &MessageRow,
-) {
-    if !row.text.starts_with('{') || !row.text.contains(vox_agentcomms::envelope::HELLO) {
-        return;
-    }
-    let Ok(e) = vox_agentcomms::envelope::Envelope::parse(&row.text) else {
-        return;
-    };
-    if e.kind != vox_agentcomms::envelope::HELLO {
-        return;
-    }
-    let Some(said) = crate::platform::claim(&e.data) else {
-        return;
-    };
-    if machines
-        .get(&row.author)
-        .is_none_or(|(at, _)| *at <= row.created_millis)
-    {
-        machines.insert(row.author, (row.created_millis, said));
-    }
+/// At most one small platform claim per current member, independent of loaded messages.
+struct MemberPlatforms {
+    room: Digest32,
+    instance: Option<[u8; 16]>,
+    revision: Option<Digest32>,
+    before: Option<(u64, Digest32)>,
+    members: BTreeSet<Digest32>,
+    claims: BTreeMap<Digest32, String>,
+    pending: bool,
+    error: Option<String>,
 }
 
 /// How many of the node's decisions, newest first, the TUI's decision screen holds.
@@ -634,6 +618,7 @@ impl DaemonCore {
             joined: None,
             clashes_said: std::collections::BTreeSet::new(),
             timeline: None,
+            member_platforms: None,
             thread_summaries: BTreeMap::new(),
             threads_stale: true,
             thread_roots: BTreeSet::new(),
@@ -778,6 +763,7 @@ impl DaemonCore {
                 self.has_identity = true;
                 self.asked = None;
                 self.timeline = None;
+                self.member_platforms = None;
                 self.thread = None;
                 self.thread_summaries.clear();
                 self.thread_roots.clear();
@@ -960,6 +946,7 @@ impl DaemonCore {
         self.conn = None;
         self.active = None;
         self.timeline = None;
+        self.member_platforms = None;
         self.image_visible.clear();
         self.images.clear();
         self.checked.clear();
@@ -1360,17 +1347,145 @@ impl DaemonCore {
                     self.note_joins(&before);
                     self.check_pulls();
                     self.refresh_footers();
+                    self.refresh_member_platforms();
                 }
                 Ok(None) => match Frame::from_bytes(&reply) {
                     Ok(Frame::NodeDetached { .. }) => self.detached(),
-                    Ok(Frame::Error { reason }) => self.notice = Some(reason),
-                    _ => {}
+                    Ok(Frame::Error { reason }) => {
+                        self.member_platforms_unavailable(format!("Platform information unavailable: {reason}"));
+                        self.notice = Some(reason);
+                    }
+                    _ => self.member_platforms_unavailable("Platform information unavailable: the node did not return its current state.".into()),
                 },
-                Err(e) => self.notice = Some(format!("the daemon's answer did not read: {e}")),
+                Err(e) => {
+                    self.member_platforms_unavailable(format!("Platform information unavailable: {e}"));
+                    self.notice = Some(format!("the daemon's answer did not read: {e}"));
+                }
             },
             Err(e) => {
+                self.member_platforms_unavailable(format!("Platform information unavailable: {e}"));
                 self.ended
                     .get_or_insert(format!("the vox daemon stopped answering: {e}"));
+            }
+        }
+    }
+
+    fn member_platforms_unavailable(&mut self, reason: String) {
+        if let Some(page) = &mut self.member_platforms {
+            page.claims.clear();
+            page.instance = None;
+            page.revision = None;
+            page.before = None;
+            page.pending = false;
+            page.error = Some(reason);
+        }
+    }
+
+    /// One metadata page per existing snapshot refresh, never a synchronous history drain.
+    fn refresh_member_platforms(&mut self) {
+        let Some(room) = self
+            .active
+            .filter(|room| self.snapshot.open.iter().any(|r| r.channel_id == *room))
+        else {
+            self.member_platforms = None;
+            return;
+        };
+        let members: BTreeSet<_> = self
+            .snapshot
+            .open
+            .iter()
+            .find(|r| r.channel_id == room)
+            .into_iter()
+            .flat_map(|r| r.members.iter().copied())
+            .collect();
+        if self
+            .member_platforms
+            .as_ref()
+            .is_none_or(|p| p.room != room || p.members != members)
+        {
+            self.member_platforms = Some(MemberPlatforms {
+                room,
+                members,
+                instance: None,
+                revision: None,
+                before: None,
+                claims: BTreeMap::new(),
+                pending: true,
+                error: None,
+            });
+        }
+        let Some(selected) = self.member_platforms.as_ref() else {
+            return;
+        };
+        let request = Request::MemberHellos {
+            channel_id: room,
+            instance: selected.instance,
+            revision: selected.revision,
+            before: selected.before,
+        };
+        let Some(conn) = self.conn.as_mut() else {
+            self.member_platforms = None;
+            return;
+        };
+        let answer = until_stopped(&self.rt, &self.stop, conn.client.request(&request));
+        let Some(selected) = self.member_platforms.as_mut() else {
+            return;
+        };
+        match answer {
+            Some(Ok(Frame::MemberHellos(page))) => {
+                if selected.revision != Some(page.revision)
+                    || selected.instance != Some(page.instance)
+                {
+                    selected.claims.clear();
+                }
+                for row in &page.rows {
+                    if !selected.members.contains(&row.author)
+                        || selected.claims.contains_key(&row.author)
+                    {
+                        continue;
+                    }
+                    let Ok(env) = vox_agentcomms::envelope::Envelope::parse(&row.text) else {
+                        continue;
+                    };
+                    if env.kind != vox_agentcomms::envelope::HELLO {
+                        continue;
+                    }
+                    if let Some(said) = crate::platform::claim(&env.data) {
+                        selected.claims.insert(row.author, said);
+                    }
+                }
+                selected.instance = Some(page.instance);
+                selected.revision = Some(page.revision);
+                selected.before = if selected
+                    .members
+                    .iter()
+                    .all(|m| selected.claims.contains_key(m))
+                {
+                    None
+                } else {
+                    page.next
+                };
+                selected.pending = selected.before.is_some();
+                selected.error = None;
+            }
+            Some(Ok(Frame::NodeDetached { .. })) => {
+                self.detached();
+            }
+            other => {
+                selected.claims.clear();
+                selected.instance = None;
+                selected.revision = None;
+                selected.before = None;
+                selected.pending = false;
+                selected.error = Some(match other {
+                    Some(Ok(Frame::Error { reason })) => {
+                        format!("Platform information unavailable: {reason}")
+                    }
+                    Some(Err(error)) => format!("Platform information unavailable: {error}"),
+                    _ => {
+                        "Platform information unavailable: the node did not return metadata.".into()
+                    }
+                });
             }
         }
     }
@@ -2008,6 +2123,7 @@ impl DaemonCore {
     fn read_timeline(&mut self) {
         let Some(cid) = self.active else {
             self.timeline = None;
+            self.member_platforms = None;
             return;
         };
         if !self.snapshot.open.iter().any(|o| o.channel_id == cid) {
@@ -2127,9 +2243,6 @@ impl DaemonCore {
             .filter(|t| t.channel_id == cid && t.view == self.room_view)
         {
             Some(t) => {
-                for row in &rows {
-                    note_machine(&mut t.machines, row);
-                }
                 if before.is_none() {
                     t.cursor = newest.or(t.cursor);
                 }
@@ -2141,10 +2254,6 @@ impl DaemonCore {
                 t.projected = None;
             }
             None => {
-                let mut machines = std::collections::HashMap::new();
-                for row in &rows {
-                    note_machine(&mut machines, row);
-                }
                 self.timeline = Some(Timeline {
                     channel_id: cid,
                     before,
@@ -2157,7 +2266,6 @@ impl DaemonCore {
                     want_latest: false,
                     stale: false,
                     projected: None,
-                    machines,
                 });
             }
         }
@@ -2809,11 +2917,28 @@ impl DaemonCore {
                             MemberView {
                                 id: *m,
                                 machine: self
-                                    .timeline
+                                    .member_platforms
                                     .as_ref()
-                                    .filter(|t| t.channel_id == d.channel_id)
-                                    .and_then(|t| t.machines.get(m))
-                                    .map(|(_, said)| said.clone()),
+                                    .filter(|p| p.room == d.channel_id)
+                                    .and_then(|p| p.claims.get(m))
+                                    .cloned(),
+                                machine_note: self
+                                    .member_platforms
+                                    .as_ref()
+                                    .filter(|p| p.room == d.channel_id)
+                                    .map_or_else(
+                                        || Some("Platform information is still being read.".into()),
+                                        |p| {
+                                            p.error.clone().or_else(|| {
+                                                (p.pending && !p.claims.contains_key(m)).then(
+                                                    || {
+                                                        "Platform information is still being read."
+                                                            .into()
+                                                    },
+                                                )
+                                            })
+                                        },
+                                    ),
                                 capability: (!is_me && snap.trusted.iter().any(|(fp, _)| fp == m))
                                     .then(|| {
                                         if snap.drive.contains(m) {
@@ -3853,6 +3978,9 @@ impl CoreHandle for DaemonCore {
                             ..RoomUnread::default()
                         },
                     );
+                }
+                if self.active != channel_id {
+                    self.member_platforms = None;
                 }
                 self.active = channel_id;
                 if let Some(cid) = channel_id {

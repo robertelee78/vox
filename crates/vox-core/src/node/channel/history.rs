@@ -10,6 +10,11 @@ use crate::node::api::{
 };
 
 pub(crate) enum Query {
+    MemberHellos {
+        instance: Option<[u8; 16]>,
+        revision: Option<Digest32>,
+        before: Option<(u64, Digest32)>,
+    },
     ViewPage {
         view: crate::node::api::RoomView,
         instance: Option<[u8; 16]>,
@@ -106,6 +111,7 @@ pub(crate) enum Query {
 }
 
 pub(crate) enum Reply {
+    MemberHellos(crate::node::api::MemberHelloPage),
     Footers {
         rows: Vec<crate::node::api::MessageFooter>,
         tags: Vec<Option<String>>,
@@ -637,9 +643,114 @@ impl View<'_> {
         })
     }
 
+    fn member_hellos(
+        &self,
+        instance: Option<[u8; 16]>,
+        known: Option<Digest32>,
+        before: Option<(u64, Digest32)>,
+        bytes: usize,
+    ) -> Answer<Reply> {
+        if let Some(instance) = instance {
+            self.view_instance(instance)?;
+        }
+        if (known.is_some() && instance.is_none()) || (before.is_some() && known.is_none()) {
+            return Err(Failure::Request(
+                "member metadata continuation lacks its room/revision",
+            ));
+        }
+        let filter = Filter::Type(vox_agentcomms::envelope::HELLO.into());
+        let members = self.ch.members();
+        use sha2::{Digest, Sha256};
+        let mut stamp = Sha256::new();
+        stamp.update(b"vox-member-hello-selection-v1");
+        stamp.update(self.ch.channel_id());
+        stamp.update(self.ch.me());
+        stamp.update(self.rendered.history_instance());
+        for value in [
+            self.ch.projection_state.incarnation,
+            self.rendered.filter_display_root(&filter)?,
+            self.rendered.display_roots()[3],
+            self.ch.effective_retention(),
+            self.ch.effective_step_retention(),
+        ] {
+            stamp.update(value.to_be_bytes());
+        }
+        stamp.update((members.len() as u64).to_be_bytes());
+        for member in &members {
+            stamp.update(member);
+        }
+        let revision: Digest32 = stamp.finalize().into();
+        let mut page = crate::node::api::MemberHelloPage {
+            instance: self.rendered.history_instance(),
+            revision,
+            unchanged: known == Some(revision) && before.is_none(),
+            rows: Vec::new(),
+            next: None,
+        };
+        if page.unchanged {
+            return Ok(Reply::MemberHellos(page));
+        }
+        // A changed selection explicitly restarts at its newest row. Clients replace their
+        // small per-current-member map when the returned revision changes.
+        let mut cursor = if known == Some(revision) {
+            before
+        } else {
+            None
+        };
+        if let Some((clock, hash)) = cursor {
+            if !self.rendered.contains(&filter, &hash)?
+                || self.rendered.order().key(&hash)? != Some((clock, hash))
+            {
+                return Err(Failure::Request(
+                    "member metadata cursor is not in this selection",
+                ));
+            }
+        }
+        let mut used = 0usize;
+        for _ in 0..256 {
+            let Some((key, _)) = self.rendered.step(Some(&filter), true, cursor, true)? else {
+                return Ok(Reply::MemberHellos(page));
+            };
+            let author = self
+                .rendered
+                .order()
+                .entry(&key.1)?
+                .ok_or(Error::MalformedAtRest("member hello entry missing"))?
+                .skeleton
+                .author_id;
+            if members.binary_search(&author).is_ok() {
+                let row = self
+                    .row(&key.1)?
+                    .ok_or(Error::MalformedAtRest("member hello row missing"))?;
+                let cost = row
+                    .text
+                    .len()
+                    .saturating_add(crate::node::ipc::ROW_OVERHEAD);
+                if !page.rows.is_empty() && used.saturating_add(cost) > bytes {
+                    page.next = cursor;
+                    return Ok(Reply::MemberHellos(page));
+                }
+                used = used.saturating_add(cost);
+                page.rows.push(row);
+            }
+            cursor = Some(key);
+            if page.rows.len() >= crate::node::ipc::MEMBER_HELLO_ROWS || used >= bytes {
+                page.next = cursor;
+                return Ok(Reply::MemberHellos(page));
+            }
+        }
+        page.next = cursor;
+        Ok(Reply::MemberHellos(page))
+    }
+
     fn answer(&self, query: Query, bytes: usize) -> Answer<Reply> {
         let cursor_error = "cursor not in this room's timeline";
         match query {
+            Query::MemberHellos {
+                instance,
+                revision,
+                before,
+            } => self.member_hellos(instance, revision, before, bytes),
             Query::ViewPage {
                 view,
                 instance,
