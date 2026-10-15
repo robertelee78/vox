@@ -145,6 +145,49 @@ pub async fn show(
     let read =
         vox_core::node::session_view::read(&sessions, rows, session, None, &label_of, &ByIdent)
             .map_err(AppError::Usage)?;
+    // What is not shown, and how to show it, on stderr: stdout stays the page.
+    if let (Some(first), true) = (&first, older > 0 && read.hidden.is_none()) {
+        eprintln!(
+            "{older} older {} not shown: vox room session {} {} --before {first}",
+            if older == 1 { "entry" } else { "entries" },
+            room.trim(),
+            read.id
+        );
+    }
+    use std::io::Write as _;
+    {
+        let mut out = std::io::stdout().lock();
+        if let Some(hidden) = &read.hidden {
+            let _ = writeln!(out, "{} · {}", read.label, read.state);
+            let _ = writeln!(out, "{hidden}");
+            return Ok(());
+        }
+        if json {
+            for l in &read.lines {
+                let d: serde_json::Map<String, Value> = l
+                    .details
+                    .iter()
+                    .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+                    .collect();
+                let _ = writeln!(
+                    out,
+                    "{}",
+                    serde_json::json!({
+                        "seq": l.seq, "kind": l.kind, "line": l.text, "ref": l.reference,
+                        "waiting": l.waiting.is_some(),
+                        "details": if details { Value::Object(d) } else { Value::Null },
+                    })
+                );
+            }
+        } else {
+            let _ = writeln!(out, "{} · {}", read.label, read.state);
+            let answer_with = format!("vox room session {} {}", room.trim(), read.id);
+            let _ = write!(out, "{}", render(&read.lines, details, &answer_with));
+        }
+        // A live owner may be unreachable. Deliver locally readable history before that wait,
+        // including when stdout is a pipe. Do not retain the stdout lock across network I/O.
+        out.flush().map_err(|e| AppError::Usage(e.to_string()))?;
+    }
     // This is the owner's durable room state, not a flag inferred from the saved transcript.
     // A disconnected owner does not prevent reading history, and never implies Resume.
     let pause = if read.hidden.is_none() {
@@ -172,49 +215,14 @@ pub async fn show(
         Some(Err(why)) => Some(format!("Pause status unknown: {why}")),
         _ => None,
     };
-    // What is not shown, and how to show it, on stderr: stdout stays the page.
-    if let (Some(first), true) = (&first, older > 0 && read.hidden.is_none()) {
-        eprintln!(
-            "{older} older {} not shown: vox room session {} {} --before {first}",
-            if older == 1 { "entry" } else { "entries" },
-            room.trim(),
-            read.id
-        );
-    }
-    use std::io::Write as _;
-    let mut out = std::io::stdout().lock();
-    if let Some(hidden) = &read.hidden {
-        let _ = writeln!(out, "{} · {}", read.label, read.state);
-        let _ = writeln!(out, "{hidden}");
-        return Ok(());
-    }
-    if json {
-        if let Some(pause) = &pause_words {
+    if let Some(pause) = pause_words {
+        if json {
             eprintln!("{pause}");
+        } else {
+            let mut out = std::io::stdout().lock();
+            writeln!(out, "{pause}").map_err(|e| AppError::Usage(e.to_string()))?;
+            out.flush().map_err(|e| AppError::Usage(e.to_string()))?;
         }
-        for l in &read.lines {
-            let d: serde_json::Map<String, Value> = l
-                .details
-                .iter()
-                .map(|(k, v)| (k.clone(), Value::String(v.clone())))
-                .collect();
-            let _ = writeln!(
-                out,
-                "{}",
-                serde_json::json!({
-                    "seq": l.seq, "kind": l.kind, "line": l.text, "ref": l.reference,
-                    "waiting": l.waiting.is_some(),
-                    "details": if details { Value::Object(d) } else { Value::Null },
-                })
-            );
-        }
-    } else {
-        let _ = writeln!(out, "{} · {}", read.label, read.state);
-        if let Some(pause) = &pause_words {
-            let _ = writeln!(out, "{pause}");
-        }
-        let answer_with = format!("vox room session {} {}", room.trim(), read.id);
-        let _ = write!(out, "{}", render(&read.lines, details, &answer_with));
     }
     Ok(())
 }
