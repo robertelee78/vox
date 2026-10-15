@@ -225,7 +225,7 @@ async fn watch_for_interrupts(node: NodeHandle, paths: Paths) {
                 if sends.len() >= 4 || room_held(&node.view(), &room) {
                     continue;
                 }
-                if session.harness != "opencode" {
+                if !crate::wake::wakeable(&session.harness) {
                     continue;
                 }
                 let page = match node
@@ -254,8 +254,8 @@ async fn watch_for_interrupts(node: NodeHandle, paths: Paths) {
                 if sources.is_empty() {
                     continue;
                 }
-                let label = detail.name.as_deref().unwrap_or(&room_text).to_owned();
-                let (node, paths, expected_pause) = (node.clone(), paths.clone(), detail.pause);
+                let (node, paths, history, expected_pause) =
+                    (node.clone(), paths.clone(), history.clone(), detail.pause);
                 // A freed adapter slot goes first to the next room. A slow client lookup
                 // stays inside that slot and cannot hold the shared room scanner.
                 next_room = (index + 1) % rooms;
@@ -285,12 +285,44 @@ async fn watch_for_interrupts(node: NodeHandle, paths: Paths) {
                         route: route.as_ref().map(|r| r.route),
                     }).await.is_err() { return; }
                     let Some(route) = route else { return };
+                    // Read only this bounded page's signed authors, one row at a time, inside
+                    // the existing adapter slot. No message text survives the read or enters
+                    // the notice; an unavailable premise leaves the work queued before Begin.
+                    let mut authors = Vec::with_capacity(sources.len());
+                    for source in &sources {
+                        let row = tokio::select! {
+                            biased;
+                            () = &mut held => return,
+                            row = history.notice_exact(room, *source) => match row {
+                                Ok(row) => row,
+                                Err(_) => return,
+                            },
+                        };
+                        if let Some(row) = row {
+                            authors.push((*source, row.row.author));
+                        }
+                    }
+                    let sources = authors.iter().map(|(source, _)| *source).collect();
                     let attempt = match node.attention(room, owner, Some(recipient.instance),
                         Operation::Begin { recipient: recipient.clone(), route: route.route, sources }).await {
                         Ok(Reply::Attempt(Some(attempt))) => attempt,
                         _ => return,
                     };
-                    let text = format!("Vox notice: a batch of {} unread room message(s) is queued for this Session in {}. Their attributed text and source references arrive through the ordinary Vox hook. This notice contains no operator request or room-message body.", attempt.count, vox_text::shown(&label, 128));
+                    let text = {
+                        let view = node.view();
+                        let senders: std::collections::BTreeSet<_> = authors.iter()
+                            .filter(|(source, _)| attempt.sources.contains(source))
+                            .map(|(_, author)| *author).collect();
+                        let mut names: Vec<_> = senders.iter().take(8).map(|author| {
+                            vox_text::shown(&crate::ident::author_for(&view.trusted, Some(&owner), author), 128)
+                        }).collect();
+                        if senders.len() > names.len() {
+                            names.push("additional senders omitted".into());
+                        }
+                        let label = view.channels.iter().find(|channel| channel.channel_id == room)
+                            .and_then(|channel| channel.name.as_deref()).unwrap_or(&room_text);
+                        format!("Vox attention notice: {} unread room message(s) from {} in room {}. This notice is from Vox, not the person you work for. Their attributed text arrives through the ordinary Vox hook.", attempt.count, names.join(", "), vox_text::shown(label, 128))
+                    };
                     // This is the existing pause-publication fence. No actor IPC is awaited
                     // while held; a pause either precedes this submission or reports busy.
                     let outcome = match crate::room_pause::publication_lock(&paths, room, false).await {
@@ -299,7 +331,13 @@ async fn watch_for_interrupts(node: NodeHandle, paths: Paths) {
                         Ok(_publication) => tokio::select! {
                             biased;
                             () = &mut held => DispatchOutcome::Unknown("room authority/pause changed while submission was pending; no retry without receipt".into()),
-                            outcome = crate::wake::attention_on_route(&paths, &session, &route, attempt.notice_id, &text) => outcome,
+                            outcome = async {
+                                if session.harness == "claude" {
+                                    crate::wake::claude_attention(&paths, &session, &route, &attempt, &text).await
+                                } else {
+                                    crate::wake::attention_on_route(&paths, &session, &route, attempt.notice_id, &text).await
+                                }
+                            } => outcome,
                         },
                     };
                     if let Err(error) = node.attention(room, owner, Some(recipient.instance), Operation::Dispatch { attempt, outcome }).await {

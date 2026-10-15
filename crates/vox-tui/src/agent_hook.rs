@@ -69,11 +69,21 @@ struct HookInput {
     /// The session's working directory: the payload's `cwd` (Claude Code's and Codex's carry it),
     /// else this process's (OpenCode's plugin runs the hook in OpenCode's own directory).
     cwd: String,
+    /// Actual native prompt text, used only to recognize Vox's body-free admission notice.
+    prompt: String,
+    /// Retained exact automatic admission; never reselect a replacement during this drain.
+    native_notice: Option<crate::wake::NativeNotice>,
 }
 
 fn parse_input(raw: &str) -> HookInput {
     let v: serde_json::Value = serde_json::from_str(raw).unwrap_or(serde_json::Value::Null);
     HookInput {
+        native_notice: None,
+        prompt: v
+            .get("prompt")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
         event: v
             .get("hook_event_name")
             .and_then(serde_json::Value::as_str)
@@ -112,6 +122,54 @@ fn parse_input(raw: &str) -> HookInput {
             })
             .unwrap_or_default(),
     }
+}
+
+/// Recheck the same admitted room/opening and native endpoint; never select a replacement.
+async fn check_native_notice(
+    paths: &Paths,
+    notice: &crate::wake::NativeNotice,
+) -> Result<(), AppError> {
+    let saved = crate::wake::pause_registration(paths, &notice.recipient.session)
+        .map_err(AppError::Usage)?
+        .ok_or_else(|| AppError::Usage("Vox attention conversation ended".into()))?;
+    if saved.room.as_deref() != Some(b32_encode(&notice.recipient.room).as_str())
+        || saved
+            .attention
+            .as_ref()
+            .is_none_or(|route| route.route != notice.route)
+        || crate::wake::AttentionRoute::claude(&saved).as_ref() != saved.attention.as_ref()
+        || std::env::var("CLAUDE_CODE_MESSAGING_SOCKET").as_deref() != Ok(saved.endpoint.as_str())
+        || std::env::var("CLAUDE_CODE_MESSAGING_TOKEN").as_deref() != Ok(saved.token.as_str())
+    {
+        return Err(AppError::Usage("Vox attention registration changed".into()));
+    }
+    let at = crate::client::one_shot(paths)?;
+    let client = crate::client::open(&at).await?;
+    let owner = client
+        .me()
+        .ok_or_else(|| AppError::Usage("Vox node is locked".into()))?;
+    use vox_core::node::attention::{local, Operation, Reply};
+    let reply = local(
+        &at,
+        owner,
+        notice.recipient.room,
+        Some(notice.recipient.instance),
+        Operation::Resolve {
+            session: notice.recipient.session.clone(),
+        },
+    )
+    .await
+    .map_err(AppError::Usage)?;
+    if !matches!(reply, Reply::Resolved {recipient, ..} if recipient == notice.recipient) {
+        return Err(AppError::Usage("Vox attention opening changed".into()));
+    }
+    if !crate::wake::pause_registration(paths, &notice.recipient.session)
+        .map_err(AppError::Usage)?
+        .is_some_and(|current| current.same(&saved))
+    {
+        return Err(AppError::Usage("Vox attention registration changed".into()));
+    }
+    Ok(())
 }
 
 /// A sealed attention notice, rather than a timeout, selects the existing urgent-ahead path.
@@ -1529,6 +1587,16 @@ fn emit_receipts(
     }
 }
 
+/// The selected hook entry point; automatic admission has a fail-closed policy.
+pub enum HookMode {
+    /// Normal harness lifecycle and room context.
+    Normal,
+    /// OpenCode's exact client route registration, without a context drain.
+    AttentionRegister,
+    /// Claude's native automatic-notice admission, without ordinary prompt handling.
+    NativeAttention,
+}
+
 /// Run the hook: read stdin, then act on the harness's event.
 ///
 /// - `Stop` (Claude Code's end of turn): record that the session is idle, and print nothing
@@ -1549,15 +1617,155 @@ pub async fn run(
     room_arg: Option<&str>,
     format: Format,
     session: Option<&str>,
-    attention_register: bool,
+    mode: HookMode,
 ) -> Result<(), AppError> {
+    let attention_register = matches!(mode, HookMode::AttentionRegister);
+    let native_attention = matches!(mode, HookMode::NativeAttention);
     let mut raw = String::new();
     // A harness always provides stdin; a person testing by hand may not — and
     // OpenCode's plugin cannot, so it passes `--session` instead.
     if session.is_none() {
-        let _ = std::io::stdin().read_to_string(&mut raw);
+        let read = std::io::stdin().read_to_string(&mut raw);
+        if native_attention {
+            read.map_err(|e| AppError::Usage(format!("invalid native hook input: {e}")))?;
+        }
+    }
+    if native_attention {
+        let value: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|e| AppError::Usage(format!("invalid native hook input: {e}")))?;
+        if !value.is_object() || !value["prompt"].is_string() || !value["session_id"].is_string() {
+            return Err(AppError::Usage("incomplete native hook input".into()));
+        }
     }
     let mut input = parse_input(&raw);
+    let notice = crate::wake::NativeNotice::parse(&input.prompt);
+    // The fail-closed command handles only automatic notices; the ordinary command handles
+    // every other prompt. Claude may run these commands concurrently, so they never share a drain.
+    if native_attention && matches!(notice, Ok(None)) {
+        return Ok(());
+    }
+    if !native_attention && !matches!(notice, Ok(None)) {
+        return Ok(());
+    }
+    if native_attention {
+        let admitted = async {
+            let notice_id = notice
+                .map_err(AppError::Usage)?
+                .ok_or_else(|| AppError::Usage("missing native attention notice".into()))?;
+            if !input.claude
+                || input.codex
+                || input.event != "UserPromptSubmit"
+                || input.session_id.is_empty()
+                || input.session_id == "unknown-session"
+            {
+                return Err(AppError::Usage(
+                    "Vox attention notice belongs to a different native conversation".into(),
+                ));
+            }
+            let saved = crate::wake::pause_registration(paths, &input.session_id)
+                .map_err(AppError::Usage)?
+                .ok_or_else(|| {
+                    AppError::Usage("Vox attention conversation is no longer registered".into())
+                })?;
+            if saved.harness != "claude"
+                || std::env::var("CLAUDE_CODE_MESSAGING_SOCKET").as_deref()
+                    != Ok(saved.endpoint.as_str())
+                || std::env::var("CLAUDE_CODE_MESSAGING_TOKEN").as_deref()
+                    != Ok(saved.token.as_str())
+                || crate::wake::AttentionRoute::claude(&saved).as_ref() != saved.attention.as_ref()
+            {
+                return Err(AppError::Usage("Vox attention registration changed".into()));
+            }
+            let at = crate::client::one_shot(paths)?;
+            let client = crate::client::open(&at).await?;
+            let owner = client
+                .me()
+                .ok_or_else(|| AppError::Usage("Vox node is locked".into()))?;
+            let room = vox_core::node::link::b32_decode(
+                saved.room.as_deref().ok_or_else(|| {
+                    AppError::Usage("Vox attention conversation has no saved room".into())
+                })?,
+                "attention room",
+            )?;
+            let route = saved
+                .attention
+                .as_ref()
+                .ok_or_else(|| AppError::Usage("Vox attention registration changed".into()))?
+                .route;
+            // The prompt contains no recipient selector. Resolve only the actual native Session
+            // in its saved room; Admit then matches this exact opening against the sealed attempt.
+            // An A notice presented in B (or a replacement A) cannot select or reopen A.
+            let recipient = match vox_core::node::attention::local(
+                &at,
+                owner,
+                room,
+                None,
+                vox_core::node::attention::Operation::Resolve {
+                    session: input.session_id.clone(),
+                },
+            )
+            .await
+            .map_err(AppError::Usage)?
+            {
+                vox_core::node::attention::Reply::Resolved { recipient, .. } => recipient,
+                _ => {
+                    return Err(AppError::Usage(
+                        "unexpected native attention selection answer".into(),
+                    ));
+                }
+            };
+            if recipient.room != room
+                || recipient.session != input.session_id
+                || !crate::wake::pause_registration(paths, &input.session_id)
+                    .map_err(AppError::Usage)?
+                    .is_some_and(|current| current.same(&saved))
+            {
+                return Err(AppError::Usage("Vox attention registration changed".into()));
+            }
+            let notice = crate::wake::NativeNotice {
+                recipient,
+                notice_id,
+                route,
+            };
+            let reply = vox_core::node::attention::local(
+                &at,
+                owner,
+                notice.recipient.room,
+                Some(notice.recipient.instance),
+                vox_core::node::attention::Operation::Admit {
+                    recipient: notice.recipient.clone(),
+                    notice_id: notice.notice_id,
+                    route: notice.route,
+                },
+            )
+            .await
+            .map_err(AppError::Usage)?;
+            if !matches!(reply, vox_core::node::attention::Reply::Done) {
+                return Err(AppError::Usage(
+                    "unexpected native attention admission answer".into(),
+                ));
+            }
+            Ok(notice)
+        };
+        match tokio::time::timeout(std::time::Duration::from_secs(5), admitted)
+            .await
+            .map_err(|_| {
+                AppError::Usage(
+                    "Vox attention admission timed out; no room content was released".into(),
+                )
+            })
+            .and_then(std::convert::identity)
+        {
+            Ok(notice) => input.native_notice = Some(notice),
+            Err(error) => {
+                println!(
+                    "{}",
+                    serde_json::json!({"decision":"block", "reason":error.to_string()})
+                );
+                return Ok(());
+            }
+        }
+    }
     // Native hook identity wins over an inherited parent harness environment. OpenCode has
     // no native stdin identity and supplies the exact client Session through --session.
     if input.session_id != "unknown-session" {
@@ -1601,6 +1809,11 @@ pub async fn run(
     // record, no cursor, no node directory; only a turn that shows the agent anything says it,
     // once per session.
     if !daemon.account.nodes_on_disk().contains(&daemon.node) {
+        if native_attention {
+            return Err(AppError::Usage(
+                "Vox attention node is no longer present".into(),
+            ));
+        }
         let shown = !matches!(input.event.as_str(), "Stop" | "SessionEnd")
             && crate::session_mirror::Event::parse(&raw)
                 .filter(|ev| crate::session_mirror::mirrors(&ev.name))
@@ -1657,6 +1870,20 @@ pub async fn run(
         _ => {}
     }
 
+    if let Some(notice) = &input.native_notice {
+        // Admission already requires an existing opening. Automatic attention must never
+        // register or reopen a conversation that ended while its notice was queued.
+        return drain(
+            paths,
+            room_arg,
+            Some(&b32_encode(&notice.recipient.room)),
+            &input,
+            &raw,
+            format,
+            None,
+        )
+        .await;
+    }
     let drained = match daemon.register(&input, room_arg).await {
         Ok(answer) => {
             // The prompt goes to the Session first: it is what the turn the drain starts answers.
@@ -1897,7 +2124,12 @@ impl Daemon {
                 _ => (String::new(), String::new()),
             };
             record.harness = "claude".into();
-            record.attention = None;
+            record.attention = if std::env::var("VOX_CLAUDE_NATIVE_ATTENTION").as_deref() == Ok("1")
+            {
+                crate::wake::AttentionRoute::claude(&record)
+            } else {
+                None
+            };
             record.mirror.clear();
         }
         record.registration_only = input.event == "VoxAttentionRegister";
@@ -2383,6 +2615,14 @@ async fn drain(
     format: Format,
     note: Option<String>,
 ) -> Result<(), AppError> {
+    if let Some(notice) = &input.native_notice {
+        if working_room != Some(b32_encode(&notice.recipient.room).as_str()) {
+            return Err(AppError::Usage(
+                "Vox attention room changed before reading".into(),
+            ));
+        }
+        check_native_notice(paths, notice).await?;
+    }
     // Over the account socket as this node, which the session's registration attached (ADR-026
     // C-1, N-6): never attaching anything itself.
     let mut client = crate::client::open(&crate::client::one_shot(paths)?).await?;
@@ -2423,6 +2663,9 @@ async fn drain(
     let selected_room = rooms.first().map(|r| r.0);
     if let (Some(room), Some(me)) = (selected_room, me) {
         if pause_holds(paths, room, me).await? {
+            if input.native_notice.is_some() {
+                return Err(AppError::Usage("Vox room attention is paused".into()));
+            }
             return Ok(());
         }
     }
@@ -2460,6 +2703,11 @@ async fn drain(
     // session to accept it. Only that typed command accepts it (K-13): the hook shows, never acts.
     let offered = new_offers(paths, &mut client, &input.session_id).await;
     let news: Vec<&RoomDrain> = drains.iter().filter(|d| d.has_news()).collect();
+    if input.native_notice.is_some() && drains.iter().all(|d| d.fresh.is_empty()) {
+        return Err(AppError::Usage(
+            "Vox attention has no readable room context".into(),
+        ));
+    }
     if news.is_empty()
         && unread.is_empty()
         && note.is_none()
@@ -2587,6 +2835,7 @@ async fn drain(
     // Reserve only actual attributed context, never the chatter/sibling/thread counters.
     // No actor IPC runs while the pause publication file lock is held.
     let mut attention_receipts = Vec::new();
+    let mut prepared_source = false;
     let native_input = if format == Format::OpenCode {
         match std::env::var("VOX_OPENCODE_INPUT_ID") {
             Ok(id) => Some(
@@ -2620,28 +2869,37 @@ async fn drain(
                 continue;
             }
             use vox_core::node::attention::{local, Operation, Reply};
-            let recipient = match local(
-                &at,
-                owner,
-                d.channel_id,
-                None,
-                Operation::Resolve {
-                    session: input.session_id.clone(),
-                },
-            )
-            .await
-            {
-                Ok(Reply::Resolved { recipient, .. }) => recipient,
-                Err(reason) if reason == "the selected Session is no longer open" => continue,
-                Err(reason) => {
-                    cancel_attention_receipts(paths, owner, &attention_receipts).await;
-                    return Err(AppError::Usage(reason));
-                }
-                _ => {
-                    cancel_attention_receipts(paths, owner, &attention_receipts).await;
+            let recipient = if let Some(notice) = &input.native_notice {
+                if d.channel_id != notice.recipient.room {
                     return Err(AppError::Usage(
-                        "unexpected attention recipient answer".into(),
+                        "Vox attention room changed during reading".into(),
                     ));
+                }
+                notice.recipient.clone()
+            } else {
+                match local(
+                    &at,
+                    owner,
+                    d.channel_id,
+                    None,
+                    Operation::Resolve {
+                        session: input.session_id.clone(),
+                    },
+                )
+                .await
+                {
+                    Ok(Reply::Resolved { recipient, .. }) => recipient,
+                    Err(reason) if reason == "the selected Session is no longer open" => continue,
+                    Err(reason) => {
+                        cancel_attention_receipts(paths, owner, &attention_receipts).await;
+                        return Err(AppError::Usage(reason));
+                    }
+                    _ => {
+                        cancel_attention_receipts(paths, owner, &attention_receipts).await;
+                        return Err(AppError::Usage(
+                            "unexpected attention recipient answer".into(),
+                        ));
+                    }
                 }
             };
             let ticket = vox_core::identity::rng::random_array()
@@ -2666,6 +2924,7 @@ async fn drain(
                         if prepared.len() <= chunk.len()
                             && prepared.iter().all(|source| chunk.contains(source)) =>
                     {
+                        prepared_source |= !prepared.is_empty();
                         if let Some(input) = native_input.filter(|_| !prepared.is_empty()) {
                             input_receipts.push(vox_core::node::attention::InputReceipt {
                                 recipient: recipient.clone(),
@@ -2685,6 +2944,14 @@ async fn drain(
             }
         }
     }
+    if input.native_notice.is_some() && !prepared_source {
+        if let Some(owner) = me {
+            cancel_attention_receipts(paths, owner, &attention_receipts).await;
+        }
+        return Err(AppError::Usage(
+            "Vox attention source is no longer pending".into(),
+        ));
+    }
     // All history/offer IPC and rendering precede this fence. Only a final point query,
     // stdout publication and synchronous acknowledgements are inside it.
     let publication = match news_publication(paths, selected_room, me).await {
@@ -2693,9 +2960,21 @@ async fn drain(
             if let Some(owner) = me {
                 cancel_attention_receipts(paths, owner, &attention_receipts).await;
             }
+            if input.native_notice.is_some() {
+                return Err(AppError::Usage("Vox attention publication is held".into()));
+            }
             return held.map(|_| ());
         }
     };
+    if let Some(notice) = &input.native_notice {
+        if let Err(error) = check_native_notice(paths, notice).await {
+            drop(publication);
+            if let Some(owner) = me {
+                cancel_attention_receipts(paths, owner, &attention_receipts).await;
+            }
+            return Err(error);
+        }
+    }
     emit_receipts(
         format,
         raw_input,
@@ -2708,6 +2987,11 @@ async fn drain(
         // Publication may be partial. Keep its reservations uncertain, and never append
         // a second envelope through run()'s pre-publication error reporter.
         eprintln!("vox agent hook: context output is unconfirmed: {error}");
+        if input.native_notice.is_some() {
+            return Err(AppError::Usage(
+                "Vox attention output is unconfirmed".into(),
+            ));
+        }
         return Ok(());
     }
     offered.commit(paths, &input.session_id);
@@ -3377,6 +3661,10 @@ pub fn claude_settings(node: &vox_core::node::paths::NodeName) -> String {
         }
     }
     v["env"] = serde_json::json!({ "VOX_NODE": node.as_str() });
+    if let Some(groups) = v["hooks"]["UserPromptSubmit"].as_array_mut() {
+        groups.push(serde_json::json!({"hooks":[{"type":"command", "command":format!("{} --native-attention", hook_command(node)), "onFailure":"block", "timeout":30, "async":false}]}));
+        v["env"]["VOX_CLAUDE_NATIVE_ATTENTION"] = "1".into();
+    }
     let mut text = serde_json::to_string_pretty(&v).unwrap_or_default();
     text.push('\n');
     text

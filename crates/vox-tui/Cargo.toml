@@ -80,6 +80,8 @@ tempfile.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# Claude's body-free native attention notice carries a bounded JSON envelope.
+base64.workspace = true
 semver.workspace = true
 # The LAN helper passes its utun descriptor over a socket: `net`. `vox daemon` asks for its
 # passphrase with echo off and the terminal otherwise as it was (V210-153): `termios`.
@@ -111,9 +113,6 @@ async-trait.workspace = true
 # The large room's proof reads its Sessions through the app's client (`VoxClient`), as Vox.app does,
 # against the shipped `vox` this crate builds (ADR-034 PF-1).
 vox-ffi = { path = "../vox-ffi" }
-# The share proof reads the thumbnail an announcement carries (ADR-028 F-9); `image`, a
-# dependency of the TUI, makes the photo it shares.
-base64.workspace = true
 # The at-rest floor proof re-derives the vault key the binary wrote, independently of
 # vox-core, with the ADR-010 floor parameters hard-coded in the test.
 argon2.workspace = true
