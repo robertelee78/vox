@@ -76,6 +76,11 @@ async fn watch_for_interrupts(node: NodeHandle, paths: Paths) {
             Some(done) = sends.join_next_with_id(), if !sends.is_empty() => {
                 let id = match done { Ok((id, ())) => id, Err(error) => error.id() };
                 submitting.remove(&id);
+                // Completion only frees the slot. A refused Begin is not new
+                // room work: rescanning it here can repeatedly rediscover the
+                // same route while an output receipt is still unconfirmed.
+                // Existing room events and the bounded tick drive the next pass.
+                continue;
             },
         }
         let view = node.view();

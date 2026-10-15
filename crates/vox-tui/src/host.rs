@@ -2361,21 +2361,46 @@ impl Router {
             }
             Ok(())
         };
+        // Subscribe before the first attempt: a projection can become ready while
+        // its refusal is returning. Retain only this already validated native
+        // observation; a publication wakes a checked retry, never another input.
+        let mut publication = handle.watch();
         let observe = async {
             for receipt in &observation.receipts {
                 let recipient = &receipt.recipient;
-                current(recipient.room, recipient.instance)?;
-                match handle
-                    .attention(
-                        recipient.room,
-                        owner,
-                        Some(recipient.instance),
-                        Operation::Observed(receipt.clone()),
-                    )
-                    .await?
-                {
-                    Reply::Done => {}
-                    _ => return Err("unexpected attention observation answer".into()),
+                loop {
+                    publication.borrow_and_update();
+                    current(recipient.room, recipient.instance)?;
+                    match handle
+                        .attention(
+                            recipient.room,
+                            owner,
+                            Some(recipient.instance),
+                            Operation::Observed(receipt.clone()),
+                        )
+                        .await
+                    {
+                        Ok(Reply::Done) => break,
+                        // These refusals precede the receipt transaction. The
+                        // existing actor publishes bounded projection progress;
+                        // wait for that progress within the original total bound.
+                        // Stale authority/openings and malformed observations are
+                        // deliberately not retryable.
+                        Err(reason)
+                            if matches!(
+                                reason.as_str(),
+                                "the room is refreshing saved Sessions; retry"
+                                    | "node: room governance is refreshing; try again when it is ready"
+                            ) =>
+                        {
+                            publication.changed().await.map_err(|_| {
+                                "attention observation node stopped; receipt outcome is unconfirmed"
+                                    .to_owned()
+                            })?;
+                        }
+                        Err(reason) => return Err(reason),
+                        _ => return Err("unexpected attention observation answer".into()),
+                    }
                 }
                 current(recipient.room, recipient.instance)?;
             }
