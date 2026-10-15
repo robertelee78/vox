@@ -146,10 +146,12 @@ struct RoomTabs: View {
                         }
                         .disabled(model.sessionsMetadataLoading)
                         .accessibilityIdentifier("sessions-open-pages")
+                        .copyMenu([("Copy Label", "Open Sessions")])
                     }
                     if !model.endedSessions.isEmpty || model.sessionsHistoryNext != nil || model.sessionsHistoryPaged {
                         Divider().frame(height: 20)
-                        Menu("Ended (\(model.endedSessions.count) on this page)") {
+                        let words = "Ended (\(model.endedSessions.count) on this page)"
+                        Menu(words) {
                             Button("First history page") { Task { await model.firstSessionHistory() } }
                                 .disabled(model.sessionsMetadataLoading || !model.sessionsHistoryPaged)
                             if model.sessionsHistoryNext != nil {
@@ -164,9 +166,13 @@ struct RoomTabs: View {
                                 }.accessibilityIdentifier("session-\(session.shortId)")
                             }
                         }.accessibilityIdentifier("sessions-ended")
+                            .copyMenu([("Copy Label", words)])
                     }
                 }
             }.accessibilityIdentifier("room-session-tabs")
+                // These words navigate. Inherited selection can install text-selection
+                // overlays on their labels; right-click Copy preserves the displayed words.
+                .textSelection(.disabled)
             if !model.roomTags.isEmpty || tagShown != nil {
                 Menu {
                     Button("All messages") { model.showing = .general }
@@ -176,6 +182,8 @@ struct RoomTabs: View {
                 } label: { Label(tagShown ?? "Tags", systemImage: "tag") }
                 .menuStyle(.borderlessButton).fixedSize()
                 .accessibilityIdentifier("room-tag-filter")
+                .textSelection(.disabled)
+                .copyMenu([("Copy Label", tagShown ?? "Tags")])
             }
         }
         .padding(.horizontal, 12).padding(.vertical, 8)
@@ -197,6 +205,7 @@ struct RoomTabs: View {
         .buttonStyle(.plain).help(words)
         .accessibilityIdentifier(id).accessibilityLabel(words)
         .accessibilityAddTraits(selected ? .isSelected : [])
+        .copyMenu([("Copy Label", words)])
     }
 }
 
