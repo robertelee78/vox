@@ -1,13 +1,17 @@
 # Agent communications
 
+Applies to Vox v0.4.5.
+
 This page shows how to give an agent its own node, wire its harness to a room, and check that
 messages reach it. A **harness** is the program the agent runs in: Claude Code, Codex or
 OpenCode. Vox wires it through a **hook**, a command the harness runs at each turn, which hands
 the agent its unread room messages. Every agent acts only as its own node, named with `--node`.
 
-Vox connects agent sessions that are already running. It never starts a harness or a model run
-because a message arrives. To drive a Claude Code session from Vox later, run Claude Code inside
-tmux ([Sessions](sessions.md#drive-a-session)).
+Vox connects sessions that are already running; it does not launch a harness or create a new
+Session because a message arrives. An eligible Claude Code or OpenCode client can start a turn
+for room attention. Codex waits for its next normal turn. To use direct operator Drive controls
+with Claude Code, run it inside tmux ([Sessions](sessions.md#drive-a-session)); automatic room
+attention uses Claude's native messaging socket and hook instead.
 
 Use `vox setup`, below. The other two ways in this page do the same work one step at a time.
 
@@ -17,26 +21,28 @@ Use `vox setup`, below. The other two ways in this page do the same work one ste
 vox setup
 ```
 
-`vox setup` looks for Claude Code, Codex and OpenCode on `PATH`. For each one found, it says what it
-is about to do, then offers a node named after the harness and the machine, such as `claude-mac`:
-
-```text
-Claude Code is to get a node of its own, claude-mac unless you name it, with a passphrase you type.
-  its hook, `vox agent hook --node claude-mac`, is to go in ~/.claude/settings.json, with VOX_NODE=claude-mac for its sessions; other Vox hook entries there are replaced, nothing else
-  the agent skill pack is to be installed in ~/.claude/skills/vox-agent-comms; a file there you changed is kept
-a node for Claude Code [claude-mac] (Enter keeps it, or type another name; skip makes none):
-```
+`vox setup` looks for Claude Code, Codex and OpenCode on `PATH`. For each one found, it describes
+the files it is to install and offers a node named after the harness and machine, such as
+`claude-mac`. It installs the agent skill beside the integration and preserves unrelated settings
+and skill files you edited.
 
 Press Return to keep the name, type another, or type `skip`. Vox asks for the node's passphrase
-twice (Return alone, twice, for none), installs the hook and the agent skill, then makes the
+twice (Return alone, twice, for none), installs the integration and the agent skill, then makes the
 node Ready and remembers it. A harness already wired to a node is left as it is. On a Mac, setup also
 offers a node for you. Type `skip` if you already have one, such as `robertgpt`.
 
 At the end, setup prints each node it made: its fingerprint beside its picture, then its name,
-harness, machine, system and Vox version. Give each fingerprint to whoever is to trust that node.
-For Codex, run `vox agent trust codex` afterwards: Codex runs a hook only once it is trusted.
+harness, machine, system and Vox version. On enrolled computers, verify the managed grants;
+for individual trust, give the actual fingerprint to whoever is to trust that node.
+For Codex, follow the hook-trust instruction: `vox agent trust codex` records trust in Vox's
+current hook entry. Codex does not run an untrusted hook. Reload a harness that was already open
+when its integration changed; then verify it below.
 
-Next, trust the agent's node as below, then start a session in the repository it works in. Vox
+To set up just one harness instead, run `vox agent setup claude`, `vox agent setup codex` or
+`vox agent setup opencode` in your own terminal. Use the actual node name it reports in later
+commands.
+
+Next, check the agent's trust as below, then start a session in the repository it works in. Vox
 asks you which room that repository works in, and puts the agent's node in it
 ([the room a session works in](sessions.md#the-room-a-session-works-in)).
 
@@ -45,8 +51,17 @@ asks you which room that repository works in, and puts the agent's node in it
 An agent's node trusts and is trusted like any other node, and each direction is a separate
 decision. For the agent `claude-mac` to work with you, `robertgpt`, in `family`:
 
-Do this right after `vox setup`; it needs no room. With two nodes Ready, each command names
-the node it acts as.
+After `vox setup`, check the existing grants first; this needs no room:
+
+```sh
+vox trust list --node robertgpt
+vox trust list --node claude-mac
+```
+
+Eligible managed local nodes and nodes on enrolled computers can already have these grants.
+Select your Ready personal node through [My computers](keyring.md#my-computers) when you want
+that policy to give it Drive over your agent nodes. Do not add duplicate individual grants.
+For a relationship that is not covered, each command below names the node granting access:
 
 1. Obtain the agent's actual fingerprint with `vox id --node claude-mac`. To grant it read access,
    construct `vox trust add` with that fingerprint, `--name claude-mac` and `--node robertgpt`.
@@ -55,7 +70,8 @@ the node it acts as.
    `--drive`. You type this in your own terminal too; the agent never holds its passphrase.
 
 Use actual fingerprints from these commands and [quote arguments](reference.md#commands-you-can-paste).
-Eligible managed local nodes may already have these grants; check the keyrings before changing them.
+An absent grant or an operator's removal is a decision to resolve with the operator, not a reason
+for an agent to change the keyring.
 
 Then put the agent in the room, as below. Once it has joined, other members, such as ann, are
 offered the agent's node, and the agent's node is offered them: `vox trust offers --node
@@ -109,15 +125,26 @@ node. The command prints the configuration on standard output and where it goes 
 error. It installs
 nothing. Merge it into the existing file. Never redirect it over the whole file.
 
-- **Claude Code:** merge the JSON into `~/.claude/settings.json`. Its hooks run
-  `vox agent hook --node claude-mac`, and its `env` sets `VOX_NODE`, so every `vox` command the
-  agent runs acts as its node.
+The v0.4.5 command's explanatory stderr still says the hook drains every room the node holds.
+That sentence is stale: actual delivery is restricted to this Session's saved repository room.
+Its ordinary-hook help also overstates that every hook exits 0; the generated native-attention
+handler deliberately fails closed for invalid automatic notices. These wording corrections are
+post-release documentation work, not changes to the v0.4.5 generated configuration.
+
+- **Claude Code:** merge the complete generated JSON into `~/.claude/settings.json`, including
+  both ordinary and native-attention hooks and its environment settings. The dedicated
+  synchronous native-attention handler blocks an automatic notice it cannot validate; the
+  ordinary hook keeps human input independent of a daemon stall. Do not replace this with a
+  single hand-written hook or change its failure policy. `VOX_NODE` selects the node for agent commands.
 - **Codex:** merge the JSON into Codex's `hooks.json`, keep `async: false`, and run
   `vox agent trust codex`. Codex sets no environment from there, so the agent passes
   `--node` and its node's name to every `vox` command. Run `vox agent trust codex` again after any change to
   the hook command.
-- **OpenCode:** save the plugin where the command says, such as
-  `~/.config/opencode/plugin/vox.js`. The node's name is written into it.
+- **OpenCode:** this print command emits the **server** plugin only. Complete attention wiring
+  also needs the TUI client plugin and its `tui.json` entry. Use `vox agent setup opencode` or
+  `vox setup` to install both: the server plugin under `plugin/vox.js`, the client under
+  `tui/vox.js`, and `./tui/vox.js` in the TUI plugin list. A server plugin alone is not proof of
+  live client admission. Setup reports conflicts with edited files rather than overwriting them.
 
 Installing or updating Vox puts the agent skill pack in each harness's skills folder, such as
 `~/.claude/skills/vox-agent-comms/`, and keeps any file there you changed. `vox agent skill
@@ -146,19 +173,42 @@ cannot tell which.
 
 ## Confirm that a message reaches the agent
 
-A clean doctor, a hook that exits 0, or a successful post does not prove delivery. To prove it,
-post a harmless, distinctive question to the agent's node from another node you both trust. Then
-start a turn in the agent's session and check that the question is in its context, and that its
-reply appears in the room.
+A clean doctor, a hook that exits 0, or a successful post does not prove delivery. With the
+agent actually open in the bound repository, post a harmless question from your own node:
 
-| Harness | Ordinary message | Urgent message addressed to it |
+```sh
+vox room post family 'Which task are you working on? Please answer in this room.' --node robertgpt
+```
+
+Ordinary room-wide conversation does not need `--to` or `--urgent`. Each eligible Session gets
+its own attributed context and may answer for its own work. Eligibility includes the saved room,
+readability, thread audience, pause state and the actual live client. A reply from another agent
+does not satisfy that Session's obligation. Session-stamped agent chatter does not broadcast a
+new automatic response obligation to every agent. A person and an agent may use the same node;
+Vox uses the actual registered sending Session, not a guessed node type, to stamp origin.
+
+| Harness | Ordinary room attention | Addressed urgent attention |
 |---|---|---|
-| Claude Code | read by the turn-start hook | can wake a running session |
-| OpenCode | read by the plugin | can wake a running session through the plugin |
-| Codex | read on the next turn | still the next turn |
+| Claude Code | a native notice queues for the existing Session; its native hook validates the current Session before releasing context | uses the same exact-Session admission boundary; does not bypass a pending permission decision |
+| OpenCode | the installed TUI client admits attention only for its current exact Session and route | also uses the current client receiver, not a retained server Session |
+| Codex | waits for the next normal hook turn, including after an idle period | still the next normal turn; Vox does not start or steer a turn |
 
-An urgent wake carries no text, only a notice that messages wait. It cannot wake a session that is
-not running.
+For Codex, start a normal turn yourself. For Claude Code/OpenCode, leave the existing client
+available and observe the notice and attributed question there. A busy Claude turn is allowed
+to finish; a permission prompt remains yours to answer. Closed or replaced Sessions are not
+reopened. A notice contains Vox's unread count and local room/sender names, not the message body;
+the body arrives through the ordinary attributed context path. It may be visible in the harness.
+
+Check that the agent's **reply appears in the room**, linked to the original question. Agents
+use `--type answer --re` with that question's actual entry hash and their actual registered
+Session. A notice, transport acknowledgement or assistant reply only in its own terminal is not
+a room answer. Delivery does not promise relevance or a model response.
+
+Members with Drive can inspect [private attention status](sessions.md#inspect-room-message-attention).
+It distinguishes a queued next turn, context delivered, a genuinely observed answering turn and a
+correlated answer. Claude delivery alone does not establish an Answering observation. Unknown
+acceptance is not silently retried. [Pause](rooms.md#pause-and-resume-agents) holds automatic news
+and wakes; resume alone does not start a turn for the ordinary backlog.
 
 ## Hand an agent a file
 
@@ -178,7 +228,7 @@ and the pulled copy's path:
 
 ## Coordinate ownership, not a second progress tracker
 
-Agents in one room can claim work, so two of them never start the same item. The room answers
+Agents in one room can claim work to coordinate who starts an item. The room answers
 "who is doing what?". Progress and proofs belong in your work tracker. `--work` names an item by
 its key in awa, a tool that tracks work in GitHub issues, as `gwa:` followed by the key. Inside the
 agent's environment, run:

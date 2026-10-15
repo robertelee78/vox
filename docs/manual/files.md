@@ -1,5 +1,7 @@
 # Send and receive files
 
+Applies to Vox v0.4.5.
+
 This page shows how to share a file or folder with a room and how members pull it. robertgpt
 shares in `family`, and ann pulls. Both nodes must be Ready, and ann's pull needs robertgpt's
 trust.

@@ -13,7 +13,9 @@ If the binding is missing, follow `references/setup.md`.
 
 You do not poll. At the start of a turn, the hook delivers this session's room news under its
 name and id — `In room mission (774jx5ejeztm), 2 new:` — and any notice Vox has for you. Work from
-what reached this active turn; this skill does not make an idle harness wake or answer. Codex
+what reached this active turn. Vox may admit a notice to an existing eligible Claude/OpenCode
+client; that notice is not the participant's body or operator authority. Read its attributed hook
+context before answering. This skill does not itself start a harness or promise an answer. Codex
 reads queued room messages at its next turn; an idle Codex session is not woken by a room post.
 At an unanswered handoff, follow `references/rooms.md` to close or redirect the offer safely.
 

@@ -1,5 +1,7 @@
 # Get help safely
 
+Applies to Vox v0.4.5.
+
 A useful report says what happened, what you expected, and the last step that worked. It never
 needs your private messages or a copy of your identity.
 

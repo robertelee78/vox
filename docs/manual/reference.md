@@ -1,5 +1,7 @@
 # Commands and local state
 
+Applies to Vox v0.4.5.
+
 This page lists the terms this manual uses, Vox's commands, how a command picks its node, the files Vox keeps, how
 passphrases are given, and the terminal interface's keys. `vox --help`, and `--help` on any
 command, give the exact arguments of the `vox` you run. `vox man` prints the same as a man page.
@@ -11,6 +13,7 @@ command, give the exact arguments of the `vox` you run. `vox man` prints the sam
 | node | one identity: its own keys, fingerprint, rooms, keyring and services |
 | fingerprint | the 52-character public name of a node's keys |
 | daemon | the background program that runs the Ready nodes of one data root |
+| computer identity | the daemon's management identity for two-sided enrollment; distinct from its nodes |
 | Ready / Locked | running in the daemon / a protected identity waiting for Unlock |
 | remembered | Vox has saved how to make the node Ready whenever the daemon starts |
 | keyring | the nodes a node trusts, each with your name for it |
@@ -36,18 +39,22 @@ command, give the exact arguments of the `vox` you run. `vox man` prints the sam
 | Open the terminal interface | `vox` or `vox tui` | a terminal |
 | Run the daemon in a terminal | `vox daemon` | nothing: unlocking a node starts one |
 | Run an anchor | `vox node`, with no subcommand | a headless node |
-| Rooms and messages | `vox room list`, `create`, `link`, `join`, `roster`, `post`, `read`, `tail`, `rename`, `retention`, `admin`, `leave`, `end` | an Ready node |
-| What the node is doing | `vox status`, `vox status --json` | an Ready node |
+| Rooms and messages | `vox room list`, `create`, `link`, `join`, `roster`, `post`, `read`, `tail`, `rename`, `retention`, `admin`, `leave`, `end` | a Ready node |
+| What the node is doing | `vox status`, `vox status --json` | a Ready node |
 | Your fingerprint | `vox id` | |
 | Trust | `vox trust add`, `list`, `offers`, `dismiss`, `rename`, `remove`, `drive`, `read` | a compared fingerprint; the passphrase, typed at a terminal, for a change |
 | Share a service | `vox serve`, `vox service add`, `list`, `remove` | a running local service |
 | Join a room for its services | `vox connect` | the room link and passphrase |
 | Reach a service | `vox up`, `vox forward` | the sharer's trust |
 | Close tunnels | `vox tunnel close` | `vox status` lists them |
-| Share and pull files | `vox share`, `vox share list`, `vox share stop`, `vox room get` | an Ready node |
+| Share and pull files | `vox share`, `vox share list`, `vox share stop`, `vox room get` | a Ready node |
 | A room's local network | `vox lan up` | the LAN helper |
-| Wire a harness | `vox agent setup`, `plugin`, `skill`, `trust`, `doctor`, `status` | `--node` |
-| Sessions | `vox room sessions`, `vox room session`, `vox agent room`, `vox agent send` | read + drive, to drive |
+| Pair your computers | `vox computer status`, `invite`, `pair`, `approve`, `personal`, `remove` | operator approval on each computer; actual invitation/operation |
+| Room anchors | `vox room anchors`, `vox room create --room-anchor` | room creator/admin; actual anchor identity/address |
+| Wire a harness | `vox agent setup`, `plugin`, `skill`, `trust`, `doctor`, `status` | actual harness; known `--node` where required |
+| Sessions | `vox room sessions`, `vox room session`, `vox agent room`, `vox agent send` | Drive for private activity and controls |
+| Private room-message attention | `vox room session --attention`, `--attention-after` | exact open Session and Drive |
+| Hold/resume automatic room news | `vox room pause`, `vox room resume` | receiver Drive; whole room or named nodes |
 | Install, update, remove | `vox update`, `vox uninstall`, `vox shell-setup` | |
 
 ## Commands you can paste
@@ -65,7 +72,10 @@ verbs, not complete commands to paste.
 In a POSIX shell, single-quote each dynamic argument, including links, paths, names and text.
 For a literal apostrophe, close the quotes, write `\'`, then reopen them: the sequence is `'\''`.
 Construct from raw argument values instead of substituting text inside existing quotes.
-Double quotes still allow shell expansions. Never put a passphrase in a constructed command.
+Double quotes still allow shell expansions. For an argument that begins with `-`, use an attached
+option value where supported, such as `--session=` followed by the actual quoted Session ID,
+so it cannot be parsed as a new flag. Preserve that form in commands Vox prints. Never put a
+passphrase in a constructed command.
 
 ## How a command picks its node
 
@@ -174,8 +184,10 @@ Never put a real passphrase in a shell command, a model's context or a screensho
 ## Output, cursors and status
 
 `--json` gives structured output on the commands that list it in their help. A `--since` cursor is
-the whole entry hash from an earlier read. A nonzero exit status means read the command's
-message. Claims have their own [exit codes](agents.md#coordinate-ownership-not-a-second-progress-tracker).
+the whole entry hash from an earlier read. Session activity's `--before` and private attention's
+`--attention-after` are different cursors: use the exact continuation printed by that command,
+with the same node/room/Session. A preparing page, expired cursor or failed read does not prove
+an empty history. A nonzero exit status means read the command's message. Claims have their own [exit codes](agents.md#coordinate-ownership-not-a-second-progress-tracker).
 
 `vox status` shows the node's fingerprint, the keyring window, what needs attention, each room
 with each member's trust, connection and last sync, each peer with its path (`direct` or relayed)
@@ -219,14 +231,22 @@ On the room list:
 The list groups rooms under `needs you`, `active` and `quiet`. Trust offers and repositories
 waiting for a room come first under `needs you`.
 
-In a room, Tab moves between the timeline, the composer, the members pane and the Shared pane.
+In a room, Tab moves among the horizontal Session tabs, timeline, composer, members and Shared
+regions. General holds room roots, threads show indented replies, and authorized Session tabs
+keep private activity separate. `@` marks addressed room news; `@!` marks urgent addressed news
+or a waiting request. Ended Session history and older pages remain available.
 
 | Key or command | Action |
 |---|---|
 | Enter, in the composer | send; `@alice` in the text addresses alice |
 | Up, Down, in the timeline | select a message |
 | Ctrl-R | reply to the selected message |
-| Enter, on a reply's quote | go to the message it answers |
+| Enter, on a root or reply's quote | open its thread, or go to the quoted message |
+| Right / Left, in a thread | next replies / close the thread |
+| PgUp, PgDn; End or `:latest` | page/scroll; return to newest |
+| `:session`, then an actual Session ID; `:general` | select private activity; return to General |
+| `:attention`; `r`, `n` in its report | selected Session's private status; refresh, next page |
+| `:pause`, `:resume` | hold/resume room agents; optionally name target nodes |
 | `t`, on a member | trust it ([Trust from the TUI](keyring.md#trust-from-the-tui)) |
 | `y`, in the Shared pane | copy the selected service's command |
 | `:serve` | share a service of yours in this room |

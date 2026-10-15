@@ -1,5 +1,7 @@
 # Sessions
 
+Applies to Vox v0.4.5.
+
 This page shows how to put an agent's sessions in the right room, follow what a session does,
 and drive it. To drive a session, the agent's node must trust your node with **read + drive**
 ([Identity and keyring](keyring.md#what-a-keyring-entry-grants-read-or-read--drive)).
@@ -31,10 +33,10 @@ under their own retention. See [Session step retention](rooms.md#set-how-long-se
 The session's node decides who sees inside:
 
 - A member it trusts with **read + drive** reads the Session and can drive it.
-- Every other member sees only the Session's label and whether it is open or ended, with
-  `Only members claude-mac trusts with drive see inside this Session.`
-- A member whose drive is taken back keeps what it already read, and reads nothing written
-  afterwards.
+- Read-only membership does not expose a selectable private Session or its attention state.
+  General may show ordinary room membership/join information, not the private activity.
+- When Drive is taken back, the app retires the selected private surface and returns to General;
+  CLI private queries refuse. Revocation cannot erase content someone already copied.
 
 A Session's label is your name for its node, the session's own name if it has one, and the first
 eight characters of its ID: `claude-mac · 3f0c25bf`, or `codex-mac · gso-cap · 01a113e7`. The name and
@@ -58,11 +60,36 @@ directory. So a session started in `/opt/vox/crates` works in `/opt/vox`'s room,
 `/opt/vox/crates` has a block of its own. A session in a git worktree of `/opt/vox` works in
 `/opt/vox`'s room too, unless a block names the worktree. If the node is not in that room yet, it
 joins. What the session does meanwhile is kept, up to 4 MiB, and added to its Session once the
-room opens. The session
-stays in that room for its whole life.
+room opens. The session stays in that room until it ends or you explicitly move it as described below.
 
 The map holds room passphrases. It must be readable by your account only, or Vox refuses to use
 it. Every node in the data root uses it, so each of them can use every passphrase in it.
+
+### Bind a repository from your terminal
+
+For an existing `family` room, with `robertgpt` and the setup-created `claude-mac` Ready on this
+computer, open your own terminal in the actual repository directory and run:
+
+```sh
+room_link=$(vox room link family --node robertgpt)
+vox room join "$room_link" --bind "$PWD" --node claude-mac
+```
+
+The first command captures your real link; the second quotes it and binds your current directory
+while joining as the agent node. Type the room passphrase in this terminal. This saves a room
+passphrase in the private room map, available to nodes in this data root. It does not grant trust.
+For a remote room, use its actual received link in the same join flow.
+
+If the repository needs a **new** room instead, while in that directory:
+
+```sh
+vox room create --name work --bind "$PWD" --node claude-mac
+```
+
+Use a different valid name if this node already holds `work`. Start the harness in this directory,
+run its `vox agent status --harness claude` check, and confirm the actual bound room and Session
+in `vox room sessions` before sending a question. Substitute the actual setup-created harness/node
+when using Codex or OpenCode; do not bind another Session's repository by guessing.
 
 ### When a repository has no room
 
@@ -123,8 +150,9 @@ Choose the intended Session from that actual output. Construct `vox room session
 its returned ID or name, and `--node robertgpt`; add `--details` to inspect full input and output.
 There is no fixed Session ID to reuse from this manual.
 
-`vox room sessions` lists `open` and `ended` Sessions by label. With `--json`, each has
-`can_drive`, which says whether you may drive it.
+`vox room sessions` lists the retained `open` and `ended` Sessions visible to the acting node.
+With `--json`, each returned row has `can_drive`. A read-only viewer may get no row at all; absence
+from that list does not prove the harness is stopped. Use the owner's view for an owner-side check.
 
 `vox room session` takes a Session's ID (at least eight characters) or its name, and prints one
 line per thing the session did:
@@ -139,7 +167,12 @@ reply: Done: big.txt is listed and e1 is made.
 — turn ended —
 ```
 
-`--details` adds each entry's whole input and output. `--json` prints one object per line.
+The command returns one bounded page, newest by default, and prints how to request an older page.
+Keep its exact `--before` entry, node, room and Session together. `--details` adds the selected
+entries' whole joined input and output. `--raw` exposes unjoined records for inspection; it is
+still paged. `--json` prints one object per line, and continuation guidance remains on stderr.
+An empty current page or a retained page is not the whole history. A removed or expired cursor
+requires a fresh newest read; do not silently treat it as a complete empty Session.
 
 ## Drive a session
 
@@ -166,7 +199,8 @@ How Vox reaches each harness:
   session's next turn.
 - **OpenCode:** through the plugin `vox setup` installs.
 
-Driving never starts a session or a model run. A slash command that would start a new session,
+Driving does not launch a new harness or Session. Submitted input can start a turn in the existing
+Session. A slash command that would start a new session,
 such as `/clear` in Codex, is refused. A refusal names the session and the reason:
 
 ```text
@@ -186,31 +220,59 @@ Nothing is posted to the room. Each of those members' nodes pulls it into its fi
 
 ## Talk to one session
 
-Any member may address one session without drive: your name for its node, a slash, and the
-session as `vox room sessions` names it.
+To address one Session, it must currently be selectable by your acting node in `vox room sessions`.
+Use your local name for its node, a slash, and that listed Session's actual ID. Knowing an ID
+supplied by its owner does not bypass this selection check or grant Drive. When a private Session
+is not selectable, address the node for room news instead; its eligible Sessions receive that
+news through their hooks.
 
 Construct `vox room post` with `family`, `--node robertgpt`, your message and `--to` holding
 `claude-mac/` followed by the intended Session's actual ID from the list. Quote the combined
 address as one argument.
 
-The session sees the message in full at its next turn, as a message from a participant, not as its
+The eligible session receives attributed context through its hook, as a message from a participant, not as its
 operator's input. A message to the node without a session reaches every session of that node in
 the room. A message to an ended session is refused. A file is addressed the same way:
 use `vox share` with an existing file, `family`, `--node robertgpt` and that same actual
 Session address in `--to`.
 
+## Inspect room-message attention
+
+With a current open Session selected from the actual list, add `--attention` to its complete
+`vox room session` command. Keep the same room, Session and acting node. `--json` exposes the
+source message ID, state, reason and any correlated answer. Use only the returned
+`--attention-after` cursor for the next page of that same selection. This is a private report,
+not room conversation; the receiver requires current Drive access.
+
+- **Queued** explains what holds delivery, such as the next Codex turn, pause, a client that
+  cannot currently admit input, or acceptance that is unknown.
+- **Delivered** means context reached the harness; it does not claim a running model turn.
+- **Answering** requires an observed running turn correlated to that input.
+- **Answered** identifies that Session's correlated room answer.
+- **Unavailable** names a source or recipient that can no longer be delivered.
+
+A preparing page is still checking thread audience; an error or unknown state is not an empty
+completed report. Follow its reason or refresh the current selection. Do not resend automatically
+when acceptance is unknown. Session retention or a room/Session change can retire the selection.
+In Vox.app this report is **Room message attention** inside the selected Session; **Refresh
+attention**, **First attention page** and **Next attention page** read bounded pages. General and
+read-only viewers do not show it.
+
 ## Sessions in the terminal interface
 
-In a room, the Sessions pane lists `General` (the room's conversation), `All` (the conversation
-with each Session's opening and end, and the entries of Sessions you drive), each open Session,
-and `Ended (N)`.
+A room has a horizontal row with **General** and the Sessions you can drive, with bounded
+navigation to more and ended Sessions. There is no combined All view or vertical Sessions list.
+General shows room roots; Enter opens a thread with indented replies, Right pages replies, and
+Left closes it. Tag selection includes that conversation's matching replies.
 
 - Enter on a Session opens it, as does `:session` followed by its actual listed ID. `:general`
-  and `:all` go back.
+  returns to the room. Ended Sessions remain accessible through their navigation.
 - In a Session you drive, the composer types into the session. A line starting with `/` is a slash
   command. `:interrupt` and `:stop` act on it. On a waiting line, `a` approves, `r` rejects, and a
   number picks an option. `:answer` takes one answer per part of a question, separated by `;`.
   `:share` followed by an existing file path sends that file. Enter or `d` on a line shows its details.
-- A Session waiting on you is marked `! claude-mac · 3f0c25bf · waiting on you`.
-- In a Session you cannot drive, there is no composer, and the TUI says `you cannot drive this
-  Session: claude-mac has not given you drive`.
+- A Session waiting on you is marked `! LABEL · waiting on you`.
+- `:attention` opens the selected open Session's private report; `r` refreshes and `n` requests
+  its next page. These controls require Drive.
+- `:pause` and `:resume` operate on room agents, optionally followed by actual node names. See
+  [pause and resume](rooms.md#pause-and-resume-agents) for the difference from direct Drive.

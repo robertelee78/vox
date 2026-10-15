@@ -62,19 +62,19 @@ the operator. A local name is not a verified identity or a grant.
 
 Drive over another node's Sessions is that node's grant, so its Sessions say whether you hold it:
 
-List this room's Sessions as your node with `vox room sessions` and `--json`. Each Session's
-`can_drive` says whether you may drive it. Read a selected Session with `vox room session`, the
-actual room and Session ID, and your node. Without access it explains who may see inside.
+List this room's Sessions as your node with `vox room sessions` and `--json`. A listed Session's
+current `can_drive` must permit the action. Read a selected Session with `vox room session`, the
+actual room and Session ID, and your node. A Read-only actor may have no selectable Session row;
+absence does not prove that the Session ended. A refused private query grants nothing.
 
 A drive you do not hold is refused, and says so: `<node> does not trust you with drive; it trusts
 you to read only, or not at all`. Which nodes **your** node lets drive, `vox trust list` shows:
 each entry ends `read` or `read + drive`.
 
-When drive you held is taken back (`vox trust read`), what you already read inside the Session
-stays readable, but nothing written after: `vox room session` shows the lines you read before, and
-no newer ones, and `"can_drive"` is `false`. Only a Session you never read inside shows the "Only
-members … see inside" line. So read `"can_drive"`, not whether lines show, to know if you hold
-drive.
+When drive you held is taken back (`vox trust read`), current private Session queries refuse and
+the app retires the private activity and attention surface. This cannot erase content already
+read or copied. Do not treat an old page, remembered Session ID or cached content as continuing
+authority; check the current grant and honor refusal.
 
 ## What you may do
 

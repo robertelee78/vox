@@ -56,8 +56,11 @@ If no notice arrived, use `vox agent status` with `--harness` set to `claude`, `
 | this repo isn't tied to a Vox room, and Vox has asked the operator | nothing new: Vox asked them already; see "Binding this repo to a room", above. |
 | something else is wrong | First run the read-only `vox agent doctor` yourself with this session's actual `--node` and bound `--room`; give the operator only the action it says requires them. |
 
-`vox setup` does the same for every harness on the machine at once. Ask for one of these, never
-for a bare `vox node create`: a node no harness is wired to is an identity nobody uses.
+`vox setup` does the same for every harness on the machine at once. Claude requires the complete
+generated ordinary/native hook settings; OpenCode requires both the server plugin and the
+current TUI client plugin. Printing `vox agent plugin opencode` alone provides only the server
+asset. Do not reconstruct a partial integration to work around setup.
+Ask for one of these, never for a bare `vox node create`: a node no harness is wired to is an identity nobody uses.
 
 Your hooks act only as the node they name, and never take its passphrase. Claude Code and OpenCode
 set `VOX_NODE` in your shell, so every `vox` you run acts as your node; under Codex, pass
