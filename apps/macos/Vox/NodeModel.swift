@@ -91,10 +91,10 @@ final class NodeModel: ObservableObject {
             words = said.isEmpty ? "new message" : "\(NodeModel.author(m, me: me)): \(said)"
         }
 
-        /// Whether `m` is a line a row may preview: the room's conversation, not a Session's
-        /// opening or end, nor plumbing.
+        /// Conversation can be previewed and drawn in General. Reserved Session announcements
+        /// and node plumbing remain available to their own readers, never matched by body text.
         static func shows(_ m: RoomMessage) -> Bool {
-            !["session", "session-end", "ping", "pong"].contains(m.kind)
+            !["hello", "bye", "session", "session-end", "ping", "pong"].contains(m.kind)
         }
     }
 
@@ -141,6 +141,7 @@ final class NodeModel: ObservableObject {
             cancelSidebarSelection()
             invalidateSessionPause()
             invalidateSessionAttention()
+            invalidateMemberPlatforms()
         }
     }
     private var roomViewGeneration = UUID() { didSet { cancelSidebarSelection() } }
@@ -171,9 +172,6 @@ final class NodeModel: ObservableObject {
             byID = Dictionary(messages.map { ($0.id, $0) }) { $1 }
             if let root = openThread, let visible = byID[root] { threadRootMessage = visible }
 
-            var said: [String: NodePlatform] = [:]
-            for message in messages { if let p = message.platform { said[message.author] = p } }
-            if said != platforms { platforms = said }
             retireFileFactsOutsideWindows()
             scheduleThreadRefresh()
         }
@@ -227,6 +225,84 @@ final class NodeModel: ObservableObject {
     /// The platform each member's node says it runs on, from its latest `hello` that says so in
     /// the room on screen (ADR-020 §4.9b), by fingerprint: its claim, never checked.
     @Published private(set) var platforms: [String: NodePlatform] = [:]
+    @Published private(set) var platformsPending = false
+    @Published private(set) var platformsError: String?
+    private var platformSources: [String: String] = [:]
+    private var platformContext: MemberPlatformContext?
+    private var platformRead = UUID()
+    private var platformRequest: MemberPlatformRead?
+    private var platformTask: Task<Void, Never>?
+
+    private func invalidateMemberPlatforms() {
+        platformRead = UUID()
+        platformRequest?.cancel()
+        platformTask?.cancel()
+        platformRequest = nil
+        platformTask = nil
+        platformContext = nil
+        platforms = [:]
+        platformSources = [:]
+        platformsPending = false
+        platformsError = nil
+    }
+
+    /// One bounded local metadata page per existing refresh turn, separately owned so a slow
+    /// daemon cannot suspend the message watcher. No transcript page or new timer is involved.
+    private func scheduleMemberPlatformRead(_ room: String) {
+        guard platformTask == nil, roomOnScreen == room, ended == nil else { return }
+        let token = UUID(), generation = roomReadGeneration, epoch = nodeObservationEpoch
+        let targets = Set(members.map(\.id)), actor = me, reader = client
+        let context = platformContext, request = MemberPlatformRead()
+        platformRead = token
+        platformRequest = request
+        platformsPending = context == nil || context?.before != nil
+        platformTask = Task { [weak self] in
+            defer {
+                if let self, self.platformRead == token {
+                    self.platformTask = nil
+                    self.platformRequest = nil
+                }
+            }
+            do {
+                let page = try await reader.memberPlatforms(room: room, actor: actor,
+                    context: context, read: request)
+                guard !Task.isCancelled, let self, self.platformRead == token,
+                      self.me == actor, self.roomReadGeneration == generation,
+                      self.nodeObservationEpoch == epoch, self.roomOnScreen == room,
+                      self.ended == nil, targets == Set(self.members.map(\.id)) else { return }
+                var claims = self.platforms, sources = self.platformSources
+                if page.context.revision != self.platformContext?.revision
+                    || page.context.instance != self.platformContext?.instance {
+                    claims = [:]
+                    sources = [:]
+                }
+                // The first valid claim in a reverse canonical scan is the newest. A later
+                // page must never replace it with an older HELLO for the same member.
+                for row in page.rows where targets.contains(row.member) && claims[row.member] == nil {
+                    claims[row.member] = row.platform
+                    sources[row.member] = row.source
+                }
+                if claims != self.platforms { self.platforms = claims }
+                self.platformSources = sources
+                var next = page.context
+                if targets.isSubset(of: Set(claims.keys)) { next.before = nil }
+                self.platformContext = next
+                self.platformsPending = next.before != nil
+                self.platformsError = nil
+            } catch {
+                guard !Task.isCancelled, let self, self.platformRead == token,
+                      self.me == actor, self.roomReadGeneration == generation,
+                      self.nodeObservationEpoch == epoch, self.roomOnScreen == room,
+                      self.ended == nil else { return }
+                // Failed authority/expiry/readiness is unknown, never a stale current claim.
+                self.platforms = [:]
+                self.platformSources = [:]
+                self.platformContext = nil
+                self.platformsPending = false
+                self.platformsError = "Platform information unavailable: " + sentence(error)
+            }
+        }
+    }
     /// Who has read each of this node's own messages in the room on screen, by message id (R-6).
     @Published private(set) var readBy: [String: [String]] = [:]
     @Published private(set) var messageFooters: [String: MessageFooter] = [:]
@@ -345,16 +421,15 @@ final class NodeModel: ObservableObject {
         let room: String
         let owner: String
         let session: String
-        let instance: Data
         let epoch: UUID
         let generation: UUID
     }
     private var sessionPauseContext: SessionPauseContext? {
         guard ended == nil, daemonReachable, let room = roomOnScreen,
-              let session = shownSession, session.canDrive,
-              let instance = sessionPages.instance else { return nil }
+              let session = shownSession, session.canDrive else { return nil }
+        // Live pause authority is read by the FFI independently of transcript availability.
         return .init(room: room, owner: session.nodeFingerprint, session: session.sessionId,
-                     instance: instance, epoch: nodeObservationEpoch, generation: roomReadGeneration)
+                     epoch: nodeObservationEpoch, generation: roomReadGeneration)
     }
     private var observedSessionPause: SessionPauseContext?
     var sessionPauseIsCurrent: Bool {
@@ -388,8 +463,7 @@ final class NodeModel: ObservableObject {
             let result: Result<RoomPauseState, Error>
             do {
                 result = .success(try await client.sessionPauseStatus(room: context.room,
-                    actor: actor, node: context.owner, sessionId: context.session,
-                    instance: context.instance, read: request))
+                    actor: actor, node: context.owner, sessionId: context.session, read: request))
             } catch { result = .failure(error) }
             guard !Task.isCancelled, let self, self.sessionPauseRead == token,
                   self.sessionPauseContext == context else { return }
@@ -418,11 +492,12 @@ final class NodeModel: ObservableObject {
     private struct SessionAttentionContext: Equatable {
         let selected: SessionPauseContext
         let opening: String
+        let instance: Data
     }
     private var sessionAttentionContext: SessionAttentionContext? {
         guard let selected = sessionPauseContext, let session = shownSession,
-              !session.opening.isEmpty else { return nil }
-        return .init(selected: selected, opening: session.opening)
+              !session.opening.isEmpty, let instance = sessionPages.instance else { return nil }
+        return .init(selected: selected, opening: session.opening, instance: instance)
     }
     private var observedSessionAttention: SessionAttentionContext?
     var sessionAttentionIsCurrent: Bool {
@@ -462,7 +537,7 @@ final class NodeModel: ObservableObject {
             do {
                 result = .success(try await client.sessionAttentionPage(room: selected.room,
                     actor: actor, node: selected.owner, sessionId: selected.session,
-                    opening: context.opening, instance: selected.instance, after: after, read: request))
+                    opening: context.opening, instance: context.instance, after: after, read: request))
             } catch { result = .failure(error) }
             guard !Task.isCancelled, let self, self.sessionAttentionRead == token,
                   self.sessionAttentionContext == context else { return }
@@ -471,7 +546,7 @@ final class NodeModel: ObservableObject {
             self.sessionAttentionLoading = false
             switch result {
             case let .success(page):
-                guard page.instance == selected.instance, page.opening == context.opening else {
+                guard page.instance == context.instance, page.opening == context.opening else {
                     self.sessionAttention = nil
                     self.sessionAttentionError = "The selected Session changed. Refresh attention."
                     return
@@ -694,7 +769,10 @@ final class NodeModel: ObservableObject {
     private var following: Task<Void, Never>?
     @Published private(set) var members: [MemberRow] = [] {
         didSet {
-            if Set(oldValue.map(\.id)) != Set(members.map(\.id)) { invalidateMemberRoles() }
+            if Set(oldValue.map(\.id)) != Set(members.map(\.id)) {
+                invalidateMemberRoles()
+                invalidateMemberPlatforms()
+            }
         }
     }
     enum MemberRole: String {
@@ -804,6 +882,7 @@ final class NodeModel: ObservableObject {
             cancelSidebarSelection()
             invalidateSessionPause()
             invalidateSessionAttention()
+            invalidateMemberPlatforms()
         }
     }
     fileprivate var observationToken: UUID { nodeObservationEpoch }
@@ -924,6 +1003,8 @@ final class NodeModel: ObservableObject {
         sessionPauseTask?.cancel()
         sessionAttentionRequest?.cancel()
         sessionAttentionTask?.cancel()
+        platformRequest?.cancel()
+        platformTask?.cancel()
     }
 
     /// The rooms in `need`, urgent first, then by name.
@@ -1598,6 +1679,7 @@ final class NodeModel: ObservableObject {
             roomServicesNext = services.next
             roomServicesRevision = services.revision
             members = rows.rows
+            scheduleMemberPlatformRead(id)
             trustsMe = rows.trustsMe
             for (fingerprint, name) in rows.presented { rememberPresentation(fingerprint, name) }
             retention = kept
@@ -3231,6 +3313,7 @@ final class NodeModel: ObservableObject {
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
                 guard !Task.isCancelled, let self, self.roomReadGeneration == generation, self.nodeObservationEpoch == scope.epoch,
                       self.selection == .room(room), self.ended == nil else { return }
+                self.scheduleMemberPlatformRead(room)
                 await self.refreshMessageFooters(room)
                 let fileIDs = self.displayedFileIDs
                 let fileFacts = try? await self.displayedFileFacts(room, ids: fileIDs)
@@ -3251,6 +3334,14 @@ final class NodeModel: ObservableObject {
                 await self.refreshSessionMetadata()
                 guard !Task.isCancelled, self.roomReadGeneration == generation, self.nodeObservationEpoch == scope.epoch,
                       self.selection == .room(room), self.ended == nil else { return }
+                // A failed exact lookup keeps the selected descriptor unavailable even if
+                // the bounded tab pages recover. Retry only that missing metadata here;
+                // transcript reload remains the person's explicit action.
+                if self.showingSession && self.shownSession == nil {
+                    await self.readSelectedSessionMetadata()
+                    guard !Task.isCancelled, self.roomReadGeneration == generation, self.nodeObservationEpoch == scope.epoch,
+                          self.selection == .room(room), self.ended == nil else { return }
+                }
                 self.scheduleSessionPauseRead()
                 self.scheduleSessionAttentionRead()
                 let visibleFiles = self.displayedFileIDs
@@ -3397,6 +3488,7 @@ final class NodeModel: ObservableObject {
     private func releaseHistoryViews() {
         invalidateSessionPause()
         invalidateSessionAttention()
+        invalidateMemberPlatforms()
         joinCaptionRead = UUID()
         joins = []
         invalidateMemberRoles()

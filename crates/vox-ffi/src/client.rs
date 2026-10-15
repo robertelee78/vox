@@ -1731,10 +1731,10 @@ fn stop_follow(following: &FollowSlot) {
 /// A handle is single-use: cancellation before start wins, and an old handle owns no later read.
 #[derive(uniffi::Object)]
 pub struct SessionPauseRead {
-    control: Mutex<SessionPauseReadControl>,
+    control: Mutex<ReadControl>,
 }
 #[derive(Default)]
-struct SessionPauseReadControl {
+struct ReadControl {
     started: bool,
     cancelled: bool,
     task: Option<tokio::task::AbortHandle>,
@@ -1744,7 +1744,7 @@ impl SessionPauseRead {
     #[uniffi::constructor]
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            control: Mutex::new(SessionPauseReadControl::default()),
+            control: Mutex::new(ReadControl::default()),
         })
     }
 
@@ -1813,6 +1813,31 @@ pub struct SessionAttentionPage {
     pub preparing: bool,
     pub rows: Vec<SessionAttentionRow>,
     pub next: Option<Arc<SessionAttentionCursor>>,
+}
+
+/// Explicit cancellation for one bounded member-metadata page. This uses the same
+/// single-use control as pause reads; Swift Task.cancel alone does not cancel UniFFI work.
+#[derive(uniffi::Object)]
+pub struct MemberPlatformRead {
+    control: Mutex<ReadControl>,
+}
+#[uniffi::export]
+impl MemberPlatformRead {
+    /// One request only, cancelled idempotently even before task registration.
+    #[uniffi::constructor]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            control: Mutex::new(ReadControl::default()),
+        })
+    }
+    /// Cancel only the work started with this handle.
+    pub fn cancel(&self) {
+        let mut control = self.control.lock().unwrap_or_else(PoisonError::into_inner);
+        control.cancelled = true;
+        if let Some(task) = control.task.take() {
+            task.abort();
+        }
+    }
 }
 
 /// One captured pause selection. Its roster is bounded by the room's existing member limit;
@@ -1937,6 +1962,7 @@ pub struct VoxClient {
     session_pause_read: Arc<tokio::sync::Semaphore>,
     /// One private attention page; never queues behind the selected owner pause read.
     session_attention_read: Arc<tokio::sync::Semaphore>,
+    member_platform_read: Arc<tokio::sync::Semaphore>,
     /// A connection to the daemon, kept while the client lives: a daemon a client started exits
     /// once no node is attached and no client is connected (ADR-026 L-8), and the app is its
     /// client from the moment it opens, before any node is attached.
@@ -2209,6 +2235,45 @@ fn platform_of(env: &vox_agentcomms::envelope::Envelope) -> Option<NodePlatform>
     })
 }
 
+/// A canonical HELLO scan position, opaque to the native member inspector.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct MemberPlatformPosition {
+    /// Canonical display clock.
+    pub clock: u64,
+    /// Complete entry identity.
+    pub entry: String,
+}
+/// One selected room's metadata scan. No before means its completed revision is checked.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct MemberPlatformContext {
+    /// Saved room instance, 16 bytes.
+    pub instance: Vec<u8>,
+    /// Selected metadata equality token, 32 bytes.
+    pub revision: Vec<u8>,
+    /// Empty only when the selected scan is complete or all current members are resolved.
+    pub before: Option<MemberPlatformPosition>,
+}
+/// A node's own bounded platform claim and the readable HELLO that supplied it.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct MemberPlatform {
+    /// Current room member, full fingerprint.
+    pub member: String,
+    /// Readable HELLO identity, full digest.
+    pub source: String,
+    /// Its bounded, sanitized claim.
+    pub platform: NodePlatform,
+}
+/// One bounded metadata page. An empty page with context.before is still incomplete.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct MemberPlatformPage {
+    /// Validated selection and next scan position.
+    pub context: MemberPlatformContext,
+    /// The prior completed selection is still current; no rows were reread.
+    pub unchanged: bool,
+    /// Newest first, at most 64 claims, without message bodies.
+    pub rows: Vec<MemberPlatform>,
+}
+
 /// The file a `file` envelope offers, from the fields its sharer's daemon filled in.
 fn file_offer(env: &vox_agentcomms::envelope::Envelope, sharer_trusted: bool) -> Option<FileOffer> {
     if env.kind != vox_core::node::shares::FILE {
@@ -2398,8 +2463,13 @@ macro_rules! on_held {
 
 /// A native window holds at most 128 selected messages and 128 KiB of raw row data.
 /// One legal row may stand alone above the byte budget, as in the daemon's pages.
-const ROOM_WINDOW_ROWS: usize = 128;
+const ROOM_WINDOW_ROWS: usize = vox_core::node::ipc::MAX_ROOM_SELECTION;
 const ROOM_WINDOW_BYTES: usize = vox_core::node::ipc::ROWS_BUDGET;
+// At most 128 legal raw rows: 8 MiB of raw text plus 16 KiB of wire metadata.
+// This bounded scratch is distinct from Swift's unchanged 8 MiB rendered-window
+// cap: JSON escaping can make a legal raw envelope larger than its visible text.
+const ROOM_HELD_BYTES: usize =
+    ROOM_WINDOW_ROWS * (vox_core::node::content::MAX_TEXT_LEN + vox_core::node::ipc::ROW_OVERHEAD);
 
 /// Newest/older pages and exact held refresh share this logical-origin ceiling.
 /// Multipart pieces and outcomes do not add rendered rows. The daemon's existing
@@ -2431,6 +2501,94 @@ fn room_window_bytes(rows: &[MessageRow]) -> Result<(), VoxError> {
         ));
     }
     Ok(())
+}
+
+/// Refresh a held General/All/tag window under one selected-ID fence. Only a
+/// definite per-chunk byte refusal is split; no authority, expiry or revision
+/// failure is retried. Generic Find and thread reads keep their existing contract.
+async fn room_view_selection(
+    client: &mut IpcClient,
+    channel_id: Digest32,
+    view: vox_core::node::api::RoomView,
+    actor: Digest32,
+    instance: [u8; 16],
+    entries: &[Digest32],
+) -> Result<FfiRoomRead, VoxError> {
+    let fence_request = Request::RoomViewRevision {
+        channel_id,
+        view: view.clone(),
+        instance,
+        entries: entries.to_vec(),
+    };
+    let fence = match ask(client, &fence_request).await? {
+        Frame::RoomDisplayRevision { revision } => revision,
+        other => return Err(unexpected(&other)),
+    };
+    let names = names(client).await?;
+    let mut found = HashMap::new();
+    let mut bytes = 0usize;
+    let mut pending: Vec<_> = entries
+        .chunks(vox_core::node::ipc::MAX_FIND)
+        .rev()
+        .collect();
+    while let Some(chunk) = pending.pop() {
+        let request = Request::RoomViewFind {
+            channel_id,
+            view: view.clone(),
+            instance,
+            entries: chunk.to_vec(),
+        };
+        let rows = match ask(client, &request).await {
+            Ok(Frame::Rows { rows }) => rows,
+            Ok(other) => return Err(unexpected(&other)),
+            Err(VoxError::Failed { reason })
+                if reason == vox_core::node::ipc::ROOM_VIEW_CHUNK_TOO_LARGE && chunk.len() > 1 =>
+            {
+                let middle = chunk.len() / 2;
+                pending.push(&chunk[middle..]);
+                pending.push(&chunk[..middle]);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        room_window_bytes(&rows)?;
+        for row in rows {
+            if !chunk.contains(&row.entry_hash) {
+                return Err(failed(
+                    "The room returned a message outside the held selection.",
+                ));
+            }
+            if found.contains_key(&row.entry_hash) {
+                continue;
+            }
+            bytes = bytes.saturating_add(row.text.len() + vox_core::node::ipc::ROW_OVERHEAD);
+            if bytes > ROOM_HELD_BYTES {
+                return Err(failed(
+                    "The held room selection exceeds its maximum raw message size. Open a smaller page.",
+                ));
+            }
+            found.insert(row.entry_hash, row);
+        }
+    }
+    match ask(client, &fence_request).await? {
+        Frame::RoomDisplayRevision { revision } if revision == fence && client.me() == Some(actor) => {}
+        Frame::RoomDisplayRevision { .. } => return Err(failed(
+            "The held messages or their authority changed while reading. Open their current page again.",
+        )),
+        other => return Err(unexpected(&other)),
+    }
+    let me = b32_encode(&actor);
+    Ok(FfiRoomRead {
+        instance: instance.to_vec(),
+        messages: entries
+            .iter()
+            .filter_map(|id| found.remove(id))
+            .map(|row| rendered(&row, &names, Some(&me)))
+            .collect(),
+        // A held refresh must never replace the owner's older-page metadata.
+        older: 0,
+        before: None,
+    })
 }
 
 impl VoxClient {
@@ -2606,6 +2764,9 @@ impl VoxClient {
                     "The acting node changed before refreshing this room.",
                 ));
             }
+            if let Some(view) = view {
+                return room_view_selection(c, channel_id, view, actor, instance, &entries).await;
+            }
             let fence = room_read_fence(c, channel_id).await?;
             if fence.0 != instance {
                 return Err(failed(
@@ -2618,17 +2779,9 @@ impl VoxClient {
             for chunk in entries.chunks(vox_core::node::ipc::MAX_FIND) {
                 // Find itself streams one coherent selection. At most 64 bounded raw rows
                 // exist in this temporary reply, independent of the room's history size.
-                let request = match &view {
-                    Some(view) => Request::RoomViewFind {
-                        channel_id,
-                        view: view.clone(),
-                        instance,
-                        entries: chunk.to_vec(),
-                    },
-                    None => Request::Find {
-                        channel_id,
-                        entries: chunk.to_vec(),
-                    },
+                let request = Request::Find {
+                    channel_id,
+                    entries: chunk.to_vec(),
                 };
                 let rows = match ask(c, &request).await? {
                     Frame::Rows { rows } => rows,
@@ -3117,6 +3270,7 @@ impl VoxClient {
             following: Arc::new(Mutex::new(None)),
             session_pause_read: Arc::new(tokio::sync::Semaphore::new(1)),
             session_attention_read: Arc::new(tokio::sync::Semaphore::new(1)),
+            member_platform_read: Arc::new(tokio::sync::Semaphore::new(1)),
             daemon_hold: Mutex::new(Some(hold)),
         }))
     }
@@ -3577,6 +3731,100 @@ impl VoxClient {
                 })
                 .collect())
         })
+    }
+
+    /// Read one current-member metadata page independently of the message window. A changed
+    /// revision replaces the caller's claims; an unchanged completed scan returns no bodies.
+    /// The owned request never holds Slot over IPC, and explicit cancellation stops its work.
+    ///
+    /// # Errors
+    /// Invalid selection, changed attachment/actor/room, or any authoritative history refusal.
+    pub async fn member_platforms(
+        &self,
+        room: String,
+        actor: String,
+        context: Option<MemberPlatformContext>,
+        read: Arc<MemberPlatformRead>,
+    ) -> Result<MemberPlatformPage, VoxError> {
+        let channel_id = digest(&room, "room id")?;
+        let actor = input_fingerprint(&actor)?;
+        let (instance, revision, before) = if let Some(context) = context {
+            let instance: [u8; 16] = context
+                .instance
+                .try_into()
+                .map_err(|_| failed("Member metadata room identity must contain 16 bytes."))?;
+            let revision: Digest32 = context
+                .revision
+                .try_into()
+                .map_err(|_| failed("Member metadata revision must contain 32 bytes."))?;
+            let before = context
+                .before
+                .map(|p| digest(&p.entry, "member metadata cursor").map(|entry| (p.clock, entry)))
+                .transpose()?;
+            (Some(instance), Some(revision), before)
+        } else {
+            (None, None, None)
+        };
+        let permit = Arc::clone(&self.member_platform_read)
+            .try_acquire_owned()
+            .map_err(|_| failed("Member platform information is still being read."))?;
+        let held = Arc::clone(&self.held);
+        let task = {
+            let mut control = read.control.lock().unwrap_or_else(PoisonError::into_inner);
+            if control.cancelled || control.started {
+                return Err(failed(
+                    "The member metadata read was cancelled or already used.",
+                ));
+            }
+            control.started = true;
+            let task = self.rt.spawn(async move {
+                let _permit = permit;
+                tokio::time::timeout(REQUEST_WITHIN, async {
+                    let (at, attachment) = {
+                        let slot = held.lock().await;
+                        let h = slot.as_ref().ok_or_else(not_attached)?;
+                        if h.client.me() != Some(actor) { return Err(failed("The acting node changed while reading member metadata.")); }
+                        (h.at.clone(), Arc::clone(&h.attachment))
+                    };
+                    let mut client = IpcClient::open_at(&at).await
+                        .map_err(|e| listing_failed("member metadata", e))?;
+                    if client.me() != Some(actor) { return Err(failed("The acting node changed while reading member metadata.")); }
+                    let page = match ask(&mut client, &Request::MemberHellos {
+                        channel_id, instance, revision, before,
+                    }).await? {
+                        Frame::MemberHellos(page) => page,
+                        other => return Err(unexpected(&other)),
+                    };
+                    let slot = held.lock().await;
+                    let h = slot.as_ref().ok_or_else(not_attached)?;
+                    if !Arc::ptr_eq(&attachment, &h.attachment) || h.client.me() != Some(actor) {
+                        return Err(failed("The acting node attachment changed while reading member metadata."));
+                    }
+                    Ok(MemberPlatformPage {
+                        context: MemberPlatformContext {
+                            instance: page.instance.to_vec(), revision: page.revision.to_vec(),
+                            before: page.next.map(|(clock, entry)| MemberPlatformPosition { clock, entry: b32_encode(&entry) }),
+                        },
+                        unchanged: page.unchanged,
+                        rows: page.rows.into_iter().filter_map(|row| {
+                            let env = vox_agentcomms::envelope::Envelope::parse(&row.text).ok()?;
+                            Some(MemberPlatform { member: b32_encode(&row.author), source: b32_encode(&row.entry_hash), platform: platform_of(&env)? })
+                        }).collect(),
+                    })
+                }).await.unwrap_or_else(|_| Err(failed("Member platform information is unavailable: the node did not answer within 60 seconds.")))
+            });
+            control.task = Some(task.abort_handle());
+            task
+        };
+        struct CancelRead(Arc<MemberPlatformRead>);
+        impl Drop for CancelRead {
+            fn drop(&mut self) {
+                self.0.cancel();
+            }
+        }
+        let _cancel = CancelRead(read);
+        task.await
+            .map_err(|_| failed("The member metadata read was cancelled."))?
     }
 
     /// Open a room at its newest bounded history page (ADR-034 FR-4).
@@ -5615,6 +5863,8 @@ impl VoxClient {
     /// The selected Session owner's current saved pause. Only one such background read is
     /// admitted per client; it never holds Slot while waiting for the remote owner. Cancellation
     /// aborts the owned read. The existing FFI request bound also covers an unreachable owner.
+    /// The current room instance is captured here, never borrowed from a transcript page;
+    /// history expiry or an explicit reload requirement does not prevent live status recovery.
     ///
     /// # Errors
     /// The actor, attachment, room or authorized Session opening changed, or status is unknown.
@@ -5624,15 +5874,11 @@ impl VoxClient {
         actor: String,
         node: String,
         session_id: String,
-        instance: Vec<u8>,
         read: Arc<SessionPauseRead>,
     ) -> Result<RoomPauseState, VoxError> {
         let room = digest(&room, "room id")?;
         let actor = input_fingerprint(&actor)?;
         let node = input_fingerprint(&node)?;
-        let expected_instance: [u8; 16] = instance
-            .try_into()
-            .map_err(|_| failed("The selected Session has no saved room instance."))?;
         let permit = Arc::clone(&self.session_pause_read)
             .try_acquire_owned()
             .map_err(|_| failed("The selected Session's pause is still being read."))?;
@@ -5667,9 +5913,6 @@ impl VoxClient {
                 }
                 let (instance, opening) =
                     pause_session_context(&mut client, room, node, &session_id).await?;
-                if instance != expected_instance {
-                    return Err(failed("The saved room changed while reading Session pause."));
-                }
                 let state = vox_core::node::room_pause::status_checked(
                     &at, room, node, actor, instance,
                 ).await.map_err(|e| failed(e.to_string()))?;

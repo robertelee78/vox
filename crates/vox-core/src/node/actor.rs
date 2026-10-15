@@ -4265,11 +4265,41 @@ impl NodeHandle {
         &self,
         channel_id: &Digest32,
     ) -> std::result::Result<Digest32, String> {
-        use crate::node::channel::history::{Query, Reply};
-        match self
-            .room_history(*channel_id, Query::DisplayRevision)
-            .await?
-        {
+        self.room_revision(
+            channel_id,
+            crate::node::channel::history::Query::DisplayRevision,
+        )
+        .await
+    }
+
+    /// A held window's current visibility and body locators, with the same current-name
+    /// and actor-lifetime fences as the whole-room revision. Unselected arrivals do not
+    /// change this token. Every call still passes the authoritative history gates.
+    pub(crate) async fn room_view_revision(
+        &self,
+        channel_id: &Digest32,
+        view: crate::node::api::RoomView,
+        instance: [u8; 16],
+        entries: Vec<Digest32>,
+    ) -> std::result::Result<Digest32, String> {
+        self.room_revision(
+            channel_id,
+            crate::node::channel::history::Query::ViewRevision {
+                view,
+                instance,
+                entries,
+            },
+        )
+        .await
+    }
+
+    async fn room_revision(
+        &self,
+        channel_id: &Digest32,
+        query: crate::node::channel::history::Query,
+    ) -> std::result::Result<Digest32, String> {
+        use crate::node::channel::history::Reply;
+        match self.room_history(*channel_id, query).await? {
             Reply::DisplayRevision(revision) => Ok(crate::hash::sha256_concat(&[
                 b"vox-room-display-revision-v2",
                 &self.display_incarnation,

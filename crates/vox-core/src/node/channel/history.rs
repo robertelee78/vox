@@ -10,13 +10,23 @@ use crate::node::api::{
 };
 
 pub(crate) enum Query {
+    MemberHellos {
+        instance: Option<[u8; 16]>,
+        revision: Option<Digest32>,
+        before: Option<(u64, Digest32)>,
+    },
     ViewPage {
         view: crate::node::api::RoomView,
         instance: Option<[u8; 16]>,
         before: Option<Digest32>,
         limit: usize,
     },
-    ViewLocate {
+    ViewRows {
+        view: crate::node::api::RoomView,
+        instance: [u8; 16],
+        entries: Vec<Digest32>,
+    },
+    ViewRevision {
         view: crate::node::api::RoomView,
         instance: [u8; 16],
         entries: Vec<Digest32>,
@@ -101,6 +111,7 @@ pub(crate) enum Query {
 }
 
 pub(crate) enum Reply {
+    MemberHellos(crate::node::api::MemberHelloPage),
     Footers {
         rows: Vec<crate::node::api::MessageFooter>,
         tags: Vec<Option<String>>,
@@ -347,6 +358,15 @@ impl View<'_> {
             return Err(Failure::Request(why));
         }
         Ok(row)
+    }
+
+    fn view_instance(&self, instance: [u8; 16]) -> Answer<()> {
+        if instance != self.rendered.history_instance() {
+            return Err(Failure::Request(
+                "the saved room changed; open its current page again",
+            ));
+        }
+        Ok(())
     }
 
     fn view_filter(&self, view: &crate::node::api::RoomView) -> Answer<Filter> {
@@ -623,44 +643,229 @@ impl View<'_> {
         })
     }
 
+    fn member_hellos(
+        &self,
+        instance: Option<[u8; 16]>,
+        known: Option<Digest32>,
+        before: Option<(u64, Digest32)>,
+        bytes: usize,
+    ) -> Answer<Reply> {
+        if let Some(instance) = instance {
+            self.view_instance(instance)?;
+        }
+        if (known.is_some() && instance.is_none()) || (before.is_some() && known.is_none()) {
+            return Err(Failure::Request(
+                "member metadata continuation lacks its room/revision",
+            ));
+        }
+        let filter = Filter::Type(vox_agentcomms::envelope::HELLO.into());
+        let members = self.ch.members();
+        use sha2::{Digest, Sha256};
+        let mut stamp = Sha256::new();
+        stamp.update(b"vox-member-hello-selection-v1");
+        stamp.update(self.ch.channel_id());
+        stamp.update(self.ch.me());
+        stamp.update(self.rendered.history_instance());
+        for value in [
+            self.ch.projection_state.incarnation,
+            self.rendered.filter_display_root(&filter)?,
+            self.rendered.display_roots()[3],
+            self.ch.effective_retention(),
+            self.ch.effective_step_retention(),
+        ] {
+            stamp.update(value.to_be_bytes());
+        }
+        stamp.update((members.len() as u64).to_be_bytes());
+        for member in &members {
+            stamp.update(member);
+        }
+        let revision: Digest32 = stamp.finalize().into();
+        let mut page = crate::node::api::MemberHelloPage {
+            instance: self.rendered.history_instance(),
+            revision,
+            unchanged: known == Some(revision) && before.is_none(),
+            rows: Vec::new(),
+            next: None,
+        };
+        if page.unchanged {
+            return Ok(Reply::MemberHellos(page));
+        }
+        // A changed selection explicitly restarts at its newest row. Clients replace their
+        // small per-current-member map when the returned revision changes.
+        let mut cursor = if known == Some(revision) {
+            before
+        } else {
+            None
+        };
+        if let Some((clock, hash)) = cursor {
+            if !self.rendered.contains(&filter, &hash)?
+                || self.rendered.order().key(&hash)? != Some((clock, hash))
+            {
+                return Err(Failure::Request(
+                    "member metadata cursor is not in this selection",
+                ));
+            }
+        }
+        let mut used = 0usize;
+        for _ in 0..256 {
+            let Some((key, _)) = self.rendered.step(Some(&filter), true, cursor, true)? else {
+                return Ok(Reply::MemberHellos(page));
+            };
+            let author = self
+                .rendered
+                .order()
+                .entry(&key.1)?
+                .ok_or(Error::MalformedAtRest("member hello entry missing"))?
+                .skeleton
+                .author_id;
+            if members.binary_search(&author).is_ok() {
+                let row = self
+                    .row(&key.1)?
+                    .ok_or(Error::MalformedAtRest("member hello row missing"))?;
+                let cost = row
+                    .text
+                    .len()
+                    .saturating_add(crate::node::ipc::ROW_OVERHEAD);
+                if !page.rows.is_empty() && used.saturating_add(cost) > bytes {
+                    page.next = cursor;
+                    return Ok(Reply::MemberHellos(page));
+                }
+                used = used.saturating_add(cost);
+                page.rows.push(row);
+            }
+            cursor = Some(key);
+            if page.rows.len() >= crate::node::ipc::MEMBER_HELLO_ROWS || used >= bytes {
+                page.next = cursor;
+                return Ok(Reply::MemberHellos(page));
+            }
+        }
+        page.next = cursor;
+        Ok(Reply::MemberHellos(page))
+    }
+
     fn answer(&self, query: Query, bytes: usize) -> Answer<Reply> {
         let cursor_error = "cursor not in this room's timeline";
         match query {
+            Query::MemberHellos {
+                instance,
+                revision,
+                before,
+            } => self.member_hellos(instance, revision, before, bytes),
             Query::ViewPage {
                 view,
                 instance,
                 before,
                 limit,
             } => self.view_page(&view, instance, before, limit, bytes),
-            Query::ViewLocate {
+            Query::ViewRows {
                 view,
                 instance,
                 entries,
             } => {
-                if instance != self.rendered.history_instance() {
-                    return Err(Failure::Request(
-                        "the saved room changed; open its current page again",
-                    ));
-                }
+                self.view_instance(instance)?;
                 if entries.len() > crate::node::ipc::MAX_FIND {
                     return Err(Failure::Request("too many message ids"));
                 }
                 let filter = self.view_filter(&view)?;
-                let mut found = BTreeSet::new();
+                let mut found = BTreeMap::new();
+                let mut used = 0usize;
                 for hash in entries {
-                    if self.view_contains(&filter, &hash)? && self.row(&hash)?.is_some() {
+                    if !self.view_contains(&filter, &hash)? {
+                        continue;
+                    }
+                    if let Some(row) = self.row(&hash)? {
                         let key = self
                             .rendered
                             .order()
                             .key(&hash)?
                             .ok_or(Error::MalformedAtRest("selected located row order missing"))?;
-                        found.insert(key);
+                        if found.contains_key(&key) {
+                            continue;
+                        }
+                        used = used.saturating_add(row.text.len() + crate::node::ipc::ROW_OVERHEAD);
+                        if !found.is_empty() && used > bytes {
+                            return Err(Failure::Request(
+                                crate::node::ipc::ROOM_VIEW_CHUNK_TOO_LARGE,
+                            ));
+                        }
+                        found.insert(key, row);
                     }
                 }
-                Ok(Reply::Located {
-                    entries: found.into_iter().map(|(_, hash)| hash).collect(),
-                    revision: Revision::of(self.ch, &self.rendered)?,
-                })
+                // One bounded snapshot, released before IPC writes or waits. An unrelated
+                // arrival cannot invalidate the middle of this selected chunk.
+                Ok(Reply::Rows(found.into_values().collect()))
+            }
+            Query::ViewRevision {
+                view,
+                instance,
+                entries,
+            } => {
+                self.view_instance(instance)?;
+                if entries.len() > crate::node::ipc::MAX_ROOM_SELECTION {
+                    return Err(Failure::Request("too many held message ids"));
+                }
+                let filter = self.view_filter(&view)?;
+                use sha2::{Digest, Sha256};
+                let mut hash = Sha256::new();
+                hash.update(b"vox-room-held-selection-v1");
+                hash.update(self.ch.channel_id());
+                hash.update(instance);
+                hash.update(self.ch.projection_state.incarnation.to_be_bytes());
+                hash.update(self.ch.effective_retention().to_be_bytes());
+                hash.update(self.ch.effective_step_retention().to_be_bytes());
+                // A render epoch is a rewrite, not an ordinary append. No whole-history
+                // count, root or arrival generation belongs to this selected-ID fence.
+                hash.update(self.rendered.display_roots()[3].to_be_bytes());
+                match view {
+                    crate::node::api::RoomView::General => hash.update([0]),
+                    crate::node::api::RoomView::All => hash.update([1]),
+                    crate::node::api::RoomView::Tag(tag) => {
+                        hash.update([2]);
+                        hash.update((tag.len() as u64).to_be_bytes());
+                        hash.update(tag.as_bytes());
+                    }
+                }
+                hash.update((entries.len() as u64).to_be_bytes());
+                for entry in entries {
+                    hash.update(entry);
+                    if !self.view_contains(&filter, &entry)? {
+                        hash.update([0]);
+                        continue;
+                    }
+                    let fact = self.rendered.fact(&entry)?;
+                    if let Some(fact) = fact {
+                        // The immutable entry/cache binding identifies the body without
+                        // decrypting every selected body just to fingerprint the window.
+                        hash.update([1]);
+                        for value in [fact.cache, fact.epoch, fact.shown, fact.created] {
+                            hash.update(value.to_be_bytes());
+                        }
+                    } else if let Some(row) = self.row(&entry)? {
+                        // No render fact means only a currently readable owed placeholder
+                        // can reach here. row() rechecks missing membership and expiry.
+                        hash.update([2]);
+                        hash.update(row.author);
+                        hash.update(row.created_millis.to_be_bytes());
+                    } else {
+                        hash.update([0]);
+                        continue;
+                    }
+                    let key = self
+                        .rendered
+                        .order()
+                        .key(&entry)?
+                        .ok_or(Error::MalformedAtRest("held selection order missing"))?;
+                    if let Some(fact) = fact {
+                        // Reordering elsewhere can alter the visible late label while this
+                        // entry's own locator/order stays fixed. Hash only the derived bit,
+                        // not the unrelated suffix root/count that produced it.
+                        let (_, late) = self.rendered.display_timing(key, fact)?;
+                        hash.update([u8::from(late)]);
+                    }
+                    hash.update(key.0.to_be_bytes());
+                    hash.update(key.1);
+                }
+                Ok(Reply::DisplayRevision(hash.finalize().into()))
             }
             Query::DisplayRevision => {
                 use sha2::{Digest, Sha256};

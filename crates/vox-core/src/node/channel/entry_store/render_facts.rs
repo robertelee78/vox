@@ -252,7 +252,7 @@ impl Filter {
     fn digest(&self) -> Digest32 {
         use crate::hash::sha256_concat;
         match self {
-            Self::General => sha256_concat(&[b"render-general\0"]),
+            Self::General => sha256_concat(&[b"render-general-v2\0"]),
             Self::Type(s) => sha256_concat(&[b"render-type\0", s.as_bytes()]),
             Self::Op(s) => sha256_concat(&[b"render-op\0", s.as_bytes()]),
             Self::Tag(s) => sha256_concat(&[b"render-tag\0", s.as_bytes()]),
@@ -271,7 +271,7 @@ fn filter_key(filter: &Filter, display: bool) -> Key {
 // These are derived selection metadata in the existing filter directory, not page
 // locators. An absent marker means bounded catch-up is required, never an empty view.
 fn general_state_key(ready: bool) -> Key {
-    let mut key = hashed(&crate::hash::sha256(b"render-general-state-v1"));
+    let mut key = hashed(&crate::hash::sha256(b"render-general-state-v2"));
     key[32] = u8::from(ready);
     key
 }
@@ -284,9 +284,20 @@ fn operation_key(author: &Digest32, op: &str, selector: u8) -> Key {
     key[32] = selector;
     key
 }
+// General is conversation, not automatic Session participation or node plumbing. Match the
+// authenticated envelope's type, never its prose: a say with identical words remains visible.
+// Malformed envelopes remain visible as text, just as the clients render them.
+fn is_general_root(text: &str) -> bool {
+    use vox_agentcomms::envelope::{is_plumbing, Envelope, BYE, HELLO};
+    crate::node::api::message_thread(text).is_none()
+        && Envelope::parse(text).map_or(true, |env| {
+            !is_plumbing(&env.kind) && env.kind != HELLO && env.kind != BYE
+        })
+}
+
 fn filters(row: &super::super::Rendered) -> Vec<Filter> {
     let mut out = vec![Filter::Author(row.author)];
-    if crate::node::api::message_thread(&row.text).is_none() {
+    if is_general_root(&row.text) {
         out.push(Filter::General);
     }
     if let Some((kind, op)) = crate::node::api::structured_kind(&row.text) {
@@ -940,6 +951,12 @@ impl RenderView<'_> {
             }),
         }
     }
+    /// Current canonical selection identity for a metadata reader. Reuses the sealed
+    /// filter root; unrelated ordinary messages do not change the HELLO selection.
+    pub(crate) fn filter_display_root(&self, filter: &Filter) -> Result<u64> {
+        self.root(Some(filter), true)
+    }
+
     /// One exact operation's canonical rows and retained conflict witness, from this same
     /// pinned snapshot. Other authors using the same op id do not invalidate its root.
     pub(crate) fn operation_state(
@@ -1081,9 +1098,16 @@ impl RenderView<'_> {
         if row.entry_hash != *hash {
             return Err(invalid("render cache hash differs"));
         }
-        let current_epoch = self.order.read.directory.render_epoch;
         row.arrival = fact.cache;
-        row.shown_at_ms = if fact.epoch == current_epoch {
+        (row.shown_at_ms, row.late) = self.display_timing(key, fact)?;
+        Ok(Some(row))
+    }
+
+    /// Visible timing depends on the selected fact and the indexed display suffix. Share
+    /// this calculation with selected-window fences without loading any plaintext body.
+    pub(crate) fn display_timing(&self, key: OrderKey, fact: RenderFact) -> Result<(u64, bool)> {
+        let current_epoch = self.order.read.directory.render_epoch;
+        let shown_at_ms = if fact.epoch == current_epoch {
             fact.shown
         } else {
             0
@@ -1101,12 +1125,12 @@ impl RenderView<'_> {
         } else {
             suffix.earliest.1
         };
-        row.late = row.shown_at_ms != 0
+        let late = shown_at_ms != 0
             && suffix.count != 0
             && earliest
                 .checked_add(super::super::LATE_AFTER_MS)
-                .is_some_and(|seen| row.shown_at_ms >= seen);
-        Ok(Some(row))
+                .is_some_and(|seen| shown_at_ms >= seen);
+        Ok((shown_at_ms, late))
     }
 }
 impl EntryIndex {
@@ -1138,9 +1162,10 @@ impl Write<'_, '_> {
     }
 }
 impl EntryIndex {
-    /// Add the General selector to current-version saved rooms without resetting their
-    /// authoritative history or other indexes. One transaction examines at most 64 current
-    /// rendered arrivals / 1 MiB (one legal large row alone); a restart resumes the prefix.
+    /// Build the current typed General selector without resetting authoritative history or
+    /// other indexes. Its new identity never accepts an old complete selector. One transaction
+    /// retires at most 64 obsolete selector entries, or examines at most 64 current rendered
+    /// arrivals / 1 MiB (one legal large row alone); a restart resumes the prefix.
     /// Returns true while another fair maintenance turn is required.
     pub(crate) fn advance_room_views(
         &self,
@@ -1163,6 +1188,54 @@ impl EntryIndex {
             Some(1) => return Ok(false),
             Some(_) => return Err(invalid("room view readiness marker")),
             None => {}
+        }
+        // Drain only the obsolete derived selector before building its replacement. The
+        // remaining roots themselves are the durable continuation; no signed row, cache,
+        // other selector or whole-tree traversal is involved. Share the existing 64-entry
+        // maintenance budget instead of doing retirement and catch-up in the same turn.
+        let mut retired = 0usize;
+        for display in [false, true] {
+            let mut old = hashed(&crate::hash::sha256_concat(&[b"render-general\0"]));
+            old[32] = u8::from(display);
+            let Some(mut root) =
+                Source::Batch(writer.batch).number(sek, channel, roots.rendered.filters, &old)?
+            else {
+                continue;
+            };
+            while root != 0 && retired < PROMOTION_ENTRIES {
+                let Some((key, Value::Rendered(_))) =
+                    Source::Batch(writer.batch).first(sek, channel, root, &[0; 64], 0)?
+                else {
+                    return Err(invalid("obsolete room view selector fact"));
+                };
+                root = writer.change_rendered(root, key, None)?;
+                retired += 1;
+            }
+            roots.rendered.filters = writer.change_value(
+                roots.rendered.filters,
+                old,
+                (root != 0).then_some(Value::Number(root)),
+            )?;
+            if retired == PROMOTION_ENTRIES {
+                break;
+            }
+        }
+        if retired != 0 {
+            writer.set_render_roots(roots)?;
+            writer.seal()?;
+            batch.commit()?;
+            self.committed();
+            return Ok(true);
+        }
+        for ready in [false, true] {
+            let mut old = hashed(&crate::hash::sha256(b"render-general-state-v1"));
+            old[32] = u8::from(ready);
+            if Source::Batch(writer.batch)
+                .number(sek, channel, roots.rendered.filters, &old)?
+                .is_some()
+            {
+                roots.rendered.filters = writer.change_value(roots.rendered.filters, old, None)?;
+            }
         }
         let mut after = Source::Batch(writer.batch).number(
             sek,
@@ -1211,7 +1284,7 @@ impl EntryIndex {
             if row.entry_hash != hash || fact.cache != arrival {
                 return Err(invalid("room view cache locator"));
             }
-            if crate::node::api::message_thread(&row.text).is_none() {
+            if is_general_root(&row.text) {
                 let clock = Source::Batch(writer.batch)
                     .number(sek, channel, roots.clock, &hashed(&hash))?
                     .ok_or(invalid("room view clock missing"))?;

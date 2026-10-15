@@ -429,6 +429,11 @@ const T_WORK_BOARD_REQ: u64 = 8746;
 const T_WORK_BOARD: u64 = 8747;
 // One current private opening for a membership caption; never an activity-history scan.
 const T_SESSION_JOIN: u64 = 8748;
+const T_ROOM_VIEW_REVISION: u64 = 8749;
+const T_MEMBER_HELLOS_REQ: u64 = 8752;
+const T_MEMBER_HELLOS: u64 = 8753;
+/// Rows per bounded current-member HELLO metadata page.
+pub const MEMBER_HELLO_ROWS: usize = 64;
 const T_ROOM_PAGE_REQ: u64 = 5492;
 const T_ROOM_PAGE: u64 = 5493;
 
@@ -549,6 +554,17 @@ pub enum Request {
         query: crate::node::api::GovernanceQuery,
     },
 
+    /// One bounded reverse HELLO page, or an unchanged completed-selection check.
+    MemberHellos {
+        /// Selected open room.
+        channel_id: Digest32,
+        /// Required when continuing a saved selection.
+        instance: Option<[u8; 16]>,
+        /// Last observed metadata revision; changed selections restart explicitly.
+        revision: Option<Digest32>,
+        /// Exclusive canonical cursor, absent for a newest page or completed check.
+        before: Option<(u64, Digest32)>,
+    },
     /// A bounded canonical page selected by its displayed message domain before budgeting.
     RoomViewPage {
         /// Selected room.
@@ -570,7 +586,18 @@ pub enum Request {
         view: crate::node::api::RoomView,
         /// Saved room identity.
         instance: [u8; 16],
-        /// At most MAX_FIND exact ids; bodies stream under the ordinary Find fence.
+        /// At most MAX_FIND exact ids, read atomically within the normal row byte budget.
+        entries: Vec<Digest32>,
+    },
+    /// Current selected-ID visibility and immutable body locators, with actor/name fences.
+    RoomViewRevision {
+        /// Selected room.
+        channel_id: Digest32,
+        /// The domain that selected these entries.
+        view: crate::node::api::RoomView,
+        /// Saved room identity.
+        instance: [u8; 16],
+        /// At most MAX_ROOM_SELECTION exact ids; no bodies are returned.
         entries: Vec<Digest32>,
     },
     /// A room's newest bounded history page, or the page before an entry (ADR-034 FR-4/5).
@@ -1212,6 +1239,12 @@ pub enum Request {
 
 /// The most entries one [`Request::Find`] may name.
 pub const MAX_FIND: usize = 64;
+/// The maximum exact IDs held by one native room window, independent of history size.
+pub const MAX_ROOM_SELECTION: usize = 128;
+/// A selected chunk is too large for one atomic actor turn. The client may split only
+/// this refusal; a changed selection or failed authority check must remain a failure.
+pub const ROOM_VIEW_CHUNK_TOO_LARGE: &str =
+    "the selected room chunk exceeds its byte budget; request fewer messages";
 
 #[path = "ipc_governance.rs"]
 mod governance_page;
@@ -1331,6 +1364,19 @@ impl Request {
                     .bytes(before.as_ref().map_or(&[][..], |value| &value[..]))
                     .uint(*limit);
             }
+            Request::MemberHellos {
+                channel_id,
+                instance,
+                revision,
+                before,
+            } => {
+                e.array(5)
+                    .uint(T_MEMBER_HELLOS_REQ)
+                    .bytes(channel_id)
+                    .bytes(instance.as_ref().map_or(&[][..], |v| &v[..]))
+                    .bytes(revision.as_ref().map_or(&[][..], |v| &v[..]));
+                encode_order_cursor(&mut e, *before);
+            }
             Request::RoomViewFind {
                 channel_id,
                 view,
@@ -1338,6 +1384,19 @@ impl Request {
                 entries,
             } => {
                 e.array(5).uint(T_ROOM_VIEW_FIND).bytes(channel_id);
+                encode_room_view(&mut e, view);
+                e.bytes(instance).array(entries.len());
+                for entry in entries {
+                    e.bytes(entry);
+                }
+            }
+            Request::RoomViewRevision {
+                channel_id,
+                view,
+                instance,
+                entries,
+            } => {
+                e.array(5).uint(T_ROOM_VIEW_REVISION).bytes(channel_id);
                 encode_room_view(&mut e, view);
                 e.bytes(instance).array(entries.len());
                 for entry in entries {
@@ -2111,6 +2170,27 @@ impl Request {
                     limit,
                 })
             }
+            (T_MEMBER_HELLOS_REQ, 5) => {
+                let channel_id = digest(&mut d)?;
+                let raw = d.bytes()?;
+                let instance = if raw.is_empty() {
+                    None
+                } else {
+                    Some(
+                        raw.try_into()
+                            .map_err(|_| Error::MalformedIpc("member metadata instance"))?,
+                    )
+                };
+                let revision = optional_digest(&mut d)?;
+                let before = order_cursor(&mut d)?;
+                d.finish()?;
+                Ok(Request::MemberHellos {
+                    channel_id,
+                    instance,
+                    revision,
+                    before,
+                })
+            }
             (T_ROOM_VIEW_PAGE_REQ, 6) => {
                 let channel_id = digest(&mut d)?;
                 let view = decode_room_view(&mut d)?;
@@ -2135,7 +2215,7 @@ impl Request {
                     limit,
                 })
             }
-            (T_ROOM_VIEW_FIND, 5) => {
+            (T_ROOM_VIEW_FIND | T_ROOM_VIEW_REVISION, 5) => {
                 let channel_id = digest(&mut d)?;
                 let view = decode_room_view(&mut d)?;
                 let instance = d
@@ -2143,7 +2223,13 @@ impl Request {
                     .try_into()
                     .map_err(|_| Error::MalformedIpc("room view instance"))?;
                 let count = d.array()?;
-                if count > MAX_FIND {
+                if count
+                    > if tag == T_ROOM_VIEW_FIND {
+                        MAX_FIND
+                    } else {
+                        MAX_ROOM_SELECTION
+                    }
+                {
                     return Err(Error::MalformedIpc("ipc too many entries"));
                 }
                 let mut entries = Vec::with_capacity(count);
@@ -2151,11 +2237,20 @@ impl Request {
                     entries.push(digest(&mut d)?);
                 }
                 d.finish()?;
-                Ok(Request::RoomViewFind {
-                    channel_id,
-                    view,
-                    instance,
-                    entries,
+                Ok(if tag == T_ROOM_VIEW_FIND {
+                    Request::RoomViewFind {
+                        channel_id,
+                        view,
+                        instance,
+                        entries,
+                    }
+                } else {
+                    Request::RoomViewRevision {
+                        channel_id,
+                        view,
+                        instance,
+                        entries,
+                    }
                 })
             }
             (T_ROOM_PAGE_REQ, 3) => {
@@ -3075,6 +3170,8 @@ pub enum Frame {
         /// The entry hash of the room's newest row, if it has any.
         last: Option<Digest32>,
     },
+    /// Bounded metadata independent of the selected message window.
+    MemberHellos(crate::node::api::MemberHelloPage),
     /// The answer to [`Request::ThreadSummary`], independent of the client's loaded timeline.
     ThreadSummary {
         /// All retained readable replies, excluding the starting message.
@@ -3457,6 +3554,18 @@ impl Frame {
                 }
                 e.bytes(before.as_ref().map_or(&[][..], |hash| &hash[..]))
                     .bytes(after.as_ref().map_or(&[][..], |hash| &hash[..]));
+            }
+            Frame::MemberHellos(page) => {
+                e.array(6)
+                    .uint(T_MEMBER_HELLOS)
+                    .bytes(&page.instance)
+                    .bytes(&page.revision)
+                    .uint(u64::from(page.unchanged))
+                    .array(page.rows.len());
+                for row in &page.rows {
+                    encode_row(&mut e, row);
+                }
+                encode_order_cursor(&mut e, page.next);
             }
             Frame::FilteredRows { rows, next } => {
                 e.array(3).uint(T_FILTERED_ROWS).array(rows.len());
@@ -4411,6 +4520,41 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 .uint()
                 .map_err(|_| Error::MalformedIpc("ipc room page older"))?;
             return Ok(Frame::RoomPage { rows, older });
+        }
+        (T_MEMBER_HELLOS, 6) => {
+            let instance = d
+                .bytes()?
+                .try_into()
+                .map_err(|_| Error::MalformedIpc("member metadata instance"))?;
+            let revision = digest(d)?;
+            let unchanged = flag(d, "member metadata unchanged")?;
+            let Frame::Rows { rows } = decode_body(d, T_ROWS, 2)? else {
+                return Err(Error::MalformedIpc("member metadata rows"));
+            };
+            if rows.len() > MEMBER_HELLO_ROWS
+                || rows
+                    .iter()
+                    .any(|row| row.owed || row.text.len() > crate::node::content::MAX_TEXT_LEN)
+                || (rows.len() > 1
+                    && rows
+                        .iter()
+                        .map(|row| row.text.len().saturating_add(ROW_OVERHEAD))
+                        .sum::<usize>()
+                        > rows_budget())
+            {
+                return Err(Error::MalformedIpc("member metadata page exceeds budget"));
+            }
+            let next = order_cursor(d)?;
+            if unchanged && (!rows.is_empty() || next.is_some()) {
+                return Err(Error::MalformedIpc("unchanged member metadata has rows"));
+            }
+            return Ok(Frame::MemberHellos(crate::node::api::MemberHelloPage {
+                instance,
+                revision,
+                unchanged,
+                rows,
+                next,
+            }));
         }
         (T_FILTERED_ROWS, 3) => {
             let Frame::Rows { rows } = decode_body(d, T_ROWS, 2)? else {
@@ -6510,19 +6654,6 @@ async fn serve_requests(
             continue;
         }
         let found = match &request {
-            Request::RoomViewFind {
-                channel_id,
-                view,
-                instance,
-                entries,
-            } => Some((
-                *channel_id,
-                crate::node::channel::history::Query::ViewLocate {
-                    view: view.clone(),
-                    instance: *instance,
-                    entries: entries.clone(),
-                },
-            )),
             Request::Find {
                 channel_id,
                 entries,
@@ -6582,6 +6713,7 @@ async fn serve_requests(
                 | Frame::OperationPage { .. }
                 | Frame::ArrivalPage { .. }
                 | Frame::FilteredRows { .. }
+                | Frame::MemberHellos(..)
                 | Frame::RoomPage { .. }
                 | Frame::ThreadPage { .. }
                 | Frame::GovernancePage { .. }
@@ -7826,6 +7958,71 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 Err(reason) => Frame::Error { reason },
             }
         }
+        Request::RoomViewFind {
+            channel_id,
+            view,
+            instance,
+            entries,
+        } => {
+            use crate::node::channel::history::{Query, Reply};
+            match handle
+                .room_history(
+                    channel_id,
+                    Query::ViewRows {
+                        view,
+                        instance,
+                        entries,
+                    },
+                )
+                .await
+            {
+                Ok(Reply::Rows(rows)) => Frame::Rows { rows },
+                Ok(_) => Frame::Error {
+                    reason: "unexpected held room answer".into(),
+                },
+                Err(reason) => Frame::Error { reason },
+            }
+        }
+        Request::MemberHellos {
+            channel_id,
+            instance,
+            revision,
+            before,
+        } => {
+            use crate::node::channel::history::{Query, Reply};
+            match handle
+                .room_history(
+                    channel_id,
+                    Query::MemberHellos {
+                        instance,
+                        revision,
+                        before,
+                    },
+                )
+                .await
+            {
+                Ok(Reply::MemberHellos(page)) => Frame::MemberHellos(page),
+                Ok(_) => Frame::Error {
+                    reason: "unexpected member metadata answer".into(),
+                },
+                Err(reason) => Frame::Error { reason },
+            }
+        }
+
+        Request::RoomViewRevision {
+            channel_id,
+            view,
+            instance,
+            entries,
+        } => {
+            match handle
+                .room_view_revision(&channel_id, view, instance, entries)
+                .await
+            {
+                Ok(revision) => Frame::RoomDisplayRevision { revision },
+                Err(reason) => Frame::Error { reason },
+            }
+        }
         Request::RoomDisplayRevision { channel_id } => {
             match handle.room_display_revision(&channel_id).await {
                 Ok(revision) => Frame::RoomDisplayRevision { revision },
@@ -7911,7 +8108,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             reason: "Unread requires a reply stream".into(),
         },
         // The server streams exact Find rows without materializing all requested bodies.
-        Request::Find { .. } | Request::RoomViewFind { .. } => Frame::Error {
+        Request::Find { .. } => Frame::Error {
             reason: "Find requires a reply stream".into(),
         },
         // Open or not by the node's own count, not by whether the view has caught up with an

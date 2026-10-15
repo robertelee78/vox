@@ -1603,6 +1603,12 @@ fn render_members(
                         theme::fg(theme::TEXT_SECONDARY),
                     )));
                 }
+                if let Some(note) = &m.machine_note {
+                    lines.push(Line::from(Span::styled(
+                        format!("    {note}"),
+                        theme::fg(theme::TEXT_SECONDARY),
+                    )));
+                }
                 for row in vox_text::fingerprint::card(&vox_core::node::link::b32_encode(&m.id)) {
                     lines.push(Line::from(format!("    {row}")));
                 }

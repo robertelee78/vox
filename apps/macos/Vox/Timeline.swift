@@ -70,7 +70,7 @@ extension NodeModel {
         let placed = notices.filter { $0.after.isEmpty || shown.contains($0.after) }
         var items = placed.filter { $0.after.isEmpty }.map(item)
         for m in messages {
-            if m.thread.isEmpty { items.append(.message(m)) }
+            if m.thread.isEmpty && Preview.shows(m) { items.append(.message(m)) }
             items += placed.filter { $0.after == m.id }.map(item)
         }
         for n in notices where !n.after.isEmpty && !shown.contains(n.after) {
