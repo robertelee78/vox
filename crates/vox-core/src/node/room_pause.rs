@@ -127,6 +127,26 @@ pub async fn status(
         .state)
 }
 
+/// Read current state for an already captured actor and saved room. This never mutates the
+/// receiver. A replacement actor/room is refused before any request is sent.
+///
+/// # Errors
+/// The capture changed or the authenticated receiver could not supply its current state.
+pub async fn status_checked(
+    at: &NodeSocket,
+    room: Digest32,
+    peer: Digest32,
+    actor: Digest32,
+    instance: [u8; 16],
+) -> Result<PauseState, Failure> {
+    Ok(
+        request(at, room, peer, None, None, None, Some((actor, instance)))
+            .await?
+            .selection
+            .state,
+    )
+}
+
 async fn request(
     at: &NodeSocket,
     room: Digest32,

@@ -136,7 +136,7 @@ final class NodeModel: ObservableObject {
             if case .room = selection { roomNeedsPage = true } else { roomNeedsPage = false }
         }
     }
-    private var roomReadGeneration = UUID()
+    private var roomReadGeneration = UUID() { didSet { invalidateSessionPause() } }
     private var roomViewGeneration = UUID()
     private var rejectedRoomMark: String?
     private var roomMessageRevision = UUID()
@@ -241,6 +241,7 @@ final class NodeModel: ObservableObject {
     @Published var showing: Showing = .general {
         didSet {
             guard showing != oldValue else { return }
+            invalidateSessionPause()
             roomViewGeneration = UUID()
             messages = []
             roomBefore = nil
@@ -311,6 +312,77 @@ final class NodeModel: ObservableObject {
     private var sessionsMetadataRead = UUID()
     @Published private(set) var selectedSessionMetadata: FfiSession?
     @Published private(set) var selectedSessionMetadataKnown = false
+    /// Only the selected Session's current owner is observed; no historical/per-peer cache.
+    @Published private(set) var sessionPause: RoomPauseState?
+    @Published private(set) var sessionPauseError: String?
+    private var sessionPauseTask: Task<Void, Never>?
+    private var sessionPauseRequest: SessionPauseRead?
+    private var sessionPauseRead = UUID()
+    private struct SessionPauseContext: Equatable {
+        let room: String
+        let owner: String
+        let session: String
+        let instance: Data
+        let epoch: UUID
+        let generation: UUID
+    }
+    private var sessionPauseContext: SessionPauseContext? {
+        guard ended == nil, daemonReachable, let room = roomOnScreen,
+              let session = shownSession, session.canDrive,
+              let instance = sessionPages.instance else { return nil }
+        return .init(room: room, owner: session.nodeFingerprint, session: session.sessionId,
+                     instance: instance, epoch: nodeObservationEpoch, generation: roomReadGeneration)
+    }
+    private var observedSessionPause: SessionPauseContext?
+    var sessionPauseIsCurrent: Bool {
+        sessionPauseContext != nil && sessionPauseContext == observedSessionPause
+    }
+
+    private func invalidateSessionPause() {
+        sessionPauseRequest?.cancel()
+        sessionPauseRequest = nil
+        sessionPauseTask?.cancel()
+        sessionPauseTask = nil
+        sessionPauseRead = UUID()
+        observedSessionPause = nil
+        sessionPause = nil
+        sessionPauseError = nil
+    }
+
+    /// Reuse existing room/Session refresh triggers. A remote wait never suspends watchReads
+    /// or the listener; one owned task is cancelled on selection, revocation or reconnect.
+    private func scheduleSessionPauseRead() {
+        guard let context = sessionPauseContext else { invalidateSessionPause(); return }
+        if observedSessionPause != context { invalidateSessionPause() }
+        guard sessionPauseTask == nil else { return }
+        observedSessionPause = context
+        let token = UUID(), client = client, actor = me
+        sessionPauseRead = token
+        let request = SessionPauseRead()
+        sessionPauseRequest = request
+        sessionPauseTask = Task { [weak self] in
+            guard !Task.isCancelled else { request.cancel(); return }
+            let result: Result<RoomPauseState, Error>
+            do {
+                result = .success(try await client.sessionPauseStatus(room: context.room,
+                    actor: actor, node: context.owner, sessionId: context.session,
+                    instance: context.instance, read: request))
+            } catch { result = .failure(error) }
+            guard !Task.isCancelled, let self, self.sessionPauseRead == token,
+                  self.sessionPauseContext == context else { return }
+            self.sessionPauseTask = nil
+            self.sessionPauseRequest = nil
+            switch result {
+            case let .success(state):
+                self.sessionPause = state
+                self.sessionPauseError = nil
+            case let .failure(error):
+                self.sessionPause = nil
+                self.sessionPauseError = sentence(error)
+            }
+        }
+    }
+
     /// The Session on screen's entries, oldest first, to a member with drive (SC-1): its newest
     /// page, and the older pages the person scrolled up to (ADR-034 FR-4); never its whole
     /// history.
@@ -413,6 +485,10 @@ final class NodeModel: ObservableObject {
         guard context == roomPauseContext, !Task.isCancelled else { throw CancellationError() }
         let page = try await client.roomPauseChange(capture: capture, member: member, paused: paused, next: next)
         guard context == roomPauseContext, !Task.isCancelled else { throw CancellationError() }
+        if shownSession?.nodeFingerprint == member {
+            invalidateSessionPause()
+            scheduleSessionPauseRead()
+        }
         return page
     }
 
@@ -604,7 +680,7 @@ final class NodeModel: ObservableObject {
     @Published private(set) var peers = 0
     /// Last-known states are never presented as current while the daemon cannot be reached.
     @Published private(set) var daemonReachable = true
-    private var nodeObservationEpoch = UUID()
+    private var nodeObservationEpoch = UUID() { didSet { invalidateSessionPause() } }
     fileprivate var observationToken: UUID { nodeObservationEpoch }
     fileprivate func acceptsObservation(_ token: UUID, actor: String) -> Bool {
         token == nodeObservationEpoch && actor == me && ended == nil && !Task.isCancelled
@@ -684,7 +760,12 @@ final class NodeModel: ObservableObject {
 
     /// The node ended: detached, or the daemon stopped.
     @Published private(set) var ended: String? {
-        didSet { if ended != nil { clearThreadState() } }
+        didSet {
+            if ended != nil {
+                clearThreadState()
+                invalidateSessionPause()
+            }
+        }
     }
 
     /// Whether macOS lets Vox notify; nil until it says.
@@ -708,6 +789,11 @@ final class NodeModel: ObservableObject {
         }
         notifier.allowed = { [weak self] granted in self?.notifying = granted }
         notifier.ask()
+    }
+
+    deinit {
+        sessionPauseRequest?.cancel()
+        sessionPauseTask?.cancel()
     }
 
     /// The rooms in `need`, urgent first, then by name.
@@ -2987,6 +3073,7 @@ final class NodeModel: ObservableObject {
                 await self.refreshSessionMetadata()
                 guard !Task.isCancelled, self.roomReadGeneration == generation, self.nodeObservationEpoch == scope.epoch,
                       self.selection == .room(room), self.ended == nil else { return }
+                self.scheduleSessionPauseRead()
                 let visibleFiles = self.displayedFileIDs
                 if visibleFiles == fileIDs, let copies = fileFacts?.copies {
                     let now = Dictionary(copies.filter { visibleFiles.contains($0.entry) }
@@ -3129,6 +3216,7 @@ final class NodeModel: ObservableObject {
     /// Recoverable history is reloaded from the node after leaving a view or losing its
     /// owner. Drafts are user working state and are preserved independently of these caches.
     private func releaseHistoryViews() {
+        invalidateSessionPause()
         joinCaptionRead = UUID()
         joins = []
         invalidateMemberRoles()
@@ -3268,6 +3356,7 @@ extension NodeModel {
         } catch {
             guard token == sessionsMetadataRead, epoch == nodeObservationEpoch,
                   generation == roomReadGeneration, roomOnScreen == room else { return }
+            invalidateSessionPause()
             reportBackground(error)
         }
     }
@@ -3316,8 +3405,10 @@ extension NodeModel {
             // Only this successful exact lookup can revoke the selected tab. Its absence
             // from a bounded open/history page is not evidence that access disappeared.
             if found == nil || found?.canDrive == false { showing = .general }
+            scheduleSessionPauseRead()
         } catch {
             guard current() else { return }
+            invalidateSessionPause()
             selectedSessionMetadata = nil
             selectedSessionMetadataKnown = true
             sessionLoading = false
@@ -3405,9 +3496,11 @@ extension NodeModel {
             }
             if read.note != sessionNote { sessionNote = read.note }
             sessionLoading = false
+            scheduleSessionPauseRead()
             if let now = shownSession { await refreshSessionRequests(room: room, session: now) }
         } catch {
             guard current() else { return }
+            invalidateSessionPause()
             // A failed protected read cannot authorize formerly cached bodies. Preserve
             // destination identity and report the refusal, so a fresh valid read can recover.
             sessionPages.clear()
@@ -3662,8 +3755,11 @@ extension NodeModel {
     /// A Session in `room` opened, ended or was renamed, or what waits on this node changed.
     fileprivate func sessionsChanged(in room: String) async {
         // A drive revocation uses this same change signal. Drop private wording before
-        // any suspension; the bounded current-author read may restore it afterward.
-        if roomOnScreen == room { clearPrivateJoinCaptions() }
+        // any suspension; bounded reads may restore it afterward.
+        if roomOnScreen == room {
+            invalidateSessionPause()
+            clearPrivateJoinCaptions()
+        }
         let epoch = nodeObservationEpoch
         let count = try? await client.sessionsWaiting(room: room)
         guard epoch == nodeObservationEpoch, !Task.isCancelled, ended == nil else { return }
