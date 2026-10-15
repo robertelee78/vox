@@ -122,8 +122,8 @@ impl Node {
             }
             let rooms: Vec<_> = self.channels.keys().copied().collect();
             for room in rooms {
-                self.act_on_removals_while_closed(&room).await;
-                self.mark_decisions_on_open(&room).await;
+                self.act_on_removals_while_closed(&room).await?;
+                self.mark_decisions_on_open(&room).await?;
                 if let Some(channel) = self.channels.get(&room) {
                     channel.lock().await.release_held_packages();
                 }

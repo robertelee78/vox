@@ -44,7 +44,12 @@ impl Read<'_> {
     }
 }
 impl Write<'_, '_> {
-    fn index_package(&mut self, mut roots: Roots, entry: &Entry, log: u64) -> Result<Roots> {
+    pub(super) fn index_package(
+        &mut self,
+        mut roots: Roots,
+        entry: &Entry,
+        log: u64,
+    ) -> Result<Roots> {
         if !entry
             .payload
             .as_deref()

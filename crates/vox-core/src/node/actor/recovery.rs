@@ -119,6 +119,9 @@ impl Node {
                         reply: None,
                         reopening: false,
                         recovery: Some(original),
+                        trusted: None,
+                        removal_after: None,
+                        consent_after: None,
                     },
                 );
             }

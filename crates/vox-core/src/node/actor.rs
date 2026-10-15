@@ -12068,33 +12068,63 @@ impl Node {
     /// (V210-118 amendment): drop the member's keys and change the lock — revoke and rotate, as a
     /// removal does in an open room — then clear the record. Every consent to a member the ring
     /// does not name is withdrawn too (V210-148): a key goes only to a member the owner trusts.
-    async fn act_on_removals_while_closed(&mut self, channel_id: &Digest32) -> Outcome {
+    async fn act_on_removals_while_closed(
+        &mut self,
+        channel_id: &Digest32,
+    ) -> crate::error::Result<()> {
+        let shared = self
+            .channels
+            .get(channel_id)
+            .map(Arc::clone)
+            .ok_or(Error::Profile("room is not open"))?;
         let result = async {
             let profile = self.profile.as_ref().ok_or(Error::AtRestLocked)?;
-            let shared = self
-                .channels
-                .get(channel_id)
-                .ok_or(Error::Profile("room is not open"))?;
-            let mut channel = shared.lock().await;
             let trusted = self.trust.trusted();
-            channel.forget_keys_except(profile.store(), &trusted)?;
+            {
+                let mut channel = shared.lock().await;
+                if let Err(error) = channel.forget_keys_except(profile.store(), &trusted) {
+                    channel.poison(&error);
+                    return Err(error);
+                }
+            }
             let signer = profile.signer()?;
             let mut locks = crate::node::pending_lock::PendingLocks::load(profile.store(), signer)?;
             for member in locks.for_room(channel_id) {
                 if !trusted.contains(&member) {
-                    channel.withdraw_consent(profile, member, self.now_ms())?;
+                    self.withdraw_for_untrust_result(channel_id, member).await?;
                 }
             }
+            let profile = self.profile.as_ref().ok_or(Error::AtRestLocked)?;
             if locks.clear_room(channel_id) {
-                locks.save(profile.store(), signer)?;
+                locks.save(profile.store(), profile.signer()?)?;
             }
-            Ok::<(), Error>(())
+            Ok(())
         }
         .await;
-        match result {
-            Ok(()) => Outcome::Done,
-            Err(error) => Outcome::Failed(fault_of(&error)),
+        if let Err(error) = &result {
+            shared.lock().await.poison(error);
         }
+        result
+    }
+
+    /// Apply durable trust-decision ordering to an already open room after computer policy
+    /// changes. A storage failure keeps that room refusing instead of publishing stale marks.
+    async fn mark_decisions_on_open(&mut self, channel_id: &Digest32) -> crate::error::Result<()> {
+        let profile = self.profile.as_ref().ok_or(Error::AtRestLocked)?;
+        let shared = self
+            .channels
+            .get(channel_id)
+            .ok_or(Error::Profile("room is not open"))?;
+        let mut channel = shared.lock().await;
+        let result = (|| {
+            let order =
+                crate::node::consent_order::ConsentOrder::load(profile.store(), profile.signer()?)?;
+            channel.mark_decisions_on_open(profile.store(), &order)
+        })();
+        if let Err(error) = &result {
+            channel.poison(error);
+        }
+        result
     }
 
     /// Trust `fingerprint` node-wide under `petname` (ADR-020 §3), then act on it
@@ -12331,9 +12361,8 @@ impl Node {
             }
             // And any other consent outside the keyring (V210-148): a key goes only to a member
             // the owner trusts, so nothing the ring does not name keeps one past this.
-            let result = self.act_on_removals_while_closed(&channel_id).await;
-            if !result.is_done() {
-                return result;
+            if let Err(error) = self.act_on_removals_while_closed(&channel_id).await {
+                return Outcome::Failed(fault_of(&error));
             }
         }
         Outcome::Done
@@ -12342,20 +12371,34 @@ impl Node {
     /// A withdrawal never waits for a historical projection to learn whether consent existed.
     /// The narrow Channel path rotates conservatively if that fact is not yet known.
     async fn withdraw_for_untrust(&mut self, room: &Digest32, target: Digest32) -> Outcome {
-        let (Some(profile), Some(shared)) = (
-            self.profile.as_ref(),
-            self.channels.get(room).map(Arc::clone),
-        ) else {
-            return Outcome::Failed(Fault::ChannelNotOpen);
-        };
+        match self.withdraw_for_untrust_result(room, target).await {
+            Ok(()) => Outcome::Done,
+            Err(error) => Outcome::Failed(fault_of(&error)),
+        }
+    }
+
+    async fn withdraw_for_untrust_result(
+        &mut self,
+        room: &Digest32,
+        target: Digest32,
+    ) -> crate::error::Result<()> {
+        let profile = self.profile.as_ref().ok_or(Error::AtRestLocked)?;
+        let shared = self
+            .channels
+            .get(room)
+            .map(Arc::clone)
+            .ok_or(Error::Profile("room is not open"))?;
         let result = shared
             .lock()
             .await
             .withdraw_consent(profile, target, self.now_ms());
         let generation = match result {
             Ok(Some(revocation)) => revocation.body.new_chain_id,
-            Ok(None) => return Outcome::Done,
-            Err(error) => return Outcome::Failed(fault_of(&error)),
+            Ok(None) => return Ok(()),
+            Err(error) => {
+                shared.lock().await.poison(&error);
+                return Err(error);
+            }
         };
         self.deliveries
             .retain(|(r, peer, _), _| r != room || *peer != target);
@@ -12369,7 +12412,7 @@ impl Node {
             generation,
             rekeyed: 0,
         });
-        Outcome::Done
+        Ok(())
     }
 
     /// Delete every superseded sender-key generation this node no longer needs
