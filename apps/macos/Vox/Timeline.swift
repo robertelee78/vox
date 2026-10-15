@@ -110,7 +110,7 @@ extension NodeModel {
                 lines.sort { $0.millis < $1.millis }
                 // What is older than the pages held, under "opened" and above the entries
                 // (ADR-034 FR-4): the newest page is shown, an older one loads on scroll.
-                if sessionOlder > 0 {
+                if sessionOlder > 0 && !sessionReloadNeeded {
                     var older = TimelineItem.notice(
                         "older-\(s.sessionId)",
                         "Earlier entries",

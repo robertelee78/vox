@@ -3408,16 +3408,23 @@ extension NodeModel {
             scheduleSessionPauseRead()
         } catch {
             guard current() else { return }
-            invalidateSessionPause()
             selectedSessionMetadata = nil
             selectedSessionMetadataKnown = true
-            sessionLoading = false
-            sessionPages.clear()
-            sessionWindowRevision = UUID()
-            selectedEarlierRequest = nil
-            sessionNote = sentence(error)
-            reportBackground(error)
+            discardSessionWindow(after: error)
         }
+    }
+
+    /// A failed protected read cannot authorize old bodies. Losing a loaded window also
+    /// invalidates its paging, independently of which read reported the refusal.
+    private func discardSessionWindow(after error: Error, requiresReload: Bool = false) {
+        invalidateSessionPause()
+        sessionReloadNeeded = sessionReloadNeeded || requiresReload || sessionPages.instance != nil
+        sessionPages.clear()
+        sessionWindowRevision = UUID()
+        selectedEarlierRequest = nil
+        sessionNote = sentence(error)
+        sessionLoading = false
+        reportBackground(error)
     }
 
     /// Capacity refusal alone permits splitting an exact selection. Every other error
@@ -3449,8 +3456,11 @@ extension NodeModel {
     }
 
     /// The Session on screen's entries, to a member with drive; nothing to one without (SC-3).
-    func readSession() async {
-        guard !sessionReloadNeeded else { return }
+    func readSession(reloadNewest: Bool = false) async {
+        // Surviving rows still need exact authorization/expiry checks while reload is
+        // offered. That refresh must not acknowledge reload or replace the held window.
+        guard !sessionReloadNeeded || reloadNewest || !sessionEntries.isEmpty else { return }
+        guard !reloadNewest || timelineFollowingNewest else { return }
         if showingSession && selectedSessionMetadataKnown && selectedSessionMetadata == nil { return }
         guard let room = roomOnScreen, let s = shownSession, s.canDrive else {
             sessionPages.clear()
@@ -3460,14 +3470,15 @@ extension NodeModel {
             return
         }
         let revision = sessionWindowRevision
-        let follows = timelineFollowingNewest
+        let following = timelineFollowingNewest
+        let follows = following && (!sessionReloadNeeded || reloadNewest)
         let epoch = nodeObservationEpoch, generation = roomReadGeneration
         let heldIDs = sessionEntries.map(\.id)
         let heldInstance = sessionPages.instance
         func current() -> Bool {
             roomOnScreen == room && shownSession?.nodeFingerprint == s.nodeFingerprint
                 && shownSession?.sessionId == s.sessionId && shownSession?.canDrive == true
-                && revision == sessionWindowRevision && follows == timelineFollowingNewest
+                && revision == sessionWindowRevision && following == timelineFollowingNewest
                 && epoch == nodeObservationEpoch && generation == roomReadGeneration
         }
         do {
@@ -3486,29 +3497,37 @@ extension NodeModel {
             }
             guard current() else { return }
             var pages = sessionPages
+            var heldActivityMissing = false
             if let retained, !pages.revalidate(retained) {
                 throw VoxError.Failed(reason: "The saved room changed while refreshing held Session activity.")
+            }
+            if let retained {
+                let available = Set(retained.entries.map(\.id))
+                heldActivityMissing = heldIDs.contains { !available.contains($0) }
             }
             pages.newest(read, following: follows)
             if pages != sessionPages {
                 sessionPages = pages
                 sessionWindowRevision = UUID()
             }
-            if read.note != sessionNote { sessionNote = read.note }
+            if heldActivityMissing {
+                // The exact read authorized only the survivors. Its result cannot repair
+                // the old paging cursor or silently move a pinned reader to newest.
+                sessionReloadNeeded = true
+                selectedEarlierRequest = nil
+                sessionNote = "Some held activity is no longer available. Reload newest activity."
+            } else {
+                if reloadNewest { sessionReloadNeeded = false }
+                if read.note != sessionNote { sessionNote = read.note }
+            }
             sessionLoading = false
             scheduleSessionPauseRead()
-            if let now = shownSession { await refreshSessionRequests(room: room, session: now) }
+            if !sessionReloadNeeded, let now = shownSession {
+                await refreshSessionRequests(room: room, session: now)
+            }
         } catch {
             guard current() else { return }
-            invalidateSessionPause()
-            // A failed protected read cannot authorize formerly cached bodies. Preserve
-            // destination identity and report the refusal, so a fresh valid read can recover.
-            sessionPages.clear()
-            sessionWindowRevision = UUID()
-            selectedEarlierRequest = nil
-            sessionNote = sentence(error)
-            reportBackground(error)
-            sessionLoading = false
+            discardSessionWindow(after: error, requiresReload: reloadNewest)
         }
     }
 
@@ -3520,11 +3539,12 @@ extension NodeModel {
         roomReadingOlder = false
         timelineFollowingNewest = true
         if showingSession {
-            sessionReloadNeeded = false
             sessionWindowRevision = UUID()
             await readSelectedSessionMetadata()
             guard roomOnScreen == room, showing == destination, epoch == nodeObservationEpoch else { return }
-            await readSession()
+            // Keep the recovery action until this newly authorized read succeeds. A
+            // projection still refreshing, or another refusal, must leave it actionable.
+            await readSession(reloadNewest: true)
         } else {
             roomReloadNeeded = false
             await readNewOnScreen()
@@ -3534,7 +3554,7 @@ extension NodeModel {
     /// The page of the Session on screen's entries before those held (ADR-034 FR-4): read when
     /// the person scrolls up to the top, or asks, and put before them. One page at a time.
     func readOlderSession() async {
-        guard let room = roomOnScreen, let s = shownSession, s.canDrive,
+        guard !sessionReloadNeeded, let room = roomOnScreen, let s = shownSession, s.canDrive,
               let before = sessionBefore, !sessionReadingOlder else { return }
         timelineFollowingNewest = false
         let revision = sessionWindowRevision
@@ -3558,15 +3578,7 @@ extension NodeModel {
                   generation == roomReadGeneration, roomOnScreen == room,
                   shownSession?.nodeFingerprint == s.nodeFingerprint,
                   shownSession?.sessionId == s.sessionId else { return }
-            sessionPages.clear()
-            sessionWindowRevision = UUID()
-            selectedEarlierRequest = nil
-            sessionNote = sentence(error)
-            if case let VoxError.Failed(reason) = error,
-               reason == "stream refused: cursor not among these Session entries" {
-                sessionReloadNeeded = true
-            }
-            reportBackground(error)
+            discardSessionWindow(after: error, requiresReload: true)
         }
     }
 
