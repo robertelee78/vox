@@ -331,6 +331,22 @@ impl ChannelState {
         self.checked_governance(store, now.get()).map(|_| ())
     }
 
+    /// A local setting is visible only after the same checked revision has reached
+    /// the bounded in-memory display. A ready disk fold alone is not publication.
+    pub(crate) fn require_governance_display(
+        &self,
+        store: &Store,
+        now: crate::time::Ms,
+    ) -> Result<()> {
+        let view = self.checked_governance(store, now.get())?;
+        if !self.governance_display_current(now.get())
+            || self.governance_display.revision != view.revision()
+        {
+            return Err(crate::error::Error::Profile(super::view::REFRESHING));
+        }
+        Ok(())
+    }
+
     pub(in crate::node::channel) fn governance_display_current(&self, now: u64) -> bool {
         self.governance_ready
             && (self.governance_display.valid_until == 0

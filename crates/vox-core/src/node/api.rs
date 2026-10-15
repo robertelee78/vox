@@ -1233,6 +1233,9 @@ pub enum Fault {
     /// (`trust::MAX_TRUSTED`). Not [`Fault::TooLong`]: nothing the person typed was too
     /// long, and "longer than this field allows" sent them looking at the petname.
     KeyringFull,
+    /// This node already offers the maximum services in this room, including file shares.
+    /// A valid new offer name is not too long; an existing offer must be stopped first.
+    ServiceOffersFull,
     /// The store failed; the channel may be poisoned until reopened.
     Storage,
     /// Another vox holds this profile's store open for writing, and only one at a time may.
@@ -1247,6 +1250,8 @@ pub enum Fault {
     ReadSelectionChanged,
     /// The composer selected a room incarnation that no longer exists; no text was appended.
     PostSelectionChanged,
+    /// A prior local room change/open still owes its checked publication; no new write began.
+    RoomChangePending,
     /// One admin removal is already being applied over bounded actor turns.
     AdminChangePending,
     /// A previous hosted room deletion is still awaiting its bounded daemon handoff.
@@ -1466,6 +1471,15 @@ impl Fault {
                     )
                 })
             }
+            Fault::ServiceOffersFull => {
+                static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+                TEXT.get_or_init(|| {
+                    format!(
+                        "this node's room service offers are full ({} offers, including file shares)\n       stop an unused file share or remove an unused service offer from this room, then try again",
+                        crate::node::channel::MAX_SERVICES
+                    )
+                })
+            }
             Fault::Storage => {
                 "the node's store could not be read or written\n       check free disk space, and that the data directory is writable and its files undamaged"
             }
@@ -1483,6 +1497,9 @@ impl Fault {
             }
             Fault::PostSelectionChanged => {
                 "the room changed before sending; this message was not posted\n       refresh the room and try again"
+            }
+            Fault::RoomChangePending => {
+                "a previous change to this room is still being applied; this request made no change\n       wait for its answer before changing the room again"
             }
             Fault::AdminChangePending => {
                 "an admin change is already being applied on this node\n       wait for its answer before making another admin change"
@@ -1705,12 +1722,14 @@ fault_names!(
     ChannelNotOpen,
     TooLong,
     KeyringFull,
+    ServiceOffersFull,
     Storage,
     ProfileBusy,
     DeliveryBusy,
     GovernanceRefreshing,
     ReadSelectionChanged,
     PostSelectionChanged,
+    RoomChangePending,
     AdminChangePending,
     SessionCleanupBusy,
     SessionCleanupUnavailable,
