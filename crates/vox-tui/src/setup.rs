@@ -18,6 +18,7 @@
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
+use sha2::{Digest as _, Sha256};
 use vox_core::node::paths::NodeName;
 
 use crate::app::AppError;
@@ -235,7 +236,7 @@ pub(crate) fn trust_codex_hook(program: &Path) -> Result<(), AppError> {
     Ok(())
 }
 
-/// Fill only missing Vox hooks, sharing discovery with the installed skill pack (HK-1).
+/// Fill missing Vox hooks and refresh owned OpenCode plugins, sharing skill-pack discovery.
 /// This does not create a node or start Vox's daemon. Every changed file is named.
 pub(crate) fn install_light_hooks() -> bool {
     let mut ok = true;
@@ -263,18 +264,26 @@ pub(crate) fn install_light_hooks() -> bool {
             };
             let light = if h.key == "opencode" {
                 if !existing.trim().is_empty() {
-                    // Do not replace a node's plugin or anything the operator put here.
                     if existing != crate::agent_hook::LIGHT_OPENCODE_PLUGIN {
-                        if !existing.contains("vox agent hook") {
-                            return Err(AppError::Usage(format!(
-                                "{} holds another plugin; left unchanged",
+                        let node = wiring.owned_opencode_node(&existing)?.ok_or_else(|| {
+                            AppError::Usage(format!(
+                                "{} holds an edited or unknown plugin; left unchanged",
                                 hook.display()
-                            )));
-                        }
+                            ))
+                        })?;
+                        writable()?;
+                        wiring.install_hook(&node)?;
                         println!(
-                            "vox: {}: kept existing plugin in {}",
+                            "vox: {}: refreshed plugin for {node} in {}",
                             h.name,
                             hook.display()
+                        );
+                        println!(
+                            "vox: OpenCode: installed client attention in {}, registered in {}; \
+                             recorded generated assets in {}; restart OpenCode to load them",
+                            wiring.tui_plugin_file().display(),
+                            wiring.dir.join("tui.json").display(),
+                            wiring.plugin_receipt_file().display()
                         );
                         return Ok(());
                     }
@@ -348,7 +357,7 @@ pub(crate) fn install_light_hooks() -> bool {
             Ok(())
         })();
         if let Err(e) = result {
-            eprintln!("vox: {}: light hook not installed: {e}", h.name);
+            eprintln!("vox: {}: hooks not fully installed: {e}", h.name);
             ok = false;
         }
     }
@@ -631,6 +640,53 @@ impl Wiring {
         self.dir.join("tui").join("vox.js")
     }
 
+    fn plugin_receipt_file(&self) -> PathBuf {
+        self.dir.join(".vox-plugins.json")
+    }
+
+    fn plugin_receipt(&self) -> Result<serde_json::Map<String, serde_json::Value>, AppError> {
+        let path = self.plugin_receipt_file();
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
+            Err(e) => return Err(e.into()),
+        };
+        let receipt: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+            AppError::Usage(format!(
+                "{} is not JSON ({e}); left unchanged",
+                path.display()
+            ))
+        })?;
+        if receipt["format"].as_u64() == Some(1) {
+            if let Some(files) = receipt["files"].as_object() {
+                return Ok(files.clone());
+            }
+        }
+        Err(AppError::Usage(format!(
+            "{} is not a supported Vox plugin receipt; left unchanged",
+            path.display()
+        )))
+    }
+
+    fn owned_opencode_node(&self, text: &str) -> Result<Option<NodeName>, AppError> {
+        let Some(node) = opencode_plugin_node(text) else {
+            return Ok(None);
+        };
+        let receipt = self.plugin_receipt()?;
+        let normalized = text.replace(
+            &format!("const VOX_NODE = \"{node}\""),
+            "const VOX_NODE = \"@VOX_NODE@\"",
+        );
+        // The untouched pre-client-attention asset observed on Beast (#935), from 9595c11a.
+        let earlier = plugin_digest(&normalized)
+            == "4e330746e7c3feefa40369a156d5c189b98f8baaad0d42ae8bb5cf86a699df53";
+        Ok((text == crate::agent_hook::opencode_plugin(&node)
+            || receipt.get("plugin/vox.js").and_then(|hash| hash.as_str())
+                == Some(plugin_digest(text).as_str())
+            || earlier)
+            .then_some(node))
+    }
+
     fn skill_dir(&self) -> PathBuf {
         self.dir.join("skills").join(crate::skill_pack::DIR_NAME)
     }
@@ -651,9 +707,10 @@ impl Wiring {
                 self.hook_file().display()
             ),
             _ => format!(
-                "its server plugin, acting as {node}, is to be written to {}; its client attention plugin is to go in {}, added to tui.json without replacing other settings",
+                "its server plugin, acting as {node}, is to be written to {}; its client attention plugin is to go in {}, added to tui.json without replacing other settings; generated-file digests are to be recorded in {}",
                 self.hook_file().display(),
-                self.tui_plugin_file().display()
+                self.tui_plugin_file().display(),
+                self.plugin_receipt_file().display()
             ),
         };
         vec![
@@ -672,8 +729,9 @@ impl Wiring {
         let mut said = vec![format!("installed the hook in {}", hook.display())];
         if self.key == "opencode" {
             said.push(format!(
-                "installed client attention in {} and registered it in tui.json",
-                self.tui_plugin_file().display()
+                "installed client attention in {} and registered it in tui.json; recorded generated assets in {}",
+                self.tui_plugin_file().display(),
+                self.plugin_receipt_file().display()
             ));
         }
         said.extend(
@@ -699,24 +757,29 @@ impl Wiring {
         match self.key {
             "claude" => merge_hooks(&hook, &crate::agent_hook::claude_settings(node)),
             "codex" => merge_hooks(&hook, &crate::agent_hook::codex_hooks(node)),
-            _ => {
-                self.install_tui_plugin(node)?;
-                write(&hook, &crate::agent_hook::opencode_plugin(node))
-            }
+            _ => self.install_opencode_plugins(node),
         }
     }
 
     /// OpenCode loads TUI plugins from tui.json, separately from server plugins.
     /// Keep every other plugin/setting, and refuse an edited asset or non-JSON file.
-    fn install_tui_plugin(&self, node: &NodeName) -> Result<(), AppError> {
+    fn install_opencode_plugins(&self, node: &NodeName) -> Result<(), AppError> {
+        let receipt = self.plugin_receipt()?;
         let plugin = self.tui_plugin_file();
-        if let Ok(text) = std::fs::read_to_string(&plugin) {
-            if !owned_tui_plugin(&text) {
-                return Err(AppError::Usage(format!(
-                    "{} holds another or edited client plugin; left unchanged",
-                    plugin.display()
-                )));
+        match std::fs::read_to_string(&plugin) {
+            Ok(text) => {
+                if !owned_tui_plugin(&text)
+                    && receipt.get("tui/vox.js").and_then(|hash| hash.as_str())
+                        != Some(plugin_digest(&text).as_str())
+                {
+                    return Err(AppError::Usage(format!(
+                        "{} holds another or edited client plugin; left unchanged",
+                        plugin.display()
+                    )));
+                }
             }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
         }
         let config = self.dir.join("tui.json");
         let mut value: serde_json::Value = match std::fs::read_to_string(&config) {
@@ -748,7 +811,9 @@ impl Wiring {
         if !plugins.iter().any(|p| p.as_str() == Some(spec)) {
             plugins.push(serde_json::Value::String(spec.into()));
         }
-        for path in [&plugin, &config] {
+        let hook = self.hook_file();
+        let receipt_path = self.plugin_receipt_file();
+        for path in [&hook, &plugin, &config, &receipt_path] {
             if std::fs::metadata(path).is_ok_and(|m| m.permissions().readonly()) {
                 return Err(AppError::Usage(format!("{} is read-only", path.display())));
             }
@@ -756,15 +821,54 @@ impl Wiring {
         let text = serde_json::to_string_pretty(&value)
             .map_err(|e| AppError::Usage(format!("cannot write TUI settings: {e}")))?
             + "\n";
-        write(&plugin, &crate::agent_hook::opencode_tui_plugin(node))?;
-        write(&config, &text)
+        let server = crate::agent_hook::opencode_plugin(node);
+        let client = crate::agent_hook::opencode_tui_plugin(node);
+        let receipt = opencode_receipt_text(&server, &client)?;
+        for (path, content) in [
+            (&plugin, &client),
+            (&config, &text),
+            (&hook, &server),
+            (&receipt_path, &receipt),
+        ] {
+            write(path, content).map_err(|e| {
+                AppError::Usage(format!(
+                    "could not write {}: {e}; plugin installation is incomplete",
+                    path.display()
+                ))
+            })?;
+        }
+        Ok(())
     }
 }
 
+fn plugin_digest(text: &str) -> String {
+    format!("{:x}", Sha256::digest(text.as_bytes()))
+}
+
+fn opencode_receipt_text(server: &str, client: &str) -> Result<String, AppError> {
+    let receipt = serde_json::json!({
+        "format": 1,
+        "files": {
+            "plugin/vox.js": plugin_digest(server),
+            "tui/vox.js": plugin_digest(client),
+        },
+    });
+    serde_json::to_string_pretty(&receipt)
+        .map(|text| text + "\n")
+        .map_err(|e| AppError::Usage(format!("cannot record OpenCode plugins: {e}")))
+}
+
+fn opencode_plugin_node(text: &str) -> Option<NodeName> {
+    let mut lines = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("const VOX_NODE = \"")?.strip_suffix('"'));
+    let name = lines.next()?;
+    let node = NodeName::parse(name).ok()?;
+    (lines.next().is_none() && node.as_str() == name).then_some(node)
+}
+
 fn owned_tui_plugin(text: &str) -> bool {
-    text.lines()
-        .find_map(|line| line.strip_prefix("const VOX_NODE = \"")?.strip_suffix('"'))
-        .and_then(|node| NodeName::parse(node).ok())
+    opencode_plugin_node(text)
         .is_some_and(|node| crate::agent_hook::opencode_tui_plugin(&node) == text)
 }
 
@@ -934,6 +1038,34 @@ pub(crate) fn unwire(account: &vox_core::node::paths::Account) -> Vec<Unwire> {
                         tui.display()
                     )));
                 }
+            }
+            let receipt = w.plugin_receipt_file();
+            match std::fs::read_to_string(&receipt) {
+                Ok(text) => {
+                    let bound = std::fs::read_to_string(&hook)
+                        .ok()
+                        .and_then(|text| opencode_plugin_node(&text));
+                    let owned = nodes.iter().chain(bound.iter()).any(|node| {
+                        opencode_receipt_text(
+                            &crate::agent_hook::opencode_plugin(node),
+                            &crate::agent_hook::opencode_tui_plugin(node),
+                        )
+                        .is_ok_and(|ours| ours == text)
+                    });
+                    if owned {
+                        out.push(Unwire::Remove(receipt));
+                    } else {
+                        out.push(Unwire::Keep(format!(
+                            "{} is kept: its plugin receipt was edited or is not recognized",
+                            receipt.display()
+                        )));
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => out.push(Unwire::Keep(format!(
+                    "{} is kept: its plugin receipt could not be read ({e})",
+                    receipt.display()
+                ))),
             }
         } else if let Some(text) = without_vox_hooks(&hook) {
             out.push(Unwire::Rewrite {
