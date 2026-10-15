@@ -3316,6 +3316,7 @@ impl VoxClient {
                 anchors: Vec::new(),
             },
             waiting: None,
+            expected_identity: None,
         };
         let held = Arc::clone(&self.held);
         let following = Arc::clone(&self.following);
@@ -4883,63 +4884,69 @@ impl VoxClient {
                     }))
             })
             .await?;
-        on_held!(self, |c| match ask(
-            c,
-            &Request::Services {
-                channel_id,
-                after,
-                revision
-            }
-        )
-        .await?
-        {
-            Frame::Services {
-                room,
-                services,
-                shared,
-                next,
-                revision,
-            } => Ok(RoomServices {
-                next: next.map(|(host, name_hash)| ServiceCursor {
-                    host: b32_encode(&host),
-                    name_hash: b32_encode(&name_hash)
+        on_held!(self, |c| {
+            let node = c
+                .node_name()
+                .cloned()
+                .ok_or_else(|| failed("the service command has no acting node"))?;
+            match ask(
+                c,
+                &Request::Services {
+                    channel_id,
+                    after,
+                    revision,
+                },
+            )
+            .await?
+            {
+                Frame::Services {
+                    room,
+                    services,
+                    shared,
+                    next,
+                    revision,
+                } => Ok(RoomServices {
+                    next: next.map(|(host, name_hash)| ServiceCursor {
+                        host: b32_encode(&host),
+                        name_hash: b32_encode(&name_hash),
+                    }),
+                    revision,
+                    room: shown_name(&room),
+                    shared: shared
+                        .into_iter()
+                        .map(|s| {
+                            use vox_core::node::service_reach::{commands, needs};
+                            SharedService {
+                                commands: commands(&s, node.as_str())
+                                    .into_iter()
+                                    .map(|(what, command)| ServiceCommand {
+                                        what: what.to_owned(),
+                                        command,
+                                    })
+                                    .collect(),
+                                needs: needs(&s, Some(&proxy))
+                                    .into_iter()
+                                    .map(|(need, holds, otherwise)| ServiceNeed {
+                                        need: shown_name(&need),
+                                        holds,
+                                        otherwise: shown_name(&otherwise),
+                                    })
+                                    .collect(),
+                                address: shown_name(&s.address),
+                                canonical: s.canonical,
+                                by: shown_name(&s.by),
+                                udp: s.udp,
+                                kind: shown_name(&s.kind),
+                            }
+                        })
+                        .collect(),
+                    offered: services
+                        .into_iter()
+                        .map(|(tag, local)| OfferedService { tag, local })
+                        .collect(),
                 }),
-                revision,
-                room: shown_name(&room),
-                shared: shared
-                    .into_iter()
-                    .map(|s| {
-                        use vox_core::node::service_reach::{commands, needs};
-                        SharedService {
-                            commands: commands(&s)
-                                .into_iter()
-                                .map(|(what, command)| ServiceCommand {
-                                    what: what.to_owned(),
-                                    command,
-                                })
-                                .collect(),
-                            needs: needs(&s, Some(&proxy))
-                                .into_iter()
-                                .map(|(need, holds, otherwise)| ServiceNeed {
-                                    need: shown_name(&need),
-                                    holds,
-                                    otherwise: shown_name(&otherwise),
-                                })
-                                .collect(),
-                            address: shown_name(&s.address),
-                            canonical: s.canonical,
-                            by: shown_name(&s.by),
-                            udp: s.udp,
-                            kind: shown_name(&s.kind),
-                        }
-                    })
-                    .collect(),
-                offered: services
-                    .into_iter()
-                    .map(|(tag, local)| OfferedService { tag, local })
-                    .collect(),
-            }),
-            other => Err(unexpected(&other)),
+                other => Err(unexpected(&other)),
+            }
         })
     }
 

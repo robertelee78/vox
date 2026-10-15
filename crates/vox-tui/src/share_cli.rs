@@ -87,6 +87,7 @@ pub(crate) fn shares_of(
 /// sharer is to be told besides (an addressee that cannot be interrupted).
 pub(crate) struct Offered {
     pub(crate) row: ShareRow,
+    pub(crate) room: vox_core::hash::Digest32,
     pub(crate) to: Vec<String>,
     pub(crate) notes: Vec<String>,
 }
@@ -193,6 +194,7 @@ pub(crate) async fn offer(
     }
     Ok(Offered {
         row,
+        room: channel_id,
         to: env.to,
         notes,
     })
@@ -209,7 +211,12 @@ pub async fn share(
     path: &Path,
     opts: &ShareOpts,
 ) -> Result<(), AppError> {
-    let Offered { row, to, notes } = offer(paths, room, path, opts, |what, which, reach| {
+    let Offered {
+        row,
+        room: room_id,
+        to,
+        notes,
+    } = offer(paths, room, path, opts, |what, which, reach| {
         println!("vox: about to share {what} in {which}");
         println!(
             "     the members of it in your keyring are to fetch it: {}",
@@ -244,13 +251,32 @@ pub async fn share(
             .collect();
         println!("     for {}", names.join(", "));
     }
-    println!(
-        "     collect it with: {}",
-        vox_text::shell::command(&["vox", "room", "get", room, &s.name])
-    );
+    let room_id = vox_core::node::link::b32_encode(&room_id);
+    let recipients: std::collections::BTreeSet<_> = env
+        .to
+        .iter()
+        .filter_map(|recipient| crate::ident::recipient(recipient))
+        .collect();
+    if recipients.is_empty() {
+        println!(
+            "     to collect this broadcast, each receiving node uses the room get command with \
+             room {room_id}, file tag {}, and --node set to its own local name or fp: fingerprint; \
+             run it on that receiving node's computer",
+            s.tag
+        );
+    } else {
+        for recipient in recipients {
+            let selector = format!("fp:{}", vox_core::node::link::b32_encode(&recipient));
+            println!(
+                "     {} collects it on its owning computer with: {}",
+                crate::ident::name_of(&recipient),
+                vox_text::shell::node_command(&["vox", "room", "get", &room_id, &s.tag], &selector)
+            );
+        }
+    }
     // Each member names this node its own way, so no one address fits all: said in words.
     println!(
-        "     or a member fetches {} through the proxy `vox up` names, at the service {} of this \
+        "     or a member fetches {} through their node's proxy, at the service {} of this \
          node in this room",
         if s.files > 0 { "one file of it" } else { "it" },
         s.tag
@@ -262,7 +288,10 @@ pub async fn share(
     }
     println!(
         "     served until its message expires, `{}`, you leave the room, or it ends",
-        vox_text::shell::command(&["vox", "share", "stop", room, &s.name])
+        vox_text::shell::node_command(
+            &["vox", "share", "stop", &room_id, &s.tag],
+            crate::client::name_of(paths)?.as_str()
+        )
     );
     Ok(())
 }
@@ -288,8 +317,11 @@ pub async fn stop(paths: &Paths, room: &str, selector: &str) -> Result<(), AppEr
     )?;
     if stopped.is_empty() {
         return Err(AppError::Usage(format!(
-            "no share of this node's in the room matches {selector:?} — `vox share list {room}` \
-             shows them"
+            "no share of this node's in the room matches {selector:?} — `{}` shows them",
+            vox_text::shell::node_command(
+                &["vox", "share", "list", room],
+                crate::client::name_of(paths)?.as_str()
+            )
         )));
     }
     for s in stopped {

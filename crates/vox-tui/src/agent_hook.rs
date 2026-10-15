@@ -1030,9 +1030,9 @@ fn render_attributed(out: &mut String, entry: &Digest32, author: &str, to: &str,
     out.push('\n');
 }
 
-/// Bytes kept back from a room's share for its one line counting chatter (V030-18): every
-/// [`CHATTER`] kind with a two-digit count, and the room's label, fit in it.
-const CHATTER_RESERVE: usize = 384;
+/// Bytes kept back for the chatter, sibling and other-thread lines (V030-18). Each may carry
+/// the complete read command, including a 64-byte local node name; reserve all three together.
+const CHATTER_RESERVE: usize = 768;
 
 /// Who this session is, as far as the drain asks whether a row is **for** it (V030-18).
 struct Reader {
@@ -1134,22 +1134,21 @@ fn thread_participant(
 
 /// The one line that stands for the messages to this node's other sessions a room's drain
 /// counted (ADR-029 TA-2).
-fn siblings_line(room_label: &str, n: usize) -> String {
+fn siblings_line(read: &str, n: usize) -> String {
     format!(
-        "{n} message(s) to another session of this node, not shown; `vox room read {room_label}` \
+        "{n} message(s) to another session of this node, not shown; `{read}` \
          has them\n"
     )
 }
 
 /// The one line that stands for the chatter a room's drain counted, by kind (V030-18).
-fn chatter_line(room_label: &str, chatter: &std::collections::BTreeMap<String, usize>) -> String {
+fn chatter_line(read: &str, chatter: &std::collections::BTreeMap<String, usize>) -> String {
     let kinds: Vec<String> = chatter
         .iter()
         .map(|(kind, n)| format!("{n} {}", one_line(kind)))
         .collect();
     format!(
-        "{} coordination message(s) from other sessions, not shown ({}); `vox room read \
-         {room_label}` has them\n",
+        "{} coordination message(s) from other sessions, not shown ({}); `{read}` has them\n",
         chatter.values().sum::<usize>(),
         kinds.join(", "),
     )
@@ -1170,7 +1169,7 @@ fn render_header(total: usize) -> String {
 }
 
 /// Bytes kept back from a turn's bound for each room's closing "more unread" line.
-const NOTE_RESERVE: usize = 256;
+const NOTE_RESERVE: usize = 384;
 
 /// Bytes kept back from a turn's bound for the one line naming the rooms not shown this turn.
 const SKIPPED_RESERVE: usize = 512;
@@ -1260,6 +1259,7 @@ impl Budget {
 fn render(
     room: &str,
     room_label: &str,
+    node: &str,
     rows: &[vox_core::node::api::MessageRow],
     beyond: usize,
     notice: Option<&str>,
@@ -1338,18 +1338,26 @@ fn render(
         return (String::new(), 0);
     }
     out.push_str(&body);
+    let read = vox_text::shell::node_command(&["vox", "room", "read", room_label], node);
     if !chatter.is_empty() {
-        out.push_str(&chatter_line(room_label, &chatter));
+        out.push_str(&chatter_line(&read, &chatter));
     }
     if siblings > 0 {
-        out.push_str(&siblings_line(room_label, siblings));
+        out.push_str(&siblings_line(&read, siblings));
     }
     if other_threads > 0 {
-        out.push_str(&format!("{other_threads} reply(s) in other threads, not shown; `vox room read {room_label}` has them\n"));
+        out.push_str(&format!(
+            "{other_threads} reply(s) in other threads, not shown; `{read}` has them\n"
+        ));
     }
     let rest = rows.len() - shown + beyond;
     if rest > 0 {
-        out.push_str(&rest_line(room_label, rest, cursor_after(shown).as_ref()));
+        out.push_str(&rest_line(
+            room_label,
+            node,
+            rest,
+            cursor_after(shown).as_ref(),
+        ));
     }
     budget.messages = budget.messages.saturating_sub(full);
     budget.bytes = budget.bytes.saturating_sub(out.len());
@@ -1358,10 +1366,13 @@ fn render(
 
 /// The closing line for `rest` messages a bounded drain had no room for: they follow on the next
 /// turn, and `vox room read` has them now, from the session's cursor `since`.
-fn rest_line(room_label: &str, rest: usize, since: Option<&Digest32>) -> String {
+fn rest_line(room_label: &str, node: &str, rest: usize, since: Option<&Digest32>) -> String {
     let read = match since {
-        Some(c) => format!("vox room read {room_label} --since {}", b32_encode(c)),
-        None => format!("vox room read {room_label}"),
+        Some(c) => vox_text::shell::node_command(
+            &["vox", "room", "read", room_label, "--since", &b32_encode(c)],
+            node,
+        ),
+        None => vox_text::shell::node_command(&["vox", "room", "read", room_label], node),
     };
     format!(
         "-- {rest} more unread message(s) in this room not shown; they follow on the next turn \
@@ -1686,6 +1697,7 @@ pub async fn run(
                     &daemon.account.data_root,
                     std::path::Path::new(&input.cwd),
                     daemon.node.as_str(),
+                    Some(&input.session_id),
                 )
             });
             drain(
@@ -1824,9 +1836,11 @@ impl Unregistered {
                 if crate::agent_onboarding::local_app(account).is_some() {
                     format!("Vox node {node} is Locked; Open Vox to unlock {node}.")
                 } else {
+                    let unlock =
+                        vox_text::shell::command(&["vox", "node", "unlock", "--", node.as_str()]);
                     format!(
                         "Vox node {node} is Locked; ask the operator to run \
-                         `vox node unlock {node}` in a terminal outside this session."
+                         `{unlock}` in a terminal outside this session."
                     )
                 }
             }
@@ -2562,6 +2576,7 @@ async fn drain(
         let (text, shown) = render(
             &d.heading,
             &d.label,
+            crate::client::name_of(paths)?.as_str(),
             &d.fresh,
             d.beyond,
             d.notice.as_deref(),
@@ -3168,7 +3183,7 @@ pub const CLAUDE_HOOKS: &str = r#"{
 /// The hook command a harness runs for `node` (ADR-020 2.1): it acts only as that node.
 #[must_use]
 pub fn hook_command(node: &vox_core::node::paths::NodeName) -> String {
-    format!("vox agent hook --node {node}")
+    vox_text::shell::node_command(&["vox", "agent", "hook"], node.as_str())
 }
 
 /// Claude Code's settings for `node`, as `vox agent plugin claude --node <name>` prints them: the

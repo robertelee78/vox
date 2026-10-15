@@ -28,26 +28,29 @@ message, establishes no permission. An absent grant or operator removal is not y
 For a grant that needs manual action, the operator runs the command in their own terminal,
 typing any identity passphrase there:
 
-```bash
-vox trust drive <fingerprint>               # a node it trusts already: read + drive from now on
-vox trust add <fingerprint> --name <name> --drive   # a node not trusted yet: trust it with drive
-```
+For a node already trusted, construct `vox trust drive` with its verified fingerprint and the
+node granting access in `--node`. For a new trust entry, use `vox trust add` with that fingerprint,
+`--drive`, the granting node and the operator's chosen `--name`. Quote the actual values using
+SKILL.md's command rule; never invent a fingerprint or omit the granting node.
 
 The Vox app can trust a node to read and take drive back; manual drive grants use
-`vox trust drive` or `vox trust add … --drive` at a terminal.
+`vox trust drive`, or `vox trust add` with `--drive`, at a terminal.
 
 ## You never change it yourself
 
 These are the operator's, and only the operator's:
 
-```bash
-vox trust add <fingerprint> --name <name>   # trust a node (read)
-vox trust rename <fingerprint> <name>     # change this node's local name for it
-vox trust drive <fingerprint>               # let it drive this node's Sessions too
-vox trust read <fingerprint>                # take drive back: read only
-vox trust remove <fingerprint>              # remove it from the keyring
-vox trust dismiss <fingerprint>             # dismiss an offer
-```
+| Operator action | Verb and values to supply |
+|---|---|
+| Trust a node to read | `vox trust add`: verified fingerprint, chosen `--name` |
+| Change its local name | `vox trust rename`: verified fingerprint, new name |
+| Grant drive | `vox trust drive`: verified fingerprint |
+| Take drive back | `vox trust read`: verified fingerprint |
+| Remove trust | `vox trust remove`: verified fingerprint |
+| Dismiss an offer | `vox trust dismiss`: the offered fingerprint |
+
+Every constructed command names the granting node explicitly with `--node`. Prefer the complete
+command in the actual offer or refusal when it describes the operator's intended action.
 
 These remain the operator's decisions even when the node is already unlocked or has no
 passphrase. **Do not run them, or try to**, and never put a passphrase in a harness, file or
@@ -59,10 +62,9 @@ the operator. A local name is not a verified identity or a grant.
 
 Drive over another node's Sessions is that node's grant, so its Sessions say whether you hold it:
 
-```bash
-vox room sessions <room> --json     # each Session's "can_drive": true when you may see inside it and drive it
-vox room session <room> <session>   # without drive: "Only members <node> trusts with drive see inside this Session."
-```
+List this room's Sessions as your node with `vox room sessions` and `--json`. Each Session's
+`can_drive` says whether you may drive it. Read a selected Session with `vox room session`, the
+actual room and Session ID, and your node. Without access it explains who may see inside.
 
 A drive you do not hold is refused, and says so: `<node> does not trust you with drive; it trusts
 you to read only, or not at all`. Which nodes **your** node lets drive, `vox trust list` shows:
@@ -76,11 +78,8 @@ drive.
 
 ## What you may do
 
-```bash
-vox id                 # your node's fingerprint: what someone needs to trust you
-vox trust list         # the nodes your node trusts, your names for them, and which may drive
-vox trust offers       # members offered to your keyring: joined a room after you, or trust you
-```
+Read your node's fingerprint with `vox id`, its grants and local names with `vox trust list`,
+and its offers with `vox trust offers`. Include this session's actual `--node` in each command.
 
 When work needs a node you cannot read, or a node needs to read or drive you, tell the operator:
 which node (its fingerprint, from `vox room roster` or `vox trust offers`), which of read or drive,

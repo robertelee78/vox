@@ -636,10 +636,11 @@ pub fn render(lines: &[Line], details: bool, answer_with: &str) -> String {
         match (l.waiting, l.reference.as_str()) {
             (_, "") | (None, _) => {}
             (Some(Waiting::Approval), r) => s.push_str(&format!(
-                "    waiting: {answer_with} --approve {r}, or --reject {r}\n"
+                "    waiting: {answer_with} --approve {}, or {answer_with} --reject {}\n",
+                vox_text::shell::arg(r), vox_text::shell::arg(r)
             )),
             (Some(Waiting::Question), r) => s.push_str(&format!(
-                "    waiting: {answer_with} --answer {r} \"<question>=<answer>\"\n"
+                "    waiting: open this Session in Vox to answer question {r}; in the CLI, use the Session command's --answer flag with this reference and each actual question-id=answer value.\n"
             )),
         }
         if details {

@@ -8642,6 +8642,8 @@ pub struct NodeSocket {
     pub path: PathBuf,
     /// What each connection opens with.
     pub using: crate::node::daemonipc::UseNode,
+    /// A fingerprint selector pins the actual `Using` identity before any node request.
+    pub expected_identity: Option<Digest32>,
     /// Called once if the daemon has not greeted within a second
     /// ([`crate::node::daemonipc::DaemonClient::open_noting`]); the caller says the wait where its
     /// user sees it.
@@ -8672,6 +8674,7 @@ impl NodeSocket {
                 anchors: Vec::new(),
             },
             waiting: None,
+            expected_identity: None,
         }
     }
 
@@ -8681,6 +8684,7 @@ impl NodeSocket {
     pub fn attached_only(&self) -> Self {
         Self {
             waiting: self.waiting,
+            expected_identity: self.expected_identity,
             ..Self::one_shot(self.path.clone(), self.using.node.clone())
         }
     }
@@ -8716,7 +8720,14 @@ pub async fn open_as_noting(
         return Err(hung_up(&at.path).await);
     };
     match DaemonFrame::from_bytes(&answer)? {
-        DaemonFrame::Using { me, notes, .. } => Ok((stream, me, notes)),
+        DaemonFrame::Using { me, notes, .. } => {
+            if at.expected_identity.is_some() && me != at.expected_identity {
+                return Err(Error::Ipc(IpcHandshake::Refused {
+                    reason: "the selected node's identity changed; no node request was sent".into(),
+                }));
+            }
+            Ok((stream, me, notes))
+        }
         DaemonFrame::Refused(r) => Err(Error::Ipc(IpcHandshake::Refused {
             reason: r.to_string(),
         })),
@@ -8806,6 +8817,12 @@ impl IpcClient {
     #[must_use]
     pub fn me(&self) -> Option<Digest32> {
         self.me
+    }
+
+    /// The local node selected by this connection's `Use`, for contextual command output.
+    #[must_use]
+    pub fn node_name(&self) -> Option<&crate::node::paths::NodeName> {
+        self.node.as_ref()
     }
 
     /// Connect to the daemon's socket at `path` and act as the node `using.node` (ADR-026 C-2):

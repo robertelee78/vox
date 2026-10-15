@@ -398,6 +398,7 @@ pub use vox_core::node::service_reach::{
 /// itself offers there and where. With `json`, the same as one JSON object, every address in it
 /// canonical.
 pub struct ServiceListPrinter {
+    node: String,
     channel_id: Digest32,
     proxy: Result<SocketAddr, String>,
     json: bool,
@@ -407,8 +408,14 @@ pub struct ServiceListPrinter {
     room: String,
 }
 impl ServiceListPrinter {
-    pub fn new(channel_id: Digest32, proxy: Result<SocketAddr, String>, json: bool) -> Self {
+    pub fn new(
+        channel_id: Digest32,
+        proxy: Result<SocketAddr, String>,
+        json: bool,
+        node: String,
+    ) -> Self {
         Self {
+            node,
             channel_id,
             proxy,
             json,
@@ -463,7 +470,7 @@ impl ServiceListPrinter {
                 }
                 let row = serde_json::json!({
                     "address":s.canonical,"readable":s.address,"by":s.by,"kind":s.kind,"udp":s.udp,
-                    "commands":service_commands(s).into_iter().map(|(what,command)|serde_json::json!({"what":what,"command":command})).collect::<Vec<_>>(),
+                    "commands":service_commands(s, &self.node).into_iter().map(|(what,command)|serde_json::json!({"what":what,"command":command})).collect::<Vec<_>>(),
                     "needs":service_needs(s,Some(&self.proxy)).into_iter().map(|(need,holds,otherwise)|serde_json::json!({"need":need,"holds":holds,"otherwise":otherwise})).collect::<Vec<_>>(),
                 });
                 print!("{row}");
@@ -474,7 +481,7 @@ impl ServiceListPrinter {
                 let udp = if s.udp && s.kind != "udp" { "/udp" } else { "" };
                 println!("  {}  by {}  {}{udp}", s.address, s.by, s.kind);
                 println!("    {}", s.canonical);
-                for (what, command) in service_commands(s) {
+                for (what, command) in service_commands(s, &self.node) {
                     println!("      {what:<8}{command}");
                 }
                 for (need, holds, otherwise) in service_needs(s, Some(&self.proxy)) {
@@ -515,7 +522,7 @@ impl ServiceListPrinter {
 
 /// The refusal for an address whose share the room's log does not carry, or `None` when it does
 /// (V030-25, PRD-001 R23: said at once, on this side).
-fn share_refusal(name: &str, room: &ServiceRoom) -> Option<AppError> {
+fn share_refusal(name: &str, room: &ServiceRoom, node: &str) -> Option<AppError> {
     // A canonical address names its share by fingerprint, which the sharer resolves itself: this
     // node's copy of the log may simply be behind (ADR-028 S-1), so the host is asked.
     if room.by_unknown_fingerprint() {
@@ -525,10 +532,13 @@ fn share_refusal(name: &str, room: &ServiceRoom) -> Option<AppError> {
         ShareState::Stated => None,
         ShareState::Absent => Some(AppError::Usage(format!(
             "{name}: {} shares no service called `{}` in that room \
-             (`vox service list {}` shows what is shared there)",
+             (`{}` shows what is shared there)",
             crate::ident::author_id(&room.host),
             vox_core::node::channel::service_name(&room.service),
-            short(&room.channel_id)
+            vox_text::shell::node_command(
+                &["vox", "service", "list", &b32_encode(&room.channel_id)],
+                node
+            )
         ))),
         ShareState::NotYetKnown => Some(AppError::Usage(format!(
             "{name}: that room has not synced with its members since this node joined it, so what \
@@ -1657,13 +1667,13 @@ pub async fn connect(
         .map_err(|e| AppError::Usage(format!("joined, but the address no longer reads: {e}")))?
         .channel_id;
     println!(
-        "joined. `vox service list {}` shows what is shared here",
-        short(&channel_id)
+        "joined. `{}` shows what is shared here",
+        vox_text::shell::node_command(
+            &["vox", "service", "list", &b32_encode(&channel_id)],
+            crate::client::name_of(paths)?.as_str()
+        )
     );
-    println!(
-        "        reach a service as <service>.<node>.<room>.vox through the daemon's proxy, \
-         running while a node is Ready (`vox up` says where)"
-    );
+    println!("        use the commands beside each service to reach it through the daemon's proxy");
     Ok(())
 }
 
@@ -1841,7 +1851,7 @@ pub async fn forward_named(
         tokio::time::sleep(Duration::from_millis(100)).await;
         room = resolve().await?;
     }
-    if let Some(refused) = share_refusal(name, &room) {
+    if let Some(refused) = share_refusal(name, &room, crate::client::name_of(paths)?.as_str()) {
         return Err(refused);
     }
     let ServiceRoom {

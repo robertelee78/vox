@@ -10,25 +10,35 @@ use crate::node::ipc::SharedService;
 /// `(what it is, the command)`, every one carrying the **canonical** address (S-1) so it works
 /// pasted on any member's machine. `ssh` and a URL go through the `.vox` proxy; a forward does not.
 #[must_use]
-pub fn commands(s: &SharedService) -> Vec<(&'static str, String)> {
+pub fn commands(s: &SharedService, node: &str) -> Vec<(&'static str, String)> {
+    use vox_text::shell::{command, node_command};
     let c = &s.canonical;
+    let forward =
+        |port: u16| node_command(&["vox", "forward", c, &format!("127.0.0.1:{port}")], node);
     match s.kind.as_str() {
         "ssh" => vec![
-            ("ssh", format!("ssh $USER@{c}")),
-            ("forward", format!("vox forward {c} 127.0.0.1:2222")),
-            ("then", "ssh -p 2222 $USER@127.0.0.1".to_owned()),
+            ("ssh", command(&["ssh", c])),
+            ("forward", forward(2222)),
+            ("then", command(&["ssh", "-p", "2222", "127.0.0.1"])),
         ],
         scheme @ ("http" | "https") => {
             let port = if scheme == "http" { 8080 } else { 8443 };
+            let opener = if cfg!(target_os = "macos") {
+                "open"
+            } else {
+                "xdg-open"
+            };
             vec![
-                ("open", format!("{scheme}://{c}/")),
-                ("forward", format!("vox forward {c} 127.0.0.1:{port}")),
-                ("then", format!("{scheme}://127.0.0.1:{port}/")),
+                ("open", command(&[opener, &format!("{scheme}://{c}/")])),
+                ("forward", forward(port)),
+                (
+                    "then",
+                    command(&[opener, &format!("{scheme}://127.0.0.1:{port}/")]),
+                ),
             ]
         }
-        "dns" => vec![("forward", format!("vox forward {c} 127.0.0.1:5353"))],
-        // A forward picks a free port and says which.
-        _ => vec![("forward", format!("vox forward {c} 127.0.0.1:0"))],
+        "dns" => vec![("forward", forward(5353))],
+        _ => vec![("forward", forward(0))],
     }
 }
 
@@ -58,22 +68,22 @@ pub fn needs(
             Err(why) => (
                 "proxy configured".to_owned(),
                 false,
-                format!("the .vox proxy is not running: {why}; a `vox forward` works without it"),
+                format!("the .vox proxy is not running: {why}; use the forward command shown for this service without it"),
             ),
         });
     }
     needs.push((
         "node Ready".to_owned(),
         true,
-        "`vox node unlock`".to_owned(),
+        "unlock this node in Vox or with the node unlock command and its local name".to_owned(),
     ));
     if theirs {
         needs.push((
             format!("{who} trusts you"),
             s.trusts_you,
             format!(
-                "{who} must trust this node: there, `vox trust add` the fingerprint `vox id` \
-                 prints here"
+                "{who} must trust this node: on its owning computer, select this node's fingerprint \
+                 in the room's trust offers and accept it"
             ),
         ));
         needs.push((

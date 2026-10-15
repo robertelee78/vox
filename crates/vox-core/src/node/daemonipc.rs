@@ -573,7 +573,8 @@ impl std::fmt::Display for Refusal {
         match self {
             Self::NotAttached { node } => write!(
                 f,
-                "node {node} is Locked; unlock it first: vox node unlock {node}"
+                "node {node} is Locked; unlock it first: {}",
+                vox_text::shell::command(&["vox", "node", "unlock", "--", node.as_str()])
             ),
             Self::NoSuchNode { node } => write!(f, "there is no node {node}"),
             Self::WrongPassphrase { node } => {
@@ -2102,6 +2103,16 @@ impl DaemonClient {
 /// this user's is not read.
 #[must_use]
 pub fn attached_nodes(path: &std::path::Path, wait: std::time::Duration) -> Vec<NodeName> {
+    attached_node_infos(path, wait)
+        .into_iter()
+        .map(|n| n.name)
+        .collect()
+}
+
+/// Attached identities from the daemon's live hello. Like [`attached_nodes`], bounded and
+/// read-only; an unreachable daemon supplies no selectable identity.
+#[must_use]
+pub fn attached_node_infos(path: &std::path::Path, wait: std::time::Duration) -> Vec<NodeInfo> {
     use std::io::Read as _;
     if crate::node::paths::check_socket_owner(path).is_err() {
         return Vec::new();
@@ -2126,7 +2137,6 @@ pub fn attached_nodes(path: &std::path::Path, wait: std::time::Duration) -> Vec<
         Ok(DaemonFrame::Hello { attached, .. }) => attached
             .into_iter()
             .filter(|n| n.state == NodeState::Attached)
-            .map(|n| n.name)
             .collect(),
         _ => Vec::new(),
     }
@@ -2146,7 +2156,7 @@ pub fn unreached(socket: &std::path::Path, node: Option<&str>, e: crate::error::
             let (detached, attach) = node.map_or((String::new(), String::new()), |n| {
                 (
                     format!(", so node {n} cannot be used until it starts"),
-                    format!(", or `vox node unlock {n}`"),
+                    format!(", or `{}`", vox_text::shell::command(&["vox", "node", "unlock", "--", n])),
                 )
             });
             format!(

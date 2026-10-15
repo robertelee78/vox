@@ -40,7 +40,9 @@ pub const DEFAULT_LISTEN: &str = "0.0.0.0:0";
 /// Which node a verb acts as, and the account it belongs to.
 #[derive(Args, Debug, Clone)]
 pub struct NodeArgs {
-    /// The node to act as. Without it: the only attached node, else the only node on disk.
+    /// The node to act as: its local name, or fp: followed by its full fingerprint for
+    /// node-scoped CLI verbs (attached nodes only). TUI/anchor/node management use local names.
+    /// Without it: the only attached node, else the only node on disk.
     #[arg(long, env = "VOX_NODE")]
     pub node: Option<String>,
     /// Data directory root (holds `nodes/<name>/` and the daemon's `.daemon/`).
@@ -97,6 +99,12 @@ impl NodeArgs {
 
     fn paths_for(&self, creates: bool) -> vox_core::error::Result<Paths> {
         let account = self.account()?;
+        if let Some(identity) = selected_fingerprint(self.node.as_deref())? {
+            let name = attached_identity(&account, identity)?;
+            let mut paths = account.node_paths_as_they_are(&name);
+            paths.expected_identity = Some(identity);
+            return Ok(paths);
+        }
         let name = resolve_node(self.node.as_deref(), &account, creates)?;
         Paths::resolve(
             name.as_str(),
@@ -203,6 +211,11 @@ pub fn resolve_node(
     creates: bool,
 ) -> vox_core::error::Result<NodeName> {
     if let Some(name) = named.map(str::trim).filter(|n| !n.is_empty()) {
+        if name.starts_with("fp:") {
+            return Err(Error::NoNodeChosen(
+                "fingerprint selectors are for node-scoped CLI verbs; use the local node name for the interactive TUI".into(),
+            ));
+        }
         return NodeName::parse(name);
     }
     // An anchor's headless node is no person's or agent's: it holds no room and reads nothing, so
@@ -228,6 +241,38 @@ pub fn resolve_node(
                 .join(", ")
         ))),
     }
+}
+
+fn attached_identity(account: &Account, identity: Digest32) -> vox_core::error::Result<NodeName> {
+    let matches: Vec<_> =
+        vox_core::node::daemonipc::attached_node_infos(&account.socket(), Duration::from_secs(2))
+            .into_iter()
+            .filter(|n| n.fingerprint == Some(identity))
+            .collect();
+    match matches.as_slice() {
+            [only] => Ok(only.name.clone()),
+            [] => Err(Error::NoNodeChosen(
+                "the daemon did not provide an attached node matching that fingerprint; run this command on its owning computer while that node is Ready".into(),
+            )),
+            _ => Err(Error::NoNodeChosen(
+                "more than one attached node has that fingerprint; choose its exact local name with --node".into(),
+            )),
+        }
+}
+
+// A prefix distinguishes fingerprints from legal local names that happen to be 52 characters.
+fn selected_fingerprint(named: Option<&str>) -> vox_core::error::Result<Option<Digest32>> {
+    named
+        .and_then(|n| n.trim().strip_prefix("fp:"))
+        .map(|fp| {
+            vox_core::node::link::fingerprint_input(fp, "--node fp: requires a full fingerprint")
+                .map_err(|_| {
+                    Error::NoNodeChosen(
+                        "--node fp: requires a full 52-character fingerprint".into(),
+                    )
+                })
+        })
+        .transpose()
 }
 
 /// Whether `node` is headless: a key file and no vault, an anchor's.
@@ -287,6 +332,7 @@ pub fn name_of(paths: &Paths) -> Result<NodeName, AppError> {
 /// As [`name_of`].
 pub fn one_shot(paths: &Paths) -> Result<NodeSocket, AppError> {
     Ok(NodeSocket {
+        expected_identity: paths.expected_identity,
         waiting: Some(say_daemon_waiting),
         ..NodeSocket::one_shot(paths.account().socket(), name_of(paths)?)
     })
@@ -395,6 +441,15 @@ pub async fn hold(
 ) -> Result<Held, AppError> {
     let account = paths.account();
     let node = name_of(paths)?;
+    if paths.expected_identity.is_some() {
+        let at = one_shot(paths)?;
+        let client = open(&at).await?;
+        return Ok(Held {
+            me: client.me(),
+            client,
+            at,
+        });
+    }
     if let Some(w) = waiting {
         w.on("the vox daemon to answer");
     }
@@ -432,6 +487,7 @@ pub async fn hold(
             anchors: args.anchor_specs(),
         },
         waiting: Some(say_daemon_waiting),
+        expected_identity: None,
     };
     let client = open(&at).await?;
     // What attaching the node said (a skipped anchors line, carrying on with no anchor), in the
@@ -462,6 +518,10 @@ pub async fn attach_to_stay(
 ) -> Result<(), AppError> {
     let account = paths.account();
     let node = name_of(paths)?;
+    if paths.expected_identity.is_some() {
+        open(&one_shot(paths)?).await?;
+        return Ok(());
+    }
     if let Some(w) = waiting {
         w.on("the vox daemon to answer");
     }
@@ -517,7 +577,8 @@ async fn identity_for_attach(
         if !exists && !creates {
             let node = name_of(&paths)?;
             return Err(AppError::Usage(format!(
-                "node {node} has no identity yet; make one: vox node create {node}"
+                "node {node} has no identity yet; make one: {}",
+                vox_text::shell::command(&["vox", "node", "create", "--", node.as_str()])
             )));
         }
         if exists {
@@ -706,7 +767,8 @@ pub async fn node_create(
             &vox_core::node::headless::load_or_create_identity(&paths)?,
         );
         println!(
-            "vox: created headless node {name}; `vox node --node {name}` runs it as an anchor"
+            "vox: created headless node {name}; `{}` runs it as an anchor",
+            vox_text::shell::node_command(&["vox", "node"], name.as_str())
         );
         println!("{}", vox_core::node::link::b32_encode(&fp));
         eprintln!("vox: {}", crate::ident::NO_BACKUP);
@@ -734,16 +796,19 @@ pub async fn node_create(
     // **Attached at once at a terminal; a script only makes it** (#666): a script's node is
     // attached when the script says so, and a daemon is not left running behind it.
     if !passphrase.is_empty() && !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-        eprintln!("vox: node {name} is Locked; unlock it: vox node unlock {name}");
+        eprintln!(
+            "vox: node {name} is Locked; unlock it: {}",
+            vox_text::shell::command(&["vox", "node", "unlock", "--", name.as_str()])
+        );
         return Ok(());
     }
     attach_with(args, &name, passphrase, typed)
         .await
         .map_err(|e| {
             AppError::Usage(format!(
-            "node {name} was created, but did not become Ready: {e}\n\x20      Unlock it: vox node unlock \
-             {name}"
-        ))
+                "node {name} was created, but did not become Ready: {e}\n\x20      Unlock it: {}",
+                vox_text::shell::command(&["vox", "node", "unlock", "--", name.as_str()])
+            ))
         })
 }
 
@@ -763,7 +828,8 @@ pub async fn node_unlock(
     let account = args.account()?;
     if !account.nodes_on_disk().contains(&name) {
         return Err(AppError::Usage(format!(
-            "there is no node {name}; make one: vox node create {name}"
+            "there is no node {name}; make one: {}",
+            vox_text::shell::command(&["vox", "node", "create", "--", name.as_str()])
         )));
     }
     // Off macOS a remembered secret must remain readable as a regular file at every restart.
@@ -818,8 +884,8 @@ pub async fn node_unlock(
     )
     .await?;
     println!(
-        "Next: start a new session in the harness wired to node {name}, or run `vox room list \
-         --node {name}` to see its rooms"
+        "Next: start a new session in the harness wired to node {name}, or run `{}` to see its rooms",
+        vox_text::shell::node_command(&["vox", "room", "list"], name.as_str())
     );
     Ok(())
 }
@@ -1271,7 +1337,10 @@ pub async fn node_forget_passphrase(args: &NodeArgs, name: &str) -> Result<(), A
                 "vox: node {name}'s remembered credentials are forgotten; its rooms and messages stay here"
             );
             if attached(&account, &name).await? {
-                println!("vox: node {name} stays Ready now; `vox node lock {name}` locks it if it has a passphrase");
+                println!(
+                    "vox: node {name} stays Ready now; `{}` locks it if it has a passphrase",
+                    vox_text::shell::command(&["vox", "node", "lock", "--", name.as_str()])
+                );
             }
             Ok(())
         }

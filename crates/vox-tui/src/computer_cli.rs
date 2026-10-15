@@ -262,10 +262,16 @@ fn show(status: &ComputerStatus, json: bool) -> Result<(), AppError> {
         );
     }
     if let Some(link) = &status.invite_link {
-        println!("Run in the other computer's own terminal:\n  vox computer pair '{link}'");
+        println!(
+            "Run in the other computer's own terminal:\n  {}",
+            vox_text::shell::command(&["vox", "computer", "pair", link])
+        );
     }
     if let Some(id) = &status.invite_id {
-        println!("Cancel: vox computer cancel {id}");
+        println!(
+            "Cancel: {}",
+            vox_text::shell::command(&["vox", "computer", "cancel", id])
+        );
     }
     for application in &status.applications {
         println!(

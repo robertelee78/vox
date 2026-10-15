@@ -3,6 +3,8 @@
 This page shows how to put an agent's sessions in the right room, follow what a session does,
 and drive it. To drive a session, the agent's node must trust your node with **read + drive**
 ([Identity and keyring](keyring.md#what-a-keyring-entry-grants-read-or-read--drive)).
+The examples use the existing room `family`, operator node `robertgpt`, and agent node `claude-mac`
+from the earlier chapters; actual Session IDs and waiting references come from your own output.
 
 ## What a Session is
 
@@ -20,8 +22,8 @@ edited. By default, steps stay for seven days or the room's message lifetime, wh
 shorter. A shorter message lifetime on your node can shorten it further. Keeping ordinary room
 messages forever therefore does not keep Session steps forever.
 
-Set the step lifetime separately with `vox room retention family --steps 7d`, or the **Session
-steps** control in Vox.app's **Retention** sheet. An admin sets the room rule; other members may
+Set the step lifetime separately with `vox room retention family --steps 7d --node robertgpt`,
+or the **Session steps** control in Vox.app's **Retention** sheet. An admin sets the room rule; other members may
 choose a shorter lifetime for their own node. **Use room rule** removes that local choice.
 Shortening it deletes older steps immediately and leaves ordinary messages and shared files
 under their own retention. See [Session step retention](rooms.md#set-how-long-session-steps-stay).
@@ -78,19 +80,17 @@ Answer in one of three ways:
 - **In the app:** choose **Choose a room…**, pick one of your node's rooms or paste a room link,
   and type the room's passphrase. Vox saves the directory in the room map and puts every session
   waiting there in that room.
-- **In the session:** paste the room's link. The agent never asks for the passphrase. It gives you
-  back a whole command, with your link and the directory in it, to run in your own terminal:
-
-  ```sh
-  vox room join 'vox://gkpeyuly4m4ezlidyid3vocosfzpec2o7um5dleicv2aacz6z2ja?a=ek46r5zf3r7m6fevgu6ghilzamowcaj66qdmw27zxvozxr4m2z4a&b=/ip4/203.0.113.7/udp/53213&m=ek46r5zf3r7m6fevgu6ghilzamowcaj66qdmw27zxvozxr4m2z4a&r=ek46r5zf3r7m6fevgu6ghilzamowcaj66qdmw27zxvozxr4m2z4a' --node claude-mac --bind /opt/vox
-  ```
-
-  It asks for the passphrase, joins the agent's node, and saves the directory in the room map. If
-  the map held something for the directory, it is replaced, and the command says what. The agent
-  then moves its session there with `vox agent room`.
+- **In the session:** paste the room's actual link. The agent never asks for the passphrase. It
+  constructs a complete join command with that link, its actual `--node` and this repository's
+  absolute `--bind` path, quoting each raw argument. Run the complete command in your own terminal.
+  It asks for the passphrase, joins the agent's node and saves the directory in the room map.
+  If the map held something for the directory, it is replaced and the command says what. Status
+  or the next hook turn puts the waiting session in that bound room.
+  If you want a new room, the notice also supplies a complete create command with a suggested
+  name, the actual node and the repository's binding; you can run it in your terminal.
 - **To say no:** choose **Not this repo** in the app, or say no in the session. The agent then runs
-  `vox agent room --none`. The map records the directory as `room none`, and no session started
-  there asks again. Delete that block to be asked again.
+  `vox agent room --none --node claude-mac` for this example's agent. The map records the
+  directory as `room none`, and no session started there asks again. Delete that block to be asked again.
 
 A directory bound to a room its node is not in is asked about too. In the app, **Join It** joins
 with the link and passphrase the map holds.
@@ -116,10 +116,12 @@ command for you to run instead.
 ## List and read Sessions
 
 ```sh
-vox room sessions family
-vox room session family 3f0c25bf
-vox room session family 3f0c25bf --details
+vox room sessions family --node robertgpt
 ```
+
+Choose the intended Session from that actual output. Construct `vox room session` with `family`,
+its returned ID or name, and `--node robertgpt`; add `--details` to inspect full input and output.
+There is no fixed Session ID to reuse from this manual.
 
 `vox room sessions` lists `open` and `ended` Sessions by label. With `--json`, each has
 `can_drive`, which says whether you may drive it.
@@ -144,22 +146,18 @@ reply: Done: big.txt is listed and e1 is made.
 Each input reaches exactly the session named, or is refused with the reason. The harness's own
 terminal keeps working beside it.
 
-```sh
-vox room session family 3f0c25bf --say 'run the tests again'
-vox room session family 3f0c25bf --slash /compact
-vox room session family 3f0c25bf --interrupt
-vox room session family 3f0c25bf --stop
-vox room session family 3f0c25bf --approve toolu_2
-vox room session family 3f0c25bf --reject toolu_3 'not that file'
-vox room session family 3f0c25bf --answer toolu_q 'colour=blue'
-vox room session family 3f0c25bf --file ./notes.txt --note 'for your review'
-```
+Use the complete read command for the actual Session selected above, retaining its room, ID
+and `--node robertgpt`. Add one of the input flags below. Text, file paths and waiting request
+references must come from your intended action and that Session's actual output; quote them
+with the [shell-quoting rule](reference.md#commands-you-can-paste).
 
 - `--say` types the text as the operator and submits it. `--slash` sends a slash command.
   `--interrupt` is Esc. `--stop` is Ctrl-C.
-- `--approve`, `--reject` and `--answer` answer the waiting request with that ref. Whichever answer
-  the harness takes first, from its terminal or from Vox, wins, and the other side is told.
-- `--file` sends the session a file, which lands in its node's files directory.
+- `--approve` takes the waiting tool call's exact reference. `--reject` takes that reference and
+  your reason. `--answer` takes the waiting question's exact reference and the actual answer in
+  its displayed question/answer format. Whichever answer the harness takes first, from its terminal or from Vox, wins, and the other side is told.
+- `--file` takes an existing file path; `--note` adds your message. The file lands in the
+  Session's node's files directory.
 
 How Vox reaches each harness:
 
@@ -177,7 +175,8 @@ vox: not delivered to codex-mac · 01a113e7: codex-mac does not trust you with d
 
 ## Send a file out of a session
 
-From inside the session, the agent sends a file to the members its node trusts with drive:
+From inside the session, with the actual report saved as `report.pdf` in its current directory,
+the agent sends that file to the members its node trusts with drive:
 
 ```sh
 vox agent send ./report.pdf --note 'the numbers you asked for' --node claude-mac
@@ -190,14 +189,15 @@ Nothing is posted to the room. Each of those members' nodes pulls it into its fi
 Any member may address one session without drive: your name for its node, a slash, and the
 session as `vox room sessions` names it.
 
-```sh
-vox room post family --to claude-mac/3f0c25bf 'the lexer is yours'
-```
+Construct `vox room post` with `family`, `--node robertgpt`, your message and `--to` holding
+`claude-mac/` followed by the intended Session's actual ID from the list. Quote the combined
+address as one argument.
 
 The session sees the message in full at its next turn, as a message from a participant, not as its
 operator's input. A message to the node without a session reaches every session of that node in
 the room. A message to an ended session is refused. A file is addressed the same way:
-`vox share family ./notes.txt --to claude-mac/3f0c25bf`.
+use `vox share` with an existing file, `family`, `--node robertgpt` and that same actual
+Session address in `--to`.
 
 ## Sessions in the terminal interface
 
@@ -205,11 +205,12 @@ In a room, the Sessions pane lists `General` (the room's conversation), `All` (t
 with each Session's opening and end, and the entries of Sessions you drive), each open Session,
 and `Ended (N)`.
 
-- Enter on a Session opens it, as does `:session 3f0c25bf`. `:general` and `:all` go back.
+- Enter on a Session opens it, as does `:session` followed by its actual listed ID. `:general`
+  and `:all` go back.
 - In a Session you drive, the composer types into the session. A line starting with `/` is a slash
   command. `:interrupt` and `:stop` act on it. On a waiting line, `a` approves, `r` rejects, and a
   number picks an option. `:answer` takes one answer per part of a question, separated by `;`.
-  `:share PATH` sends a file. Enter or `d` on a line shows its details.
+  `:share` followed by an existing file path sends that file. Enter or `d` on a line shows its details.
 - A Session waiting on you is marked `! claude-mac · 3f0c25bf · waiting on you`.
 - In a Session you cannot drive, there is no composer, and the TUI says `you cannot drive this
   Session: claude-mac has not given you drive`.

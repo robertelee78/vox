@@ -12,12 +12,11 @@ Then gather:
 command -v vox
 vox --version
 vox node list
-vox room list
-vox status
 ```
 
-If several nodes are Ready, add `--node` and the affected node's name. A daemon started in the
-background writes to `.daemon/log` in the data root ([local state](reference.md#local-state)).
+Then read `vox room list` and `vox status` with the affected node's actual name in `--node`.
+The node list identifies it; do not let another Ready node decide the diagnostic context.
+A daemon started in the background writes to `.daemon/log` in the data root ([local state](reference.md#local-state)).
 
 Do not delete a node, remove a lock file, trust an unknown node or turn off a check as a first
 step. Each of these destroys the evidence that tells causes apart. If an entry's fix does not
@@ -54,7 +53,7 @@ passphrase-free node becomes Ready automatically.
 **Fix:** run `vox node unlock robertgpt`. Do not make a new node to get past the message: a new
 node is a new identity, with no rooms and no trust.
 
-**Confirm:** `vox room list` shows your rooms, or `no rooms`.
+**Confirm:** `vox room list --node robertgpt` shows this node's rooms, or `no rooms`.
 
 ## A keyring change asks for the passphrase, or is refused
 
@@ -91,7 +90,8 @@ as it was sent`, and the shell reports a job it started in the background.
 **Meaning:** the room link was typed without single quotes. zsh reads its `?` as a file pattern,
 and bash ends the command at its first `&`. Nothing was joined, and the link is fine.
 
-**Fix:** type `vox room join '`, paste the link, and type the closing `'`. Commands Vox prints for
+**Fix:** construct `vox room join` with the entire actual link and the intended node in `--node`,
+following the [shell-quoting rule](reference.md#commands-you-can-paste). Commands Vox prints for
 you to paste are already quoted: copy the whole line.
 
 **Confirm:** Vox asks for the room passphrase, then says `vox: joined` and the room's name.
@@ -261,8 +261,8 @@ vox agent doctor --node claude-mac --room family
 vox room read family --node claude-mac
 ```
 
-Run them on the agent's machine. From another node, `vox room ping family claude-mac` asks the
-agent's daemon which sessions it holds. If the agent's node cannot read the question, fix trust or
+Run them on the agent's machine. From `robertgpt`, `vox room ping family claude-mac --node robertgpt`
+asks the agent's daemon which sessions it holds. If the agent's node cannot read the question, fix trust or
 connectivity first. A session in a repository with no room works in none
 ([the room a session works in](sessions.md#the-room-a-session-works-in)).
 
@@ -276,7 +276,7 @@ Codex reads messages at its next turn, even urgent ones.
 **Meaning:** exit 5 means the claim is posted but not every member agrees yet. Exit 3 means the
 members run different versions of Vox. Exit 1 means another session holds the item.
 
-**Check:** read the reason Vox prints, and `vox room board family` as the agent's node.
+**Check:** read the reason Vox prints, and `vox room board family --node claude-mac` for this agent.
 
 **Fix:** restore the named member's connectivity, align versions, or coordinate with the holder.
 To retry the same operation, keep its `--op` ID.
