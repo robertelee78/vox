@@ -170,7 +170,13 @@ async fn offer_save(
              in it, run this in a terminal: {}",
             start.display(),
             vox_text::shell::node_command(
-                &["vox", "agent", "room", &room, "--session", session],
+                &[
+                    "vox",
+                    "agent",
+                    "room",
+                    &room,
+                    &format!("--session={session}")
+                ],
                 node.as_str()
             )
         );

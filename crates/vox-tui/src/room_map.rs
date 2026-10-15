@@ -307,7 +307,7 @@ pub fn note(
     let decline = session.map_or_else(
         || "If they say no, decline the repository's room offer in Vox, or use the session-specific decline command shown under Vox needs you.".to_owned(),
         |session| format!("If they say no: run {}, and no session started here is asked again.",
-            vox_text::shell::node_command(&["vox", "agent", "room", "--none", "--session", session], node)),
+            vox_text::shell::node_command(&["vox", "agent", "room", "--none", &format!("--session={session}")], node)),
     );
     let dir = dir.display();
     Some(format!(
