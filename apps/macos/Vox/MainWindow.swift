@@ -146,13 +146,16 @@ private struct Sidebar: View {
     @ObservedObject var model: NodeModel
 
     var body: some View {
-        // Selected at once, then read: the list never sees the old selection come back.
+        // The list sees its pending choice at once. Model publication waits until this
+        // SwiftUI update has finished, then the existing selection/read boundary runs.
         GeometryReader { available in
         VStack(spacing: 0) {
-        List(selection: Binding(get: { model.selection },
+        List(selection: Binding(get: { model.sidebarSelection },
                                 set: { s in
-                                    model.select(s)
-                                    Task { await model.show(s) }
+                                    model.selectFromSidebar(s) { [weak model] in
+                                        guard let model else { return false }
+                                        return AppModel.shared.node === model
+                                    }
                                 })) {
             // Who you are, first (G5): the node's mark, its name, and that it is attached; and a
             // + that makes a room or joins one, as Room > New Room… and Join Room… do.
@@ -174,19 +177,20 @@ private struct Sidebar: View {
                     !model.rooms.contains { r in o.rooms.contains { $0.id == r.id } }
                 }, id: \.fingerprint) { offer in
                     OfferRow(model: model, offer: offer).tag(NodeModel.Selection.offer(offer.fingerprint))
-                        .sidebarRow(model.selection == .offer(offer.fingerprint))
+                        .sidebarRow(model.sidebarSelection == .offer(offer.fingerprint))
                         .copyMenu([("Copy Fingerprint", offer.fingerprint)])
                 }
                 ForEach(model.orderedRooms) { room in
-                    RoomRow(room: room, selected: model.selection == .room(room.id), health: model.roomHealth(room.id))
+                    RoomRow(room: room, selected: model.sidebarSelection == .room(room.id), health: model.roomHealth(room.id))
                         .tag(NodeModel.Selection.room(room.id))
-                        .sidebarRow(model.selection == .room(room.id))
+                        .sidebarRow(model.sidebarSelection == .room(room.id))
                         .contextMenu { roomContextMenu(room) }
                 }
             }
         }
         .listStyle(.sidebar)
         .accessibilityIdentifier("sidebar-rooms")
+        .onDisappear { model.cancelSidebarSelection() }
         // On bg.panel, not the system's sidebar material (L-6), drawn where the sidebar's
         // vibrancy cannot tint it (PanelFill).
         .scrollContentBackground(.hidden)

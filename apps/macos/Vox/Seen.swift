@@ -10,14 +10,25 @@ import SwiftUI
 /// the window key, not minimized and not covered.
 @MainActor
 final class WindowSeen: ObservableObject {
-    @Published private(set) var seen = false
-    private weak var window: NSWindow?
-    private var watching: [NSObjectProtocol] = []
+    /// Publish only outside representable updates. The live identity/visibility guard also
+    /// makes a detached or replaced attachment ineligible before that publication runs.
+    @Published private var visibleAttachment: UUID?
+    var seen: Bool { visibleAttachment == attachment && isVisible }
 
-    func attach(_ window: NSWindow?) {
-        guard let window, window !== self.window else { return }
+    private weak var window: NSWindow?
+    private var owner: UUID?
+    private var attachment = UUID()
+    private var watching: [NSObjectProtocol] = []
+    private var updateTask: Task<Void, Never>?
+    private var updateToken: UUID?
+
+    func attach(_ window: NSWindow?, owner: UUID) {
+        guard owner != self.owner || window !== self.window else { return }
+        retireAttachment()
+        self.owner = owner
         self.window = window
-        watching.forEach(NotificationCenter.default.removeObserver)
+        guard let window else { scheduleUpdate(); return }
+        let attachment = attachment
         let names: [(Notification.Name, AnyObject?)] = [
             (NSWindow.didBecomeKeyNotification, window),
             (NSWindow.didResignKeyNotification, window),
@@ -32,19 +43,64 @@ final class WindowSeen: ObservableObject {
         watching = names.map { name, object in
             NotificationCenter.default.addObserver(forName: name, object: object, queue: .main) {
                 [weak self] _ in
-                MainActor.assumeIsolated { self?.update() }
+                MainActor.assumeIsolated {
+                    guard let self, self.attachment == attachment else { return }
+                    self.scheduleUpdate()
+                }
             }
         }
-        update()
+        scheduleUpdate()
     }
 
-    private func update() {
-        guard let window else {
-            seen = false
-            return
-        }
-        seen = NSApp.isActive && !NSApp.isHidden && window.isKeyWindow && !window.isMiniaturized
+    /// An old represented view must not detach or move its replacement's attachment.
+    func moved(to window: NSWindow?, owner: UUID) {
+        guard self.owner == owner else { return }
+        attach(window, owner: owner)
+    }
+
+    func detach(owner: UUID) {
+        guard self.owner == owner else { return }
+        retireAttachment()
+        self.owner = nil
+        window = nil
+        scheduleUpdate()
+    }
+
+    private func retireAttachment() {
+        attachment = UUID()
+        updateTask?.cancel()
+        updateTask = nil
+        updateToken = nil
+        watching.forEach(NotificationCenter.default.removeObserver)
+        watching = []
+    }
+
+    private var isVisible: Bool {
+        guard owner != nil, let window else { return false }
+        return NSApp.isActive && !NSApp.isHidden && window.isKeyWindow && !window.isMiniaturized
             && window.occlusionState.contains(.visible)
+    }
+
+    private func scheduleUpdate() {
+        guard updateTask == nil else { return }
+        let token = UUID(), attachment = attachment
+        updateToken = token
+        updateTask = Task { @MainActor [weak self] in
+            guard let self, !Task.isCancelled, self.updateToken == token,
+                  self.attachment == attachment else { return }
+            self.updateTask = nil
+            self.updateToken = nil
+            // Never replay a Bool captured during attachment or a window notification.
+            let visible = self.isVisible ? attachment : nil
+            // A view may have sampled live visibility while it was false and then true again
+            // before this coalesced update. Publish even when the attachment is unchanged.
+            self.visibleAttachment = visible
+        }
+    }
+
+    deinit {
+        updateTask?.cancel()
+        watching.forEach(NotificationCenter.default.removeObserver)
     }
 }
 
@@ -54,24 +110,42 @@ final class WindowSeen: ObservableObject {
 struct WindowReader: NSViewRepresentable {
     let seen: WindowSeen
 
-    func makeNSView(context: Context) -> NSView {
+    func makeNSView(context: Context) -> WindowWatcher {
         let view = WindowWatcher()
-        view.joined = { [weak seen] window in seen?.attach(window) }
+        view.use(seen)
         return view
     }
 
-    func updateNSView(_ view: NSView, context: Context) {
-        if let window = view.window { seen.attach(window) }
+    func updateNSView(_ view: WindowWatcher, context: Context) {
+        view.use(seen)
+    }
+
+    static func dismantleNSView(_ view: WindowWatcher, coordinator: ()) {
+        view.detach()
     }
 
     /// Says when it joins a window.
     final class WindowWatcher: NSView {
-        var joined: ((NSWindow?) -> Void)?
+        private let owner = UUID()
+        private weak var seen: WindowSeen?
+
+        func use(_ seen: WindowSeen) {
+            if self.seen !== seen {
+                self.seen?.detach(owner: owner)
+                self.seen = seen
+            }
+            seen.attach(window, owner: owner)
+        }
+
+        func detach() {
+            seen?.detach(owner: owner)
+            seen = nil
+        }
 
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
             let window = window
-            MainActor.assumeIsolated { joined?(window) }
+            MainActor.assumeIsolated { seen?.moved(to: window, owner: owner) }
         }
     }
 }
