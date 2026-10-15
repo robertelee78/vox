@@ -475,6 +475,10 @@ pub(super) struct Write<'a, 's> {
     activity_working: bool,
 }
 
+pub(super) fn exists_in(batch: &Batch<'_>, room: &Digest32) -> Result<bool> {
+    Ok(batch.get_segment(room, KIND, HEADER)?.is_some())
+}
+
 pub(super) fn find_in(
     batch: &Batch<'_>,
     sek: &Sek,
@@ -771,7 +775,6 @@ impl<'a, 's> Write<'a, 's> {
         const ALL: [Tree; TREES] = [
             Tree::PrivateHash,
             Tree::PrivateArrival,
-            Tree::PrivateUnread,
             Tree::Candidates,
             Tree::Groups,
             Tree::Openings,
@@ -806,6 +809,7 @@ impl<'a, 's> Write<'a, 's> {
             Tree::FloorSelf,
             Tree::FloorContinuity,
             Tree::FloorFirst,
+            Tree::PrivateUnread,
         ];
         self.working = true;
         for _ in 0..limit {

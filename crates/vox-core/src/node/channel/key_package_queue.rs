@@ -73,6 +73,9 @@ impl Queue {
         tip: u64,
     ) -> Result<()> {
         if let Some(segment) = store.get_segment(room, SegmentKind::KeyMaterial, CHECKPOINT)? {
+            if segment.ciphertext.len() > AUTHORS_HARD_LIMIT * 48 + 256 {
+                return Err(Error::MalformedAtRest("key-package checkpoint size"));
+            }
             let bytes = open_segment(sek, SegmentKind::KeyMaterial, CHECKPOINT, &segment)?;
             let mut d = Decoder::new(&bytes);
             if d.array()? != 7 || d.uint()? != 1 {
@@ -241,6 +244,8 @@ impl Queue {
             || self.attempt.is_some()
     }
 
+    // One bounded read needs the room's storage, binding and acceptance predicate together.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn next(
         &mut self,
         store: &Store,

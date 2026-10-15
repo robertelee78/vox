@@ -28,6 +28,9 @@ pub(in crate::node::channel) struct Restart {
 
 impl Restart {
     fn read(sek: &Sek, segment: &crate::atrest::store::SealedSegment) -> Result<Self> {
+        if segment.ciphertext.len() > 256 {
+            return Err(Error::MalformedAtRest("private restart size"));
+        }
         let bytes = open_segment(sek, SegmentKind::KeyMaterial, RESTART, segment)?;
         let mut d = Decoder::new(&bytes);
         if d.array()? != 7 || d.uint()? != 1 {
@@ -57,6 +60,17 @@ impl Restart {
         })
     }
     pub fn queue(&self, batch: &mut Batch<'_>, sek: &Sek, room: &Digest32) -> Result<()> {
+        if self.complete && !super::storage::exists_in(batch, room)? {
+            // Empty new rooms have no locator writes yet. Publish their empty index with
+            // this checkpoint; saved bodies without an index are never certified complete.
+            if batch
+                .last_segment_id(room, SegmentKind::PrivateSession)?
+                .is_some()
+            {
+                return Err(Error::MalformedAtRest("private restart index missing"));
+            }
+            Write::open(batch, sek, room)?.seal()?;
+        }
         let mut e = Encoder::new();
         e.array(7).uint(1).uint(u64::from(self.complete));
         put_optional(&mut e, self.after);
@@ -92,17 +106,42 @@ pub(in crate::node::channel) fn restart(
     sek: &Sek,
     room: &Digest32,
 ) -> Result<Restart> {
-    snapshot
+    let state = snapshot
         .get_segment(room, SegmentKind::KeyMaterial, RESTART)?
         .map(|s| Restart::read(sek, &s))
-        .transpose()
-        .map(|s| {
-            s.unwrap_or_else(|| Restart {
-                next: 1,
-                ..Default::default()
-            })
-        })
+        .transpose()?
+        .unwrap_or_else(|| Restart {
+            next: 1,
+            ..Default::default()
+        });
+    if state.complete && Read::existing(snapshot, sek, room)?.is_none() {
+        return Err(Error::MalformedAtRest("private restart index missing"));
+    }
+    Ok(state)
 }
+
+/// Fresh create/join already has an empty room transaction; certify that exact empty index.
+pub(in crate::node::channel) fn initialize(
+    batch: &mut Batch<'_>,
+    sek: &Sek,
+    room: &Digest32,
+) -> Result<()> {
+    if batch
+        .last_segment_id(room, SegmentKind::PrivateSession)?
+        .is_some()
+    {
+        return Err(Error::MalformedAtRest(
+            "private initialization is not empty",
+        ));
+    }
+    Restart {
+        complete: true,
+        next: 1,
+        ..Default::default()
+    }
+    .queue(batch, sek, room)
+}
+
 fn restart_in(batch: &Batch<'_>, sek: &Sek, room: &Digest32) -> Result<Restart> {
     batch
         .get_segment(room, SegmentKind::KeyMaterial, RESTART)?

@@ -1787,6 +1787,7 @@ impl ChannelState {
         index.initialize_restart(epoch)?;
         index.empty_rendered()?;
         index.seal()?;
+        session_projection::private_index::initialize(&mut batch, &sek, &channel_id)?;
         batch.commit()?;
 
         let mut admission = AdmissionPolicy::new();
@@ -2673,6 +2674,7 @@ impl ChannelState {
         index.initialize_restart(epoch)?;
         index.empty_rendered()?;
         index.seal()?;
+        session_projection::private_index::initialize(&mut batch, &sek, channel_id)?;
         batch.commit()?;
 
         let mut admission = AdmissionPolicy::new();
