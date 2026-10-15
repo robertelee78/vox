@@ -1233,6 +1233,9 @@ pub enum Fault {
     /// (`trust::MAX_TRUSTED`). Not [`Fault::TooLong`]: nothing the person typed was too
     /// long, and "longer than this field allows" sent them looking at the petname.
     KeyringFull,
+    /// This node already offers the maximum services in this room, including file shares.
+    /// A valid new offer name is not too long; an existing offer must be stopped first.
+    ServiceOffersFull,
     /// The store failed; the channel may be poisoned until reopened.
     Storage,
     /// Another vox holds this profile's store open for writing, and only one at a time may.
@@ -1465,6 +1468,15 @@ impl Fault {
                          vox trust remove and its fingerprint (`vox trust list` shows them), then \
                          add again",
                         crate::node::trust::trust_cap_words()
+                    )
+                })
+            }
+            Fault::ServiceOffersFull => {
+                static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+                TEXT.get_or_init(|| {
+                    format!(
+                        "this node's room service offers are full ({} offers, including file shares)\n       stop an unused file share or remove an unused service offer from this room, then try again",
+                        crate::node::channel::MAX_SERVICES
                     )
                 })
             }
@@ -1710,6 +1722,7 @@ fault_names!(
     ChannelNotOpen,
     TooLong,
     KeyringFull,
+    ServiceOffersFull,
     Storage,
     ProfileBusy,
     DeliveryBusy,

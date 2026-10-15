@@ -20967,6 +20967,7 @@ pub fn fault_of(e: &Error) -> Fault {
         Error::ProfileBusy => Fault::ProfileBusy,
         // Before the general size arm: a full keyring is not an input that was too long.
         Error::SizeLimitExceeded("trusted identities") => Fault::KeyringFull,
+        Error::SizeLimitExceeded("room services") => Fault::ServiceOffersFull,
         Error::SizeLimitExceeded(_) => Fault::TooLong,
         Error::MalformedLink(_) | Error::MalformedAnchor(_) => Fault::BadLink,
         Error::Unreachable(_) => Fault::Unreachable,
