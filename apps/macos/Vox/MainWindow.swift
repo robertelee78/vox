@@ -65,7 +65,19 @@ struct MainWindow: View {
                 switch model.selection {
                 case let .room(id):
                     // One view per room: its draft, To:, urgent and attachment do not carry over.
-                    RoomTimelineView(model: model, room: id).id(id)
+                    if model.rooms.first(where: { $0.id == id })?.preparing == true {
+                        VStack(spacing: Space.s12) {
+                            ProgressView()
+                            Text("Preparing room history").title()
+                            Text("Your node is Ready. This room will appear when its saved history is ready; no passphrase is needed.")
+                                .secondaryText().multilineTextAlignment(.center)
+                        }
+                        .padding(Space.s12)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .accessibilityIdentifier("room-history-preparing")
+                    } else {
+                        RoomTimelineView(model: model, room: id).id(id)
+                    }
                 case .keyring:
                     KeyringView(model: model)
                 case .decisions:
@@ -571,6 +583,7 @@ private struct RoomRow: View {
     }
 
     private var preview: String {
+        if room.preparing { return "Preparing room history" }
         if room.offered > 0 { return room.offerSaid }
         if room.waiting > 0 { return room.waiting == 1 ? "a Session needs you" : "\(room.waiting) Session requests need you" }
         return room.last?.words ?? ""

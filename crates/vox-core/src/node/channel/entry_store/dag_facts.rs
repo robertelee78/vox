@@ -471,6 +471,28 @@ impl Write<'_, '_> {
         }
         self.set_fact_roots(roots)
     }
+
+    /// Cold rebuilds know their entire verified set. Wait for an included parent rather than
+    /// publishing a provisional clock and repeatedly moving its already placed descendants.
+    /// Stored rows outside that set remain missing parents, just as in live publication.
+    fn rebuild_parents_ready(&self, entry: &Entry, dag: &crate::log::dag::Dag) -> Result<bool> {
+        let roots = self.fact_roots()?;
+        let source = Source::Batch(self.batch);
+        let sk = &entry.skeleton;
+        for parent in sk.seen.iter().chain((sk.seq > 1).then_some(&sk.prev_hash)) {
+            let Some(at) = source.find(self.sek, self.channel, roots.hash, &hashed(parent))? else {
+                continue;
+            };
+            if at.seq <= dag.verified_head(&at.author)
+                && source
+                    .number(self.sek, self.channel, roots.clock, &hashed(parent))?
+                    .is_none()
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
     /// Each step visits at most one entry or one reverse edge; queued descendants stay sealed.
     /// Tree updates are COW and the active roots remain unchanged until the effects commit.
     pub(super) fn fact_chunk(&mut self) -> Result<bool> {
@@ -569,31 +591,63 @@ impl EntryIndex {
             writer.seal()?;
             batch.commit()?;
         }
-        let mut batch = Some(store.batch()?);
-        let mut count = 0usize;
-        for author in dag.authors() {
-            for seq in 1..=dag.verified_head(&author) {
-                let current = batch.as_mut().ok_or(invalid("DAG rebuild batch missing"))?;
-                let mut writer = self.write(current, sek, channel)?;
-                let entry = writer
-                    .get(&author, seq)?
-                    .ok_or(invalid("DAG verified prefix missing"))?;
-                writer.enqueue_fact(entry.entry_hash())?;
-                writer.seal()?;
-                count += 1;
-                if count == PROMOTION_ENTRIES {
-                    batch
-                        .take()
-                        .ok_or(invalid("DAG rebuild batch missing"))?
-                        .commit()?;
-                    batch = Some(store.batch()?);
-                    count = 0;
+        // Keep one cursor per verified author, not a queue containing every saved hash.
+        // Hash order can put descendants first. In an ordinary old room their provisional
+        // clocks all clamp to genesis + MAX_LEAD_MS, so late parents repeatedly lift them.
+        let mut heads: Vec<_> = dag
+            .authors()
+            .into_iter()
+            .filter_map(|author| {
+                let through = dag.verified_head(&author);
+                (through != 0).then_some((author, Some(1), through))
+            })
+            .collect();
+        let mut remaining = heads.len();
+        while remaining != 0 {
+            let mut batch = store.batch()?;
+            let mut writer = self.write(&mut batch, sek, channel)?;
+            let mut count = 0usize;
+            let mut bytes = 0usize;
+            'chunk: loop {
+                let mut progressed = false;
+                for (author, next, through) in &mut heads {
+                    let Some(seq) = *next else { continue };
+                    let entry = writer
+                        .get(author, seq)?
+                        .ok_or(invalid("DAG verified prefix missing"))?;
+                    if !writer.rebuild_parents_ready(&entry, dag)? {
+                        continue;
+                    }
+                    let size = entry.to_wire().len();
+                    if count != 0 && bytes.saturating_add(size) > PROMOTION_BYTES {
+                        break 'chunk;
+                    }
+                    writer.place_fact(entry.entry_hash())?;
+                    // Every included parent was placed first, so no already placed child
+                    // needs repair. Preserve the normal work-drain invariant before sealing.
+                    if !writer.fact_chunk()? {
+                        return Err(invalid("cold DAG placement left descendant work"));
+                    }
+                    if seq == *through {
+                        *next = None;
+                        remaining -= 1;
+                    } else {
+                        *next = Some(seq + 1);
+                    }
+                    count += 1;
+                    bytes = bytes.saturating_add(size);
+                    progressed = true;
+                    if count == PROMOTION_ENTRIES || remaining == 0 {
+                        break 'chunk;
+                    }
+                }
+                if !progressed {
+                    return Err(invalid("verified DAG parents cannot be ordered"));
                 }
             }
+            writer.seal()?;
+            batch.commit()?;
         }
-        batch
-            .ok_or(invalid("DAG rebuild batch missing"))?
-            .commit()?;
         self.finish_fact_work(store, sek, channel)?;
         let mut batch = store.batch()?;
         let mut writer = self.write(&mut batch, sek, channel)?;

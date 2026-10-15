@@ -792,6 +792,27 @@ pub(crate) struct Snapshot {
 }
 
 impl Snapshot {
+    /// Read the last segment key without opening its sealed body.
+    pub(crate) fn last_segment_id(
+        &self,
+        channel: &Digest32,
+        kind: SegmentKind,
+    ) -> Result<Option<u64>> {
+        let table = self
+            .txn
+            .open_table(SEGMENTS)
+            .map_err(storage("open segments"))?;
+        let mut rows = table
+            .range((*channel, kind_code(kind), 0)..=(*channel, kind_code(kind), u64::MAX))
+            .map_err(storage("range segments"))?;
+        let found = rows
+            .next_back()
+            .transpose()
+            .map_err(storage("iterate segments"))?
+            .map(|(key, _)| key.value().2);
+        Ok(found)
+    }
+
     /// Read only the next segment key. A readiness check never copies the sealed body.
     pub(crate) fn segment_id_after(
         &self,

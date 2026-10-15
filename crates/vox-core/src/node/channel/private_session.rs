@@ -9,6 +9,7 @@ use crate::node::sessionstream::{Ask, Cursor, Page, Record, PAGE_RECORDS};
 
 const SUPPORT: &str = "vox/private-session-stream/v1";
 const SEG_LEGACY_DRIVE_GENERATIONS: u64 = 19;
+const SEG_PRIVATE_PULLS: u64 = 23;
 const WORK_ROWS: usize = 32;
 const WORK_BYTES: usize = 1024 * 1024;
 
@@ -684,6 +685,17 @@ impl ChannelState {
                 self.private_sessions.pending_active = true;
                 self.private_sessions.pending_after = None;
                 self.private_sessions.pending_through = self.private_sessions.next;
+                let mut batch = store.batch()?;
+                {
+                    let mut index = self
+                        .entries
+                        .write(&mut batch, &self.sek, &self.channel_id)?;
+                    index.clear_retained_step_marker()?;
+                    index.seal()?;
+                }
+                self.queue_private_progress(&mut batch)?;
+                batch.commit()?;
+                self.entries.committed();
                 return Ok(true);
             };
             let size = entry.payload.as_ref().map_or(0, Vec::len);
@@ -850,6 +862,7 @@ impl ChannelState {
         self.private_sessions.pending_active = true;
         self.private_sessions.pending_after = None;
         self.private_sessions.pending_through = self.private_sessions.next;
+        self.save_private_progress(store)?;
         if self.private_policy_ready(store, now)?
             && !self.private_sessions.upgrading
             && !self.private_sessions.restoring
@@ -876,14 +889,21 @@ impl ChannelState {
         }
         let mut bytes = 0usize;
         for _ in 0..WORK_ROWS {
-            let next = self.private_after(store, self.private_sessions.pending_after)?;
-            let Some((id, saved)) =
-                next.filter(|(id, _)| *id < self.private_sessions.pending_through)
-            else {
+            let next = private_index::unread_after(
+                &store.snapshot()?,
+                &self.sek,
+                &self.channel_id,
+                self.private_sessions.pending_after,
+            )?;
+            let Some(id) = next.filter(|id| *id < self.private_sessions.pending_through) else {
                 self.private_sessions.pending_active = false;
                 self.private_sessions.pending_after = None;
+                self.save_private_progress(store)?;
                 return Ok(true);
             };
+            let saved = self
+                .private_at(store, id)?
+                .ok_or(Error::MalformedAtRest("unread Session locator missing"))?;
             let size = saved.record.message.ciphertext.len();
             if bytes != 0 && bytes.saturating_add(size) > WORK_BYTES {
                 break;
@@ -941,6 +961,7 @@ impl ChannelState {
             }
             self.private_sessions.pending_after = Some(id);
         }
+        self.save_private_progress(store)?;
         Ok(false)
     }
 
@@ -1042,13 +1063,157 @@ impl ChannelState {
         Ok(())
     }
     pub(super) fn restore_private_sessions(&mut self, store: &Store) -> Result<()> {
-        let _ = store;
-        self.private_sessions.controls_import = true;
+        let snapshot = store.snapshot()?;
+        let state = private_index::restart(&snapshot, &self.sek, &self.channel_id)?;
+        self.private_sessions.controls_import = snapshot
+            .get_segment(
+                &self.channel_id,
+                SegmentKind::KeyMaterial,
+                SEG_LEGACY_DRIVE_GENERATIONS,
+            )?
+            .is_some();
         self.private_sessions.controls_import_after = None;
         self.private_sessions.controls_after = None;
-        self.private_sessions.restoring = true;
-        self.private_sessions.restore_after = None;
+        self.private_sessions.restoring = !state.complete;
+        self.private_sessions.restore_after = state.after;
+        self.private_sessions.next = state.next;
+        self.private_sessions.pending_active = state.pending;
+        self.private_sessions.pending_after = state.pending_after;
+        self.private_sessions.pending_through = state.pending_through;
+        self.restore_private_pulls(store)?;
         Ok(())
+    }
+
+    // Cursor scope follows held grant generations, not ratchet iterations. A grant saved
+    // immediately before a crash invalidates the old cursor even if its reset was not saved.
+    fn private_pull_binding(&self) -> Digest32 {
+        let mut e = Encoder::new();
+        e.array(3)
+            .bytes(&self.channel_id)
+            .uint(self.epoch)
+            .array(self.drive.receivers.len());
+        for (author, generation) in self.drive.receivers.keys() {
+            e.array(2).bytes(author).uint(*generation);
+        }
+        crate::hash::sha256(&e.finish())
+    }
+
+    fn restore_private_pulls(&mut self, store: &Store) -> Result<()> {
+        let Some(segment) = store.get_segment(
+            &self.channel_id,
+            SegmentKind::KeyMaterial,
+            SEG_PRIVATE_PULLS,
+        )?
+        else {
+            return Ok(());
+        };
+        if segment.ciphertext.len() > AUTHORS_HARD_LIMIT * 96 + 256 {
+            return Err(Error::MalformedAtRest("private pull cursor bound"));
+        }
+        let bytes = open_segment(
+            &self.sek,
+            SegmentKind::KeyMaterial,
+            SEG_PRIVATE_PULLS,
+            &segment,
+        )?;
+        let mut d = Decoder::new(&bytes);
+        if d.array()? != 4 || d.uint()? != 1 {
+            return Err(Error::MalformedAtRest("private pull cursor version"));
+        }
+        self.private_sessions.incarnation = match d.bytes()? {
+            [] => None,
+            b => Some(
+                b.try_into()
+                    .map_err(|_| Error::MalformedAtRest("private stream incarnation"))?,
+            ),
+        };
+        let binding: Digest32 = d
+            .bytes()?
+            .try_into()
+            .map_err(|_| Error::MalformedAtRest("private pull grant binding"))?;
+        let count = d.array()?;
+        if count > AUTHORS_HARD_LIMIT {
+            return Err(Error::MalformedAtRest("private pull peer bound"));
+        }
+        let mut cursors = BTreeMap::new();
+        for _ in 0..count {
+            if d.array()? != 3 {
+                return Err(Error::MalformedAtRest("private pull peer cursor"));
+            }
+            let peer = d
+                .bytes()?
+                .try_into()
+                .map_err(|_| Error::MalformedAtRest("private pull peer"))?;
+            let incarnation = d
+                .bytes()?
+                .try_into()
+                .map_err(|_| Error::MalformedAtRest("private pull incarnation"))?;
+            let after = d.uint()?;
+            if cursors
+                .insert(peer, Cursor { incarnation, after })
+                .is_some()
+            {
+                return Err(Error::MalformedAtRest("duplicate private pull peer"));
+            }
+        }
+        d.finish()?;
+        if binding == self.private_pull_binding() {
+            self.private_sessions.cursors = cursors;
+        }
+        Ok(())
+    }
+
+    fn save_private_pulls(&self, store: &Store) -> Result<()> {
+        if self.private_sessions.cursors.len() > AUTHORS_HARD_LIMIT {
+            return Err(Error::MalformedAtRest("private pull peer bound"));
+        }
+        let mut e = Encoder::new();
+        e.array(4)
+            .uint(1)
+            .bytes(
+                self.private_sessions
+                    .incarnation
+                    .as_ref()
+                    .map_or(&[][..], |v| &v[..]),
+            )
+            .bytes(&self.private_pull_binding())
+            .array(self.private_sessions.cursors.len());
+        for (peer, cursor) in &self.private_sessions.cursors {
+            e.array(3)
+                .bytes(peer)
+                .bytes(&cursor.incarnation)
+                .uint(cursor.after);
+        }
+        let segment = seal_segment(
+            &self.sek,
+            SegmentKind::KeyMaterial,
+            SEG_PRIVATE_PULLS,
+            &e.finish(),
+        )?;
+        store.put_segment(
+            &self.channel_id,
+            SegmentKind::KeyMaterial,
+            SEG_PRIVATE_PULLS,
+            &segment,
+        )
+    }
+
+    fn queue_private_progress(&self, batch: &mut crate::node::store::Batch<'_>) -> Result<()> {
+        private_index::Restart {
+            complete: !self.private_sessions.restoring,
+            after: self.private_sessions.restore_after,
+            next: self.private_sessions.next.max(1),
+            pending: self.private_sessions.pending_active,
+            pending_after: self.private_sessions.pending_after,
+            pending_through: self.private_sessions.pending_through,
+        }
+        .queue(batch, &self.sek, &self.channel_id)
+    }
+
+    fn save_private_progress(&self, store: &Store) -> Result<()> {
+        let mut batch = store.batch()?;
+        self.queue_private_progress(&mut batch)?;
+        batch.commit()
     }
 
     fn restore_private_chunk(&mut self, store: &Store) -> Result<bool> {
@@ -1061,6 +1226,7 @@ impl ChannelState {
                 self.private_sessions.pending_active = true;
                 self.private_sessions.pending_after = None;
                 self.private_sessions.pending_through = self.private_sessions.next;
+                self.save_private_progress(store)?;
                 return Ok(false);
             };
             let size = saved.record.message.ciphertext.len();
@@ -1078,9 +1244,15 @@ impl ChannelState {
                 .ok_or(Error::MalformedAtRest("private Session id exhausted"))?;
             let mut batch = store.batch()?;
             private_index::put(&mut batch, &self.sek, &self.channel_id, id, &saved)?;
-            batch.commit()?;
             self.private_sessions.next = self.private_sessions.next.max(next);
             self.private_sessions.restore_after = Some(id);
+            if saved.row.is_none() {
+                self.private_sessions.pending_active = true;
+                self.private_sessions.pending_after = None;
+                self.private_sessions.pending_through = self.private_sessions.next;
+            }
+            self.queue_private_progress(&mut batch)?;
+            batch.commit()?;
         }
         Ok(false)
     }
@@ -1700,6 +1872,10 @@ impl ChannelState {
                 let mut i = [0; 32];
                 getrandom::fill(&mut i).map_err(|_| Error::Rng)?;
                 self.private_sessions.incarnation = Some(i);
+                if let Err(error) = self.save_private_pulls(store) {
+                    self.private_save_failed(&error);
+                    return Err(error);
+                }
                 i
             }
         };
@@ -1794,6 +1970,10 @@ impl ChannelState {
         // Do not overwrite that reset with a cursor sampled before the grant.
         if page.revision == self.private_sessions.revision {
             self.private_sessions.cursors.insert(peer, page.cursor);
+            if let Err(error) = self.save_private_pulls(store) {
+                self.private_save_failed(&error);
+                return Err(error);
+            }
         }
         if page.more {
             self.private_sessions.attempted.remove(&peer);

@@ -3292,7 +3292,7 @@ pub enum Frame {
     Rooms {
         /// `(channel_id, local name, open, over)` per room; `over` says, in plain words, that
         /// this identity left the room or it ended (V030-08), and is empty while it goes on.
-        rooms: Vec<(Digest32, String, bool, String)>,
+        rooms: Vec<(Digest32, String, bool, String, bool)>,
     },
     /// The services a [`Request::Services`] asked for: the room's local name, and
     /// `(service tag, local address)` per service, as the node offers them.
@@ -3650,17 +3650,13 @@ impl Frame {
             }
             Frame::Rooms { rooms } => {
                 e.array(2).uint(T_ROOMS).array(rooms.len());
-                for (id, name, open, over) in rooms {
-                    // `over` only when there is one: additive, so an older client still decodes.
-                    if over.is_empty() {
-                        e.array(3).bytes(id).text(name).uint(u64::from(*open));
-                    } else {
-                        e.array(4)
-                            .bytes(id)
-                            .text(name)
-                            .uint(u64::from(*open))
-                            .text(over);
-                    }
+                for (id, name, open, over, preparing) in rooms {
+                    e.array(5)
+                        .bytes(id)
+                        .text(name)
+                        .uint(u64::from(*open))
+                        .text(over)
+                        .uint(u64::from(*preparing));
                 }
             }
             Frame::Presented { entries } => {
@@ -4708,7 +4704,7 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             let mut rooms = Vec::with_capacity(n.min(1024));
             for _ in 0..n {
                 let arity = d.array().map_err(|_| Error::MalformedIpc("ipc room"))?;
-                if !(3..=4).contains(&arity) {
+                if !(3..=5).contains(&arity) {
                     return Err(Error::MalformedIpc("ipc room arity"));
                 }
                 let id = digest(d)?;
@@ -4717,14 +4713,21 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                     .map_err(|_| Error::MalformedIpc("ipc room name"))?
                     .to_owned();
                 let open = d.uint().map_err(|_| Error::MalformedIpc("ipc room open"))? != 0;
-                let over = if arity == 4 {
+                let over = if arity >= 4 {
                     d.text()
                         .map_err(|_| Error::MalformedIpc("ipc room over"))?
                         .to_owned()
                 } else {
                     String::new()
                 };
-                rooms.push((id, name, open, over));
+                let preparing = arity == 5
+                    && d.uint()
+                        .map_err(|_| Error::MalformedIpc("ipc room preparing"))?
+                        != 0;
+                if open && preparing {
+                    return Err(Error::MalformedIpc("ipc room availability"));
+                }
+                rooms.push((id, name, open, over, preparing));
             }
             return Ok(Frame::Rooms { rooms });
         }
@@ -7279,6 +7282,88 @@ async fn serve_post(
 /// connection: a client that asked for a room it does not have should be told so
 /// and be able to ask something else.
 async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
+    // A preparing room is not empty, closed, or waiting for another passphrase. Refuse
+    // its operation promptly without blocking node controls or creating a second opener.
+    let room = match &request {
+        Request::WorkBoard { channel_id, .. }
+        | Request::Footers { channel_id, .. }
+        | Request::ArrivalHead { channel_id, .. }
+        | Request::ArrivalPage { channel_id, .. }
+        | Request::OperationPage { channel_id, .. }
+        | Request::GovernancePage { channel_id, .. }
+        | Request::MemberHellos { channel_id, .. }
+        | Request::RoomViewPage { channel_id, .. }
+        | Request::RoomViewFind { channel_id, .. }
+        | Request::RoomViewRevision { channel_id, .. }
+        | Request::RoomPage { channel_id, .. }
+        | Request::ThreadPage { channel_id, .. }
+        | Request::MarkRead { channel_id, .. }
+        | Request::MarkReadAt { channel_id, .. }
+        | Request::UnreadSummary { channel_id, .. }
+        | Request::Post { channel_id, .. }
+        | Request::PostAt { channel_id, .. }
+        | Request::Read { channel_id, .. }
+        | Request::Order { channel_id, .. }
+        | Request::Roster { channel_id, .. }
+        | Request::KeyWaits { channel_id, .. }
+        | Request::MemberConsents { channel_id, .. }
+        | Request::AddService { channel_id, .. }
+        | Request::Services { channel_id, .. }
+        | Request::Share { channel_id, .. }
+        | Request::ShareStop { channel_id, .. }
+        | Request::ShareList { channel_id, .. }
+        | Request::AppendSession { channel_id, .. }
+        | Request::SessionShare { channel_id, .. }
+        | Request::SessionEntries { channel_id, .. }
+        | Request::SessionPage { channel_id, .. }
+        | Request::Sessions { channel_id, .. }
+        | Request::SessionsPage { channel_id, .. }
+        | Request::SessionsOpenPage { channel_id, .. }
+        | Request::SessionJoin { channel_id, .. }
+        | Request::SessionsWaiting { channel_id, .. }
+        | Request::SessionsPending { channel_id, .. }
+        | Request::SessionLookup { channel_id, .. }
+        | Request::SessionLifecycle { channel_id, .. }
+        | Request::Pull { channel_id, .. }
+        | Request::PullStates { channel_id, .. }
+        | Request::PullStatesFor { channel_id, .. }
+        | Request::RemoveService { channel_id, .. }
+        | Request::Forward { channel_id, .. }
+        | Request::CheckRoomPassphrase { channel_id, .. }
+        | Request::Invite { channel_id, .. }
+        | Request::OpenRoom { channel_id, .. }
+        | Request::Leave { channel_id, .. }
+        | Request::SetRetention { channel_id, .. }
+        | Request::SetStepRetention { channel_id, .. }
+        | Request::RoomAnchors { channel_id, .. }
+        | Request::ChangeRoomAnchors { channel_id, .. }
+        | Request::RenameRoom { channel_id, .. }
+        | Request::End { channel_id, .. }
+        | Request::SetAdmin { channel_id, .. }
+        | Request::Admins { channel_id, .. }
+        | Request::IdleEnd { channel_id, .. }
+        | Request::Structured { channel_id, .. }
+        | Request::Tagged { channel_id, .. }
+        | Request::Thread { channel_id, .. }
+        | Request::ThreadSummary { channel_id, .. }
+        | Request::RoomDisplayRevision { channel_id, .. }
+        | Request::Count { channel_id, .. }
+        | Request::Unread { channel_id, .. }
+        | Request::Find { channel_id, .. }
+        | Request::Agree { channel_id, .. } => Some(channel_id),
+        _ => None,
+    };
+    if room.is_some_and(|id| {
+        handle
+            .view()
+            .channels
+            .iter()
+            .any(|c| c.channel_id == *id && c.preparing)
+    }) {
+        return Frame::Error {
+            reason: crate::node::api::Fault::RoomPreparing.explain().into(),
+        };
+    }
     let frame = match request {
         Request::OperationPage {
             channel_id,
@@ -8749,11 +8834,12 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                         c.name.clone().unwrap_or_default(),
                         c.open,
                         c.over.clone().unwrap_or_default(),
+                        c.preparing,
                     )
                 })
                 .collect();
             Frame::Rooms {
-                rooms: page(rooms, after, |(id, name, _, over)| {
+                rooms: page(rooms, after, |(id, name, _, over, _)| {
                     (*id, name.len() + over.len())
                 }),
             }

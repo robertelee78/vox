@@ -2644,15 +2644,15 @@ async fn drain(
     // node may hold several repositories' rooms; none of those selects news for another session.
     // Even an explicit hook --room cannot move an existing session: `vox agent room` does that.
     if let Some(arg) = room_arg {
-        let ids: Vec<Digest32> = rooms.iter().map(|(id, _, _, _)| *id).collect();
+        let ids: Vec<Digest32> = rooms.iter().map(|(id, _, _, _, _)| *id).collect();
         let target = resolve_prefix(arg, &ids)?;
         vox_core::node::sessions::check_working_room(paths, &input.session_id, &target)
             .map_err(AppError::Usage)?;
     }
-    let rooms: Vec<(Digest32, String, bool, String)> = match working_room {
+    let rooms: Vec<(Digest32, String, bool, String, bool)> = match working_room {
         Some(room) => rooms
             .into_iter()
-            .filter(|(id, _, _, _)| b32_encode(id) == room)
+            .filter(|(id, _, _, _, _)| b32_encode(id) == room)
             .collect(),
         None => Vec::new(),
     };
@@ -2660,7 +2660,7 @@ async fn drain(
     // A pause holds the complete room feed, including joining/coordination/file notices.
     // No hook cursor advances while it is held. The person's prompt itself still reaches
     // the harness: this only supplies (or withholds) Vox's extra context.
-    let selected_room = rooms.first().map(|r| r.0);
+    let selected_room = rooms.first().filter(|r| r.2 && !r.4).map(|r| r.0);
     if let (Some(room), Some(me)) = (selected_room, me) {
         if pause_holds(paths, room, me).await? {
             if input.native_notice.is_some() {
@@ -2674,7 +2674,15 @@ async fn drain(
     // **One room that cannot be read does not silence the others** (V210-163): it is named,
     // in one line, and its cursor stays where it was.
     let mut unread: Vec<String> = Vec::new();
-    for (channel_id, name, open, _) in rooms {
+    for (channel_id, name, open, _, preparing) in rooms {
+        // Preparation does not mean no news, and never advances this session's cursor.
+        if preparing {
+            unread.push(format!(
+                "Vox room {} is preparing saved history; news will resume when it is ready.\n",
+                room_heading(&b32_encode(&channel_id), &name)
+            ));
+            continue;
+        }
         // A closed room cannot be read; it is heard again once it is open.
         if !open {
             continue;

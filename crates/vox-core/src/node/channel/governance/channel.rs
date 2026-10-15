@@ -10,7 +10,7 @@ use crate::node::store::Store;
 use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, Debug)]
-pub(in crate::node::channel) struct Presence {
+pub(crate) struct Presence {
     pub last: (u64, bool),
     pub back: Option<(u64, u64)>,
 }
@@ -506,6 +506,10 @@ impl ChannelState {
                         {
                             held.back = Some((entry.skeleton.seq, entry.skeleton.claimed_ms));
                         }
+                        let state = *held;
+                        let mut index = self.entries.write(batch, &self.sek, &self.channel_id)?;
+                        index.note_presence(entry.skeleton.author_id, state)?;
+                        index.seal()?;
                     }
                 }
             }

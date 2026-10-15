@@ -178,6 +178,18 @@ pub enum Rejected {
     PreCheckpoint,
 }
 
+/// Compact state for one already authenticated, durably published feed prefix.
+/// Never serialize a staging DAG head: it can be ahead of the committed root switch.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PublishedFeed {
+    pub seq: u64,
+    pub hash: Digest32,
+    pub first_claimed_ms: u64,
+    pub ended: bool,
+    pub checkpoint: Option<(u64, Digest32)>,
+    pub swept_to: u64,
+}
+
 /// The replicated log store: per-author feeds, a hash index, and frozen authors.
 /// One [`Dag`] per channel.
 #[derive(Debug, Default)]
@@ -234,6 +246,64 @@ impl Dag {
     #[must_use]
     pub fn for_room(_origin_ms: u64) -> Self {
         Self::default()
+    }
+
+    /// Bootstrap only after the complete historical acceptance pass has discarded all
+    /// unverified tails. Live publication derives each changed author from its own witness.
+    pub(crate) fn published_feeds(&self) -> Result<BTreeMap<Digest32, PublishedFeed>> {
+        if !self.unverified_from.is_empty() {
+            return Err(Error::MalformedAtRest("unverified feed in restart state"));
+        }
+        Ok(self
+            .feeds
+            .iter()
+            .filter(|(_, feed)| !feed.is_empty())
+            .map(|(author, feed)| {
+                (
+                    *author,
+                    PublishedFeed {
+                        seq: feed.max_seq(),
+                        hash: feed.head_hash(),
+                        first_claimed_ms: feed.first_claimed_ms().unwrap_or(0),
+                        ended: feed.ended(),
+                        checkpoint: self.checkpoints.get(author).copied(),
+                        swept_to: self.swept_to.get(author).copied().unwrap_or(0),
+                    },
+                )
+            })
+            .collect())
+    }
+
+    /// Restore sealed accepted metadata. Head/source authentication is checked by the room
+    /// loader; incoming entries still pass the unchanged acceptance predicate.
+    pub(crate) fn restore_published(feeds: &BTreeMap<Digest32, PublishedFeed>) -> Result<Self> {
+        let mut dag = Self::new();
+        for (author, state) in feeds {
+            dag.feeds.insert(
+                *author,
+                Feed::restore_published(
+                    *author,
+                    state.seq,
+                    state.hash,
+                    state.first_claimed_ms,
+                    state.ended,
+                )?,
+            );
+            if let Some(checkpoint) = state.checkpoint {
+                if checkpoint.0 == 0 || checkpoint.0 >= state.seq || state.swept_to > checkpoint.0 {
+                    return Err(Error::MalformedAtRest("published checkpoint bound"));
+                }
+                dag.checkpoints.insert(*author, checkpoint);
+            } else if state.swept_to != 0 {
+                return Err(Error::MalformedAtRest("sweep without checkpoint"));
+            }
+            dag.swept_to.insert(*author, state.swept_to);
+        }
+        Ok(dag)
+    }
+
+    pub(crate) fn swept_positions(&self) -> impl Iterator<Item = (&Digest32, &u64)> {
+        self.swept_to.iter()
     }
 
     /// The number of entries stored across all authors.

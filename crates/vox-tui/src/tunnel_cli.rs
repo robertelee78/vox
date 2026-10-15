@@ -1789,6 +1789,11 @@ pub(crate) async fn open_named_room(
         [one] => *one,
         _ => resolve_prefix(prefix, &rooms.iter().map(|r| r.0).collect::<Vec<_>>())?,
     };
+    if rooms.iter().any(|r| r.0 == channel_id && r.4) {
+        return Err(AppError::Usage(
+            vox_core::node::api::Fault::RoomPreparing.explain().into(),
+        ));
+    }
     let open = rooms.iter().any(|r| r.0 == channel_id && r.2);
     if open {
         return Ok(channel_id);

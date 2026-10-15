@@ -41,6 +41,8 @@ pub struct ChannelSummary {
     pub name: Option<String>,
     /// Whether the channel is open (SEK unlocked) in this session.
     pub open: bool,
+    /// The room is recovering locally; its history is not yet available.
+    pub preparing: bool,
     /// Number of accepted log entries (0 while closed).
     pub entries: u64,
     /// Whether the room is over for this node, in plain words (V030-08): this identity left it,
@@ -1247,6 +1249,8 @@ pub enum Fault {
     UnknownChannel,
     /// The channel is not open.
     ChannelNotOpen,
+    /// Identity is Ready; this room is still preparing its saved state.
+    RoomPreparing,
     /// An input exceeded its bound (name or text length).
     TooLong,
     /// A trust add or remove needs the identity passphrase: it was not entered for a keyring
@@ -1481,6 +1485,9 @@ impl Fault {
             }
             Fault::UnknownChannel => {
                 "no such room on this node\n       `vox room list` shows the rooms it holds"
+            }
+            Fault::RoomPreparing => {
+                "that room is preparing its saved history; the node is Ready, and the room will become available when preparation finishes — no passphrase is needed"
             }
             Fault::ChannelNotOpen => {
                 "that room is not open on this node\n       open it with its passphrase: a line holding the room's id and its passphrase to `vox daemon`, or in `vox tui`"
@@ -1749,6 +1756,7 @@ fault_names!(
     PassphraseEmpty,
     UnknownChannel,
     ChannelNotOpen,
+    RoomPreparing,
     TooLong,
     KeyringFull,
     ServiceOffersFull,

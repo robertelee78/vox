@@ -405,7 +405,13 @@ fn render_sidebar(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &UiState) {
             format!(" ({})", levels.join(" · "))
         };
         // In words, never a padlock (ADR-028 L-8).
-        let closed = if c.open { "" } else { " (closed)" };
+        let closed = if c.preparing {
+            " (preparing history)"
+        } else if c.open {
+            ""
+        } else {
+            " (closed)"
+        };
         let attention = if c.waiting > 0 || (c.to_you > 0 && c.urgent > 0) {
             " @!"
         } else if c.to_you > 0 {

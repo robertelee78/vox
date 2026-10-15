@@ -1179,6 +1179,10 @@ impl UiState {
         let Some(summary) = vm.channels.get(self.selected_channel) else {
             return Action::Redraw;
         };
+        if summary.preparing {
+            // The list says why this room is pending; its saved key needs no new prompt.
+            return Action::Redraw;
+        }
         if summary.open {
             self.screen = Screen::Channel;
             self.focus = Focus::Timeline;

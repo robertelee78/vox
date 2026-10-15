@@ -57,9 +57,10 @@ pub(super) enum Tree {
     FloorContinuity,
     FloorFirst,
     OpenSessions,
+    PrivateUnread,
 }
 
-const TREES: usize = 36;
+const TREES: usize = 37;
 
 impl Tree {
     fn index(self) -> usize {
@@ -100,6 +101,7 @@ impl Tree {
             Self::FloorContinuity => 33,
             Self::FloorFirst => 34,
             Self::OpenSessions => 35,
+            Self::PrivateUnread => 36,
         }
     }
 }
@@ -219,7 +221,7 @@ impl Header {
         let stored_trees = d.array()?;
         // These are append-only derived roots within the current development format. Keep
         // every original locator; startup streams the absent private/control facts.
-        if next == 0 || !matches!(stored_trees, 26 | 29 | 30 | 35 | TREES) {
+        if next == 0 || !matches!(stored_trees, 26 | 29 | 30 | 35 | 36 | TREES) {
             return Err(invalid("Session index header roots"));
         }
         let mut roots = [0; TREES];
@@ -315,7 +317,7 @@ impl Header {
         };
         let activity = ActivityState::read(&mut d, next)?;
         d.finish()?;
-        if stored_trees < TREES {
+        if stored_trees < 36 {
             // Preserve all original private locators and bodies. The new derived open-only
             // selector is unpublished until the existing bounded metadata fold fills it.
             ready = false;
@@ -769,6 +771,7 @@ impl<'a, 's> Write<'a, 's> {
         const ALL: [Tree; TREES] = [
             Tree::PrivateHash,
             Tree::PrivateArrival,
+            Tree::PrivateUnread,
             Tree::Candidates,
             Tree::Groups,
             Tree::Openings,
@@ -825,6 +828,7 @@ impl<'a, 's> Write<'a, 's> {
                         | Tree::LogicalRecords
                         | Tree::PrivateHash
                         | Tree::PrivateArrival
+                        | Tree::PrivateUnread
                         | Tree::Files
                         | Tree::OpeningHash
                         | Tree::Counts

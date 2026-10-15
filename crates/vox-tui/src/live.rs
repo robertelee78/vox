@@ -3044,6 +3044,7 @@ impl DaemonCore {
             .iter()
             .map(|c| ChannelSummary {
                 open: c.open,
+                preparing: c.preparing,
                 channel_id: c.channel_id,
                 name: if let Some(cause) = self.room_save_errors.get(&c.channel_id) {
                     cause.clone()
@@ -3055,6 +3056,7 @@ impl DaemonCore {
                             names_here(),
                         ),
                         (None, true) => vox_core::node::resolver::room_shown(None, &c.channel_id),
+                        (None, false) if c.preparing => short_id(&c.channel_id),
                         (None, false) => format!("(closed {})", short_id(&c.channel_id)),
                     }
                 },

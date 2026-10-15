@@ -39,6 +39,7 @@ final class NodeModel: ObservableObject {
         let id: String
         let name: String
         let open: Bool
+        let preparing: Bool
         /// Unread messages addressed to this node; of them, urgent.
         var addressed = 0
         var urgent = 0
@@ -66,6 +67,7 @@ final class NodeModel: ObservableObject {
 
         /// The room's unread in words, as its row says it.
         var words: String {
+            if preparing { return "preparing history" }
             var parts: [String] = []
             if addressed > 0 { parts.append("\(addressed) to you") }
             if waiting > 0 { parts.append("waiting \(waiting)") }
@@ -1082,7 +1084,11 @@ final class NodeModel: ObservableObject {
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 3_000_000_000)
                 guard let self else { return }
-                await self.readFacts()
+                if self.rooms.contains(where: { $0.preparing }) {
+                    _ = await self.refresh()
+                } else {
+                    await self.readFacts()
+                }
                 guard self.daemonReachable else { continue }
                 await self.readWaiting()
                 if self.showingSession {
@@ -1176,7 +1182,8 @@ final class NodeModel: ObservableObject {
     }
 
     private func readNewOnScreen() async {
-        guard case let .room(id) = selection, ended == nil, !showingSession, !roomReloadNeeded else { return }
+        guard case let .room(id) = selection, ended == nil, !showingSession, !roomReloadNeeded,
+              rooms.first(where: { $0.id == id })?.preparing != true else { return }
         let generation = roomReadGeneration, epoch = nodeObservationEpoch
         let view = selectedRoomView, displayed = showing, viewGeneration = roomViewGeneration
         let revision = roomMessageRevision, follows = timelineFollowingNewest
@@ -1464,8 +1471,11 @@ final class NodeModel: ObservableObject {
         do {
             let fresh = try await client.rooms()
             guard epoch == nodeObservationEpoch, !Task.isCancelled else { return false }
+            let preparedOnScreen = fresh.first { r in
+                selection == .room(r.id) && r.open && rooms.first(where: { $0.id == r.id })?.preparing == true
+            }?.id
             let now = fresh.map { r in
-                var room = Room(id: r.id, name: name(of: r), open: r.open)
+                var room = Room(id: r.id, name: name(of: r), open: r.open, preparing: r.preparing)
                 if let held = rooms.first(where: { $0.id == r.id }) {
                     room.addressed = held.addressed
                     room.urgent = held.urgent
@@ -1480,7 +1490,7 @@ final class NodeModel: ObservableObject {
                 return room
             }
             if now != rooms { rooms = now }
-            for room in now {
+            for room in now where room.open {
                 await readLast(room.id)
                 guard epoch == nodeObservationEpoch, !Task.isCancelled else { return false }
             }
@@ -1491,6 +1501,7 @@ final class NodeModel: ObservableObject {
             let back = await readTrustsBack()
             guard epoch == nodeObservationEpoch, !Task.isCancelled else { return false }
             if back != trustsBack { trustsBack = back }
+            if let id = preparedOnScreen, selection == .room(id) { await show(.room(id)) }
             return true
         } catch {
             guard epoch == nodeObservationEpoch, !Task.isCancelled else { return false }
@@ -1637,6 +1648,7 @@ final class NodeModel: ObservableObject {
             decisionEvents = await decisions()
         }
         guard case let .room(id) = selection, ended == nil else { return }
+        guard rooms.first(where: { $0.id == id })?.preparing != true else { return }
         watchReads(id)
         let view = selectedRoomView, viewGeneration = roomViewGeneration
         let generation = roomReadGeneration

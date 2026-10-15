@@ -1378,7 +1378,7 @@ pub(crate) async fn open_rooms_by_line(node: &vox_core::node::actor::NodeHandle,
         .view()
         .channels
         .iter()
-        .filter(|c| !c.open)
+        .filter(|c| !c.open && !c.preparing)
         .map(|c| c.channel_id)
         .collect();
     let mut opened_by_line = false;

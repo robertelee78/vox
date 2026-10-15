@@ -33,9 +33,12 @@ type Key = [u8; 64];
 
 mod dag_facts;
 mod missing_facts;
+mod packages;
 mod receipt_facts;
 mod render_facts;
+mod restart;
 mod retention_facts;
+pub(crate) use restart::RestartState;
 pub(crate) mod session_tree;
 pub use dag_facts::OrderView;
 pub(crate) use render_facts::{Filter, RenderFact, RenderView};
@@ -92,11 +95,14 @@ pub(crate) struct Roots {
     read_pairs: u64,
     missing_positions: u64,
     read_pending: u64,
+    key_packages: u64,
+    key_latest: u64,
+    key_tip: u64,
 }
 
 impl Roots {
     fn write(self, e: &mut Encoder) {
-        e.array(12)
+        e.array(15)
             .uint(self.sequence)
             .uint(self.hash)
             .uint(self.clock)
@@ -108,10 +114,14 @@ impl Roots {
         e.uint(self.read_receipts)
             .uint(self.read_pairs)
             .uint(self.missing_positions)
-            .uint(self.read_pending);
+            .uint(self.read_pending)
+            .uint(self.key_packages)
+            .uint(self.key_latest)
+            .uint(self.key_tip);
     }
     fn read(d: &mut Decoder<'_>) -> Result<Self> {
-        if d.array()? != 12 {
+        let arity = d.array()?;
+        if !matches!(arity, 12 | 15) {
             return Err(invalid("entry roots arity"));
         }
         Ok(Self {
@@ -127,6 +137,9 @@ impl Roots {
             read_pairs: d.uint()?,
             missing_positions: d.uint()?,
             read_pending: d.uint()?,
+            key_packages: if arity >= 15 { d.uint()? } else { 0 },
+            key_latest: if arity >= 15 { d.uint()? } else { 0 },
+            key_tip: if arity >= 15 { d.uint()? } else { 0 },
         })
     }
 }
@@ -160,6 +173,7 @@ struct Promotion {
     retired: u64,
     bodyless_prefix: bool,
     reordered: u64,
+    accepted: Option<crate::log::dag::PublishedFeed>,
 }
 
 #[derive(Clone, Debug)]
@@ -182,6 +196,10 @@ struct Directory {
     retention_stage: u8,
     retention_cursor: Option<u64>,
     read_sent_ms: u64,
+    restart: Option<RestartState>,
+    next_package: u64,
+    packages_ready: bool,
+    packages_cursor: Option<u64>,
 }
 
 impl Default for Directory {
@@ -205,6 +223,10 @@ impl Default for Directory {
             retention_stage: 0,
             retention_cursor: None,
             read_sent_ms: 0,
+            restart: None,
+            next_package: 1,
+            packages_ready: false,
+            packages_cursor: None,
         }
     }
 }
@@ -221,7 +243,7 @@ impl Directory {
     }
     fn bytes(&self) -> Zeroizing<Vec<u8>> {
         let mut e = Encoder::new();
-        e.array(19).uint(8);
+        e.array(23).uint(9);
         self.active.write(&mut e);
         self.provisional.write(&mut e);
         e.uint(self.next_page)
@@ -238,7 +260,7 @@ impl Directory {
                 e.array(0);
             }
             Some(p) => {
-                e.array(16)
+                e.array(17)
                     .bytes(&p.author)
                     .uint(p.from)
                     .uint(p.through)
@@ -255,6 +277,15 @@ impl Directory {
                     .uint(p.retired)
                     .uint(u64::from(p.bodyless_prefix))
                     .uint(p.reordered);
+                match &p.accepted {
+                    Some(state) => {
+                        e.array(1);
+                        restart::write_feed(state, &mut e);
+                    }
+                    None => {
+                        e.array(0);
+                    }
+                }
             }
         }
         e.uint(u64::from(self.graph_ready));
@@ -288,11 +319,30 @@ impl Directory {
             }
         }
         e.uint(self.read_sent_ms);
+        match &self.restart {
+            Some(state) => {
+                e.array(1);
+                state.write(&mut e);
+            }
+            None => {
+                e.array(0);
+            }
+        }
+        e.uint(self.next_package)
+            .uint(u64::from(self.packages_ready));
+        match self.packages_cursor {
+            Some(cursor) => {
+                e.array(1).uint(cursor);
+            }
+            None => {
+                e.array(0);
+            }
+        }
         Zeroizing::new(e.finish())
     }
     fn parse(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() > PAGE_BYTES {
-            return Err(invalid("entry directory exceeds page bound"));
+        if bytes.len() > 1024 * 1024 {
+            return Err(invalid("entry directory exceeds bounded author state"));
         }
         let mut d = Decoder::new(bytes);
         let arity = d.array()?;
@@ -300,7 +350,7 @@ impl Directory {
         // This unpublished format includes durable receipts, pending local read marks,
         // canonical operation members and retained conflict witnesses. Older partial roots
         // cannot be treated as empty without silently losing accepted work.
-        if (arity, version) != (19, 8) {
+        if !matches!((arity, version), (19, 8) | (23, 9)) {
             return Err(invalid("entry directory format"));
         }
         let active = Roots::read(&mut d)?;
@@ -318,7 +368,7 @@ impl Directory {
         let promotion_arity = d.array()?;
         let promotion = match promotion_arity {
             0 => None,
-            14 | 16 => Some(Promotion {
+            14 | 16 | 17 => Some(Promotion {
                 author: d
                     .bytes()?
                     .try_into()
@@ -342,12 +392,21 @@ impl Directory {
                 first_page: d.uint()?,
                 after_page: d.uint()?,
                 retired: d.uint()?,
-                bodyless_prefix: if promotion_arity == 16 {
+                bodyless_prefix: if promotion_arity >= 16 {
                     flag(&mut d)?
                 } else {
                     true
                 },
-                reordered: if promotion_arity == 16 { d.uint()? } else { 0 },
+                reordered: if promotion_arity >= 16 { d.uint()? } else { 0 },
+                accepted: if promotion_arity >= 17 {
+                    match d.array()? {
+                        0 => None,
+                        1 => Some(restart::read_feed(&mut d)?),
+                        _ => return Err(invalid("promotion accepted state")),
+                    }
+                } else {
+                    None
+                },
             }),
             _ => return Err(invalid("promotion arity")),
         };
@@ -405,8 +464,31 @@ impl Directory {
             None
         };
         let read_sent_ms = d.uint()?;
+        let restart = if version >= 9 {
+            match d.array()? {
+                0 => None,
+                1 => Some(RestartState::read(&mut d)?),
+                _ => return Err(invalid("restart state option")),
+            }
+        } else {
+            None
+        };
+        let next_package = if version >= 9 { d.uint()? } else { 1 };
+        let packages_ready = version >= 9 && flag(&mut d)?;
+        let packages_cursor = if version >= 9 {
+            match d.array()? {
+                0 => None,
+                1 => Some(d.uint()?),
+                _ => return Err(invalid("package catalog cursor")),
+            }
+        } else {
+            None
+        };
         d.finish()?;
-        if retention_stage > 2
+        if next_package == 0
+            || active.key_tip >= next_package
+            || (packages_ready && packages_cursor.is_some())
+            || retention_stage > 2
             || (retention_stage == 2 && retention_cursor.is_some())
             || next_page == 0
             || next_provisional == 0
@@ -421,12 +503,16 @@ impl Directory {
                 active.read_pairs,
                 active.missing_positions,
                 active.read_pending,
+                active.key_packages,
+                active.key_latest,
                 provisional.sequence,
                 provisional.hash,
                 provisional.read_receipts,
                 provisional.read_pairs,
                 provisional.missing_positions,
                 provisional.read_pending,
+                provisional.key_packages,
+                provisional.key_latest,
             ]
             .iter()
             .any(|id| *id >= next_page)
@@ -459,6 +545,9 @@ impl Directory {
                 || p.work.read_pairs >= next_page
                 || p.work.missing_positions >= next_page
                 || p.work.read_pending >= next_page
+                || p.work.key_packages >= next_page
+                || p.work.key_latest >= next_page
+                || p.work.key_tip >= next_package
                 || !p.work.rendered.valid_for(next_page)
                 || !p.work.retained.valid_for(next_page)
                 || p.retired >= next_page
@@ -485,6 +574,10 @@ impl Directory {
             retention_stage,
             retention_cursor,
             read_sent_ms,
+            restart,
+            next_package,
+            packages_ready,
+            packages_cursor,
         })
     }
 }
@@ -891,6 +984,9 @@ impl EntryIndex {
 }
 
 impl Read<'_> {
+    pub(crate) fn restart_state(&self) -> Option<&RestartState> {
+        self.directory.restart.as_ref()
+    }
     pub(crate) fn transaction(&self) -> Transaction<'_, '_> {
         Transaction::Snapshot(&self.snapshot)
     }
@@ -1279,6 +1375,7 @@ impl<'s> Write<'_, 's> {
         self.batch
             .put_segment(self.channel, SegmentKind::LogDb, log, &sealed)?;
         self.directory.active = self.index(self.directory.active, entry, log)?;
+        self.directory.active = self.index_package(self.directory.active, entry, log)?;
         // A refill settles recovery atomically with its durable wire. Rewriting a body as
         // a skeleton for local retention deliberately does not create recovery work.
         if entry.payload.is_some() {
@@ -1358,6 +1455,79 @@ const PROMOTION_ENTRIES: usize = 64;
 const PROMOTION_BYTES: usize = 1024 * 1024;
 
 impl Write<'_, '_> {
+    pub(crate) fn initialize_restart(&mut self, epoch: u64) -> Result<()> {
+        if self.directory.active.sequence != 0 {
+            return Err(invalid("nonempty restart initialization"));
+        }
+        self.bootstrap_restart(RestartState::empty(*self.channel, epoch))?;
+        self.directory.packages_ready = true;
+        Ok(())
+    }
+    pub(crate) fn bootstrap_restart(&mut self, state: RestartState) -> Result<()> {
+        if self.directory.phase != Phase::Idle
+            || state.room != *self.channel
+            || self.directory.restart.is_some()
+        {
+            return Err(invalid("restart bootstrap binding"));
+        }
+        self.directory.restart = Some(state);
+        Ok(())
+    }
+    pub(crate) fn note_presence(
+        &mut self,
+        author: Digest32,
+        state: super::governance::Presence,
+    ) -> Result<()> {
+        let restart = self
+            .directory
+            .restart
+            .as_mut()
+            .ok_or(invalid("presence without restart state"))?;
+        if !restart
+            .feeds
+            .get(&author)
+            .is_some_and(|f| state.last.0 <= f.seq)
+        {
+            return Err(invalid("presence beyond published feed"));
+        }
+        restart.presence.insert(author, state);
+        Ok(())
+    }
+    pub(crate) fn note_swept(&mut self, dag: &crate::log::dag::Dag) -> Result<()> {
+        let restart = self
+            .directory
+            .restart
+            .as_mut()
+            .ok_or(invalid("sweep without restart state"))?;
+        for (author, seq) in dag.swept_positions() {
+            if let Some(feed) = restart.feeds.get_mut(author) {
+                if *seq > feed.checkpoint.map_or(0, |cp| cp.0) {
+                    return Err(invalid("sweep beyond published checkpoint"));
+                }
+                feed.swept_to = *seq;
+            }
+        }
+        Ok(())
+    }
+    pub(crate) fn clear_retained_step_marker(&mut self) -> Result<()> {
+        self.directory
+            .restart
+            .as_mut()
+            .ok_or(invalid("legacy completion without restart state"))?
+            .retained_step_body = None;
+        Ok(())
+    }
+    pub(crate) fn note_projection(&mut self, bytes: Vec<u8>) -> Result<()> {
+        if bytes.len() > 256 {
+            return Err(invalid("projection state bound"));
+        }
+        self.directory
+            .restart
+            .as_mut()
+            .ok_or(invalid("projection without restart state"))?
+            .projection = Some(bytes);
+        Ok(())
+    }
     /// The caller already checked the complete feed linkage and the successor's signature.
     /// The signed witness stays in the provisional store until publication and cleanup finish.
     pub(crate) fn begin_promotion(&mut self, publication: Publication<'_>) -> Result<()> {
@@ -1420,6 +1590,23 @@ impl Write<'_, '_> {
         first_log
             .checked_add(count)
             .ok_or(invalid("promotion log allocator exhausted"))?;
+        if self.directory.restart.is_none() && self.directory.active.sequence == 0 && from == 1 {
+            self.directory.packages_ready = true;
+            self.directory.restart =
+                Some(RestartState::empty(*self.channel, witness.skeleton.epoch));
+        }
+        let restart = self
+            .directory
+            .restart
+            .as_ref()
+            .ok_or(invalid("accepted restart state was not prepared"))?;
+        if restart.room != *self.channel || restart.epoch != witness.skeleton.epoch {
+            return Err(invalid("restart room binding"));
+        }
+        let accepted = restart.feeds.get(&author).cloned().unwrap_or_default();
+        if accepted.seq.checked_add(1) != Some(from) || accepted.hash != base_hash {
+            return Err(invalid("restart prefix differs from promotion"));
+        }
         self.directory.promotion = Some(Promotion {
             author,
             from,
@@ -1437,6 +1624,7 @@ impl Write<'_, '_> {
             retired: 0,
             bodyless_prefix,
             reordered: 0,
+            accepted: Some(accepted),
         });
         self.directory.phase = Phase::Building;
         Ok(())
@@ -1505,6 +1693,12 @@ impl Write<'_, '_> {
             {
                 return Err(invalid("promotion predecessor or witness differs"));
             }
+            restart::advance(
+                p.accepted
+                    .as_mut()
+                    .ok_or(invalid("promotion restart state missing"))?,
+                &entry,
+            )?;
             let log = p
                 .first_log
                 .checked_add(p.cursor - p.from)
@@ -1532,6 +1726,7 @@ impl Write<'_, '_> {
                     .put_segment(self.channel, SegmentKind::Index, log, &seen)?;
             }
             p.work = self.index(p.work, &entry, log)?;
+            p.work = self.index_package(p.work, &entry, log)?;
             if entry.payload.is_none() {
                 // The membership stays unpublished with this authenticated suffix until the
                 // witness's effects and root switch commit together.
@@ -1573,6 +1768,22 @@ impl Write<'_, '_> {
             .ok_or(invalid("promotion missing"))?;
         if p.cursor <= p.through || !self.directory.work.is_empty() {
             return Err(invalid("promotion suffix or DAG facts incomplete"));
+        }
+        let accepted = p
+            .accepted
+            .clone()
+            .ok_or(invalid("promotion accepted state missing"))?;
+        if accepted.seq != p.through || accepted.hash != p.witness_hash {
+            return Err(invalid("promotion accepted witness differs"));
+        }
+        let restart = self
+            .directory
+            .restart
+            .as_mut()
+            .ok_or(invalid("restart state missing at publication"))?;
+        restart.feeds.insert(p.author, accepted);
+        if restart.feeds.len() > super::AUTHORS_HARD_LIMIT {
+            return Err(invalid("restart author bound"));
         }
         let result = (p.through - p.from + 1, p.after_log);
         let from = p.from;
@@ -1724,34 +1935,45 @@ impl EntryIndex {
                     break;
                 }
             }
-            let mut batch = Some(store.batch()?);
-            let mut count = 0usize;
-            store.visit_segments(channel, SegmentKind::LogDb, |id, sealed| {
-                let wire = open_segment(sek, SegmentKind::LogDb, id, &sealed)?;
-                let entry = Entry::from_wire(&wire)?;
-                if entry.skeleton.channel_id != *channel {
-                    return Err(invalid("saved entry belongs to another room"));
+            // Read the immutable log through each write transaction. A read snapshot spanning
+            // the whole rebuild pins every retired redb page until the last entry, preventing
+            // reuse across these commits. Only the stable LogDb id crosses a batch boundary;
+            // index writes cannot move or replace any of the log rows being visited.
+            let mut after = None;
+            loop {
+                let mut batch = store.batch()?;
+                let mut writer = self.write(&mut batch, sek, channel)?;
+                let mut bytes = 0usize;
+                let mut complete = false;
+                for _ in 0..PROMOTION_ENTRIES {
+                    let Some((id, sealed)) =
+                        writer
+                            .batch
+                            .segment_after(channel, SegmentKind::LogDb, after)?
+                    else {
+                        complete = true;
+                        break;
+                    };
+                    let wire = open_segment(sek, SegmentKind::LogDb, id, &sealed)?;
+                    if bytes != 0 && bytes.saturating_add(wire.len()) > PROMOTION_BYTES {
+                        break;
+                    }
+                    let entry = Entry::from_wire(&wire)?;
+                    if entry.skeleton.channel_id != *channel {
+                        return Err(invalid("saved entry belongs to another room"));
+                    }
+                    writer.index_existing(&entry, id)?;
+                    bytes = bytes.saturating_add(wire.len());
+                    after = Some(id);
                 }
-                let current = batch
-                    .as_mut()
-                    .ok_or(invalid("entry rebuild batch missing"))?;
-                let mut writer = self.write(current, sek, channel)?;
-                writer.index_existing(&entry, id)?;
+                // All changed roots and their directory become durable together. Keep one
+                // writer for the batch instead of decrypting and resealing it for every row.
                 writer.seal()?;
-                count += 1;
-                if count == PROMOTION_ENTRIES {
-                    batch
-                        .take()
-                        .ok_or(invalid("entry rebuild batch missing"))?
-                        .commit()?;
-                    batch = Some(store.batch()?);
-                    count = 0;
+                batch.commit()?;
+                if complete {
+                    break;
                 }
-                Ok(())
-            })?;
-            batch
-                .ok_or(invalid("entry rebuild batch missing"))?
-                .commit()?;
+            }
             let mut batch = store.batch()?;
             let mut writer = self.write(&mut batch, sek, channel)?;
             writer.finish_rebuild()?;
@@ -1798,6 +2020,9 @@ impl EntryIndex {
                     .batch
                     .delete_segment(channel, SegmentKind::ProvisionalLog, at.log)?;
                 removed += 1;
+            }
+            if removed == 0 {
+                return Ok(());
             }
             writer.seal()?;
             batch.commit()?;

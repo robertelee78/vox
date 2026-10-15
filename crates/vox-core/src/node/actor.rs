@@ -284,6 +284,7 @@ fn summary_of(ch: &ChannelState) -> ChannelSummary {
         channel_id: ch.channel_id(),
         name: ch.name().map(str::to_owned),
         open: true,
+        preparing: false,
         entries: ch.entry_count() as u64,
         over: over_of(ch),
     }
@@ -4531,6 +4532,11 @@ struct RoomPreparation {
     reply: Option<oneshot::Sender<Outcome>>,
     reopening: bool,
     recovery: Option<std::sync::Weak<tokio::sync::Mutex<ChannelState>>>,
+    // Current trust is checked again between bounded preparation turns. A later decision
+    // restarts both cursors before this room can become visible or serve a peer.
+    trusted: Option<BTreeSet<Digest32>>,
+    removal_after: Option<Digest32>,
+    consent_after: Option<Digest32>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -4760,8 +4766,6 @@ pub struct Node {
     key_package_after: Option<Digest32>,
     /// Exact off-actor unwraps; a close/lock cannot be undone by their late result.
     opening_rooms: BTreeMap<Digest32, Arc<()>>,
-    /// Unlock replies held until the reopening has finished (#208).
-    unlock_waiters: Vec<oneshot::Sender<Outcome>>,
     /// Locks begun whose settling — the wait for work still holding a secret — has not reported
     /// back yet (`NetEvent::LockSettled`, V210-94). While any is, the node is *locking*: the
     /// identity is already locked and refuses new work, but not every secret is gone yet.
@@ -4884,7 +4888,6 @@ pub struct Node {
     /// One progress cursor per open room, not a materialized set of every historical consenter.
     rekey_after: BTreeMap<Digest32, Digest32>,
     history_after: BTreeMap<Digest32, Digest32>,
-    untrusted_after: BTreeMap<Digest32, Digest32>,
     /// Set when this node adopted a peer's session over its own (ADR-004 O3): what it owes that
     /// peer goes out as soon as the stream that carried the hello is answered, not on the tick.
     redeliver_now: bool,
@@ -5374,7 +5377,6 @@ impl Node {
             key_package_rooms: BTreeMap::new(),
             key_package_after: None,
             opening_rooms: BTreeMap::new(),
-            unlock_waiters: Vec::new(),
             locking: 0,
             unlock_after_lock: Vec::new(),
             view_stale: std::sync::atomic::AtomicBool::new(false),
@@ -5420,7 +5422,6 @@ impl Node {
             key_backoff: BTreeMap::new(),
             rekey_after: BTreeMap::new(),
             history_after: BTreeMap::new(),
-            untrusted_after: BTreeMap::new(),
             redeliver_now: false,
             reoffer: BTreeSet::new(),
             keys_in_flight: BTreeMap::new(),
@@ -7060,7 +7061,6 @@ impl Node {
                 let _ = reply.send(Outcome::Failed(Fault::ChannelNotOpen));
             }
             self.reopening.remove(&room);
-            self.answer_prepared_unlocks();
             return;
         };
         if let Some(waiting) = self.publish_waiters.get_mut(&room) {
@@ -7286,10 +7286,9 @@ impl Node {
         if waiting.reopening {
             self.reopening.remove(&room);
             waiting.reopening = false;
-            self.answer_prepared_unlocks();
         }
-        // Unlock waits for its held-room view, not an unnecessary anchor. Explicit
-        // create/join/open replies keep the original routing condition.
+        // Node Ready is independent of room preparation. Explicit create/join/open
+        // replies keep their original routing condition.
         if waiting.reply.is_some()
             && self.own_routes().is_empty()
             && self.publishing.iter().any(|(id, _)| *id == room)
@@ -7404,9 +7403,6 @@ impl Node {
         }
         if waiting.reopening {
             self.reopening.remove(&room);
-            for reply in std::mem::take(&mut self.unlock_waiters) {
-                let _ = reply.send(Outcome::Failed(fault));
-            }
         }
     }
 
@@ -8260,8 +8256,8 @@ impl Node {
             }
             NetEvent::ReopenFinished => {
                 self.reopen_task = None;
-                // Opening the store is finished; bounded private preparation may still
-                // be pending. Unlock must not report Ready before those rooms are held.
+                // Opening the stores finished; bounded private preparation may still
+                // be pending. Node readiness does not claim that these rooms are available.
                 self.reopening.retain(|room| {
                     self.preparing_rooms.contains_key(room)
                         || self
@@ -8269,7 +8265,6 @@ impl Node {
                             .get(room)
                             .is_some_and(|waiting| waiting.reopening)
                 });
-                self.answer_prepared_unlocks();
             }
             NetEvent::HandshakesQueued {
                 waited,
@@ -12066,27 +12061,6 @@ impl Node {
         }
     }
 
-    /// Mark, in a room just opened, every trust decision taken while it was closed (V210-45).
-    async fn mark_decisions_on_open(&mut self, channel_id: &Digest32) {
-        let (Some(profile), Some(shared)) = (
-            self.profile.as_ref(),
-            self.channels.get(channel_id).map(Arc::clone),
-        ) else {
-            return;
-        };
-        let Ok(signer) = profile.signer() else {
-            return;
-        };
-        let Ok(order) = crate::node::consent_order::ConsentOrder::load(profile.store(), signer)
-        else {
-            return;
-        };
-        let _ = shared
-            .lock()
-            .await
-            .mark_decisions_on_open(profile.store(), &order);
-    }
-
     /// Drop, in a room just opened, every sender key held from a member this owner does not trust
     /// (V210-118): one stopped being trusted while the room was closed, or a key taken before this
     /// node refused untrusted keys. Rendered messages stay; nothing more of theirs opens.
@@ -12094,112 +12068,33 @@ impl Node {
     /// (V210-118 amendment): drop the member's keys and change the lock — revoke and rotate, as a
     /// removal does in an open room — then clear the record. Every consent to a member the ring
     /// does not name is withdrawn too (V210-148): a key goes only to a member the owner trusts.
-    async fn act_on_removals_while_closed(&mut self, channel_id: &Digest32) {
-        self.forget_untrusted_keys(channel_id).await;
-        self.revoke_untrusted_consents(channel_id).await;
-        let (Some(profile), Some(shared)) = (
-            self.profile.as_ref(),
-            self.channels.get(channel_id).map(Arc::clone),
-        ) else {
-            return;
-        };
-        let Ok(signer) = profile.signer() else {
-            return;
-        };
-        let Ok(mut locks) = crate::node::pending_lock::PendingLocks::load(profile.store(), signer)
-        else {
-            return;
-        };
-        let removed = locks.for_room(channel_id);
-        if removed.is_empty() {
-            return;
-        }
-        // The lock changes before the record goes: a failure in between changes it again on the
-        // next open, which narrows nothing that should be read.
-        drop(shared);
-        for member in removed {
-            if !self.trust.is_trusted(&member)
-                && !self
-                    .withdraw_for_untrust(channel_id, member)
-                    .await
-                    .is_done()
-            {
-                return; // Preserve the durable removal until its narrowing fact is committed.
+    async fn act_on_removals_while_closed(&mut self, channel_id: &Digest32) -> Outcome {
+        let result = async {
+            let profile = self.profile.as_ref().ok_or(Error::AtRestLocked)?;
+            let shared = self
+                .channels
+                .get(channel_id)
+                .ok_or(Error::Profile("room is not open"))?;
+            let mut channel = shared.lock().await;
+            let trusted = self.trust.trusted();
+            channel.forget_keys_except(profile.store(), &trusted)?;
+            let signer = profile.signer()?;
+            let mut locks = crate::node::pending_lock::PendingLocks::load(profile.store(), signer)?;
+            for member in locks.for_room(channel_id) {
+                if !trusted.contains(&member) {
+                    channel.withdraw_consent(profile, member, self.now_ms())?;
+                }
             }
-        }
-        let Some(profile) = self.profile.as_ref() else {
-            return;
-        };
-        let Ok(signer) = profile.signer() else {
-            return;
-        };
-        if locks.clear_room(channel_id) {
-            let _ = locks.save(profile.store(), signer);
-        }
-    }
-
-    /// Withdraw every consent this identity holds in `channel_id` for a member its keyring does
-    /// not trust (V210-148). A key goes only to a member the owner trusts, so a consent outside
-    /// the keyring — one a room-only grant made before that grant was removed, or one the ring
-    /// lost while the room was closed — changes the lock against that member. What it already
-    /// holds cannot be taken back; it reads nothing written from now on.
-    async fn revoke_untrusted_consents(&mut self, channel_id: &Digest32) -> bool {
-        let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
-            return false;
-        };
-        let page = {
-            let Some(profile) = self.profile.as_ref() else {
-                return false;
-            };
-            let Ok(channel) = shared.try_lock() else {
-                return false;
-            };
-            match channel.consent_page(
-                profile.store(),
-                &channel.me(),
-                self.untrusted_after.get(channel_id).copied(),
-                64,
-            ) {
-                Ok(page) => page,
-                Err(_) => return false,
+            if locks.clear_room(channel_id) {
+                locks.save(profile.store(), signer)?;
             }
-        };
-        // One narrowing append per actor turn, even if this page names many stale consenters.
-        if let Some(member) = page
-            .targets
-            .iter()
-            .find(|m| !self.trust.is_trusted(m))
-            .copied()
-        {
-            if self
-                .withdraw_for_untrust(channel_id, member)
-                .await
-                .is_done()
-            {
-                self.untrusted_after.insert(*channel_id, member);
-                return true;
-            }
-        } else if let Some(next) = page.next {
-            self.untrusted_after.insert(*channel_id, next);
-            return true;
-        } else {
-            self.untrusted_after.remove(channel_id);
+            Ok::<(), Error>(())
         }
-        false
-    }
-
-    async fn forget_untrusted_keys(&mut self, channel_id: &Digest32) {
-        let (Some(profile), Some(shared)) = (
-            self.profile.as_ref(),
-            self.channels.get(channel_id).map(Arc::clone),
-        ) else {
-            return;
-        };
-        let trusted = self.trust.trusted();
-        let _ = shared
-            .lock()
-            .await
-            .forget_keys_except(profile.store(), &trusted);
+        .await;
+        match result {
+            Ok(()) => Outcome::Done,
+            Err(error) => Outcome::Failed(fault_of(&error)),
+        }
     }
 
     /// Trust `fingerprint` node-wide under `petname` (ADR-020 §3), then act on it
@@ -12436,7 +12331,10 @@ impl Node {
             }
             // And any other consent outside the keyring (V210-148): a key goes only to a member
             // the owner trusts, so nothing the ring does not name keeps one past this.
-            self.act_on_removals_while_closed(&channel_id).await;
+            let result = self.act_on_removals_while_closed(&channel_id).await;
+            if !result.is_done() {
+                return result;
+            }
         }
         Outcome::Done
     }
@@ -12620,8 +12518,6 @@ impl Node {
         self.rekey_after
             .retain(|room, _| self.channels.contains_key(room));
         self.history_after
-            .retain(|room, _| self.channels.contains_key(room));
-        self.untrusted_after
             .retain(|room, _| self.channels.contains_key(room));
         let channels: Vec<Digest32> = self.channels.keys().copied().collect();
         for channel_id in channels {
@@ -14828,11 +14724,19 @@ impl Node {
         package: &crate::node::keypackage::KeyPackage,
         ctx: &crate::join::session::JoinContext,
         now: u64,
-    ) -> Option<crate::group::skdm::Skdm> {
-        let init = package.initial_message().ok()?;
-        let mut session = self.respond_to_initial(&init, ctx).await?;
-        let skdm = package.open(&mut session, now).ok()?;
-        self.trust.is_trusted(&skdm.body.author_id).then_some(skdm)
+    ) -> crate::error::Result<Option<crate::group::skdm::Skdm>> {
+        let Ok(init) = package.initial_message() else {
+            return Ok(None);
+        };
+        let mut session = match self.respond_to_initial_checked(&init, ctx).await {
+            Ok(session) => session,
+            Err((_, Some(error))) => return Err(error),
+            Err((_, None)) => return Ok(None),
+        };
+        let Ok(skdm) = package.open(&mut session, now) else {
+            return Ok(None);
+        };
+        Ok(self.trust.is_trusted(&skdm.body.author_id).then_some(skdm))
     }
 
     /// Attempt at most one package after examining at most 64 sealed log positions.
@@ -14864,7 +14768,10 @@ impl Node {
             let fetched = (|| -> crate::error::Result<_> {
                 // Establish the context before advancing the queue's cursor.
                 let ctx = channel.join_context()?;
-                let progress = channel.next_key_package(profile.store())?;
+                let progress = channel.next_key_package(
+                    profile.store(),
+                    crate::hash::sha256(&self.trust.to_bytes()),
+                )?;
                 Ok((progress, ctx))
             })();
             if let Err(ref error) = fetched {
@@ -14894,14 +14801,17 @@ impl Node {
         let opened = self
             .open_logged_key_package(&pending.package, &ctx, now.get())
             .await;
+        let opened = match opened {
+            Ok(opened) => opened,
+            Err(error) => {
+                shared.lock().await.poison(&error);
+                return true;
+            }
+        };
         let mut changed = false;
         if let Some(skdm) = opened {
             let installed = {
                 let Some(profile) = self.profile.as_ref() else {
-                    shared
-                        .lock()
-                        .await
-                        .key_package_attempted(&pending.author, pending.log_id);
                     return false;
                 };
                 shared.lock().await.accept_skdm(profile.store(), &skdm, now)
@@ -14925,7 +14835,16 @@ impl Node {
             }
         }
         let mut channel = shared.lock().await;
-        channel.key_package_attempted(&pending.author, pending.log_id);
+        if let Some(profile) = self.profile.as_ref() {
+            if channel
+                .key_package_attempted(profile.store(), &pending.author, pending.log_id)
+                .is_err()
+            {
+                return true;
+            }
+        } else {
+            return changed;
+        }
         if channel.key_packages_pending() && !channel.is_poisoned() {
             self.key_package_rooms.entry(*channel_id).or_insert(false);
         }
@@ -14956,21 +14875,40 @@ impl Node {
         init: &InitialMessage,
         ctx: &crate::join::session::JoinContext,
     ) -> Result<crate::pairwise::session::Session, crate::node::pairwise_stream::KeyRefusal> {
+        self.respond_to_initial_checked(init, ctx)
+            .await
+            .map_err(|(refusal, _)| refusal)
+    }
+
+    // Local persistence failure must not acknowledge a durable logged delivery. Network
+    // callers retain their existing refusal response without exposing storage details.
+    async fn respond_to_initial_checked(
+        &mut self,
+        init: &InitialMessage,
+        ctx: &crate::join::session::JoinContext,
+    ) -> Result<
+        crate::pairwise::session::Session,
+        (crate::node::pairwise_stream::KeyRefusal, Option<Error>),
+    > {
         use crate::node::pairwise_stream::KeyRefusal;
         let refused = KeyRefusal::HelloRefused;
         let now = self.now_ms().get();
         let mut reuse = crate::pairwise::OtpReuseTracker::new();
-        let profile = self.profile.as_ref().ok_or(refused)?;
+        let profile = self.profile.as_ref().ok_or((refused, None))?;
         let store = profile.store();
         let Ok(signer) = profile.signer() else {
-            return Err(refused);
+            return Err((refused, None));
         };
         // The ring is taken under its lock below, so take what the save needs first. The
         // `Send + Sync` bound is load-bearing, not decoration: this function now awaits the
         // ring lock, so the actor's whole future has to stay `Send`, and a bare
         // `&dyn RootSigner` is not.
         let signer: &(dyn crate::identity::composite::RootSigner + Send + Sync) = signer;
-        let ring = self.prekeys.as_ref().map(Arc::clone).ok_or(refused)?;
+        let ring = self
+            .prekeys
+            .as_ref()
+            .map(Arc::clone)
+            .ok_or((refused, None))?;
         let mut ring = ring.lock().await;
         if let Some(id) = init.one_time_prekey_id {
             match ring.use_one_time(id, now) {
@@ -14980,17 +14918,17 @@ impl Node {
                     // the downgrade is graded even after a restart (ADR-004).
                     reuse.observe(id);
                 }
-                prekeys::OneTimeUse::Unknown => return Err(KeyRefusal::UnknownPrekey),
+                prekeys::OneTimeUse::Unknown => return Err((KeyRefusal::UnknownPrekey, None)),
             }
             // Persist the consume before the handshake completes: a crash here must not
             // leave the prekey re-offerable.
-            if prekeys::save(store, signer, &ring).is_err() {
-                return Err(refused);
+            if let Err(error) = prekeys::save(store, signer, &ring) {
+                return Err((refused, Some(error)));
             }
         }
         let signed_prekey = ring
             .signed_prekey_for(init.signed_prekey_id)
-            .ok_or(refused)?;
+            .ok_or((refused, None))?;
         let one_time_prekey = init
             .one_time_prekey_id
             .and_then(|id| ring.consumed_one_time(id));
@@ -15007,7 +14945,7 @@ impl Node {
             &mut reuse,
             ctx.floor,
         ) else {
-            return Err(refused);
+            return Err((refused, None));
         };
         Ok(session)
     }
@@ -16336,10 +16274,6 @@ impl Node {
                 let _ = reply.send(Outcome::Failed(Fault::Locked));
             }
         }
-        // The held-room publication was cancelled before this unlock could complete.
-        for reply in std::mem::take(&mut self.unlock_waiters) {
-            let _ = reply.send(Outcome::Failed(Fault::Locked));
-        }
         // Drop the prekey ring: its secrets zeroize on drop, so a locked node holds
         // no key-agreement material (ADR-015 lock/zeroize).
         self.prekeys = None;
@@ -16416,20 +16350,14 @@ impl Node {
         }
     }
 
-    /// Unlock, and answer `reply` — at once, or once the rooms it held are held again (#208):
-    /// they reopen off the actor so the node answers everyone meanwhile, but a caller told `Done`
-    /// — `vox daemon`, which then opens its control socket — must not find a room it held still
-    /// closed.
+    /// Ready authenticates the identity and starts its network, independently of saved history.
+    /// Each remembered room stays unavailable until its own verification, governance and
+    /// retention preparation finishes; the view reports that work explicitly.
     async fn unlock_and_answer(&mut self, passphrase: &Secret, reply: oneshot::Sender<Outcome>) {
         let outcome = self.unlock(passphrase).await;
-        // The view first, as for every command: a caller told `Done` reads the view at once (the
-        // trust keyring, the rooms) and must find the unlock in it.
+        // Publish identity, trust and room preparation before acknowledging Ready.
         self.publish().await;
-        if outcome.is_done() && (self.reopen_task.is_some() || !self.reopening.is_empty()) {
-            self.unlock_waiters.push(reply);
-        } else {
-            let _ = reply.send(outcome);
-        }
+        let _ = reply.send(outcome);
     }
 
     /// Everything after a room exists: hold it, give it anchors, publish it, say so.
@@ -16818,10 +16746,11 @@ impl Node {
             }
             return;
         }
-        if self.opening_rooms.contains_key(&channel_id)
+        if self.reopening.contains(&channel_id)
+            || self.opening_rooms.contains_key(&channel_id)
             || self.preparing_rooms.contains_key(&channel_id)
         {
-            let _ = reply.send(Outcome::Failed(Fault::ChannelNotOpen));
+            let _ = reply.send(Outcome::Failed(Fault::RoomPreparing));
             return;
         }
         let now_ms = self.now_ms();
@@ -16875,8 +16804,8 @@ impl Node {
             if pending.reply.is_none() {
                 pending.reply = reply;
             } else if let Some(reply) = reply {
-                // Do not retain an unlimited waiter list for repeated open requests.
-                let _ = reply.send(Outcome::Failed(Fault::ChannelNotOpen));
+                // Repeated opens do not start another writer or retain unlimited waiters.
+                let _ = reply.send(Outcome::Failed(Fault::RoomPreparing));
             }
             return;
         }
@@ -16887,16 +16816,11 @@ impl Node {
                 reply,
                 reopening,
                 recovery: None,
+                trusted: None,
+                removal_after: None,
+                consent_after: None,
             },
         );
-    }
-
-    fn answer_prepared_unlocks(&mut self) {
-        if self.reopen_task.is_none() && self.reopening.is_empty() {
-            for reply in std::mem::take(&mut self.unlock_waiters) {
-                let _ = reply.send(Outcome::Done);
-            }
-        }
     }
 
     fn cancel_room_preparation(&mut self, id: &Digest32, fault: Fault) -> bool {
@@ -17011,10 +16935,9 @@ impl Node {
         if let Some(reply) = prepared.reply {
             self.answer_when_published(id, reply, outcome).await;
         } else {
-            // An Unlock waiter observes the held-room view before Ready.
+            // Publish the failed room's availability independently of node readiness.
             self.publish().await;
         }
-        self.answer_prepared_unlocks();
     }
 
     /// Establish current governance, then apply shorter limits and private recovery
@@ -17035,12 +16958,13 @@ impl Node {
         if ch.needs_session_upgrade() && ch.key_packages_pending() {
             let ctx = ch.join_context()?;
             let profile = self.profile.as_ref().ok_or(Error::AtRestLocked)?;
-            let progress = ch.next_key_package(profile.store())?;
+            let progress =
+                ch.next_key_package(profile.store(), crate::hash::sha256(&self.trust.to_bytes()))?;
             if let Some(pending) = progress.package {
                 let now = self.now_ms();
                 let opened = self
                     .open_logged_key_package(&pending.package, &ctx, now.get())
-                    .await;
+                    .await?;
                 let installed = if let Some(skdm) = opened {
                     match self.profile.as_ref() {
                         Some(profile) => ch.accept_skdm(profile.store(), &skdm, now).map(|_| ()),
@@ -17049,13 +16973,15 @@ impl Node {
                 } else {
                     Ok(())
                 };
-                ch.key_package_attempted(&pending.author, pending.log_id);
-                // Every attempted outcome is acknowledged; storage faults keep the room closed.
+                // Refusals are acknowledged only after the attempt finishes. Storage faults
+                // leave the durable cursor behind this package so restart can recover it.
                 if let Err(error) = installed {
                     if ch.is_poisoned() || matches!(error, Error::AtRestLocked) {
                         return Err(error);
                     }
                 }
+                let profile = self.profile.as_ref().ok_or(Error::AtRestLocked)?;
+                ch.key_package_attempted(profile.store(), &pending.author, pending.log_id)?;
                 return Ok(false);
             }
             if progress.pending {
@@ -17086,6 +17012,59 @@ impl Node {
         if ch.advance_room_views(profile.store())?.0 {
             return Ok(false);
         }
+        self.reconcile_prepared_trust(prepared)
+    }
+
+    /// Narrow current trust before publishing, at most one withdrawal or one 64-member
+    /// page per turn. A failure never clears its durable obligation or exposes the room.
+    fn reconcile_prepared_trust(
+        &self,
+        prepared: &mut RoomPreparation,
+    ) -> crate::error::Result<bool> {
+        let profile = self.profile.as_ref().ok_or(Error::AtRestLocked)?;
+        let trusted = self.trust.trusted();
+        if prepared.trusted.as_ref() != Some(&trusted) {
+            prepared.trusted = Some(trusted.clone());
+            prepared.removal_after = None;
+            prepared.consent_after = None;
+        }
+        let channel = prepared.channel.get_mut();
+        let room = channel.channel_id();
+        channel.forget_keys_except(profile.store(), &trusted)?;
+        let signer = profile.signer()?;
+        let mut locks = crate::node::pending_lock::PendingLocks::load(profile.store(), signer)?;
+        let pending = locks.for_room(&room);
+        let mut examined = 0;
+        let after = prepared.removal_after;
+        for member in pending.into_iter().filter(|m| after.is_none_or(|a| *m > a)) {
+            prepared.removal_after = Some(member);
+            examined += 1;
+            if !trusted.contains(&member) {
+                channel.withdraw_consent(profile, member, self.now_ms())?;
+                return Ok(false);
+            }
+            if examined == 64 {
+                return Ok(false);
+            }
+        }
+        // Rotation is durable before the removal record is cleared. A failed save is
+        // surfaced; repeating an already committed narrowing is safe on the next open.
+        if locks.clear_room(&room) {
+            locks.save(profile.store(), signer)?;
+        }
+        let page =
+            channel.consent_page(profile.store(), &channel.me(), prepared.consent_after, 64)?;
+        if let Some(member) = page.targets.iter().find(|m| !trusted.contains(*m)).copied() {
+            channel.withdraw_consent(profile, member, self.now_ms())?;
+            prepared.consent_after = Some(member);
+            return Ok(false);
+        }
+        if let Some(next) = page.next {
+            prepared.consent_after = Some(next);
+            return Ok(false);
+        }
+        let order = crate::node::consent_order::ConsentOrder::load(profile.store(), signer)?;
+        channel.mark_decisions_on_open(profile.store(), &order)?;
         Ok(true)
     }
 
@@ -17097,9 +17076,8 @@ impl Node {
         self.remember_or_say(&ch);
         self.channels
             .insert(channel_id, Arc::new(tokio::sync::Mutex::new(ch)));
-        self.mark_decisions_on_open(&channel_id).await;
+        // Preparation established current decisions and completed all pending narrowing.
         self.resume_leave(&channel_id).await;
-        self.act_on_removals_while_closed(&channel_id).await;
         self.adopt_channel_anchors(&channel_id).await;
         self.refresh_network_view().await;
         // As a reopened room: the app gate must know the room before anything dials it.
@@ -17163,9 +17141,8 @@ impl Node {
             None => Outcome::Failed(Fault::ChannelNotOpen),
         };
         if outcome.is_done() {
-            // A concurrent Unlock may complete only after this successful close is visible.
+            // Publish a successful close before its caller observes the room again.
             self.publish().await;
-            self.answer_prepared_unlocks();
         }
         outcome
     }
@@ -17625,15 +17602,7 @@ impl Node {
                 }
             },
         };
-        let interrupted_unlock = self.reopening.contains(channel_id);
         self.cancel_room_preparation(channel_id, Fault::UnknownChannel);
-        if interrupted_unlock {
-            // Deletion overtakes an Unlock that still owes this room. It must not report
-            // success before deletion finishes, including a later storage failure.
-            for reply in std::mem::take(&mut self.unlock_waiters) {
-                let _ = reply.send(Outcome::Failed(Fault::UnknownChannel));
-            }
-        }
         // A leave still waiting for this room is overtaken: the room is joined again from scratch.
         let (overtaken, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.leave_waiters)
             .into_iter()
@@ -19641,6 +19610,7 @@ impl Node {
                 channel_id,
                 name: None,
                 open: false,
+                preparing: false,
                 entries: 0,
                 over: None,
             })
@@ -19937,6 +19907,7 @@ impl Node {
                             channel_id: *id,
                             name: None,
                             open: true,
+                            preparing: false,
                             entries: 0,
                             over: None,
                         }),
@@ -19945,6 +19916,9 @@ impl Node {
                     channel_id: *id,
                     name: None,
                     open: false,
+                    preparing: self.reopening.contains(id)
+                        || self.opening_rooms.contains_key(id)
+                        || self.preparing_rooms.contains_key(id),
                     entries: 0,
                     over: None,
                 },

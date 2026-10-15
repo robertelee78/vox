@@ -250,6 +250,8 @@ pub struct RoomSummary {
     pub name: String,
     /// Whether its key is unlocked now.
     pub open: bool,
+    /// The saved room is preparing; it does not need another passphrase.
+    pub preparing: bool,
     /// Empty while the room goes on; else, in words, that this node left it or it ended.
     pub over: String,
 }
@@ -2389,7 +2391,7 @@ fn pinned_anchor_set(
 
 async fn room_ids(
     client: &mut IpcClient,
-) -> Result<Vec<(Digest32, String, bool, String)>, VoxError> {
+) -> Result<Vec<(Digest32, String, bool, String, bool)>, VoxError> {
     match answered(client.rooms().await.map_err(|e| failed(e.to_string()))?)? {
         Frame::Rooms { rooms } => Ok(rooms),
         other => Err(unexpected(&other)),
@@ -3098,6 +3100,13 @@ impl VoxClient {
                 "the vox daemon did not answer with the node's state",
             ));
         };
+        if snap
+            .rooms
+            .iter()
+            .any(|r| r.channel_id == channel_id && r.preparing)
+        {
+            return Err(failed(vox_core::node::api::Fault::RoomPreparing.explain()));
+        }
         Ok((
             snap.open.into_iter().find(|o| o.channel_id == channel_id),
             names,
@@ -3691,10 +3700,11 @@ impl VoxClient {
     pub async fn rooms(&self) -> Result<Vec<RoomSummary>, VoxError> {
         Ok(on_held!(self, |c| room_ids(c).await)?
             .into_iter()
-            .map(|(id, name, open, over)| RoomSummary {
+            .map(|(id, name, open, over, preparing)| RoomSummary {
                 id: b32_encode(&id),
                 name: shown_name(&name),
                 open,
+                preparing,
                 over,
             })
             .collect())
@@ -4412,7 +4422,9 @@ impl VoxClient {
             room_ids(c)
                 .await?
                 .into_iter()
-                .find(|(id, held, _, _)| held == &name && !before.iter().any(|(old, ..)| old == id))
+                .find(|(id, held, _, _, _)| {
+                    held == &name && !before.iter().any(|(old, ..)| old == id)
+                })
                 .map(|(id, ..)| b32_encode(&id))
                 .ok_or_else(|| {
                     failed("the room was created, but it is not listed on the creating node")
@@ -7400,7 +7412,7 @@ impl VoxClient {
             h.mend().await?;
             let mut cursors = HashMap::new();
             let seen = session_revisions(&mut h.client).await?;
-            for (id, _, open, _) in room_ids(&mut h.client).await? {
+            for (id, _, open, _, _) in room_ids(&mut h.client).await? {
                 if !open {
                     continue;
                 }
@@ -7436,7 +7448,7 @@ impl VoxClient {
             let reanchor = room_ids(&mut h.client)
                 .await?
                 .into_iter()
-                .any(|(id, _, open, _)| open && !cursors.contains_key(&id));
+                .any(|(id, _, open, _, _)| open && !cursors.contains_key(&id));
             let task_held = Arc::clone(&held);
             // The start signal is only an installation barrier, never a delivery queue. It
             // keeps even the immediate terminal callback outside the setup's Slot guard.

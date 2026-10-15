@@ -1577,6 +1577,72 @@ impl Default for State {
     }
 }
 impl State {
+    /// Persist only bounded progress; incarnation remains new for every live room.
+    pub(super) fn to_bytes(&self) -> Vec<u8> {
+        let mut e = crate::cbor::Encoder::new();
+        e.array(6).uint(1);
+        match self.policy {
+            Some(policy) => {
+                e.array(3);
+                for part in policy {
+                    e.uint(part);
+                }
+            }
+            None => {
+                e.array(0);
+            }
+        }
+        e.uint(u64::from(self.pending));
+        for position in [self.cursor, self.through, self.cleanup_cursor] {
+            match position {
+                Some((author, seq)) => {
+                    e.array(2).bytes(&author).uint(seq);
+                }
+                None => {
+                    e.array(0);
+                }
+            }
+        }
+        e.finish()
+    }
+    pub(super) fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let mut d = crate::cbor::Decoder::new(bytes);
+        if d.array()? != 6 || d.uint()? != 1 {
+            return Err(Error::MalformedAtRest("projection restart format"));
+        }
+        let policy = match d.array()? {
+            0 => None,
+            3 => Some([d.uint()?, d.uint()?, d.uint()?]),
+            _ => return Err(Error::MalformedAtRest("projection restart policy")),
+        };
+        let pending = match d.uint()? {
+            0 => false,
+            1 => true,
+            _ => return Err(Error::MalformedAtRest("projection restart pending")),
+        };
+        let mut positions = [None; 3];
+        for position in &mut positions {
+            *position = match d.array()? {
+                0 => None,
+                2 => Some((
+                    d.bytes()?
+                        .try_into()
+                        .map_err(|_| Error::MalformedAtRest("projection restart author"))?,
+                    d.uint()?,
+                )),
+                _ => return Err(Error::MalformedAtRest("projection restart position")),
+            };
+        }
+        d.finish()?;
+        Ok(Self {
+            policy,
+            pending,
+            cursor: positions[0],
+            through: positions[1],
+            cleanup_cursor: positions[2],
+            ..Self::default()
+        })
+    }
     pub(super) fn owed_range(&mut self, author: Digest32, from: u64, through: u64) {
         let before = Some((author, from.saturating_sub(1)));
         let end = Some((author, through));
@@ -1622,6 +1688,7 @@ impl ChannelState {
     /// Exact counts never decrypt/scan the remaining history while a client waits.
     pub(crate) fn refresh_projection(&mut self, store: &Store) -> Result<bool> {
         let result = (|| -> Result<bool> {
+            let before = self.projection_state.to_bytes();
             let policy = [
                 self.effective_retention(),
                 self.effective_step_retention(),
@@ -1673,11 +1740,15 @@ impl ChannelState {
                 changed = true;
             }
             let expired_remain = writer.first_expired_owed(self.now_hint)?.is_some();
-            if changed {
+            let progress = self.projection_state.to_bytes();
+            if changed || before != progress {
+                writer.note_projection(progress)?;
                 writer.seal()?;
                 batch.commit()?;
                 self.entries.committed();
-                self.invalidate_display();
+                if changed {
+                    self.invalidate_display();
+                }
             }
             Ok(!self.projection_state.pending && !expired_remain)
         })();

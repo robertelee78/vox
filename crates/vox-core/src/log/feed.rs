@@ -163,6 +163,31 @@ impl Feed {
         (self.head != 0).then_some(self.first_claimed_ms)
     }
 
+    /// Restore metadata previously committed with an authenticated prefix. The caller checks
+    /// its sealed room binding and the indexed head; this never admits an incoming entry.
+    pub(crate) fn restore_published(
+        author: Digest32,
+        head: u64,
+        hash: Digest32,
+        first: u64,
+        ended: bool,
+    ) -> Result<Self> {
+        if head == 0 || head > MAX_SEQ {
+            return Err(Error::MalformedAtRest("published feed head"));
+        }
+        Ok(Self {
+            author_id: Some(author),
+            head,
+            head_hash: hash,
+            first_claimed_ms: first,
+            ended,
+        })
+    }
+
+    pub(crate) fn ended(&self) -> bool {
+        self.ended
+    }
+
     /// Read one accepted position as an owned entry; an unreadable held row is an error.
     pub fn get(&self, entries: &impl EntryRead, seq: u64) -> Result<Option<Entry>> {
         if seq == 0 || seq > self.head {
