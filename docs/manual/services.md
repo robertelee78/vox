@@ -23,8 +23,9 @@ reaching it needs: the proxy, a Ready node, the sharer's trust and an online sha
 your actual service list. The addresses contain your real identities; this manual supplies no
 reusable canonical address. Each command that uses Vox names the acting node.
 
-The printed SSH commands use `$USER`, your user name on this machine. If your account on the
-sharer's machine has another name, use that. A missing prerequisite is named with what to do;
+The printed SSH commands use SSH's default user and configuration for that destination. To use
+a different remote account, add `-l` followed by the actual account name to the copied SSH
+command, quoting that name as one shell argument. A missing prerequisite is named with what to do;
 for example, an offline sharer is reached when it comes back. A canonical address inside a
 message is shown in its readable form.
 
