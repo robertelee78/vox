@@ -1293,6 +1293,9 @@ pub struct AgentHookArgs {
     /// Register an exact OpenCode client route without draining news or starting a turn.
     #[arg(long, requires = "session", conflicts_with = "light")]
     pub attention_register: bool,
+    /// Claude's fail-closed automatic-notice hook; ordinary prompts return without daemon IPC.
+    #[arg(long, conflicts_with_all = ["light", "attention_register", "session"])]
+    pub native_attention: bool,
     /// The harness session this drain is for, overriding the one on stdin.
     ///
     /// The session id is the cursor key: it is what stops two agent sessions on
@@ -3293,7 +3296,7 @@ pub fn run() -> ExitCode {
                 .build()
             else {
                 // Ordinary hooks cannot fail a turn; registration-only callers need a truthful ACK.
-                return if args.attention_register {
+                return if args.attention_register || args.native_attention {
                     ExitCode::FAILURE
                 } else {
                     ExitCode::SUCCESS
@@ -3305,9 +3308,15 @@ pub fn run() -> ExitCode {
                 args.room.as_deref(),
                 format,
                 args.session.as_deref(),
-                args.attention_register,
+                if args.native_attention {
+                    crate::agent_hook::HookMode::NativeAttention
+                } else if args.attention_register {
+                    crate::agent_hook::HookMode::AttentionRegister
+                } else {
+                    crate::agent_hook::HookMode::Normal
+                },
             ));
-            if args.attention_register {
+            if args.attention_register || args.native_attention {
                 return match result {
                     Ok(()) => ExitCode::SUCCESS,
                     Err(error) => {

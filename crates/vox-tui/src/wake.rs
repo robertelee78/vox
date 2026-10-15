@@ -5,9 +5,9 @@
 //! is not admission authority. Ordinary news and addressed urgency use this same boundary.
 //! A lost acknowledgment remains unknown; a timer never resubmits it.
 //!
-//! Claude's shared messaging endpoint does not bind the active conversation across `/clear`.
-//! Automatic attention is therefore unavailable for Claude until a receiver can enforce that
-//! boundary. Ordinary hooks still deliver its room news. Codex is always next-turn-only:
+//! Claude's shared messaging endpoint carries only an opaque notice. Its actual native prompt
+//! hook checks the exact Session and consumes the sealed notice before reading room context.
+//! The socket alone is never conversation admission. Codex is always next-turn-only:
 //! Vox never starts, adds to, or steers a Codex turn for room attention.
 //!
 //! Durable source/recipient observations live in the room's sealed attention ledger. Only
@@ -20,7 +20,7 @@ use vox_core::hash::Digest32;
 use vox_core::node::api::MessageRow;
 use vox_core::node::paths::Paths;
 
-/// A capability issued by an actual OpenCode client for its current conversation.
+/// An exact input route: an OpenCode client capability or Claude's native-hook registration.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AttentionRoute {
     /// Private client-owned Unix socket, distinct from the server mirror socket.
@@ -31,6 +31,29 @@ pub struct AttentionRoute {
     pub route: [u8; 32],
 }
 impl AttentionRoute {
+    /// Advertised only by this version's native Claude hook, which enforces final admission.
+    pub(crate) fn claude(session: &Session) -> Option<Self> {
+        if session.harness != "claude"
+            || session.endpoint.is_empty()
+            || session.token.is_empty()
+            || session.endpoint.len() > 1024
+            || session.token.len() > 256
+        {
+            return None;
+        }
+        Some(Self {
+            endpoint: session.endpoint.clone(),
+            token: session.token.clone(),
+            route: vox_core::hash::sha256_concat(&[
+                b"vox/attention/claude-native-hook/v1\0",
+                session.session.as_bytes(),
+                b"\0",
+                session.endpoint.as_bytes(),
+                b"\0",
+                session.token.as_bytes(),
+            ]),
+        })
+    }
     fn from_env() -> Option<Self> {
         let endpoint = std::env::var("VOX_OPENCODE_ATTENTION_SOCKET").ok()?;
         let token = std::env::var("VOX_OPENCODE_ATTENTION_TOKEN").ok()?;
@@ -53,6 +76,44 @@ impl AttentionRoute {
             token,
             route,
         })
+    }
+}
+
+/// Body-free native prompt capability. Authentication secrets never enter the transcript.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeNotice {
+    pub recipient: vox_core::node::attention::Recipient,
+    pub notice_id: [u8; 16],
+    pub route: Digest32,
+}
+impl NativeNotice {
+    const PREFIX: &str = "Vox attention notice v1: ";
+
+    pub(crate) fn parse(prompt: &str) -> Result<Option<Self>, String> {
+        use base64::Engine as _;
+        let Some(encoded) = prompt.strip_prefix(Self::PREFIX) else {
+            return Ok(None);
+        };
+        if encoded.len() > 4096 {
+            return Err("attention notice exceeds its bound".into());
+        }
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(encoded)
+            .map_err(|_| "malformed attention notice")?;
+        serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|_| "malformed attention notice".into())
+    }
+
+    fn prompt(&self) -> Result<String, String> {
+        use base64::Engine as _;
+        let bytes = serde_json::to_vec(self).map_err(|error| error.to_string())?;
+        Ok(format!(
+            "{}{}",
+            Self::PREFIX,
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+        ))
     }
 }
 
@@ -231,7 +292,7 @@ pub(crate) async fn current_attention(
     session: &Session,
 ) -> Result<Option<AttentionRoute>, String> {
     use futures_util::StreamExt as _;
-    if session.harness != "opencode" || !session.interactive {
+    if !matches!(session.harness.as_str(), "opencode" | "claude") || !session.interactive {
         return Ok(None);
     }
     let same = || {
@@ -240,6 +301,13 @@ pub(crate) async fn current_attention(
     };
     if !same() {
         return Err("the registered conversation changed before client discovery".into());
+    }
+    if session.harness == "claude" {
+        // A live native hook is the final receiver. A connection alone never releases content.
+        return Ok(session
+            .attention
+            .clone()
+            .filter(|route| AttentionRoute::claude(session).as_ref() == Some(route)));
     }
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
     let clients = attention_clients(paths, session)?;
@@ -542,6 +610,10 @@ pub async fn reach(session: &Session) -> Reach {
         let mut stream = tokio::net::UnixStream::connect(&route.endpoint)
             .await
             .map_err(|error| error.to_string())?;
+        if session.harness == "claude" {
+            // This is reachability only. The native prompt hook still decides admission.
+            return Ok(());
+        }
         let request = format!(
             "{}\n{}\n",
             serde_json::json!({"type":"auth","token":route.token}),
@@ -622,7 +694,7 @@ pub fn now_millis() -> u64 {
 /// The `data` key of a session's `hello` saying how it can be reached (V030-17).
 pub const WAKE_KEY: &str = "wake";
 /// Advertised route capability, not a promise of admission or delivery. Only an exact
-/// registered OpenCode client route may advertise automatic attention; all others use hooks.
+/// registered native receiver may advertise automatic attention; Codex uses its normal hook.
 #[must_use]
 pub fn reachability(paths: &Paths, session: &str) -> &'static str {
     if pause_registration(paths, session)
@@ -1530,11 +1602,67 @@ pub(crate) async fn attention_on_route(
     })
 }
 
+/// Queue a body-free notice without touching terminal input or interrupting current work.
+/// Claude has no acceptance receipt on this socket; the native hook resolves the uncertainty.
+pub(crate) async fn claude_attention(
+    paths: &Paths,
+    session: &Session,
+    route: &AttentionRoute,
+    attempt: &vox_core::node::attention::Attempt,
+) -> vox_core::node::attention::DispatchOutcome {
+    use tokio::io::AsyncWriteExt as _;
+    use vox_core::node::attention::DispatchOutcome as Outcome;
+    let notice = NativeNotice {
+        recipient: attempt.recipient.clone(),
+        notice_id: attempt.notice_id,
+        route: route.route,
+    };
+    let prompt = match notice.prompt() {
+        Ok(prompt) => prompt,
+        Err(error) => return Outcome::NotSent(error),
+    };
+    let payload = format!(
+        "{}\n{}\n",
+        serde_json::json!({"type":"auth", "token":route.token}),
+        serde_json::json!({"type":"user", "session_id":session.session, "priority":"later",
+            "message":{"role":"user", "content":prompt}})
+    );
+    let mut written = false;
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let mut stream = match tokio::net::UnixStream::connect(&route.endpoint).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                return Outcome::NotSent(format!("Claude input endpoint was not reached: {error}"))
+            }
+        };
+        if !pause_registration(paths, &session.session)
+            .is_ok_and(|current| current.is_some_and(|current| current.same(session)))
+        {
+            return Outcome::NotSent(
+                "the registered conversation changed before submission".into(),
+            );
+        }
+        written = true;
+        if let Err(error) = stream.write_all(payload.as_bytes()).await {
+            return Outcome::Unknown(format!("Claude notice write is unconfirmed: {error}"));
+        }
+        Outcome::Unknown("Claude notice sent; waiting for its native hook receipt".into())
+    })
+    .await;
+    result.unwrap_or_else(|_| {
+        if written {
+            Outcome::Unknown("Claude notice submission timed out after a possible write".into())
+        } else {
+            Outcome::NotSent("Claude input connection timed out before a write".into())
+        }
+    })
+}
+
 /// Whether this harness supports an exact client receiver. Actual availability additionally
-/// requires a current route capability; Codex and Claude receive ordinary hook context only.
+/// requires a current native receiver; Codex receives ordinary hook context only.
 #[must_use]
 pub fn wakeable(harness: &str) -> bool {
-    harness == "opencode"
+    matches!(harness, "opencode" | "claude")
 }
 
 /// The kinds that are never a reply worth announcing (V030-20): acknowledgements, progress,

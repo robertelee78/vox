@@ -314,6 +314,15 @@ pub enum Operation {
         /// Observed adapter outcome, kept separate from context delivery.
         outcome: DispatchOutcome,
     },
+    /// Admit an opaque notice inside the actual native prompt hook, once, before reading news.
+    Admit {
+        /// Native hook's exact selected recipient incarnation.
+        recipient: Recipient,
+        /// Previously sealed notice identity; never a caller-created turn.
+        notice_id: [u8; 16],
+        /// Route that reserved the notice.
+        route: Digest32,
+    },
     /// Reserve exact context sources before stdout; a crash leaves an explicit unknown receipt.
     Prepare {
         /// Exact selected recipient incarnation.
@@ -355,6 +364,7 @@ impl Operation {
             Self::Scan { recipient, .. }
             | Self::Pending { recipient }
             | Self::Begin { recipient, .. }
+            | Self::Admit { recipient, .. }
             | Self::Prepare { recipient, .. }
             | Self::CancelPrepared { recipient, .. }
             | Self::Received { recipient, .. } => &recipient.session,
@@ -367,6 +377,7 @@ impl Operation {
             Self::Scan { recipient, .. }
             | Self::Pending { recipient }
             | Self::Begin { recipient, .. }
+            | Self::Admit { recipient, .. }
             | Self::Prepare { recipient, .. }
             | Self::CancelPrepared { recipient, .. }
             | Self::Received { recipient, .. } => Some(recipient),

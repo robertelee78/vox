@@ -1002,6 +1002,7 @@ fn without_vox_hooks(path: &Path) -> Option<String> {
         .and_then(serde_json::Value::as_object_mut)
     {
         changed |= env.remove("VOX_NODE").is_some();
+        changed |= env.remove("VOX_CLAUDE_NATIVE_ATTENTION").is_some();
         if env.is_empty() {
             obj.remove("env");
         }

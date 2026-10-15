@@ -44,6 +44,9 @@ struct Session {
     queued: u64,
     cursor: u64,
     attempt: Option<Attempt>,
+    // A native prompt hook consumes an existing notice, never a second queue entry.
+    #[serde(default)]
+    notice_admitted: bool,
     uncertain: bool,
     reason: Option<String>,
     wait: Option<Wait>,
@@ -70,6 +73,7 @@ impl Session {
             queued: 0,
             cursor: 0,
             attempt: None,
+            notice_admitted: false,
             uncertain: false,
             reason: None,
             wait: None,
@@ -620,10 +624,41 @@ impl<'a, 's> Ledger<'a, 's> {
         // A crash after this seal must not turn a possibly accepted write into a fresh turn.
         s.blocked_route = None;
         s.attempt = Some(a.clone());
+        s.notice_admitted = false;
         s.uncertain = true;
         s.reason = Some("notice acceptance has not been confirmed".into());
         self.save_session(id, s)?;
         Ok(Some(a))
+    }
+    pub(crate) fn notice(
+        &self,
+        recipient: &Recipient,
+        notice_id: [u8; 16],
+        route: Digest32,
+    ) -> Result<Attempt> {
+        let (_, session) = self.session(recipient)?;
+        session
+            .attempt
+            .filter(|attempt| {
+                !session.notice_admitted
+                    && attempt.recipient == *recipient
+                    && attempt.notice_id == notice_id
+                    && attempt.route == route
+            })
+            .ok_or(Error::Profile(
+                "attention notice is stale or already admitted",
+            ))
+    }
+    pub(crate) fn admit_notice(
+        &mut self,
+        recipient: &Recipient,
+        notice_id: [u8; 16],
+        route: Digest32,
+    ) -> Result<()> {
+        self.notice(recipient, notice_id, route)?;
+        let (id, mut session) = self.session(recipient)?;
+        session.notice_admitted = true;
+        self.save_session(id, session)
     }
     pub(crate) fn dispatch(&mut self, a: &Attempt, outcome: DispatchOutcome) -> Result<()> {
         let (id, mut s) = self.session(&a.recipient)?;

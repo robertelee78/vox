@@ -88,8 +88,26 @@ impl ChannelState {
         };
         // Recheck source readability in this turn before taking the Batch writer. No retained
         // snapshot, plaintext body or authority projection survives the operation.
+        let native_notice = if let Operation::Admit {
+            notice_id, route, ..
+        } = &operation
+        {
+            let mut batch = store.batch().map_err(|e| e.to_string())?;
+            let ledger = Ledger::open(&mut batch, &self.sek, self.channel_id, instance)
+                .map_err(|e| e.to_string())?;
+            Some(
+                ledger
+                    .notice(&recipient, *notice_id, *route)
+                    .map_err(|e| e.to_string())?,
+            )
+        } else {
+            None
+        };
         let sources = match &operation {
             Operation::Begin { sources, .. } => sources.as_slice(),
+            Operation::Admit { .. } => native_notice
+                .as_ref()
+                .map_or(&[][..], |notice| notice.sources.as_slice()),
             Operation::Prepare { sources, .. }
             | Operation::CancelPrepared { sources, .. }
             | Operation::Received { sources, .. } => sources.as_slice(),
@@ -144,6 +162,9 @@ impl ChannelState {
                     }
                     Operation::Received { .. } | Operation::Observed(_) => existing[index],
                     Operation::Begin { .. } => true,
+                    Operation::Admit { .. } => {
+                        self.attention_eligible(store, owner, &recipient, &notice.row, &env, now)?
+                    }
                     _ => env.is_ordinary_conversation() || env.urgent,
                 } {
                     readable.push((*hash, notice.row.arrival, env.urgent));
@@ -208,6 +229,21 @@ impl ChannelState {
                 }
                 Operation::Dispatch { attempt, outcome } => {
                     ledger.dispatch(&attempt, outcome)?;
+                    Reply::Done
+                }
+                Operation::Admit {
+                    notice_id, route, ..
+                } => {
+                    if paused
+                        || !readable
+                            .iter()
+                            .any(|(_, arrival, urgent)| *urgent || *arrival > cutoff)
+                    {
+                        return Err(Error::Profile(
+                            "attention notice has no currently eligible source",
+                        ));
+                    }
+                    ledger.admit_notice(&recipient, notice_id, route)?;
                     Reply::Done
                 }
                 Operation::CancelPrepared {
@@ -407,7 +443,7 @@ impl ChannelState {
         }
         let wait = match harness {
             "codex" => Some(Wait::NextCodexTurn),
-            "opencode" if route.is_some() => None,
+            "opencode" | "claude" if route.is_some() => None,
             _ => Some(Wait::AdapterUnavailable),
         };
         let result = (|| -> Result<Reply> {

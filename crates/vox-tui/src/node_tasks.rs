@@ -225,7 +225,7 @@ async fn watch_for_interrupts(node: NodeHandle, paths: Paths) {
                 if sends.len() >= 4 || room_held(&node.view(), &room) {
                     continue;
                 }
-                if session.harness != "opencode" {
+                if !crate::wake::wakeable(&session.harness) {
                     continue;
                 }
                 let page = match node
@@ -299,7 +299,13 @@ async fn watch_for_interrupts(node: NodeHandle, paths: Paths) {
                         Ok(_publication) => tokio::select! {
                             biased;
                             () = &mut held => DispatchOutcome::Unknown("room authority/pause changed while submission was pending; no retry without receipt".into()),
-                            outcome = crate::wake::attention_on_route(&paths, &session, &route, attempt.notice_id, &text) => outcome,
+                            outcome = async {
+                                if session.harness == "claude" {
+                                    crate::wake::claude_attention(&paths, &session, &route, &attempt).await
+                                } else {
+                                    crate::wake::attention_on_route(&paths, &session, &route, attempt.notice_id, &text).await
+                                }
+                            } => outcome,
                         },
                     };
                     if let Err(error) = node.attention(room, owner, Some(recipient.instance), Operation::Dispatch { attempt, outcome }).await {
