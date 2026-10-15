@@ -6787,15 +6787,16 @@ impl ChannelState {
     }
 
     fn persist_drive(&mut self, store: &Store) -> Result<()> {
-        let seg = seal_segment(
+        let saved = seal_segment(
             &self.sek,
             SegmentKind::KeyMaterial,
             SEG_DRIVE,
             &self.drive.to_state(),
-        )?;
-        if let Err(e) =
+        )
+        .and_then(|seg| {
             store.put_segment(&self.channel_id, SegmentKind::KeyMaterial, SEG_DRIVE, &seg)
-        {
+        });
+        if let Err(e) = saved {
             self.poisoned = true;
             self.save_error = Some(e.to_string());
             return Err(e);
@@ -6832,20 +6833,23 @@ impl ChannelState {
         }
     }
 
-    /// Persist the receiver chains, poisoning the channel if the write fails.
+    /// Persist the receiver chains, poisoning the channel if sealing or writing fails.
     fn persist_receivers(&mut self, store: &Store) -> Result<()> {
-        let seg = seal_segment(
+        let saved = seal_segment(
             &self.sek,
             SegmentKind::KeyMaterial,
             SEG_RECEIVERS,
             &receivers_bytes(&self.receivers),
-        )?;
-        if let Err(e) = store.put_segment(
-            &self.channel_id,
-            SegmentKind::KeyMaterial,
-            SEG_RECEIVERS,
-            &seg,
-        ) {
+        )
+        .and_then(|seg| {
+            store.put_segment(
+                &self.channel_id,
+                SegmentKind::KeyMaterial,
+                SEG_RECEIVERS,
+                &seg,
+            )
+        });
+        if let Err(e) = saved {
             self.poisoned = true;
             self.save_error = Some(e.to_string());
             return Err(e);

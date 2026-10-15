@@ -1376,6 +1376,7 @@ impl<'s> Write<'_, 's> {
             .put_segment(self.channel, SegmentKind::LogDb, log, &sealed)?;
         self.directory.active = self.index(self.directory.active, entry, log)?;
         self.directory.active = self.index_package(self.directory.active, entry, log)?;
+        self.note_checkpoint_refill(entry)?;
         // A refill settles recovery atomically with its durable wire. Rewriting a body as
         // a skeleton for local retention deliberately does not create recovery work.
         if entry.payload.is_some() {

@@ -241,3 +241,70 @@ pub(super) fn advance(state: &mut PublishedFeed, entry: &Entry) -> Result<()> {
     }
     Ok(())
 }
+
+impl super::Write<'_, '_> {
+    /// A valid checkpoint body can arrive after its signed skeleton was accepted. Its
+    /// durable control state must accompany that body, without advancing the accepted head.
+    pub(super) fn note_checkpoint_refill(&mut self, entry: &Entry) -> Result<()> {
+        let Some(payload) = entry.payload.as_deref().filter(|_| entry.is_signed()) else {
+            return Ok(());
+        };
+        let Some(checkpoint) = crate::log::checkpoint::Checkpoint::from_payload(payload)
+            .ok()
+            .flatten()
+        else {
+            return Ok(());
+        };
+        entry.verify_payload_binding()?;
+        let author = entry.skeleton.author_id;
+        let restart = self
+            .directory
+            .restart
+            .as_ref()
+            .ok_or(invalid("checkpoint refill without restart state"))?;
+        let feed = restart
+            .feeds
+            .get(&author)
+            .ok_or(invalid("checkpoint refill author is not published"))?;
+        if entry.skeleton.channel_id != restart.room
+            || entry.skeleton.epoch != restart.epoch
+            || entry.skeleton.seq > feed.seq
+        {
+            return Err(invalid("checkpoint refill outside published feed"));
+        }
+        // Match Dag::fill_body: a malformed checkpoint claim does not become authority
+        // merely because its body matches an already accepted signed skeleton.
+        if checkpoint.seq >= entry.skeleton.seq
+            || feed.checkpoint.is_some_and(|old| old.0 >= checkpoint.seq)
+        {
+            return Ok(());
+        }
+        let source = super::Source::Batch(self.batch);
+        let Some(at) = source.find(
+            self.sek,
+            self.channel,
+            self.directory.active.sequence,
+            &super::position(&author, checkpoint.seq),
+        )?
+        else {
+            return Ok(());
+        };
+        let named = super::indexed_entry(
+            &source,
+            self.sek,
+            self.channel,
+            crate::atrest::store::SegmentKind::LogDb,
+            at,
+        )?;
+        if named.entry_hash() != checkpoint.entry_hash {
+            return Ok(());
+        }
+        self.directory
+            .restart
+            .as_mut()
+            .and_then(|state| state.feeds.get_mut(&author))
+            .ok_or(invalid("checkpoint refill state disappeared"))?
+            .checkpoint = Some((checkpoint.seq, checkpoint.entry_hash));
+        Ok(())
+    }
+}
