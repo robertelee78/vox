@@ -216,7 +216,10 @@ pub async fn run(command: ComputerCmd) -> Result<(), AppError> {
                     "computer pairing was not approved; no new local approval was made".into(),
                 ));
             }
-            status = ask(&mut client, DaemonRequest::ComputerApprove { operation }).await?;
+            // A daemon control connection answers one opening request. Preview consumed it;
+            // approval uses a fresh authenticated connection after the person's confirmation.
+            let mut approval = DaemonClient::open(&root.socket()).await?;
+            status = ask(&mut approval, DaemonRequest::ComputerApprove { operation }).await?;
         }
     }
     show(&status, json)
