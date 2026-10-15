@@ -6602,14 +6602,27 @@ pub async fn trust_list(paths: &Paths) -> Result<(), AppError> {
 /// so it starts no daemon and attaches nothing.
 ///
 /// # Errors
-/// The node's files cannot be read, or a new identity's passphrase cannot be had.
+/// The node's files cannot be read, or a new identity's passphrase cannot be had. An explicit
+/// fingerprint selector requires its pinned live connection and never uses those fallbacks.
 pub fn print_identity(
     paths: &Paths,
     flag: Option<String>,
     file: Option<std::path::PathBuf>,
     with_name: bool,
 ) -> Result<(), AppError> {
-    let fingerprint = if vox_core::node::profile::Profile::exists(paths) {
+    let fingerprint = if paths.expected_identity.is_some() {
+        // A fingerprint selector names an attached identity, not a disk profile. Never turn
+        // a failed pin (or a detached/replaced node) into a disk read or identity creation.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let at = crate::client::one_shot(paths)?;
+        rt.block_on(async {
+            crate::client::open(&at).await?.me().ok_or_else(|| {
+                AppError::Usage("the selected attached node supplied no fingerprint".into())
+            })
+        })?
+    } else if vox_core::node::profile::Profile::exists(paths) {
         let attached = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()

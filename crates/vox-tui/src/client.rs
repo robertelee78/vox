@@ -252,7 +252,7 @@ fn attached_identity(account: &Account, identity: Digest32) -> vox_core::error::
     match matches.as_slice() {
             [only] => Ok(only.name.clone()),
             [] => Err(Error::NoNodeChosen(
-                "no attached node has that fingerprint; run this command on its owning computer while that node is Ready".into(),
+                "the daemon did not provide an attached node matching that fingerprint; run this command on its owning computer while that node is Ready".into(),
             )),
             _ => Err(Error::NoNodeChosen(
                 "more than one attached node has that fingerprint; choose its exact local name with --node".into(),
