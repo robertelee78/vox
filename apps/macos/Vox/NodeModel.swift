@@ -202,7 +202,11 @@ final class NodeModel: ObservableObject {
     private var threadPageDirty = false
     private var threadRefreshDirty = false
     private var threadDisplayRevision: String?
+    /// Outstanding first-author-window reads, including every root owed a newer display revision.
+    /// A replan consumes one root, never the rest of a captured page's obligations.
     private var threadForcedSummaries: Set<String> = []
+    /// Priority only, bounded by the retained root window; this is not read eligibility.
+    private var threadVisibleRoots: Set<String> = []
     @Published private(set) var threadAuthorsPaged: Set<String> = []
     private var threadRefreshTask: Task<Void, Never>?
     private var threadPageTask: Task<Void, Never>?
@@ -4050,6 +4054,7 @@ extension NodeModel {
         threadRefreshDirty = false
         threadDisplayRevision = nil
         threadForcedSummaries = []
+        threadVisibleRoots = []
         threadAuthorsPaged = []
         threadSummaryVersions = [:]
         threadAuthorRequests = [:]
@@ -4074,6 +4079,42 @@ extension NodeModel {
             && roomOnScreen == room && ended == nil && threadRefreshID == request
     }
 
+    /// The current bounded General window plus the one independently retained open thread.
+    private func retainedThreadRoots() -> [String] {
+        var roots = messages.filter { $0.thread.isEmpty && !$0.owed }.map(\.id)
+        if let root = openThread, threadRootMessage != nil, !roots.contains(root) { roots.append(root) }
+        return roots
+    }
+
+    /// Reuse the timeline's measured viewport without publishing during SwiftUI's layout pass.
+    /// A running task sees the new priority after its current await; no second read is started.
+    func threadRootsVisible(in room: String, ids: Set<String>) {
+        guard roomOnScreen == room, ended == nil else { return }
+        let visible = ids.intersection(Set(retainedThreadRoots()))
+        guard visible != threadVisibleRoots else { return }
+        threadVisibleRoots = visible
+        if threadRefreshTask == nil && visible.contains(where: {
+            threadForcedSummaries.contains($0) || (threadSummaries[$0] == nil && threadSummaryErrors[$0] == nil)
+        }) { scheduleThreadRefresh() }
+    }
+
+    private func retainThreadSummaries(in known: Set<String>) {
+        // Avoid publishing identical dictionaries each time a summary completes.
+        if threadSummaries.keys.contains(where: { !known.contains($0) }) {
+            threadSummaries = threadSummaries.filter { known.contains($0.key) }
+        }
+        if threadSummaryErrors.keys.contains(where: { !known.contains($0) }) {
+            threadSummaryErrors = threadSummaryErrors.filter { known.contains($0.key) }
+        }
+        threadSummaryVersions = threadSummaryVersions.filter { known.contains($0.key) }
+        threadAuthorRequests = threadAuthorRequests.filter { known.contains($0.key) }
+        threadForcedSummaries.formIntersection(known)
+        threadVisibleRoots.formIntersection(known)
+        if threadAuthorsPaged.contains(where: { !known.contains($0) }) {
+            threadAuthorsPaged.formIntersection(known)
+        }
+    }
+
     private func scheduleThreadRefresh() {
         guard let room = roomOnScreen, ended == nil else { return }
         threadRefreshDirty = true
@@ -4090,73 +4131,92 @@ extension NodeModel {
                     if self.threadRefreshDirty { self.scheduleThreadRefresh() }
                 }
             }
-            repeat {
-                self.threadRefreshDirty = false
-                @MainActor func current() -> Bool {
-                    !Task.isCancelled && self.threadReadIsCurrent(room: room, generation: generation,
-                        epoch: epoch, request: refreshID)
-                }
-                let revision: String
-                do {
-                    revision = try await self.client.roomDisplayRevision(room: room)
-                    guard current() else { return }
-                } catch {
-                    guard current() else { return }
-                    // A refused revision is not permission to retain formerly readable bodies.
-                    self.threadDisplayRevision = nil
-                    self.threadSummaries = [:]
-                    self.threadAuthorsPaged = []
-                    self.threadSummaryVersions = [:]
-                    self.threadAuthorRequests = [:]
-                    self.retireThreadSelection()
-                    self.threadRootMessage = nil
-                    self.threadReplies = []
-                    self.threadHasMore = false
-                    self.threadGeneration = UUID()
-                    self.threadPageTask?.cancel()
-                    self.threadPageDirty = false
-                    self.threadLoading = false
-                    self.threadError = sentence(error)
-                    for root in self.messages.filter({ $0.thread.isEmpty && !$0.owed }).map(\.id) {
-                        self.threadSummaryErrors[root] = sentence(error)
-                    }
-                    return
-                }
-                let changed = self.threadDisplayRevision != revision
-                self.threadDisplayRevision = revision
-                if changed { self.refreshOpenThread() }
-                var roots = self.messages.filter { $0.thread.isEmpty && !$0.owed }.map(\.id)
-                if let root = self.openThread, self.threadRootMessage != nil, !roots.contains(root) { roots.append(root) }
-                let known = Set(roots)
-                self.threadSummaries = self.threadSummaries.filter { known.contains($0.key) }
-                self.threadSummaryErrors = self.threadSummaryErrors.filter { known.contains($0.key) }
-                self.threadSummaryVersions = self.threadSummaryVersions.filter { known.contains($0.key) }
-                self.threadAuthorRequests = self.threadAuthorRequests.filter { known.contains($0.key) }
-                self.threadForcedSummaries.formIntersection(known)
-                self.threadAuthorsPaged.formIntersection(known)
-                let forced = self.threadForcedSummaries
-                self.threadForcedSummaries = []
-                for root in roots where changed || forced.contains(root)
-                    || (self.threadSummaries[root] == nil && self.threadSummaryErrors[root] == nil) {
-                    guard current() else { return }
+            @MainActor func current() -> Bool {
+                !Task.isCancelled && self.threadReadIsCurrent(room: room, generation: generation,
+                    epoch: epoch, request: refreshID)
+            }
+            while current() {
+                if self.threadRefreshDirty {
+                    self.threadRefreshDirty = false
+                    let revision: String
                     do {
-                        let summary = try await self.client.threadSummary(room: room, root: root, afterAuthor: nil)
+                        revision = try await self.client.roomDisplayRevision(room: room)
                         guard current() else { return }
-                        guard summary.root == root else {
-                            throw VoxError.Failed(reason: "The reply summary belongs to another message.")
-                        }
-                        self.threadSummaries[root] = summary
-                        self.threadAuthorsPaged.remove(root)
-                        self.threadSummaryVersions[root] = UUID()
-                        self.threadSummaryErrors[root] = nil
                     } catch {
                         guard current() else { return }
-                        self.threadSummaries[root] = nil
-                        self.threadSummaryVersions[root] = UUID()
-                        self.threadSummaryErrors[root] = sentence(error)
+                        // A refused revision is not permission to retain formerly readable bodies.
+                        self.threadDisplayRevision = nil
+                        self.threadSummaries = [:]
+                        self.threadAuthorsPaged = []
+                        self.threadSummaryVersions = [:]
+                        self.threadAuthorRequests = [:]
+                        self.retireThreadSelection()
+                        self.threadRootMessage = nil
+                        self.threadReplies = []
+                        self.threadHasMore = false
+                        self.threadGeneration = UUID()
+                        self.threadPageTask?.cancel()
+                        self.threadPageDirty = false
+                        self.threadLoading = false
+                        self.threadError = sentence(error)
+                        let known = Set(self.retainedThreadRoots())
+                        self.retainThreadSummaries(in: known)
+                        for root in known { self.threadSummaryErrors[root] = sentence(error) }
+                        return
+                    }
+                    let changed = self.threadDisplayRevision != revision
+                    self.threadDisplayRevision = revision
+                    // Recording the global revision does not finish any individual root. Keep
+                    // every unfinished obligation across viewport/page replans, including roots
+                    // with an old cached summary. A retry inserted during an await also survives.
+                    if changed {
+                        let known = Set(self.retainedThreadRoots())
+                        self.threadForcedSummaries.formUnion(known)
+                        // An older author-page request cannot publish across this revision.
+                        self.threadAuthorRequests = [:]
+                        self.refreshOpenThread()
                     }
                 }
-            } while self.threadRefreshDirty
+                // Recompute after every await: at most the single in-flight old root finishes.
+                // No captured old-page queue continues ahead of a newly visible root.
+                let roots = self.retainedThreadRoots()
+                let known = Set(roots)
+                self.retainThreadSummaries(in: known)
+                let pending = roots.filter {
+                    self.threadForcedSummaries.contains($0)
+                        || (self.threadSummaries[$0] == nil && self.threadSummaryErrors[$0] == nil)
+                }
+                let root = pending.first(where: {
+                    self.threadVisibleRoots.contains($0) && self.threadSummaries[$0] == nil
+                }) ?? pending.first(where: { self.threadVisibleRoots.contains($0) })
+                    ?? pending.first(where: { self.threadSummaries[$0] == nil }) ?? pending.first
+                guard let root else {
+                    if self.threadRefreshDirty { continue }
+                    return
+                }
+                self.threadForcedSummaries.remove(root)
+                // Invalidate author-page work for the snapshot this first page replaces.
+                self.threadSummaryVersions[root] = UUID()
+                self.threadAuthorRequests[root] = nil
+                do {
+                    let summary = try await self.client.threadSummary(room: room, root: root, afterAuthor: nil)
+                    guard current() else { return }
+                    guard self.retainedThreadRoots().contains(root) else { continue }
+                    guard summary.root == root else {
+                        throw VoxError.Failed(reason: "The reply summary belongs to another message.")
+                    }
+                    self.threadSummaries[root] = summary
+                    self.threadAuthorsPaged.remove(root)
+                    self.threadSummaryVersions[root] = UUID()
+                    self.threadSummaryErrors[root] = nil
+                } catch {
+                    guard current() else { return }
+                    guard self.retainedThreadRoots().contains(root) else { continue }
+                    self.threadSummaries[root] = nil
+                    self.threadSummaryVersions[root] = UUID()
+                    self.threadSummaryErrors[root] = sentence(error)
+                }
+            }
         }
     }
 
