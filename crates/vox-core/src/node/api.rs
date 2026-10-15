@@ -1247,6 +1247,8 @@ pub enum Fault {
     ReadSelectionChanged,
     /// The composer selected a room incarnation that no longer exists; no text was appended.
     PostSelectionChanged,
+    /// A prior local room change/open still owes its checked publication; no new write began.
+    RoomChangePending,
     /// One admin removal is already being applied over bounded actor turns.
     AdminChangePending,
     /// A previous hosted room deletion is still awaiting its bounded daemon handoff.
@@ -1484,6 +1486,9 @@ impl Fault {
             Fault::PostSelectionChanged => {
                 "the room changed before sending; this message was not posted\n       refresh the room and try again"
             }
+            Fault::RoomChangePending => {
+                "a previous change to this room is still being applied; this request made no change\n       wait for its answer before changing the room again"
+            }
             Fault::AdminChangePending => {
                 "an admin change is already being applied on this node\n       wait for its answer before making another admin change"
             }
@@ -1711,6 +1716,7 @@ fault_names!(
     GovernanceRefreshing,
     ReadSelectionChanged,
     PostSelectionChanged,
+    RoomChangePending,
     AdminChangePending,
     SessionCleanupBusy,
     SessionCleanupUnavailable,

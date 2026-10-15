@@ -4474,13 +4474,22 @@ struct RoomPreparation {
     recovery: Option<std::sync::Weak<tokio::sync::Mutex<ChannelState>>>,
 }
 
-/// One original open/create/join reply, fenced to the room it actually published.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RoomPublicationKind {
+    Open,
+    Settings,
+    Anchors,
+}
+
+/// One original room reply, fenced to the room it actually published.
 /// Reopens use the same completion without retaining an individual reply.
 struct RoomPublication {
     instance: std::sync::Weak<tokio::sync::Mutex<ChannelState>>,
     reply: Option<oneshot::Sender<Outcome>>,
     outcome: Outcome,
     reopening: bool,
+    /// Settings need current local policy/configuration, not history or an anchor round.
+    kind: RoomPublicationKind,
 }
 
 /// The node actor's state (owned by its task).
@@ -5716,6 +5725,23 @@ impl Node {
                         self.publish().await;
                         continue;
                     }
+                    // Reserve the room's sole completion before any signed/config write.
+                    // Asynchronous admissions, services, pause and the stronger leave/admin-
+                    // removal completions deliberately do not use this local-settings barrier.
+                    let local_change = match &command {
+                        NodeCommand::RenameRoom { channel_id, .. }
+                        | NodeCommand::SetRetention { channel_id, .. }
+                        | NodeCommand::SetStepRetention { channel_id, .. }
+                        | NodeCommand::ChooseIdleEnd { channel_id, .. }
+                        | NodeCommand::EndRoom { channel_id }
+                        | NodeCommand::SetAdmin { channel_id, admin: true, .. } => Some((*channel_id, RoomPublicationKind::Settings)),
+                        NodeCommand::ChangeRoomAnchors { channel_id, .. } => Some((*channel_id, RoomPublicationKind::Anchors)),
+                        _ => None,
+                    };
+                    if local_change.is_some_and(|(room, _)| self.publish_waiters.contains_key(&room)) {
+                        let _ = reply.send(Outcome::Failed(Fault::RoomChangePending));
+                        continue;
+                    }
                     let outcome = self.handle(command).await;
                     self.resume_session_retirements();
                     if self
@@ -5730,8 +5756,12 @@ impl Node {
                         shutdown_reply = Some(reply);
                         break;
                     }
-                    // A dropped reply receiver is the caller's choice, not an error.
-                    let _ = reply.send(outcome);
+                    if let Some((room, kind)) = local_change.filter(|_| outcome.is_done()) {
+                        self.queue_room_publication(room, Some(reply), outcome, false, kind);
+                    } else {
+                        // A dropped reply receiver is the caller's choice, not an error.
+                        let _ = reply.send(outcome);
+                    }
                     self.schedule().await;
                 }
                 Some(event) = net_rx.recv() => {
@@ -6932,7 +6962,13 @@ impl Node {
         outcome: Outcome,
     ) {
         if outcome.is_done() {
-            self.queue_room_publication(room, Some(reply), outcome, false);
+            self.queue_room_publication(
+                room,
+                Some(reply),
+                outcome,
+                false,
+                RoomPublicationKind::Open,
+            );
             return;
         }
         self.publish().await;
@@ -6945,6 +6981,7 @@ impl Node {
         reply: Option<oneshot::Sender<Outcome>>,
         outcome: Outcome,
         reopening: bool,
+        kind: RoomPublicationKind,
     ) {
         let Some(shared) = self.channels.get(&room) else {
             if let Some(reply) = reply {
@@ -6971,6 +7008,7 @@ impl Node {
                     reply,
                     outcome,
                     reopening,
+                    kind,
                 },
             );
         }
@@ -7003,6 +7041,40 @@ impl Node {
         let Some(mut waiting) = self.publish_waiters.remove(&room) else {
             return;
         };
+        if waiting.kind != RoomPublicationKind::Open {
+            match self.publish_room_settings(room, &waiting) {
+                Ok(true) => {
+                    if let Some(reply) = waiting.reply {
+                        let _ = reply.send(waiting.outcome);
+                    }
+                    if waiting.kind == RoomPublicationKind::Anchors {
+                        // The canonical scope was adopted by governance maintenance.
+                        // Start the existing background round only after that scope is
+                        // current; local completion never waits for a remote answer.
+                        self.publish_channel_to_anchors(&room, PublishCause::Governance)
+                            .await;
+                    }
+                }
+                Ok(false) => {
+                    // A held lock is revisited by the existing tick/room work; do not spin.
+                    self.publish_waiters.insert(room, waiting);
+                }
+                Err(error) if ChannelState::governance_refreshing(&error) => {
+                    self.publication_again = true;
+                    self.publish_waiters.insert(room, waiting);
+                }
+                Err(error) => {
+                    let fault =
+                        if matches!(error, Error::Profile("room publication instance changed")) {
+                            Fault::ChannelNotOpen
+                        } else {
+                            fault_of(&error)
+                        };
+                    self.fail_room_publication(room, waiting, fault);
+                }
+            }
+            return;
+        }
         let checked = (|| -> crate::error::Result<Option<(ChannelSummary, ChannelDetail)>> {
             let profile = self
                 .profile
@@ -7156,6 +7228,102 @@ impl Node {
         if let Some(reply) = waiting.reply {
             let _ = reply.send(waiting.outcome);
         }
+    }
+
+    /// Publish only local settings while holding the checked room incarnation. The
+    /// previous history/Session/authority tokens remain previous: completing a rename
+    /// does not pretend that an unrelated Session projection or consent page advanced.
+    /// Both fallback snapshots are patched before the original caller is answered.
+    fn publish_room_settings(
+        &mut self,
+        room: Digest32,
+        waiting: &RoomPublication,
+    ) -> crate::error::Result<bool> {
+        let profile = self
+            .profile
+            .as_ref()
+            .filter(|p| p.is_unlocked())
+            .ok_or(Error::AtRestLocked)?;
+        let shared = self
+            .channels
+            .get(&room)
+            .zip(waiting.instance.upgrade())
+            .filter(|(current, original)| Arc::ptr_eq(current, original))
+            .map(|(current, _)| Arc::clone(current))
+            .ok_or(Error::Profile("room publication instance changed"))?;
+        let Ok(mut channel) = shared.try_lock() else {
+            return Ok(false);
+        };
+        channel.require_governance_display(profile.store(), self.now_ms())?;
+        if self.retention_dirty.contains(&room) {
+            if let Err(error) = channel
+                .set_node_retention(profile.store(), self.node_retention.for_room(&room))
+                .and_then(|()| {
+                    channel.set_node_step_retention(
+                        profile.store(),
+                        self.node_step_retention.for_room(&room),
+                    )
+                })
+            {
+                channel.poison(&error);
+                return Err(error);
+            }
+            self.retention_dirty.remove(&room);
+        }
+        let instance = channel.history_instance(profile.store())?;
+        let name = channel.name().map(str::to_owned);
+        let over = over_of(&channel);
+        let patch = |summary: &mut ChannelSummary, detail: &mut ChannelDetail| {
+            summary.name.clone_from(&name);
+            summary.over.clone_from(&over);
+            detail.name.clone_from(&name);
+            detail.retention = channel.effective_retention();
+            detail.room_retention = channel.room_retention();
+            detail.room_step_retention = channel.room_step_retention();
+            detail.step_retention = channel.effective_step_retention();
+            detail.local_step_retention = channel.local_step_retention();
+            detail.retention_above_room = channel.retention_above_room();
+        };
+        if let Some((summary, detail)) = self.fresh_details.get_mut(&room) {
+            if detail.history_instance != instance {
+                return Err(Error::Profile("room publication instance changed"));
+            }
+            patch(summary, detail);
+        }
+        let mut view = self.view_tx.borrow().clone();
+        let summary = view
+            .channels
+            .iter_mut()
+            .find(|s| s.channel_id == room)
+            .ok_or(Error::Profile("room publication instance changed"))?;
+        let detail = view
+            .open_channels
+            .iter_mut()
+            .find(|d| d.channel_id == room)
+            .filter(|d| d.history_instance == instance)
+            .ok_or(Error::Profile("room publication instance changed"))?;
+        patch(summary, detail);
+        // Anchor inventory is display-only. Dialing authority is adopted by the shared
+        // governance turn that made this checked display current, never from this cache.
+        if let Some(inventory) = view.room_anchors.iter_mut().find(|r| r.room == room) {
+            let mut anchors = BootstrapSet::new();
+            for anchor in channel.anchors().nodes() {
+                if !channel.is_known_member(&anchor.id) {
+                    anchors.add(anchor.clone())?;
+                }
+            }
+            if inventory.name != name || inventory.anchors != anchors {
+                inventory.observed_at = self
+                    .now_ms()
+                    .get()
+                    .max(inventory.observed_at.saturating_add(1));
+                inventory.name.clone_from(&name);
+                inventory.anchors = anchors;
+            }
+            inventory.stale = false;
+        }
+        self.view_tx.send_replace(view);
+        Ok(true)
     }
 
     fn fail_room_publication(&mut self, room: Digest32, waiting: RoomPublication, fault: Fault) {
@@ -16566,7 +16734,13 @@ impl Node {
     ) {
         if self.channels.contains_key(&channel_id) {
             if self.publish_waiters.contains_key(&channel_id) {
-                self.queue_room_publication(channel_id, Some(reply), Outcome::Done, false);
+                self.queue_room_publication(
+                    channel_id,
+                    Some(reply),
+                    Outcome::Done,
+                    false,
+                    RoomPublicationKind::Open,
+                );
             } else {
                 let _ = reply.send(Outcome::Done);
             }
@@ -16752,7 +16926,13 @@ impl Node {
                 }
             };
         if outcome.is_done() {
-            self.queue_room_publication(id, prepared.reply, outcome, prepared.reopening);
+            self.queue_room_publication(
+                id,
+                prepared.reply,
+                outcome,
+                prepared.reopening,
+                RoomPublicationKind::Open,
+            );
             return;
         }
         self.reopening.remove(&id);
@@ -17269,25 +17449,12 @@ impl Node {
                 }
                 return Outcome::Failed(fault_of(&e));
             }
-            match detail_of(
-                &ch,
-                profile.store(),
-                None,
-                self.now_ms(),
-                &self.display_sequence,
-            ) {
-                Ok(detail) => {
-                    self.fresh_details
-                        .insert(*channel_id, (summary_of(&ch), detail));
-                }
-                Err(error) => detail_failed(&mut ch, &error),
-            }
         }
         self.note_local_append(channel_id);
         self.withdraw_from_boards(channel_id, crate::nat::withdraw::WithdrawScope::Room)
             .await;
-        // `tend_lifecycle` starts the wind-down: the room is ended from here on, on this node.
-        let _ = self.tend_lifecycle().await;
+        // The checked local publication completes first; the regular lifecycle turn
+        // then winds the room down without overtaking this command's reply.
         Outcome::Done
     }
 
@@ -17319,23 +17486,10 @@ impl Node {
             if let Err(e) = done {
                 return Outcome::Failed(fault_of(&e));
             }
-            match detail_of(
-                &ch,
-                profile.store(),
-                None,
-                self.now_ms(),
-                &self.display_sequence,
-            ) {
-                Ok(detail) => {
-                    self.fresh_details
-                        .insert(*channel_id, (summary_of(&ch), detail));
-                }
-                Err(error) => detail_failed(&mut ch, &error),
-            }
         }
         self.note_local_append(channel_id);
-        // The boards learn who may take the room off them (V030-14).
-        self.publish_admin_roster(channel_id).await;
+        // Bounded governance maintenance publishes the checked roster (V030-14)
+        // before the local completion is eligible to answer.
         Outcome::Done
     }
 
@@ -17352,19 +17506,6 @@ impl Node {
             let mut ch = shared.lock().await;
             if let Err(e) = ch.choose_idle_end(profile, idle_secs, now_ms) {
                 return Outcome::Failed(fault_of(&e));
-            }
-            match detail_of(
-                &ch,
-                profile.store(),
-                None,
-                self.now_ms(),
-                &self.display_sequence,
-            ) {
-                Ok(detail) => {
-                    self.fresh_details
-                        .insert(*channel_id, (summary_of(&ch), detail));
-                }
-                Err(error) => detail_failed(&mut ch, &error),
             }
         }
         self.note_local_append(channel_id);
@@ -17626,6 +17767,15 @@ impl Node {
                 }
             }
             if handed < members.len() && since.elapsed() < WIND_DOWN {
+                continue;
+            }
+            // A successful local end/idle-policy change still owes its checked
+            // publication. Do not purge that incarnation out from under its reply.
+            if self
+                .publish_waiters
+                .get(&cid)
+                .is_some_and(|waiting| waiting.kind != RoomPublicationKind::Open)
+            {
                 continue;
             }
             self.winding.remove(&cid);
@@ -18415,9 +18565,8 @@ impl Node {
             return Outcome::Failed(fault_of(&error));
         }
         self.note_local_append(channel_id);
-        self.adopt_channel_anchors(channel_id).await;
-        self.publish_channel_to_anchors(channel_id, PublishCause::Governance)
-            .await;
+        // Adoption and the background publish use the checked canonical set, after
+        // bounded governance maintenance, through this command's local completion.
         Outcome::Done
     }
 
