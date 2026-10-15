@@ -93,16 +93,19 @@ impl ChannelState {
             Operation::Prepare { sources, .. }
             | Operation::CancelPrepared { sources, .. }
             | Operation::Received { sources, .. } => sources.as_slice(),
+            Operation::Observed(receipt) => receipt.sources.as_slice(),
             _ => &[],
         };
         if sources.len() > PAGE_SIZE
             || (matches!(operation, Operation::Prepare { .. }) && sources.len() > 6)
+            || (matches!(operation, Operation::Observed(_))
+                && (sources.is_empty() || sources.len() > 6))
         {
             return Err("attention operation exceeds one page".into());
         }
         let existing = if matches!(
             operation,
-            Operation::Prepare { .. } | Operation::Received { .. }
+            Operation::Prepare { .. } | Operation::Received { .. } | Operation::Observed(_)
         ) {
             let mut batch = store.batch().map_err(|e| e.to_string())?;
             let ledger = Ledger::open(&mut batch, &self.sek, self.channel_id, instance)
@@ -139,13 +142,16 @@ impl ChannelState {
                                 now,
                             )?
                     }
-                    Operation::Received { .. } => existing[index],
+                    Operation::Received { .. } | Operation::Observed(_) => existing[index],
                     Operation::Begin { .. } => true,
                     _ => env.is_ordinary_conversation() || env.urgent,
                 } {
                     readable.push((*hash, notice.row.arrival, env.urgent));
                 }
             }
+        }
+        if matches!(operation, Operation::Observed(_)) && readable.len() != sources.len() {
+            return Err("attention receipt source is no longer readable or retained".into());
         }
         let paused = self.room_pause().paused;
         let cutoff = self.pause_resume_after();
@@ -210,17 +216,20 @@ impl ChannelState {
                     ledger.cancel_prepared(&recipient, &sources, ticket)?;
                     Reply::Done
                 }
-                Operation::Prepare { ticket, .. } => {
+                Operation::Prepare { ticket, input, .. } => {
                     for (hash, arrival, urgent) in &readable {
                         ledger.admit(&recipient, *hash, *arrival, *urgent, None, now)?;
                     }
                     let hashes: Vec<_> = readable.iter().map(|(hash, _, _)| *hash).collect();
-                    ledger.prepare(&recipient, &hashes, ticket)?;
+                    Reply::Prepared(ledger.prepare(&recipient, &hashes, ticket, input)?)
+                }
+                Operation::Received { ticket, .. } => {
+                    let hashes: Vec<_> = readable.iter().map(|(hash, _, _)| *hash).collect();
+                    ledger.received(&recipient, &hashes, ticket, now)?;
                     Reply::Done
                 }
-                Operation::Received { running, .. } => {
-                    let hashes: Vec<_> = readable.iter().map(|(hash, _, _)| *hash).collect();
-                    ledger.received(&recipient, &hashes, running, now)?;
+                Operation::Observed(receipt) => {
+                    ledger.observed(&receipt, now)?;
                     Reply::Done
                 }
             };

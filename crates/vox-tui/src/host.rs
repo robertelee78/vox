@@ -293,7 +293,8 @@ impl Router {
             .map(|bind| Arc::new(crate::daemon_proxy::DaemonProxy::new(bind)));
         let router = Self {
             inner: Arc::new_cyclic(|weak: &std::sync::Weak<Inner>| {
-                let (weak, weak_room, weak_rename) = (weak.clone(), weak.clone(), weak.clone());
+                let (weak, weak_room, weak_rename, weak_attention) =
+                    (weak.clone(), weak.clone(), weak.clone(), weak.clone());
                 let sink = crate::session_sink::Sink::new(
                     Arc::new(
                         move |node: NodeName,
@@ -327,6 +328,15 @@ impl Router {
                         if let Some(inner) = weak_rename.upgrade() {
                             Router { inner }.rename_session(node, session, name);
                         }
+                    }),
+                    Arc::new(move |node, endpoint, token, observation| {
+                        let weak = weak_attention.clone();
+                        Box::pin(async move {
+                            let inner = weak.upgrade().ok_or("the daemon stopped")?;
+                            Router { inner }
+                                .observe_attention(&node, &endpoint, &token, observation)
+                                .await
+                        })
                     }),
                 );
                 let codex = crate::codex_mirror::CodexMirror::new(Arc::clone(&sink));
@@ -2288,6 +2298,95 @@ impl Router {
             return None;
         }
         vox_core::node::link::b32_decode(reg.room.as_deref()?, "room").ok()
+    }
+
+    /// The existing authenticated mirror observed an exact input's running step.
+    /// Each bounded mutation retains the actor attachment, origin and room incarnation.
+    async fn observe_attention(
+        &self,
+        node: &NodeName,
+        endpoint: &str,
+        token: &str,
+        observation: vox_core::node::attention::InputObservation,
+    ) -> Result<(), String> {
+        use vox_core::node::attention::{Operation, Reply};
+        observation.validate()?;
+        let paths = self
+            .inner
+            .account
+            .node_paths(node)
+            .map_err(|e| e.to_string())?;
+        let (handle, generation, mut detached) = {
+            let slots = lock(&self.inner.slots);
+            match slots.get(node) {
+                Some(Slot::Attached(a)) if !*a.detached.borrow() => {
+                    (a.handle.clone(), a.generation, a.detached.subscribe())
+                }
+                _ => return Err("attention observation node is no longer attached".into()),
+            }
+        };
+        let owner = handle
+            .view()
+            .identity
+            .map(|id| id.fingerprint)
+            .ok_or("attention observation node is locked")?;
+        let current = |room, instance| -> Result<(), String> {
+            let attached = matches!(lock(&self.inner.slots).get(node),
+                Some(Slot::Attached(a)) if a.generation == generation
+                    && Arc::ptr_eq(a.handle.app(), handle.app()) && !*a.detached.borrow());
+            let view = handle.view();
+            let reg = crate::wake::pause_registration(&paths, &observation.session)?;
+            let room_text = vox_core::node::link::b32_encode(&room);
+            if !attached
+                || view.locked
+                || view.locking
+                || view
+                    .identity
+                    .as_ref()
+                    .is_none_or(|id| id.fingerprint != owner)
+                || !view
+                    .open_channels
+                    .iter()
+                    .any(|r| r.channel_id == room && r.history_instance == instance)
+                || !reg.is_some_and(|reg| {
+                    reg.session == observation.session
+                        && reg.interactive
+                        && reg.harness == "opencode"
+                        && reg.room.as_deref() == Some(room_text.as_str())
+                        && reg.mirror == endpoint
+                        && reg.token == token
+                })
+            {
+                return Err("attention observation attachment, mirror or room changed".into());
+            }
+            Ok(())
+        };
+        let observe = async {
+            for receipt in &observation.receipts {
+                let recipient = &receipt.recipient;
+                current(recipient.room, recipient.instance)?;
+                match handle
+                    .attention(
+                        recipient.room,
+                        owner,
+                        Some(recipient.instance),
+                        Operation::Observed(receipt.clone()),
+                    )
+                    .await?
+                {
+                    Reply::Done => {}
+                    _ => return Err("unexpected attention observation answer".into()),
+                }
+                current(recipient.room, recipient.instance)?;
+            }
+            Ok(())
+        };
+        tokio::select! {
+            biased;
+            _ = detached.wait_for(|d| *d) => Err("attention observation node detached; receipt outcome is unconfirmed".into()),
+            result = tokio::time::timeout(Duration::from_secs(15), observe) =>
+                result.map_err(|_| "attention observation did not finish; receipt outcome is unconfirmed".to_owned())?,
+        }
     }
 
     /// Persist one complete batch before reporting committed acceptance. At most 64 bounded

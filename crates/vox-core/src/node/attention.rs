@@ -14,6 +14,87 @@ pub const LABEL: &str = "vox-attention/v1";
 pub const PAGE_SIZE: usize = 64;
 /// Maximum encoded private page or request.
 pub const MAX_BYTES: usize = 128 * 1024;
+/// The hook's existing maximum number of attributed messages in one output.
+pub const MAX_RECEIPT_SOURCES: usize = 50;
+
+/// Exact sources reserved for one native input. Metadata alone grants no authority:
+/// every source must still match this binding in the sealed ledger.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InputReceipt {
+    /// Exact selected recipient incarnation.
+    pub recipient: Recipient,
+    /// Domain-separated native input identity, not a content hash.
+    pub input: Digest32,
+    /// The hook's pre-output reservation.
+    pub ticket: [u8; 16],
+    /// At most six exact prepared sources in this descriptor.
+    pub sources: Vec<Digest32>,
+}
+
+/// A running OpenCode step and the receipts on its authoritative parent input.
+/// The authenticated mirror resolves both messages before constructing this value.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InputObservation {
+    /// Exact native Session, never a descendant mapped to its owner.
+    pub session: String,
+    /// Authoritative user message id.
+    pub input: String,
+    /// Authoritative assistant message whose parent is `input`.
+    pub assistant: String,
+    /// Actual step-start part in that assistant message.
+    pub step: String,
+    /// Compact descriptors; no transcript bodies.
+    pub receipts: Vec<InputReceipt>,
+}
+
+/// Bind a native input to its exact OpenCode Session using bounded opaque ids.
+///
+/// # Errors
+/// Either identifier is empty, too long or contains a control character.
+pub fn opencode_input(session: &str, input: &str) -> Result<Digest32, String> {
+    let valid = |id: &str| {
+        !id.is_empty()
+            && id.len() <= crate::node::content::MAX_SESSION_ID_LEN
+            && !id.chars().any(char::is_control)
+    };
+    if !valid(session) || !valid(input) {
+        return Err("invalid OpenCode attention input identity".into());
+    }
+    Ok(crate::hash::sha256_concat(&[
+        b"vox/attention/opencode-input/v1\0",
+        session.as_bytes(),
+        b"\0",
+        input.as_bytes(),
+    ]))
+}
+
+impl InputObservation {
+    /// Validate the bounded association before any owned mutation.
+    ///
+    /// # Errors
+    /// Identities, digest, descriptor shape or aggregate bounds do not agree.
+    pub fn validate(&self) -> Result<(), String> {
+        let input = opencode_input(&self.session, &self.input)?;
+        opencode_input(&self.session, &self.assistant)?;
+        opencode_input(&self.session, &self.step)?;
+        if self.receipts.is_empty()
+            || self.receipts.len() > MAX_RECEIPT_SOURCES
+            || self.receipts.iter().map(|r| r.sources.len()).sum::<usize>() > MAX_RECEIPT_SOURCES
+            || self.receipts.iter().any(|r| {
+                r.input != input
+                    || r.recipient.session != self.session
+                    || r.recipient.validate().is_err()
+                    || r.sources.is_empty()
+                    || r.sources.len() > 6
+            })
+        {
+            return Err("invalid OpenCode attention receipt association".into());
+        }
+        Ok(())
+    }
+}
 
 /// An exact local Session incarnation in one saved room.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -241,6 +322,8 @@ pub enum Operation {
         sources: Vec<Digest32>,
         /// Identity of this particular hook output attempt.
         ticket: [u8; 16],
+        /// Native input association, when the hook is inside an OpenCode input.
+        input: Option<Digest32>,
     },
     /// Retire only this hook's reservation when publication was definitely cancelled.
     CancelPrepared {
@@ -257,9 +340,11 @@ pub enum Operation {
         recipient: Recipient,
         /// Bounded exact source set; Prepare accepts six and other operations at most 64.
         sources: Vec<Digest32>,
-        /// Whether consumption by a running turn was actually observed.
-        running: bool,
+        /// Only this emitted output's pending accounting may be settled.
+        ticket: [u8; 16],
     },
+    /// Authoritative persisted input and its actual running step were observed.
+    Observed(InputReceipt),
 }
 impl Operation {
     pub(crate) fn session(&self) -> &str {
@@ -274,6 +359,7 @@ impl Operation {
             | Self::CancelPrepared { recipient, .. }
             | Self::Received { recipient, .. } => &recipient.session,
             Self::Dispatch { attempt, .. } => &attempt.recipient.session,
+            Self::Observed(receipt) => &receipt.recipient.session,
         }
     }
     pub(crate) fn recipient(&self) -> Option<&Recipient> {
@@ -285,6 +371,7 @@ impl Operation {
             | Self::CancelPrepared { recipient, .. }
             | Self::Received { recipient, .. } => Some(recipient),
             Self::Dispatch { attempt, .. } => Some(&attempt.recipient),
+            Self::Observed(receipt) => Some(&receipt.recipient),
             _ => None,
         }
     }
@@ -313,6 +400,8 @@ pub enum Reply {
     Page(Page),
     /// A newly sealed single notice, or no eligible work.
     Attempt(Option<Attempt>),
+    /// Exact newly or resumably reserved sources; excludes already-bound other inputs.
+    Prepared(Vec<Digest32>),
     /// Mutation sealed, including an idempotent no-op.
     Done,
 }

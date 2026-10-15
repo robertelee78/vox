@@ -118,6 +118,8 @@ impl OpenCodeMirror {
             node: node.clone(),
             session: session.to_owned(),
             sink: Arc::clone(&self.sink),
+            mirror_endpoint: endpoint.to_owned(),
+            mirror_token: token.to_owned(),
             agent: None,
             texts: Vec::new(),
             asks: BTreeMap::new(),
@@ -220,6 +222,8 @@ struct Follow {
     node: NodeName,
     session: String,
     sink: Arc<Sink>,
+    mirror_endpoint: String,
+    mirror_token: String,
     /// Current authoritative sub-agent label. An unavailable label falls back to exact agent_id.
     agent: Option<(String, String)>,
     /// Live assistant text parts not yet posted: (session, part id, text, agent label).
@@ -774,6 +778,46 @@ impl Follow {
                     self.fail("a part arrived without its authoritative message role")
                         .await;
                     return;
+                }
+                if let Some(observed) = p.get("voxAttention").filter(|v| !v.is_null()) {
+                    let result = async {
+                        if sid != self.session
+                            || role != "assistant"
+                            || part["type"] != "step-start"
+                        {
+                            return Err(
+                                "attention observation is not this Session's running step".into()
+                            );
+                        }
+                        let bytes = serde_json::to_vec(observed).map_err(|e| e.to_string())?;
+                        if bytes.len() > vox_core::node::attention::MAX_BYTES {
+                            return Err("attention observation exceeds its byte bound".into());
+                        }
+                        let observation: vox_core::node::attention::InputObservation =
+                            serde_json::from_slice(&bytes)
+                                .map_err(|e| format!("invalid attention observation: {e}"))?;
+                        if Some(observation.assistant.as_str()) != part["messageID"].as_str()
+                            || Some(observation.step.as_str()) != part["id"].as_str()
+                        {
+                            return Err(
+                                "attention observation names a different assistant step".into()
+                            );
+                        }
+                        self.sink
+                            .attention_observed(
+                                &self.node,
+                                &self.session,
+                                &self.mirror_endpoint,
+                                &self.mirror_token,
+                                observation,
+                            )
+                            .await
+                    }
+                    .await;
+                    if let Err(why) = result {
+                        self.fail(&why).await;
+                        return;
+                    }
                 }
                 self.agent = info
                     .get("agent")

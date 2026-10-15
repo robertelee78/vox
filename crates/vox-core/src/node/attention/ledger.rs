@@ -88,8 +88,16 @@ struct Record {
     ordinal: u64,
     row: Row,
     output_pending: Option<[u8; 16]>,
+    #[serde(default)]
+    input_receipt: Option<ReceiptBinding>,
     // Pending audience is sealed but is not a public recipient observation.
     audience: Option<ThreadScan>,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ReceiptBinding {
+    ticket: [u8; 16],
+    input: Digest32,
 }
 
 fn bad() -> Error {
@@ -538,6 +546,7 @@ impl<'a, 's> Ledger<'a, 's> {
             recipient: recipient_key,
             ordinal: id,
             output_pending: None,
+            input_receipt: None,
             audience: None,
             row: Row {
                 source,
@@ -661,9 +670,12 @@ impl<'a, 's> Ledger<'a, 's> {
         recipient: &Recipient,
         sources: &[Digest32],
         ticket: [u8; 16],
-    ) -> Result<()> {
+        input: Option<Digest32>,
+    ) -> Result<Vec<Digest32>> {
         let (sid, mut s) = self.session(recipient)?;
         let mut changed_any = false;
+        let binding = input.map(|input| ReceiptBinding { ticket, input });
+        let mut prepared = Vec::new();
         for source in sources {
             let Some(id) = self
                 .tree()
@@ -672,17 +684,27 @@ impl<'a, 's> Ledger<'a, 's> {
                 continue;
             };
             let mut r: Record = self.get(id)?;
-            if r.row.state == State::Queued && r.output_pending.is_none() {
+            if r.row.state == State::Queued
+                && r.output_pending.is_none()
+                && r.input_receipt.is_none()
+            {
                 r.output_pending = Some(ticket);
+                r.input_receipt.clone_from(&binding);
                 s.outputs_pending = s.outputs_pending.checked_add(1).ok_or_else(bad)?;
                 self.put(id, &r)?;
                 changed_any = true;
+            }
+            if r.output_pending == Some(ticket)
+                && r.input_receipt == binding
+                && !prepared.contains(source)
+            {
+                prepared.push(*source);
             }
         }
         if changed_any {
             self.save_session(sid, s)?;
         }
-        Ok(())
+        Ok(prepared)
     }
     pub(crate) fn cancel_prepared(
         &mut self,
@@ -702,6 +724,10 @@ impl<'a, 's> Ledger<'a, 's> {
             let mut r: Record = self.get(id)?;
             if r.output_pending == Some(ticket) {
                 r.output_pending = None;
+                // Known no-output cancellation retires only this reservation's binding.
+                if r.input_receipt.as_ref().is_some_and(|b| b.ticket == ticket) {
+                    r.input_receipt = None;
+                }
                 s.outputs_pending = s.outputs_pending.checked_sub(1).ok_or_else(bad)?;
                 self.put(id, &r)?;
                 changed_any = true;
@@ -716,7 +742,7 @@ impl<'a, 's> Ledger<'a, 's> {
         &mut self,
         recipient: &Recipient,
         sources: &[Digest32],
-        running: bool,
+        ticket: [u8; 16],
         now: u64,
     ) -> Result<()> {
         if sources.len() > PAGE_SIZE {
@@ -733,7 +759,11 @@ impl<'a, 's> Ledger<'a, 's> {
             if r.recipient != rkey || r.row.source != *source {
                 return Err(bad());
             }
-            if matches!(r.row.state, State::Answered | State::Unavailable) {
+            if matches!(
+                r.row.state,
+                State::Answered | State::Unavailable | State::Answering
+            ) || r.output_pending != Some(ticket)
+            {
                 continue;
             }
             if r.output_pending.is_some() {
@@ -745,11 +775,7 @@ impl<'a, 's> Ledger<'a, 's> {
                 self.header.queued =
                     self.set(self.header.queued, ordered(&rkey, r.ordinal), None)?;
             }
-            r.row.state = if running || r.row.state == State::Answering {
-                State::Answering
-            } else {
-                State::Delivered
-            };
+            r.row.state = State::Delivered;
             r.row.wait = None;
             r.row.reason = None;
             r.row.at_millis = now;
@@ -759,6 +785,61 @@ impl<'a, 's> Ledger<'a, 's> {
         if changed_any {
             Self::reconcile_attempt(&mut s, sources);
             self.save_session(sid, s)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn observed(&mut self, receipt: &super::InputReceipt, now: u64) -> Result<()> {
+        let recipient = &receipt.recipient;
+        let (sid, mut session) = self.session(recipient)?;
+        let rkey = recipient.key();
+        let expected = ReceiptBinding {
+            ticket: receipt.ticket,
+            input: receipt.input,
+        };
+        let mut changed_any = false;
+        for source in &receipt.sources {
+            let Some(id) = self.tree().find(self.header.exact, &key(&rkey, source))? else {
+                return Err(Error::Profile(
+                    "attention receipt source is no longer retained",
+                ));
+            };
+            let mut record: Record = self.get(id)?;
+            if record.recipient != rkey || record.row.source != *source {
+                return Err(bad());
+            }
+            if record.input_receipt.as_ref() != Some(&expected) {
+                return Err(Error::Profile(
+                    "attention receipt does not match its prepared input",
+                ));
+            }
+            if matches!(
+                record.row.state,
+                State::Answering | State::Answered | State::Unavailable
+            ) {
+                continue;
+            }
+            if let Some(pending) = record.output_pending {
+                if pending != receipt.ticket {
+                    return Err(Error::Profile("attention output reservation changed"));
+                }
+                record.output_pending = None;
+                session.outputs_pending = session.outputs_pending.checked_sub(1).ok_or_else(bad)?;
+            }
+            if record.row.state == State::Queued {
+                session.queued = session.queued.checked_sub(1).ok_or_else(bad)?;
+                self.header.queued =
+                    self.set(self.header.queued, ordered(&rkey, record.ordinal), None)?;
+            }
+            record.row.state = State::Answering;
+            record.row.wait = None;
+            record.row.reason = None;
+            record.row.at_millis = now;
+            self.put(id, &record)?;
+            changed_any = true;
+        }
+        if changed_any {
+            Self::reconcile_attempt(&mut session, &receipt.sources);
+            self.save_session(sid, session)?;
         }
         Ok(())
     }

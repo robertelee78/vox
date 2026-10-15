@@ -1479,6 +1479,17 @@ impl std::str::FromStr for Format {
 /// room member chose), then `room`, everything drawn from the rooms. Claude Code and Codex take
 /// them as one text, as before; OpenCode's plugin takes them apart (see [`Format::OpenCode`]).
 fn emit(format: Format, raw_input: &str, event: &str, vox: &str, room: &str) {
+    emit_receipts(format, raw_input, event, vox, room, &[]);
+}
+
+fn emit_receipts(
+    format: Format,
+    raw_input: &str,
+    event: &str,
+    vox: &str,
+    room: &str,
+    receipts: &[vox_core::node::attention::InputReceipt],
+) {
     let context = format!("{vox}{room}");
     let chosen = match format {
         Format::Auto => {
@@ -1510,7 +1521,10 @@ fn emit(format: Format, raw_input: &str, event: &str, vox: &str, room: &str) {
         // with `async: false`, or the output is observed and discarded.
         Format::Text | Format::Auto => print!("{context}"),
         Format::OpenCode => {
-            println!("{}", serde_json::json!({ "vox": vox, "room": room }));
+            println!(
+                "{}",
+                serde_json::json!({ "vox": vox, "room": room, "attention_receipts": receipts })
+            );
         }
     }
 }
@@ -2573,6 +2587,19 @@ async fn drain(
     // Reserve only actual attributed context, never the chatter/sibling/thread counters.
     // No actor IPC runs while the pause publication file lock is held.
     let mut attention_receipts = Vec::new();
+    let native_input = if format == Format::OpenCode {
+        match std::env::var("VOX_OPENCODE_INPUT_ID") {
+            Ok(id) => Some(
+                vox_core::node::attention::opencode_input(&input.session_id, &id)
+                    .map_err(AppError::Usage)?,
+            ),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(_) => return Err(AppError::Usage("invalid OpenCode input identity".into())),
+        }
+    } else {
+        None
+    };
+    let mut input_receipts = Vec::new();
     if let Some(owner) = me {
         let at = crate::client::one_shot(paths)?;
         for (d, shown) in drains.iter().zip(&shown_in) {
@@ -2621,7 +2648,7 @@ async fn drain(
                 .map_err(|error| AppError::Usage(error.to_string()))?;
             attention_receipts.push((recipient.clone(), sources.clone(), ticket));
             for chunk in sources.chunks(6) {
-                if let Err(reason) = local(
+                let prepared = local(
                     &at,
                     owner,
                     d.channel_id,
@@ -2630,12 +2657,30 @@ async fn drain(
                         recipient: recipient.clone(),
                         sources: chunk.to_vec(),
                         ticket,
+                        input: native_input,
                     },
                 )
-                .await
-                {
-                    cancel_attention_receipts(paths, owner, &attention_receipts).await;
-                    return Err(AppError::Usage(reason));
+                .await;
+                match prepared {
+                    Ok(Reply::Prepared(prepared))
+                        if prepared.len() <= chunk.len()
+                            && prepared.iter().all(|source| chunk.contains(source)) =>
+                    {
+                        if let Some(input) = native_input.filter(|_| !prepared.is_empty()) {
+                            input_receipts.push(vox_core::node::attention::InputReceipt {
+                                recipient: recipient.clone(),
+                                input,
+                                ticket,
+                                sources: prepared,
+                            });
+                        }
+                    }
+                    reply => {
+                        cancel_attention_receipts(paths, owner, &attention_receipts).await;
+                        return Err(AppError::Usage(reply.err().unwrap_or_else(|| {
+                            "unexpected attention preparation answer".into()
+                        })));
+                    }
                 }
             }
         }
@@ -2651,8 +2696,20 @@ async fn drain(
             return held.map(|_| ());
         }
     };
-    emit(format, raw_input, &input.event, &vox, &context);
-    std::io::Write::flush(&mut std::io::stdout())?;
+    emit_receipts(
+        format,
+        raw_input,
+        &input.event,
+        &vox,
+        &context,
+        &input_receipts,
+    );
+    if let Err(error) = std::io::Write::flush(&mut std::io::stdout()) {
+        // Publication may be partial. Keep its reservations uncertain, and never append
+        // a second envelope through run()'s pre-publication error reporter.
+        eprintln!("vox agent hook: context output is unconfirmed: {error}");
+        return Ok(());
+    }
     offered.commit(paths, &input.session_id);
 
     for (file, _) in joined {
@@ -2667,21 +2724,29 @@ async fn drain(
     }
     drop(publication);
     if let Some(owner) = me {
-        let at = crate::client::one_shot(paths)?;
-        for (recipient, sources, _) in attention_receipts {
-            if let Err(reason) = vox_core::node::attention::local(
-                &at,
-                owner,
-                recipient.room,
-                Some(recipient.instance),
-                vox_core::node::attention::Operation::Received {
-                    recipient,
-                    sources,
-                    running: false,
-                },
-            )
-            .await
-            {
+        match crate::client::one_shot(paths) {
+            Ok(at) => {
+                for (recipient, sources, ticket) in attention_receipts {
+                    if let Err(reason) = vox_core::node::attention::local(
+                        &at,
+                        owner,
+                        recipient.room,
+                        Some(recipient.instance),
+                        vox_core::node::attention::Operation::Received {
+                            recipient,
+                            sources,
+                            ticket,
+                        },
+                    )
+                    .await
+                    {
+                        eprintln!("vox agent hook: attributed context was emitted, but its receipt is unconfirmed: {reason}");
+                    }
+                }
+            }
+            Err(reason) => {
+                // The one output is already public. Reporting its receipt failure must
+                // not append another JSON envelope or repeat the context.
                 eprintln!("vox agent hook: attributed context was emitted, but its receipt is unconfirmed: {reason}");
             }
         }

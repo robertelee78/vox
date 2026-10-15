@@ -196,15 +196,19 @@ function defang(text) {
 
 /**
  * What `vox agent hook --format opencode` printed: `vox`, Vox's own notices, and `room`, what
- * the rooms said. Output of any other shape is taken as room text, all of it, so it is fenced:
- * nothing reads as Vox's that Vox did not mark as its own.
+ * the rooms said, plus private receipt descriptors. Empty output means a quiet hook.
+ * Anything else must be one complete typed envelope: raw fallback could expose receipts.
  */
 function drained(stdout) {
+  if (Buffer.byteLength(stdout) > MAX_MIRROR_BYTES) throw new Error("Vox hook output exceeds its bound")
+  if (!stdout.trim()) return { vox: "", room: "", attention_receipts: [] }
+  let v
   try {
-    const v = JSON.parse(stdout)
-    if (v && typeof v.vox === "string" && typeof v.room === "string") return v
-  } catch {}
-  return { vox: "", room: stdout }
+    v = JSON.parse(stdout)
+  } catch { throw new Error("Vox hook output is not one complete JSON envelope") }
+  if (!v || Array.isArray(v) || typeof v.vox !== "string" || typeof v.room !== "string"
+    || !Array.isArray(v.attention_receipts)) throw new Error("Vox hook output is not a typed context envelope")
+  return v
 }
 
 // The agent's own node, written in by `vox agent plugin opencode --node <name>` (ADR-020 2.1): the
@@ -312,6 +316,83 @@ async function ownerOf(client, event) {
   throw new Error("OpenCode session lineage exceeds 32 ancestors")
 }
 
+const MAX_ATTENTION_SOURCES = 50
+const MAX_ATTENTION_BYTES = 128 << 10
+const nativeID = (id) => typeof id === "string" && id.length > 0
+  && Buffer.byteLength(id) <= 256 && !/[\u0000-\u001f\u007f-\u009f]/.test(id)
+const byteArray = (value, length) => Array.isArray(value) && value.length === length
+  && value.every((v) => Number.isInteger(v) && v >= 0 && v <= 255)
+function inputDigest(session, input) {
+  if (!nativeID(session) || !nativeID(input)) throw new Error("invalid OpenCode attention input identity")
+  return [...createHash("sha256").update(Buffer.concat([
+    Buffer.from("vox/attention/opencode-input/v1\0"), Buffer.from(session), Buffer.from([0]), Buffer.from(input),
+  ])).digest()]
+}
+function receiptDescriptors(value, session, input, empty = false) {
+  if (!Array.isArray(value) || (!empty && !value.length) || value.length > MAX_ATTENTION_SOURCES
+    || Buffer.byteLength(JSON.stringify(value)) > MAX_ATTENTION_BYTES) {
+    throw new Error("OpenCode attention receipts exceed their bound or have invalid shape")
+  }
+  const digest = inputDigest(session, input)
+  let count = 0
+  for (const r of value) {
+    const recipient = r?.recipient
+    if (!r || !recipient || recipient.session !== session
+      || !byteArray(recipient.room, 32) || !byteArray(recipient.instance, 16)
+      || !byteArray(recipient.opening, 32) || !byteArray(recipient.identity, 32)
+      || !byteArray(r.input, 32) || r.input.some((v, i) => v !== digest[i])
+      || !byteArray(r.ticket, 16) || !Array.isArray(r.sources)
+      || !r.sources.length || r.sources.length > 6 || !r.sources.every((source) => byteArray(source, 32))) {
+      throw new Error("OpenCode attention receipt does not match its exact input")
+    }
+    count += r.sources.length
+  }
+  if (count > MAX_ATTENTION_SOURCES) throw new Error("OpenCode attention source count exceeds its bound")
+  return value
+}
+
+/** Read only the two exact messages. A busy flag or allocated assistant is not consumption. */
+async function attentionStep(client, part, owner) {
+  if (part.sessionID !== owner) return null // Descendant ownership is not this Session.
+  if (!nativeID(part.id) || !nativeID(part.messageID) || !nativeID(part.sessionID)) {
+    throw new Error("OpenCode step has invalid authoritative identifiers")
+  }
+  const exact = async (id) => boundedJson(client,
+    `/session/${encodeURIComponent(part.sessionID)}/message/${encodeURIComponent(id)}`, MAX_MIRROR_BYTES)
+  const parent = await (async () => {
+    const assistant = await exact(part.messageID)
+    const info = assistant?.info
+    if (info?.id !== part.messageID || info.sessionID !== part.sessionID || info.role !== "assistant"
+      || !nativeID(info.parentID) || !Array.isArray(assistant.parts)
+      || assistant.parts.filter((p) => p.id === part.id && p.type === "step-start"
+        && p.messageID === info.id && p.sessionID === info.sessionID).length !== 1) {
+      throw new Error("OpenCode could not resolve the exact running assistant step")
+    }
+    if (info.summary === true || info.mode === "compaction" || info.agent === "compaction") return null
+    return info.parentID
+  })()
+  if (parent === null) return null
+  const input = await exact(parent)
+  if (input?.info?.id !== parent || input.info.sessionID !== part.sessionID
+    || input.info.role !== "user" || !Array.isArray(input.parts)) {
+    throw new Error("OpenCode could not resolve the step's exact parent input")
+  }
+  const receipts = []
+  for (const p of input.parts) {
+    if (!p.metadata || !Object.hasOwn(p.metadata, "vox_attention_receipts")) continue
+    const stamp = p.metadata.vox_attention_receipts
+    if (p.type !== "text" || p.sessionID !== part.sessionID || p.messageID !== parent
+      || !stamp || stamp.session !== part.sessionID || stamp.input !== parent) {
+      throw new Error("OpenCode persisted attention metadata on a different input")
+    }
+    receipts.push(...receiptDescriptors(stamp.receipts, part.sessionID, parent))
+    // Check the aggregate as well as each stamped part before retaining anything further.
+    receiptDescriptors(receipts, part.sessionID, parent)
+  }
+  if (!receipts.length) return null // An ordinary input with no reserved metadata.
+  return { session: part.sessionID, input: parent, assistant: part.messageID, step: part.id, receipts }
+}
+
 /** A bounded optimization only. A cache miss is resolved against OpenCode's own message. */
 function mirrorEvents(client) {
   const messages = new Map()
@@ -340,7 +421,7 @@ function mirrorEvents(client) {
     if (messages.size > MAX_MESSAGE_ROLES) messages.delete(messages.keys().next().value)
     return value
   }
-  const enrich = async (event) => {
+  const enrich = async (event, owner) => {
     if (event.type === "message.updated") remember(event.properties?.info)
     if (event.type !== "message.part.updated") return event
     const part = event.properties?.part
@@ -359,7 +440,8 @@ function mirrorEvents(client) {
       info = remember(candidate)
       if (!info) throw new Error("OpenCode supplied no user or assistant role for a part")
     }
-    return { ...event, properties: { ...event.properties, voxMessage: info } }
+    const attention = part.type === "step-start" ? await attentionStep(client, part, owner) : null
+    return { ...event, properties: { ...event.properties, voxMessage: info, voxAttention: attention } }
   }
   const drain = async () => {
     if (running) return
@@ -376,7 +458,7 @@ function mirrorEvents(client) {
             const writers = (item.targets ?? item.followers.get(owner) ?? [])
               .filter((write) => write.active && (!item.targets || !write.titleUpdated))
             if (owner && writers.length) {
-              const event = await enrich(raw)
+              const event = await enrich(raw, owner)
               if (Buffer.byteLength(JSON.stringify({ type: "event", event })) + 1 > MAX_MIRROR_BYTES) {
                 throw new Error("an enriched mirror event exceeds its line bound")
               }
@@ -398,7 +480,7 @@ function mirrorEvents(client) {
       running = false
     }
   }
-  return (event, targets = null) => {
+  const enqueue = (event, targets = null) => {
     // Only events consumed by the Session adapter need lineage. In particular, an unused
     // deletion must not GET an already-deleted session and stop unrelated observations.
     if (!["message.updated", "message.part.updated", "session.updated", "session.idle",
@@ -430,6 +512,9 @@ function mirrorEvents(client) {
       void drain()
     })
   }
+  // Hook decoding uses the same bounded, persistent private failure path as event decoding.
+  enqueue.fail = fail
+  return enqueue
 }
 
 function fanout(event, owner, writers) {
@@ -842,11 +927,10 @@ export default async function vox({ $, client, directory }) {
     },
     "chat.message": async (input, output) => {
       try {
-        const sessionID = output.message?.sessionID || input.sessionID
-        if (!sessionID) {
-          log("chat.message: no session id")
-          return
-        }
+        const sessionID = output.message?.sessionID
+        const inputID = output.message?.id
+        inputDigest(sessionID, inputID)
+        if (input.sessionID && input.sessionID !== sessionID) throw new Error("OpenCode input Session changed")
         const bin = process.env.VOX_BIN || "vox"
 
         // Whether this message is a wake notice Vox relayed, not something the operator typed:
@@ -866,7 +950,7 @@ export default async function vox({ $, client, directory }) {
         //
         // The wake channel goes to the hook alone, in its environment: the hook
         // registers it, so `vox daemon` can interrupt this session (see above).
-        const env = { ...process.env, VOX_SESSION: sessionID, VOX_HARNESS: "opencode" }
+        const env = { ...process.env, VOX_SESSION: sessionID, VOX_HARNESS: "opencode", VOX_OPENCODE_INPUT_ID: inputID }
         // This hook belongs to the actual OpenCode Session, even when its server
         // was started by another harness. Neither that parent's ID nor socket is ours.
         for (const key of ["CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_ENTRYPOINT",
@@ -892,7 +976,15 @@ export default async function vox({ $, client, directory }) {
             .env(env)
             .quiet()
             .nothrow()
-        const out = drained(result.stdout.toString())
+        let out, receipts
+        try {
+          out = drained(result.stdout.toString())
+          receipts = receiptDescriptors(out.attention_receipts, sessionID, inputID, true)
+        } catch {
+          // Never echo stdout or parser excerpts: they can contain private receipt tickets.
+          mirrorEvent.fail("Vox hook returned invalid context or receipt output; no context was injected")
+          return
+        }
         log("drain: exit=" + result.exitCode + " vox=" + out.vox.length + " room=" + out.room.length)
         // **The fence's tag is this turn's own** (V030-21): a nonce drawn now, after the drain has
         // returned, so nothing in the room text can have known it. Only `</vox-room-<nonce>>` ends
@@ -940,6 +1032,9 @@ export default async function vox({ $, client, directory }) {
         for (const part of output.parts) {
           if (part.type === "text" && typeof part.text === "string") {
             part.text = block + part.text
+            if (receipts.length) {
+              part.metadata = { ...part.metadata, vox_attention_receipts: { session: sessionID, input: inputID, receipts } }
+            }
             log("chat.message: injected " + block.length + " chars")
             return
           }
