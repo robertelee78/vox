@@ -3001,7 +3001,7 @@ async fn run_op(
     })
 }
 
-fn millis_as_time(ms: u64) -> String {
+pub(crate) fn millis_as_time(ms: u64) -> String {
     held_since(ms / 1_000)
 }
 

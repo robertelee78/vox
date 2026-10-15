@@ -23,6 +23,8 @@ pub struct SessionRow {
     pub name: Option<String>,
     /// The harness: `claude`, `codex` or `opencode`, as the node claims it.
     pub harness: String,
+    /// The registered starting directory, claimed by the Session and private to drive readers.
+    pub cwd: Option<String>,
     /// Whether it is open: opened, and not ended since.
     pub open: bool,
     /// When it opened, the author's time in milliseconds.
@@ -135,6 +137,8 @@ pub struct Opening {
     pub id: String,
     /// The harness: `claude`, `codex` or `opencode`.
     pub harness: String,
+    /// The registered starting directory, claimed by the Session and private to drive readers.
+    pub cwd: Option<String>,
     /// Its current name, if the harness gives one.
     pub name: Option<String>,
 }
@@ -164,11 +168,15 @@ pub async fn open_when_member(
     // that posts nothing would otherwise keep its old name until its next message. A Session record
     // for one already open names it again (`fold` reads it as the name from then on).
     if open.is_some_and(|row| {
-        session.name.as_ref().is_none_or(|name| {
-            row.name.is_some_and(|held| {
-                held.bytes == name.len() as u64 && held.hash == crate::hash::sha256(name.as_bytes())
+        let same = |given: &Option<String>, held: Option<(u64, Digest32)>| {
+            given.as_ref().is_none_or(|value| {
+                held.is_some_and(|held| {
+                    held.0 == value.len() as u64 && held.1 == crate::hash::sha256(value.as_bytes())
+                })
             })
-        })
+        };
+        same(&session.name, row.name.map(|f| (f.bytes, f.hash)))
+            && same(&session.cwd, row.cwd.map(|f| (f.bytes, f.hash)))
     }) {
         return Ok(());
     }
@@ -189,6 +197,7 @@ pub(crate) fn opening_parts(session: &Opening) -> Vec<String> {
     let mut env = Envelope::new(SESSION, "");
     env.from.clone_from(&session.id);
     env.at.session_name.clone_from(&session.name);
+    env.at.cwd.clone_from(&session.cwd);
     env.data = serde_json::json!({ "session": { "harness": session.harness } });
     metadata_parts(env.to_text())
 }
@@ -286,11 +295,12 @@ pub(crate) fn put_rows(e: &mut crate::cbor::Encoder, rows: &[SessionRow]) {
 }
 
 pub(crate) fn put_row(e: &mut crate::cbor::Encoder, r: &SessionRow) {
-    e.array(10)
+    e.array(11)
         .bytes(&r.node)
         .text(&r.id)
         .text(r.name.as_deref().unwrap_or_default())
         .text(&r.harness)
+        .text(r.cwd.as_deref().unwrap_or_default())
         .uint(u64::from(r.open))
         .uint(r.opened_millis)
         .uint(r.ended_millis.unwrap_or(0))
@@ -322,13 +332,19 @@ pub(crate) fn read_rows_bounded(
     }
     let mut rows = Vec::with_capacity(n.min(1024));
     for _ in 0..n {
-        if d.array().map_err(bad("ipc session row"))? != 10 {
+        let fields = d.array().map_err(bad("ipc session row"))?;
+        if !matches!(fields, 10 | 11) {
             return Err(Error::MalformedIpc("ipc session row arity"));
         }
         let node = digest(d.bytes().map_err(bad("ipc session node"))?)?;
         let id = d.text().map_err(bad("ipc session id"))?.to_owned();
         let name = d.text().map_err(bad("ipc session name"))?.to_owned();
         let harness = d.text().map_err(bad("ipc session harness"))?.to_owned();
+        let cwd = if fields == 11 {
+            d.text().map_err(bad("ipc session cwd"))?.to_owned()
+        } else {
+            String::new()
+        };
         let open = d.uint().map_err(bad("ipc session open"))? != 0;
         let opened_millis = d.uint().map_err(bad("ipc session opened"))?;
         let ended_millis = d.uint().map_err(bad("ipc session ended at"))?;
@@ -345,6 +361,7 @@ pub(crate) fn read_rows_bounded(
             id,
             name: (!name.is_empty()).then_some(name),
             harness,
+            cwd: (!cwd.is_empty()).then_some(cwd),
             open,
             opened_millis,
             ended_millis: (ended_millis != 0).then_some(ended_millis),

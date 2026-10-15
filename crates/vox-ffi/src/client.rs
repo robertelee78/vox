@@ -1400,6 +1400,32 @@ async fn exact_session(
     }
 }
 
+/// Bound a pause observation to the exact currently authorized Session opening and saved room.
+async fn pause_session_context(
+    client: &mut IpcClient,
+    room: Digest32,
+    node: Digest32,
+    id: &str,
+) -> Result<([u8; 16], Digest32), VoxError> {
+    let before = match ask(client, &Request::ArrivalHead { channel_id: room }).await? {
+        Frame::ArrivalHead { head } => head.instance,
+        other => return Err(unexpected(&other)),
+    };
+    let (sessions, _) = exact_session(client, room, node, id).await?;
+    let opening = sessions
+        .first()
+        .filter(|s| s.can_drive)
+        .ok_or_else(|| failed("The selected Session is no longer readable."))?
+        .opening;
+    match ask(client, &Request::ArrivalHead { channel_id: room }).await? {
+        Frame::ArrivalHead { head } if head.instance == before => Ok((before, opening)),
+        Frame::ArrivalHead { .. } => Err(failed(
+            "The saved room changed while reading Session pause.",
+        )),
+        other => Err(unexpected(&other)),
+    }
+}
+
 /// A paged listing whose answer did not come, or could not be read: not known to be whole, so
 /// not shown.
 fn listing_failed(what: &str, e: Error) -> VoxError {
@@ -1697,6 +1723,38 @@ fn stop_follow(following: &FollowSlot) {
     );
 }
 
+/// Explicit cancellation for one selected-Session status read. UniFFI's Swift async adapter
+/// does not forward Task.cancel, so the native owner cancels this handle as well as its Task.
+/// A handle is single-use: cancellation before start wins, and an old handle owns no later read.
+#[derive(uniffi::Object)]
+pub struct SessionPauseRead {
+    control: Mutex<SessionPauseReadControl>,
+}
+#[derive(Default)]
+struct SessionPauseReadControl {
+    started: bool,
+    cancelled: bool,
+    task: Option<tokio::task::AbortHandle>,
+}
+#[uniffi::export]
+impl SessionPauseRead {
+    #[uniffi::constructor]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            control: Mutex::new(SessionPauseReadControl::default()),
+        })
+    }
+
+    /// Idempotently stop only this read, including when called before it starts.
+    pub fn cancel(&self) {
+        let mut control = self.control.lock().unwrap_or_else(PoisonError::into_inner);
+        control.cancelled = true;
+        if let Some(task) = control.task.take() {
+            task.abort();
+        }
+    }
+}
+
 /// One captured pause selection. Its roster is bounded by the room's existing member limit;
 /// release/replacement of the app's attachment invalidates it even if the fingerprint is reused.
 #[derive(uniffi::Object)]
@@ -1815,6 +1873,8 @@ pub struct VoxClient {
     held: Slot,
     /// At most one observer; release, detach and replacement cancel it, including UI waits.
     following: FollowSlot,
+    /// One selected-owner pause read, with no waiting queue or per-history state.
+    session_pause_read: Arc<tokio::sync::Semaphore>,
     /// A connection to the daemon, kept while the client lives: a daemon a client started exits
     /// once no node is attached and no client is connected (ADR-026 L-8), and the app is its
     /// client from the moment it opens, before any node is attached.
@@ -2993,6 +3053,7 @@ impl VoxClient {
             config_dir: account.config_dir.clone(),
             held: Arc::new(tokio::sync::Mutex::new(None)),
             following: Arc::new(Mutex::new(None)),
+            session_pause_read: Arc::new(tokio::sync::Semaphore::new(1)),
             daemon_hold: Mutex::new(Some(hold)),
         }))
     }
@@ -5488,6 +5549,98 @@ impl VoxClient {
         })
     }
 
+    /// The selected Session owner's current saved pause. Only one such background read is
+    /// admitted per client; it never holds Slot while waiting for the remote owner. Cancellation
+    /// aborts the owned read. The existing FFI request bound also covers an unreachable owner.
+    ///
+    /// # Errors
+    /// The actor, attachment, room or authorized Session opening changed, or status is unknown.
+    pub async fn session_pause_status(
+        &self,
+        room: String,
+        actor: String,
+        node: String,
+        session_id: String,
+        instance: Vec<u8>,
+        read: Arc<SessionPauseRead>,
+    ) -> Result<RoomPauseState, VoxError> {
+        let room = digest(&room, "room id")?;
+        let actor = input_fingerprint(&actor)?;
+        let node = input_fingerprint(&node)?;
+        let expected_instance: [u8; 16] = instance
+            .try_into()
+            .map_err(|_| failed("The selected Session has no saved room instance."))?;
+        let permit = Arc::clone(&self.session_pause_read)
+            .try_acquire_owned()
+            .map_err(|_| failed("The selected Session's pause is still being read."))?;
+        let held = Arc::clone(&self.held);
+        let task = {
+            let mut control = read.control.lock().unwrap_or_else(PoisonError::into_inner);
+            if control.cancelled || control.started {
+                return Err(failed(
+                    "The Session pause read was cancelled or already used.",
+                ));
+            }
+            control.started = true;
+            // Registration and cancellation share this short lock. No cancellation can land
+            // between checking the flag and retaining the task's exact abort handle.
+            let task = self.rt.spawn(async move {
+            let _permit = permit;
+            tokio::time::timeout(REQUEST_WITHIN, async {
+                let (at, attachment) = {
+                    let slot = held.lock().await;
+                    let h = slot.as_ref().ok_or_else(not_attached)?;
+                    if h.client.me() != Some(actor) {
+                        return Err(failed("The acting node changed while reading Session pause."));
+                    }
+                    (h.at.clone(), Arc::clone(&h.attachment))
+                };
+                // An independent control connection keeps even local readiness/authorization
+                // waits outside the shared Slot used by room reads and message delivery.
+                let mut client = IpcClient::open_at(&at).await
+                    .map_err(|e| listing_failed("Session pause", e))?;
+                if client.me() != Some(actor) {
+                    return Err(failed("The acting node changed while reading Session pause."));
+                }
+                let (instance, opening) =
+                    pause_session_context(&mut client, room, node, &session_id).await?;
+                if instance != expected_instance {
+                    return Err(failed("The saved room changed while reading Session pause."));
+                }
+                let state = vox_core::node::room_pause::status_checked(
+                    &at, room, node, actor, instance,
+                ).await.map_err(|e| failed(e.to_string()))?;
+                if pause_session_context(&mut client, room, node, &session_id).await?
+                    != (instance, opening)
+                {
+                    return Err(failed("The selected Session changed while reading its pause."));
+                }
+                let slot = held.lock().await;
+                let h = slot.as_ref().ok_or_else(not_attached)?;
+                if !Arc::ptr_eq(&attachment, &h.attachment) || h.client.me() != Some(actor) {
+                    return Err(failed("The acting node attachment changed while reading Session pause."));
+                }
+                Ok(state.into())
+            }).await.unwrap_or_else(|_| Err(failed(
+                "Pause status is unknown: the Session's owner or local node did not answer within 60 seconds.",
+            )))
+            });
+            control.task = Some(task.abort_handle());
+            task
+        };
+        // Unlike the general mutation wrapper, this read has no uncertain write to preserve.
+        // Dropping the foreign future cancels its task instead of leaving a detached poll.
+        struct CancelRead(Arc<SessionPauseRead>);
+        impl Drop for CancelRead {
+            fn drop(&mut self) {
+                self.0.cancel();
+            }
+        }
+        let _cancel = CancelRead(read);
+        task.await
+            .map_err(|_| failed("The Session pause read was cancelled."))?
+    }
+
     /// Capture the current room roster without collecting Session history.
     ///
     /// # Errors
@@ -6278,28 +6431,108 @@ impl VoxClient {
     /// What a member's client says when `member` joins `room` (ADR-028 K-7), word for word as the
     /// TUI says it: its name (alias, else its fingerprint marked "(not in keyring)"), "joined.",
     /// and which nodes in this node's keyring trust it, from the consent grants on the room's log.
-    /// It adds nothing to any keyring.
+    /// It adds nothing to any keyring. A current drive-readable opening can enrich that same
+    /// line with its registered directory; no Session history or new notice is produced.
     ///
     /// # Errors
-    /// A malformed id, the room not open here, or the daemon's refusal.
+    /// A malformed id, the room not open here, changed authority or oversized join metadata.
+    /// A caller must remove any prior private caption on failure.
     pub async fn join_said(&self, room: String, member: String) -> Result<String, VoxError> {
         let who = input_fingerprint(&member)?;
-        let (open, names) = self.open_snap(&room).await?;
-        let Some(open) = open else {
-            return Err(failed("the room is not open on this node"));
-        };
-        let mut trusters: Vec<String> = open
-            .trusted_by
-            .iter()
-            .find(|(m, _)| *m == who)
-            .map(|(_, by)| by.iter().filter_map(|fp| names.get(fp).cloned()).collect())
-            .unwrap_or_default();
-        trusters.sort();
-        let name = vox_text::offer::name(names.get(&who).map(String::as_str), &b32_encode(&who));
-        Ok(format!(
-            "{name} joined. {}",
-            vox_text::offer::trusted_by(&trusters)
-        ))
+        let channel_id = digest(&room, "room id")?;
+        // Only the daemon's inventory proves that an author is on this Mac. A harness,
+        // claimed hostname or a reader's alias cannot establish that fact.
+        let local = self
+            .nodes()
+            .await?
+            .into_iter()
+            .find(|n| n.fingerprint == b32_encode(&who));
+        on_held!(self, |c| {
+            let before = match ask(c, &Request::ArrivalHead { channel_id }).await? {
+                Frame::ArrivalHead { head } => head.instance,
+                other => return Err(unexpected(&other)),
+            };
+            let names = names(c).await?;
+            let bytes = c
+                .exchange(&vox_core::node::snapshot::request_body())
+                .await
+                .map_err(|e| {
+                    read_interrupted(e, |e| format!("the vox daemon stopped answering: {e}"))
+                })?;
+            let snap = vox_core::node::snapshot::NodeSnapshot::from_bytes(&bytes)
+                .map_err(|e| failed(e.to_string()))?
+                .ok_or_else(|| failed("the vox daemon did not answer with the node's state"))?;
+            let open = snap
+                .open
+                .into_iter()
+                .find(|o| o.channel_id == channel_id)
+                .ok_or_else(|| failed("the room is not open on this node"))?;
+            if !open.members.contains(&who) {
+                return Err(failed("the node is no longer a member of this room"));
+            }
+            let mut trusters: Vec<String> = open
+                .trusted_by
+                .iter()
+                .find(|(m, _)| *m == who)
+                .map(|(_, by)| by.iter().filter_map(|fp| names.get(fp).cloned()).collect())
+                .unwrap_or_default();
+            trusters.sort();
+            let name =
+                vox_text::offer::name(names.get(&who).map(String::as_str), &b32_encode(&who));
+            let ordinary = format!("{name} joined. {}", vox_text::offer::trusted_by(&trusters));
+            let session = match ask(
+                c,
+                &Request::SessionJoin {
+                    channel_id,
+                    node: who,
+                },
+            )
+            .await?
+            {
+                Frame::SessionsPage {
+                    mut sessions,
+                    summaries,
+                    more: false,
+                } if sessions.len() <= 1
+                    && sessions.len() == summaries.len()
+                    && sessions
+                        .iter()
+                        .all(|s| s.node == who && s.open && s.can_drive) =>
+                {
+                    sessions.pop()
+                }
+                other => return Err(unexpected(&other)),
+            };
+            let after = match ask(c, &Request::ArrivalHead { channel_id }).await? {
+                Frame::ArrivalHead { head } => head.instance,
+                other => return Err(unexpected(&other)),
+            };
+            if before != after {
+                return Err(failed("the saved room changed; refresh its join line"));
+            }
+            let Some(cwd) = session.and_then(|s| s.cwd).filter(|cwd| !cwd.is_empty()) else {
+                return Ok(ordinary);
+            };
+            let label = names
+                .get(&who)
+                .cloned()
+                .or_else(|| local.as_ref().map(|n| shown_name(&n.name)))
+                .unwrap_or(name);
+            let location = if local.is_some() {
+                " (on this Mac)"
+            } else {
+                ""
+            };
+            let room = open
+                .name
+                .map(|name| shown_name(&name))
+                .unwrap_or_else(|| b32_encode(&channel_id));
+            Ok(format!(
+                "{label}{location} joined {room} and is working in {}. {}",
+                shown_name(&cwd),
+                vox_text::offer::trusted_by(&trusters)
+            ))
+        })
     }
 
     /// Where each of this node's own recent messages in `room` is (ADR-028 R-6), from how many of

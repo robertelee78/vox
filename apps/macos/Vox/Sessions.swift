@@ -78,6 +78,26 @@ extension NodeModel {
         return sessions.first { $0.nodeFingerprint == node && $0.sessionId == id }
     }
 
+    /// Pause is the owning node's live room state, independently of the saved transcript.
+    /// An unavailable owner is unknown; absence of a response never means resumed.
+    var sessionPauseWords: String? {
+        guard showingSession, shownSession?.canDrive == true else { return nil }
+        guard sessionPauseIsCurrent else { return "Pause status unknown; waiting for the selected Session." }
+        if let error = sessionPauseError { return "Pause status unknown. \(error)" }
+        guard let state = sessionPause else { return "Checking pause status…" }
+        guard state.paused else { return nil }
+        let when = Date(timeIntervalSince1970: Double(state.atMillis) / 1000)
+            .formatted(date: .abbreviated, time: .standard)
+        return "Paused by \(roomPauseName(state.by)) at \(when)"
+    }
+
+    func sessionPauseMark(_ session: FfiSession) -> String {
+        guard showing == .session(node: session.nodeFingerprint, id: session.sessionId),
+              sessionPauseIsCurrent, sessionPause?.paused == true,
+              sessionPauseError == nil else { return "" }
+        return " · Paused"
+    }
+
     /// Another node's Session's header, with drive or without (ADR-029 MD-3, as the TUI says it):
     /// its name and id are that node's claim. None for this node's own Sessions (their node's
     /// alias is empty): the claim is this node's own.
@@ -111,8 +131,8 @@ struct RoomTabs: View {
                     ForEach(model.openSessions.map { RoomSessionTab(room: room, session: $0) }) { item in
                         let session = item.session
                         Divider().frame(height: 20)
-                        tab(session.pending > 0 ? "! " + model.sessionTabLabel(session) + " · waiting on you"
-                                                : model.sessionTabLabel(session),
+                        tab((session.pending > 0 ? "! " + model.sessionTabLabel(session) + " · waiting on you"
+                                                : model.sessionTabLabel(session)) + model.sessionPauseMark(session),
                             .session(node: session.nodeFingerprint, id: session.sessionId),
                             id: "session-\(session.shortId)")
                     }
