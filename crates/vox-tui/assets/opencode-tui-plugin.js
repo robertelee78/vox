@@ -226,3 +226,4 @@ export async function tui(api) {
   helper.on("error", () => {})
   helper.unref()
 }
+export default { id, tui }

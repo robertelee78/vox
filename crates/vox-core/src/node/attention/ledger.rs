@@ -11,6 +11,10 @@ use serde::{Deserialize, Serialize};
 const KIND: SegmentKind = SegmentKind::SessionAttention;
 const RECORD_BYTES: usize = 16 * 1024;
 type Key = [u8; 64];
+type MaintenancePage = (
+    Option<(Digest32, u64)>,
+    Vec<(Recipient, Option<(Digest32, State)>)>,
+);
 
 #[derive(Serialize, Deserialize)]
 struct Header {
@@ -862,12 +866,7 @@ impl<'a, 's> Ledger<'a, 's> {
             }),
         })
     }
-    pub(crate) fn maintenance(
-        &self,
-    ) -> Result<(
-        Option<(Digest32, u64)>,
-        Vec<(Recipient, Option<(Digest32, State)>)>,
-    )> {
+    pub(crate) fn maintenance(&self) -> Result<MaintenancePage> {
         let mut after = self.header.cleanup;
         let mut records = Vec::new();
         for _ in 0..32 {
