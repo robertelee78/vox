@@ -5372,8 +5372,9 @@ async fn write_found(
     Ok(true)
 }
 
-/// Validate and stream one bounded activity page. The preflight retains only bounded
-/// multipart coordinates, and emission retains one row; no room snapshot crosses an await.
+/// Validate and stream one bounded activity page. Preflight retains bounded multipart
+/// coordinates and emitted locators; emission retains those locators and one row.
+/// No room snapshot crosses an await.
 async fn write_session_activity(
     stream: &mut UnixStream,
     handle: &NodeHandle,
@@ -5464,6 +5465,11 @@ async fn write_session_activity(
         return Ok(true);
     }
     let mut preflight = session_activity::Preflight::new(plan.visible);
+    // A page can select the same part/outcome through several origins. Keep the first
+    // occurrence without asking the actor to re-read every preceding origin. Insert only
+    // after preflight's row/byte checks: at most SESSION_READ_ROWS locators live here,
+    // scoped to this request, never accumulated across pages or retained by the actor.
+    let mut emitted = std::collections::BTreeSet::new();
     let mut cursor = Cursor::default();
     loop {
         let Reply::Companions { arrivals, next } = answer!(Query::Companions {
@@ -5473,6 +5479,9 @@ async fn write_session_activity(
             return Err(Error::MalformedIpc("unexpected Session activity locators"));
         };
         for arrival in arrivals {
+            if emitted.contains(&arrival) {
+                continue;
+            }
             let Reply::Row(row) = answer!(Query::Row {
                 plan: plan.clone(),
                 arrival
@@ -5491,6 +5500,7 @@ async fn write_session_activity(
                 .await?;
                 return Ok(true);
             }
+            emitted.insert(arrival);
         }
         match next {
             Some(next) => cursor = next,
@@ -5531,6 +5541,7 @@ async fn write_session_activity(
     let mut offset = 0usize;
     reply_part(stream, &prefix.finish(), &mut offset, true, writing).await?;
     cursor = Cursor::default();
+    emitted.clear();
     let mut sent = 0usize;
     loop {
         let Reply::Companions { arrivals, next } = answer!(Query::Companions {
@@ -5540,6 +5551,9 @@ async fn write_session_activity(
             return Err(Error::MalformedIpc("unexpected Session activity locators"));
         };
         for arrival in arrivals {
+            if emitted.contains(&arrival) {
+                continue;
+            }
             let Reply::Row(row) = answer!(Query::Row {
                 plan: plan.clone(),
                 arrival
@@ -5552,6 +5566,7 @@ async fn write_session_activity(
             if sent > count {
                 return Err(Error::MalformedIpc("Session activity row count changed"));
             }
+            emitted.insert(arrival);
             let mut e = Encoder::new();
             e.array(5)
                 .bytes(&row.entry_hash)

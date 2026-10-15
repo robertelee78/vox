@@ -243,41 +243,6 @@ fn bound_selection(rows: u64, bytes: u64) -> Result<()> {
     Ok(())
 }
 
-/// Test membership in an earlier selected origin instead of retaining a set of
-/// every emitted part. The number of selected origins has the public page bound.
-fn already_in(read: &Read<'_>, origins: &[u64], f: &Fact) -> Result<bool> {
-    for origin in origins {
-        if *origin == f.arrival {
-            return Ok(true);
-        }
-        let old = fact(read, *origin)?;
-        if read
-            .activity_find(T::Parts, &member_key(&old.hash, f.arrival))?
-            .is_some()
-        {
-            return Ok(true);
-        }
-        if let Some(reference) = old.outcome_reference() {
-            if outcome_kind(old.kind) != Some(f.kind) {
-                continue;
-            }
-            if old.association.is_some() && old.author != f.author {
-                continue;
-            }
-            if read
-                .activity_find(
-                    T::Outcomes,
-                    &member_key(&authored(&reference, &f.author), f.arrival),
-                )?
-                .is_some()
-            {
-                return Ok(true);
-            }
-        }
-    }
-    Ok(false)
-}
-
 fn next_companion(
     read: &Read<'_>,
     plan: &Plan,
@@ -417,31 +382,16 @@ impl ChannelState {
                                 next: None,
                             });
                         }
-                        let owner = cursor.origin;
-                        let phase = cursor.phase;
                         if let Some(arrival) = next_companion(&read, &plan, &mut cursor, &authors)?
                         {
                             let f = fact(&read, arrival)?;
                             if !authors.contains(&f.author) {
                                 return Err(Error::StreamRefused(CHANGED));
                             }
-                            let own = if phase == 2 {
-                                let original = fact(&read, plan.origins[owner])?;
-                                original.arrival == arrival
-                                    || read
-                                        .activity_find(
-                                            T::Parts,
-                                            &member_key(&original.hash, arrival),
-                                        )?
-                                        .is_some()
-                            } else {
-                                false
-                            };
-                            if !plan.visible
-                                || (!own && !already_in(&read, &plan.origins[..owner], &f)?)
-                            {
-                                arrivals.push(arrival);
-                            }
+                            // The IPC reader deduplicates this bounded page's locators.
+                            // Rescanning every earlier origin here makes one actor turn
+                            // perform quadratic sealed lookups even for plain user rows.
+                            arrivals.push(arrival);
                             if arrivals.len() == 64 {
                                 break;
                             }
