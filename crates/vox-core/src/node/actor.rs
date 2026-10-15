@@ -19685,6 +19685,22 @@ impl Node {
             .cloned()
             .map(|room| (room.room, room))
             .collect();
+        // A checked local setting can publish a newer observation before a full
+        // view gets the room lock or saves the inventory. Keep that observation
+        // through a later busy-room fallback; otherwise an acknowledged rename or
+        // anchor change can regress. It is last-known until read under the lock.
+        // The saved cache remains unchanged on save failure, so publish retries it;
+        // authoritative enumeration below still prunes rooms no longer held.
+        for previous in &prev.room_anchors {
+            if inventory
+                .get(&previous.room)
+                .is_none_or(|saved| saved.observed_at < previous.observed_at)
+            {
+                let mut observed = previous.clone();
+                observed.stale = true;
+                inventory.insert(observed.room, observed);
+            }
+        }
         let mut known: Vec<Digest32> = match saved_rooms {
             Ok(Some(saved)) => {
                 inventory.retain(|room, _| saved.contains(room));
