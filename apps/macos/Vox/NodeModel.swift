@@ -343,16 +343,15 @@ final class NodeModel: ObservableObject {
         let room: String
         let owner: String
         let session: String
-        let instance: Data
         let epoch: UUID
         let generation: UUID
     }
     private var sessionPauseContext: SessionPauseContext? {
         guard ended == nil, daemonReachable, let room = roomOnScreen,
-              let session = shownSession, session.canDrive,
-              let instance = sessionPages.instance else { return nil }
+              let session = shownSession, session.canDrive else { return nil }
+        // Live pause authority is read by the FFI independently of transcript availability.
         return .init(room: room, owner: session.nodeFingerprint, session: session.sessionId,
-                     instance: instance, epoch: nodeObservationEpoch, generation: roomReadGeneration)
+                     epoch: nodeObservationEpoch, generation: roomReadGeneration)
     }
     private var observedSessionPause: SessionPauseContext?
     var sessionPauseIsCurrent: Bool {
@@ -386,8 +385,7 @@ final class NodeModel: ObservableObject {
             let result: Result<RoomPauseState, Error>
             do {
                 result = .success(try await client.sessionPauseStatus(room: context.room,
-                    actor: actor, node: context.owner, sessionId: context.session,
-                    instance: context.instance, read: request))
+                    actor: actor, node: context.owner, sessionId: context.session, read: request))
             } catch { result = .failure(error) }
             guard !Task.isCancelled, let self, self.sessionPauseRead == token,
                   self.sessionPauseContext == context else { return }
@@ -3149,6 +3147,14 @@ final class NodeModel: ObservableObject {
                 await self.refreshSessionMetadata()
                 guard !Task.isCancelled, self.roomReadGeneration == generation, self.nodeObservationEpoch == scope.epoch,
                       self.selection == .room(room), self.ended == nil else { return }
+                // A failed exact lookup keeps the selected descriptor unavailable even if
+                // the bounded tab pages recover. Retry only that missing metadata here;
+                // transcript reload remains the person's explicit action.
+                if self.showingSession && self.shownSession == nil {
+                    await self.readSelectedSessionMetadata()
+                    guard !Task.isCancelled, self.roomReadGeneration == generation, self.nodeObservationEpoch == scope.epoch,
+                          self.selection == .room(room), self.ended == nil else { return }
+                }
                 self.scheduleSessionPauseRead()
                 let visibleFiles = self.displayedFileIDs
                 if visibleFiles == fileIDs, let copies = fileFacts?.copies {
