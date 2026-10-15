@@ -16,7 +16,12 @@ pub(crate) enum Query {
         before: Option<Digest32>,
         limit: usize,
     },
-    ViewLocate {
+    ViewRows {
+        view: crate::node::api::RoomView,
+        instance: [u8; 16],
+        entries: Vec<Digest32>,
+    },
+    ViewRevision {
         view: crate::node::api::RoomView,
         instance: [u8; 16],
         entries: Vec<Digest32>,
@@ -349,6 +354,15 @@ impl View<'_> {
         Ok(row)
     }
 
+    fn view_instance(&self, instance: [u8; 16]) -> Answer<()> {
+        if instance != self.rendered.history_instance() {
+            return Err(Failure::Request(
+                "the saved room changed; open its current page again",
+            ));
+        }
+        Ok(())
+    }
+
     fn view_filter(&self, view: &crate::node::api::RoomView) -> Answer<Filter> {
         use crate::node::api::RoomView;
         match view {
@@ -632,35 +646,107 @@ impl View<'_> {
                 before,
                 limit,
             } => self.view_page(&view, instance, before, limit, bytes),
-            Query::ViewLocate {
+            Query::ViewRows {
                 view,
                 instance,
                 entries,
             } => {
-                if instance != self.rendered.history_instance() {
-                    return Err(Failure::Request(
-                        "the saved room changed; open its current page again",
-                    ));
-                }
+                self.view_instance(instance)?;
                 if entries.len() > crate::node::ipc::MAX_FIND {
                     return Err(Failure::Request("too many message ids"));
                 }
                 let filter = self.view_filter(&view)?;
-                let mut found = BTreeSet::new();
+                let mut found = BTreeMap::new();
+                let mut used = 0usize;
                 for hash in entries {
-                    if self.view_contains(&filter, &hash)? && self.row(&hash)?.is_some() {
+                    if !self.view_contains(&filter, &hash)? {
+                        continue;
+                    }
+                    if let Some(row) = self.row(&hash)? {
                         let key = self
                             .rendered
                             .order()
                             .key(&hash)?
                             .ok_or(Error::MalformedAtRest("selected located row order missing"))?;
-                        found.insert(key);
+                        if found.contains_key(&key) {
+                            continue;
+                        }
+                        used = used.saturating_add(row.text.len() + crate::node::ipc::ROW_OVERHEAD);
+                        if !found.is_empty() && used > bytes {
+                            return Err(Failure::Request(
+                                crate::node::ipc::ROOM_VIEW_CHUNK_TOO_LARGE,
+                            ));
+                        }
+                        found.insert(key, row);
                     }
                 }
-                Ok(Reply::Located {
-                    entries: found.into_iter().map(|(_, hash)| hash).collect(),
-                    revision: Revision::of(self.ch, &self.rendered)?,
-                })
+                // One bounded snapshot, released before IPC writes or waits. An unrelated
+                // arrival cannot invalidate the middle of this selected chunk.
+                Ok(Reply::Rows(found.into_values().collect()))
+            }
+            Query::ViewRevision {
+                view,
+                instance,
+                entries,
+            } => {
+                self.view_instance(instance)?;
+                if entries.len() > crate::node::ipc::MAX_ROOM_SELECTION {
+                    return Err(Failure::Request("too many held message ids"));
+                }
+                let filter = self.view_filter(&view)?;
+                use sha2::{Digest, Sha256};
+                let mut hash = Sha256::new();
+                hash.update(b"vox-room-held-selection-v1");
+                hash.update(self.ch.channel_id());
+                hash.update(instance);
+                hash.update(self.ch.projection_state.incarnation.to_be_bytes());
+                hash.update(self.ch.effective_retention().to_be_bytes());
+                hash.update(self.ch.effective_step_retention().to_be_bytes());
+                // A render epoch is a rewrite, not an ordinary append. No whole-history
+                // count, root or arrival generation belongs to this selected-ID fence.
+                hash.update(self.rendered.display_roots()[3].to_be_bytes());
+                match view {
+                    crate::node::api::RoomView::General => hash.update([0]),
+                    crate::node::api::RoomView::All => hash.update([1]),
+                    crate::node::api::RoomView::Tag(tag) => {
+                        hash.update([2]);
+                        hash.update((tag.len() as u64).to_be_bytes());
+                        hash.update(tag.as_bytes());
+                    }
+                }
+                hash.update((entries.len() as u64).to_be_bytes());
+                for entry in entries {
+                    hash.update(entry);
+                    if !self.view_contains(&filter, &entry)? {
+                        hash.update([0]);
+                        continue;
+                    }
+                    if let Some(fact) = self.rendered.fact(&entry)? {
+                        // The immutable entry/cache binding identifies the body without
+                        // decrypting every selected body just to fingerprint the window.
+                        hash.update([1]);
+                        for value in [fact.cache, fact.epoch, fact.shown, fact.created] {
+                            hash.update(value.to_be_bytes());
+                        }
+                    } else if let Some(row) = self.row(&entry)? {
+                        // No render fact means only a currently readable owed placeholder
+                        // can reach here. row() rechecks missing membership and expiry.
+                        hash.update([2]);
+                        hash.update(row.author);
+                        hash.update(row.created_millis.to_be_bytes());
+                    } else {
+                        hash.update([0]);
+                        continue;
+                    }
+                    let (clock, id) = self
+                        .rendered
+                        .order()
+                        .key(&entry)?
+                        .ok_or(Error::MalformedAtRest("held selection order missing"))?;
+                    hash.update(clock.to_be_bytes());
+                    hash.update(id);
+                }
+                Ok(Reply::DisplayRevision(hash.finalize().into()))
             }
             Query::DisplayRevision => {
                 use sha2::{Digest, Sha256};

@@ -2336,8 +2336,11 @@ macro_rules! on_held {
 
 /// A native window holds at most 128 selected messages and 128 KiB of raw row data.
 /// One legal row may stand alone above the byte budget, as in the daemon's pages.
-const ROOM_WINDOW_ROWS: usize = 128;
+const ROOM_WINDOW_ROWS: usize = vox_core::node::ipc::MAX_ROOM_SELECTION;
 const ROOM_WINDOW_BYTES: usize = vox_core::node::ipc::ROWS_BUDGET;
+// Swift already holds at most 128 rows / 8 MiB. A selected refresh applies that
+// existing aggregate bound across its smaller atomic IPC chunks, under one fence.
+const ROOM_HELD_BYTES: usize = 8 * 1024 * 1024;
 
 /// Newest/older pages and exact held refresh share this logical-origin ceiling.
 /// Multipart pieces and outcomes do not add rendered rows. The daemon's existing
@@ -2369,6 +2372,94 @@ fn room_window_bytes(rows: &[MessageRow]) -> Result<(), VoxError> {
         ));
     }
     Ok(())
+}
+
+/// Refresh a held General/All/tag window under one selected-ID fence. Only a
+/// definite per-chunk byte refusal is split; no authority, expiry or revision
+/// failure is retried. Generic Find and thread reads keep their existing contract.
+async fn room_view_selection(
+    client: &mut IpcClient,
+    channel_id: Digest32,
+    view: vox_core::node::api::RoomView,
+    actor: Digest32,
+    instance: [u8; 16],
+    entries: &[Digest32],
+) -> Result<FfiRoomRead, VoxError> {
+    let fence_request = Request::RoomViewRevision {
+        channel_id,
+        view: view.clone(),
+        instance,
+        entries: entries.to_vec(),
+    };
+    let fence = match ask(client, &fence_request).await? {
+        Frame::RoomDisplayRevision { revision } => revision,
+        other => return Err(unexpected(&other)),
+    };
+    let names = names(client).await?;
+    let mut found = HashMap::new();
+    let mut bytes = 0usize;
+    let mut pending: Vec<_> = entries
+        .chunks(vox_core::node::ipc::MAX_FIND)
+        .rev()
+        .collect();
+    while let Some(chunk) = pending.pop() {
+        let request = Request::RoomViewFind {
+            channel_id,
+            view: view.clone(),
+            instance,
+            entries: chunk.to_vec(),
+        };
+        let rows = match ask(client, &request).await {
+            Ok(Frame::Rows { rows }) => rows,
+            Ok(other) => return Err(unexpected(&other)),
+            Err(VoxError::Failed { reason })
+                if reason == vox_core::node::ipc::ROOM_VIEW_CHUNK_TOO_LARGE && chunk.len() > 1 =>
+            {
+                let middle = chunk.len() / 2;
+                pending.push(&chunk[middle..]);
+                pending.push(&chunk[..middle]);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        room_window_bytes(&rows)?;
+        for row in rows {
+            if !chunk.contains(&row.entry_hash) {
+                return Err(failed(
+                    "The room returned a message outside the held selection.",
+                ));
+            }
+            if found.contains_key(&row.entry_hash) {
+                continue;
+            }
+            bytes = bytes.saturating_add(row.text.len() + vox_core::node::ipc::ROW_OVERHEAD);
+            if !found.is_empty() && bytes > ROOM_HELD_BYTES {
+                return Err(failed(
+                    "The held room selection exceeds its 8 MiB window budget. Open a smaller page.",
+                ));
+            }
+            found.insert(row.entry_hash, row);
+        }
+    }
+    match ask(client, &fence_request).await? {
+        Frame::RoomDisplayRevision { revision } if revision == fence && client.me() == Some(actor) => {}
+        Frame::RoomDisplayRevision { .. } => return Err(failed(
+            "The held messages or their authority changed while reading. Open their current page again.",
+        )),
+        other => return Err(unexpected(&other)),
+    }
+    let me = b32_encode(&actor);
+    Ok(FfiRoomRead {
+        instance: instance.to_vec(),
+        messages: entries
+            .iter()
+            .filter_map(|id| found.remove(id))
+            .map(|row| rendered(&row, &names, Some(&me)))
+            .collect(),
+        // A held refresh must never replace the owner's older-page metadata.
+        older: 0,
+        before: None,
+    })
 }
 
 impl VoxClient {
@@ -2544,6 +2635,9 @@ impl VoxClient {
                     "The acting node changed before refreshing this room.",
                 ));
             }
+            if let Some(view) = view {
+                return room_view_selection(c, channel_id, view, actor, instance, &entries).await;
+            }
             let fence = room_read_fence(c, channel_id).await?;
             if fence.0 != instance {
                 return Err(failed(
@@ -2556,17 +2650,9 @@ impl VoxClient {
             for chunk in entries.chunks(vox_core::node::ipc::MAX_FIND) {
                 // Find itself streams one coherent selection. At most 64 bounded raw rows
                 // exist in this temporary reply, independent of the room's history size.
-                let request = match &view {
-                    Some(view) => Request::RoomViewFind {
-                        channel_id,
-                        view: view.clone(),
-                        instance,
-                        entries: chunk.to_vec(),
-                    },
-                    None => Request::Find {
-                        channel_id,
-                        entries: chunk.to_vec(),
-                    },
+                let request = Request::Find {
+                    channel_id,
+                    entries: chunk.to_vec(),
                 };
                 let rows = match ask(c, &request).await? {
                     Frame::Rows { rows } => rows,
