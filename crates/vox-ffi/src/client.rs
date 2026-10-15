@@ -2338,9 +2338,11 @@ macro_rules! on_held {
 /// One legal row may stand alone above the byte budget, as in the daemon's pages.
 const ROOM_WINDOW_ROWS: usize = vox_core::node::ipc::MAX_ROOM_SELECTION;
 const ROOM_WINDOW_BYTES: usize = vox_core::node::ipc::ROWS_BUDGET;
-// Swift already holds at most 128 rows / 8 MiB. A selected refresh applies that
-// existing aggregate bound across its smaller atomic IPC chunks, under one fence.
-const ROOM_HELD_BYTES: usize = 8 * 1024 * 1024;
+// At most 128 legal raw rows: 8 MiB of raw text plus 16 KiB of wire metadata.
+// This bounded scratch is distinct from Swift's unchanged 8 MiB rendered-window
+// cap: JSON escaping can make a legal raw envelope larger than its visible text.
+const ROOM_HELD_BYTES: usize =
+    ROOM_WINDOW_ROWS * (vox_core::node::content::MAX_TEXT_LEN + vox_core::node::ipc::ROW_OVERHEAD);
 
 /// Newest/older pages and exact held refresh share this logical-origin ceiling.
 /// Multipart pieces and outcomes do not add rendered rows. The daemon's existing
@@ -2433,9 +2435,9 @@ async fn room_view_selection(
                 continue;
             }
             bytes = bytes.saturating_add(row.text.len() + vox_core::node::ipc::ROW_OVERHEAD);
-            if !found.is_empty() && bytes > ROOM_HELD_BYTES {
+            if bytes > ROOM_HELD_BYTES {
                 return Err(failed(
-                    "The held room selection exceeds its 8 MiB window budget. Open a smaller page.",
+                    "The held room selection exceeds its maximum raw message size. Open a smaller page.",
                 ));
             }
             found.insert(row.entry_hash, row);
