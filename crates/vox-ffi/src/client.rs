@@ -5552,6 +5552,8 @@ impl VoxClient {
     /// The selected Session owner's current saved pause. Only one such background read is
     /// admitted per client; it never holds Slot while waiting for the remote owner. Cancellation
     /// aborts the owned read. The existing FFI request bound also covers an unreachable owner.
+    /// The current room instance is captured here, never borrowed from a transcript page;
+    /// history expiry or an explicit reload requirement does not prevent live status recovery.
     ///
     /// # Errors
     /// The actor, attachment, room or authorized Session opening changed, or status is unknown.
@@ -5561,15 +5563,11 @@ impl VoxClient {
         actor: String,
         node: String,
         session_id: String,
-        instance: Vec<u8>,
         read: Arc<SessionPauseRead>,
     ) -> Result<RoomPauseState, VoxError> {
         let room = digest(&room, "room id")?;
         let actor = input_fingerprint(&actor)?;
         let node = input_fingerprint(&node)?;
-        let expected_instance: [u8; 16] = instance
-            .try_into()
-            .map_err(|_| failed("The selected Session has no saved room instance."))?;
         let permit = Arc::clone(&self.session_pause_read)
             .try_acquire_owned()
             .map_err(|_| failed("The selected Session's pause is still being read."))?;
@@ -5604,9 +5602,6 @@ impl VoxClient {
                 }
                 let (instance, opening) =
                     pause_session_context(&mut client, room, node, &session_id).await?;
-                if instance != expected_instance {
-                    return Err(failed("The saved room changed while reading Session pause."));
-                }
                 let state = vox_core::node::room_pause::status_checked(
                     &at, room, node, actor, instance,
                 ).await.map_err(|e| failed(e.to_string()))?;
