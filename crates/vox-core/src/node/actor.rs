@@ -17700,7 +17700,7 @@ impl Node {
         let now_ms = self.now_ms();
         let outcome = {
             let mut channel = shared.lock().await;
-            channel
+            let outcome = channel
                 .add_service(profile.store(), profile, service_tag, local, kind, persist)
                 .and_then(|_| {
                     // A share is said to the room so its members can list it (V030-25); a
@@ -17719,7 +17719,11 @@ impl Node {
                         }
                         Ok(()) => Ok(()),
                     }
-                })
+                });
+            if outcome.is_ok() {
+                self.publish_service_offers(&channel);
+            }
+            outcome
         };
         match outcome {
             Ok(()) => {
@@ -17758,6 +17762,9 @@ impl Node {
             if matches!(removed, Ok(true)) && was_shared {
                 let _ = channel.say_share(profile, service_tag, false, now_ms);
             }
+            if matches!(removed, Ok(true)) {
+                self.publish_service_offers(&channel);
+            }
             removed
         };
         match outcome {
@@ -17769,6 +17776,31 @@ impl Node {
             Ok(false) => Outcome::Failed(Fault::NotOffered),
             Err(e) => Outcome::Failed(fault_of(&e)),
         }
+    }
+
+    /// Publish local offers while the successful mutation still holds the room lock.
+    /// A full detail can be unavailable during governance/Session refresh, and the next
+    /// publish can miss a busy room. Both fallback snapshots must already contain this
+    /// bounded local configuration before the command acknowledges it.
+    fn publish_service_offers(&mut self, channel: &ChannelState) {
+        let channel_id = channel.channel_id();
+        let services: Vec<_> = channel
+            .services()
+            .iter()
+            .map(|(tag, local)| (tag.clone(), *local))
+            .collect();
+        if let Some((_, detail)) = self.fresh_details.get_mut(&channel_id) {
+            detail.services.clone_from(&services);
+        }
+        self.view_tx.send_modify(|view| {
+            if let Some(detail) = view
+                .open_channels
+                .iter_mut()
+                .find(|detail| detail.channel_id == channel_id)
+            {
+                detail.services.clone_from(&services);
+            }
+        });
     }
 
     /// Forward a local port to a member's service (ADR-013 Dial, M16.1): reach the
