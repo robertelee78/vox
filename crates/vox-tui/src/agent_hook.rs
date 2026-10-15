@@ -3618,10 +3618,11 @@ pub fn claude_settings(node: &vox_core::node::paths::NodeName) -> String {
             }
         }
     }
-    v["hooks"]["UserPromptSubmit"].as_array_mut().expect("built-in Claude hook groups").push(
-        serde_json::json!({"hooks":[{"type":"command", "command":format!("{} --native-attention", hook_command(node)), "onFailure":"block", "timeout":30, "async":false}]})
-    );
-    v["env"] = serde_json::json!({ "VOX_NODE": node.as_str(), "VOX_CLAUDE_NATIVE_ATTENTION":"1" });
+    v["env"] = serde_json::json!({ "VOX_NODE": node.as_str() });
+    if let Some(groups) = v["hooks"]["UserPromptSubmit"].as_array_mut() {
+        groups.push(serde_json::json!({"hooks":[{"type":"command", "command":format!("{} --native-attention", hook_command(node)), "onFailure":"block", "timeout":30, "async":false}]}));
+        v["env"]["VOX_CLAUDE_NATIVE_ATTENTION"] = "1".into();
+    }
     let mut text = serde_json::to_string_pretty(&v).unwrap_or_default();
     text.push('\n');
     text
