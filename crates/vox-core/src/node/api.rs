@@ -381,7 +381,7 @@ pub struct MessagePage {
 
 /// One reverse page of readable HELLO metadata for current room members. No historical
 /// bodies or per-member history are retained by this reader.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemberHelloPage {
     /// Saved room identity, checked on continuation.
     pub instance: [u8; 16],
