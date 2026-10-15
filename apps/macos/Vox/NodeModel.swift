@@ -91,10 +91,10 @@ final class NodeModel: ObservableObject {
             words = said.isEmpty ? "new message" : "\(NodeModel.author(m, me: me)): \(said)"
         }
 
-        /// Whether `m` is a line a row may preview: the room's conversation, not a Session's
-        /// opening or end, nor plumbing.
+        /// Conversation can be previewed and drawn in General. Reserved Session announcements
+        /// and node plumbing remain available to their own readers, never matched by body text.
         static func shows(_ m: RoomMessage) -> Bool {
-            !["session", "session-end", "ping", "pong"].contains(m.kind)
+            !["hello", "bye", "session", "session-end", "ping", "pong"].contains(m.kind)
         }
     }
 
