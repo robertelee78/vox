@@ -3,7 +3,7 @@
 import { createRoot, createComputed } from "solid-js"
 import { createServer } from "node:net"
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto"
-import { lstatSync, mkdirSync, mkdtempSync, realpathSync, rmdirSync, unlinkSync, writeFileSync } from "node:fs"
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, realpathSync, rmdirSync, unlinkSync, writeFileSync } from "node:fs"
 import { spawn } from "node:child_process"
 import { join } from "node:path"
 import { StringDecoder } from "node:string_decoder"
@@ -214,6 +214,7 @@ export async function tui(api) {
   server.listen(socket, () => {
     if (!live()) { dispose(); return }
     try {
+      chmodSync(socket, 0o600)
       writeFileSync(join(dir, "client.json"), JSON.stringify({ version: 1, node: VOX_NODE, directory, socket, token, client }), { mode: 0o600, flag: "wx" })
       listening = true
       register()

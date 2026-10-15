@@ -51,13 +51,15 @@ impl NodeTasks {
 /// Fair bounded inspection of the existing room/Session indexes. Only one cursor per
 /// configured room and at most four in-flight adapter submissions are resident.
 async fn watch_for_interrupts(node: NodeHandle, paths: Paths) {
-    use vox_core::node::attention::{DispatchOutcome, Operation, Reply, State};
+    use vox_core::node::attention::{DispatchOutcome, Operation, Reply, State, Wait};
     let mut events = node.subscribe();
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
     let mut recipients = std::collections::HashMap::new();
     let mut pings = std::collections::HashMap::new();
     let mut said_above = std::collections::HashMap::new();
     let mut sends = tokio::task::JoinSet::new();
+    // Only the existing four adapter slots retain a selection; lookup is not a new queue.
+    let mut submitting = std::collections::HashMap::<tokio::task::Id, ([u8; 32], String)>::new();
     let mut next_room = 0usize;
     let history = node.history_reader();
     let deaf = wake_deaf();
@@ -71,7 +73,10 @@ async fn watch_for_interrupts(node: NodeHandle, paths: Paths) {
                 Some(vox_core::node::actor::EventStreamItem::Lagged(_)) => {}
             },
             _ = tick.tick() => {},
-            Some(_) = sends.join_next(), if !sends.is_empty() => {},
+            Some(done) = sends.join_next_with_id(), if !sends.is_empty() => {
+                let id = match done { Ok((id, ())) => id, Err(error) => error.id() };
+                submitting.remove(&id);
+            },
         }
         let view = node.view();
         say_retention_above_room(&view, &mut said_above, &paths);
@@ -175,6 +180,11 @@ async fn watch_for_interrupts(node: NodeHandle, paths: Paths) {
                     }
                     _ => continue,
                 };
+                if submitting.values().any(|(active_room, active_session)| {
+                    *active_room == room && active_session == &recipient.session
+                }) {
+                    continue;
+                }
                 // Registration establishes this durable cursor before its caller receives ACK.
                 // Restart or idle route refresh never resets an existing recipient's cursor.
                 if node
@@ -210,13 +220,9 @@ async fn watch_for_interrupts(node: NodeHandle, paths: Paths) {
                 if sends.len() >= 4 || room_held(&node.view(), &room) {
                     continue;
                 }
-                let Some(route) = session
-                    .attention
-                    .as_ref()
-                    .filter(|_| session.harness == "opencode")
-                else {
+                if session.harness != "opencode" {
                     continue;
-                };
+                }
                 let page = match node
                     .attention(
                         room,
@@ -234,35 +240,22 @@ async fn watch_for_interrupts(node: NodeHandle, paths: Paths) {
                 let sources: Vec<_> = page
                     .rows
                     .iter()
-                    .filter(|row| row.state == State::Queued && row.wait.is_none())
+                    .filter(|row| {
+                        row.state == State::Queued
+                            && matches!(row.wait, None | Some(Wait::AdapterUnavailable))
+                    })
                     .map(|row| row.source)
                     .collect();
                 if sources.is_empty() {
                     continue;
                 }
-                let attempt = match node
-                    .attention(
-                        room,
-                        owner,
-                        Some(recipient.instance),
-                        Operation::Begin {
-                            recipient: recipient.clone(),
-                            route: route.route,
-                            sources,
-                        },
-                    )
-                    .await
-                {
-                    Ok(Reply::Attempt(Some(attempt))) => attempt,
-                    _ => continue,
-                };
-                let label = detail.name.as_deref().unwrap_or(&room_text);
-                let text = format!("Vox notice: a batch of {} unread room message(s) is queued for this Session in {}. Their attributed text and source references arrive through the ordinary Vox hook. This notice contains no operator request or room-message body.", attempt.count, vox_text::shown(label, 128));
+                let label = detail.name.as_deref().unwrap_or(&room_text).to_owned();
                 let (node, paths, expected_pause) = (node.clone(), paths.clone(), detail.pause);
-                // A freed slot goes first to the next room, not back to the room that
-                // just filled it. Keep this position when a pass admits no submission.
+                // A freed adapter slot goes first to the next room. A slow client lookup
+                // stays inside that slot and cannot hold the shared room scanner.
                 next_room = (index + 1) % rooms;
-                sends.spawn(async move {
+                let key = (room, recipient.session.clone());
+                let task = sends.spawn(async move {
                     let mut watch = node.watch();
                     let held = async {
                         loop {
@@ -270,6 +263,29 @@ async fn watch_for_interrupts(node: NodeHandle, paths: Paths) {
                             if watch.changed().await.is_err() { return; }
                         }
                     };
+                    tokio::pin!(held);
+                    let route = tokio::select! {
+                        biased;
+                        () = &mut held => return,
+                        result = crate::wake::current_attention(&paths, &session) => match result {
+                            Ok(route) => route,
+                            Err(_) => return,
+                        },
+                    };
+                    // Availability comes from the exact live-client handshake, not the last
+                    // client that happened to register this saved Session. The actor still
+                    // checks this opening/room incarnation and pause authority for every step.
+                    if node.attention(room, owner, Some(recipient.instance), Operation::Scan {
+                        recipient: recipient.clone(), harness: session.harness.clone(),
+                        route: route.as_ref().map(|r| r.route),
+                    }).await.is_err() { return; }
+                    let Some(route) = route else { return };
+                    let attempt = match node.attention(room, owner, Some(recipient.instance),
+                        Operation::Begin { recipient: recipient.clone(), route: route.route, sources }).await {
+                        Ok(Reply::Attempt(Some(attempt))) => attempt,
+                        _ => return,
+                    };
+                    let text = format!("Vox notice: a batch of {} unread room message(s) is queued for this Session in {}. Their attributed text and source references arrive through the ordinary Vox hook. This notice contains no operator request or room-message body.", attempt.count, vox_text::shown(&label, 128));
                     // This is the existing pause-publication fence. No actor IPC is awaited
                     // while held; a pause either precedes this submission or reports busy.
                     let outcome = match crate::room_pause::publication_lock(&paths, room, false).await {
@@ -277,14 +293,15 @@ async fn watch_for_interrupts(node: NodeHandle, paths: Paths) {
                         Ok(_publication) if room_held(&node.view(), &room) => DispatchOutcome::Held("room news is paused before submission".into()),
                         Ok(_publication) => tokio::select! {
                             biased;
-                            () = held => DispatchOutcome::Unknown("room authority/pause changed while submission was pending; no retry without receipt".into()),
-                            outcome = crate::wake::attention(&paths, &session, attempt.notice_id, &text) => outcome,
+                            () = &mut held => DispatchOutcome::Unknown("room authority/pause changed while submission was pending; no retry without receipt".into()),
+                            outcome = crate::wake::attention_on_route(&paths, &session, &route, attempt.notice_id, &text) => outcome,
                         },
                     };
                     if let Err(error) = node.attention(room, owner, Some(recipient.instance), Operation::Dispatch { attempt, outcome }).await {
                         eprintln!("vox daemon: attention outcome was not saved; reserved notice remains uncertain: {error}");
                     }
                 });
+                submitting.insert(task.id(), key);
             }
             tokio::task::yield_now().await;
         }

@@ -56,6 +56,235 @@ impl AttentionRoute {
     }
 }
 
+// The installed OpenCode TUI already owns this finite node/directory registry.
+// Its files are candidates only: an authenticated current-route reply is required.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AttentionClient {
+    version: u8,
+    node: String,
+    directory: String,
+    socket: String,
+    token: String,
+    client: String,
+}
+
+fn attention_clients(paths: &Paths, session: &Session) -> Result<Vec<AttentionClient>, String> {
+    use std::io::Read as _;
+    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+    let node = crate::client::name_of(paths).map_err(|e| e.to_string())?;
+    let directory = std::fs::canonicalize(
+        session
+            .start
+            .as_deref()
+            .ok_or("the Session has no saved directory")?,
+    )
+    .map_err(|e| e.to_string())?;
+    let directory = directory
+        .to_str()
+        .ok_or("the Session directory is not UTF-8")?;
+    let scope = serde_json::to_vec(&[node.as_str(), directory]).map_err(|e| e.to_string())?;
+    let digest = vox_core::hash::sha256(&scope);
+    let scope: String = digest[..16].iter().map(|b| format!("{b:02x}")).collect();
+    let registry = std::path::PathBuf::from("/tmp").join(format!("vox-oc-clients-{scope}"));
+    let uid = rustix::process::getuid().as_raw();
+    let owned_dir = |path: &Path| -> Result<(), std::io::Error> {
+        let st = std::fs::symlink_metadata(path)?;
+        if !st.is_dir() || st.uid() != uid || st.mode() & 0o077 != 0 {
+            return Err(std::io::Error::other(
+                "OpenCode client registry is not an owned private directory",
+            ));
+        }
+        Ok(())
+    };
+    match std::fs::symlink_metadata(&registry) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.to_string()),
+        Ok(_) => owned_dir(&registry).map_err(|e| e.to_string())?,
+    }
+    let mut clients = Vec::new();
+    for (inspected, entry) in std::fs::read_dir(&registry)
+        .map_err(|e| e.to_string())?
+        .enumerate()
+    {
+        if inspected >= 64 {
+            return Err("OpenCode client inventory exceeds its 64-entry bound".into());
+        }
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(suffix) = name.strip_prefix("client-") else {
+            continue;
+        };
+        if suffix.len() != 6 || !suffix.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            continue;
+        }
+        let dir = entry.path();
+        // A client may dispose between listing and opening. No such entry is live.
+        let read = (|| -> Result<AttentionClient, std::io::Error> {
+            owned_dir(&dir)?;
+            let fd = rustix::fs::open(
+                dir.join("client.json"),
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::NONBLOCK
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )?;
+            let file = std::fs::File::from(fd);
+            let st = file.metadata()?;
+            if !st.is_file() || st.uid() != uid || st.mode() & 0o077 != 0 || st.len() > 16384 {
+                return Err(std::io::Error::other("unsafe OpenCode client descriptor"));
+            }
+            let mut bytes = Vec::new();
+            file.take(16385).read_to_end(&mut bytes)?;
+            if bytes.len() > 16384 {
+                return Err(std::io::Error::other(
+                    "OpenCode client descriptor exceeds its byte bound",
+                ));
+            }
+            let client: AttentionClient =
+                serde_json::from_slice(&bytes).map_err(std::io::Error::other)?;
+            let hex = |text: &str| {
+                text.len() == 64
+                    && text
+                        .bytes()
+                        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            };
+            if client.version != 1
+                || client.node != node.as_str()
+                || client.directory != directory
+                || Path::new(&client.socket) != dir.join("attention.sock")
+                || !hex(&client.token)
+                || !hex(&client.client)
+            {
+                return Err(std::io::Error::other(
+                    "OpenCode client descriptor has a different scope or schema",
+                ));
+            }
+            let st = std::fs::symlink_metadata(&client.socket)?;
+            if !st.file_type().is_socket() || st.uid() != uid {
+                return Err(std::io::Error::other("OpenCode client socket is not owned"));
+            }
+            Ok(client)
+        })();
+        match read {
+            Ok(client) => clients.push(client),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    clients.sort_by(|a, b| {
+        a.client
+            .cmp(&b.client)
+            .then_with(|| a.socket.cmp(&b.socket))
+    });
+    Ok(clients)
+}
+
+async fn current_client_route(client: &AttentionClient, session: &str) -> Option<AttentionRoute> {
+    use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _};
+    let mut stream = tokio::net::UnixStream::connect(&client.socket).await.ok()?;
+    let request = format!(
+        "{}\n{}\n",
+        serde_json::json!({"type":"auth","token":client.token}),
+        serde_json::json!({"type":"route","session":session})
+    );
+    stream.write_all(request.as_bytes()).await.ok()?;
+    let mut line = String::new();
+    tokio::io::BufReader::new(stream)
+        .take(8193)
+        .read_line(&mut line)
+        .await
+        .ok()?;
+    if line.len() > 8192 || !line.ends_with('\n') {
+        return None;
+    }
+    let reply: serde_json::Value = serde_json::from_str(&line).ok()?;
+    let hex = reply["route"].as_str()?;
+    if reply["outcome"].as_str() != Some("available")
+        || reply["session"].as_str() != Some(session)
+        || reply["client"].as_str() != Some(client.client.as_str())
+        || hex.len() != 64
+        || !hex
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return None;
+    }
+    let mut route = [0; 32];
+    for (i, byte) in route.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(AttentionRoute {
+        endpoint: client.socket.clone(),
+        token: client.token.clone(),
+        route,
+    })
+}
+
+/// Resolve one current client for this exact saved Session; stale registration is only a hint.
+/// At most 64 descriptors and four concurrent handshakes share one two-second deadline.
+/// No file is changed, no turn is submitted, and no timer establishes liveness.
+pub(crate) async fn current_attention(
+    paths: &Paths,
+    session: &Session,
+) -> Result<Option<AttentionRoute>, String> {
+    use futures_util::StreamExt as _;
+    if session.harness != "opencode" || !session.interactive {
+        return Ok(None);
+    }
+    let same = || {
+        pause_registration(paths, &session.session)
+            .is_ok_and(|current| current.is_some_and(|current| current.same(session)))
+    };
+    if !same() {
+        return Err("the registered conversation changed before client discovery".into());
+    }
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    let clients = attention_clients(paths, session)?;
+    // Every finite batch gets a share: four silent sockets cannot retain all slots
+    // until the global deadline and permanently exclude a later responsive client.
+    // The extra share leaves scheduling margin; only a valid reply proves liveness.
+    let shares = u32::try_from(clients.len().div_ceil(4) + 1)
+        .map_err(|_| "OpenCode client inventory exceeds its bound")?;
+    let probe_budget = deadline.saturating_duration_since(tokio::time::Instant::now()) / shares;
+    // Own each probe's inputs before the stream crosses the spawned-task boundary.
+    let probes: Vec<_> = clients
+        .into_iter()
+        .enumerate()
+        .map(|(rank, client)| {
+            let session_id = session.session.clone();
+            async move {
+                let route =
+                    tokio::time::timeout(probe_budget, current_client_route(&client, &session_id))
+                        .await
+                        .ok()
+                        .flatten();
+                (rank, route)
+            }
+        })
+        .collect();
+    let probes = futures_util::stream::iter(probes).buffer_unordered(4);
+    tokio::pin!(probes);
+    let mut selected: Option<(usize, AttentionRoute)> = None;
+    loop {
+        match tokio::time::timeout_at(deadline, probes.next()).await {
+            Ok(Some((rank, Some(route))))
+                if selected.as_ref().is_none_or(|(best, _)| rank < *best) =>
+            {
+                selected = Some((rank, route));
+            }
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => break,
+        }
+    }
+    if !same() {
+        return Err("the registered conversation changed during client discovery".into());
+    }
+    Ok(selected.map(|(_, route)| route))
+}
+
 /// How one agent session can be woken.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Session {
@@ -880,8 +1109,9 @@ pub(crate) fn registered_page(
     Ok((page, next))
 }
 
-/// Only the live routing fields needed to interrupt. Large current titles and transcript
-/// metadata are skipped by the streaming JSON decoder rather than copied into every page.
+/// Only the live routing fields needed to interrupt, including the saved directory that
+/// scopes OpenCode's client registry. Large current titles and transcript metadata are skipped
+/// by the streaming JSON decoder rather than copied into every page.
 #[derive(serde::Deserialize)]
 struct PauseRegistration {
     session: String,
@@ -892,6 +1122,8 @@ struct PauseRegistration {
     token: String,
     #[serde(default)]
     room: Option<String>,
+    #[serde(default)]
+    start: Option<String>,
     #[serde(default)]
     first_seen_ms: u64,
     #[serde(default = "interactive_by_default")]
@@ -937,7 +1169,7 @@ fn pause_registration_file(path: &std::path::Path) -> Result<Option<Session>, St
         state: String::new(),
         state_ms: 0,
         last_drained_ms: 0,
-        start: None,
+        start: reg.start,
         name: None,
         transcript: String::new(),
         tmux_claim: None,
@@ -1198,7 +1430,6 @@ pub async fn attention(
     id: [u8; 16],
     text: &str,
 ) -> vox_core::node::attention::DispatchOutcome {
-    use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _};
     use vox_core::node::attention::DispatchOutcome as Outcome;
     let Some(route) = session
         .attention
@@ -1214,6 +1445,20 @@ pub async fn attention(
             .into(),
         );
     };
+    attention_on_route(paths, session, route, id, text).await
+}
+
+/// Send only to the live capability selected before the durable notice reservation.
+/// The original saved registration remains a separate before-write fence.
+pub(crate) async fn attention_on_route(
+    paths: &Paths,
+    session: &Session,
+    route: &AttentionRoute,
+    id: [u8; 16],
+    text: &str,
+) -> vox_core::node::attention::DispatchOutcome {
+    use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _};
+    use vox_core::node::attention::DispatchOutcome as Outcome;
     let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
     let id = hex(&id);
     let payload = format!(
