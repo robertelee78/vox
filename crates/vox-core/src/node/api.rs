@@ -809,6 +809,19 @@ pub struct AnchoredChannel {
 /// A command from a client to the node.
 #[derive(Debug)]
 pub enum NodeCommand {
+    /// One private bounded attention operation, authenticated by the receiving transport.
+    Attention {
+        /// Exact room.
+        channel_id: Digest32,
+        /// Authenticated sender; mutations require this node's own identity.
+        by: Digest32,
+        /// Captured receiver-local room incarnation, when supplied by an owned caller.
+        expected_instance: Option<[u8; 16]>,
+        /// Selected query or local daemon mutation.
+        operation: crate::node::attention::Operation,
+        /// Answer after any mutation is sealed.
+        reply: tokio::sync::oneshot::Sender<Result<crate::node::attention::Reply, String>>,
+    },
     /// Read or change the local room pause. Only the authenticated drive receiver constructs
     /// a change; the actor rechecks current authority before sealing it.
     RoomPause {

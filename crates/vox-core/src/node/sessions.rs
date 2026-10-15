@@ -167,7 +167,7 @@ pub async fn open_when_member(
     // **A rename is said at once** (ADR-029 MD-1): the harness renamed its session, and a Session
     // that posts nothing would otherwise keep its old name until its next message. A Session record
     // for one already open names it again (`fold` reads it as the name from then on).
-    if open.is_some_and(|row| {
+    let unchanged = open.is_some_and(|row| {
         let same = |given: &Option<String>, held: Option<(u64, Digest32)>| {
             given.as_ref().is_none_or(|value| {
                 held.is_some_and(|held| {
@@ -177,13 +177,38 @@ pub async fn open_when_member(
         };
         same(&session.name, row.name.map(|f| (f.bytes, f.hash)))
             && same(&session.cwd, row.cwd.map(|f| (f.bytes, f.hash)))
-    }) {
-        return Ok(());
+    });
+    if !unchanged {
+        for part in opening_parts(session) {
+            post(handle, room, &session.id, part).await?;
+        }
     }
-    for part in opening_parts(session) {
-        post(handle, room, &session.id, part).await?;
+    // Every caller, including a move and background join, completes only after the
+    // recipient is ready. Its cutoff comes from the committed opening, not this later
+    // lookup; restart, rename and delayed projection cannot swallow intervening news.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        match handle
+            .attention(
+                room,
+                me,
+                None,
+                crate::node::attention::Operation::Resolve {
+                    session: session.id.clone(),
+                },
+            )
+            .await
+        {
+            Ok(crate::node::attention::Reply::Resolved { .. }) => return Ok(()),
+            Ok(_) => return Err("unexpected Session attention preparation answer".into()),
+            Err(reason)
+                if opening_refreshing(&reason) && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::task::yield_now().await;
+            }
+            Err(reason) => return Err(reason),
+        }
     }
-    Ok(())
 }
 
 /// Whether this envelope is a lifecycle record, including a part of a large opening.

@@ -95,6 +95,10 @@ pub const DEFAULT_HOPS: u32 = 8;
 /// Longest petname accepted in [`Envelope::to`], matching the keyring's bound.
 pub const MAX_NAME: usize = 64;
 
+/// A complete displayed Session name may fill a room text entry (64 KiB). It is not a
+/// petname or Session id: imposing `MAX_NAME` would discard legitimate long harness names.
+pub const MAX_SESSION_NAME: usize = 64 * 1024;
+
 /// Longest resource name a claim may carry: a work reference's scheme, `:` and
 /// [`MAX_WORK_ID`], with room to spare.
 pub const MAX_RESOURCE: usize = 160;
@@ -333,6 +337,10 @@ pub struct Envelope {
     pub tags: Vec<String>,
 }
 
+fn valid_origin(value: &str, max: usize) -> bool {
+    !value.trim().is_empty() && is_valid_name(value, max)
+}
+
 fn default_hops() -> u32 {
     DEFAULT_HOPS
 }
@@ -441,6 +449,28 @@ impl Envelope {
                 return Err(ParseError::UnsupportedVersion(v));
             }
         }
+        // Presence matters: serde's defaults would otherwise erase an explicit empty/null
+        // origin and let malformed session metadata acquire ordinary attention (ADR-020 RA-2).
+        for (field, max) in [
+            (value.get("from"), MAX_NAME),
+            (
+                value.get("at").and_then(|at| at.get("session_name")),
+                MAX_SESSION_NAME,
+            ),
+            (
+                value
+                    .get("data")
+                    .and_then(|data| data.get("session"))
+                    .and_then(|session| session.get("harness")),
+                MAX_NAME,
+            ),
+        ] {
+            if field.is_some_and(|v| !v.as_str().is_some_and(|s| valid_origin(s, max))) {
+                return Err(ParseError::Malformed(
+                    "session origin must be a nonempty bounded string on one line",
+                ));
+            }
+        }
         let env: Self = serde_json::from_value(value).map_err(|_| ParseError::NotAnEnvelope)?;
         env.validate()?;
         Ok(env)
@@ -469,6 +499,21 @@ impl Envelope {
                 "`from` is too long or not on one line",
             ));
         }
+        if self
+            .at
+            .session_name
+            .as_deref()
+            .is_some_and(|name| !valid_origin(name, MAX_SESSION_NAME))
+            || self
+                .data
+                .get("session")
+                .and_then(|session| session.get("harness"))
+                .is_some_and(|v| !v.as_str().is_some_and(|h| valid_origin(h, MAX_NAME)))
+        {
+            return Err(ParseError::Malformed(
+                "session origin must be a nonempty bounded string on one line",
+            ));
+        }
         // Tags are printed and filtered by (#636): never empty, made of nothing, or off one line.
         if self.tags.len() > MAX_TAGS || !self.tags.iter().all(|t| is_valid_tag(t)) {
             return Err(ParseError::Malformed(
@@ -477,6 +522,26 @@ impl Envelope {
             ));
         }
         Ok(())
+    }
+
+    /// The ordinary-conversation default, after successful parsing (ADR-020 RA-2).
+    /// Recognized session metadata only changes delivery policy, never identity/authority.
+    /// Generic tags, work, context, recipients and replies do not change this default.
+    /// A parse error must stay an error; callers must not replace it with `Envelope::say`.
+    #[must_use]
+    pub fn is_ordinary_conversation(&self) -> bool {
+        self.v <= VERSION
+            && self.validate().is_ok()
+            && self.from.is_empty()
+            && self.at.session_name.is_none()
+            && self
+                .data
+                .get("session")
+                .and_then(|session| session.get("harness"))
+                .is_none()
+            && !is_plumbing(&self.kind)
+            && !matches!(self.kind.as_str(), HELLO | BYE)
+            && !crate::claim::is_claim_protocol(self)
     }
 
     /// Render for a log entry's text.

@@ -114,14 +114,37 @@ fn parse_input(raw: &str) -> HookInput {
     }
 }
 
-/// Whether the daemon sent `session` a notice within the wake hold: the turn it starts must
-/// show what it announced first, wherever that lies past the cursor (V030-15).
-fn notice_is_recent(paths: &Paths, session: &str) -> bool {
-    let hold = crate::wake::Settings::load(paths).0.wake_hold;
-    let hold = u64::try_from(hold.as_millis()).unwrap_or(u64::MAX);
-    crate::wake::notices(paths, session)
-        .sent_at
-        .is_some_and(|t| crate::wake::now_millis().saturating_sub(t) < hold)
+/// A sealed attention notice, rather than a timeout, selects the existing urgent-ahead path.
+async fn notice_pending(
+    paths: &Paths,
+    room: Digest32,
+    owner: Option<Digest32>,
+    session: &str,
+) -> Result<bool, AppError> {
+    let Some(owner) = owner else {
+        return Ok(false);
+    };
+    use vox_core::node::attention::{local, Operation, Reply};
+    let at = crate::client::one_shot(paths)?;
+    match local(
+        &at,
+        owner,
+        room,
+        None,
+        Operation::Resolve {
+            session: session.into(),
+        },
+    )
+    .await
+    {
+        Ok(Reply::Resolved { notice_pending, .. }) => Ok(notice_pending),
+        // Manual/headless hooks have no private Session obligation, but still read room news.
+        Err(reason) if reason == "the selected Session is no longer open" => Ok(false),
+        Err(reason) => Err(AppError::Usage(reason)),
+        _ => Err(AppError::Usage(
+            "unexpected attention reservation answer".into(),
+        )),
+    }
 }
 
 /// Read this session's cursor for `room`, if it has one: the first line of its cursor file.
@@ -254,10 +277,6 @@ impl SavedHashes {
             }
         }
         Ok(lo)
-    }
-
-    pub(crate) fn cursor(&self) -> Option<Digest32> {
-        self.cursor
     }
 
     pub(crate) fn contains(&self, hash: &Digest32) -> std::io::Result<bool> {
@@ -1412,89 +1431,6 @@ fn room_heading(room_label: &str, room_name: &str) -> String {
     }
 }
 
-/// What a session is owed in one room, for its wake (V030-15, V030-20): exact message
-/// counts and a bounded sender sample, named from this node's keyring.
-pub(crate) struct Owed {
-    /// The start of the room's id, as commands take it.
-    pub room_label: String,
-    /// The room's local name, or empty.
-    pub room_name: String,
-    /// Exact counts, independent of the distinct sender names.
-    pub urgent_count: usize,
-    pub reply_count: usize,
-    /// The senders of the urgent messages addressed to this node.
-    pub urgent: Vec<String>,
-    /// The senders of the replies to this session's posts.
-    pub replies: Vec<String>,
-    /// Further senders exist beyond the displayed sample; their exact number is not claimed.
-    pub urgent_more: bool,
-    pub replies_more: bool,
-}
-
-/// What a wake puts in front of a session (ADR-020 §6; V030-15, V030-20): **a count and the
-/// senders, per room, never a message.**
-///
-/// A wake is delivered as the harness's own user message (Claude Code's `role: user`, OpenCode's
-/// prompt), which is exactly where the person the agent works for speaks. It used to carry the
-/// message itself, so any member of the room could put words in that slot, and the turn's drain
-/// then showed it a second time. So no byte of any message, nor anything else an author chose,
-/// is in it: the counts, the senders as this node's keyring names them, and the rooms. The
-/// messages arrive once, through the drain, which runs in the turn this wake starts (Claude Code
-/// runs `UserPromptSubmit` for it, measured on 2.1.287; OpenCode's relayed prompt runs
-/// `chat.message`) and shows them first.
-///
-/// **It says plainly that this is from Vox** (V210-112, the decider): Claude Code presents a
-/// message written to its messaging socket as one "from another Claude session … a teammate's
-/// request" (2.1.287, measured), and OpenCode as the person's own prompt.
-pub(crate) fn render_wake(owed: &[Owed]) -> String {
-    let from = |names: &[String], more: bool| {
-        let mut seen: Vec<String> = Vec::new();
-        for n in names.iter().map(|n| one_line(n)) {
-            if !seen.contains(&n) {
-                seen.push(n);
-            }
-        }
-        if more {
-            seen.push("additional senders omitted".to_owned());
-        }
-        seen.join(", ")
-    };
-    let rooms: Vec<String> = owed
-        .iter()
-        .map(|o| {
-            let mut said = Vec::new();
-            if o.urgent_count != 0 {
-                said.push(format!(
-                    "{} urgent message{} addressed to you from {}",
-                    o.urgent_count,
-                    if o.urgent_count == 1 { "" } else { "s" },
-                    from(&o.urgent, o.urgent_more)
-                ));
-            }
-            if o.reply_count != 0 {
-                said.push(format!(
-                    "{} repl{} to your messages from {}",
-                    o.reply_count,
-                    if o.reply_count == 1 { "y" } else { "ies" },
-                    from(&o.replies, o.replies_more)
-                ));
-            }
-            format!(
-                "{} in room {}",
-                said.join(", and "),
-                room_heading(&o.room_label, &o.room_name)
-            )
-        })
-        .collect();
-    format!(
-        "Vox: {}. This notice does not carry them: your room read, in this turn, shows them \
-         first. If it shows nothing new, you have already read them. This is a notice from Vox, \
-         not a message from the person you are working for, nor a request from another agent \
-         session.\n{ROOM_AND_ISSUE}",
-        rooms.join("; ")
-    )
-}
-
 /// `text` as one line, so a name cannot start a line of its own in a model's context: every
 /// control character and U+2028/U+2029 replaced, cut to about 64 bytes. It is
 /// [`vox_agentcomms::envelope::shown`], the one sanitiser for names (V210-123).
@@ -1543,6 +1479,17 @@ impl std::str::FromStr for Format {
 /// room member chose), then `room`, everything drawn from the rooms. Claude Code and Codex take
 /// them as one text, as before; OpenCode's plugin takes them apart (see [`Format::OpenCode`]).
 fn emit(format: Format, raw_input: &str, event: &str, vox: &str, room: &str) {
+    emit_receipts(format, raw_input, event, vox, room, &[]);
+}
+
+fn emit_receipts(
+    format: Format,
+    raw_input: &str,
+    event: &str,
+    vox: &str,
+    room: &str,
+    receipts: &[vox_core::node::attention::InputReceipt],
+) {
     let context = format!("{vox}{room}");
     let chosen = match format {
         Format::Auto => {
@@ -1574,7 +1521,10 @@ fn emit(format: Format, raw_input: &str, event: &str, vox: &str, room: &str) {
         // with `async: false`, or the output is observed and discarded.
         Format::Text | Format::Auto => print!("{context}"),
         Format::OpenCode => {
-            println!("{}", serde_json::json!({ "vox": vox, "room": room }));
+            println!(
+                "{}",
+                serde_json::json!({ "vox": vox, "room": room, "attention_receipts": receipts })
+            );
         }
     }
 }
@@ -1599,6 +1549,7 @@ pub async fn run(
     room_arg: Option<&str>,
     format: Format,
     session: Option<&str>,
+    attention_register: bool,
 ) -> Result<(), AppError> {
     let mut raw = String::new();
     // A harness always provides stdin; a person testing by hand may not — and
@@ -1607,15 +1558,43 @@ pub async fn run(
         let _ = std::io::stdin().read_to_string(&mut raw);
     }
     let mut input = parse_input(&raw);
-    // The same order `vox room` uses to name the session, so that what this hook
-    // recognises as "my own message" is exactly what that session's verbs wrote
-    // (ADR-021 §7): the flag, then `VOX_SESSION`, then what the harness sent.
-    if let Some(s) = session.map(str::to_owned).or_else(|| {
-        std::env::var("VOX_SESSION")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-    }) {
-        input.session_id = s.trim().to_owned();
+    // Native hook identity wins over an inherited parent harness environment. OpenCode has
+    // no native stdin identity and supplies the exact client Session through --session.
+    if input.session_id != "unknown-session" {
+        if session.is_some_and(|s| s.trim() != input.session_id) {
+            return Err(AppError::Usage(
+                "--session conflicts with the harness Session".into(),
+            ));
+        }
+    } else if let Some(id) = session
+        .map(str::to_owned)
+        .or_else(|| {
+            std::env::var("CODEX_THREAD_ID")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        })
+        .or_else(|| {
+            std::env::var("VOX_SESSION")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        })
+    {
+        input.session_id = id.trim().to_owned();
+        input.codex = session.is_none() && std::env::var_os("CODEX_THREAD_ID").is_some();
+    }
+    if attention_register {
+        let route = crate::wake::Session::from_env(&input.session_id, false);
+        if route.attention.is_none() || session.is_none() {
+            return Err(AppError::Usage("attention registration requires an exact OpenCode Session and complete client route".into()));
+        }
+        input.event = "VoxAttentionRegister".into();
+        input.codex = false;
+        input.claude = false;
+        daemon
+            .register(&input, room_arg)
+            .await
+            .map_err(|error| AppError::Usage(error.said(&input, &daemon.account)))?;
+        return Ok(());
     }
 
     // **A node that is not on this machine is said, and nothing is written** (#666): no session
@@ -1907,11 +1886,21 @@ impl Daemon {
                 }
             })?;
         let mut record = crate::wake::Session::from_env(&input.session_id, input.codex);
-        // **The harness, from its own input** when its environment named no wake channel: Claude
-        // Code's payload names its event (ADR-029 SE-3 labels a Session by it).
-        if record.harness == "unknown" && input.claude && !input.codex {
+        // A native Claude hook identifies its actual child harness even inside another
+        // agent's shell. Inherited OpenCode endpoints never become that child's route.
+        if input.claude && !input.codex {
+            (record.endpoint, record.token) = match (
+                std::env::var("CLAUDE_CODE_MESSAGING_SOCKET"),
+                std::env::var("CLAUDE_CODE_MESSAGING_TOKEN"),
+            ) {
+                (Ok(endpoint), Ok(token)) => (endpoint, token),
+                _ => (String::new(), String::new()),
+            };
             record.harness = "claude".into();
+            record.attention = None;
+            record.mirror.clear();
         }
+        record.registration_only = input.event == "VoxAttentionRegister";
         record.name = session_name(input);
         if input.claude {
             record.transcript.clone_from(&input.transcript);
@@ -2171,6 +2160,8 @@ impl Pulling {
 
 /// One room's share of a turn's drain, read and judged, before anything is emitted.
 struct RoomDrain {
+    /// The exact room selected for this drain's reads and attention receipts.
+    channel_id: Digest32,
     /// The room's id, base32: its cursor's key.
     key: String,
     /// The start of its id, as commands take it.
@@ -2593,14 +2584,132 @@ async fn drain(
         shown_in[i] = shown;
     }
     context.push_str(&render_skipped(&skipped));
+    // Reserve only actual attributed context, never the chatter/sibling/thread counters.
+    // No actor IPC runs while the pause publication file lock is held.
+    let mut attention_receipts = Vec::new();
+    let native_input = if format == Format::OpenCode {
+        match std::env::var("VOX_OPENCODE_INPUT_ID") {
+            Ok(id) => Some(
+                vox_core::node::attention::opencode_input(&input.session_id, &id)
+                    .map_err(AppError::Usage)?,
+            ),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(_) => return Err(AppError::Usage("invalid OpenCode input identity".into())),
+        }
+    } else {
+        None
+    };
+    let mut input_receipts = Vec::new();
+    if let Some(owner) = me {
+        let at = crate::client::one_shot(paths)?;
+        for (d, shown) in drains.iter().zip(&shown_in) {
+            let sources: Vec<_> = d
+                .fresh
+                .iter()
+                .take(*shown)
+                .filter(|row| {
+                    !other_thread(row, &d.reader)
+                        && !for_a_sibling(row, &d.reader)
+                        && chatter_kind(row, &d.reader).is_none()
+                        && vox_agentcomms::envelope::Envelope::parse(&row.text)
+                            .is_ok_and(|env| !vox_agentcomms::envelope::is_plumbing(&env.kind))
+                })
+                .map(|row| row.entry_hash)
+                .collect();
+            if sources.is_empty() {
+                continue;
+            }
+            use vox_core::node::attention::{local, Operation, Reply};
+            let recipient = match local(
+                &at,
+                owner,
+                d.channel_id,
+                None,
+                Operation::Resolve {
+                    session: input.session_id.clone(),
+                },
+            )
+            .await
+            {
+                Ok(Reply::Resolved { recipient, .. }) => recipient,
+                Err(reason) if reason == "the selected Session is no longer open" => continue,
+                Err(reason) => {
+                    cancel_attention_receipts(paths, owner, &attention_receipts).await;
+                    return Err(AppError::Usage(reason));
+                }
+                _ => {
+                    cancel_attention_receipts(paths, owner, &attention_receipts).await;
+                    return Err(AppError::Usage(
+                        "unexpected attention recipient answer".into(),
+                    ));
+                }
+            };
+            let ticket = vox_core::identity::rng::random_array()
+                .map_err(|error| AppError::Usage(error.to_string()))?;
+            attention_receipts.push((recipient.clone(), sources.clone(), ticket));
+            for chunk in sources.chunks(6) {
+                let prepared = local(
+                    &at,
+                    owner,
+                    d.channel_id,
+                    Some(recipient.instance),
+                    Operation::Prepare {
+                        recipient: recipient.clone(),
+                        sources: chunk.to_vec(),
+                        ticket,
+                        input: native_input,
+                    },
+                )
+                .await;
+                match prepared {
+                    Ok(Reply::Prepared(prepared))
+                        if prepared.len() <= chunk.len()
+                            && prepared.iter().all(|source| chunk.contains(source)) =>
+                    {
+                        if let Some(input) = native_input.filter(|_| !prepared.is_empty()) {
+                            input_receipts.push(vox_core::node::attention::InputReceipt {
+                                recipient: recipient.clone(),
+                                input,
+                                ticket,
+                                sources: prepared,
+                            });
+                        }
+                    }
+                    reply => {
+                        cancel_attention_receipts(paths, owner, &attention_receipts).await;
+                        return Err(AppError::Usage(reply.err().unwrap_or_else(|| {
+                            "unexpected attention preparation answer".into()
+                        })));
+                    }
+                }
+            }
+        }
+    }
     // All history/offer IPC and rendering precede this fence. Only a final point query,
     // stdout publication and synchronous acknowledgements are inside it.
-    let NewsPublication::Ready(publication) = news_publication(paths, selected_room, me).await?
-    else {
-        return Ok(());
+    let publication = match news_publication(paths, selected_room, me).await {
+        Ok(NewsPublication::Ready(publication)) => publication,
+        held => {
+            if let Some(owner) = me {
+                cancel_attention_receipts(paths, owner, &attention_receipts).await;
+            }
+            return held.map(|_| ());
+        }
     };
-    emit(format, raw_input, &input.event, &vox, &context);
-    std::io::Write::flush(&mut std::io::stdout())?;
+    emit_receipts(
+        format,
+        raw_input,
+        &input.event,
+        &vox,
+        &context,
+        &input_receipts,
+    );
+    if let Err(error) = std::io::Write::flush(&mut std::io::stdout()) {
+        // Publication may be partial. Keep its reservations uncertain, and never append
+        // a second envelope through run()'s pre-publication error reporter.
+        eprintln!("vox agent hook: context output is unconfirmed: {error}");
+        return Ok(());
+    }
     offered.commit(paths, &input.session_id);
 
     for (file, _) in joined {
@@ -2614,10 +2723,73 @@ async fn drain(
         d.commit(paths, &input.session_id, *shown);
     }
     drop(publication);
+    if let Some(owner) = me {
+        match crate::client::one_shot(paths) {
+            Ok(at) => {
+                for (recipient, sources, ticket) in attention_receipts {
+                    if let Err(reason) = vox_core::node::attention::local(
+                        &at,
+                        owner,
+                        recipient.room,
+                        Some(recipient.instance),
+                        vox_core::node::attention::Operation::Received {
+                            recipient,
+                            sources,
+                            ticket,
+                        },
+                    )
+                    .await
+                    {
+                        eprintln!("vox agent hook: attributed context was emitted, but its receipt is unconfirmed: {reason}");
+                    }
+                }
+            }
+            Err(reason) => {
+                // The one output is already public. Reporting its receipt failure must
+                // not append another JSON envelope or repeat the context.
+                eprintln!("vox agent hook: attributed context was emitted, but its receipt is unconfirmed: {reason}");
+            }
+        }
+    }
     for (d, shown) in drains.iter().zip(shown_in) {
         mark_read(&mut client, d, shown).await;
     }
     Ok(())
+}
+
+/// A known no-output path retires only its own sealed reservations. Failure stays explicit;
+/// it cannot be guessed away or turn into a second automatic notice.
+async fn cancel_attention_receipts(
+    paths: &Paths,
+    owner: Digest32,
+    receipts: &[(
+        vox_core::node::attention::Recipient,
+        Vec<Digest32>,
+        [u8; 16],
+    )],
+) {
+    let Ok(at) = crate::client::one_shot(paths) else {
+        return;
+    };
+    for (recipient, sources, ticket) in receipts {
+        if let Err(reason) = vox_core::node::attention::local(
+            &at,
+            owner,
+            recipient.room,
+            Some(recipient.instance),
+            vox_core::node::attention::Operation::CancelPrepared {
+                recipient: recipient.clone(),
+                sources: sources.clone(),
+                ticket: *ticket,
+            },
+        )
+        .await
+        {
+            eprintln!(
+                "vox agent hook: cancelled context reservation remains unconfirmed: {reason}"
+            );
+        }
+    }
 }
 
 enum NewsPublication {
@@ -2779,6 +2951,7 @@ async fn read_room(
     let room_key = b32_encode(&channel_id);
     let label: String = room_key.chars().take(12).collect();
 
+    let attention_pending = notice_pending(paths, channel_id, me, &input.session_id).await?;
     let ahead = delivered_ahead(paths, &room_key, &input.session_id)?;
     let mut since = ahead.cursor;
     let ahead_slots = AHEAD_WINDOW.saturating_sub(usize::try_from(ahead.len).unwrap_or(usize::MAX));
@@ -2851,7 +3024,7 @@ async fn read_room(
     // one extra page is retained, and the exact saved shown-ahead window admits 128 IDs.
     // Each room row is already limited to 64 KiB by the public IPC contract.
     let mut beyond = beyond;
-    if beyond > 0 && notice_is_recent(paths, &input.session_id) && ahead_slots > 0 {
+    if beyond > 0 && attention_pending && ahead_slots > 0 {
         let me_fp = me.map(|m| b32_encode(&m));
         let mut from = rows.last().map(|r| r.entry_hash);
         let held: std::collections::HashSet<Digest32> = rows.iter().map(|r| r.entry_hash).collect();
@@ -2905,7 +3078,7 @@ async fn read_room(
     //
     // **Nor is one an earlier drain already showed ahead of the cursor** (V030-15). A wake
     // carries no message, so nothing a wake said is shown twice either.
-    if beyond > 0 && ahead_slots == 0 && notice_is_recent(paths, &input.session_id) {
+    if beyond > 0 && ahead_slots == 0 && attention_pending {
         let waiting = "(Urgent delivery is waiting for the ordinary backlog to retire the saved shown-ahead window.)";
         notice = Some(notice.map_or_else(|| waiting.to_owned(), |old| format!("{old}\n{waiting}")));
     }
@@ -3100,6 +3273,7 @@ async fn read_room(
     };
 
     Ok(RoomDrain {
+        channel_id,
         reader,
         parents,
         heading: room_heading(&label, name),
@@ -3246,6 +3420,12 @@ pub fn codex_hooks(node: &vox_core::node::paths::NodeName) -> String {
 #[must_use]
 pub fn opencode_plugin(node: &vox_core::node::paths::NodeName) -> String {
     OPENCODE_PLUGIN.replace("@VOX_NODE@", node.as_str())
+}
+
+/// Client-owned OpenCode attention receiver, installed beside the server plugin.
+#[must_use]
+pub fn opencode_tui_plugin(node: &vox_core::node::paths::NodeName) -> String {
+    include_str!("../assets/opencode-tui-plugin.js").replace("@VOX_NODE@", node.as_str())
 }
 
 /// The OpenCode plugin, shipped in the binary so `vox agent plugin opencode` can

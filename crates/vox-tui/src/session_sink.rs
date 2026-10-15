@@ -100,12 +100,26 @@ pub type RoomOf = Arc<dyn Fn(&NodeName, &str) -> Option<vox_core::hash::Digest32
 /// Where a session's new name goes (ADR-029 MD-1): its registration, and its Session's record.
 pub type Renamer = Arc<dyn Fn(&NodeName, &str, &str) + Send + Sync>;
 
+/// One exact authenticated mirror observation, through the already attached node.
+pub type AttentionObserver = Arc<
+    dyn Fn(
+            NodeName,
+            String,
+            String,
+            vox_core::node::attention::InputObservation,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// The sink. One per daemon.
 pub struct Sink {
     state: Mutex<BTreeMap<(NodeName, String), Session>>,
     post: Poster,
     room_of: RoomOf,
     rename: Renamer,
+    attention: AttentionObserver,
 }
 
 /// What the sink holds for one session.
@@ -273,13 +287,38 @@ pub enum Handed {
 impl Sink {
     /// A sink posting through `post`, and naming a session anew through `rename`.
     #[must_use]
-    pub fn new(post: Poster, room_of: RoomOf, rename: Renamer) -> Arc<Self> {
+    pub fn new(
+        post: Poster,
+        room_of: RoomOf,
+        rename: Renamer,
+        attention: AttentionObserver,
+    ) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(BTreeMap::new()),
             post,
             room_of,
             rename,
+            attention,
         })
+    }
+
+    /// Preserve the exact native input/step and mirror origin; no resident receipt map.
+    ///
+    /// # Errors
+    /// The observation is malformed or its current attachment, origin or recipient changed.
+    pub async fn attention_observed(
+        &self,
+        node: &NodeName,
+        session: &str,
+        endpoint: &str,
+        token: &str,
+        observation: vox_core::node::attention::InputObservation,
+    ) -> Result<(), String> {
+        observation.validate()?;
+        if observation.session != session {
+            return Err("attention observation belongs to another Session".into());
+        }
+        (self.attention)(node.clone(), endpoint.into(), token.into(), observation).await
     }
 
     /// The harness renamed `session` (Codex's thread name, OpenCode's session title): its

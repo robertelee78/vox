@@ -4168,6 +4168,35 @@ impl NodeHandle {
             .map_err(|_| crate::error::Error::Unreachable("the node has stopped"))?
     }
 
+    /// A bounded private attention operation. Remote callers may only query under drive.
+    ///
+    /// # Errors
+    /// Current authority, room or Session changed, storage failed, or the actor stopped.
+    pub async fn attention(
+        &self,
+        channel_id: Digest32,
+        by: Digest32,
+        expected_instance: Option<[u8; 16]>,
+        operation: crate::node::attention::Operation,
+    ) -> Result<crate::node::attention::Reply, String> {
+        let (reply, rx) = oneshot::channel();
+        match self
+            .apply(NodeCommand::Attention {
+                channel_id,
+                by,
+                expected_instance,
+                operation,
+                reply,
+            })
+            .await
+        {
+            Outcome::Failed(fault) => Err(fault.explain().into()),
+            _ => rx
+                .await
+                .map_err(|_| "the attention actor stopped".to_owned())?,
+        }
+    }
+
     /// Current room pause, or a receiver-authorized durable change. `by` must come from
     /// the authenticated app stream (or this actor's own socket), never a request body.
     /// Changes must carry the hook-publication lock already acquired outside this actor.
@@ -5928,6 +5957,19 @@ impl Node {
             return Outcome::Failed(Fault::ComputerPolicy);
         }
         match command {
+            NodeCommand::Attention {
+                channel_id,
+                by,
+                expected_instance,
+                operation,
+                reply,
+            } => {
+                let result = self
+                    .attention(&channel_id, by, expected_instance, operation)
+                    .await;
+                let _ = reply.send(result);
+                Outcome::Done
+            }
             NodeCommand::RoomPause {
                 channel_id,
                 by,
@@ -18848,6 +18890,46 @@ impl Node {
             self.note_local_append(cid);
         }
         pruned > 0 || !checkpointed.is_empty() || applied
+    }
+
+    async fn attention(
+        &self,
+        channel_id: &Digest32,
+        by: Digest32,
+        expected_instance: Option<[u8; 16]>,
+        operation: crate::node::attention::Operation,
+    ) -> Result<crate::node::attention::Reply, String> {
+        let profile = self
+            .profile
+            .as_ref()
+            .filter(|p| p.is_unlocked())
+            .ok_or("this node is locked")?;
+        let owner = profile.fingerprint();
+        if by != owner
+            && (!matches!(operation, crate::node::attention::Operation::Page(_))
+                || !self.trust.has_drive(&by)
+                || !self.trust.is_trusted(&by))
+        {
+            return Err("attention requires current drive permission".into());
+        }
+        let shared = self
+            .channels
+            .get(channel_id)
+            .ok_or("the room is not open")?;
+        let mut channel = shared.lock().await;
+        if by != owner && !channel.is_member(&by) {
+            return Err("attention requires current room membership".into());
+        }
+        if let Some(expected) = expected_instance {
+            if channel
+                .history_instance(profile.store())
+                .map_err(|error| error.to_string())?
+                != expected
+            {
+                return Err("the selected room changed; refresh and retry".into());
+            }
+        }
+        channel.attention(profile.store(), owner, operation, (self.millis_clock)())
     }
 
     async fn room_pause(

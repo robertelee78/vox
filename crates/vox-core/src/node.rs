@@ -29,6 +29,7 @@ pub mod anchor_inventory;
 pub mod api;
 pub mod app;
 pub mod appipc;
+pub mod attention;
 pub mod card;
 pub mod channel;
 pub mod circuitstream;

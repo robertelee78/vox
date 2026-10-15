@@ -91,6 +91,8 @@ pub enum SegmentKind {
     GovernanceIndex,
     /// Node-identity-sealed activity accepted before its room can append it.
     SessionIngress,
+    /// Sealed current attention obligations and exact recipient receipts.
+    SessionAttention,
 }
 
 impl SegmentKind {
@@ -110,6 +112,7 @@ impl SegmentKind {
             SegmentKind::SessionIndex => b"vox/seg/session-index/v1",
             SegmentKind::GovernanceIndex => b"vox/seg/governance-index/v1",
             SegmentKind::SessionIngress => b"vox/seg/session-ingress/v1",
+            SegmentKind::SessionAttention => b"vox/seg/session-attention/v1",
         }
     }
 }

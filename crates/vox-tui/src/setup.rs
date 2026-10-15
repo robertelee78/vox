@@ -627,6 +627,10 @@ impl Wiring {
         }
     }
 
+    fn tui_plugin_file(&self) -> PathBuf {
+        self.dir.join("tui").join("vox.js")
+    }
+
     fn skill_dir(&self) -> PathBuf {
         self.dir.join("skills").join(crate::skill_pack::DIR_NAME)
     }
@@ -647,8 +651,9 @@ impl Wiring {
                 self.hook_file().display()
             ),
             _ => format!(
-                "its plugin, acting as {node}, is to be written to {}",
-                self.hook_file().display()
+                "its server plugin, acting as {node}, is to be written to {}; its client attention plugin is to go in {}, added to tui.json without replacing other settings",
+                self.hook_file().display(),
+                self.tui_plugin_file().display()
             ),
         };
         vec![
@@ -665,6 +670,12 @@ impl Wiring {
         let hook = self.hook_file();
         self.install_hook(node)?;
         let mut said = vec![format!("installed the hook in {}", hook.display())];
+        if self.key == "opencode" {
+            said.push(format!(
+                "installed client attention in {} and registered it in tui.json",
+                self.tui_plugin_file().display()
+            ));
+        }
         said.extend(
             crate::skill_pack::install_into(&self.skill_dir())?
                 .iter()
@@ -688,9 +699,73 @@ impl Wiring {
         match self.key {
             "claude" => merge_hooks(&hook, &crate::agent_hook::claude_settings(node)),
             "codex" => merge_hooks(&hook, &crate::agent_hook::codex_hooks(node)),
-            _ => write(&hook, &crate::agent_hook::opencode_plugin(node)),
+            _ => {
+                self.install_tui_plugin(node)?;
+                write(&hook, &crate::agent_hook::opencode_plugin(node))
+            }
         }
     }
+
+    /// OpenCode loads TUI plugins from tui.json, separately from server plugins.
+    /// Keep every other plugin/setting, and refuse an edited asset or non-JSON file.
+    fn install_tui_plugin(&self, node: &NodeName) -> Result<(), AppError> {
+        let plugin = self.tui_plugin_file();
+        if let Ok(text) = std::fs::read_to_string(&plugin) {
+            if !owned_tui_plugin(&text) {
+                return Err(AppError::Usage(format!(
+                    "{} holds another or edited client plugin; left unchanged",
+                    plugin.display()
+                )));
+            }
+        }
+        let config = self.dir.join("tui.json");
+        let mut value: serde_json::Value = match std::fs::read_to_string(&config) {
+            Ok(text) => serde_json::from_str(&text).map_err(|e| {
+                AppError::Usage(format!(
+                    "{} is not JSON ({e}); left unchanged",
+                    config.display()
+                ))
+            })?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+            Err(e) => return Err(e.into()),
+        };
+        let object = value.as_object_mut().ok_or_else(|| {
+            AppError::Usage(format!(
+                "{} holds no object; left unchanged",
+                config.display()
+            ))
+        })?;
+        let plugins = object
+            .entry("plugin")
+            .or_insert_with(|| serde_json::json!([]));
+        let plugins = plugins.as_array_mut().ok_or_else(|| {
+            AppError::Usage(format!(
+                "{} plugin is not an array; left unchanged",
+                config.display()
+            ))
+        })?;
+        let spec = "./tui/vox.js";
+        if !plugins.iter().any(|p| p.as_str() == Some(spec)) {
+            plugins.push(serde_json::Value::String(spec.into()));
+        }
+        for path in [&plugin, &config] {
+            if std::fs::metadata(path).is_ok_and(|m| m.permissions().readonly()) {
+                return Err(AppError::Usage(format!("{} is read-only", path.display())));
+            }
+        }
+        let text = serde_json::to_string_pretty(&value)
+            .map_err(|e| AppError::Usage(format!("cannot write TUI settings: {e}")))?
+            + "\n";
+        write(&plugin, &crate::agent_hook::opencode_tui_plugin(node))?;
+        write(&config, &text)
+    }
+}
+
+fn owned_tui_plugin(text: &str) -> bool {
+    text.lines()
+        .find_map(|line| line.strip_prefix("const VOX_NODE = \"")?.strip_suffix('"'))
+        .and_then(|node| NodeName::parse(node).ok())
+        .is_some_and(|node| crate::agent_hook::opencode_tui_plugin(&node) == text)
 }
 
 /// Merge the hook entries of `snippet` (as `vox agent plugin` prints them) into the settings file
@@ -801,6 +876,62 @@ pub(crate) fn unwire(account: &vox_core::node::paths::Account) -> Vec<Unwire> {
                     out.push(Unwire::Keep(format!(
                         "{} is kept: it is not the plugin Vox writes for a node here (edited, or for a node no longer on this machine); remove it yourself if it is Vox's",
                         hook.display()
+                    )));
+                }
+            }
+            let tui = w.tui_plugin_file();
+            if let Ok(text) = std::fs::read_to_string(&tui) {
+                if nodes
+                    .iter()
+                    .any(|node| crate::agent_hook::opencode_tui_plugin(node) == text)
+                {
+                    let config = w.dir.join("tui.json");
+                    let prepared = (|| -> Result<Option<String>, ()> {
+                        let text = match std::fs::read_to_string(&config) {
+                            Ok(text) => text,
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                            Err(_) => return Err(()),
+                        };
+                        let mut value: serde_json::Value =
+                            serde_json::from_str(&text).map_err(|_| ())?;
+                        let object = value.as_object_mut().ok_or(())?;
+                        let Some(plugins) = object.get_mut("plugin") else {
+                            return Ok(None);
+                        };
+                        let plugins = plugins.as_array_mut().ok_or(())?;
+                        let before = plugins.len();
+                        plugins.retain(|p| p.as_str() != Some("./tui/vox.js"));
+                        if plugins.len() == before {
+                            return Ok(None);
+                        }
+                        Ok(Some(
+                            serde_json::to_string_pretty(&value).map_err(|_| ())? + "\n",
+                        ))
+                    })();
+                    match prepared {
+                        Ok(text) => {
+                            if let Some(text) = text {
+                                out.push(Unwire::Rewrite {
+                                    what: format!(
+                                        "remove Vox's client attention plugin from {}",
+                                        config.display()
+                                    ),
+                                    path: config,
+                                    text,
+                                });
+                            }
+                            out.push(Unwire::Remove(tui));
+                        }
+                        Err(()) => out.push(Unwire::Keep(format!(
+                            "{} is kept because {} could not be safely updated",
+                            tui.display(),
+                            config.display()
+                        ))),
+                    }
+                } else {
+                    out.push(Unwire::Keep(format!(
+                        "{} is kept: its client plugin was edited or is not Vox's",
+                        tui.display()
                     )));
                 }
             }

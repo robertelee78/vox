@@ -294,6 +294,8 @@ pub struct ChannelView {
     pub ended_more: bool,
     /// Exact selected identity, independent of the displayed metadata page.
     pub selected_session: Option<SessionView>,
+    /// One private selected-Session attention page; never a General roster or count.
+    pub session_attention: Option<SessionAttentionView>,
     /// The lines of the Session on screen, for a member with drive (ADR-029 SC-1): one per
     /// activity, in the words `vox room session` prints. Empty while none is shown.
     pub session_lines: Vec<SessionLineView>,
@@ -322,6 +324,23 @@ pub struct SharedView {
     pub browser_hint: Option<String>,
 }
 
+/// Rendered observations for exactly the current drive-authorized open Session.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SessionAttentionView {
+    /// Bounded page rendered as plain lines, including source and observation time.
+    pub lines: Vec<String>,
+    /// Thread audiences are unresolved; this page cannot establish complete absence.
+    pub preparing: bool,
+    /// A current query is running independently of the TUI connection.
+    pub loading: bool,
+    /// Query failure is uncertainty, not a receiver Unavailable observation.
+    pub error: Option<String>,
+    /// The sealed current page has a continuation.
+    pub more: bool,
+    /// This is a later page; Refresh returns to first.
+    pub later: bool,
+}
+
 /// One Session in a room, as the TUI lists it (ADR-029 SE-3, CL-2).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SessionView {
@@ -339,6 +358,8 @@ pub struct SessionView {
     pub node_alias: String,
     /// When it opened, milliseconds since the Unix epoch.
     pub opened: u64,
+    /// Exact opening identity, not just a reused Session display id.
+    pub opening: Digest32,
     /// When it ended, milliseconds since the Unix epoch; `None` while it is open (SE-5).
     pub ended: Option<u64>,
     /// Whether the session's node trusts this node with drive (SC-2, CL-3).
@@ -652,6 +673,15 @@ pub enum Command {
         session: Option<(Digest32, String)>,
         /// General or an exact tag; ignored while a Session is selected.
         view: vox_core::node::api::RoomView,
+    },
+    /// Read one private attention page for the selected Session, without blocking the TUI.
+    SessionAttention {
+        /// The selected room.
+        channel_id: Digest32,
+        /// The selected Session owner and exact id.
+        session: (Digest32, String),
+        /// Continue the displayed page; false refreshes the first page.
+        next: bool,
     },
     /// Resolve an explicit typed Session name/id across bounded pages before showing it.
     FindSession {

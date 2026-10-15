@@ -1,62 +1,17 @@
-//! ADR-020 §6, second half — **interrupting** an agent session that is already
-//! running, rather than waiting for its next turn.
+//! Exact registered Session routes for room attention (ADR-020 RA-4–RA-8).
 //!
-//! The queue half is the drain hook: every turn, an agent reads what it has not
-//! seen. That is enough for work that can wait, and it is deliberately the default,
-//! because an interrupt that fires on everything is a queue with worse manners.
-//! What it cannot do is reach an agent *mid-turn*, or start a turn for an agent
-//! sitting idle — which is exactly what an **addressed, urgent** message needs.
+//! OpenCode automatic attention uses an authenticated capability issued and rechecked by
+//! its actual current TUI conversation. A retained server Session or a connectable socket
+//! is not admission authority. Ordinary news and addressed urgency use this same boundary.
+//! A lost acknowledgment remains unknown; a timer never resubmits it.
 //!
-//! ## How a session becomes reachable
+//! Claude's shared messaging endpoint does not bind the active conversation across `/clear`.
+//! Automatic attention is therefore unavailable for Claude until a receiver can enforce that
+//! boundary. Ordinary hooks still deliver its room news. Codex is always next-turn-only:
+//! Vox never starts, adds to, or steers a Codex turn for room attention.
 //!
-//! Not by configuration. The drain hook already runs every turn and already knows
-//! the session id, so it **records what it finds in its own environment** — which
-//! harness it is inside, and how that harness can be woken. "Which harness is this
-//! and how do I reach it" becomes something the system observes rather than
-//! something an operator maintains, and a stale registration is self-correcting
-//! because the next turn rewrites it.
-//!
-//! ## What each harness needs, measured rather than assumed
-//!
-//! - **Claude Code** — a Unix socket named by `CLAUDE_CODE_MESSAGING_SOCKET`, with
-//!   `CLAUDE_CODE_MESSAGING_TOKEN`. The wire is NDJSON: an `auth` frame, then a
-//!   `user` message. The binary documents this form itself, and it is **verified
-//!   here** — a message written this way arrived in a live session. Delivered
-//!   between tool calls, and it starts a new turn when the session is idle, which
-//!   is the property that makes it an interrupt rather than a queue.
-//! - **OpenCode** — a plain `opencode` has **no listener** an outside process could
-//!   find: the server URL its plugins are handed is a placeholder unless it was started
-//!   with `--port`, and it sets no variable naming one (ADR-021 F17, measured against
-//!   1.18.32). So Vox's plugin owns the channel: a Unix socket in a private directory,
-//!   with a token, whose path and token it puts in the drain hook's environment
-//!   (`VOX_OPENCODE_WAKE_SOCKET`, `_TOKEN`). The wire is Claude Code's shape — an
-//!   `auth` frame, then a `prompt` frame naming the session — and the plugin relays it
-//!   with its in-process client's `promptAsync`, which starts a turn when the session is
-//!   idle and is taken at the next step boundary mid-turn. It answers one line, so a
-//!   session OpenCode no longer knows is told apart from one that took the prompt.
-//! - **Codex** — **not woken, by decision** (V210-169). Its app-server can start a turn on a
-//!   thread it holds, but it keeps a session's thread loaded for a while after the user quits,
-//!   so a wake sent there would start a model turn in a session nobody is in. Vox never starts
-//!   a model run. A Codex session is registered so that the poster of an urgent message to it
-//!   is told, in one line, that it cannot be interrupted and reads the message at its next
-//!   turn ([`uninterruptible`]).
-//!
-//! ## Who is woken (V210-161, V210-163)
-//!
-//! An urgent message addressed to a node wakes its sessions working in that room: `to` names
-//! nodes, but each session hears only its saved room (ADR-029 RB-4, RB-5). A session with no room
-//! receives no room wakes. The node the message is for decides, on its own daemon, so a session
-//! on another node is woken by that node's daemon once the message reaches it. Not the session that posted it, and not one that
-//! already spoke in the reply chain it answers (V210-121).
-//!
-//! ## What a wake says, and when (V030-15, V030-20)
-//!
-//! A wake is a **notice**: how many urgent messages and replies wait, from whom, in which room,
-//! and never a byte of any of them (`agent_hook::render_wake`). The messages arrive once, in the
-//! drain of the turn the notice starts. The daemon counts what is owed just before it sends
-//! ([`crate::node_tasks`], [`tend`]), keeps at most one notice outstanding per session in its saved room,
-//! and announces an unread reply to an idle session on a schedule ([`Settings`]). What it owes
-//! each session is kept in [`Notices`], beside the registration, so a restart resumes it.
+//! Durable source/recipient observations live in the room's sealed attention ledger. Only
+//! successful hook output is a context receipt; transport acceptance is not delivery or answer.
 
 use std::path::Path;
 
@@ -64,6 +19,271 @@ use vox_agentcomms::envelope::Envelope;
 use vox_core::hash::Digest32;
 use vox_core::node::api::MessageRow;
 use vox_core::node::paths::Paths;
+
+/// A capability issued by an actual OpenCode client for its current conversation.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AttentionRoute {
+    /// Private client-owned Unix socket, distinct from the server mirror socket.
+    pub endpoint: String,
+    /// Private receiver authentication token.
+    pub token: String,
+    /// Fresh capability invalidated on route transition or disposal.
+    pub route: [u8; 32],
+}
+impl AttentionRoute {
+    fn from_env() -> Option<Self> {
+        let endpoint = std::env::var("VOX_OPENCODE_ATTENTION_SOCKET").ok()?;
+        let token = std::env::var("VOX_OPENCODE_ATTENTION_TOKEN").ok()?;
+        let hex = std::env::var("VOX_OPENCODE_ATTENTION_ROUTE").ok()?;
+        if endpoint.is_empty()
+            || endpoint.len() > 1024
+            || token.is_empty()
+            || token.len() > 256
+            || hex.len() != 64
+            || !hex.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return None;
+        }
+        let mut route = [0; 32];
+        for (i, byte) in route.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
+        }
+        Some(Self {
+            endpoint,
+            token,
+            route,
+        })
+    }
+}
+
+// The installed OpenCode TUI already owns this finite node/directory registry.
+// Its files are candidates only: an authenticated current-route reply is required.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AttentionClient {
+    version: u8,
+    node: String,
+    directory: String,
+    socket: String,
+    token: String,
+    client: String,
+}
+
+fn attention_clients(paths: &Paths, session: &Session) -> Result<Vec<AttentionClient>, String> {
+    use std::io::Read as _;
+    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+    let node = crate::client::name_of(paths).map_err(|e| e.to_string())?;
+    let directory = std::fs::canonicalize(
+        session
+            .start
+            .as_deref()
+            .ok_or("the Session has no saved directory")?,
+    )
+    .map_err(|e| e.to_string())?;
+    let directory = directory
+        .to_str()
+        .ok_or("the Session directory is not UTF-8")?;
+    let scope = serde_json::to_vec(&[node.as_str(), directory]).map_err(|e| e.to_string())?;
+    let digest = vox_core::hash::sha256(&scope);
+    let scope: String = digest[..16].iter().map(|b| format!("{b:02x}")).collect();
+    let registry = std::path::PathBuf::from("/tmp").join(format!("vox-oc-clients-{scope}"));
+    let uid = rustix::process::getuid().as_raw();
+    let owned_dir = |path: &Path| -> Result<(), std::io::Error> {
+        let st = std::fs::symlink_metadata(path)?;
+        if !st.is_dir() || st.uid() != uid || st.mode() & 0o077 != 0 {
+            return Err(std::io::Error::other(
+                "OpenCode client registry is not an owned private directory",
+            ));
+        }
+        Ok(())
+    };
+    match std::fs::symlink_metadata(&registry) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.to_string()),
+        Ok(_) => owned_dir(&registry).map_err(|e| e.to_string())?,
+    }
+    let mut clients = Vec::new();
+    for (inspected, entry) in std::fs::read_dir(&registry)
+        .map_err(|e| e.to_string())?
+        .enumerate()
+    {
+        if inspected >= 64 {
+            return Err("OpenCode client inventory exceeds its 64-entry bound".into());
+        }
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(suffix) = name.strip_prefix("client-") else {
+            continue;
+        };
+        if suffix.len() != 6 || !suffix.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            continue;
+        }
+        let dir = entry.path();
+        // A client may dispose between listing and opening. No such entry is live.
+        let read = (|| -> Result<AttentionClient, std::io::Error> {
+            owned_dir(&dir)?;
+            let fd = rustix::fs::open(
+                dir.join("client.json"),
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::NONBLOCK
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )?;
+            let file = std::fs::File::from(fd);
+            let st = file.metadata()?;
+            if !st.is_file() || st.uid() != uid || st.mode() & 0o077 != 0 || st.len() > 16384 {
+                return Err(std::io::Error::other("unsafe OpenCode client descriptor"));
+            }
+            let mut bytes = Vec::new();
+            file.take(16385).read_to_end(&mut bytes)?;
+            if bytes.len() > 16384 {
+                return Err(std::io::Error::other(
+                    "OpenCode client descriptor exceeds its byte bound",
+                ));
+            }
+            let client: AttentionClient =
+                serde_json::from_slice(&bytes).map_err(std::io::Error::other)?;
+            let hex = |text: &str| {
+                text.len() == 64
+                    && text
+                        .bytes()
+                        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            };
+            if client.version != 1
+                || client.node != node.as_str()
+                || client.directory != directory
+                || Path::new(&client.socket) != dir.join("attention.sock")
+                || !hex(&client.token)
+                || !hex(&client.client)
+            {
+                return Err(std::io::Error::other(
+                    "OpenCode client descriptor has a different scope or schema",
+                ));
+            }
+            let st = std::fs::symlink_metadata(&client.socket)?;
+            if !st.file_type().is_socket() || st.uid() != uid {
+                return Err(std::io::Error::other("OpenCode client socket is not owned"));
+            }
+            Ok(client)
+        })();
+        match read {
+            Ok(client) => clients.push(client),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    clients.sort_by(|a, b| {
+        a.client
+            .cmp(&b.client)
+            .then_with(|| a.socket.cmp(&b.socket))
+    });
+    Ok(clients)
+}
+
+async fn current_client_route(client: &AttentionClient, session: &str) -> Option<AttentionRoute> {
+    use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _};
+    let mut stream = tokio::net::UnixStream::connect(&client.socket).await.ok()?;
+    let request = format!(
+        "{}\n{}\n",
+        serde_json::json!({"type":"auth","token":client.token}),
+        serde_json::json!({"type":"route","session":session})
+    );
+    stream.write_all(request.as_bytes()).await.ok()?;
+    let mut line = String::new();
+    tokio::io::BufReader::new(stream)
+        .take(8193)
+        .read_line(&mut line)
+        .await
+        .ok()?;
+    if line.len() > 8192 || !line.ends_with('\n') {
+        return None;
+    }
+    let reply: serde_json::Value = serde_json::from_str(&line).ok()?;
+    let hex = reply["route"].as_str()?;
+    if reply["outcome"].as_str() != Some("available")
+        || reply["session"].as_str() != Some(session)
+        || reply["client"].as_str() != Some(client.client.as_str())
+        || hex.len() != 64
+        || !hex
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return None;
+    }
+    let mut route = [0; 32];
+    for (i, byte) in route.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(AttentionRoute {
+        endpoint: client.socket.clone(),
+        token: client.token.clone(),
+        route,
+    })
+}
+
+/// Resolve one current client for this exact saved Session; stale registration is only a hint.
+/// At most 64 descriptors and four concurrent handshakes share one two-second deadline.
+/// No file is changed, no turn is submitted, and no timer establishes liveness.
+pub(crate) async fn current_attention(
+    paths: &Paths,
+    session: &Session,
+) -> Result<Option<AttentionRoute>, String> {
+    use futures_util::StreamExt as _;
+    if session.harness != "opencode" || !session.interactive {
+        return Ok(None);
+    }
+    let same = || {
+        pause_registration(paths, &session.session)
+            .is_ok_and(|current| current.is_some_and(|current| current.same(session)))
+    };
+    if !same() {
+        return Err("the registered conversation changed before client discovery".into());
+    }
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    let clients = attention_clients(paths, session)?;
+    // Every finite batch gets a share: four silent sockets cannot retain all slots
+    // until the global deadline and permanently exclude a later responsive client.
+    // The extra share leaves scheduling margin; only a valid reply proves liveness.
+    let shares = u32::try_from(clients.len().div_ceil(4) + 1)
+        .map_err(|_| "OpenCode client inventory exceeds its bound")?;
+    let probe_budget = deadline.saturating_duration_since(tokio::time::Instant::now()) / shares;
+    // Own each probe's inputs before the stream crosses the spawned-task boundary.
+    let probes: Vec<_> = clients
+        .into_iter()
+        .enumerate()
+        .map(|(rank, client)| {
+            let session_id = session.session.clone();
+            async move {
+                let route =
+                    tokio::time::timeout(probe_budget, current_client_route(&client, &session_id))
+                        .await
+                        .ok()
+                        .flatten();
+                (rank, route)
+            }
+        })
+        .collect();
+    let probes = futures_util::stream::iter(probes).buffer_unordered(4);
+    tokio::pin!(probes);
+    let mut selected: Option<(usize, AttentionRoute)> = None;
+    loop {
+        match tokio::time::timeout_at(deadline, probes.next()).await {
+            Ok(Some((rank, Some(route))))
+                if selected.as_ref().is_none_or(|(best, _)| rank < *best) =>
+            {
+                selected = Some((rank, route));
+            }
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => break,
+        }
+    }
+    if !same() {
+        return Err("the registered conversation changed during client discovery".into());
+    }
+    Ok(selected.map(|(_, route)| route))
+}
 
 /// How one agent session can be woken.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -133,6 +353,12 @@ pub struct Session {
     /// (ADR-029 #542). Its token is [`Self::token`].
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub mirror: String,
+    /// Current client-owned automatic-attention capability. Absence clears a stale route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention: Option<AttentionRoute>,
+    /// Registration-only client activation; consumed before storage, never a turn receipt.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub registration_only: bool,
 }
 
 /// What a hook's environment says of its tmux pane: claimed, not proven. The daemon proves it
@@ -278,7 +504,8 @@ pub fn codex_headless(argv: &[String]) -> bool {
 /// report it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reach {
-    /// Its wake endpoint accepts a connection: an urgent message to its node interrupts it.
+    /// The current client route answered its exact capability probe; a later notice still
+    /// requires receiver admission. This is not proof that a notice was delivered.
     Interrupt,
     /// It has no wake path (Codex, which Vox never interrupts, or a harness Vox does not know):
     /// it reads at its next turn.
@@ -303,17 +530,55 @@ impl Reach {
 /// Whether `session` can be woken now: a connection to its endpoint, closed at once, so nothing
 /// is delivered and nothing is woken.
 pub async fn reach(session: &Session) -> Reach {
-    if !wakeable(&session.harness) {
+    use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _};
+    let Some(route) = session
+        .attention
+        .as_ref()
+        .filter(|_| wakeable(&session.harness))
+    else {
         return Reach::Turn;
-    }
-    if session.endpoint.is_empty() {
-        return Reach::Gone("it registered no wake endpoint".into());
-    }
-    let probe = tokio::net::UnixStream::connect(&session.endpoint);
+    };
+    let probe = async {
+        let mut stream = tokio::net::UnixStream::connect(&route.endpoint)
+            .await
+            .map_err(|error| error.to_string())?;
+        let request = format!(
+            "{}\n{}\n",
+            serde_json::json!({"type":"auth","token":route.token}),
+            serde_json::json!({"type":"route","session":session.session})
+        );
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut line = String::new();
+        tokio::io::BufReader::new(stream)
+            .take(8193)
+            .read_line(&mut line)
+            .await
+            .map_err(|error| error.to_string())?;
+        if line.len() > 8192 || !line.ends_with('\n') {
+            return Err("no bounded client route response".to_owned());
+        }
+        let reply: serde_json::Value =
+            serde_json::from_str(&line).map_err(|error| error.to_string())?;
+        let expected: String = route
+            .route
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        if reply["outcome"].as_str() == Some("available")
+            && reply["route"].as_str() == Some(expected.as_str())
+        {
+            Ok(())
+        } else {
+            Err("the registered client conversation is no longer available".to_owned())
+        }
+    };
     match tokio::time::timeout(std::time::Duration::from_secs(2), probe).await {
-        Ok(Ok(_)) => Reach::Interrupt,
-        Ok(Err(e)) => Reach::Gone(format!("{}: {e}", session.endpoint)),
-        Err(_) => Reach::Gone(format!("{}: no answer within 2 s", session.endpoint)),
+        Ok(Ok(())) => Reach::Interrupt,
+        Ok(Err(error)) => Reach::Gone(error),
+        Err(_) => Reach::Gone("the client route did not answer within 2 s".into()),
     }
 }
 
@@ -342,6 +607,7 @@ impl Session {
             && self.endpoint == other.endpoint
             && self.token == other.token
             && self.room == other.room
+            && self.attention == other.attention
     }
 }
 
@@ -355,25 +621,14 @@ pub fn now_millis() -> u64 {
 
 /// The `data` key of a session's `hello` saying how it can be reached (V030-17).
 pub const WAKE_KEY: &str = "wake";
-/// How `session` can be reached, as its `hello` says it (`data.wake`, V030-17): `interrupt` when
-/// it left Vox a wake channel (Claude Code's messaging socket, or the Vox OpenCode plugin's), else
-/// `turn` — it reads the room at its next turn, and nothing can start one (Codex: V210-169).
-///
-/// Its registration decides when it has one: a Codex started from a Claude Code terminal
-/// inherits that terminal's socket, and its hook registered it as Codex from its own input. With
-/// no registration (no hook ran), what the harness put in the environment.
+/// Advertised route capability, not a promise of admission or delivery. Only an exact
+/// registered OpenCode client route may advertise automatic attention; all others use hooks.
 #[must_use]
 pub fn reachability(paths: &Paths, session: &str) -> &'static str {
-    if let Some(reg) = load(paths, session) {
-        return if reg.harness != "codex" && !reg.endpoint.is_empty() {
-            "interrupt"
-        } else {
-            "turn"
-        };
-    }
-    let set = |k: &str| std::env::var_os(k).is_some();
-    if (set("CLAUDE_CODE_MESSAGING_SOCKET") && set("CLAUDE_CODE_MESSAGING_TOKEN"))
-        || (set("VOX_OPENCODE_WAKE_SOCKET") && set("VOX_OPENCODE_WAKE_TOKEN"))
+    if pause_registration(paths, session)
+        .ok()
+        .flatten()
+        .is_some_and(|reg| wakeable(&reg.harness) && reg.attention.is_some())
     {
         "interrupt"
     } else {
@@ -504,9 +759,26 @@ pub fn store_checked(paths: &Paths, reg: &Session) -> Result<(), String> {
     // **A name, once given, stays until the harness gives another** (ADR-029 MD-1): a turn whose
     // harness said nothing of it (a sub-agent's event, a transcript not yet written) keeps it.
     if reg.name.is_none() {
-        reg.name = earlier.and_then(|b| b.name);
+        reg.name = earlier.as_ref().and_then(|b| b.name.clone());
     }
-    reg.last_drained_ms = now;
+    if reg.registration_only {
+        reg.state = earlier
+            .as_ref()
+            .map(|b| b.state.clone())
+            .unwrap_or_default();
+        reg.state_ms = earlier.as_ref().map_or(0, |b| b.state_ms);
+        reg.last_drained_ms = earlier.as_ref().map_or(0, |b| b.last_drained_ms);
+        // An idle client route refresh says nothing about its mirror or terminal binding.
+        if let Some(before) = &earlier {
+            reg.endpoint.clone_from(&before.endpoint);
+            reg.token.clone_from(&before.token);
+            reg.mirror.clone_from(&before.mirror);
+            reg.tmux.clone_from(&before.tmux);
+        }
+        reg.registration_only = false;
+    } else {
+        reg.last_drained_ms = now;
+    }
     // **One session per pane** (ADR-029 DR-5): the newest hook in a pane claims it, and every other
     // session of this node bound there loses its binding. Case: a new session (or `/clear`) in the
     // pane of one that ended without a SessionEnd while its process lives on.
@@ -561,6 +833,10 @@ impl Session {
             Ok(claim) => s.tmux_claim = claim,
             Err(why) => s.tmux_why = Some(why),
         }
+        s.attention = AttentionRoute::from_env();
+        if s.attention.is_some() && !codex {
+            s.harness = "opencode".into();
+        }
         // Claude Code sets `CLAUDE_CODE_ENTRYPOINT` for its hooks even when its messaging socket
         // is off.
         if s.harness == "unknown" && std::env::var_os("CLAUDE_CODE_ENTRYPOINT").is_some() {
@@ -590,6 +866,8 @@ impl Session {
                 tmux_claim: None,
                 codex_home: crate::codex_mirror::codex_home_from_env(),
                 mirror: String::new(),
+                attention: None,
+                registration_only: false,
             }
         } else if let (Ok(endpoint), Ok(token)) = (
             std::env::var("CLAUDE_CODE_MESSAGING_SOCKET"),
@@ -614,6 +892,8 @@ impl Session {
                 tmux_claim: None,
                 codex_home: String::new(),
                 mirror: String::new(),
+                attention: None,
+                registration_only: false,
             }
         } else if let (Ok(endpoint), Ok(token)) = (
             std::env::var("VOX_OPENCODE_WAKE_SOCKET"),
@@ -638,6 +918,8 @@ impl Session {
                 tmux_claim: None,
                 codex_home: String::new(),
                 mirror: std::env::var("VOX_OPENCODE_MIRROR_SOCKET").unwrap_or_default(),
+                attention: None,
+                registration_only: false,
             }
         } else {
             Session {
@@ -659,6 +941,8 @@ impl Session {
                 tmux_claim: None,
                 codex_home: String::new(),
                 mirror: String::new(),
+                attention: None,
+                registration_only: false,
             }
         }
     }
@@ -732,8 +1016,8 @@ pub fn uninterruptible(paths: &Paths, me: &str, to: &[String]) -> Option<String>
     }
     let reachable = registered(paths).iter().any(|s| {
         (whole || named.contains(&s.session.as_str()))
-            && s.harness != "codex"
-            && !s.endpoint.is_empty()
+            && wakeable(&s.harness)
+            && s.attention.is_some()
     });
     if reachable {
         return None;
@@ -825,8 +1109,9 @@ pub(crate) fn registered_page(
     Ok((page, next))
 }
 
-/// Only the live routing fields needed to interrupt. Large current titles and transcript
-/// metadata are skipped by the streaming JSON decoder rather than copied into every page.
+/// Only the live routing fields needed to interrupt, including the saved directory that
+/// scopes OpenCode's client registry. Large current titles and transcript metadata are skipped
+/// by the streaming JSON decoder rather than copied into every page.
 #[derive(serde::Deserialize)]
 struct PauseRegistration {
     session: String,
@@ -837,6 +1122,8 @@ struct PauseRegistration {
     token: String,
     #[serde(default)]
     room: Option<String>,
+    #[serde(default)]
+    start: Option<String>,
     #[serde(default)]
     first_seen_ms: u64,
     #[serde(default = "interactive_by_default")]
@@ -849,6 +1136,8 @@ struct PauseRegistration {
     codex_home: String,
     #[serde(default)]
     mirror: String,
+    #[serde(default)]
+    attention: Option<AttentionRoute>,
 }
 fn pause_registration_file(path: &std::path::Path) -> Result<Option<Session>, String> {
     let file = match std::fs::File::open(path) {
@@ -875,10 +1164,12 @@ fn pause_registration_file(path: &std::path::Path) -> Result<Option<Session>, St
         tmux_why: reg.tmux_why,
         codex_home: reg.codex_home,
         mirror: reg.mirror,
+        attention: reg.attention,
+        registration_only: false,
         state: String::new(),
         state_ms: 0,
         last_drained_ms: 0,
-        start: None,
+        start: reg.start,
         name: None,
         transcript: String::new(),
         tmux_claim: None,
@@ -1121,117 +1412,129 @@ impl std::fmt::Display for WakeError {
 /// # Errors
 /// If the harness has no implemented wake path, or delivery fails.
 pub async fn wake(paths: &Paths, session: &Session, text: &str) -> Result<(), WakeError> {
-    check_wake_registration(paths, session)?;
-    match session.harness.as_str() {
-        "claude" => wake_claude(paths, session, text).await,
-        "opencode" => wake_opencode(paths, session, text).await,
-        // Never woken (V210-169): Codex keeps a quit session's thread loaded, so a turn started
-        // there could run with nobody in the session.
-        "codex" => Err(WakeError::Failed(
-            "Vox does not interrupt Codex sessions; the message waits for the session's next turn"
-                .into(),
-        )),
+    let id =
+        vox_core::identity::rng::random_array().map_err(|e| WakeError::Failed(e.to_string()))?;
+    match attention(paths, session, id, text).await {
+        vox_core::node::attention::DispatchOutcome::Accepted => Ok(()),
         other => Err(WakeError::Failed(format!(
-            "no wake path for harness {other:?}"
+            "attention was not acknowledged: {other:?}"
         ))),
     }
 }
 
-/// Recheck after asynchronous connection too, immediately before handing text to the harness.
-fn check_wake_registration(paths: &Paths, session: &Session) -> Result<(), WakeError> {
-    if session.room.is_some()
-        && registration(paths, &session.session).is_some_and(|s| s.same(session))
-    {
-        Ok(())
-    } else {
-        Err(WakeError::Moved)
-    }
+/// Submit one already-reserved notice to the current client-owned conversation boundary.
+/// No server or Claude shared-endpoint fallback is permitted. Lost acknowledgments are unknown.
+pub async fn attention(
+    paths: &Paths,
+    session: &Session,
+    id: [u8; 16],
+    text: &str,
+) -> vox_core::node::attention::DispatchOutcome {
+    use vox_core::node::attention::DispatchOutcome as Outcome;
+    let Some(route) = session
+        .attention
+        .as_ref()
+        .filter(|_| session.harness == "opencode")
+    else {
+        return Outcome::Unavailable(
+            if session.harness == "codex" {
+                "waiting for next Codex turn"
+            } else {
+                "this adapter has no exact client admission boundary"
+            }
+            .into(),
+        );
+    };
+    attention_on_route(paths, session, route, id, text).await
 }
 
-/// Connect to a session's socket; a socket that is gone or refuses means the session ended.
-async fn connect(socket: &Path) -> Result<tokio::net::UnixStream, WakeError> {
-    tokio::net::UnixStream::connect(socket).await.map_err(|e| {
-        let why = format!("connecting to the session socket: {e}");
-        // No socket file, or nobody listening on it: the session has ended.
-        match e.kind() {
-            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
-                WakeError::Gone(why)
+/// Send only to the live capability selected before the durable notice reservation.
+/// The original saved registration remains a separate before-write fence.
+pub(crate) async fn attention_on_route(
+    paths: &Paths,
+    session: &Session,
+    route: &AttentionRoute,
+    id: [u8; 16],
+    text: &str,
+) -> vox_core::node::attention::DispatchOutcome {
+    use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _};
+    use vox_core::node::attention::DispatchOutcome as Outcome;
+    let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let id = hex(&id);
+    let payload = format!(
+        "{}\n{}\n",
+        serde_json::json!({"type":"auth","token":route.token}),
+        serde_json::json!({"type":"attention","session":session.session,"route":hex(&route.route),"id":id,"text":text})
+    );
+    if payload.len() > 64 * 1024 {
+        return Outcome::NotSent("attention notice exceeds its transport bound".into());
+    }
+    let mut written = false;
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let mut stream = match tokio::net::UnixStream::connect(&route.endpoint).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                return Outcome::NotSent(format!("attention client was not reached: {error}"))
             }
-            _ => WakeError::Failed(why),
+        };
+        if !pause_registration(paths, &session.session)
+            .is_ok_and(|current| current.is_some_and(|current| current.same(session)))
+        {
+            return Outcome::NotSent(
+                "the registered conversation changed before submission".into(),
+            );
+        }
+        written = true;
+        if let Err(error) = stream.write_all(payload.as_bytes()).await {
+            return Outcome::Unknown(format!(
+                "attention write failed; acceptance is unknown: {error}"
+            ));
+        }
+        let mut line = String::new();
+        if let Err(error) = tokio::io::BufReader::new(stream)
+            .take(8193)
+            .read_line(&mut line)
+            .await
+        {
+            return Outcome::Unknown(format!("attention acknowledgment failed: {error}"));
+        }
+        if line.len() > 8192 || !line.ends_with('\n') {
+            return Outcome::Unknown("no complete bounded attention acknowledgment".into());
+        }
+        let Ok(reply) = serde_json::from_str::<serde_json::Value>(&line) else {
+            return Outcome::Unknown("invalid attention acknowledgment".into());
+        };
+        if reply["id"].as_str() != Some(id.as_str()) {
+            return Outcome::Unknown("attention acknowledgment did not name this notice".into());
+        }
+        let reason = reply["error"]
+            .as_str()
+            .unwrap_or("the current client refused attention")
+            .chars()
+            .take(512)
+            .collect::<String>();
+        match reply["outcome"].as_str() {
+            Some("accepted") => Outcome::Accepted,
+            Some("rejected") => Outcome::Rejected(reason),
+            Some("unavailable") => Outcome::Unavailable(reason),
+            _ => Outcome::Unknown(reason),
+        }
+    })
+    .await;
+    result.unwrap_or_else(|_| {
+        if written {
+            Outcome::Unknown("attention acknowledgment timed out; acceptance is unknown".into())
+        } else {
+            Outcome::NotSent("attention client connection timed out before any write".into())
         }
     })
 }
 
-/// Write `frames` (each one NDJSON line) and flush.
-async fn send(
-    stream: &mut tokio::net::UnixStream,
-    frames: &[serde_json::Value],
-) -> Result<(), WakeError> {
-    use tokio::io::AsyncWriteExt as _;
-    let payload: String = frames.iter().map(|f| format!("{f}\n")).collect();
-    stream
-        .write_all(payload.as_bytes())
-        .await
-        .map_err(|e| WakeError::Failed(format!("writing to the session socket: {e}")))?;
-    stream
-        .flush()
-        .await
-        .map_err(|e| WakeError::Failed(format!("flushing the session socket: {e}")))
-}
-
-/// NDJSON over Claude Code's messaging socket: an `auth` frame, then a user
-/// message. Verified against a live session.
-async fn wake_claude(paths: &Paths, session: &Session, text: &str) -> Result<(), WakeError> {
-    let mut stream = connect(Path::new(&session.endpoint)).await?;
-    check_wake_registration(paths, session)?;
-    let auth = serde_json::json!({ "type": "auth", "token": session.token });
-    let message = serde_json::json!({
-        "type": "user",
-        "message": { "role": "user", "content": text },
-    });
-    send(&mut stream, &[auth, message]).await
-}
-
-/// The Vox OpenCode plugin's wake socket: an `auth` frame, then a `prompt` frame for
-/// `session`, answered with one line saying whether OpenCode took it.
-async fn wake_opencode(paths: &Paths, session: &Session, text: &str) -> Result<(), WakeError> {
-    use tokio::io::AsyncBufReadExt as _;
-    let mut stream = connect(Path::new(&session.endpoint)).await?;
-    check_wake_registration(paths, session)?;
-    let auth = serde_json::json!({ "type": "auth", "token": session.token });
-    let prompt = serde_json::json!({
-        "type": "prompt",
-        "session": session.session,
-        "text": text,
-    });
-    send(&mut stream, &[auth, prompt]).await?;
-    let mut line = String::new();
-    tokio::io::BufReader::new(stream)
-        .read_line(&mut line)
-        .await
-        .map_err(|e| WakeError::Failed(format!("reading the plugin's answer: {e}")))?;
-    let reply: serde_json::Value = serde_json::from_str(line.trim())
-        .map_err(|_| WakeError::Failed(format!("the plugin answered {line:?}")))?;
-    if reply["ok"] == true {
-        return Ok(());
-    }
-    let why = format!(
-        "the OpenCode plugin answered: {}",
-        reply["error"].as_str().unwrap_or("nothing")
-    );
-    // OpenCode is up and does not know this session.
-    if reply["gone"] == true {
-        Err(WakeError::Gone(why))
-    } else {
-        Err(WakeError::Failed(why))
-    }
-}
-
-/// Whether `harness` has a wake path at all. Codex has none (see the module header), so nothing is
-/// owed to a Codex session in notices: it reads at its next turn.
+/// Whether this harness supports an exact client receiver. Actual availability additionally
+/// requires a current route capability; Codex and Claude receive ordinary hook context only.
 #[must_use]
 pub fn wakeable(harness: &str) -> bool {
-    matches!(harness, "claude" | "opencode")
+    harness == "opencode"
 }
 
 /// The kinds that are never a reply worth announcing (V030-20): acknowledgements, progress,

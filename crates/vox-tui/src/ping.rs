@@ -140,7 +140,7 @@ pub async fn ping(
         body: "which agent sessions does this node hold, and can each be reached?".into(),
         ..crate::coord::Draft::default()
     };
-    let session = crate::coord::session(None).unwrap_or_default();
+    let session = crate::coord::posting_session(paths, None)?.unwrap_or_default();
     let op = crate::coord::new_op()?;
     let posted = crate::coord::post_once(&mut client, channel_id, &draft, &session, &op, &snap)
         .await?

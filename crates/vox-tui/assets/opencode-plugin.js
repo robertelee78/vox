@@ -46,25 +46,17 @@
 //     by ctm's own plugin, not measured here. This file touches the client only
 //     when a wake arrives, which is always after init.
 //
-// ## How an urgent message reaches this session (ADR-020 §6, ADR-021 F17)
+// ## Client-owned attention (ADR-020 RA7)
 //
-// `vox daemon` interrupts a session through whatever channel the session's drain
-// registered. A plain `opencode` has **no listener** an outside process could reach:
-// the `serverUrl` a plugin is handed is a placeholder unless OpenCode was started
-// with `--port`, and OpenCode sets no variable naming it (measured, 1.18.32). Its
-// in-process client, though, reaches the session from here. So this plugin owns
-// the channel: a Unix socket in a private directory of its own, with a random
-// token, whose path and token it passes to `vox agent hook` (and to nothing else).
-// The hook records them; the daemon writes an `auth` frame and a `prompt` frame to
-// the socket; this plugin checks the token and relays the prompt with
-// `client.session.promptAsync`. That starts a turn when the session is idle, and
-// mid-turn it is taken at the next step boundary, exactly as if typed while busy.
-// It never aborts the running turn first: an abort orphans a queued prompt.
+// The separate tui/vox.js plugin owns a private receiver in the actual TUI. Server
+// hooks discover its exact current Session capability, and pass that capability to
+// Vox. Only the client rechecks the route/lifecycle and submits the neutral notice.
+// A retained server, saved Session, PID or heartbeat never authorizes submission.
+// Background open clients qualify. No client prompt draft is read or modified, and
+// busy work is never aborted. An uncertain acknowledgement must not be retried.
 //
-// **A wake carries no message** (V030-15). The relayed prompt is a notice from Vox: how many
-// urgent messages and replies wait, from whom, in which room. The relayed prompt is a user
-// message, so this plugin's own drain runs on it, and that drain is what gives the model the
-// messages themselves, once, first in its block.
+// A wake carries no room message: the normal hook drains authorized room context.
+// The receiver marks the notice's SDK part metadata so it stays Vox-generated text.
 //
 // ## How the session's Session is fed and driven (ADR-029 #542, #544)
 //
@@ -81,10 +73,10 @@
 // Hook failures never throw into OpenCode's turn. Mirror capacity, metadata and control
 // failures are explicit on the private socket so Vox reports stopped observation.
 
-import { appendFileSync, lstatSync, mkdtempSync, readdirSync, rmdirSync, unlinkSync } from "node:fs"
+import { appendFileSync, closeSync, constants, fstatSync, lstatSync, mkdtempSync, openSync, opendirSync, readFileSync, realpathSync, readdirSync, rmdirSync, unlinkSync } from "node:fs"
 import { spawn } from "node:child_process"
 import { connect, createServer } from "node:net"
-import { randomBytes, timingSafeEqual } from "node:crypto"
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto"
 import { StringDecoder } from "node:string_decoder"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -106,19 +98,9 @@ function log(line) {
 }
 
 /**
- * The wake channel: a private socket that relays a prompt into a session of this
- * OpenCode through its in-process client. `null` when it could not be opened —
- * the session then still reads its room every turn; it just cannot be interrupted.
- *
- * The wire is NDJSON, the same shape Claude Code's messaging socket takes:
- *
- *   {"type":"auth","token":"…"}
- *   {"type":"prompt","session":"ses_…","text":"…"}
- *
- * answered with one line: `{"ok":true}`, or `{"error":"…"}` with `"gone":true`
- * when this OpenCode does not know the session. A connection that has not sent both
- * frames within `AUTH_IDLE_MS`, or sends more than `MAX_FRAMES_BYTES` before them, is
- * closed unanswered.
+ * The legacy server wake endpoint refuses submission; the mirror endpoint still
+ * follows this server's Sessions. Both use authenticated, bounded NDJSON. Actual
+ * attention is admitted by opencode-tui-plugin.js in the selected live client.
  *
  * ## The directory is removed when OpenCode exits, however it exits (ADR-021 F17)
  *
@@ -214,19 +196,20 @@ function defang(text) {
 
 /**
  * What `vox agent hook --format opencode` printed: `vox`, Vox's own notices, and `room`, what
- * the rooms said. Output of any other shape is taken as room text, all of it, so it is fenced:
- * nothing reads as Vox's that Vox did not mark as its own.
+ * the rooms said, plus private receipt descriptors. Empty output means a quiet hook.
+ * Anything else must be one complete typed envelope: raw fallback could expose receipts.
  */
 function drained(stdout) {
+  if (Buffer.byteLength(stdout) > MAX_MIRROR_BYTES) throw new Error("Vox hook output exceeds its bound")
+  if (!stdout.trim()) return { vox: "", room: "", attention_receipts: [] }
+  let v
   try {
-    const v = JSON.parse(stdout)
-    if (v && typeof v.vox === "string" && typeof v.room === "string") return v
-  } catch {}
-  return { vox: "", room: stdout }
+    v = JSON.parse(stdout)
+  } catch { throw new Error("Vox hook output is not one complete JSON envelope") }
+  if (!v || Array.isArray(v) || typeof v.vox !== "string" || typeof v.room !== "string"
+    || !Array.isArray(v.attention_receipts)) throw new Error("Vox hook output is not a typed context envelope")
+  return v
 }
-
-/** The most wake notices remembered per session until OpenCode runs a turn on them. */
-const MAX_RELAYED = 16
 
 // The agent's own node, written in by `vox agent plugin opencode --node <name>` (ADR-020 2.1): the
 // drain hook acts only as it, and every shell this session runs names it in `VOX_NODE`, so the
@@ -257,7 +240,6 @@ const MAX_SESSION_META = 64 << 10
 const MAX_CONNECTIONS = 64
 const MAX_CALLS = 32
 const MAX_QUEUED_FRAMES = 64
-const MAX_RELAYED_BYTES = 4 << 20
 const MAX_CONTROL_BYTES = 64 << 10
 const CALL_WITHIN_MS = 30_000
 let mirrorFailure = null
@@ -334,6 +316,83 @@ async function ownerOf(client, event) {
   throw new Error("OpenCode session lineage exceeds 32 ancestors")
 }
 
+const MAX_ATTENTION_SOURCES = 50
+const MAX_ATTENTION_BYTES = 128 << 10
+const nativeID = (id) => typeof id === "string" && id.length > 0
+  && Buffer.byteLength(id) <= 256 && !/[\u0000-\u001f\u007f-\u009f]/.test(id)
+const byteArray = (value, length) => Array.isArray(value) && value.length === length
+  && value.every((v) => Number.isInteger(v) && v >= 0 && v <= 255)
+function inputDigest(session, input) {
+  if (!nativeID(session) || !nativeID(input)) throw new Error("invalid OpenCode attention input identity")
+  return [...createHash("sha256").update(Buffer.concat([
+    Buffer.from("vox/attention/opencode-input/v1\0"), Buffer.from(session), Buffer.from([0]), Buffer.from(input),
+  ])).digest()]
+}
+function receiptDescriptors(value, session, input, empty = false) {
+  if (!Array.isArray(value) || (!empty && !value.length) || value.length > MAX_ATTENTION_SOURCES
+    || Buffer.byteLength(JSON.stringify(value)) > MAX_ATTENTION_BYTES) {
+    throw new Error("OpenCode attention receipts exceed their bound or have invalid shape")
+  }
+  const digest = inputDigest(session, input)
+  let count = 0
+  for (const r of value) {
+    const recipient = r?.recipient
+    if (!r || !recipient || recipient.session !== session
+      || !byteArray(recipient.room, 32) || !byteArray(recipient.instance, 16)
+      || !byteArray(recipient.opening, 32) || !byteArray(recipient.identity, 32)
+      || !byteArray(r.input, 32) || r.input.some((v, i) => v !== digest[i])
+      || !byteArray(r.ticket, 16) || !Array.isArray(r.sources)
+      || !r.sources.length || r.sources.length > 6 || !r.sources.every((source) => byteArray(source, 32))) {
+      throw new Error("OpenCode attention receipt does not match its exact input")
+    }
+    count += r.sources.length
+  }
+  if (count > MAX_ATTENTION_SOURCES) throw new Error("OpenCode attention source count exceeds its bound")
+  return value
+}
+
+/** Read only the two exact messages. A busy flag or allocated assistant is not consumption. */
+async function attentionStep(client, part, owner) {
+  if (part.sessionID !== owner) return null // Descendant ownership is not this Session.
+  if (!nativeID(part.id) || !nativeID(part.messageID) || !nativeID(part.sessionID)) {
+    throw new Error("OpenCode step has invalid authoritative identifiers")
+  }
+  const exact = async (id) => boundedJson(client,
+    `/session/${encodeURIComponent(part.sessionID)}/message/${encodeURIComponent(id)}`, MAX_MIRROR_BYTES)
+  const parent = await (async () => {
+    const assistant = await exact(part.messageID)
+    const info = assistant?.info
+    if (info?.id !== part.messageID || info.sessionID !== part.sessionID || info.role !== "assistant"
+      || !nativeID(info.parentID) || !Array.isArray(assistant.parts)
+      || assistant.parts.filter((p) => p.id === part.id && p.type === "step-start"
+        && p.messageID === info.id && p.sessionID === info.sessionID).length !== 1) {
+      throw new Error("OpenCode could not resolve the exact running assistant step")
+    }
+    if (info.summary === true || info.mode === "compaction" || info.agent === "compaction") return null
+    return info.parentID
+  })()
+  if (parent === null) return null
+  const input = await exact(parent)
+  if (input?.info?.id !== parent || input.info.sessionID !== part.sessionID
+    || input.info.role !== "user" || !Array.isArray(input.parts)) {
+    throw new Error("OpenCode could not resolve the step's exact parent input")
+  }
+  const receipts = []
+  for (const p of input.parts) {
+    if (!p.metadata || !Object.hasOwn(p.metadata, "vox_attention_receipts")) continue
+    const stamp = p.metadata.vox_attention_receipts
+    if (p.type !== "text" || p.sessionID !== part.sessionID || p.messageID !== parent
+      || !stamp || stamp.session !== part.sessionID || stamp.input !== parent) {
+      throw new Error("OpenCode persisted attention metadata on a different input")
+    }
+    receipts.push(...receiptDescriptors(stamp.receipts, part.sessionID, parent))
+    // Check the aggregate as well as each stamped part before retaining anything further.
+    receiptDescriptors(receipts, part.sessionID, parent)
+  }
+  if (!receipts.length) return null // An ordinary input with no reserved metadata.
+  return { session: part.sessionID, input: parent, assistant: part.messageID, step: part.id, receipts }
+}
+
 /** A bounded optimization only. A cache miss is resolved against OpenCode's own message. */
 function mirrorEvents(client) {
   const messages = new Map()
@@ -362,7 +421,7 @@ function mirrorEvents(client) {
     if (messages.size > MAX_MESSAGE_ROLES) messages.delete(messages.keys().next().value)
     return value
   }
-  const enrich = async (event) => {
+  const enrich = async (event, owner) => {
     if (event.type === "message.updated") remember(event.properties?.info)
     if (event.type !== "message.part.updated") return event
     const part = event.properties?.part
@@ -381,7 +440,8 @@ function mirrorEvents(client) {
       info = remember(candidate)
       if (!info) throw new Error("OpenCode supplied no user or assistant role for a part")
     }
-    return { ...event, properties: { ...event.properties, voxMessage: info } }
+    const attention = part.type === "step-start" ? await attentionStep(client, part, owner) : null
+    return { ...event, properties: { ...event.properties, voxMessage: info, voxAttention: attention } }
   }
   const drain = async () => {
     if (running) return
@@ -398,7 +458,7 @@ function mirrorEvents(client) {
             const writers = (item.targets ?? item.followers.get(owner) ?? [])
               .filter((write) => write.active && (!item.targets || !write.titleUpdated))
             if (owner && writers.length) {
-              const event = await enrich(raw)
+              const event = await enrich(raw, owner)
               if (Buffer.byteLength(JSON.stringify({ type: "event", event })) + 1 > MAX_MIRROR_BYTES) {
                 throw new Error("an enriched mirror event exceeds its line bound")
               }
@@ -420,7 +480,7 @@ function mirrorEvents(client) {
       running = false
     }
   }
-  return (event, targets = null) => {
+  const enqueue = (event, targets = null) => {
     // Only events consumed by the Session adapter need lineage. In particular, an unused
     // deletion must not GET an already-deleted session and stop unrelated observations.
     if (!["message.updated", "message.part.updated", "session.updated", "session.idle",
@@ -452,6 +512,9 @@ function mirrorEvents(client) {
       void drain()
     })
   }
+  // Hook decoding uses the same bounded, persistent private failure path as event decoding.
+  enqueue.fail = fail
+  return enqueue
 }
 
 function fanout(event, owner, writers) {
@@ -545,12 +608,77 @@ async function runCall(client, session, call) {
   }
 }
 
-/**
- * `relayed` notes each wake notice relayed to a session (session id → its texts), before
- * OpenCode is handed it: OpenCode may run the prompt's `chat.message` before `promptAsync`
- * returns, and that turn must know the message is Vox's notice, not the operator's (V030-21).
- */
-function wakeChannel(client, relayed, mirrorEvent) {
+// Discover only this node/directory's private TUI descriptors. A descriptor is not
+// presence: the exact receiver must acknowledge its current route. Ambiguous or
+// incomplete discovery is unavailable; it never submits anything or advances news.
+async function attentionRoute(session, directory) {
+  const found = []
+  try {
+    directory = realpathSync(directory)
+    const scope = createHash("sha256").update(JSON.stringify([VOX_NODE, directory])).digest("hex")
+    const registry = join("/tmp", "vox-oc-clients-" + scope.slice(0, 32))
+    const st = lstatSync(registry)
+    if (!st.isDirectory() || st.isSymbolicLink() || st.uid !== process.getuid?.() || (st.mode & 0o077)) return null
+    const entries = opendirSync(registry)
+    try {
+      let entry, inspected = 0
+      while ((entry = entries.readSync())) {
+        if (++inspected > 64) return null
+        if (!/^client-[A-Za-z0-9]{6}$/.test(entry.name)) continue
+        const dir = join(registry, entry.name)
+        const ds = lstatSync(dir)
+        if (!ds.isDirectory() || ds.isSymbolicLink() || ds.uid !== st.uid || (ds.mode & 0o077)) return null
+        let fd
+        try {
+          fd = openSync(join(dir, "client.json"), constants.O_RDONLY | constants.O_NOFOLLOW)
+          const fs = fstatSync(fd)
+          if (!fs.isFile() || fs.uid !== st.uid || (fs.mode & 0o077) || fs.size > 16384) return null
+          const descriptor = JSON.parse(readFileSync(fd, "utf8"))
+          if (descriptor.version !== 1 || descriptor.node !== VOX_NODE || descriptor.directory !== directory
+            || descriptor.socket !== join(dir, "attention.sock") || !/^[0-9a-f]{64}$/.test(descriptor.token)
+            || !/^[0-9a-f]{64}$/.test(descriptor.client)) return null
+          const ss = lstatSync(descriptor.socket)
+          if (!ss.isSocket() || ss.uid !== st.uid) return null
+          found.push(descriptor)
+        } catch (e) {
+          if (e?.code !== "ENOENT") return null
+        } finally { if (fd !== undefined) closeSync(fd) }
+      }
+    } finally { entries.closeSync() }
+    const answers = await Promise.all(found.map((descriptor) => new Promise((resolve) => {
+      const conn = connect(descriptor.socket)
+      let settled = false, buffer = "", bytes = 0
+      const decoder = new StringDecoder("utf8")
+      const finish = (value) => { if (settled) return; settled = true; clearTimeout(timer); conn.destroy(); resolve(value) }
+      const timer = setTimeout(() => finish({ incomplete: true }), AUTH_IDLE_MS)
+      timer.unref?.()
+      conn.on("error", (e) => finish(e?.code === "ECONNREFUSED" || e?.code === "ENOENT" ? null : { incomplete: true }))
+      conn.on("close", () => finish({ incomplete: true }))
+      conn.on("connect", () => conn.write(JSON.stringify({ type: "auth", token: descriptor.token }) + "\n"
+        + JSON.stringify({ type: "route", session }) + "\n"))
+      conn.on("data", (chunk) => {
+        bytes += chunk.length
+        if (bytes > 16384) return finish({ incomplete: true })
+        buffer += decoder.write(chunk)
+        const end = buffer.indexOf("\n")
+        if (end < 0) return
+        try {
+          const response = JSON.parse(buffer.slice(0, end))
+          if (response.outcome === "unavailable") return finish(null)
+          if (response.outcome !== "available" || response.session !== session || response.client !== descriptor.client
+            || !/^[0-9a-f]{64}$/.test(response.route)) return finish({ incomplete: true })
+          finish({ ...descriptor, route: response.route })
+        } catch { finish({ incomplete: true }) }
+      })
+    })))
+    if (answers.some((a) => a?.incomplete)) return null
+    const eligible = answers.filter(Boolean)
+    return eligible.length === 1 ? eligible[0] : null
+  } catch (e) { log("attention discovery unavailable: " + e); return null }
+}
+
+// Existing server socket remains the Session mirror; it cannot admit client attention.
+function wakeChannel(client, mirrorEvent) {
   try {
     // `mkdtemp` makes the directory 0700, so only this user can reach the socket;
     // the token keeps every other process of theirs out as well.
@@ -559,7 +687,7 @@ function wakeChannel(client, relayed, mirrorEvent) {
     const mirrorPath = join(dir, "mirror.sock")
     const token = randomBytes(32).toString("hex")
     const expected = Buffer.from(token)
-    // Two sockets, one token: `wake.sock` takes one prompt per connection (ADR-020 6.13);
+    // Two sockets, one token: `wake.sock` refuses obsolete server-only wake requests;
     // `mirror.sock` takes one subscription per connection and stays open (ADR-029 #542).
     let connections = 0
     // Includes queued work of closed sockets until its awaited operation completes.
@@ -694,49 +822,9 @@ function wakeChannel(client, relayed, mirrorEvent) {
             .finally(() => { snapshots -= 1 })
           return
         }
-        if (msg?.type !== "prompt" || typeof msg.session !== "string" || !msg.session
-          || msg.session.length > 4096 || typeof msg.text !== "string") {
-          return answer({ error: "expected a prompt frame" })
-        }
-        const prior = relayed.get(msg.session) ?? []
-        let retained = 0
-        for (const [id, notes] of relayed) {
-          retained += Buffer.byteLength(id)
-          for (const note of notes) retained += Buffer.byteLength(note.text)
-        }
-        if (prior.length >= MAX_RELAYED || (!relayed.has(msg.session) && relayed.size >= MAX_CONNECTIONS)
-          || retained + Buffer.byteLength(msg.session) + Buffer.byteLength(msg.text) > MAX_RELAYED_BYTES) {
-          return answer({ error: "Vox wake backlog is full; this notice was not relayed" })
-        }
-        done = true
-        const ticket = { text: msg.text }
-        const noted = [...prior, ticket]
-        relayed.set(msg.session, noted)
-        const forget = () => {
-          const left = relayed.get(msg.session) ?? []
-          const i = left.indexOf(ticket)
-          if (i >= 0) left.splice(i, 1)
-          if (!left.length) relayed.delete(msg.session)
-        }
-        try {
-          let res
-          try {
-            res = await runCall(client, msg.session, { action: "prompt", text: msg.text })
-          } catch (e) {
-            // An uncertain prompt may still run later; retain its provenance until the
-            // matching hook consumes it. Capacity refusal is preferable to calling it human.
-            if (!e?.outcomeUnknown) forget()
-            throw e
-          }
-          const status = res?.response?.status ?? 0
-          log("wake: session " + msg.session + " answered " + status)
-          if (status >= 200 && status < 300) return answer({ ok: true })
-          forget()
-          answer({ error: "OpenCode answered " + status, gone: status === 404 })
-        } catch (e) {
-          log("wake: threw: " + e)
-          answer({ error: String(e) })
-        }
+        // A retained server is not an attached client. Old wake registrations must
+        // fail honestly; only the separate TUI receiver may admit attention.
+        return answer({ error: "Vox attention requires an open, registered OpenCode TUI Session", gone: true })
       }
       // Lines are handled one at a time, in order.
       let queue = Promise.resolve()
@@ -795,11 +883,10 @@ function wakeChannel(client, relayed, mirrorEvent) {
   }
 }
 
-export default async function vox({ $, client }) {
+export default async function vox({ $, client, directory }) {
   log("plugin loaded (cwd=" + process.cwd() + ")")
-  const relayed = new Map()
   const mirrorEvent = mirrorEvents(client)
-  const wake = wakeChannel(client, relayed, mirrorEvent)
+  const wake = wakeChannel(client, mirrorEvent)
   return {
     // Every event of OpenCode's bus, to the connections following its session (#542). The
     // `event` hook is fed in-process with the full set (permission.asked, question.asked,
@@ -824,7 +911,13 @@ export default async function vox({ $, client }) {
     "shell.env": async (input, output) => {
       try {
         if (input?.sessionID && output?.env) {
+          // shell.env is merged over the server's inherited environment. Empty
+          // overrides remove a parent harness's identity from this tool's sender
+          // selection; deleting output keys would leave the inherited IDs intact.
+          output.env.CODEX_THREAD_ID = ""
+          output.env.CLAUDE_CODE_SESSION_ID = ""
           output.env.VOX_SESSION = input.sessionID
+          output.env.VOX_HARNESS = "opencode"
           output.env.VOX_NODE = VOX_NODE
           log("shell.env: VOX_SESSION=" + input.sessionID + " VOX_NODE=" + VOX_NODE)
         }
@@ -834,21 +927,22 @@ export default async function vox({ $, client }) {
     },
     "chat.message": async (input, output) => {
       try {
-        const sessionID = output.message?.sessionID || input.sessionID
-        if (!sessionID) {
-          log("chat.message: no session id")
-          return
-        }
+        const sessionID = output.message?.sessionID
+        const inputID = output.message?.id
+        inputDigest(sessionID, inputID)
+        if (input.sessionID && input.sessionID !== sessionID) throw new Error("OpenCode input Session changed")
         const bin = process.env.VOX_BIN || "vox"
 
         // Whether this message is a wake notice Vox relayed, not something the operator typed:
         // its text is one this session was relayed and has not had a turn on yet.
         const typed = output.parts.find((p) => p.type === "text" && typeof p.text === "string")
-        const notes = relayed.get(sessionID) ?? []
-        const at = typed ? notes.findIndex((note) => note.text === typed.text) : -1
-        const isWake = at >= 0
-        if (isWake) notes.splice(at, 1)
-        if (!notes.length) relayed.delete(sessionID)
+        const origin = typed?.metadata?.vox_attention
+        // This SDK part metadata is supplied by our actual TUI receiver. Room text
+        // and operator typing cannot synthesize a part's metadata. It labels source;
+        // it grants no room/drive permission and is not an admission credential.
+        const isWake = typed?.synthetic === true && origin?.source === "vox"
+          && /^[0-9a-f]{64}$/.test(origin.client ?? "")
+          && /^[0-9a-f]{64}$/.test(origin.route ?? "") && /^[0-9a-f]{32}$/.test(origin.id ?? "")
 
         // `.quiet()` keeps the child's output out of OpenCode's, `.nothrow()`
         // makes a non-zero exit a value rather than an exception — `vox agent
@@ -856,8 +950,21 @@ export default async function vox({ $, client }) {
         //
         // The wake channel goes to the hook alone, in its environment: the hook
         // registers it, so `vox daemon` can interrupt this session (see above).
-        const env = { ...process.env }
+        const env = { ...process.env, VOX_SESSION: sessionID, VOX_HARNESS: "opencode", VOX_OPENCODE_INPUT_ID: inputID }
+        // This hook belongs to the actual OpenCode Session, even when its server
+        // was started by another harness. Neither that parent's ID nor socket is ours.
+        for (const key of ["CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_ENTRYPOINT",
+          "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN"]) delete env[key]
         if (HEADLESS) env.VOX_OPENCODE_HEADLESS = "1"
+        delete env.VOX_OPENCODE_ATTENTION_SOCKET
+        delete env.VOX_OPENCODE_ATTENTION_TOKEN
+        delete env.VOX_OPENCODE_ATTENTION_ROUTE
+        const attention = HEADLESS ? null : await attentionRoute(sessionID, directory ?? process.cwd())
+        if (attention) {
+          env.VOX_OPENCODE_ATTENTION_SOCKET = attention.socket
+          env.VOX_OPENCODE_ATTENTION_TOKEN = attention.token
+          env.VOX_OPENCODE_ATTENTION_ROUTE = attention.route
+        }
         if (wake) {
           env.VOX_OPENCODE_WAKE_SOCKET = wake.path
           env.VOX_OPENCODE_WAKE_TOKEN = wake.token
@@ -869,7 +976,15 @@ export default async function vox({ $, client }) {
             .env(env)
             .quiet()
             .nothrow()
-        const out = drained(result.stdout.toString())
+        let out, receipts
+        try {
+          out = drained(result.stdout.toString())
+          receipts = receiptDescriptors(out.attention_receipts, sessionID, inputID, true)
+        } catch {
+          // Never echo stdout or parser excerpts: they can contain private receipt tickets.
+          mirrorEvent.fail("Vox hook returned invalid context or receipt output; no context was injected")
+          return
+        }
         log("drain: exit=" + result.exitCode + " vox=" + out.vox.length + " room=" + out.room.length)
         // **The fence's tag is this turn's own** (V030-21): a nonce drawn now, after the drain has
         // returned, so nothing in the room text can have known it. Only `</vox-room-<nonce>>` ends
@@ -917,6 +1032,9 @@ export default async function vox({ $, client }) {
         for (const part of output.parts) {
           if (part.type === "text" && typeof part.text === "string") {
             part.text = block + part.text
+            if (receipts.length) {
+              part.metadata = { ...part.metadata, vox_attention_receipts: { session: sessionID, input: inputID, receipts } }
+            }
             log("chat.message: injected " + block.length + " chars")
             return
           }

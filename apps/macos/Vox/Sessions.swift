@@ -91,6 +91,27 @@ extension NodeModel {
         return "Paused by \(roomPauseName(state.by)) at \(when)"
     }
 
+    /// Delivery observations belong only to the selected drive-authorized Session.
+    var showsSessionAttention: Bool { showingSession && shownSession?.canDrive == true }
+
+    func sessionAttentionWords(_ row: SessionAttentionRow) -> String {
+        switch row.state {
+        case .queued:
+            switch row.wait {
+            case .nextCodexTurn: return "Waiting for next Codex turn"
+            case .paused: return "Queued — room paused"
+            case .nextTurnAfterResume: return "Queued — waiting for the next turn after resume"
+            case .adapterUnavailable: return "Queued — delivery adapter unavailable"
+            case .unknown: return "Queued — notice acceptance unknown; awaiting a context receipt"
+            case nil: return "Queued"
+            }
+        case .delivered: return "Delivered to harness; running turn not observed"
+        case .answering: return "Answering — running turn observed"
+        case .answered: return "Answered"
+        case .unavailable: return "Unavailable"
+        }
+    }
+
     func sessionPauseMark(_ session: FfiSession) -> String {
         guard showing == .session(node: session.nodeFingerprint, id: session.sessionId),
               sessionPauseIsCurrent, sessionPause?.paused == true,
@@ -311,5 +332,69 @@ private struct RequestSelection: ViewModifier {
         } else {
             content
         }
+    }
+}
+
+/// One bounded private page. This is never mounted in General or a room-wide member roster.
+struct SessionAttentionView: View {
+    @ObservedObject var model: NodeModel
+    @State private var expanded = true
+
+    var body: some View {
+        DisclosureGroup(isExpanded: $expanded) {
+            VStack(alignment: .leading, spacing: Space.s4) {
+                if !model.sessionAttentionIsCurrent {
+                    Text("Attention status unknown; waiting for the selected Session.").secondaryText().textSelection(.enabled)
+                } else if let error = model.sessionAttentionError {
+                    Text("Attention status unknown. \(error)").secondaryText().textSelection(.enabled)
+                } else if let page = model.sessionAttention {
+                    if page.preparing {
+                        Text("Thread audience is still being checked").secondaryText().textSelection(.enabled)
+                    } else if page.rows.isEmpty {
+                        Text(page.next == nil ? "No observations on this page." : "No observations on this page; more pages are available.")
+                            .secondaryText().textSelection(.enabled)
+                    }
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: Space.s8) {
+                            ForEach(page.rows, id: \.source) { row in
+                                VStack(alignment: .leading, spacing: Space.s4) {
+                                    Text("Message \(row.source.prefix(12)): \(model.sessionAttentionWords(row))")
+                                        .textSelection(.enabled)
+                                        .accessibilityIdentifier("session-attention-\(row.source)")
+                                        .copyMenu([("Copy Message ID", row.source)])
+                                    if let reason = row.reason, !reason.isEmpty {
+                                        Text(reason).secondaryText().textSelection(.enabled)
+                                    }
+                                    if let answer = row.answer {
+                                        Text("Answer \(answer.prefix(12))").secondaryText().textSelection(.enabled)
+                                            .copyMenu([("Copy Answer ID", answer)])
+                                    }
+                                    Text("Observed \(Date(timeIntervalSince1970: Double(row.observedAtMs) / 1000).formatted(date: .abbreviated, time: .standard))")
+                                        .secondaryText().textSelection(.enabled)
+                                }.frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                        }
+                    }.frame(maxHeight: Theme.scaled(180))
+                } else {
+                    Text("Checking attention status…").secondaryText().textSelection(.enabled)
+                }
+                HStack {
+                    Button(model.sessionAttentionPaged ? "First attention page" : "Refresh attention") {
+                        model.refreshSessionAttention()
+                    }.accessibilityIdentifier("session-attention-refresh")
+                    if model.sessionAttentionIsCurrent, model.sessionAttention?.next != nil {
+                        Button("Next attention page") { model.nextSessionAttention() }
+                            .accessibilityIdentifier("session-attention-next")
+                    }
+                    if model.sessionAttentionLoading { ProgressView().controlSize(.small) }
+                }.disabled(model.sessionAttentionLoading)
+                Text("Delivery does not promise a reply. These observations are private to members with drive access.")
+                    .secondaryText().textSelection(.enabled)
+            }
+        } label: {
+            Text("Room message attention").copyMenu([("Copy Label", "Room message attention")])
+        }
+        .textSelection(.disabled)
+        .accessibilityIdentifier("session-attention")
     }
 }
