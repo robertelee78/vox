@@ -169,6 +169,11 @@ struct RoomTabs: View {
                             .copyMenu([("Copy Label", words)])
                     }
                 }
+                // Reserve the horizontal scroller inside the viewport so it cannot cover the tabs.
+                .padding(.bottom, max(
+                    NSScroller.scrollerWidth(for: .regular, scrollerStyle: .legacy),
+                    NSScroller.scrollerWidth(for: .regular, scrollerStyle: .overlay)
+                ))
             }.accessibilityIdentifier("room-session-tabs")
                 // These words navigate. Inherited selection can install text-selection
                 // overlays on their labels; right-click Copy preserves the displayed words.
