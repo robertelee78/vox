@@ -1220,6 +1220,7 @@ private struct RoomTimelineView: View {
                                     let shown = frame.intersection(bounds)
                                     return !shown.isNull && shown.height * 2 >= frame.height ? id : nil
                                 })
+                                model.threadRootsVisible(in: room, ids: inView)
                                 // The last three rows' frames and the viewport, for reading a row
                                 // never counted in view (debug: kept only when asked for).
                                 let tail = model.timelineItems.suffix(3).map { item in
@@ -1240,7 +1241,15 @@ private struct RoomTimelineView: View {
                             }
                             // The timeline shrank or grew (the composer grows with To:, a draft
                             // or a reply): the newest line kept in view.
-                            .onChange(of: viewport.size) { _ in keepNewest(scroller, viewport.size.height, "viewport") }
+                            .onChange(of: viewport.size) { size in
+                                let bounds = CGRect(origin: .zero, size: size)
+                                let visible = Set(rowFrames.compactMap { id, frame in
+                                    let shown = frame.intersection(bounds)
+                                    return !shown.isNull && shown.height * 2 >= frame.height ? id : nil
+                                })
+                                model.threadRootsVisible(in: room, ids: visible)
+                                keepNewest(scroller, size.height, "viewport")
+                            }
                             // A room opens at its newest message: loaded before the view
                             // appeared, its count never changed and it stayed at the top, so the
                             // newest rows were never in view, and never read.
@@ -1268,6 +1277,7 @@ private struct RoomTimelineView: View {
                             // newest line, or, a Session with a request waiting, at that request,
                             // centred, so going to an approval shows it (P7).
                             .onChange(of: model.showing) { _ in
+                                model.threadRootsVisible(in: room, ids: [])
                                 olderVisible = false
                                 // The rows of what is now shown are laid out after this change,
                                 // so the scroll waits for the next turn of the main loop: asked
@@ -1325,7 +1335,10 @@ private struct RoomTimelineView: View {
                     .onChange(of: window.seen) { _ in markSeen() }
                     .onChange(of: model.readMarkRevision) { _ in markSeen() }
                     .onChange(of: model.showing) { _ in updateLooking() }
-                    .onDisappear { if model.lookingAt == room { model.lookingAt = nil } }
+                    .onDisappear {
+                        model.threadRootsVisible(in: room, ids: [])
+                        if model.lookingAt == room { model.lookingAt = nil }
+                    }
                     // A row whose body has just arrived is read now, even if its frame is
                     // unchanged (no new measure to trigger it).
                     .onChange(of: model.messages) { _ in markSeen() }
