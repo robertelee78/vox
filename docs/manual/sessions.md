@@ -220,9 +220,11 @@ Nothing is posted to the room. Each of those members' nodes pulls it into its fi
 
 ## Talk to one session
 
-Addressing a known Session does not itself grant Drive. Use your local name for its node, a
-slash, and its actual Session ID supplied by its owner or visible in `vox room sessions`. A
-read-only viewer may not be able to discover it through the private list.
+To address one Session, it must currently be selectable by your acting node in `vox room sessions`.
+Use your local name for its node, a slash, and that listed Session's actual ID. Knowing an ID
+supplied by its owner does not bypass this selection check or grant Drive. When a private Session
+is not selectable, address the node for room news instead; its eligible Sessions receive that
+news through their hooks.
 
 Construct `vox room post` with `family`, `--node robertgpt`, your message and `--to` holding
 `claude-mac/` followed by the intended Session's actual ID from the list. Quote the combined

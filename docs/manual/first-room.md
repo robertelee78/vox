@@ -51,8 +51,8 @@ vox node create ann
 
 Node names use lower-case letters, digits, `.`, `_` and `-`.
 
-Vox asks for an identity passphrase twice. It unlocks the node on this machine. You see, among
-other lines:
+Vox asks for an identity passphrase twice. It unlocks the node on this machine. On a Mac with
+successful Keychain storage, you see these lines among the output:
 
 ```text
 vox: created node robertgpt
@@ -62,8 +62,12 @@ vox: node robertgpt is Ready (remembered)
 ```
 
 The second line is the node's fingerprint, the public name of its keys. The node is now
-**Ready**: Vox's **daemon**, a background program, runs it, and makes it Ready again by itself
-after a restart.
+**Ready**: Vox's **daemon**, a background program, runs it. On a Mac, successful remembering
+lets it become Ready again after a restart. On Linux, creating a protected node interactively
+makes it Ready but does not remember its passphrase; the output says so. Follow the
+[persistent passphrase-file unlock instructions](keyring.md#your-nodes) before relying on automatic
+restart there. If remembering fails on either platform, keep the reported qualification rather
+than treating Ready as remembered.
 
 ## 3. Both of you compare fingerprints
 

@@ -64,13 +64,15 @@ change its keyring with `vox trust add`, `remove`, `rename`, `drive` or `read`. 
 sharing, and a room's name or retention never ask.
 
 A passphrase typed for a keyring change opens the keyring for 30 minutes. Further changes in that
-time do not ask. A passphrase typed to unlock the node does not open it. While the keyring is
-open, any program running as you, an agent included, can change it. `vox status` shows the state
-on its second line: `keyring asks for the passphrase`, or `keyring open 30m` with the minutes left.
+time do not ask. A passphrase typed to unlock the node does not open it. The separate agent-origin
+guard still refuses `vox trust add` and `vox trust drive` from a process carrying a harness's
+Session mark, even while the keyring is open. Run those commands in your own terminal outside
+the agent session. This guard is not OS security isolation from other programs running as you.
+`vox status` shows `keyring asks for the passphrase`, or `keyring open 30m` with the minutes left.
 
 A keyring change takes the passphrase only from a terminal. It never reads a file or
-`VOX_IDENTITY_PASSPHRASE`. Without a terminal, the change is refused and Vox prints the complete
-command to run in one. That command carries the actual fingerprint, chosen name and acting node. Copy it
+`VOX_IDENTITY_PASSPHRASE`. When a passphrase is needed but there is no terminal, the change is
+refused and Vox prints the complete command to run in one. That command carries the actual fingerprint, chosen name and acting node. Copy it
 from the refusal only if it describes the change you intend.
 
 ## An agent's node
@@ -139,8 +141,11 @@ Then inspect the result:
 vox trust list --node robertgpt
 ```
 
-The name is yours alone. Without `--name`, Vox asks for one at a terminal. Before and after it
-asks for the passphrase, Vox says what the trust grants:
+The keyring alias is yours alone. Without `--name`, Vox offers the name carried by a copied
+identity, or the node's presented name when available. At a terminal, press Enter to accept that
+default or type your own alias; if no default is available, you must supply a name. A default is
+not proof of identity: compare the fingerprint. Before and after asking for a passphrase when
+needed, Vox says what the trust grants:
 
 ```text
 vox: trusting f7l2q44g56mzd62nsvck7mofib as "ann": read

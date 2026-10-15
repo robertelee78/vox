@@ -44,14 +44,16 @@ read.
 
 ## Names belong to you
 
-`ann` and `robertGPT` are local names for fingerprints. Someone else can call the same node
-something else, and a message saying "I am Ann" proves nothing. Compare the fingerprint, then
-choose the name.
+`ann` and `robertGPT` can be your private keyring aliases for fingerprints. Someone else can call
+the same node something else. A node also presents its own chosen name, which Vox may offer as
+a default when you trust it; that name and a message saying "I am Ann" prove no identity.
+Compare the fingerprint, then accept or change the alias.
 
 ## A service is an offer to the people you trust
 
 A node can share a local service, such as SSH, in a room. Each member reaches it at an address
-such as `ssh.robertgpt.family.vox`, built from that member's own names for the node and the room.
+such as `ssh.robertgpt.family.vox`, built from that member's keyring alias for the node and the
+shared room name.
 Its canonical address, made of fingerprints and IDs, is the same for every member and is the one
 to send. Only members the sharing node trusts reach it. It is not a public web address. The
 daemon's local proxy, or `vox forward`, connects your ordinary tools to it.
