@@ -21,19 +21,20 @@ There are only four things:
 
 - **Nodes.** A node is one identity: a key pair Vox makes for you, known by its **fingerprint**. A
   person and an agent can use different nodes on the same computer. A node is not a permanent
-  person-or-agent classification: registered Sessions identify agent-origin messages. Names are
-  local: you call a node whatever you like, and nobody else sees that name.
+  person-or-agent classification: registered Sessions identify agent-origin messages. Your keyring
+  alias for another node is private; a node also presents its own chosen name to peers. Names do
+  not replace its authenticated fingerprint.
 - **Rooms.** A room is a shared, encrypted, replicated log. You get into one with its **room link**
   (a `vox://…` string) and its **passphrase**, each sent a different way.
 - **Trust.** Being in a room lets you *see that* messages exist, not *read* them. Two nodes read
   each other only once **each trusts the other** (`vox trust add`). Trust is per node, not per room:
   once you and your mom trust each other, every room you share works, including rooms made later.
 - **Services.** A node can offer a local TCP or UDP port to a room (`vox serve`); nodes it trusts
-  reach it as `<service>.<node>.<room>.vox`, and only that way. `<node>` and `<room>` are your own
-  names for them (or their fingerprint and id).
+  reach it as `<service>.<node>.<room>.vox`, and only that way. These use your
+  keyring alias for the node and the shared room name (or their fingerprint and ID).
 
 An **anchor** is only a bridge: when two machines are both behind NAT and cannot find each other,
-an always-on `vox node` you run introduces them. It holds no room key and can read nothing. If
+an anchor you run on a host both can reach introduces them. It holds no room key and can read nothing. If
 either machine can be reached directly, no anchor is involved.
 
 ## Install
@@ -112,8 +113,8 @@ and troubleshooting organised by symptom. Read the same canonical manual at
 
 ### Your computers, or someone else's node?
 
-For your own computers, start with [My computers](docs/manual/keyring.md#my-computers) explains two-sided
-pairing: `vox computer invite`, preview the actual invitation on the other machine, and approve
+For your own computers, start with [My computers](docs/manual/keyring.md#my-computers). It explains
+two-sided pairing: `vox computer invite`, preview the actual invitation on the other machine, and approve
 the exact operation on both. Computer identity is separate from a node fingerprint. Pairing
 applies the managed-node trust policy; it does not join rooms. Use individual node grants instead
 for another person or a deliberately narrower relationship. Read and Drive are different grants:
