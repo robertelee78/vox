@@ -379,6 +379,22 @@ pub struct MessagePage {
     pub next: Option<HistoryCursor>,
 }
 
+/// One reverse page of readable HELLO metadata for current room members. No historical
+/// bodies or per-member history are retained by this reader.
+#[derive(Debug, Clone)]
+pub struct MemberHelloPage {
+    /// Saved room identity, checked on continuation.
+    pub instance: [u8; 16],
+    /// HELLO selection, current roster and read-policy equality token.
+    pub revision: Digest32,
+    /// True only for a completed caller's unchanged revision check.
+    pub unchanged: bool,
+    /// Newest first in canonical room order, at most 64 ordinary readable rows.
+    pub rows: Vec<MessageRow>,
+    /// Continue strictly before this examined canonical key, even on an empty page.
+    pub next: Option<(u64, Digest32)>,
+}
+
 /// One bounded scan of readable files offered by private Session activity.
 /// An empty page can still have a continuation after filtered records.
 #[derive(Debug, Clone)]

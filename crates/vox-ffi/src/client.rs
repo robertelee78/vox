@@ -1728,10 +1728,10 @@ fn stop_follow(following: &FollowSlot) {
 /// A handle is single-use: cancellation before start wins, and an old handle owns no later read.
 #[derive(uniffi::Object)]
 pub struct SessionPauseRead {
-    control: Mutex<SessionPauseReadControl>,
+    control: Mutex<ReadControl>,
 }
 #[derive(Default)]
-struct SessionPauseReadControl {
+struct ReadControl {
     started: bool,
     cancelled: bool,
     task: Option<tokio::task::AbortHandle>,
@@ -1741,11 +1741,36 @@ impl SessionPauseRead {
     #[uniffi::constructor]
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            control: Mutex::new(SessionPauseReadControl::default()),
+            control: Mutex::new(ReadControl::default()),
         })
     }
 
     /// Idempotently stop only this read, including when called before it starts.
+    pub fn cancel(&self) {
+        let mut control = self.control.lock().unwrap_or_else(PoisonError::into_inner);
+        control.cancelled = true;
+        if let Some(task) = control.task.take() {
+            task.abort();
+        }
+    }
+}
+
+/// Explicit cancellation for one bounded member-metadata page. This uses the same
+/// single-use control as pause reads; Swift Task.cancel alone does not cancel UniFFI work.
+#[derive(uniffi::Object)]
+pub struct MemberPlatformRead {
+    control: Mutex<ReadControl>,
+}
+#[uniffi::export]
+impl MemberPlatformRead {
+    /// One request only, cancelled idempotently even before task registration.
+    #[uniffi::constructor]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            control: Mutex::new(ReadControl::default()),
+        })
+    }
+    /// Cancel only the work started with this handle.
     pub fn cancel(&self) {
         let mut control = self.control.lock().unwrap_or_else(PoisonError::into_inner);
         control.cancelled = true;
@@ -1875,6 +1900,7 @@ pub struct VoxClient {
     following: FollowSlot,
     /// One selected-owner pause read, with no waiting queue or per-history state.
     session_pause_read: Arc<tokio::sync::Semaphore>,
+    member_platform_read: Arc<tokio::sync::Semaphore>,
     /// A connection to the daemon, kept while the client lives: a daemon a client started exits
     /// once no node is attached and no client is connected (ADR-026 L-8), and the app is its
     /// client from the moment it opens, before any node is attached.
@@ -2145,6 +2171,45 @@ fn platform_of(env: &vox_agentcomms::envelope::Envelope) -> Option<NodePlatform>
         os_version: text("os_version"),
         arch: text("arch"),
     })
+}
+
+/// A canonical HELLO scan position, opaque to the native member inspector.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct MemberPlatformPosition {
+    /// Canonical display clock.
+    pub clock: u64,
+    /// Complete entry identity.
+    pub entry: String,
+}
+/// One selected room's metadata scan. No before means its completed revision is checked.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct MemberPlatformContext {
+    /// Saved room instance, 16 bytes.
+    pub instance: Vec<u8>,
+    /// Selected metadata equality token, 32 bytes.
+    pub revision: Vec<u8>,
+    /// Empty only when the selected scan is complete or all current members are resolved.
+    pub before: Option<MemberPlatformPosition>,
+}
+/// A node's own bounded platform claim and the readable HELLO that supplied it.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct MemberPlatform {
+    /// Current room member, full fingerprint.
+    pub member: String,
+    /// Readable HELLO identity, full digest.
+    pub source: String,
+    /// Its bounded, sanitized claim.
+    pub platform: NodePlatform,
+}
+/// One bounded metadata page. An empty page with context.before is still incomplete.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct MemberPlatformPage {
+    /// Validated selection and next scan position.
+    pub context: MemberPlatformContext,
+    /// The prior completed selection is still current; no rows were reread.
+    pub unchanged: bool,
+    /// Newest first, at most 64 claims, without message bodies.
+    pub rows: Vec<MemberPlatform>,
 }
 
 /// The file a `file` envelope offers, from the fields its sharer's daemon filled in.
@@ -3142,6 +3207,7 @@ impl VoxClient {
             held: Arc::new(tokio::sync::Mutex::new(None)),
             following: Arc::new(Mutex::new(None)),
             session_pause_read: Arc::new(tokio::sync::Semaphore::new(1)),
+            member_platform_read: Arc::new(tokio::sync::Semaphore::new(1)),
             daemon_hold: Mutex::new(Some(hold)),
         }))
     }
@@ -3602,6 +3668,100 @@ impl VoxClient {
                 })
                 .collect())
         })
+    }
+
+    /// Read one current-member metadata page independently of the message window. A changed
+    /// revision replaces the caller's claims; an unchanged completed scan returns no bodies.
+    /// The owned request never holds Slot over IPC, and explicit cancellation stops its work.
+    ///
+    /// # Errors
+    /// Invalid selection, changed attachment/actor/room, or any authoritative history refusal.
+    pub async fn member_platforms(
+        &self,
+        room: String,
+        actor: String,
+        context: Option<MemberPlatformContext>,
+        read: Arc<MemberPlatformRead>,
+    ) -> Result<MemberPlatformPage, VoxError> {
+        let channel_id = digest(&room, "room id")?;
+        let actor = input_fingerprint(&actor)?;
+        let (instance, revision, before) = if let Some(context) = context {
+            let instance: [u8; 16] = context
+                .instance
+                .try_into()
+                .map_err(|_| failed("Member metadata room identity must contain 16 bytes."))?;
+            let revision: Digest32 = context
+                .revision
+                .try_into()
+                .map_err(|_| failed("Member metadata revision must contain 32 bytes."))?;
+            let before = context
+                .before
+                .map(|p| digest(&p.entry, "member metadata cursor").map(|entry| (p.clock, entry)))
+                .transpose()?;
+            (Some(instance), Some(revision), before)
+        } else {
+            (None, None, None)
+        };
+        let permit = Arc::clone(&self.member_platform_read)
+            .try_acquire_owned()
+            .map_err(|_| failed("Member platform information is still being read."))?;
+        let held = Arc::clone(&self.held);
+        let task = {
+            let mut control = read.control.lock().unwrap_or_else(PoisonError::into_inner);
+            if control.cancelled || control.started {
+                return Err(failed(
+                    "The member metadata read was cancelled or already used.",
+                ));
+            }
+            control.started = true;
+            let task = self.rt.spawn(async move {
+                let _permit = permit;
+                tokio::time::timeout(REQUEST_WITHIN, async {
+                    let (at, attachment) = {
+                        let slot = held.lock().await;
+                        let h = slot.as_ref().ok_or_else(not_attached)?;
+                        if h.client.me() != Some(actor) { return Err(failed("The acting node changed while reading member metadata.")); }
+                        (h.at.clone(), Arc::clone(&h.attachment))
+                    };
+                    let mut client = IpcClient::open_at(&at).await
+                        .map_err(|e| listing_failed("member metadata", e))?;
+                    if client.me() != Some(actor) { return Err(failed("The acting node changed while reading member metadata.")); }
+                    let page = match ask(&mut client, &Request::MemberHellos {
+                        channel_id, instance, revision, before,
+                    }).await? {
+                        Frame::MemberHellos(page) => page,
+                        other => return Err(unexpected(&other)),
+                    };
+                    let slot = held.lock().await;
+                    let h = slot.as_ref().ok_or_else(not_attached)?;
+                    if !Arc::ptr_eq(&attachment, &h.attachment) || h.client.me() != Some(actor) {
+                        return Err(failed("The acting node attachment changed while reading member metadata."));
+                    }
+                    Ok(MemberPlatformPage {
+                        context: MemberPlatformContext {
+                            instance: page.instance.to_vec(), revision: page.revision.to_vec(),
+                            before: page.next.map(|(clock, entry)| MemberPlatformPosition { clock, entry: b32_encode(&entry) }),
+                        },
+                        unchanged: page.unchanged,
+                        rows: page.rows.into_iter().filter_map(|row| {
+                            let env = vox_agentcomms::envelope::Envelope::parse(&row.text).ok()?;
+                            Some(MemberPlatform { member: b32_encode(&row.author), source: b32_encode(&row.entry_hash), platform: platform_of(&env)? })
+                        }).collect(),
+                    })
+                }).await.unwrap_or_else(|_| Err(failed("Member platform information is unavailable: the node did not answer within 60 seconds.")))
+            });
+            control.task = Some(task.abort_handle());
+            task
+        };
+        struct CancelRead(Arc<MemberPlatformRead>);
+        impl Drop for CancelRead {
+            fn drop(&mut self) {
+                self.0.cancel();
+            }
+        }
+        let _cancel = CancelRead(read);
+        task.await
+            .map_err(|_| failed("The member metadata read was cancelled."))?
     }
 
     /// Open a room at its newest bounded history page (ADR-034 FR-4).

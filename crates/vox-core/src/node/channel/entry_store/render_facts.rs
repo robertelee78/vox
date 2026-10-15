@@ -951,6 +951,12 @@ impl RenderView<'_> {
             }),
         }
     }
+    /// Current canonical selection identity for a metadata reader. Reuses the sealed
+    /// filter root; unrelated ordinary messages do not change the HELLO selection.
+    pub(crate) fn filter_display_root(&self, filter: &Filter) -> Result<u64> {
+        self.root(Some(filter), true)
+    }
+
     /// One exact operation's canonical rows and retained conflict witness, from this same
     /// pinned snapshot. Other authors using the same op id do not invalidate its root.
     pub(crate) fn operation_state(

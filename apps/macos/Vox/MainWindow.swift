@@ -2424,6 +2424,13 @@ private struct Inspector: View {
                         Text(problem).secondaryText().fixedSize(horizontal: false, vertical: true)
                             .accessibilityIdentifier("member-roles-unavailable")
                     }
+                    if let problem = model.platformsError {
+                        Text(problem).secondaryText().fixedSize(horizontal: false, vertical: true)
+                            .accessibilityIdentifier("member-platform-unavailable")
+                    } else if model.platformsPending {
+                        Text("Platform information is still being read.").caption().secondaryText()
+                            .accessibilityIdentifier("member-platform-pending")
+                    }
                     ForEach(model.members) { member in
                         TrustMark(name: member.name, trust: member.trust)
                             .nodeCard(model, member.id, name: member.name)
