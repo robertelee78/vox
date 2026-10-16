@@ -1595,6 +1595,7 @@ fn legacy_placeholder_journey(
         let seq = feed.last_key_value().map_or(1, |(n, _)| n + 1);
         let hash_at = |n| feed.get(&n).map_or(ZERO_HASH, Entry::entry_hash);
         let skeleton = EntrySkeleton {
+            v2: None,
             author_id: author,
             seq,
             prev_hash: hash_at(seq - 1),

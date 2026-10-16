@@ -123,11 +123,15 @@ pub enum StructTag {
     AdmissionNotice = 0x0020,
     /// The room's complete signed anchor set (ADR-032 AN-5).
     RoomAnchors = 0x0021,
+    /// An author's signed augmented append-only log head (ADR-036).
+    LogHead = 0x0022,
+    /// A canonical content-addressed control frontier (ADR-036).
+    ControlContext = 0x0023,
 }
 
 impl StructTag {
     /// All registered tags, in ascending order.
-    pub const ALL: [StructTag; 29] = [
+    pub const ALL: [StructTag; 31] = [
         StructTag::LogEntry,
         StructTag::Skdm,
         StructTag::AdminCert,
@@ -157,6 +161,8 @@ impl StructTag {
         StructTag::RoomName,
         StructTag::AdmissionNotice,
         StructTag::RoomAnchors,
+        StructTag::LogHead,
+        StructTag::ControlContext,
     ];
 
     /// The 2-byte tag value.
@@ -233,6 +239,9 @@ impl StructTag {
     /// from a log is verified over exactly what its signer signed.
     #[must_use]
     pub const fn domain_sep_at(self, version: u8) -> &'static str {
+        if matches!(self, StructTag::LogEntry) && version == 2 {
+            return "vox/log-entry/v2";
+        }
         if version == self.format_version() {
             return self.domain_sep();
         }
@@ -295,6 +304,8 @@ impl StructTag {
             StructTag::RoomName => "vox/room-name/v1",
             StructTag::RoomAnchors => "vox/room-anchors/v1",
             StructTag::AdmissionNotice => "vox/admission-notice/v1",
+            StructTag::LogHead => "vox/log-head/v1",
+            StructTag::ControlContext => "vox/log-context/v1",
         }
     }
 }
@@ -338,7 +349,7 @@ pub fn parse_frame(bytes: &[u8]) -> Result<Frame<'_>> {
         tag: tag_val,
         version: 0,
     })?;
-    if version != tag.format_version() {
+    if version != tag.format_version() && !(tag == StructTag::LogEntry && version == 2) {
         if version == FORMAT_VERSION && tag.format_version() == MS_FORMAT_VERSION {
             if !tag.reads_seconds_format() {
                 return Err(Error::OlderFormat {

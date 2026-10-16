@@ -8383,6 +8383,7 @@ impl ChannelState {
                     .ok_or(Error::MalformedAtRest("local feed predecessor missing"))
             };
             Ok(EntrySkeleton {
+                v2: None,
                 author_id: *author,
                 seq,
                 prev_hash: if seq == 1 {

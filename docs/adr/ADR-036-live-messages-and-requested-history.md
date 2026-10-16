@@ -312,9 +312,12 @@ then appends `auth_type`, `signature`, `payload_present` and, when present, `pay
 19 or 20 fields. Presence and end flags are integers 0 or 1. A signed header is the body-absent
 19-field form. It is at most 8 KiB. Payload length is at most 16,777,216 bytes. Consequently
 `MAX_ENTRY_WIRE = 16 MiB + 8 KiB + 9` bounds the complete canonical record, including the
-largest CBOR byte-string length header. Signature type 1 is required for v2 controls and for
-newly admitted sparse entries. Existing legacy dropped-signature rules are unchanged; an
-unsigned sparse record cannot acquire authenticity just by arriving.
+largest CBOR byte-string length header. Signature type 1 is required for every v2 header. Retain
+those signatures even after body retention: a later live entry may require an exact receipt for any earlier content parent.
+Otherwise dropping a content signature could make the required parent evidence unavailable.
+This deliberately preserves v1 dropped-signature behavior and adds no alternate sparse
+signature-authentication path. An unsigned sparse record cannot acquire authenticity merely
+by arriving or being described as checkpointed.
 
 | Kind | Sole dispatch |
 | --- | --- |
