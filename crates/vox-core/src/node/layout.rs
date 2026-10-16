@@ -130,15 +130,18 @@ pub fn refuse_old_layout(account: &Account) -> Result<()> {
 }
 
 /// The data root's format (ADR-026 F-3): the layout of `.daemon/` and `nodes/`, and every format
-/// the files under them are in. A release that changes any of them raises it, and upgrades a root
-/// of every earlier value a supported release (v0.4.0 on) wrote.
+/// the files under them are in. A release that writes an incompatible representation raises it
+/// before opening node stores, so older binaries refuse rather than reinterpret that data.
 // Format 2 adds separate Session retention and version-3 age records. Opening a
 // supported older root decodes its version-1/2 records and classifies stored drive
 // envelopes before the first retention sweep; no identity or room is rewritten.
 // Format 3 is v0.4.5's shared target (#741). Its first contribution adds version-4 keyrings
 // with durable manual-removal history for local trust. Other v0.4.5 storage contributions
 // extend this target; they must not each raise it. Their combined upgrade remains #741's proof.
-pub const DATA_ROOT_FORMAT: u32 = 3;
+// Format 4 is v0.4.6's shared target: accepted restart state adds EntryIndex directory version 9
+// and a durable private-session index. The existing readers retain supported older data; the
+// marker prevents a v0.4.5 helper from opening it again after this daemon has advanced its indexes.
+pub const DATA_ROOT_FORMAT: u32 = 4;
 
 /// Read the supported format before opening or writing anything in the data root (ADR-026 F-3).
 /// A missing marker is format 1, written by v0.4.0; an existing but unreadable marker is not.
