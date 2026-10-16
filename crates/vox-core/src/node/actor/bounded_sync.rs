@@ -21,6 +21,10 @@ struct Running {
     result: Arc<StdMutex<Option<Returned>>>,
     task: tokio::task::JoinHandle<()>,
 }
+struct Cleanup {
+    result: Arc<StdMutex<Option<(Flow, crate::error::Result<bool>)>>>,
+    task: tokio::task::JoinHandle<()>,
+}
 #[derive(Default)]
 pub(super) struct Controller {
     running: [Option<Running>; 2],
@@ -28,8 +32,140 @@ pub(super) struct Controller {
     deferred: VecDeque<Flow>,
     body_slots: Arc<stream::runtime::BodySlots>,
     required: VecDeque<(Digest32, Digest32, Digest32, u64)>,
+    retiring: VecDeque<Flow>,
+    cleanup: Option<Cleanup>,
+    cleanup_due: Option<std::time::Instant>,
 }
 impl Controller {
+    /// Retiring work stays inside the same twelve-flow limit and retains its charge/lease.
+    /// Other rooms may progress while one room waits for its next bounded cleanup slice.
+    fn flow_count(&self) -> usize {
+        self.ready.iter().flatten().count()
+            + self.running.iter().flatten().count()
+            + self.deferred.len()
+            + self.retiring.len()
+            + usize::from(self.cleanup.is_some())
+    }
+    fn dispose(&mut self, flow: Flow) {
+        flow.cancel();
+        self.retiring.push_back(flow);
+        self.poll_cleanup();
+    }
+    fn poll_cleanup(&mut self) {
+        if let Some(cleanup) = &self.cleanup {
+            if !cleanup.task.is_finished() {
+                return;
+            }
+            let result = cleanup
+                .result
+                .lock()
+                .ok()
+                .and_then(|mut value| value.take());
+            if let Some((flow, result)) = result {
+                self.cleanup.take();
+                match result {
+                    Ok(true) => {}
+                    Ok(false) => self.retiring.push_back(flow),
+                    Err(error) => {
+                        eprintln!("vox: history retirement is pending: {error}");
+                        self.retiring.push_back(flow);
+                        self.cleanup_due = Some(std::time::Instant::now() + Duration::from_secs(1));
+                    }
+                }
+            }
+        }
+        if self.cleanup.is_some()
+            || self
+                .cleanup_due
+                .is_some_and(|due| std::time::Instant::now() < due)
+        {
+            return;
+        }
+        self.cleanup_due = None;
+        let Some(mut flow) = self.retiring.pop_front() else {
+            return;
+        };
+        let result = Arc::new(StdMutex::new(None));
+        let output = result.clone();
+        let task = tokio::spawn(async move {
+            let outcome = flow.retire_slice().await;
+            if let Ok(mut result) = output.lock() {
+                *result = Some((flow, outcome));
+            }
+        });
+        self.cleanup = Some(Cleanup { result, task });
+    }
+    async fn join_cleanup(&mut self) -> crate::error::Result<()> {
+        if let Some(cleanup) = self.cleanup.take() {
+            let _ = cleanup.task.await;
+            let result = cleanup
+                .result
+                .lock()
+                .ok()
+                .and_then(|mut value| value.take());
+            if let Some((flow, result)) = result {
+                match result {
+                    Ok(true) => {}
+                    Ok(false) => self.retiring.push_back(flow),
+                    Err(error) => {
+                        self.retiring.push_back(flow);
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    pub(super) async fn retire_room(&mut self, room: Digest32) -> crate::error::Result<()> {
+        for slot in &mut self.ready {
+            if slot.as_ref().is_some_and(|flow| flow.room == room) {
+                let flow = slot.take().expect("matched room");
+                flow.cancel();
+                self.retiring.push_back(flow);
+            }
+        }
+        let mut keep = VecDeque::new();
+        while let Some(flow) = self.deferred.pop_front() {
+            if flow.room == room {
+                flow.cancel();
+                self.retiring.push_back(flow);
+            } else {
+                keep.push_back(flow);
+            }
+        }
+        self.deferred = keep;
+        for slot in &mut self.running {
+            if slot.as_ref().is_some_and(|work| work.room == room) {
+                let work = slot.take().expect("matched room");
+                work.fence.retire();
+                let _ = work.task.await;
+                if let Ok(mut result) = work.result.lock() {
+                    if let Some(returned) = result.take() {
+                        self.retiring.push_back(returned.flow);
+                    }
+                };
+            }
+        }
+        self.required.retain(|(r, _, _, _)| *r != room);
+        self.join_cleanup().await?;
+        while let Some(at) = self.retiring.iter().position(|flow| flow.room == room) {
+            let mut flow = self.retiring.remove(at).expect("matched retiring room");
+            match flow.retire_slice().await {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.retiring.push_back(flow);
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => {
+                    self.retiring.push_back(flow);
+                    return Err(error);
+                }
+            }
+        }
+        self.poll_cleanup();
+        Ok(())
+    }
+
     pub(super) fn archive_for_port(
         &self,
         room: Digest32,
@@ -60,6 +196,7 @@ impl Controller {
             {
                 if let Some(flow) = slot.take() {
                     flow.cancel();
+                    self.retiring.push_back(flow);
                 }
             }
         }
@@ -71,16 +208,19 @@ impl Controller {
         {
             running.fence.retire();
         }
-        self.deferred.retain(|flow| {
+        let mut keep = VecDeque::new();
+        while let Some(flow) = self.deferred.pop_front() {
             if flow.room == room && flow.peer == peer {
                 flow.cancel();
-                false
+                self.retiring.push_back(flow);
             } else {
-                true
+                keep.push_back(flow);
             }
-        });
+        }
+        self.deferred = keep;
         self.required
             .retain(|(r, p, _, _)| *r != room || *p != peer);
+        self.poll_cleanup();
     }
     pub(super) fn fence(&self) {
         for flow in self.deferred.iter().chain(self.ready.iter().flatten()) {
@@ -92,23 +232,39 @@ impl Controller {
     }
     pub(super) async fn retire(&mut self) {
         self.fence();
-        self.ready = [None, None];
-        self.deferred.clear();
+        for slot in &mut self.ready {
+            if let Some(flow) = slot.take() {
+                self.retiring.push_back(flow);
+            }
+        }
+        self.retiring.extend(self.deferred.drain(..));
         self.required.clear();
         for slot in &mut self.running {
             if let Some(work) = slot.take() {
                 let _ = work.task.await;
                 if let Ok(mut result) = work.result.lock() {
                     if let Some(returned) = result.take() {
-                        returned.flow.cancel();
+                        self.retiring.push_back(returned.flow);
                     }
-                }
+                };
+            }
+        }
+        let _ = self.join_cleanup().await;
+        while let Some(mut flow) = self.retiring.pop_front() {
+            // lock_all has already erased room SEK. Such work exits without writes;
+            // bounded reopen recovery owns any durable cursor/publication still present.
+            // Memory admission may still be held by a fenced actual worker. Keep this
+            // owner until a later bounded slice observes the erased key.
+            if matches!(flow.retire_slice().await, Ok(false)) {
+                self.retiring.push_back(flow);
+                tokio::task::yield_now().await;
             }
         }
     }
 }
 impl Node {
     pub(super) fn accept_bounded_sync(&mut self) {
+        self.bounded_sync.poll_cleanup();
         for index in 0..2 {
             let Some(work) = self.bounded_sync.running[index].as_ref() else {
                 continue;
@@ -135,7 +291,7 @@ impl Node {
                     .get(&work.room)
                     .is_some_and(|room| Arc::ptr_eq(room, &returned.flow.shared));
             if !valid {
-                returned.flow.cancel();
+                self.bounded_sync.dispose(returned.flow);
                 continue;
             }
             if returned.flow.admitted_authors > 0 {
@@ -176,10 +332,10 @@ impl Node {
                         .failed(request, returned.flow.generation, &error);
                 }
 
-                returned.flow.cancel();
                 if let Some(hint) = returned.flow.hint {
                     self.history_hints.finish(work.room, hint.author, hint.head);
                 }
+                self.bounded_sync.dispose(returned.flow);
                 crate::node::status::SyncBook::with(
                     &self.sync_book,
                     work.room,
@@ -238,10 +394,10 @@ impl Node {
                 if index == 0 {
                     if self.bounded_sync.deferred.len() == 8 {
                         if let Some(old) = self.bounded_sync.deferred.pop_front() {
-                            old.cancel();
                             if let Some(hint) = old.hint {
                                 self.history_hints.finish(old.room, hint.author, hint.head);
                             }
+                            self.bounded_sync.dispose(old);
                         }
                     }
                     self.bounded_sync.deferred.push_back(returned.flow);
@@ -313,6 +469,9 @@ impl Node {
                     .take()
                     .expect("selected pending flow")
             } else {
+                if self.bounded_sync.flow_count() >= 12 {
+                    return false;
+                }
                 let Ok(lease) = self.secret_work.clone().try_read_owned() else {
                     return false;
                 };
@@ -352,6 +511,8 @@ impl Node {
                             dispatch.fence,
                             state_charge,
                             self.bounded_sync.body_slots.clone(),
+                            store.clone(),
+                            state_job.clone(),
                         )
                     } else {
                         if self.bounded_sync.ready[0].is_some()
@@ -391,6 +552,8 @@ impl Node {
                             required,
                             state_charge,
                             self.bounded_sync.body_slots.clone(),
+                            store.clone(),
+                            state_job.clone(),
                         ) {
                             Ok(flow) => flow,
                             Err(_) => {
@@ -439,6 +602,8 @@ impl Node {
                         required,
                         state_charge,
                         self.bounded_sync.body_slots.clone(),
+                        store.clone(),
+                        state_job.clone(),
                     ) {
                         Ok(flow) => flow,
                         Err(_) => {
@@ -468,7 +633,7 @@ impl Node {
             return false;
         };
         let Some(port) = self.ports.get_mut(&(room, peer)) else {
-            flow.cancel();
+            self.bounded_sync.dispose(flow);
             return false;
         };
         let token = self.next_token;

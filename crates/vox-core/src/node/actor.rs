@@ -17759,6 +17759,9 @@ impl Node {
     async fn close_channel(&mut self, channel_id: &Digest32) -> Outcome {
         self.history_demand.retire_room(*channel_id);
         self.history_hints.retire_room(*channel_id);
+        if let Err(error) = self.bounded_sync.retire_room(*channel_id).await {
+            return Outcome::Failed(fault_of(&error));
+        }
         // Closed on purpose, so not reopened at the next unlock (#208). Forgotten first: a room
         // that stayed in the set would come back by itself, which is not what closing it meant.
         // A room still reopening is closed too: it leaves `reopening`, so its state is dropped
@@ -17822,6 +17825,10 @@ impl Node {
     async fn begin_leave(&mut self, channel_id: Digest32, reply: oneshot::Sender<Outcome>) {
         self.history_demand.retire_room(channel_id);
         self.history_hints.retire_room(channel_id);
+        if let Err(error) = self.bounded_sync.retire_room(channel_id).await {
+            let _ = reply.send(Outcome::Failed(fault_of(&error)));
+            return;
+        }
         let Some(shared) = self.channels.get(&channel_id).map(Arc::clone) else {
             let held = self
                 .profile
@@ -18237,6 +18244,9 @@ impl Node {
     async fn purge_room(&mut self, channel_id: &Digest32) -> Outcome {
         self.history_demand.retire_room(*channel_id);
         self.history_hints.retire_room(*channel_id);
+        if let Err(error) = self.bounded_sync.retire_room(*channel_id).await {
+            return Outcome::Failed(fault_of(&error));
+        }
         if self
             .session_rooms_retiring
             .iter()

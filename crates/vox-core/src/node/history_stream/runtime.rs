@@ -96,7 +96,12 @@ pub(crate) struct Flow {
     tasks: Vec<Task>,
     slots: Arc<BodySlots>,
     owners: [Option<RequestId>; 2],
-    busy_body: u8,
+    no_progress: u8,
+    body_progress: bool,
+    request: RequestId,
+    cleanup_store: Arc<Store>,
+    cleanup_job: Job,
+    cleanup_after: Option<[u8; 64]>,
     live_context: Option<Arc<Context>>,
     control_context: Arc<Context>,
     live: Option<Staging>,
@@ -121,6 +126,8 @@ impl Flow {
         required: Option<(Digest32, u64)>,
         state_charge: crate::node::history_budget::BufferCharge,
         slots: Arc<BodySlots>,
+        cleanup_store: Arc<Store>,
+        cleanup_job: Job,
     ) -> Result<Self> {
         let request = request_id()?;
         let mut flow = Self {
@@ -146,7 +153,12 @@ impl Flow {
             tasks: Vec::new(),
             slots,
             owners: [None, None],
-            busy_body: 0,
+            no_progress: 0,
+            body_progress: false,
+            request,
+            cleanup_store,
+            cleanup_job,
+            cleanup_after: None,
             live_context: Some(live),
             control_context: control,
             live: None,
@@ -208,6 +220,8 @@ impl Flow {
         fence: Arc<Fence>,
         state_charge: crate::node::history_budget::BufferCharge,
         slots: Arc<BodySlots>,
+        cleanup_store: Arc<Store>,
+        cleanup_job: Job,
     ) -> Self {
         Self {
             room,
@@ -231,7 +245,12 @@ impl Flow {
             archive_status: None,
             slots,
             owners: [None, None],
-            busy_body: 0,
+            no_progress: 0,
+            body_progress: false,
+            request,
+            cleanup_store,
+            cleanup_job,
+            cleanup_after: None,
             tasks: vec![Task {
                 request,
                 purpose: Purpose::History,
@@ -297,6 +316,50 @@ impl Flow {
             staging.context.cancellation().cancel();
         }
     }
+    /// The Controller owns this future and awaits it before dropping an abandoned flow.
+    /// Each transaction is bounded; no transport or authority effect runs during retirement.
+    pub(crate) async fn retire_slice(&mut self) -> Result<bool> {
+        self.cancel();
+        if !self.initialized {
+            return Ok(true);
+        }
+        // Retained flow metadata is charged to the daemon's small control reservation.
+        // Cleanup must not need that same pool to free it: several hosted nodes can fill
+        // its headroom. Use an independently admitted foreground-control envelope instead.
+        const CLEANUP_ENVELOPE: usize = 6 * 1024 * 1024;
+        let Some(cleanup_job) = self.cleanup_job.record_job(CLEANUP_ENVELOPE) else {
+            return Ok(false);
+        };
+        let Some(charge) = cleanup_job.reserve(CLEANUP_ENVELOPE) else {
+            return Ok(false);
+        };
+        let room = self.shared.clone();
+        let store = self.cleanup_store.clone();
+        let request = self.request;
+        let instance = self.instance;
+        let after = self.cleanup_after;
+        let step = tokio::task::spawn_blocking(move || {
+            let _charge = charge;
+            let mut channel = room.blocking_lock();
+            // Lock erases keys immediately. Reopen owns the bounded crash cleanup;
+            // no retired worker may keep/recreate an unlocked room to finish work.
+            match channel.history_instance(&store) {
+                Err(Error::AtRestLocked) => return Ok((true, None)),
+                Err(error) => return Err(error),
+                Ok(current) if current != instance => return Ok((true, None)),
+                Ok(_) => {}
+            }
+            if !channel.cleanup_history_source_owned(&store, request)? {
+                return Ok((false, after));
+            }
+            channel.cleanup_history_verifiers(&store, request, after)
+        })
+        .await
+        .map_err(|_| Error::Profile("history retirement worker stopped"))??;
+        self.cleanup_after = step.1;
+        Ok(step.0)
+    }
+
     fn stage(&self, purpose: Purpose) -> Option<Staging> {
         match purpose {
             Purpose::Live => self.live.clone(),
@@ -335,6 +398,7 @@ impl Flow {
 
     /// Exactly one local slice or one response quantum. The caller retains its worker/port slot
     /// through this return, including every spawned blocking worker, even after cancellation.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn turn(
         &mut self,
         store: Arc<Store>,
@@ -346,7 +410,46 @@ impl Flow {
         inbox_generation: u64,
         now: u64,
     ) -> Result<()> {
+        let result = self
+            .turn_inner(
+                store,
+                conn,
+                job,
+                fence,
+                deadline,
+                inbox,
+                inbox_generation,
+                now,
+            )
+            .await;
+        if self.owners.iter().any(Option::is_some) && self.waiting && !self.body_progress {
+            self.no_progress = self.no_progress.saturating_add(1);
+            if self.no_progress >= 3 {
+                return Err(Error::Unreachable(
+                    "current work repeatedly busy; retiring its body slot",
+                ));
+            }
+        } else {
+            // A successful metadata/local slice or durable body chunk is progress. Retain
+            // its exact body slot across progressing multi-quantum current entries.
+            self.no_progress = 0;
+        }
+        result
+    }
+
+    async fn turn_inner(
+        &mut self,
+        store: Arc<Store>,
+        conn: &VoxConnection,
+        job: &Job,
+        fence: Arc<Fence>,
+        deadline: tokio::time::Instant,
+        inbox: &super::HintInbox,
+        inbox_generation: u64,
+        now: u64,
+    ) -> Result<()> {
         self.waiting = false;
+        self.body_progress = false;
         self.external = None;
         let source = Source::new(
             self.shared.clone(),
@@ -481,6 +584,7 @@ impl Flow {
                     deadline,
                 )
                 .await?;
+                self.body_progress |= result.body_progress;
                 // Inventory is a hint. The first signed Head(author) response selects the
                 // exact live tail before any entry/body work; a concurrent post may replace
                 // the hinted head. Never retarget an already selected dependency or proof.
@@ -521,16 +625,6 @@ impl Flow {
                     return Err(Error::Unreachable(
                         "required current evidence is unavailable",
                     ));
-                }
-                if body && task.purpose != Purpose::History && result.status == Status::Busy {
-                    self.busy_body = self.busy_body.saturating_add(1);
-                    if self.busy_body >= 3 {
-                        return Err(Error::Unreachable(
-                            "current body repeatedly busy; yielding its slot",
-                        ));
-                    }
-                } else if body {
-                    self.busy_body = 0;
                 }
                 if matches!(result.status, Status::Busy | Status::EvidenceUnavailable) {
                     if self.archive && body {
@@ -646,7 +740,7 @@ impl Flow {
                         self.waiting = true;
                     }
                     Some(LocalNeed::Entry { head, seq }) => {
-                        let request = request_id()?;
+                        let request = task.request;
                         self.push(Task {
                             request,
                             purpose: Purpose::Control,

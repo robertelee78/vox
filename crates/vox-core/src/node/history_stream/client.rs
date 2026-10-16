@@ -42,6 +42,7 @@ pub(crate) struct Received {
     pub(crate) needs: Vec<Query>,
     pub(crate) verifiers: Vec<CursorBinding>,
     pub(crate) body_ready: Option<Digest32>,
+    pub(crate) body_progress: bool,
     pub(crate) inventory: Option<Inventory>,
     pub(crate) heads: Vec<super::HeadHint>,
 }
@@ -53,6 +54,7 @@ impl Received {
             needs: Vec::new(),
             verifiers: Vec::new(),
             body_ready: None,
+            body_progress: false,
             inventory: None,
             heads: Vec::new(),
         }
@@ -341,6 +343,9 @@ impl Receiver {
                     if persisted != next {
                         return Err(Error::MalformedAtRest("history persisted offset differs"));
                     }
+                    // Durable nonempty chunk progress remains progress even if later metadata
+                    // or ACK allocation is Busy within this same bounded response.
+                    result.body_progress = true;
                     // Current room access is checked again after durable storage and before ACK.
                     if !self.authorize(io.job()).await? {
                         io.abort(WireError::SessionBusy);
@@ -707,13 +712,14 @@ impl Receiver {
 
     pub(super) async fn begin_source(
         &self,
+        request: RequestId,
         record: Arc<Record>,
         validated: crate::node::channel::governance::ValidatedSparseEntry,
         now: crate::time::Ms,
     ) -> Result<Lookup<(Arc<Record>, crate::node::channel::HistorySourceStart)>> {
         let job = record.job.clone();
         self.read_precharged(&job, 64 * 1024, record, move |room, store, record| {
-            room.begin_history_source(store, &record.entry, &validated, now)
+            room.begin_history_source(store, request, &record.entry, &validated, now)
                 .map(Some)
         })
         .await
@@ -1208,8 +1214,13 @@ impl Receiver {
                                 "completed history validation requires renewed evidence",
                             ));
                         };
-                        let started =
-                            room.begin_history_source(store, &record.entry, &validated, now)?;
+                        let started = room.begin_history_source(
+                            store,
+                            request,
+                            &record.entry,
+                            &validated,
+                            now,
+                        )?;
                         if matches!(started, Start::Duplicate) {
                             room.history_write(store, |index| {
                                 index.finish_history_verifier_cursor(binding)
