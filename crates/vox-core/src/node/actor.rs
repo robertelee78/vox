@@ -17677,6 +17677,10 @@ impl Node {
         } else if let Some(prepared) = self.preparing_rooms.get_mut(&id) {
             apply(prepared.channel.get_mut())
                 .unwrap_or_else(|error| Turn::Failed(error.to_string()))
+        } else if self.opening_rooms.contains_key(&id) || self.reopening.contains(&id) {
+            // Cancellation can finish while the blocking opener still owns this room. Keep the
+            // exact cleanup owner until adoption; dropping it here would preserve a stale spool.
+            Turn::Again(owner)
         } else {
             Turn::Done
         };
