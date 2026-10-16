@@ -2678,9 +2678,10 @@ mod journey {
             };
             let (ok, want) = match *path {
                 "detached" => {
+                    let unlock = vox_text::shell::command(&["vox", "node", "unlock", "--", node]);
                     let want = format!(
                         "Vox node {node} is Locked; ask the operator to run \
-                         `vox node unlock {node}` in a terminal outside this session."
+                         `{unlock}` in a terminal outside this session."
                     );
                     (text == want, want)
                 }
