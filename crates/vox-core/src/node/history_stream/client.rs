@@ -920,10 +920,12 @@ impl Receiver {
             let room_id = room.channel_id();
             let instance = room.history_instance(store)?;
             let epoch = room.epoch();
+            let body_expected = record.staged.is_some();
             let outcome = room.advance_history_effect(
                 store,
                 &mut cursor,
                 now,
+                body_expected,
                 |batch| grant.check_batch(batch, room_id, instance, epoch),
                 |batch, hash| complete_staged(batch, staging.as_ref(), record, hash),
             )?;

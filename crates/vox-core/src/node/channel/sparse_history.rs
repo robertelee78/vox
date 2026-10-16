@@ -608,6 +608,7 @@ impl ChannelState {
         store: &Store,
         cursor: &mut HistoryEffectCursor,
         now: crate::time::Ms,
+        body_expected: bool,
         check_binding: impl FnOnce(&Batch<'_>) -> Result<()>,
         on_admitted: impl FnOnce(&mut Batch<'_>, Digest32) -> Result<()>,
     ) -> Result<HistoryEffectProgress> {
@@ -753,7 +754,8 @@ impl ChannelState {
             }
             let mut expired = Vec::new();
             let mut rows = Vec::new();
-            let refill_pending = kind == SignedEntryKind::Content && entry.payload.is_none();
+            let refill_pending =
+                body_expected && kind == SignedEntryKind::Content && entry.payload.is_none();
             let mut projection_deferred = false;
             if kind == SignedEntryKind::Content {
                 if let Some(payload) = &entry.payload {
@@ -772,9 +774,10 @@ impl ChannelState {
                     }
                 }
             }
+            let staged_deferred = body_expected && projection_deferred;
             self.queue_receivers(&mut batch)?;
             self.queue_private_generations(&mut batch)?;
-            if !refill_pending && !projection_deferred {
+            if !(refill_pending || staged_deferred) {
                 on_admitted(&mut batch, *hash)?;
             }
             batch.commit()?;
@@ -798,7 +801,7 @@ impl ChannelState {
             let rendered = !rows.is_empty();
             self.place_committed(store, rows, &expired)?;
             self.settle_display_order(store)?;
-            Ok((rendered, refill_pending, projection_deferred))
+            Ok((rendered, refill_pending, staged_deferred))
         })();
         let (rendered, refill_pending, projection_deferred) = match applied {
             Ok(outcome) => outcome,
