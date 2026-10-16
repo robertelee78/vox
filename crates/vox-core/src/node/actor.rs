@@ -5734,7 +5734,8 @@ impl Node {
                                 self.advance_room_preparation().await;
                                 break;
                             }
-                            1 if !self.legacy_cleanup_rooms.is_empty() => {
+                            1 if !self.legacy_cleanup_rooms.is_empty()
+                                && std::time::Instant::now() >= self.legacy_cleanup_due => {
                                 self.advance_legacy_cleanup().await;
                                 break;
                             }
@@ -17667,8 +17668,12 @@ impl Node {
         };
 
         let turn = if let Some(shared) = self.channels.get(&id).cloned() {
-            let mut room = shared.lock().await;
-            apply(&mut room).unwrap_or_else(|error| Turn::Failed(error.to_string()))
+            match shared.try_lock() {
+                Ok(mut room) => {
+                    apply(&mut room).unwrap_or_else(|error| Turn::Failed(error.to_string()))
+                }
+                Err(_) => Turn::Again(owner),
+            }
         } else if let Some(prepared) = self.preparing_rooms.get_mut(&id) {
             apply(prepared.channel.get_mut())
                 .unwrap_or_else(|error| Turn::Failed(error.to_string()))
