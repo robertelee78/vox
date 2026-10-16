@@ -322,7 +322,7 @@ impl Snapshot {
         for p in self.posted.iter().filter(|p| {
             p.author == self.me
                 && (claim::is_claim_protocol(&p.envelope)
-                    || (p.envelope.kind == HELLO && p.envelope.data.contains_key(VOX_KEY))
+                    || (p.envelope.kind == HELLO && p.envelope.data.get(VOX_KEY).is_some())
                     || p.envelope.kind == BYE)
         }) {
             let newer = |previous: &Posted| {
