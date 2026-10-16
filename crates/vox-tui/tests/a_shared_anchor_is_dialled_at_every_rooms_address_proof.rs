@@ -11,7 +11,7 @@
 //!
 //! **The scene.** A real anchor (`vox node`), alice (`vox daemon --anchor` it) with two rooms,
 //! and bob (`vox daemon` with **no anchor of his own**), who joins both from invites alice
-//! issued, edited as a stale invite would be:
+//! issued for explicitly anchored rooms (`room create --room-anchor`), edited as a stale invite would be:
 //! - the room that sorts **first** (the order the node walks its rooms in, by room id) names the
 //!   anchor at **eight dead ports** only;
 //! - the other names it at its one real address.
@@ -328,7 +328,16 @@ fn a_shared_anchor_is_redialled_at_every_rooms_address() {
     for name in ["one", "two"] {
         let (ok, _, err) = vox(
             &alice_dir,
-            &["room", "create", "--passphrase-file", "-", "--name", name],
+            &[
+                "room",
+                "create",
+                "--passphrase-file",
+                "-",
+                "--name",
+                name,
+                "--room-anchor",
+                &spec,
+            ],
             Some(ROOM_PASS),
         );
         assert!(ok, "PRODUCT (staging): alice's room create: {err}");

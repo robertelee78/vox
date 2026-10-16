@@ -79,7 +79,7 @@ Exit 0 = pass, 1 = red, 2 = apparatus or CANNOT MEASURE. A `vox` step that fails
 red: `PRODUCT (staging):` before the move (the scene was not reached, and what vox said is quoted),
 `PRODUCT:` after it. Every process is recorded and stopped by PID.
 """
-import json, os, re, socket, subprocess, sys, tempfile, threading, time, traceback
+import json, os, re, select, socket, subprocess, sys, tempfile, threading, time, traceback
 
 VOX = os.path.abspath(sys.argv[1])
 LINUX = sys.platform.startswith("linux")
@@ -338,6 +338,47 @@ def ok(w, *args, stdin=None, secs=120):
         raise Product(f"{w}'s `vox {' '.join(args[:2])}` failed: {r.stderr.strip()}")
     return r.stdout
 
+def trust(w, peer, name):
+    # Same terminal interaction as support/typed.rs: a current keyring change accepts no
+    # passphrase file/environment fallback. This proof controls only its own scratch identities.
+    pid, fd = os.forkpty()
+    if pid == 0:
+        os.execve(VOX, [VOX, "trust", "add", peer, "--name", name], env(w))
+    out, sent, deadline = b"", False, time.monotonic() + 120
+    try:
+        while True:
+            if time.monotonic() >= deadline:
+                os.kill(pid, signal.SIGKILL)
+                raise Product(f"{w}'s terminal trust add did not finish within 120 s: {out!r}")
+            ready, _, _ = select.select([fd], [], [], 0.2)
+            if not ready:
+                continue
+            try:
+                chunk = os.read(fd, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            out += chunk
+            prompt = out.rstrip().rsplit(b"\n", 1)[-1]
+            if not sent and (prompt.endswith(b"passphrase:") or
+                             (prompt.startswith(b"passphrase for ") and prompt.endswith(b":"))):
+                time.sleep(0.5)  # the same read-the-prompt pause as the existing typed driver
+                os.write(fd, b"id pass\r")
+                sent = True
+        _, status = os.waitpid(pid, 0)
+        pid = None
+        if os.waitstatus_to_exitcode(status) != 0:
+            raise Product(f"{w}'s terminal trust add failed: {out.decode('utf-8', 'replace')}")
+    finally:
+        os.close(fd)
+        if pid is not None:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            os.waitpid(pid, 0)
+
 def until(pred, secs, step=0.1):
     end = time.time() + secs
     while time.time() < end:
@@ -438,8 +479,8 @@ try:
     if "10.77.0.2" not in link:
         raise Apparatus(f"D's invite link does not name A (10.77.0.2), so P would not dial it there: {link}")
     ok("p", "room", "join", "--passphrase-file", "-", link, stdin="room pass\n", secs=490)
-    ok("d", "trust", "add", fp["p"], "--name", "p", "--identity-passphrase-file", f"{S}/idpass")
-    ok("p", "trust", "add", fp["d"], "--name", "d", "--identity-passphrase-file", f"{S}/idpass")
+    trust("d", fp["p"], "p")
+    trust("p", fp["d"], "d")
     ok("d", "room", "post", room, "BEFORE-THE-MOVE")
     if not until(lambda: "BEFORE-THE-MOVE" in run("p", "room", "read", room).stdout, 60, 0.5):
         raise Product("P never read D's post before the change, within 60 s")
