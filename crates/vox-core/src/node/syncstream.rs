@@ -52,7 +52,21 @@ pub fn should_use_range_mode(authors: usize) -> bool {
 }
 
 /// The largest sync preamble either side will read (`[channel_id, epoch]`).
-const MAX_SYNC_PREAMBLE: usize = 64;
+const MAX_SYNC_PREAMBLE: usize = crate::node::history_stream::MAX_PREAMBLE;
+
+pub(crate) enum RequestPreamble {
+    Legacy { room: Digest32, epoch: u64 },
+    Bounded(crate::node::history_stream::Preamble),
+}
+
+impl RequestPreamble {
+    pub(crate) fn room_epoch(&self) -> (Digest32, u64) {
+        match self {
+            Self::Legacy { room, epoch } => (*room, *epoch),
+            Self::Bounded(preamble) => (preamble.room, preamble.epoch),
+        }
+    }
+}
 
 /// Open a `sync`-typed bi-stream on `conn` for one channel and wrap it as the
 /// ADR-008 transport. The kind frame is written first so the peer dispatches it,
@@ -73,13 +87,26 @@ pub async fn open_sync(
 /// Read the preamble from an accepted `sync` stream: which `(channelID, epoch)` the
 /// peer wants to reconcile.
 pub async fn read_sync_request(recv: &mut quinn::RecvStream) -> Result<(Digest32, u64)> {
+    match read_request_preamble(recv).await? {
+        RequestPreamble::Legacy { room, epoch } => Ok((room, epoch)),
+        RequestPreamble::Bounded(_) => Err(Error::MalformedGovernance(
+            "bounded history request cannot use legacy reconciliation",
+        )),
+    }
+}
+
+pub(crate) async fn read_request_preamble(recv: &mut quinn::RecvStream) -> Result<RequestPreamble> {
     let bytes = read_frame(recv, MAX_SYNC_PREAMBLE)
         .await?
         .ok_or(Error::MalformedGovernance(
             "sync stream closed before preamble",
         ))?;
     let mut d = Decoder::new(&bytes);
-    if d.array()? != 2 {
+    let arity = d.array()?;
+    if arity == 6 {
+        return crate::node::history_stream::Preamble::decode(&bytes).map(RequestPreamble::Bounded);
+    }
+    if arity != 2 {
         return Err(Error::MalformedGovernance("sync preamble arity"));
     }
     let channel_id: Digest32 = d
@@ -88,7 +115,10 @@ pub async fn read_sync_request(recv: &mut quinn::RecvStream) -> Result<(Digest32
         .map_err(|_| Error::MalformedGovernance("sync preamble room id"))?;
     let epoch = d.uint()?;
     d.finish()?;
-    Ok((channel_id, epoch))
+    Ok(RequestPreamble::Legacy {
+        room: channel_id,
+        epoch,
+    })
 }
 
 /// Wrap an already-accepted, already-authorized `sync` stream as the ADR-008

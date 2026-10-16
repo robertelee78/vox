@@ -432,11 +432,25 @@ WANT (`0x03`) is `[request_id, query]`, where query is exactly one of:
 [2, HeadID, proof_kind, from, to]                 # proof
 [3, HeadID, seq, offset]                          # one entry/body continuation
 [4, HeadID, lo, hi, entry_limit, wire_limit]       # bounded page
+[5, HeadID, seq]                                 # signed header only; no body
 ```
 
 Proof kinds 0/1/2 mean inclusion/consistency/control range. Inclusion requires `from == to == p`;
 consistency uses old/new sizes. Requests are bound to the authenticated author/scope and the
 original local operation; a peer cannot widen demand through a returned continuation.
+Header-only requests consume one header credit and never permit CHUNK. Required proof/parent
+headers therefore do not implicitly request their older content bodies.
+
+The purpose also constrains the server before any body read: pages require the history
+reservation, and a control-body request requires a signed mandatory-control kind. A live body
+must be the current accepted author's tail when selected. Finishing that body across quanta may
+use the same exact node/peer/room/epoch/request/head/position/hash/length binding and durable ACK
+offset even after the author advances. At most 64 such volatile bindings exist daemon-wide;
+they expire after 30 seconds without progress or 300 seconds total. A receiver whose ACK was
+lost may resume only at the last acknowledged offset or the sole outstanding chunk boundary.
+The binding authorizes no additional entry or page. Restart drops it; this is bounded transfer
+state, not a saved history queue or permission to resume archive work. Changing a query's purpose
+cannot borrow reserved control/live capacity for arbitrary older bodies.
 
 The consistency META proof body is `[claimed_prefix_descriptor, consistency]`, carrying the
 prefix descriptor already required by the receipt above. Its leaf count MUST equal `from`.

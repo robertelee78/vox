@@ -5,7 +5,9 @@ use std::time::{Duration, Instant};
 
 use super::session_projection::{floor_index, private_index};
 use super::*;
-use crate::node::sessionstream::{Ask, Cursor, Page, Record, PAGE_RECORDS};
+use crate::node::sessionstream::{
+    Ask, Cursor, Page, Record, MAX_PAGE, MAX_RECORD, PAGE_OVERHEAD, PAGE_RECORDS,
+};
 
 const SUPPORT: &str = "vox/private-session-stream/v1";
 const SEG_LEGACY_DRIVE_GENERATIONS: u64 = 19;
@@ -1855,6 +1857,7 @@ impl ChannelState {
         ask: &Ask,
         peer: &Digest32,
         holders: &BTreeSet<Digest32>,
+        charge: crate::node::history_budget::BufferCharge,
     ) -> Result<Page> {
         self.require_governance_ready(store, crate::time::Ms(self.now_hint))?;
         if self.poisoned
@@ -1885,6 +1888,7 @@ impl ChannelState {
             0
         };
         let mut records = Vec::new();
+        let mut wire_bytes = PAGE_OVERHEAD;
         // Bound CPU and bytes even when most retained records belong to other audiences.
         for _ in 0..256 {
             if records.len() == PAGE_RECORDS {
@@ -1893,16 +1897,29 @@ impl ChannelState {
             let Some((id, saved)) = self.private_after(store, Some(after))? else {
                 break;
             };
-            after = id;
             if self.private_expired(&saved, self.now_hint) {
+                after = id;
                 continue;
             }
             if saved.record.message.header.author_id == self.me() && !holders.contains(peer) {
+                after = id;
                 continue;
             }
             if self.private_permitted(store, &saved.record, peer)? {
-                records.push(saved.record.wire());
+                let wire = saved.record.wire();
+                if wire.len() > MAX_RECORD {
+                    return Err(Error::SizeLimitExceeded("private Session record"));
+                }
+                let next = wire_bytes + wire.len() + 5;
+                // The unsent record remains after the returned cursor; never skip it merely
+                // because this response used its byte credit before its record-count credit.
+                if next > MAX_PAGE {
+                    break;
+                }
+                wire_bytes = next;
+                records.push(wire);
             }
+            after = id;
         }
         let more = self.private_after(store, Some(after))?.is_some();
         Ok(Page {
@@ -1910,6 +1927,7 @@ impl ChannelState {
             cursor: Cursor { incarnation, after },
             more,
             records,
+            charge,
         })
     }
 

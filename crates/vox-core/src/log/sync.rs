@@ -412,6 +412,9 @@ pub fn decode_frame(bytes: &[u8]) -> Result<SyncFrame> {
             d.finish()?;
             Ok(SyncFrame::Neg(msg))
         }
+        FrameId::Meta | FrameId::Chunk | FrameId::Done | FrameId::Cancel | FrameId::Ack => {
+            Err(Error::MalformedBundle("bounded frame in legacy sync mode"))
+        }
     }
 }
 

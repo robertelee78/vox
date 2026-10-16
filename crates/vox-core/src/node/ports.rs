@@ -163,6 +163,7 @@ pub fn backoff_kind(fail: &SyncFailure) -> Option<BackoffKind> {
             | WireError::SuiteBelowFloor
             | WireError::UnknownStructTag
             | WireError::UnknownAlgoId
+            | WireError::ProtocolLimits
             | WireError::SyncModeUnsupported => BackoffKind::NoProgress,
         },
         SyncFailure::Session(SessionError::Local(code)) => match code {
@@ -178,6 +179,7 @@ pub fn backoff_kind(fail: &SyncFailure) -> Option<BackoffKind> {
             | WireError::UnknownStructTag
             | WireError::UnknownAlgoId
             | WireError::AuthenticatorInvalid
+            | WireError::ProtocolLimits
             | WireError::SyncModeUnsupported => BackoffKind::NoProgress,
         },
     })

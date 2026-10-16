@@ -428,6 +428,16 @@ pub enum FrameId {
     Entry = 0x04,
     /// `0x05` — Negentropy range-reconciliation payload.
     Neg = 0x05,
+    /// `0x06` — bounded signed head, context, proof or header (ADR-036).
+    Meta = 0x06,
+    /// `0x07` — one credited payload chunk (ADR-036).
+    Chunk = 0x07,
+    /// `0x08` — the bounded response's explicit outcome and continuation hint.
+    Done = 0x08,
+    /// `0x09` — cancellation of one exact bounded request.
+    Cancel = 0x09,
+    /// `0x0A` — acknowledgement of one exact persisted payload offset.
+    Ack = 0x0A,
 }
 
 impl FrameId {
@@ -447,6 +457,11 @@ impl FrameId {
             0x03 => Some(FrameId::Want),
             0x04 => Some(FrameId::Entry),
             0x05 => Some(FrameId::Neg),
+            0x06 => Some(FrameId::Meta),
+            0x07 => Some(FrameId::Chunk),
+            0x08 => Some(FrameId::Done),
+            0x09 => Some(FrameId::Cancel),
+            0x0A => Some(FrameId::Ack),
             _ => None,
         }
     }
@@ -456,6 +471,9 @@ impl FrameId {
 pub const SYNC_MODE_FRONTIER: u8 = 0b0000_0001;
 /// `HELLO` mode bitmap bit: Negentropy range-reconciliation (required at scale).
 pub const SYNC_MODE_RANGE_RECONCILIATION: u8 = 0b0000_0010;
+/// `HELLO` mode bitmap bit: authenticated live/control and explicit bounded history.
+/// This mode never falls back to an archive-draining reconciliation mode.
+pub const SYNC_MODE_BOUNDED_HISTORY: u8 = 0b0000_0100;
 
 /// The single wire application-error contract (ADR-008). A hard fail closes the
 /// QUIC stream/connection with one of these codes — never a silent downgrade.
@@ -545,6 +563,9 @@ pub enum WireError {
     /// node it named does not answer here.
     #[error("not available")]
     NotAvailable = 0x0F,
+    /// `0x10` — malformed or oversized protocol input, not ordinary resource exhaustion.
+    #[error("protocol limits exceeded")]
+    ProtocolLimits = 0x10,
 }
 
 impl WireError {
@@ -571,6 +592,7 @@ impl WireError {
             0x0D => Some(WireError::ShuttingDown),
             0x0E => Some(WireError::Superseded),
             0x0F => Some(WireError::NotAvailable),
+            0x10 => Some(WireError::ProtocolLimits),
             _ => None,
         }
     }

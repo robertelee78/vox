@@ -571,6 +571,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::NetworkChanged(_) => "acting on a change of the machine's network",
         NetEvent::Stranded { .. } => "dialling again peers a network change stranded",
         NetEvent::SyncDone { .. } => "filing a sync that finished",
+        NetEvent::BoundedSyncDone { .. } => "filing a bounded history response",
         NetEvent::PrivateSessionAsk { .. } => "authorizing private Session records",
         NetEvent::PrivateSessionDone { .. } => "filing private Session records",
         NetEvent::RoomStored { .. } => "evaluating a room whose log grew",
@@ -686,6 +687,8 @@ impl std::fmt::Debug for Bind {
 /// constructors are shorthands for common shapes of it.
 #[derive(Clone)]
 pub struct NodeConfig {
+    /// Shared by all nodes in the hosting daemon; standalone nodes own a private budget.
+    pub history_budget: Arc<crate::node::history_budget::Budget>,
     /// The wall clock, in milliseconds (tests inject a fixed one).
     pub clock: Clock,
     /// Milliseconds since the epoch, from one read. Defaults to
@@ -777,6 +780,7 @@ impl NodeConfig {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            history_budget: crate::node::history_budget::Budget::new(),
             clock: crate::time::clock_with_test_skew(),
             // The system clock unless a proof set the test-only clock step (V210-64); the
             // milliseconds clock below also honours the skew alone (ADR-023 proof 2, #230).
@@ -1154,6 +1158,8 @@ enum NetEvent {
         channel_id: Digest32,
         /// The epoch it named.
         epoch: u64,
+        /// A new-format request is never handed to the legacy archive reconciler.
+        history: Option<crate::node::history_stream::Preamble>,
         /// The stream's send half.
         send: quinn::SendStream,
         /// The stream's receive half.
@@ -1211,6 +1217,13 @@ enum NetEvent {
         token: crate::node::ports::Token,
         /// What the session did, and why it stopped if it did not complete.
         report: crate::node::channel::SessionReport,
+    },
+    /// Completion of one response quantum; it grants no whole-log synchronization credit.
+    BoundedSyncDone {
+        channel_id: Digest32,
+        peer: Digest32,
+        token: crate::node::ports::Token,
+        result: crate::error::Result<crate::node::history_stream::Status>,
     },
     /// A session's worker persisted entries (ADR-025 D1a): the room's generation moved, so its
     /// ports are evaluated — reported on its own, because a retired worker's result is ignored
@@ -1966,10 +1979,14 @@ async fn serve_typed(
             let conn = Arc::clone(&conn);
             tokio::spawn(async move {
                 let mut recv = recv;
-                let Ok((channel_id, epoch)) =
-                    crate::node::syncstream::read_sync_request(&mut recv).await
+                let Ok(preamble) = crate::node::syncstream::read_request_preamble(&mut recv).await
                 else {
                     return;
+                };
+                let (channel_id, epoch) = preamble.room_epoch();
+                let history = match preamble {
+                    crate::node::syncstream::RequestPreamble::Legacy { .. } => None,
+                    crate::node::syncstream::RequestPreamble::Bounded(preamble) => Some(preamble),
                 };
                 let _ = tx
                     .send(NetEvent::SyncRequest {
@@ -1977,6 +1994,7 @@ async fn serve_typed(
                         peer,
                         channel_id,
                         epoch,
+                        history,
                         send,
                         recv,
                     })
@@ -4586,6 +4604,7 @@ struct RoomPublication {
 
 /// The node actor's state (owned by its task).
 pub struct Node {
+    history_budget: Arc<crate::node::history_budget::Budget>,
     governance_work: governance::Maintenance,
     paths: Paths,
     store_recovery: BTreeMap<Digest32, recovery::Retry>,
@@ -5294,6 +5313,7 @@ impl Node {
     ) -> crate::error::Result<(NodeHandle, tokio::task::JoinHandle<()>)> {
         let display_incarnation = crate::identity::rng::random_array::<32>()?;
         let NodeConfig {
+            history_budget,
             clock,
             millis_clock,
             argon2,
@@ -5341,6 +5361,7 @@ impl Node {
                 Err(error) => (Vec::new(), Some(error.to_string())),
             };
         let node = Self {
+            history_budget,
             paths,
             decisions,
             profile,
@@ -8952,10 +8973,11 @@ impl Node {
                 peer,
                 channel_id,
                 epoch,
+                history,
                 send,
                 recv,
             } => {
-                self.run_sync_session(conn, peer, channel_id, epoch, send, recv)
+                self.run_sync_session(conn, peer, channel_id, epoch, history, send, recv)
                     .await;
             }
             NetEvent::AddressesDiscovered => {
@@ -9735,10 +9757,32 @@ impl Node {
                     crate::transport::streams::refuse(&mut send, &mut recv);
                     return;
                 };
-                let page = shared
-                    .lock()
-                    .await
-                    .private_page(profile.store(), &ask, &peer, &holders);
+                let Some(job) = self.history_budget.try_start(
+                    profile.fingerprint(),
+                    crate::node::history_budget::Lane::Live,
+                ) else {
+                    if self.owed_a_reason(&ask.room, &peer, ask.epoch) {
+                        crate::node::net::refuse_stream_because(
+                            &mut send,
+                            &mut recv,
+                            crate::wire::WireError::SessionBusy,
+                        );
+                    } else {
+                        crate::transport::streams::refuse(&mut send, &mut recv);
+                    }
+                    return;
+                };
+                let Some(charge) = job.reserve(crate::node::sessionstream::PAGE_ENVELOPE) else {
+                    crate::transport::streams::refuse(&mut send, &mut recv);
+                    return;
+                };
+                let page = shared.lock().await.private_page(
+                    profile.store(),
+                    &ask,
+                    &peer,
+                    &holders,
+                    charge,
+                );
                 match page {
                     Ok(page) => {
                         tokio::spawn(async move {
@@ -9777,6 +9821,36 @@ impl Node {
                 if result.is_ok_and(|more| more) {
                     self.pull_private_sessions(channel_id, peer).await;
                 }
+            }
+            NetEvent::BoundedSyncDone {
+                channel_id,
+                peer,
+                token,
+                result,
+            } => {
+                let current = self
+                    .ports
+                    .get_mut(&(channel_id, peer))
+                    .and_then(|port| port.take(token));
+                if current.is_some() {
+                    crate::node::status::SyncBook::with(
+                        &self.sync_book,
+                        channel_id,
+                        peer,
+                        |counts| match result {
+                            Ok(crate::node::history_stream::Status::Complete) => {
+                                counts.completed += 1
+                            }
+                            Ok(_) => counts.partial += 1,
+                            Err(error) => {
+                                counts.failed += 1;
+                                counts.last_failure = Some(error.to_string());
+                            }
+                        },
+                    );
+                }
+                // A finite response neither consumes pending local requests nor follows the
+                // peer's continuation. In particular it never raises the legacy archive port.
             }
             NetEvent::SyncDone {
                 channel_id,
@@ -14593,6 +14667,7 @@ impl Node {
         peer: Digest32,
         channel_id: Digest32,
         epoch: u64,
+        history: Option<crate::node::history_stream::Preamble>,
         send: quinn::SendStream,
         recv: quinn::RecvStream,
     ) {
@@ -14669,6 +14744,19 @@ impl Node {
             crate::node::net::refuse_stream(&mut send, &mut recv);
             return;
         }
+        let sparse = match (self.channels.get(&channel_id), self.log_store()) {
+            (Some(shared), Some(store)) => shared.lock().await.uses_sparse_history(&store),
+            _ => Err(Error::Unreachable("room store unavailable")),
+        };
+        if !matches!(sparse, Ok(enabled) if enabled == history.is_some()) {
+            let (mut send, mut recv) = (send, recv);
+            crate::node::net::refuse_stream_because(
+                &mut send,
+                &mut recv,
+                crate::wire::WireError::SyncModeUnsupported,
+            );
+            return;
+        }
         // Admitted: the port exists for the room instance held now (it may not have been
         // discovered yet, since the peer spoke first).
         if !self.ensure_port(&channel_id, &peer).await {
@@ -14676,8 +14764,94 @@ impl Node {
             crate::node::net::refuse_stream(&mut send, &mut recv);
             return;
         }
-        let transport = accept_sync(tokio::runtime::Handle::current(), send, recv);
-        self.start_inbound(channel_id, peer, conn, transport);
+        if let Some(preamble) = history {
+            self.start_bounded_inbound(peer, conn, preamble, send, recv);
+        } else {
+            let transport = accept_sync(tokio::runtime::Handle::current(), send, recv);
+            self.start_inbound(channel_id, peer, conn, transport);
+        }
+    }
+
+    fn start_bounded_inbound(
+        &mut self,
+        peer: Digest32,
+        conn: Arc<VoxConnection>,
+        preamble: crate::node::history_stream::Preamble,
+        mut send: quinn::SendStream,
+        mut recv: quinn::RecvStream,
+    ) {
+        use crate::node::history_budget::Lane;
+        use crate::node::history_stream::Purpose;
+        let channel_id = preamble.room;
+        let (Some(store), Some(shared), Some(profile)) = (
+            self.log_store(),
+            self.channels.get(&channel_id).map(Arc::clone),
+            self.profile.as_ref(),
+        ) else {
+            return;
+        };
+        let lane = match preamble.purpose {
+            Purpose::Control => Lane::Control,
+            Purpose::Live => Lane::Live,
+            Purpose::History => Lane::Archive,
+        };
+        let Some(job) = self.history_budget.try_start(profile.fingerprint(), lane) else {
+            crate::node::net::refuse_stream_because(
+                &mut send,
+                &mut recv,
+                crate::wire::WireError::SessionBusy,
+            );
+            return;
+        };
+        let Some(port) = self.ports.get_mut(&(channel_id, peer)) else {
+            return;
+        };
+        let token = self.next_token;
+        self.next_token += 1;
+        let fence = crate::transport::stream_transport::Fence::new();
+        let running = crate::node::status::Running::start(
+            &self.sync_book,
+            channel_id,
+            peer,
+            token,
+            false,
+            crate::node::status::SyncStep::Exchanging,
+        );
+        port.inbound.insert(
+            token,
+            crate::node::ports::Attempt {
+                token,
+                dir: crate::node::ports::Dir::In,
+                conn,
+                req_at_start: port.req_gen,
+                started: std::time::Instant::now(),
+                abort: None,
+                fence: Arc::clone(&fence),
+                running,
+            },
+        );
+        let tx = self.net_tx.clone();
+        let task = tokio::spawn(async move {
+            let result = crate::node::history_stream::serve(
+                shared, store, peer, preamble, send, recv, job, fence,
+            )
+            .await;
+            let _ = tx
+                .send(NetEvent::BoundedSyncDone {
+                    channel_id,
+                    peer,
+                    token,
+                    result,
+                })
+                .await;
+        });
+        if let Some(attempt) = self
+            .ports
+            .get_mut(&(channel_id, peer))
+            .and_then(|port| port.inbound.get_mut(&token))
+        {
+            attempt.abort = Some(task.abort_handle());
+        }
     }
 
     /// Whether `peer` is a joiner this node let in, into any room, whose join is still settling:
@@ -19495,6 +19669,12 @@ impl Node {
         let Some(profile) = self.profile.as_ref() else {
             return;
         };
+        let Some(job) = self.history_budget.try_start(
+            profile.fingerprint(),
+            crate::node::history_budget::Lane::Live,
+        ) else {
+            return;
+        };
         let ask = {
             let mut ch = shared.lock().await;
             match ch.start_private_pull(profile.store(), peer) {
@@ -19511,7 +19691,7 @@ impl Node {
             let _slot = slot;
             let page = tokio::time::timeout(
                 Duration::from_secs(10),
-                crate::node::sessionstream::pull(&conn, ask),
+                crate::node::sessionstream::pull(&conn, ask, job),
             )
             .await
             .unwrap_or(Err(crate::error::Error::Unreachable(

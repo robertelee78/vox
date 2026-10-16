@@ -1,0 +1,847 @@
+//! Explicit bounded sync requests and frames (ADR-036 H-6).
+//!
+//! This codec checks structure and resource bounds. It grants no authority: the caller binds
+//! every object to its request, verifies author/control evidence, and rechecks current access.
+//! Payload slices borrow the charged input frame rather than making another queued copy.
+
+mod credit;
+mod server;
+mod source;
+mod transport;
+
+use super::history_budget::{BufferCharge, Job};
+use crate::cbor::{Decoder, Encoder};
+use crate::error::{Error, Result};
+use crate::hash::Digest32;
+use crate::log::feed::MAX_SEQ;
+use crate::log::history::{
+    ConsistencyProof, ControlRangeProof, Descriptor, InclusionProof, MAX_CHUNK_BYTES,
+    MAX_CONTEXT_AUTHORS, MAX_CONTEXT_BYTES, MAX_FRAME_BYTES, MAX_HEADER_BYTES, MAX_PAGE_ENTRIES,
+    MAX_PAYLOAD_BYTES, MAX_RESPONSE_BYTES,
+};
+
+pub type RequestId = [u8; 16];
+pub const MAX_PREAMBLE: usize = 128;
+pub const DONE_RESERVE: usize = 512;
+
+/// Run one admitted incoming request with a fixed lifetime. This never asks for another page.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn serve(
+    room: std::sync::Arc<tokio::sync::Mutex<super::channel::ChannelState>>,
+    store: std::sync::Arc<super::store::Store>,
+    peer: Digest32,
+    preamble: Preamble,
+    send: quinn::SendStream,
+    recv: quinn::RecvStream,
+    job: Job,
+    fence: std::sync::Arc<crate::transport::stream_transport::Fence>,
+) -> Result<Status> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let source = source::Source::new(room, store, preamble.epoch, peer, fence.clone(), deadline);
+    let mut io = transport::Transport::new(send, recv, job, fence, deadline);
+    let result = serve_request(&source, &mut io, preamble).await;
+    if let Err(error) = &result {
+        let code = match error {
+            Error::SizeLimitExceeded(_) | Error::MalformedBundle(_) => {
+                crate::wire::WireError::ProtocolLimits
+            }
+            _ => crate::wire::WireError::TransportFailed,
+        };
+        io.abort(code);
+    }
+    result
+}
+
+async fn serve_request(
+    source: &source::Source,
+    io: &mut transport::Transport,
+    preamble: Preamble,
+) -> Result<Status> {
+    let first = match io.read(MAX_FRAME_BYTES + 4).await? {
+        transport::Read::Frame(frame) => frame,
+        transport::Read::End => return Err(invalid("history closed before HELLO")),
+        transport::Read::Busy => return Err(Error::Unreachable("history HELLO reader busy")),
+    };
+    if !matches!(first.frame()?, Frame::Hello(mode) if mode == crate::wire::SYNC_MODE_BOUNDED_HISTORY)
+    {
+        return Err(invalid("history HELLO mode"));
+    }
+    let mut overhead = first.wire_len() + preamble.encode().len() + 4;
+    drop(first);
+    let hello = Frame::Hello(crate::wire::SYNC_MODE_BOUNDED_HISTORY);
+    let Some(encoded) = hello.encode(io.job())? else {
+        return Err(Error::Unreachable("history HELLO writer busy"));
+    };
+    overhead += encoded.as_slice().len() + 4;
+    io.write_encoded(&encoded).await?;
+    drop(encoded);
+    let next = match io.read(MAX_FRAME_BYTES + 4).await? {
+        transport::Read::Frame(frame) => frame,
+        transport::Read::End => return Err(invalid("history closed before WANT")),
+        transport::Read::Busy => return Err(Error::Unreachable("history WANT reader busy")),
+    };
+    overhead += next.wire_len();
+    let query = match next.frame()? {
+        Frame::Want { request, query } if request == preamble.request => query,
+        Frame::Cancel(request) if request == preamble.request => {
+            let done = Frame::Done {
+                request,
+                status: Status::Cancelled,
+                continuation: None,
+            };
+            if !io.write(&done).await? {
+                return Err(Error::Unreachable("history cancelled response busy"));
+            }
+            io.finish()?;
+            return Ok(Status::Cancelled);
+        }
+        _ => return Err(invalid("history expected bound WANT")),
+    };
+    drop(next);
+    server::answer(source, io, preamble, query, overhead).await
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Purpose {
+    Control = 0,
+    Live = 1,
+    History = 2,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Preamble {
+    pub room: Digest32,
+    pub epoch: u64,
+    pub purpose: Purpose,
+    pub request: RequestId,
+}
+
+impl Preamble {
+    pub fn encode(self) -> Vec<u8> {
+        let mut e = Encoder::new();
+        e.array(6)
+            .uint(2)
+            .bytes(&self.room)
+            .uint(self.epoch)
+            .uint(0)
+            .uint(self.purpose as u64)
+            .bytes(&self.request);
+        e.finish()
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        bound(bytes, MAX_PREAMBLE)?;
+        let mut d = Decoder::new(bytes);
+        arity(&mut d, 6)?;
+        if d.uint()? != 2 {
+            return Err(invalid("history preamble version"));
+        }
+        let room = digest(&mut d)?;
+        let epoch = d.uint()?;
+        if d.uint()? != 0 {
+            return Err(invalid("history public scope"));
+        }
+        let purpose = match d.uint()? {
+            0 => Purpose::Control,
+            1 => Purpose::Live,
+            2 => Purpose::History,
+            _ => return Err(invalid("history purpose")),
+        };
+        let request = request_id(&mut d)?;
+        d.finish()?;
+        Ok(Self {
+            room,
+            epoch,
+            purpose,
+            request,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ProofKind {
+    Inclusion = 0,
+    Consistency = 1,
+    Control = 2,
+}
+
+impl ProofKind {
+    fn decode(value: u64) -> Result<Self> {
+        match value {
+            0 => Ok(Self::Inclusion),
+            1 => Ok(Self::Consistency),
+            2 => Ok(Self::Control),
+            _ => Err(invalid("history proof kind")),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Query {
+    Head(Digest32),
+    Context(Digest32),
+    /// A proof dependency's signed header, without requesting its content body.
+    Header {
+        head: Digest32,
+        seq: u64,
+    },
+    Proof {
+        head: Digest32,
+        kind: ProofKind,
+        from: u64,
+        to: u64,
+    },
+    Entry {
+        head: Digest32,
+        seq: u64,
+        offset: u64,
+    },
+    Page {
+        head: Digest32,
+        lo: u64,
+        hi: u64,
+        entries: usize,
+        wire_bytes: usize,
+    },
+}
+
+impl Query {
+    pub fn validate(&self) -> Result<()> {
+        match self {
+            Self::Head(_) | Self::Context(_) => {}
+            Self::Header { seq, .. } => position(*seq)?,
+            Self::Proof { kind, from, to, .. } => {
+                if *from > *to
+                    || *to > MAX_SEQ
+                    || (*kind != ProofKind::Consistency && *from == 0)
+                    || (*kind == ProofKind::Inclusion && from != to)
+                {
+                    return Err(invalid("history proof interval"));
+                }
+            }
+            Self::Entry { seq, offset, .. } => {
+                position(*seq)?;
+                if *offset > MAX_PAYLOAD_BYTES as u64 {
+                    return Err(invalid("history body offset"));
+                }
+            }
+            Self::Page {
+                lo,
+                hi,
+                entries,
+                wire_bytes,
+                ..
+            } => {
+                interval(*lo, *hi)?;
+                if *entries == 0
+                    || *entries > MAX_PAGE_ENTRIES
+                    || *wire_bytes <= DONE_RESERVE
+                    || *wire_bytes > MAX_RESPONSE_BYTES
+                {
+                    return Err(invalid("history page budget"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn encode(&self, e: &mut Encoder) -> Result<()> {
+        self.validate()?;
+        match self {
+            Self::Head(author) => {
+                e.array(2).uint(0).bytes(author);
+            }
+            Self::Context(hash) => {
+                e.array(2).uint(1).bytes(hash);
+            }
+            Self::Header { head, seq } => {
+                e.array(3).uint(5).bytes(head).uint(*seq);
+            }
+            Self::Proof {
+                head,
+                kind,
+                from,
+                to,
+            } => {
+                e.array(5)
+                    .uint(2)
+                    .bytes(head)
+                    .uint(*kind as u64)
+                    .uint(*from)
+                    .uint(*to);
+            }
+            Self::Entry { head, seq, offset } => {
+                e.array(4).uint(3).bytes(head).uint(*seq).uint(*offset);
+            }
+            Self::Page {
+                head,
+                lo,
+                hi,
+                entries,
+                wire_bytes,
+            } => {
+                e.array(6)
+                    .uint(4)
+                    .bytes(head)
+                    .uint(*lo)
+                    .uint(*hi)
+                    .uint(*entries as u64)
+                    .uint(*wire_bytes as u64);
+            }
+        }
+        Ok(())
+    }
+
+    fn decode(d: &mut Decoder<'_>) -> Result<Self> {
+        let len = d.array()?;
+        let query = match (d.uint()?, len) {
+            (0, 2) => Self::Head(digest(d)?),
+            (1, 2) => Self::Context(digest(d)?),
+            (5, 3) => Self::Header {
+                head: digest(d)?,
+                seq: d.uint()?,
+            },
+            (2, 5) => Self::Proof {
+                head: digest(d)?,
+                kind: ProofKind::decode(d.uint()?)?,
+                from: d.uint()?,
+                to: d.uint()?,
+            },
+            (3, 4) => Self::Entry {
+                head: digest(d)?,
+                seq: d.uint()?,
+                offset: d.uint()?,
+            },
+            (4, 6) => Self::Page {
+                head: digest(d)?,
+                lo: d.uint()?,
+                hi: d.uint()?,
+                entries: size(d.uint()?)?,
+                wire_bytes: size(d.uint()?)?,
+            },
+            _ => return Err(invalid("history query arity/kind")),
+        };
+        query.validate()?;
+        Ok(query)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Status {
+    Complete = 0,
+    More = 1,
+    EvidenceUnavailable = 2,
+    BodyNotHeld = 3,
+    Busy = 4,
+    Cancelled = 5,
+    ControlPending = 6,
+}
+
+impl Status {
+    fn decode(value: u64) -> Result<Self> {
+        match value {
+            0 => Ok(Self::Complete),
+            1 => Ok(Self::More),
+            2 => Ok(Self::EvidenceUnavailable),
+            3 => Ok(Self::BodyNotHeld),
+            4 => Ok(Self::Busy),
+            5 => Ok(Self::Cancelled),
+            6 => Ok(Self::ControlPending),
+            _ => Err(invalid("history done status")),
+        }
+    }
+}
+
+/// Peer-supplied continuation is only a hint until checked against the persisted local demand.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Continuation {
+    pub query_kind: u8,
+    pub head: Digest32,
+    pub lo: u64,
+    pub hi: u64,
+    pub next_seq: u64,
+    pub entry: Option<Digest32>,
+    pub offset: u64,
+    pub entries_remaining: usize,
+}
+
+impl Continuation {
+    fn validate(&self) -> Result<()> {
+        interval(self.lo, self.hi)?;
+        if self.query_kind > 4
+            || self.next_seq < self.lo
+            || self.next_seq > self.hi
+            || self.offset > MAX_PAYLOAD_BYTES as u64
+            || (self.offset != 0 && self.entry.is_none())
+            || self.entries_remaining > MAX_PAGE_ENTRIES
+        {
+            return Err(invalid("history continuation bounds"));
+        }
+        Ok(())
+    }
+
+    fn encode(&self, e: &mut Encoder) -> Result<()> {
+        self.validate()?;
+        e.array(8)
+            .uint(self.query_kind as u64)
+            .bytes(&self.head)
+            .uint(self.lo)
+            .uint(self.hi)
+            .uint(self.next_seq)
+            .array(usize::from(self.entry.is_some()));
+        if let Some(hash) = self.entry {
+            e.bytes(&hash);
+        }
+        e.uint(self.offset).uint(self.entries_remaining as u64);
+        Ok(())
+    }
+
+    fn decode(d: &mut Decoder<'_>, len: usize) -> Result<Self> {
+        if len != 8 {
+            return Err(invalid("history continuation arity"));
+        }
+        let query_kind =
+            u8::try_from(d.uint()?).map_err(|_| invalid("history continuation kind"))?;
+        let head = digest(d)?;
+        let lo = d.uint()?;
+        let hi = d.uint()?;
+        let next_seq = d.uint()?;
+        let entry = match d.array()? {
+            0 => None,
+            1 => Some(digest(d)?),
+            _ => return Err(invalid("history continuation entry")),
+        };
+        let offset = d.uint()?;
+        let entries_remaining = size(d.uint()?)?;
+        let result = Self {
+            query_kind,
+            head,
+            lo,
+            hi,
+            next_seq,
+            entry,
+            offset,
+            entries_remaining,
+        };
+        result.validate()?;
+        Ok(result)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeadHint {
+    pub author: Digest32,
+    pub size: u64,
+    pub head: Digest32,
+}
+
+pub enum Proof {
+    Inclusion(InclusionProof),
+    Consistency {
+        prefix: Descriptor,
+        proof: ConsistencyProof,
+    },
+    Control(ControlRangeProof),
+}
+
+pub enum Object<'a> {
+    Head(&'a [u8]),
+    Context(&'a [u8]),
+    Proof(Proof),
+    Header(&'a [u8]),
+}
+
+pub enum Frame<'a> {
+    Hello(u8),
+    Have(Vec<HeadHint>),
+    Want {
+        request: RequestId,
+        query: Query,
+    },
+    Meta {
+        request: RequestId,
+        object: Object<'a>,
+    },
+    Chunk {
+        request: RequestId,
+        entry: Digest32,
+        offset: u64,
+        bytes: &'a [u8],
+    },
+    Done {
+        request: RequestId,
+        status: Status,
+        continuation: Option<Continuation>,
+    },
+    Cancel(RequestId),
+    Ack {
+        request: RequestId,
+        entry: Digest32,
+        next_offset: u64,
+    },
+}
+
+/// Encoded bytes retain their reservation until the last transport copy is finished.
+pub struct Encoded {
+    bytes: Vec<u8>,
+    _charge: BufferCharge,
+}
+
+impl Encoded {
+    pub fn as_slice(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl<'a> Frame<'a> {
+    /// Reserve the encoder, nested proof and final-frame copies before producing any of them.
+    /// The caller already owns the independently charged source objects. Lack of room is a
+    /// local busy/yield result; it is not malformed peer input.
+    pub fn encode(&self, job: &Job) -> Result<Option<Encoded>> {
+        let Some(charge) = job.reserve(4 * MAX_FRAME_BYTES) else {
+            return Ok(None);
+        };
+        let mut e = Encoder::new();
+        let mut tail = None;
+        let id = match self {
+            Self::Hello(bitmap) => {
+                e.uint(u64::from(*bitmap));
+                0x01
+            }
+            Self::Have(hints) => {
+                if hints.len() > MAX_CONTEXT_AUTHORS {
+                    return Err(invalid("history have authors"));
+                }
+                e.array(hints.len());
+                let mut previous = None;
+                for hint in hints {
+                    if hint.size > MAX_SEQ || previous.is_some_and(|last| last >= hint.author) {
+                        return Err(invalid("history have order/size"));
+                    }
+                    previous = Some(hint.author);
+                    e.array(3)
+                        .bytes(&hint.author)
+                        .uint(hint.size)
+                        .bytes(&hint.head);
+                }
+                0x02
+            }
+            Self::Want { request, query } => {
+                e.array(2).bytes(request);
+                query.encode(&mut e)?;
+                0x03
+            }
+            Self::Meta { request, object } => {
+                e.array(3).bytes(request);
+                match object {
+                    Object::Head(bytes) => {
+                        bound(bytes, MAX_HEADER_BYTES)?;
+                        e.uint(0).bytes(bytes);
+                    }
+                    Object::Context(bytes) => {
+                        bound(bytes, MAX_CONTEXT_BYTES)?;
+                        e.uint(1).bytes(bytes);
+                    }
+                    Object::Proof(proof) => {
+                        e.uint(2).array(2);
+                        match proof {
+                            Proof::Inclusion(proof) => {
+                                proof.validate()?;
+                                e.uint(0);
+                                proof.encode(&mut e);
+                            }
+                            Proof::Consistency { prefix, proof } => {
+                                prefix.validate()?;
+                                proof.validate()?;
+                                if prefix.leaves != proof.from {
+                                    return Err(invalid("history claimed prefix size"));
+                                }
+                                e.uint(1).array(2);
+                                prefix.encode(&mut e);
+                                proof.encode(&mut e);
+                            }
+                            Proof::Control(proof) => {
+                                e.uint(2);
+                                tail = Some(proof.to_bytes()?);
+                            }
+                        }
+                    }
+                    Object::Header(bytes) => {
+                        bound(bytes, MAX_HEADER_BYTES)?;
+                        e.uint(3).bytes(bytes);
+                    }
+                }
+                0x06
+            }
+            Self::Chunk {
+                request,
+                entry,
+                offset,
+                bytes,
+            } => {
+                bound(bytes, MAX_CHUNK_BYTES)?;
+                if bytes.is_empty()
+                    || offset
+                        .checked_add(bytes.len() as u64)
+                        .is_none_or(|end| end > MAX_PAYLOAD_BYTES as u64)
+                {
+                    return Err(invalid("history chunk bounds"));
+                }
+                e.array(4)
+                    .bytes(request)
+                    .bytes(entry)
+                    .uint(*offset)
+                    .bytes(bytes);
+                0x07
+            }
+            Self::Done {
+                request,
+                status,
+                continuation,
+            } => {
+                done_shape(*status, continuation.as_ref())?;
+                e.array(3).bytes(request).uint(*status as u64);
+                if let Some(cursor) = continuation {
+                    cursor.encode(&mut e)?;
+                } else {
+                    e.array(0);
+                }
+                0x08
+            }
+            Self::Cancel(request) => {
+                e.array(1).bytes(request);
+                0x09
+            }
+            Self::Ack {
+                request,
+                entry,
+                next_offset,
+            } => {
+                if *next_offset > MAX_PAYLOAD_BYTES as u64 {
+                    return Err(invalid("history ack offset"));
+                }
+                e.array(3).bytes(request).bytes(entry).uint(*next_offset);
+                0x0A
+            }
+        };
+        let body = e.finish();
+        let len = 1 + body.len() + tail.as_ref().map_or(0, Vec::len);
+        if len > MAX_FRAME_BYTES {
+            return Err(Error::SizeLimitExceeded("history encoded frame"));
+        }
+        let mut bytes = Vec::with_capacity(len);
+        bytes.push(id);
+        bytes.extend_from_slice(&body);
+        if let Some(tail) = tail {
+            bytes.extend_from_slice(&tail);
+        }
+        Ok(Some(Encoded {
+            bytes,
+            _charge: charge,
+        }))
+    }
+
+    pub fn decode(bytes: &'a [u8]) -> Result<Self> {
+        bound(bytes, MAX_FRAME_BYTES)?;
+        let (&id, body) = bytes.split_first().ok_or(invalid("history empty frame"))?;
+        let mut d = Decoder::new(body);
+        let frame = match id {
+            0x01 => {
+                Self::Hello(u8::try_from(d.uint()?).map_err(|_| invalid("history hello bitmap"))?)
+            }
+            0x02 => {
+                let count = d.array()?;
+                if count > MAX_CONTEXT_AUTHORS {
+                    return Err(invalid("history have authors"));
+                }
+                let mut hints = Vec::with_capacity(count);
+                let mut previous = None;
+                for _ in 0..count {
+                    arity(&mut d, 3)?;
+                    let author = digest(&mut d)?;
+                    let size = d.uint()?;
+                    if size > MAX_SEQ || previous.is_some_and(|last| last >= author) {
+                        return Err(invalid("history have order/size"));
+                    }
+                    previous = Some(author);
+                    hints.push(HeadHint {
+                        author,
+                        size,
+                        head: digest(&mut d)?,
+                    });
+                }
+                Self::Have(hints)
+            }
+            0x03 => {
+                arity(&mut d, 2)?;
+                Self::Want {
+                    request: request_id(&mut d)?,
+                    query: Query::decode(&mut d)?,
+                }
+            }
+            0x06 => {
+                arity(&mut d, 3)?;
+                let request = request_id(&mut d)?;
+                let object = match d.uint()? {
+                    0 => Object::Head(bounded_bytes(&mut d, MAX_HEADER_BYTES)?),
+                    1 => Object::Context(bounded_bytes(&mut d, MAX_CONTEXT_BYTES)?),
+                    2 => {
+                        arity(&mut d, 2)?;
+                        let kind = ProofKind::decode(d.uint()?)?;
+                        // The proof is the final field. Its typed decoder consumes the exact
+                        // remaining body, including end-of-input validation; no generic Value.
+                        let rest = &body[body.len() - d.remaining()..];
+                        let proof = match kind {
+                            ProofKind::Inclusion => {
+                                Proof::Inclusion(InclusionProof::from_bytes(rest)?)
+                            }
+                            ProofKind::Consistency => {
+                                let mut body = Decoder::new(rest);
+                                arity(&mut body, 2)?;
+                                let prefix = Descriptor::decode(&mut body)?;
+                                let proof = ConsistencyProof::decode(&mut body)?;
+                                body.finish()?;
+                                if prefix.leaves != proof.from {
+                                    return Err(invalid("history claimed prefix size"));
+                                }
+                                Proof::Consistency { prefix, proof }
+                            }
+                            ProofKind::Control => {
+                                Proof::Control(ControlRangeProof::from_bytes(rest)?)
+                            }
+                        };
+                        return Ok(Self::Meta {
+                            request,
+                            object: Object::Proof(proof),
+                        });
+                    }
+                    3 => Object::Header(bounded_bytes(&mut d, MAX_HEADER_BYTES)?),
+                    _ => return Err(invalid("history metadata kind")),
+                };
+                Self::Meta { request, object }
+            }
+            0x07 => {
+                arity(&mut d, 4)?;
+                let request = request_id(&mut d)?;
+                let entry = digest(&mut d)?;
+                let offset = d.uint()?;
+                let chunk = bounded_bytes(&mut d, MAX_CHUNK_BYTES)?;
+                if chunk.is_empty()
+                    || offset
+                        .checked_add(chunk.len() as u64)
+                        .is_none_or(|end| end > MAX_PAYLOAD_BYTES as u64)
+                {
+                    return Err(invalid("history chunk bounds"));
+                }
+                Self::Chunk {
+                    request,
+                    entry,
+                    offset,
+                    bytes: chunk,
+                }
+            }
+            0x08 => {
+                arity(&mut d, 3)?;
+                let request = request_id(&mut d)?;
+                let status = Status::decode(d.uint()?)?;
+                let len = d.array()?;
+                let continuation = if len == 0 {
+                    None
+                } else {
+                    Some(Continuation::decode(&mut d, len)?)
+                };
+                done_shape(status, continuation.as_ref())?;
+                Self::Done {
+                    request,
+                    status,
+                    continuation,
+                }
+            }
+            0x09 => {
+                arity(&mut d, 1)?;
+                Self::Cancel(request_id(&mut d)?)
+            }
+            0x0A => {
+                arity(&mut d, 3)?;
+                let request = request_id(&mut d)?;
+                let entry = digest(&mut d)?;
+                let next_offset = d.uint()?;
+                if next_offset > MAX_PAYLOAD_BYTES as u64 {
+                    return Err(invalid("history ack offset"));
+                }
+                Self::Ack {
+                    request,
+                    entry,
+                    next_offset,
+                }
+            }
+            _ => return Err(invalid("history frame kind")),
+        };
+        d.finish()?;
+        Ok(frame)
+    }
+}
+
+fn done_shape(status: Status, continuation: Option<&Continuation>) -> Result<()> {
+    if (status == Status::Complete && continuation.is_some())
+        || (status == Status::More && continuation.is_none())
+    {
+        return Err(invalid("history done continuation"));
+    }
+    Ok(())
+}
+
+fn invalid(reason: &'static str) -> Error {
+    Error::MalformedBundle(reason)
+}
+fn bound(bytes: &[u8], maximum: usize) -> Result<()> {
+    if bytes.len() > maximum {
+        Err(Error::SizeLimitExceeded("history frame/object"))
+    } else {
+        Ok(())
+    }
+}
+fn bounded_bytes<'a>(d: &mut Decoder<'a>, maximum: usize) -> Result<&'a [u8]> {
+    let bytes = d.bytes()?;
+    bound(bytes, maximum)?;
+    Ok(bytes)
+}
+fn arity(d: &mut Decoder<'_>, expected: usize) -> Result<()> {
+    if d.array()? != expected {
+        Err(invalid("history array arity"))
+    } else {
+        Ok(())
+    }
+}
+fn digest(d: &mut Decoder<'_>) -> Result<Digest32> {
+    d.bytes()?
+        .try_into()
+        .map_err(|_| invalid("history digest length"))
+}
+fn request_id(d: &mut Decoder<'_>) -> Result<RequestId> {
+    d.bytes()?
+        .try_into()
+        .map_err(|_| invalid("history request length"))
+}
+fn size(value: u64) -> Result<usize> {
+    usize::try_from(value).map_err(|_| invalid("history size"))
+}
+fn position(value: u64) -> Result<()> {
+    if value == 0 || value > MAX_SEQ {
+        Err(invalid("history position"))
+    } else {
+        Ok(())
+    }
+}
+fn interval(lo: u64, hi: u64) -> Result<()> {
+    position(lo)?;
+    position(hi)?;
+    if lo > hi {
+        Err(invalid("history interval"))
+    } else {
+        Ok(())
+    }
+}

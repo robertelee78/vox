@@ -14,6 +14,7 @@ use crate::group::message::GroupMessage;
 use crate::hash::{sha256, Digest32, COMPOSITE_SIG_LEN};
 use crate::identity::composite::{CompositePublicKey, CompositeSignature, RootSigner};
 use crate::log::entry::Entry;
+use crate::node::history_budget::{BufferCharge, Job};
 use crate::transport::framing::{read_frame, write_frame};
 use crate::transport::quic::VoxConnection;
 use crate::transport::streams::{open_typed, StreamKind};
@@ -21,7 +22,11 @@ use crate::transport::streams::{open_typed, StreamKind};
 const DOMAIN: &[u8] = b"vox/private-session/v1";
 pub(crate) const MAX_RECORD: usize = 96 * 1024;
 pub(crate) const PAGE_RECORDS: usize = 32;
-const MAX_PAGE: usize = PAGE_RECORDS * (MAX_RECORD + 8) + 128;
+pub(crate) const MAX_PAGE: usize = 1024 * 1024;
+/// Outer framing/cursor overhead; each record additionally has at most five CBOR length bytes.
+pub(crate) const PAGE_OVERHEAD: usize = 128;
+/// Wire, decoder copies, one parsed record and encoder/sealing scratch remain charged together.
+pub(crate) const PAGE_ENVELOPE: usize = 4 * MAX_PAGE;
 
 pub(crate) struct Record {
     pub room: Digest32,
@@ -177,6 +182,8 @@ pub(crate) struct Page {
     pub cursor: Cursor,
     pub more: bool,
     pub records: Vec<Vec<u8>>,
+    /// Keeps the daemon-wide reservation alive through the actor's durable application.
+    pub charge: BufferCharge,
 }
 
 fn digest(d: &mut Decoder<'_>) -> Result<Digest32> {
@@ -220,6 +227,22 @@ pub(crate) async fn read_ask(recv: &mut RecvStream) -> Result<Ask> {
 }
 
 pub(crate) async fn answer(mut send: SendStream, page: Page) -> Result<()> {
+    if page.records.len() > PAGE_RECORDS {
+        return Err(Error::SizeLimitExceeded("private Session page records"));
+    }
+    let mut size = PAGE_OVERHEAD;
+    for record in &page.records {
+        if record.len() > MAX_RECORD {
+            return Err(Error::SizeLimitExceeded("private Session record"));
+        }
+        size = size
+            .checked_add(record.len() + 5)
+            .ok_or(Error::SizeLimitExceeded("private Session page"))?;
+    }
+    if size > MAX_PAGE {
+        return Err(Error::SizeLimitExceeded("private Session page"));
+    }
+    let _charge = page.charge;
     let mut e = Encoder::new();
     e.array(5)
         .uint(1)
@@ -235,12 +258,15 @@ pub(crate) async fn answer(mut send: SendStream, page: Page) -> Result<()> {
         .map_err(|_| Error::Unreachable("private Session answer closed"))
 }
 
-pub(crate) async fn pull(conn: &VoxConnection, ask: Ask) -> Result<Page> {
+pub(crate) async fn pull(conn: &VoxConnection, ask: Ask, job: Job) -> Result<Page> {
+    let charge = job
+        .reserve(PAGE_ENVELOPE)
+        .ok_or(Error::StreamRefused("private Session transfer busy"))?;
     let (mut send, mut recv) = open_typed(conn, StreamKind::Session).await?;
     write_frame(&mut send, &ask.wire()).await?;
     send.finish()
         .map_err(|_| Error::Unreachable("private Session request closed"))?;
-    let bytes = read_frame(&mut recv, MAX_PAGE)
+    let bytes = read_frame(&mut recv, MAX_PAGE - 4)
         .await?
         .ok_or(Error::MalformedBundle("private Session answer missing"))?;
     let mut d = Decoder::new(&bytes);
@@ -277,5 +303,6 @@ pub(crate) async fn pull(conn: &VoxConnection, ask: Ask) -> Result<Page> {
         cursor,
         more,
         records,
+        charge,
     })
 }

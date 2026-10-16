@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::log::history::{ControlContext, Descriptor, LogScope, SignedHead, TreeBinding};
+use crate::node::store::Batch;
 
 /// Exact signed header and the length bound governing payload continuations.
 pub(crate) struct HistoryHeader {
@@ -30,7 +31,13 @@ pub(crate) enum HistoryPayload {
 
 impl ChannelState {
     pub(crate) fn uses_sparse_history(&self, store: &Store) -> Result<bool> {
-        Ok(self.history_read(store)?.sparse_enabled())
+        if self.poisoned {
+            return Err(self.save_failure());
+        }
+        Ok(self
+            .entries
+            .read(store, &self.sek, &self.channel_id)?
+            .sparse_enabled())
     }
 
     fn require_history_source_boundary(&self, entry: &Entry) -> Result<()> {
