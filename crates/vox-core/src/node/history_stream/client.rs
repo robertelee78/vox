@@ -42,6 +42,8 @@ pub(crate) struct Received {
     pub(crate) needs: Vec<Query>,
     pub(crate) verifiers: Vec<CursorBinding>,
     pub(crate) body_ready: Option<Digest32>,
+    pub(crate) inventory: Option<Inventory>,
+    pub(crate) heads: Vec<super::HeadHint>,
 }
 impl Received {
     fn pending(status: Status) -> Self {
@@ -51,6 +53,8 @@ impl Received {
             needs: Vec::new(),
             verifiers: Vec::new(),
             body_ready: None,
+            inventory: None,
+            heads: Vec::new(),
         }
     }
     fn need(&mut self, query: Query) -> Result<()> {
@@ -84,6 +88,13 @@ impl Receiver {
         }
     }
 
+    pub(super) async fn inventory(
+        &self,
+        job: &crate::node::history_budget::Job,
+    ) -> Result<Lookup<Vec<super::HeadHint>>> {
+        self.source.inventory(job).await
+    }
+
     /// The caller opens/handshakes the stream and owns its tracked cancellation fence.
     pub(super) async fn pull(
         &self,
@@ -112,6 +123,7 @@ impl Receiver {
                 credit.accept(&frame, incoming.wire_len())?;
                 match frame {
                     Frame::Meta { .. } => Action::Meta,
+                    Frame::Have(hints) => Action::Inventory(hints),
                     Frame::Chunk {
                         entry,
                         offset,
@@ -130,6 +142,21 @@ impl Receiver {
                 }
             };
             match action {
+                Action::Inventory(hints) => {
+                    let Some(charge) = io
+                        .job()
+                        .reserve(hints.capacity() * std::mem::size_of::<super::HeadHint>())
+                    else {
+                        io.abort(WireError::SessionBusy);
+                        result.status = Status::Busy;
+                        return Ok(result);
+                    };
+                    result.inventory = Some(Inventory {
+                        hints,
+                        _charge: charge,
+                    });
+                    drop(incoming);
+                }
                 Action::Meta => {
                     let generation = self.generation;
                     let selected = query.clone();
@@ -159,7 +186,15 @@ impl Receiver {
                             result.status = Status::Busy;
                             return Ok(result);
                         }
-                        Staged::Head { head, tail, .. } if *tail > 0 => {
+                        Staged::Head { head, tail, author } if *tail > 0 => {
+                            if result.heads.len() >= MAX_NEEDS {
+                                return Err(Error::SizeLimitExceeded("history head result bound"));
+                            }
+                            result.heads.push(super::HeadHint {
+                                author: *author,
+                                head: *head,
+                                size: *tail,
+                            });
                             result.need(Query::Header {
                                 head: *head,
                                 seq: *tail,
@@ -379,6 +414,7 @@ impl Receiver {
 }
 
 enum Action {
+    Inventory(Vec<super::HeadHint>),
     Meta,
     Chunk { entry: Digest32, next: u64 },
     Done(Status, Option<Continuation>),
@@ -838,7 +874,7 @@ fn complete_staged(
 
 /// Small scheduling state only. Bodies and context maps never survive a local-step return.
 #[derive(Clone, Copy)]
-pub(super) enum LocalStep {
+pub(crate) enum LocalStep {
     Verify(CursorBinding),
     Entry {
         request: RequestId,
@@ -854,7 +890,7 @@ pub(super) enum LocalStep {
     },
 }
 #[derive(Clone, Copy)]
-pub(super) enum EntryPhase {
+pub(crate) enum EntryPhase {
     Start,
     Preflight { parent: usize, next: usize },
     Body,
@@ -866,7 +902,7 @@ pub(super) enum EntryPhase {
     Refill,
     Effect(Option<crate::node::channel::HistoryEffectCursor>),
 }
-pub(super) enum LocalNeed {
+pub(crate) enum LocalNeed {
     /// Resume only through the existing operation's exact persisted body cursor.
     StagedBody,
     Wire(Query),
@@ -881,12 +917,14 @@ pub(super) enum LocalNeed {
     },
     Governance,
 }
-pub(super) struct LocalResult {
-    pub(super) next: Option<LocalStep>,
-    pub(super) need: Option<LocalNeed>,
+pub(crate) struct LocalResult {
+    pub(crate) next: Option<LocalStep>,
+    pub(crate) need: Option<LocalNeed>,
     /// Semantic dispatch completed; a header-only source need not have a visible body.
-    pub(super) published: Option<Digest32>,
-    pub(super) busy: bool,
+    pub(crate) published: Option<Digest32>,
+    pub(crate) rendered: bool,
+    pub(crate) governance: bool,
+    pub(crate) busy: bool,
 }
 impl LocalResult {
     fn next(step: LocalStep) -> Self {
@@ -894,6 +932,8 @@ impl LocalResult {
             next: Some(step),
             need: None,
             published: None,
+            rendered: false,
+            governance: false,
             busy: false,
         }
     }
@@ -902,6 +942,8 @@ impl LocalResult {
             next: None,
             need: None,
             published: None,
+            rendered: false,
+            governance: false,
             busy: false,
         }
     }
@@ -910,6 +952,8 @@ impl LocalResult {
             next: Some(step),
             need: Some(need),
             published: None,
+            rendered: false,
+            governance: false,
             busy: false,
         }
     }
@@ -918,6 +962,8 @@ impl LocalResult {
             next: Some(step),
             need: None,
             published: None,
+            rendered: false,
+            governance: false,
             busy: true,
         }
     }
@@ -926,7 +972,7 @@ impl LocalResult {
 impl Receiver {
     /// One local slice. The actor schedules its returned dependency explicitly; this function
     /// opens no stream, loops no verifier budget, and retains no full record on return.
-    pub(super) async fn local_step(
+    pub(crate) async fn local_step(
         &self,
         job: &crate::node::history_budget::Job,
         step: LocalStep,
@@ -1000,6 +1046,7 @@ impl Receiver {
                 .staged = Some((request, self.generation));
         }
         let hash = record.entry.entry_hash();
+        let record_author = record.entry.skeleton.author_id;
         let next = |phase| LocalStep::Entry {
             request,
             head,
@@ -1007,6 +1054,12 @@ impl Receiver {
             body,
             phase,
         };
+        let is_governance = record
+            .entry
+            .skeleton
+            .v2
+            .as_ref()
+            .is_some_and(|v2| v2.kind == crate::log::history::SignedEntryKind::Governance);
         let effect_result = |progress| -> LocalResult {
             match progress {
                 Effect::Progress => LocalResult::next(step),
@@ -1020,15 +1073,24 @@ impl Receiver {
                 ),
                 Effect::GovernancePending => LocalResult::wait(step, LocalNeed::Governance),
                 Effect::CheckpointPending {
-                    author: _,
+                    author,
                     seq,
                     hash: _,
-                } => LocalResult::wait(step, LocalNeed::Entry { head, seq }),
+                } => {
+                    // Existing Checkpoint payloads contain only seq/hash: their target is
+                    // necessarily in this entry's own author feed, covered by this head.
+                    if author != record_author {
+                        return LocalResult::busy(step);
+                    }
+                    LocalResult::wait(step, LocalNeed::Entry { head, seq })
+                }
                 Effect::Busy => LocalResult::busy(step),
-                Effect::Complete { .. } => LocalResult {
+                Effect::Complete { rendered } => LocalResult {
                     next: None,
                     need: None,
                     published: Some(hash),
+                    rendered,
+                    governance: is_governance,
                     busy: false,
                 },
             }
@@ -1056,7 +1118,21 @@ impl Receiver {
                         LocalResult::next(next(EntryPhase::Validate(binding)))
                     }
                     admission::EntryStart::Need(query) => {
-                        LocalResult::wait(step, LocalNeed::Wire(query))
+                        let resume = if matches!(query, Query::Entry { head: needed, seq: at, .. } if needed == head && at == seq)
+                        {
+                            // A mandatory typed-control body is now an explicit staged obligation;
+                            // the caller cannot fetch it and then retry header-only admission.
+                            LocalStep::Entry {
+                                request,
+                                head,
+                                seq,
+                                body: true,
+                                phase,
+                            }
+                        } else {
+                            step
+                        };
+                        LocalResult::wait(resume, LocalNeed::Wire(query))
                     }
                     admission::EntryStart::Busy => LocalResult::busy(step),
                 }
@@ -1396,4 +1472,10 @@ impl Receiver {
             Lookup::Found(_)
         ))
     }
+}
+
+/// Charged scalar hints only. They never advance a feed or authorize a body request.
+pub(crate) struct Inventory {
+    pub(crate) hints: Vec<super::HeadHint>,
+    _charge: crate::node::history_budget::BufferCharge,
 }

@@ -7,11 +7,16 @@
 mod admission;
 mod client;
 mod credit;
+mod driver;
+mod hints;
+pub(crate) mod runtime;
 mod server;
 mod source;
 mod transport;
 
-pub(crate) use client::Staging;
+pub(crate) use client::{EntryPhase, LocalNeed, LocalStep, Receiver, Staging};
+pub(crate) use driver::exchange;
+pub(crate) use hints::HintInbox;
 
 use super::history_budget::{BufferCharge, Job};
 use crate::cbor::{Decoder, Encoder};
@@ -88,11 +93,22 @@ pub(crate) async fn serve(
     recv: quinn::RecvStream,
     job: Job,
     fence: std::sync::Arc<crate::transport::stream_transport::Fence>,
-) -> Result<Status> {
+    inbox: std::sync::Arc<HintInbox>,
+) -> (Result<Status>, bool) {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     let source = source::Source::new(room, store, preamble.epoch, peer, fence.clone(), deadline);
     let mut io = transport::Transport::new(send, recv, job, fence, deadline);
-    let result = serve_request(&source, &mut io, preamble).await;
+    let generation = inbox.generation();
+    let mut inventory_added = false;
+    let result = serve_request(
+        &source,
+        &mut io,
+        preamble,
+        &inbox,
+        generation,
+        &mut inventory_added,
+    )
+    .await;
     if let Err(error) = &result {
         let code = match error {
             Error::SizeLimitExceeded(_) | Error::MalformedBundle(_) => {
@@ -102,13 +118,16 @@ pub(crate) async fn serve(
         };
         io.abort(code);
     }
-    result
+    (result, inventory_added)
 }
 
 async fn serve_request(
     source: &source::Source,
     io: &mut transport::Transport,
     preamble: Preamble,
+    inbox: &HintInbox,
+    inbox_generation: u64,
+    inventory_added: &mut bool,
 ) -> Result<Status> {
     let first = match io.read(MAX_FRAME_BYTES + 4).await? {
         transport::Read::Frame(frame) => frame,
@@ -155,7 +174,17 @@ async fn serve_request(
         _ => return Err(invalid("history expected bound WANT")),
     };
     drop(next);
-    server::answer(source, io, preamble, query, overhead).await
+    server::answer(
+        source,
+        io,
+        preamble,
+        query,
+        overhead,
+        inbox,
+        inbox_generation,
+        inventory_added,
+    )
+    .await
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -237,6 +266,8 @@ impl ProofKind {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Query {
+    /// One bounded inventory of scalar authenticated-head hints; no content request.
+    Inventory,
     Head(Digest32),
     Context(Digest32),
     /// A proof dependency's signed header, without requesting its content body.
@@ -267,7 +298,7 @@ pub enum Query {
 impl Query {
     pub fn validate(&self) -> Result<()> {
         match self {
-            Self::Head(_) | Self::Context(_) => {}
+            Self::Inventory | Self::Head(_) | Self::Context(_) => {}
             Self::Header { seq, .. } => position(*seq)?,
             Self::Proof { kind, from, to, .. } => {
                 if *from > *to
@@ -307,6 +338,9 @@ impl Query {
     fn encode(&self, e: &mut Encoder) -> Result<()> {
         self.validate()?;
         match self {
+            Self::Inventory => {
+                e.array(1).uint(6);
+            }
             Self::Head(author) => {
                 e.array(2).uint(0).bytes(author);
             }
@@ -354,6 +388,7 @@ impl Query {
     fn decode(d: &mut Decoder<'_>) -> Result<Self> {
         let len = d.array()?;
         let query = match (d.uint()?, len) {
+            (6, 1) => Self::Inventory,
             (0, 2) => Self::Head(digest(d)?),
             (1, 2) => Self::Context(digest(d)?),
             (5, 3) => Self::Header {

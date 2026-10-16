@@ -45,16 +45,18 @@ use crate::node::network::{Inbound, NodeNet};
 use crate::node::open_rooms::OpenRooms;
 use crate::node::paths::Paths;
 
+mod bounded_sync;
 mod computer;
 mod governance;
+mod history_demand;
 mod local_trust;
 mod recovery;
-mod history_demand;
 use crate::node::prekeys::{self, PrekeyRing};
 use crate::node::profile::Profile;
 use crate::node::status::PublishCause;
 use crate::pairwise::init_message::InitialMessage;
 use crate::transport::quic::VoxConnection;
+pub(crate) use history_demand::saved_status as saved_history_status;
 
 /// One key on its way to one member in a session of its own (ADR-030 D-1, D-4): the frame that
 /// carries it, kept so a re-carry resends exactly these bytes and opens no second session.
@@ -573,6 +575,8 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::NetworkChanged(_) => "acting on a change of the machine's network",
         NetEvent::Stranded { .. } => "dialling again peers a network change stranded",
         NetEvent::SyncDone { .. } => "filing a sync that finished",
+        NetEvent::BoundedRoomAdvanced { .. } => "publishing accepted current room work",
+        NetEvent::BoundedSyncProgress { .. } => "advancing bounded current/history work",
         NetEvent::BoundedSyncDone { .. } => "filing a bounded history response",
         NetEvent::PrivateSessionAsk { .. } => "authorizing private Session records",
         NetEvent::PrivateSessionDone { .. } => "filing private Session records",
@@ -1048,7 +1052,9 @@ enum NetEvent {
             std::result::Result<crate::node::channel::session_projection::FileReply, String>,
         >,
     },
-    HistoryDemandPrepared { token: u64 },
+    HistoryDemandPrepared {
+        token: u64,
+    },
     RoomHistory {
         channel_id: Digest32,
         query: crate::node::channel::history::Query,
@@ -1235,11 +1241,20 @@ enum NetEvent {
         report: crate::node::channel::SessionReport,
     },
     /// Completion of one response quantum; it grants no whole-log synchronization credit.
+    BoundedRoomAdvanced {
+        channel_id: Digest32,
+        rendered: bool,
+        governance: bool,
+    },
+    BoundedSyncProgress {
+        token: u64,
+    },
     BoundedSyncDone {
         channel_id: Digest32,
         peer: Digest32,
         token: crate::node::ports::Token,
         result: crate::error::Result<crate::node::history_stream::Status>,
+        inventory_added: bool,
     },
     /// A session's worker persisted entries (ADR-025 D1a): the room's generation moved, so its
     /// ports are evaluated — reported on its own, because a retired worker's result is ignored
@@ -4621,6 +4636,8 @@ struct RoomPublication {
 /// The node actor's state (owned by its task).
 pub struct Node {
     history_demand: history_demand::Controller,
+    bounded_sync: bounded_sync::Controller,
+    history_hints: Arc<crate::node::history_stream::HintInbox>,
     history_budget: Arc<crate::node::history_budget::Budget>,
     governance_work: governance::Maintenance,
     paths: Paths,
@@ -5380,6 +5397,8 @@ impl Node {
             };
         let node = Self {
             history_demand: history_demand::Controller::default(),
+            bounded_sync: bounded_sync::Controller::default(),
+            history_hints: crate::node::history_stream::HintInbox::new(),
             history_budget,
             paths,
             decisions,
@@ -6037,7 +6056,12 @@ impl Node {
             return Outcome::Failed(Fault::ComputerPolicy);
         }
         match command {
-            NodeCommand::HistoryDemand { channel_id, instance, action, reply } => {
+            NodeCommand::HistoryDemand {
+                channel_id,
+                instance,
+                action,
+                reply,
+            } => {
                 let _ = reply.send(self.begin_history_demand(channel_id, instance, action));
                 Outcome::Done
             }
@@ -9881,11 +9905,41 @@ impl Node {
                     self.pull_private_sessions(channel_id, peer).await;
                 }
             }
+            NetEvent::BoundedRoomAdvanced {
+                channel_id,
+                rendered,
+                governance,
+            } => {
+                if self.channels.contains_key(&channel_id) {
+                    self.install_key_packages(&channel_id).await;
+                    if governance {
+                        self.adopt_channel_anchors(&channel_id).await;
+                        self.refresh_network_view().await;
+                        self.refresh_reachers().await;
+                        self.publish_channel_to_anchors(&channel_id, PublishCause::Governance)
+                            .await;
+                    }
+                    self.say_session_news(&channel_id).await;
+                    self.sched_rooms.insert(channel_id);
+                    if rendered || governance {
+                        let _ = self.event_tx.send(NodeEvent::Synced {
+                            channel_id,
+                            applied: 1,
+                            rendered: u64::from(rendered),
+                        });
+                    }
+                }
+            }
+            NetEvent::BoundedSyncProgress { token } => {
+                let _ = token;
+                self.accept_bounded_sync();
+            }
             NetEvent::BoundedSyncDone {
                 channel_id,
                 peer,
                 token,
                 result,
+                inventory_added,
             } => {
                 let current = self
                     .ports
@@ -9908,8 +9962,16 @@ impl Node {
                         },
                     );
                 }
+                // A scalar wake schedules only already bounded new head hints. It does not
+                // authorize archive demand, and a retired inbound attempt cannot wake a room.
+                if current.is_some() && inventory_added {
+                    if let Some(port) = self.ports.get_mut(&(channel_id, peer)) {
+                        port.raise();
+                    }
+                    self.sched_rooms.insert(channel_id);
+                }
                 // A finite response neither consumes pending local requests nor follows the
-                // peer's continuation. In particular it never raises the legacy archive port.
+                // peer's continuation. Sparse scheduling never falls back to legacy archive.
             }
             NetEvent::SyncDone {
                 channel_id,
@@ -10124,7 +10186,12 @@ impl Node {
                 let _ = reply.send(result);
             }
             NetEvent::HistoryDemandPrepared { token } => {
-                if self.history_demand.preparing.as_ref().is_some_and(|p| p.token == token) {
+                if self
+                    .history_demand
+                    .preparing
+                    .as_ref()
+                    .is_some_and(|p| p.token == token)
+                {
                     self.accept_history_demand();
                 }
             }
@@ -13667,6 +13734,16 @@ impl Node {
 
     /// Retire a port's attempts and forget it (its room is gone or held again).
     fn drop_port(&mut self, channel_id: &Digest32, peer: &Digest32) {
+        if let Some((request, generation)) = self.bounded_sync.archive_for_port(*channel_id, *peer)
+        {
+            self.history_demand.failed(
+                request,
+                generation,
+                "History peer or room retired; resume explicitly when available.",
+            );
+        }
+        self.bounded_sync.retire_port(*channel_id, *peer);
+        self.history_hints.retire_peer(*channel_id, *peer);
         if let Some(mut port) = self.ports.remove(&(*channel_id, *peer)) {
             for a in port.take_attempts() {
                 a.retire();
@@ -13769,6 +13846,7 @@ impl Node {
     /// started.
     async fn schedule(&mut self) -> bool {
         self.accept_history_demand();
+        self.accept_bounded_sync();
         if self.net.is_none() {
             self.sched_rooms.clear();
             self.sched_all = false;
@@ -14074,6 +14152,16 @@ impl Node {
                 port.done_gen = port.gen.load(std::sync::atomic::Ordering::Relaxed);
             }
             return false;
+        }
+        let sparse = shared.lock().await.uses_sparse_history(&store);
+        match sparse {
+            Ok(true) => {
+                return self
+                    .start_bounded_outbound(channel_id, peer, shared, store, conn)
+                    .await
+            }
+            Err(_) => return false,
+            Ok(false) => {}
         }
         let target = SessionTarget::Channel(shared);
         let wake = self.net_tx.clone();
@@ -14896,9 +14984,10 @@ impl Node {
             },
         );
         let tx = self.net_tx.clone();
+        let inbox = Arc::clone(&self.history_hints);
         let task = tokio::spawn(async move {
-            let result = crate::node::history_stream::serve(
-                shared, store, peer, preamble, send, recv, job, fence,
+            let (result, inventory_added) = crate::node::history_stream::serve(
+                shared, store, peer, preamble, send, recv, job, fence, inbox,
             )
             .await;
             let _ = tx
@@ -14907,6 +14996,7 @@ impl Node {
                     peer,
                     token,
                     result,
+                    inventory_added,
                 })
                 .await;
         });
@@ -16757,6 +16847,9 @@ impl Node {
     /// up to one Argon2id derivation, it would answer nobody meanwhile (V210-71). Until then the
     /// node is *locking* ([`NodeView::locking`]). The returned receiver fires once it has settled.
     async fn lock_all(&mut self) -> oneshot::Receiver<()> {
+        let mut bounded_sync = std::mem::take(&mut self.bounded_sync);
+        bounded_sync.fence();
+        self.history_hints.clear();
         let mut history_demand = std::mem::take(&mut self.history_demand);
         history_demand.fence();
         self.cancel_room_validations(None, Fault::Locked);
@@ -16890,6 +16983,7 @@ impl Node {
         tokio::spawn(async move {
             let mut aborted = aborted;
             history_demand.retire().await;
+            bounded_sync.retire().await;
             if let Some(task) = reopening {
                 let _ = task.await;
             }
@@ -17664,6 +17758,7 @@ impl Node {
 
     async fn close_channel(&mut self, channel_id: &Digest32) -> Outcome {
         self.history_demand.retire_room(*channel_id);
+        self.history_hints.retire_room(*channel_id);
         // Closed on purpose, so not reopened at the next unlock (#208). Forgotten first: a room
         // that stayed in the set would come back by itself, which is not what closing it meant.
         // A room still reopening is closed too: it leaves `reopening`, so its state is dropped
@@ -17726,6 +17821,7 @@ impl Node {
     /// first would take the only copy of the departure with it.
     async fn begin_leave(&mut self, channel_id: Digest32, reply: oneshot::Sender<Outcome>) {
         self.history_demand.retire_room(channel_id);
+        self.history_hints.retire_room(channel_id);
         let Some(shared) = self.channels.get(&channel_id).map(Arc::clone) else {
             let held = self
                 .profile
@@ -18140,6 +18236,7 @@ impl Node {
     /// (V210-164) or ended (the decider, 2026-10-03) goes this way.
     async fn purge_room(&mut self, channel_id: &Digest32) -> Outcome {
         self.history_demand.retire_room(*channel_id);
+        self.history_hints.retire_room(*channel_id);
         if self
             .session_rooms_retiring
             .iter()

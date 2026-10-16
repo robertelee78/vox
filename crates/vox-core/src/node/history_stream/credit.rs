@@ -15,6 +15,7 @@ pub(super) struct Response {
     headers_left: usize,
     body: Option<BodyCredit>,
     done: bool,
+    inventory_seen: bool,
 }
 
 struct BodyCredit {
@@ -44,6 +45,7 @@ impl Response {
             headers_left,
             body: None,
             done: false,
+            inventory_seen: false,
         })
     }
 
@@ -138,6 +140,9 @@ impl Response {
             return Err(Error::SizeLimitExceeded("history response quantum"));
         }
         match frame {
+            Frame::Have(_) if matches!(self.query, Query::Inventory) && !self.inventory_seen => {
+                self.inventory_seen = true;
+            }
             Frame::Meta { request, object } if *request == self.request => {
                 if self
                     .body
@@ -182,6 +187,12 @@ impl Response {
                 status,
                 continuation,
             } if *request == self.request => {
+                if *status == Status::Complete
+                    && matches!(self.query, Query::Inventory)
+                    && !self.inventory_seen
+                {
+                    return Err(invalid("inventory completed without HAVE"));
+                }
                 if self
                     .body
                     .as_ref()
