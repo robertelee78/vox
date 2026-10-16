@@ -93,6 +93,8 @@ pub enum SegmentKind {
     SessionIngress,
     /// Sealed current attention obligations and exact recipient receipts.
     SessionAttention,
+    /// One explicit node-wide archive demand and its bounded provisional body pages.
+    HistoryDemand,
 }
 
 impl SegmentKind {
@@ -113,6 +115,7 @@ impl SegmentKind {
             SegmentKind::GovernanceIndex => b"vox/seg/governance-index/v1",
             SegmentKind::SessionIngress => b"vox/seg/session-ingress/v1",
             SegmentKind::SessionAttention => b"vox/seg/session-attention/v1",
+            SegmentKind::HistoryDemand => b"vox/seg/history-demand/v1",
         }
     }
 }
