@@ -955,7 +955,11 @@ impl ChannelState {
             self.gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let rendered = !rows.is_empty();
             self.place_committed(store, rows, &expired)?;
-            Ok(HistoryEffectProgress::Complete { rendered })
+            Ok(if settled {
+                HistoryEffectProgress::Complete { rendered }
+            } else {
+                HistoryEffectProgress::Progress
+            })
         })();
         if let Err(error) = &applied {
             self.poison(error);

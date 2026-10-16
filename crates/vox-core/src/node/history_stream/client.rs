@@ -1143,6 +1143,7 @@ impl Receiver {
                     | EntryPhase::Begin(_)
                     | EntryPhase::Commit(_)
                     | EntryPhase::Refill
+                    | EntryPhase::Effect(_)
             );
         let assembly = if full {
             self.assemble(job).await?
@@ -1387,7 +1388,8 @@ impl Receiver {
                     return Ok(LocalResult::busy(step));
                 };
                 match value.value.1 {
-                    Effect::Complete { .. } => LocalResult::next(next(EntryPhase::Effect(None))),
+                    complete @ Effect::Complete { .. } => effect_result(complete),
+                    Effect::Progress => LocalResult::next(next(EntryPhase::Effect(None))),
                     other => effect_result(other),
                 }
             }
