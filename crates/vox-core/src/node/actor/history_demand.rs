@@ -791,6 +791,15 @@ fn select(
     let count = candidates.len();
     let mut next = page_after;
     for (position, (head, author, hi)) in candidates.into_iter().enumerate() {
+        // Never skip an author's unchecked suffix when the aggregate slice is nearly spent.
+        // The next explicit request starts that author with its full bounded window.
+        if examined != 0 && hi.min(64) as usize > 64 - examined {
+            return Ok(Selection {
+                found: None,
+                after: next,
+                more: true,
+            });
+        }
         next = if position + 1 < count || page_after.is_some() {
             Some(author)
         } else {
