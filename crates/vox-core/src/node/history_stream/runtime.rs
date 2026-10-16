@@ -373,10 +373,18 @@ impl Flow {
             .iter()
             .any(|task| matches!(task.operation, Operation::Reclaim(Purpose::Control)));
         let cleanup_job = self.cleanup_job.clone();
-        if reclaim_live && !self.reclaim_stage(Purpose::Live, &cleanup_job).await? {
+        if reclaim_live
+            && !self
+                .reclaim_stage(Purpose::Live, &cleanup_job, true)
+                .await?
+        {
             return Ok(false);
         }
-        if reclaim_control && !self.reclaim_stage(Purpose::Control, &cleanup_job).await? {
+        if reclaim_control
+            && !self
+                .reclaim_stage(Purpose::Control, &cleanup_job, true)
+                .await?
+        {
             return Ok(false);
         }
         // No worker owns this Flow while it is retiring. Retain its already-fenced local
@@ -896,7 +904,7 @@ impl Flow {
                 }
             }
             Operation::Reclaim(purpose) => {
-                if !self.reclaim_stage(purpose, job).await? {
+                if !self.reclaim_stage(purpose, job, false).await? {
                     self.push(task)?;
                 } else if self.archive && self.tasks.is_empty() {
                     self.finish_archive(job).await?;
@@ -1005,7 +1013,7 @@ impl Flow {
         };
         Ok(true)
     }
-    async fn reclaim_stage(&mut self, purpose: Purpose, job: &Job) -> Result<bool> {
+    async fn reclaim_stage(&mut self, purpose: Purpose, job: &Job, retiring: bool) -> Result<bool> {
         let Some(staging) = self.stage(purpose) else {
             return Ok(true);
         };
@@ -1015,10 +1023,16 @@ impl Flow {
                 .active
                 .lock()
                 .map_err(|_| Error::Profile("history activation lock failed"))?;
+            if retiring {
+                // The entry/effect is already admitted. End only this exact current staging
+                // request, without consulting a peer grant that may have changed during
+                // departure; cancel creates no network or archive authority.
+                demand::cancel(&staging.context, active.request(), &job)?;
+            }
             if !demand::reclaim(&staging.context, active.request(), &job)? {
                 return Ok(false);
             }
-            if purpose != Purpose::History {
+            if !retiring && purpose != Purpose::History {
                 demand::checkpoint(
                     &staging.context,
                     &mut active,
