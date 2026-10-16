@@ -21,7 +21,6 @@ impl ChannelState {
             || !self
                 .admission
                 .is_admitted(&self.channel_id, self.epoch, &sk.author_id)
-            || self.dag.is_frozen(&sk.author_id)
         {
             return Err(Error::StreamRefused(
                 "legacy tip room, epoch or author differs",
@@ -32,6 +31,18 @@ impl ChannelState {
             .get(&sk.author_id)
             .ok_or(Error::StreamRefused("legacy tip author unknown"))?;
         tip.verify(key)?;
+        // An unsigned attached suffix is never evidence of an accepted end. The writer
+        // checks the sealed accepted restart feed; these are the DAG's actual refusals.
+        if self
+            .dag
+            .refused_from(&sk.author_id)
+            .is_some_and(|from| sk.seq >= from)
+            || (self.dag.is_frozen(&sk.author_id) && sk.seq > self.dag.verified_head(&sk.author_id))
+        {
+            return Err(Error::StreamRefused(
+                "legacy tip extends refused or frozen feed",
+            ));
+        }
         let required = LegacyRequired {
             author: sk.author_id,
             through: sk.seq,
@@ -86,7 +97,8 @@ impl ChannelState {
             .legacy_required_page(after, limit))
     }
     /// Background maintenance only advances a previously identified orphan, never a paused
-    /// owner's publication. The caller schedules another turn if CleanupPending remains.
+    /// owner's publication. Schedule another bounded local turn for CleanupPending or
+    /// ReadyWithCleanup; the latter permits current staging/reads immediately.
     pub(crate) fn cleanup_legacy_orphan(&self, store: &Store) -> Result<entry_store::Preparation> {
         if self.poisoned {
             return Err(self.save_failure());
@@ -131,6 +143,8 @@ impl ChannelState {
     pub(crate) fn detach_legacy_provisional(&self, owner: LegacyProvisionalOwner) -> Result<()> {
         self.entries.detach_legacy_provisional(owner)
     }
+    /// True means the exact owner no longer occupies current staging. Retired ciphertext
+    /// can remain; call cleanup_legacy_orphan in later local maintenance turns to reclaim it.
     pub(crate) fn cleanup_legacy_provisional(
         &self,
         store: &Store,

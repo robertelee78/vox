@@ -273,6 +273,8 @@ impl LegacyProvisionalState {
 struct Directory {
     active: Roots,
     provisional: Roots,
+    // One detached garbage root, never visible through ordinary entry lookups.
+    retired_provisional: Roots,
     legacy_provisional: Option<LegacyProvisionalState>,
     legacy_required: BTreeMap<Digest32, LegacyRequired>,
     // Process-local attachment is deliberately absent from the sealed encoding.
@@ -305,6 +307,7 @@ impl Default for Directory {
         Self {
             active: Roots::default(),
             provisional: Roots::default(),
+            retired_provisional: Roots::default(),
             legacy_provisional: None,
             legacy_required: BTreeMap::new(),
             provisional_attached: false,
@@ -345,7 +348,7 @@ impl Directory {
     }
     fn bytes(&self) -> Zeroizing<Vec<u8>> {
         let mut e = Encoder::new();
-        e.array(25).uint(12);
+        e.array(26).uint(13);
         self.active.write(&mut e);
         self.provisional.write(&mut e);
         e.uint(self.next_page)
@@ -469,6 +472,7 @@ impl Directory {
                 .uint(tip.through)
                 .bytes(&tip.hash);
         }
+        self.retired_provisional.write(&mut e);
         Zeroizing::new(e.finish())
     }
     fn parse(bytes: &[u8]) -> Result<Self> {
@@ -483,7 +487,7 @@ impl Directory {
         // cannot be treated as empty without silently losing accepted work.
         if !matches!(
             (arity, version),
-            (19, 8) | (23, 9) | (23, 10) | (24, 11) | (25, 12)
+            (19, 8) | (23, 9) | (23, 10) | (24, 11) | (25, 12) | (26, 13)
         ) {
             return Err(invalid("entry directory format"));
         }
@@ -692,6 +696,30 @@ impl Directory {
                 previous = Some(author);
             }
         }
+        let retired_provisional = if version >= 13 {
+            Roots::read(&mut d)?
+        } else {
+            Roots::default()
+        };
+        // Retired roots can contain only the exact two provisional locator indexes. They
+        // are disjoint from the current roots and cannot hide any accepted-history tree.
+        if retired_provisional
+            != (Roots {
+                sequence: retired_provisional.sequence,
+                hash: retired_provisional.hash,
+                ..Roots::default()
+            })
+            || (retired_provisional.sequence == 0) != (retired_provisional.hash == 0)
+            || (retired_provisional.sequence != 0
+                && (retired_provisional.sequence == provisional.sequence
+                    || retired_provisional.sequence == active.sequence))
+            || (retired_provisional.hash != 0
+                && (retired_provisional.hash == provisional.hash
+                    || retired_provisional.hash == active.hash))
+            || (phase == Phase::Rebuilding && retired_provisional != Roots::default())
+        {
+            return Err(invalid("retired provisional roots differ"));
+        }
         d.finish()?;
         if let Some(state) = legacy_provisional {
             if state.owner.instance != history_instance
@@ -730,6 +758,8 @@ impl Directory {
                 active.key_latest,
                 provisional.sequence,
                 provisional.hash,
+                retired_provisional.sequence,
+                retired_provisional.hash,
                 provisional.read_receipts,
                 provisional.read_pairs,
                 provisional.missing_positions,
@@ -787,6 +817,7 @@ impl Directory {
         Ok(Self {
             active,
             provisional,
+            retired_provisional,
             legacy_provisional,
             legacy_required,
             provisional_attached: false,
@@ -2170,7 +2201,12 @@ impl Write<'_, '_> {
                 }
             }
             if let Some(required) = self.directory.legacy_required.get(&p.author).copied() {
-                if accepted.seq >= required.through
+                if accepted.ended && accepted.seq < required.through {
+                    tracing::warn!(author = ?p.author, accepted_end = accepted.seq,
+                        refused_tip = required.through,
+                        "discarding legacy history requirement beyond accepted end of feed");
+                    self.directory.legacy_required.remove(&p.author);
+                } else if accepted.seq >= required.through
                     && Source::Batch(self.batch)
                         .find(self.sek, self.channel, p.work.hash, &hashed(&required.hash))?
                         .is_some_and(|at| {
@@ -2278,6 +2314,9 @@ impl Write<'_, '_> {
 #[must_use = "unfinished cleanup must be scheduled as bounded maintenance, never looped at startup"]
 pub(crate) enum Preparation {
     Ready,
+    /// Current reads/staging are usable; one detached retired root still needs maintenance.
+    ReadyWithCleanup,
+    /// Current unpublished roots are still awaiting one bounded cleanup/quarantine step.
     CleanupPending,
 }
 
@@ -2484,7 +2523,12 @@ impl EntryIndex {
             self.committed();
         }
         self.provisional_hidden.set(false);
-        Ok(Preparation::Ready)
+        let read = self.read(store, sek, channel)?;
+        Ok(if read.directory.retired_provisional == Roots::default() {
+            Preparation::Ready
+        } else {
+            Preparation::ReadyWithCleanup
+        })
     }
 
     /// One orphan cleanup quantum. A preserved paused owner is never eligible for this path.
@@ -2494,32 +2538,44 @@ impl EntryIndex {
         sek: &Sek,
         channel: &Digest32,
     ) -> Result<Preparation> {
-        if !self.provisional_hidden.get() {
-            return Ok(Preparation::Ready);
-        }
+        let hidden = self.provisional_hidden.get();
         let mut batch = store.batch()?;
         let mut writer = self.write(&mut batch, sek, channel)?;
-        let (done, changed) = if matches!(writer.directory.phase, Phase::Building | Phase::Switched)
-        {
-            let done = writer.cleanup_chunk()?;
-            let empty = writer.directory.provisional == Roots::default();
-            if done && empty {
-                writer.directory.legacy_provisional = None;
+        let (current_ready, changed) = if hidden {
+            match writer.directory.phase {
+                Phase::Building | Phase::Switched => {
+                    let cleaned = writer.cleanup_chunk()?;
+                    let empty = writer.directory.provisional == Roots::default();
+                    if cleaned && empty {
+                        writer.directory.legacy_provisional = None;
+                    }
+                    // Never add an unbounded second phase to this publication quantum.
+                    (cleaned && empty, true)
+                }
+                Phase::Idle => writer.quarantine_provisional()?,
+                Phase::Rebuilding => return Err(invalid("orphan cleanup during index rebuild")),
             }
-            (done && empty, true)
         } else if writer.directory.phase == Phase::Idle {
-            writer.discard_provisional_chunk()?
+            // A live or paused current owner is unrelated to these retired locators.
+            let (_, changed) = writer.reclaim_retired_provisional()?;
+            (true, changed)
         } else {
-            return Err(invalid("orphan cleanup during index rebuild"));
+            // Page allocation/retirement belongs to the current publication until Idle.
+            (true, false)
         };
+        let retired = writer.directory.retired_provisional != Roots::default();
         if changed {
             writer.seal()?;
             batch.commit()?;
             self.committed();
         }
-        if done {
+        if current_ready {
             self.provisional_hidden.set(false);
-            Ok(Preparation::Ready)
+            Ok(if retired {
+                Preparation::ReadyWithCleanup
+            } else {
+                Preparation::Ready
+            })
         } else {
             Ok(Preparation::CleanupPending)
         }
@@ -2527,21 +2583,49 @@ impl EntryIndex {
 }
 
 impl Write<'_, '_> {
-    /// Delete only locator references and ciphertext; no body decode or archive scan.
-    fn discard_provisional_chunk(&mut self) -> Result<(bool, bool)> {
+    /// Detach one Idle orphan in constant work. An occupied retirement slot gets only one
+    /// bounded reclaim slice; the caller returns and schedules another local turn.
+    fn quarantine_provisional(&mut self) -> Result<(bool, bool)> {
+        if self.directory.phase != Phase::Idle {
+            return Err(invalid("provisional quarantine requires idle publication"));
+        }
+        if self.directory.provisional == Roots::default() {
+            let changed = self.directory.legacy_provisional.take().is_some();
+            return Ok((true, changed));
+        }
+        if self.directory.retired_provisional != Roots::default() {
+            let (_, changed) = self.reclaim_retired_provisional()?;
+            return Ok((false, changed));
+        }
+        self.directory.retired_provisional = self.directory.provisional;
+        self.directory.provisional = Roots::default();
+        self.directory.legacy_provisional = None;
+        Ok((true, true))
+    }
+
+    /// Delete at most sixteen exact retired locator pairs and their ciphertext. Never
+    /// consult current roots: an identical hash/position may now be staged under a new id.
+    fn reclaim_retired_provisional(&mut self) -> Result<(bool, bool)> {
+        if self.directory.phase != Phase::Idle {
+            return Err(invalid(
+                "retired provisional cleanup requires idle publication",
+            ));
+        }
         let mut changed = false;
         for _ in 0..16 {
-            let roots = self.directory.provisional;
+            let roots = self.directory.retired_provisional;
             let Some((key, value)) =
                 Source::Batch(self.batch).first(self.sek, self.channel, roots.hash, &[0; 64], 0)?
             else {
                 if roots.sequence != 0 {
-                    return Err(invalid("provisional locator roots disagree"));
+                    return Err(invalid("retired provisional locator roots disagree"));
                 }
-                changed |= self.directory.legacy_provisional.take().is_some();
                 return Ok((true, changed));
             };
             let at = value.locator()?;
+            if at.log == 0 || at.log >= self.directory.next_provisional {
+                return Err(invalid("retired provisional log bounds"));
+            }
             let sequence_key = position(&at.author, at.seq);
             if Source::Batch(self.batch).find(
                 self.sek,
@@ -2550,20 +2634,20 @@ impl Write<'_, '_> {
                 &sequence_key,
             )? != Some(at)
             {
-                return Err(invalid("provisional cleanup locator differs"));
+                return Err(invalid("retired provisional cleanup locator differs"));
             }
-            self.directory.provisional.hash = self.change(roots.hash, key, None)?;
-            self.directory.provisional.sequence =
+            self.directory.retired_provisional.hash = self.change(roots.hash, key, None)?;
+            self.directory.retired_provisional.sequence =
                 self.change(roots.sequence, sequence_key, None)?;
             self.batch
                 .delete_segment(self.channel, SegmentKind::ProvisionalLog, at.log)?;
             changed = true;
         }
-        let done = self.directory.provisional.hash == 0;
-        if done {
-            self.directory.legacy_provisional = None;
+        let roots = self.directory.retired_provisional;
+        if (roots.hash == 0) != (roots.sequence == 0) {
+            return Err(invalid("retired provisional locator roots disagree"));
         }
-        Ok((done, changed))
+        Ok((roots == Roots::default(), changed))
     }
 }
 
@@ -2603,6 +2687,31 @@ impl Read<'_> {
 }
 
 impl Write<'_, '_> {
+    /// Resolve an impossible requirement in the same Batch that persists its refusal.
+    /// This releases a blocker only; it never claims the advertised tip was accepted.
+    pub(crate) fn resolve_legacy_required_invalid(
+        &mut self,
+        author: &Digest32,
+        refused_from: u64,
+    ) -> bool {
+        if self
+            .directory
+            .legacy_required
+            .get(author)
+            .is_some_and(|tip| tip.through >= refused_from)
+        {
+            tracing::warn!(
+                ?author,
+                refused_from,
+                "discarding legacy history requirement in refused feed suffix"
+            );
+            self.directory.legacy_required.remove(author);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Caller verified the retained current-author signature and exact room/epoch. This
     /// setter cannot accept history; a conflict retains the earlier obligation unchanged.
     pub(crate) fn note_legacy_required(&mut self, tip: LegacyRequired) -> Result<bool> {
@@ -2611,6 +2720,16 @@ impl Write<'_, '_> {
             || tip.through > crate::log::feed::MAX_SEQ
         {
             return Err(invalid("legacy required tip bounds"));
+        }
+        let accepted = self
+            .directory
+            .restart
+            .as_ref()
+            .and_then(|r| r.feeds.get(&tip.author));
+        if accepted.is_some_and(|f| f.ended && f.seq < tip.through) {
+            return Err(Error::StreamRefused(
+                "legacy tip extends accepted end of feed",
+            ));
         }
         if let Some(old) = self.directory.legacy_required.get(&tip.author) {
             if old.through > tip.through {
@@ -2625,11 +2744,6 @@ impl Write<'_, '_> {
                 return Ok(false);
             }
         }
-        let accepted = self
-            .directory
-            .restart
-            .as_ref()
-            .and_then(|r| r.feeds.get(&tip.author));
         if accepted.is_some_and(|f| f.seq >= tip.through) {
             if Source::Batch(self.batch)
                 .find(
@@ -2879,7 +2993,7 @@ impl EntryIndex {
             }
             (done, true)
         } else if writer.directory.phase == Phase::Idle {
-            writer.discard_provisional_chunk()?
+            writer.quarantine_provisional()?
         } else {
             return Err(invalid("legacy cleanup during rebuild"));
         };
@@ -2887,6 +3001,9 @@ impl EntryIndex {
             writer.seal()?;
             batch.commit()?;
             self.committed();
+        }
+        if done {
+            self.provisional_hidden.set(false);
         }
         Ok(done)
     }
