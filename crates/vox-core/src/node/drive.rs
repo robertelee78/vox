@@ -324,6 +324,15 @@ impl DriveState {
     /// the buffer zeroizes on drop.
     #[must_use]
     pub fn to_state(&self) -> Zeroizing<Vec<u8>> {
+        self.state_with_receiver(None)
+    }
+
+    /// Serialize a candidate ratchet in the same transaction as its private record, without
+    /// publishing that receiver in memory before the transaction commits.
+    pub(crate) fn state_with_receiver(
+        &self,
+        replacement: Option<((Digest32, u64), &ReceiverChain)>,
+    ) -> Zeroizing<Vec<u8>> {
         let mut e = Encoder::for_secrets();
         e.array(6).uint(DRIVE_VERSION);
         match &self.chain {
@@ -335,8 +344,11 @@ impl DriveState {
             None => e.bytes(&[]),
         };
         e.array(self.receivers.len());
-        for r in self.receivers.values() {
-            e.bytes(&r.to_state());
+        for (slot, r) in &self.receivers {
+            let receiver = replacement
+                .filter(|(selected, _)| selected == slot)
+                .map_or(r, |(_, candidate)| candidate);
+            e.bytes(&receiver.to_state());
         }
         e.array(self.delivered.len());
         for (m, g) in &self.delivered {

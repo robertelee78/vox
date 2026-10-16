@@ -476,8 +476,10 @@ impl Node {
                 let bounds = dispatch.bounds;
                 let plan = dispatch.plan.clone();
                 let check = PrivateGuard { node, room: dispatch.room, instance: dispatch.instance, generation, context: dispatch.staging.context.clone(), fence: dispatch.fence.clone(), deadline };
-                let ask = private_room(shared.clone(), store.clone(), job.clone(), check.clone(), move |room, store| {
-                    room.private_history_ask(store, bounds, &plan).map_err(|e| e.to_string())
+                let (ask, trust_nonce) = private_room(shared.clone(), store.clone(), job.clone(), check.clone(), move |room, store| {
+                    let nonce = store.get_meta_prefix::<{ crate::atrest::sek::NONCE_LEN }>(crate::node::trust::TRUST_META_KEY).map_err(|e| e.to_string())?;
+                    let ask = room.private_history_ask(store, bounds, &plan).map_err(|e| e.to_string())?;
+                    Ok((ask, nonce))
                 }).await?;
                 let page = tokio::select! {
                     biased;
@@ -490,7 +492,7 @@ impl Node {
                 let checkpoint_job = job.clone();
                 private_room(shared, store, job, check, move |room, store| {
                     let mut next = expected.clone();
-                    room.finish_private_history(store, bounds, &mut next, page, now).map_err(|e| e.to_string())?;
+                    room.finish_private_history(store, bounds, &mut next, page, now, trust_nonce).map_err(|e| e.to_string())?;
                     let remaining = next.positions.len();
                     let progress = if next.inventory_done && remaining == 0 { demand::Progress::Complete } else { demand::Progress::More };
                     let mut active = active.lock().map_err(|_| "Private recovery state poisoned.")?;
@@ -520,20 +522,17 @@ impl Node {
 
     /// Metadata-only event; a single private result slot owns any not-yet-dispatched context.
     pub(super) fn accept_history_demand(&mut self) -> bool {
-        if let Some(work) = &self.history_demand.private_work {
-            if let Ok(mut result) = work.result.try_lock() {
-                if let Some(answer) = result.take() {
-                    let request = work.request;
-                    let generation = work.generation;
-                    drop(result);
-                    self.history_demand.private_work = None;
-                    match answer {
-                        Ok(status) => self.history_demand.completed(request, generation, status),
-                        Err(reason) => self.history_demand.failed(request, generation, &reason),
-                    }
-                    return true;
-                }
+        let completed = self.history_demand.private_work.as_ref().and_then(|work| {
+            let answer = work.result.try_lock().ok()?.take()?;
+            Some((work.request, work.generation, answer))
+        });
+        if let Some((request, generation, answer)) = completed {
+            self.history_demand.private_work = None;
+            match answer {
+                Ok(status) => self.history_demand.completed(request, generation, status),
+                Err(reason) => self.history_demand.failed(request, generation, &reason),
             }
+            return true;
         }
         let Some(preparation) = self.history_demand.preparing.as_ref() else {
             return false;
@@ -711,7 +710,7 @@ async fn private_room<T: Send + 'static>(
 #[derive(Clone)]
 pub(super) struct CurrentPrivateGuard {
     lease: Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
-    nonce: Option<[u8; crate::atrest::sek::NONCE_LEN]>,
+    pub(super) nonce: Option<[u8; crate::atrest::sek::NONCE_LEN]>,
     deadline: tokio::time::Instant,
 }
 impl Node {
@@ -761,7 +760,17 @@ pub(super) async fn current_private_room<T: Send + 'static>(
                 "private authority changed or request expired",
             ));
         }
-        work(&mut room, &store)
+        let result = work(&mut room, &store)?;
+        if tokio::time::Instant::now() >= guard.deadline
+            || store.get_meta_prefix::<{ crate::atrest::sek::NONCE_LEN }>(
+                crate::node::trust::TRUST_META_KEY,
+            )? != guard.nonce
+        {
+            return Err(Error::StreamRefused(
+                "private authority changed or request expired",
+            ));
+        }
+        Ok(result)
     })
     .await
     .map_err(|_| Error::StreamRefused("private disk worker stopped"))?

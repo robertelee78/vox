@@ -15,6 +15,8 @@ const SEG_LEGACY_DRIVE_GENERATIONS: u64 = 19;
 const SEG_PRIVATE_PULLS: u64 = 23;
 const WORK_ROWS: usize = 32;
 const WORK_BYTES: usize = 1024 * 1024;
+const TRUST_CHANGED: &str = "private trust incarnation changed";
+type TrustNonce = Option<[u8; crate::atrest::sek::NONCE_LEN]>;
 
 /// Callers only signal that committed public steps need inspection. The actual work is a
 /// disk cursor, not one resident hash for every historical step.
@@ -929,7 +931,8 @@ impl ChannelState {
                     saved.record.message.header.chain_id,
                 ))
             {
-                if let Err(error) = self.take_private_record(store, &saved.record.wire(), now) {
+                if let Err(error) = self.take_private_record(store, &saved.record.wire(), now, None)
+                {
                     // A policy replay is not a verdict on the saved wire. Keep both the
                     // record and the last completed cursor so the same row can be retried.
                     if super::governance::refreshing(&error) || floor_index::refreshing(&error) {
@@ -1374,6 +1377,17 @@ impl ChannelState {
         saved: Stored,
         completion: Option<&crate::node::session_ingress::Completion>,
     ) -> Result<Digest32> {
+        self.keep_private_candidate(store, saved, completion, None, None)
+    }
+
+    fn keep_private_candidate(
+        &mut self,
+        store: &Store,
+        saved: Stored,
+        completion: Option<&crate::node::session_ingress::Completion>,
+        candidate: Option<((Digest32, u64), &ReceiverChain)>,
+        authority: Option<TrustNonce>,
+    ) -> Result<Digest32> {
         let hash = saved.record.hash();
         let id = self
             .private_id(store, &hash)?
@@ -1386,6 +1400,14 @@ impl ChannelState {
         let result = (|| {
             let segment = seal_segment(&self.sek, SegmentKind::PrivateSession, id, &saved.bytes())?;
             let mut batch = store.batch()?;
+            if let Some(expected) = authority {
+                if batch.get_meta_prefix::<{ crate::atrest::sek::NONCE_LEN }>(
+                    crate::node::trust::TRUST_META_KEY,
+                )? != expected
+                {
+                    return Err(Error::StreamRefused(TRUST_CHANGED));
+                }
+            }
             if let Some(old) =
                 batch.get_segment(&self.channel_id, SegmentKind::PrivateSession, id)?
             {
@@ -1393,7 +1415,18 @@ impl ChannelState {
                 private_index::remove(&mut batch, &self.sek, &self.channel_id, id, &old)?;
             }
             batch.put_segment(&self.channel_id, SegmentKind::PrivateSession, id, &segment)?;
-            self.queue_drive(&mut batch)?;
+            let drive = seal_segment(
+                &self.sek,
+                SegmentKind::KeyMaterial,
+                SEG_DRIVE,
+                &self.drive.state_with_receiver(candidate),
+            )?;
+            batch.put_segment(
+                &self.channel_id,
+                SegmentKind::KeyMaterial,
+                SEG_DRIVE,
+                &drive,
+            )?;
             private_index::put(&mut batch, &self.sek, &self.channel_id, id, &saved)?;
             if let Some(completion) = completion {
                 completion.queue(&mut batch)?;
@@ -1401,7 +1434,9 @@ impl ChannelState {
             batch.commit()
         })();
         if let Err(e) = result {
-            self.private_save_failed(&e);
+            if !matches!(&e, Error::StreamRefused(reason) if *reason == TRUST_CHANGED) {
+                self.private_save_failed(&e);
+            }
             return Err(e);
         }
         if let Some(row) = &saved.row {
@@ -2084,6 +2119,7 @@ impl ChannelState {
         peer: Digest32,
         page: Result<Page>,
         now: u64,
+        trust_nonce: TrustNonce,
     ) -> Result<bool> {
         self.private_sessions.pulling.remove(&peer);
         let page = page?;
@@ -2169,7 +2205,7 @@ impl ChannelState {
                     ));
                 }
             }
-            self.take_private_record(store, wire, now)?;
+            self.take_private_record(store, wire, now, Some(trust_nonce))?;
         }
         if self.private_sessions.cursors.get(&peer) != Some(&page.cursor) {
             self.private_sessions.cursors.insert(peer, page.cursor);
@@ -2306,6 +2342,7 @@ impl ChannelState {
         plan: &mut crate::node::history_demand::PrivatePlan,
         page: Page,
         now: u64,
+        trust_nonce: TrustNonce,
     ) -> Result<()> {
         let ask = self.private_history_ask(store, bounds, plan)?;
         if page.revision != ask.revision || page.query != ask.query {
@@ -2336,7 +2373,7 @@ impl ChannelState {
                         .ok_or(Error::StreamRefused(
                             "requested private history key is no longer retained",
                         ))?;
-                    self.take_private_record(store, wire, now)?;
+                    self.take_private_record(store, wire, now, Some(trust_nonce))?;
                 }
                 plan.positions.drain(..page.records.len());
             }
@@ -2372,7 +2409,13 @@ impl ChannelState {
             && self.private_permitted(store, &saved.record, &self.me())?)
     }
 
-    fn take_private_record(&mut self, store: &Store, wire: &[u8], now: u64) -> Result<()> {
+    fn take_private_record(
+        &mut self,
+        store: &Store,
+        wire: &[u8],
+        now: u64,
+        authority: Option<TrustNonce>,
+    ) -> Result<()> {
         if let Err(error) = self.require_governance_ready(store, crate::time::Ms(now)) {
             self.private_save_failed(&error);
             return Err(error);
@@ -2435,8 +2478,7 @@ impl ChannelState {
             session_id: content.session_id,
             body: content.body,
         };
-        self.drive.receivers.insert(slot, next);
-        self.keep_private(
+        self.keep_private_candidate(
             store,
             Stored {
                 record,
@@ -2445,7 +2487,10 @@ impl ChannelState {
                 attention_after: None,
             },
             None,
+            Some((slot, &next)),
+            authority,
         )?;
+        self.drive.receivers.insert(slot, next);
         self.sweep_private_sessions(store, now)?;
         Ok(())
     }

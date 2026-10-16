@@ -19884,12 +19884,16 @@ impl Node {
                     "private Session page timed out",
                 )));
                 let now = clock();
+                let trust_nonce = guard.nonce;
                 history_demand::current_private_room(
                     shared,
                     store,
                     job,
                     guard,
-                    move |room, store| room.finish_private_pull(store, peer, page, now).map(|_| ()),
+                    move |room, store| {
+                        room.finish_private_pull(store, peer, page, now, trust_nonce)
+                            .map(|_| ())
+                    },
                 )
                 .await
             }
