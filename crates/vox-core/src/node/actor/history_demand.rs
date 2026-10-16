@@ -85,6 +85,17 @@ pub(super) struct Controller {
     selection: Option<(Digest32, [u8; 16], Option<Digest32>)>,
 }
 impl Controller {
+    pub(super) fn ready_binding(
+        &self,
+        room: Digest32,
+        peer: Digest32,
+    ) -> Option<(RequestId, Digest32, [u8; 16])> {
+        self.ready
+            .as_ref()
+            .filter(|dispatch| dispatch.room == room && dispatch.peer == peer)
+            .map(|dispatch| (dispatch.request, dispatch.generation, dispatch.instance))
+    }
+
     pub(super) fn take_legacy_cleanup(&mut self) -> Option<(Digest32, LegacyProvisionalOwner)> {
         self.cancelled_legacy.take()
     }

@@ -30,8 +30,16 @@ struct ArchiveAdmission {
     token: u64,
     room: Digest32,
     peer: Digest32,
+    request: stream::RequestId,
+    generation: Digest32,
+    instance: [u8; 16],
     ticket: crate::node::history_budget::Ticket,
     task: tokio::task::JoinHandle<()>,
+}
+enum ArchiveTurn {
+    Ready(crate::node::history_budget::Job),
+    Waiting,
+    Full,
 }
 #[derive(Default)]
 pub(super) struct Controller {
@@ -215,6 +223,12 @@ impl Controller {
                     .map(|request| (request, flow.generation))
             })
             .or_else(|| {
+                self.archive_admission.as_ref().and_then(|admission| {
+                    (admission.room == room && admission.peer == peer)
+                        .then_some((admission.request, admission.generation))
+                })
+            })
+            .or_else(|| {
                 self.running
                     .iter()
                     .flatten()
@@ -319,6 +333,11 @@ impl Controller {
         instance: [u8; 16],
         request: stream::RequestId,
     ) {
+        if self.archive_admission.as_ref().is_some_and(|admission| {
+            admission.room == room && admission.instance == instance && admission.request == request
+        }) {
+            self.cancel_archive_admission();
+        }
         if self.ready[1].as_ref().is_some_and(|flow| {
             flow.room == room && flow.instance == instance && flow.archive_request == Some(request)
         }) {
@@ -335,6 +354,88 @@ impl Controller {
         }) {
             work.fence.retire();
         }
+    }
+
+    fn archive_turn(
+        &mut self,
+        budget: &Arc<crate::node::history_budget::Budget>,
+        net_tx: &mpsc::Sender<NetEvent>,
+        next_token: &mut u64,
+        node: Digest32,
+        room: Digest32,
+        peer: Digest32,
+        request: stream::RequestId,
+        generation: Digest32,
+        instance: [u8; 16],
+    ) -> ArchiveTurn {
+        if self.archive_admission.as_ref().is_some_and(|admission| {
+            admission.room != room
+                || admission.peer != peer
+                || admission.request != request
+                || admission.generation != generation
+                || admission.instance != instance
+        }) {
+            self.cancel_archive_admission();
+        }
+        if let Some(mut admission) = self.archive_admission.take() {
+            let wake = admission.ticket.wake();
+            if let Some(job) = admission.ticket.try_admit() {
+                admission.task.abort();
+                return ArchiveTurn::Ready(job);
+            }
+            // Replace the completed or superseded notifier with a freshly registered one. A new
+            // token makes a late event from the old task harmless.
+            admission.task.abort();
+            let tx = net_tx.clone();
+            let wake_token = *next_token;
+            *next_token += 1;
+            admission.token = wake_token;
+            admission.task = tokio::spawn(async move {
+                wake.await;
+                let _ = tx
+                    .send(NetEvent::ArchiveAdmissionReady {
+                        token: wake_token,
+                        room,
+                        peer,
+                    })
+                    .await;
+            });
+            self.archive_admission = Some(admission);
+            return ArchiveTurn::Waiting;
+        }
+
+        let Some(mut ticket) = budget.enqueue(node, crate::node::history_budget::Lane::Archive)
+        else {
+            return ArchiveTurn::Full;
+        };
+        let wake = ticket.wake();
+        if let Some(job) = ticket.try_admit() {
+            return ArchiveTurn::Ready(job);
+        }
+        let tx = net_tx.clone();
+        let wake_token = *next_token;
+        *next_token += 1;
+        let task = tokio::spawn(async move {
+            wake.await;
+            let _ = tx
+                .send(NetEvent::ArchiveAdmissionReady {
+                    token: wake_token,
+                    room,
+                    peer,
+                })
+                .await;
+        });
+        self.archive_admission = Some(ArchiveAdmission {
+            token: wake_token,
+            room,
+            peer,
+            request,
+            generation,
+            instance,
+            ticket,
+            task,
+        });
+        ArchiveTurn::Waiting
     }
 }
 impl Node {
@@ -652,6 +753,7 @@ impl Node {
                     .as_ref()
                     .is_some_and(|flow| flow.room == room && flow.peer == peer && !flow.waiting)
         });
+        let mut admitted_archive = None;
         let mut flow = if let Some(index) = existing {
             self.bounded_sync.ready[index]
                 .take()
@@ -673,6 +775,34 @@ impl Node {
             } else {
                 if self.bounded_sync.flow_count() >= 12 {
                     return false;
+                }
+                if self.bounded_sync.ready[1].is_none() && self.bounded_sync.running[1].is_none() {
+                    if let Some((request, generation, instance)) =
+                        self.history_demand.ready_binding(room, peer)
+                    {
+                        match self.bounded_sync.archive_turn(
+                            &self.history_budget,
+                            &self.net_tx,
+                            &mut self.next_token,
+                            node,
+                            room,
+                            peer,
+                            request,
+                            generation,
+                            instance,
+                        ) {
+                            ArchiveTurn::Ready(job) => admitted_archive = Some(job),
+                            ArchiveTurn::Waiting => return false,
+                            ArchiveTurn::Full => {
+                                self.history_demand.busy(
+                                    request,
+                                    generation,
+                                    "The daemon archive queue is full; resume this request later.",
+                                );
+                                return false;
+                            }
+                        }
+                    }
                 }
                 let Ok(lease) = self.secret_work.clone().try_read_owned() else {
                     return false;
@@ -857,88 +987,38 @@ impl Node {
         let index = usize::from(flow.archive);
         let lane = flow.lane();
         let job = if lane == crate::node::history_budget::Lane::Archive {
-            if self
-                .bounded_sync
-                .archive_admission
-                .as_ref()
-                .is_some_and(|admission| admission.room != flow.room || admission.peer != flow.peer)
-            {
-                self.bounded_sync.cancel_archive_admission();
-            }
-            if self.bounded_sync.archive_admission.is_some() {
-                let mut admission = self
-                    .bounded_sync
-                    .archive_admission
-                    .take()
-                    .expect("checked archive admission");
-                let wake = admission.ticket.wake();
-                if let Some(job) = admission.ticket.try_admit() {
-                    admission.task.abort();
-                    job
-                } else {
-                    // Replace the completed or superseded notifier with a freshly registered one.
-                    // A new token makes a late event from the old task harmless.
-                    admission.task.abort();
-                    let tx = self.net_tx.clone();
-                    let wake_token = self.next_token;
-                    self.next_token += 1;
-                    let wake_room = flow.room;
-                    let wake_peer = flow.peer;
-                    admission.token = wake_token;
-                    admission.task = tokio::spawn(async move {
-                        wake.await;
-                        let _ = tx
-                            .send(NetEvent::ArchiveAdmissionReady {
-                                token: wake_token,
-                                room: wake_room,
-                                peer: wake_peer,
-                            })
-                            .await;
-                    });
-                    self.bounded_sync.archive_admission = Some(admission);
-                    self.bounded_sync.ready[index] = Some(flow);
-                    return false;
-                }
+            if let Some(job) = admitted_archive.take() {
+                job
             } else {
-                let Some(mut ticket) = self.history_budget.enqueue(node, lane) else {
-                    if let Some(request) = flow.archive_request {
+                let Some(request) = flow.archive_request else {
+                    self.bounded_sync.dispose(flow);
+                    return false;
+                };
+                match self.bounded_sync.archive_turn(
+                    &self.history_budget,
+                    &self.net_tx,
+                    &mut self.next_token,
+                    node,
+                    flow.room,
+                    flow.peer,
+                    request,
+                    flow.generation,
+                    flow.instance,
+                ) {
+                    ArchiveTurn::Ready(job) => job,
+                    ArchiveTurn::Waiting => {
+                        self.bounded_sync.ready[index] = Some(flow);
+                        return false;
+                    }
+                    ArchiveTurn::Full => {
                         self.history_demand.busy(
                             request,
                             flow.generation,
                             "The daemon archive queue is full; resume this request later.",
                         );
+                        self.bounded_sync.dispose(flow);
+                        return false;
                     }
-                    self.bounded_sync.dispose(flow);
-                    return false;
-                };
-                let wake = ticket.wake();
-                if let Some(job) = ticket.try_admit() {
-                    job
-                } else {
-                    let tx = self.net_tx.clone();
-                    let wake_token = self.next_token;
-                    self.next_token += 1;
-                    let wake_room = flow.room;
-                    let wake_peer = flow.peer;
-                    let task = tokio::spawn(async move {
-                        wake.await;
-                        let _ = tx
-                            .send(NetEvent::ArchiveAdmissionReady {
-                                token: wake_token,
-                                room: wake_room,
-                                peer: wake_peer,
-                            })
-                            .await;
-                    });
-                    self.bounded_sync.archive_admission = Some(ArchiveAdmission {
-                        token: wake_token,
-                        room: flow.room,
-                        peer: flow.peer,
-                        ticket,
-                        task,
-                    });
-                    self.bounded_sync.ready[index] = Some(flow);
-                    return false;
                 }
             }
         } else {
