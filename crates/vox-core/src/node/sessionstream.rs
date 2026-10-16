@@ -24,7 +24,7 @@ pub(crate) const MAX_RECORD: usize = 96 * 1024;
 pub(crate) const PAGE_RECORDS: usize = 32;
 pub(crate) const MAX_PAGE: usize = 1024 * 1024;
 /// Outer framing/cursor overhead; each record additionally has at most five CBOR length bytes.
-pub(crate) const PAGE_OVERHEAD: usize = 128;
+pub(crate) const PAGE_OVERHEAD: usize = 4096;
 /// Wire, decoder copies, one parsed record and encoder/sealing scratch remain charged together.
 pub(crate) const PAGE_ENVELOPE: usize = 4 * MAX_PAGE;
 
@@ -162,10 +162,149 @@ impl Record {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub(crate) struct Cursor {
     pub incarnation: Digest32,
     pub after: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Locator {
+    pub id: u64,
+    pub hash: Digest32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LifecycleCursor {
+    pub version: Digest32,
+    pub slot: u8,
+    pub after: u64,
+}
+
+/// Purpose is explicit before any private body is read. A returned cursor is never permission
+/// to turn a current-tail request into an archive request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Query {
+    LiveTail,
+    Lifecycle {
+        author: Digest32,
+        session: String,
+        cursor: Option<LifecycleCursor>,
+    },
+    ArchiveInventory {
+        lo: u64,
+        hi: u64,
+        before: u64,
+    },
+    ArchiveRecords {
+        lo: u64,
+        hi: u64,
+        positions: Vec<Locator>,
+    },
+}
+impl Query {
+    pub(crate) fn archive(&self) -> bool {
+        matches!(
+            self,
+            Self::ArchiveInventory { .. } | Self::ArchiveRecords { .. }
+        )
+    }
+    fn validate(&self) -> Result<()> {
+        let interval = |lo, hi| {
+            if lo == 0 || lo > hi || hi - lo >= PAGE_RECORDS as u64 {
+                Err(Error::MalformedBundle("private history interval"))
+            } else {
+                Ok(())
+            }
+        };
+        match self {
+            Self::LiveTail => Ok(()),
+            Self::Lifecycle {
+                session, cursor, ..
+            } => {
+                if session.is_empty()
+                    || session.len() > crate::node::content::MAX_SESSION_ID_LEN
+                    || cursor.as_ref().is_some_and(|c| c.slot > 5)
+                {
+                    return Err(Error::MalformedBundle("private lifecycle selection"));
+                }
+                Ok(())
+            }
+            Self::ArchiveInventory { lo, hi, before } => {
+                interval(*lo, *hi)?;
+                if *before < *lo || *before > hi.saturating_add(1) {
+                    return Err(Error::MalformedBundle("private history inventory cursor"));
+                }
+                Ok(())
+            }
+            Self::ArchiveRecords { lo, hi, positions } => {
+                interval(*lo, *hi)?;
+                if positions.is_empty() || positions.len() > PAGE_RECORDS {
+                    return Err(Error::MalformedBundle("private history positions"));
+                }
+                let mut previous = hi.saturating_add(1);
+                for position in positions {
+                    if position.id < *lo || position.id > *hi || position.id >= previous {
+                        return Err(Error::MalformedBundle("private history position binding"));
+                    }
+                    previous = position.id;
+                }
+                Ok(())
+            }
+        }
+    }
+    fn put(&self, e: &mut Encoder) {
+        match self {
+            Self::LiveTail => {
+                e.array(1).uint(0);
+            }
+            Self::Lifecycle {
+                author,
+                session,
+                cursor,
+            } => {
+                e.array(4).uint(1).bytes(author).text(session);
+                put_lifecycle(e, cursor.as_ref());
+            }
+            Self::ArchiveInventory { lo, hi, before } => {
+                e.array(4).uint(2).uint(*lo).uint(*hi).uint(*before);
+            }
+            Self::ArchiveRecords { lo, hi, positions } => {
+                e.array(4).uint(3).uint(*lo).uint(*hi);
+                put_locators(e, positions);
+            }
+        }
+    }
+    fn read(d: &mut Decoder<'_>) -> Result<Self> {
+        let query = match (d.array()?, d.uint()?) {
+            (1, 0) => Self::LiveTail,
+            (4, 1) => {
+                let author = digest(d)?;
+                let session = d.text()?;
+                if session.len() > crate::node::content::MAX_SESSION_ID_LEN {
+                    return Err(Error::SizeLimitExceeded("private lifecycle session"));
+                }
+                Self::Lifecycle {
+                    author,
+                    session: session.into(),
+                    cursor: read_lifecycle(d)?,
+                }
+            }
+            (4, 2) => Self::ArchiveInventory {
+                lo: d.uint()?,
+                hi: d.uint()?,
+                before: d.uint()?,
+            },
+            (4, 3) => Self::ArchiveRecords {
+                lo: d.uint()?,
+                hi: d.uint()?,
+                positions: read_locators(d)?,
+            },
+            _ => return Err(Error::MalformedBundle("private Session purpose")),
+        };
+        query.validate()?;
+        Ok(query)
+    }
 }
 
 pub(crate) struct Ask {
@@ -174,15 +313,20 @@ pub(crate) struct Ask {
     pub room: Digest32,
     pub epoch: u64,
     pub cursor: Cursor,
+    pub query: Query,
 }
 
 pub(crate) struct Page {
-    /// The initiating node's grant revision; never read from the peer's frame.
+    /// The initiating node's grant revision and query are local, never accepted from the peer.
     pub revision: u64,
+    pub query: Query,
     pub cursor: Cursor,
     pub more: bool,
     pub records: Vec<Vec<u8>>,
-    /// Keeps the daemon-wide reservation alive through the actor's durable application.
+    pub positions: Vec<u64>,
+    pub hints: Vec<Locator>,
+    pub lifecycle: Option<LifecycleCursor>,
+    /// Keeps the daemon-wide reservation alive through durable application.
     pub charge: BufferCharge,
 }
 
@@ -191,26 +335,82 @@ fn digest(d: &mut Decoder<'_>) -> Result<Digest32> {
         .try_into()
         .map_err(|_| Error::MalformedBundle("private Session digest"))
 }
+fn put_lifecycle(e: &mut Encoder, value: Option<&LifecycleCursor>) {
+    e.array(usize::from(value.is_some()));
+    if let Some(value) = value {
+        e.array(3)
+            .bytes(&value.version)
+            .uint(value.slot.into())
+            .uint(value.after);
+    }
+}
+fn read_lifecycle(d: &mut Decoder<'_>) -> Result<Option<LifecycleCursor>> {
+    match d.array()? {
+        0 => Ok(None),
+        1 => {
+            if d.array()? != 3 {
+                return Err(Error::MalformedBundle("private lifecycle cursor"));
+            }
+            let version = digest(d)?;
+            let slot = u8::try_from(d.uint()?)
+                .map_err(|_| Error::MalformedBundle("private lifecycle slot"))?;
+            if slot > 5 {
+                return Err(Error::MalformedBundle("private lifecycle slot"));
+            }
+            Ok(Some(LifecycleCursor {
+                version,
+                slot,
+                after: d.uint()?,
+            }))
+        }
+        _ => Err(Error::MalformedBundle("private lifecycle cursor")),
+    }
+}
+fn put_locators(e: &mut Encoder, positions: &[Locator]) {
+    e.array(positions.len());
+    for position in positions {
+        e.array(2).uint(position.id).bytes(&position.hash);
+    }
+}
+fn read_locators(d: &mut Decoder<'_>) -> Result<Vec<Locator>> {
+    let count = d.array()?;
+    if count > PAGE_RECORDS {
+        return Err(Error::SizeLimitExceeded("private history inventory"));
+    }
+    let mut result = Vec::with_capacity(count);
+    for _ in 0..count {
+        if d.array()? != 2 {
+            return Err(Error::MalformedBundle("private history locator"));
+        }
+        result.push(Locator {
+            id: d.uint()?,
+            hash: digest(d)?,
+        });
+    }
+    Ok(result)
+}
 
 impl Ask {
-    fn wire(&self) -> Vec<u8> {
+    fn wire(&self) -> Result<Vec<u8>> {
+        self.query.validate()?;
         let mut e = Encoder::new();
-        e.array(5)
-            .uint(1)
+        e.array(6)
+            .uint(2)
             .bytes(&self.room)
             .uint(self.epoch)
             .bytes(&self.cursor.incarnation)
             .uint(self.cursor.after);
-        e.finish()
+        self.query.put(&mut e);
+        Ok(e.finish())
     }
 }
 
 pub(crate) async fn read_ask(recv: &mut RecvStream) -> Result<Ask> {
-    let bytes = read_frame(recv, 128)
+    let bytes = read_frame(recv, 4096)
         .await?
         .ok_or(Error::MalformedBundle("private Session ask missing"))?;
     let mut d = Decoder::new(&bytes);
-    if d.array()? != 5 || d.uint()? != 1 {
+    if d.array()? != 6 || d.uint()? != 2 {
         return Err(Error::MalformedBundle("private Session ask version"));
     }
     let ask = Ask {
@@ -221,39 +421,40 @@ pub(crate) async fn read_ask(recv: &mut RecvStream) -> Result<Ask> {
             incarnation: digest(&mut d)?,
             after: d.uint()?,
         },
+        query: Query::read(&mut d)?,
     };
     d.finish()?;
     Ok(ask)
 }
 
 pub(crate) async fn answer(mut send: SendStream, page: Page) -> Result<()> {
-    if page.records.len() > PAGE_RECORDS {
+    if page.records.len() > PAGE_RECORDS
+        || page.records.len() != page.positions.len()
+        || page.hints.len() > PAGE_RECORDS
+    {
         return Err(Error::SizeLimitExceeded("private Session page records"));
-    }
-    let mut size = PAGE_OVERHEAD;
-    for record in &page.records {
-        if record.len() > MAX_RECORD {
-            return Err(Error::SizeLimitExceeded("private Session record"));
-        }
-        size = size
-            .checked_add(record.len() + 5)
-            .ok_or(Error::SizeLimitExceeded("private Session page"))?;
-    }
-    if size > MAX_PAGE {
-        return Err(Error::SizeLimitExceeded("private Session page"));
     }
     let _charge = page.charge;
     let mut e = Encoder::new();
-    e.array(5)
-        .uint(1)
+    e.array(7)
+        .uint(2)
         .bytes(&page.cursor.incarnation)
         .uint(page.cursor.after)
         .uint(u64::from(page.more))
         .array(page.records.len());
-    for record in page.records {
-        e.bytes(&record);
+    for (id, record) in page.positions.into_iter().zip(page.records) {
+        if record.len() > MAX_RECORD {
+            return Err(Error::SizeLimitExceeded("private Session record"));
+        }
+        e.array(2).uint(id).bytes(&record);
     }
-    write_frame(&mut send, &e.finish()).await?;
+    put_locators(&mut e, &page.hints);
+    put_lifecycle(&mut e, page.lifecycle.as_ref());
+    let wire = e.finish();
+    if wire.len() + 4 > MAX_PAGE {
+        return Err(Error::SizeLimitExceeded("private Session page"));
+    }
+    write_frame(&mut send, &wire).await?;
     send.finish()
         .map_err(|_| Error::Unreachable("private Session answer closed"))
 }
@@ -263,14 +464,14 @@ pub(crate) async fn pull(conn: &VoxConnection, ask: Ask, job: Job) -> Result<Pag
         .reserve(PAGE_ENVELOPE)
         .ok_or(Error::StreamRefused("private Session transfer busy"))?;
     let (mut send, mut recv) = open_typed(conn, StreamKind::Session).await?;
-    write_frame(&mut send, &ask.wire()).await?;
+    write_frame(&mut send, &ask.wire()?).await?;
     send.finish()
         .map_err(|_| Error::Unreachable("private Session request closed"))?;
     let bytes = read_frame(&mut recv, MAX_PAGE - 4)
         .await?
         .ok_or(Error::MalformedBundle("private Session answer missing"))?;
     let mut d = Decoder::new(&bytes);
-    if d.array()? != 5 || d.uint()? != 1 {
+    if d.array()? != 7 || d.uint()? != 2 {
         return Err(Error::MalformedBundle("private Session answer version"));
     }
     let cursor = Cursor {
@@ -287,22 +488,96 @@ pub(crate) async fn pull(conn: &VoxConnection, ask: Ask, job: Job) -> Result<Pag
         return Err(Error::SizeLimitExceeded("private Session page"));
     }
     let mut records = Vec::with_capacity(count);
+    let mut positions = Vec::with_capacity(count);
     for _ in 0..count {
+        if d.array()? != 2 {
+            return Err(Error::MalformedBundle("private Session record locator"));
+        }
+        positions.push(d.uint()?);
         let record = d.bytes()?;
         if record.len() > MAX_RECORD {
             return Err(Error::SizeLimitExceeded("private Session record"));
         }
         records.push(record.to_vec());
     }
+    let hints = read_locators(&mut d)?;
+    let lifecycle = read_lifecycle(&mut d)?;
     d.finish()?;
-    if cursor.incarnation == ask.cursor.incarnation && cursor.after < ask.cursor.after {
-        return Err(Error::MalformedBundle("private Session cursor regressed"));
+    if ask.query.archive() && cursor.incarnation != ask.cursor.incarnation {
+        return Err(Error::MalformedBundle("private history donor changed"));
+    }
+    match &ask.query {
+        Query::LiveTail => {
+            if !hints.is_empty()
+                || lifecycle.is_some()
+                || (cursor.incarnation == ask.cursor.incarnation && cursor.after < ask.cursor.after)
+                || positions.iter().any(|id| {
+                    *id == 0 || *id > cursor.after || cursor.after - *id >= PAGE_RECORDS as u64
+                })
+                || positions.windows(2).any(|p| p[0] >= p[1])
+            {
+                return Err(Error::MalformedBundle("private live tail binding"));
+            }
+        }
+        Query::Lifecycle {
+            cursor: previous, ..
+        } => {
+            if !hints.is_empty()
+                || records.is_empty()
+                || more != lifecycle.is_some()
+                || previous
+                    .as_ref()
+                    .zip(lifecycle.as_ref())
+                    .is_some_and(|(a, b)| {
+                        a.version != b.version || (b.slot, b.after) <= (a.slot, a.after)
+                    })
+            {
+                return Err(Error::MalformedBundle("private lifecycle continuation"));
+            }
+        }
+        Query::ArchiveInventory { lo, hi, before } => {
+            if !records.is_empty()
+                || lifecycle.is_some()
+                || cursor.after < *lo
+                || cursor.after > *before
+                || hints
+                    .iter()
+                    .any(|p| p.id < *lo || p.id > *hi || p.id >= *before)
+                || hints.windows(2).any(|p| p[0].id <= p[1].id)
+            {
+                return Err(Error::MalformedBundle("private history inventory binding"));
+            }
+        }
+        Query::ArchiveRecords {
+            positions: wanted, ..
+        } => {
+            if !hints.is_empty()
+                || lifecycle.is_some()
+                || records.is_empty()
+                || records.len() > wanted.len()
+                || more != (records.len() < wanted.len())
+                || positions.last().copied() != Some(cursor.after)
+                || positions
+                    .iter()
+                    .zip(&records)
+                    .zip(wanted)
+                    .any(|((id, wire), want)| {
+                        *id != want.id || Record::read(wire).map_or(true, |r| r.hash() != want.hash)
+                    })
+            {
+                return Err(Error::MalformedBundle("private history body selection"));
+            }
+        }
     }
     Ok(Page {
         revision: ask.revision,
+        query: ask.query,
         cursor,
         more,
         records,
+        positions,
+        hints,
+        lifecycle,
         charge,
     })
 }
