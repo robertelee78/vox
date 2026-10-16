@@ -575,6 +575,16 @@ impl ConnectionManager {
         *self.network.borrow()
     }
 
+    /// Apply a synchronous publication while this path remains current.
+    pub(crate) fn on_current_network<T>(
+        &self,
+        generation: u64,
+        publish: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let current = self.network.borrow();
+        (*current == generation).then(publish)
+    }
+
     /// Cancel old-path work promptly so it cannot hold a current-path peer's dial slot.
     pub async fn on_network<T>(
         &self,

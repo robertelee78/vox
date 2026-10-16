@@ -108,6 +108,9 @@ pub fn default_gateway_v6() -> Result<(Ipv6Addr, u32)> {
         .map_err(|_| Error::PortMappingFailed("gateway: cannot read /proc/net/ipv6_route"))?;
     let (gw, iface) =
         parse_proc_net_ipv6_route(&table).ok_or(Error::PortMappingFailed(NO_ROUTE_V6))?;
+    if gw.is_unspecified() {
+        return Err(Error::PortMappingFailed(NO_NEXT_HOP));
+    }
     let scope = if is_link_local(gw) {
         interface_index(&iface).ok_or(Error::PortMappingFailed(
             "gateway: link-local next hop with no interface index",
@@ -162,7 +165,10 @@ fn parse_proc_net_ipv6_route(contents: &str) -> Option<(Ipv6Addr, String)> {
         let Some(gw) = hex_to_ipv6(cols[4]) else {
             continue;
         };
-        if gw.is_unspecified() {
+        if u32::from_str_radix(cols[8], 16)
+            .ok()
+            .is_none_or(|flags| flags & 1 == 0)
+        {
             continue;
         }
         let Ok(metric) = u32::from_str_radix(cols[5], 16) else {
@@ -220,6 +226,13 @@ pub fn default_gateway_v4() -> Result<Ipv4Addr> {
     parse_proc_net_route(&table)
         .map(|(ip, _)| ip)
         .ok_or(Error::PortMappingFailed(NO_ROUTE))
+        .and_then(|ip| {
+            if ip.is_unspecified() {
+                Err(Error::PortMappingFailed(NO_NEXT_HOP))
+            } else {
+                Ok(ip)
+            }
+        })
 }
 
 /// The IPv4 default route's next hop on macOS, by `RTM_GET` ([`macos::default_route`], N-53).
@@ -254,18 +267,17 @@ fn parse_proc_net_route(contents: &str) -> Option<(Ipv4Addr, String)> {
         let iface = cols.next()?;
         let dest = cols.next()?;
         let gateway = cols.next()?;
-        let _flags = cols.next()?;
+        let flags = cols.next()?;
         let _refcnt = cols.next()?;
         let _use = cols.next()?;
         let metric = cols.next()?;
-        if dest != "00000000" {
+        let mask = cols.next()?;
+        if dest != "00000000" || mask != "00000000" || u32::from_str_radix(flags, 16).ok()? & 1 == 0
+        {
             continue;
         }
         let gw = hex_le_to_ipv4(gateway)?;
         let m: u32 = metric.parse().ok()?;
-        if gw == Ipv4Addr::UNSPECIFIED {
-            continue; // a default route with a 0.0.0.0 gateway is on-link, not a hop
-        }
         match best {
             Some((bm, _, _)) if bm <= m => {}
             _ => best = Some((m, gw, iface.to_owned())),
@@ -290,7 +302,7 @@ fn hex_le_to_ipv4(hex: &str) -> Option<Ipv4Addr> {
 /// platform says it, and its index).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Hop {
-    /// The next hop.
+    /// The next hop; unspecified only in a path observation for an on-link default route.
     pub addr: std::net::IpAddr,
     /// The interface's name (`en0`), when the platform names it.
     pub interface: Option<String>,
@@ -312,9 +324,22 @@ pub fn default_hop(v6: bool) -> Option<Hop> {
 /// # Errors
 /// The kernel's route lookup failed or reported no default next hop.
 pub fn default_hop_result(v6: bool) -> Result<Hop> {
+    let path = default_path_result(v6)?;
+    if path.addr.is_unspecified() {
+        return Err(Error::PortMappingFailed(NO_NEXT_HOP));
+    }
+    Ok(path)
+}
+
+/// The active default path, including an on-link route with no mapping gateway. Its unspecified
+/// next-hop address is a path marker only and must never be sent a port-mapping request.
+///
+/// # Errors
+/// The route is absent or could not be observed; these remain distinct errors.
+pub fn default_path_result(v6: bool) -> Result<Hop> {
     #[cfg(target_os = "macos")]
     {
-        macos::default_route(v6)
+        macos::default_path(v6)
     }
     #[cfg(target_os = "linux")]
     {
@@ -443,6 +468,18 @@ pub mod macos {
     /// there is no default route of that family (`route -n get` says "not in table"), or it leaves
     /// by an interface with no next hop.
     pub fn default_route(v6: bool) -> Result<Hop> {
+        let path = default_path(v6)?;
+        if path.addr.is_unspecified() {
+            return Err(Error::PortMappingFailed(super::NO_NEXT_HOP));
+        }
+        Ok(path)
+    }
+
+    /// Observe the default path even when its next hop is an interface rather than an IP gateway.
+    ///
+    /// # Errors
+    /// As [`default_route`], except an on-link route is returned with an unspecified next hop.
+    pub fn default_path(v6: bool) -> Result<Hop> {
         use rustix::net::{socket, sockopt, AddressFamily, SocketType};
         let fail = |what: &'static str| Error::PortMappingFailed(what);
         let fd = socket(AddressFamily::ROUTE, SocketType::RAW, None)
@@ -486,12 +523,12 @@ pub mod macos {
             if field(24) != 0 {
                 return Err(fail(super::NO_ROUTE));
             }
-            return parse_answer(m);
+            return parse_answer(m, v6);
         }
     }
 
     /// The gateway and interface out of a kernel `RTM_GET` answer.
-    fn parse_answer(m: &[u8]) -> Result<Hop> {
+    fn parse_answer(m: &[u8], v6: bool) -> Result<Hop> {
         let fail = |what: &'static str| Error::PortMappingFailed(what);
         let addrs = i32::from_ne_bytes([m[12], m[13], m[14], m[15]]);
         let index = u32::from(u16::from_ne_bytes([m[4], m[5]]));
@@ -530,12 +567,60 @@ pub mod macos {
             }
             at += padded(len);
         }
-        let addr = gateway.ok_or(fail(super::NO_NEXT_HOP))?;
+        let addr = gateway
+            .or_else(|| {
+                (index != 0).then_some(if v6 {
+                    IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+                } else {
+                    IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+                })
+            })
+            .ok_or(fail(super::NO_NEXT_HOP))?;
         Ok(Hop {
             addr,
             interface,
             index,
         })
+    }
+
+    /// A withdrawn default route, including its gateway and interface. A zero destination
+    /// alone is insufficient: 0.0.0.0/1 is not the default, and an unselected gateway on the
+    /// same interface is not the active path. The watcher compares this full identity.
+    pub(crate) fn withdrawn_default(m: &[u8]) -> Option<Hop> {
+        if m.len() < RT_MSGHDR_LEN || m[2] != RTM_VERSION || m[3] != 2 {
+            return None;
+        }
+        let flags = u32::from_ne_bytes(m[8..12].try_into().ok()?);
+        if flags & 4 != 0 {
+            return None;
+        } // RTF_HOST
+        let addrs = u32::from_ne_bytes(m[12..16].try_into().ok()?);
+        let mut at = RT_MSGHDR_LEN;
+        let (mut destination, mut netmask) = (None, None);
+        for bit in 0..8 {
+            if addrs & (1 << bit) == 0 {
+                continue;
+            }
+            let len = usize::from(*m.get(at)?);
+            let sa = m.get(at..at + len)?;
+            if bit == 0 {
+                destination = Some(sa);
+            }
+            if bit == 2 {
+                netmask = Some(sa);
+            }
+            at += padded(len);
+        }
+        let dst = destination?;
+        if !netmask?.get(2..).unwrap_or(&[]).iter().all(|b| *b == 0) {
+            return None;
+        }
+        let v6 = match dst.get(1).copied()? {
+            AF_INET if dst.len() >= 8 && dst[4..8].iter().all(|b| *b == 0) => false,
+            AF_INET6 if dst.len() >= 24 && dst[8..24].iter().all(|b| *b == 0) => true,
+            _ => return None,
+        };
+        parse_answer(m, v6).ok()
     }
 }
 

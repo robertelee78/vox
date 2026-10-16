@@ -897,7 +897,6 @@ fn spawn_watcher(presence: std::sync::Weak<NetPresence>) -> tokio::task::AbortHa
                 Default::default()
             };
             let change = NetChange::between(&before, &after, &events, unix_now_ms());
-            missed_events = false;
             before = after.knowing(&before);
             let Some(p) = presence.upgrade() else { return };
             if lock(&p.unwatched).take().is_some() {

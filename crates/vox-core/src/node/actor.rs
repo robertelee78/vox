@@ -33,6 +33,7 @@ use crate::atrest::sek::Argon2Profile;
 use crate::error::Error;
 use crate::hash::Digest32;
 use crate::nat::bootstrap::{BootstrapNode, BootstrapSet};
+use crate::nat::multiaddr::{EndpointList, Multiaddr};
 use crate::nat::record::{MemberBundleRecord, RendezvousRecord};
 use crate::node::api::{
     ChannelDetail, ChannelSummary, Fault, IdentityInfo, MessageRow, NodeCommand, NodeEvent,
@@ -565,6 +566,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::ReachFailed { .. } => "filing a failed dial",
         NetEvent::UpgradeFailed { .. } => "filing a path upgrade that failed",
         NetEvent::AnchorConnected { .. } => "publishing every room to an anchor that answered",
+        NetEvent::AnchorEndpoints { .. } => "remembering an anchor's own dial hints",
         NetEvent::AddressesDiscovered => "publishing every room at a new address",
         NetEvent::NetworkChanged(_) => "acting on a change of the machine's network",
         NetEvent::Stranded { .. } => "dialling again peers a network change stranded",
@@ -1080,6 +1082,13 @@ enum NetEvent {
         generation: u64,
         /// The connection to the anchor.
         conn: Arc<VoxConnection>,
+    },
+    /// Self-advertised hints from an already authorized anchor, never new scope or trust.
+    AnchorEndpoints {
+        peer: Digest32,
+        serial: u64,
+        generation: u64,
+        endpoints: EndpointList,
     },
     /// A background dial failed. **The one thing that must never be dropped.**
     ///
@@ -4659,6 +4668,12 @@ pub struct Node {
     /// addresses: where the next dial's window starts in their union (V210-75). Moved on by
     /// each failed dial, dropped when one connects.
     anchor_window: BTreeMap<Digest32, usize>,
+    /// Bounded sealed self-reported dial hints, consulted only for currently authorized anchors.
+    /// The BootstrapSet codec supplies bounds, never authority; old hints require a fresh dial.
+    anchor_hints: BootstrapSet,
+    anchor_hints_load_error: bool,
+    /// Connection, network generation and next refresh time; a new connection is asked at once.
+    anchor_hints_due: BTreeMap<Digest32, (u64, u64, u64)>,
     /// When each anchor's current connection was made (unix milliseconds), with that connection's
     /// serial, so one lost soon after is told from one lost after a while ([`ANCHOR_FLAP_MS`]).
     anchor_connected_at: BTreeMap<Digest32, (u64, u64)>,
@@ -5358,6 +5373,9 @@ impl Node {
             anchor_backoff: BTreeMap::new(),
             anchor_dials: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             anchor_window: BTreeMap::new(),
+            anchor_hints: BootstrapSet::new(),
+            anchor_hints_load_error: false,
+            anchor_hints_due: BTreeMap::new(),
             anchor_connected_at: BTreeMap::new(),
             anchors_up: BTreeMap::new(),
             anchor_unreached_since: BTreeMap::new(),
@@ -6605,9 +6623,8 @@ impl Node {
         // The configured anchors are dialled at once, each on its own task: they are
         // where this node's records go and the helpers its ladder climbs through, and
         // an anchor that is down must not hold up the ones that are not.
-        let configured: Vec<BootstrapNode> = self.anchors.nodes().to_vec();
-        for anchor in configured {
-            self.dial_anchor(&net, anchor.id, anchor.endpoints.direct_candidates());
+        for (id, candidates) in self.kept_anchors() {
+            self.dial_anchor(&net, id, candidates);
         }
         // No membership refresh here: the network only starts when the identity
         // unlocks, and `lock_all` cleared every channel, so there is nothing to
@@ -7641,7 +7658,17 @@ impl Node {
             }
         }
         let mut all = Vec::with_capacity(shared.len());
-        for (id, rooms) in shared {
+        for (id, mut rooms) in shared {
+            // Only sources above establish that this identity is eligible. A connected anchor's
+            // self-report supplies routes to itself, and can neither introduce a new identity
+            // nor make a room-scoped anchor serve another room.
+            if let Some(hints) = self.anchor_hints.get(&id) {
+                rooms.push(hints.endpoints.direct_candidates());
+            }
+            let reached = self.peer_book.endpoints(&id);
+            if !reached.is_empty() {
+                rooms.push(reached.direct_candidates());
+            }
             let mut union: Vec<std::net::SocketAddr> = Vec::new();
             let deepest = rooms.iter().map(Vec::len).max().unwrap_or(0);
             for i in 0..deepest {
@@ -7682,6 +7709,7 @@ impl Node {
     async fn network_changed(&mut self, change: &crate::nat::netwatch::NetChange) {
         self.anchor_backoff.clear();
         self.anchor_connected_at.clear();
+        self.anchor_hints_due.clear();
         self.anchor_dials
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -7780,6 +7808,8 @@ impl Node {
         self.room_anchors.retain(|room, _| open.contains_key(room));
         self.sync_anchor_scopes(&net);
         let known = self.kept_anchors();
+        self.anchor_hints_due
+            .retain(|id, _| known.iter().any(|(known, _)| known == id));
         // **A loss is noticed however the anchor went** (V210-93), in every build. A clean stop
         // closes the connection; a kill or a crash closes nothing, so the connection held is also
         // probed once it falls quiet, and closed here when nothing answers.
@@ -7843,6 +7873,7 @@ impl Node {
                 .entry(*id)
                 .and_modify(|at| *at = (*at).max(conn.session().ts_ms))
                 .or_insert(conn.session().ts_ms);
+            self.learn_anchor_endpoints(&net, Arc::clone(conn));
         }
         self.anchor_unreached_since
             .retain(|id, _| known.iter().any(|(k, _)| k == id) && !up.contains_key(id));
@@ -7872,6 +7903,112 @@ impl Node {
                         seconds_said(waited)
                     ),
                 );
+            }
+        }
+    }
+
+    /// Learn alternates while this path still works. One bounded request per connection/path,
+    /// then once per 30 seconds, off the actor; gateway discovery may finish after first contact.
+    fn learn_anchor_endpoints(&mut self, net: &Arc<NodeNet>, conn: Arc<VoxConnection>) {
+        let peer = conn.peer_id();
+        let now = self.now_ms().get();
+        let generation = net.manager().network_generation();
+        if self
+            .anchor_hints_due
+            .get(&peer)
+            .is_some_and(|(serial, path, due)| {
+                *serial == conn.serial() && *path == generation && now < *due
+            })
+        {
+            return;
+        }
+        self.anchor_hints_due.insert(
+            peer,
+            (conn.serial(), generation, now.saturating_add(30_000)),
+        );
+        let tx = self.net_tx.clone();
+        let net = Arc::clone(net);
+        tokio::spawn(async move {
+            let Ok(endpoints) = net
+                .manager()
+                .on_network(generation, crate::node::coordstream::ask_endpoints(&conn))
+                .await
+            else {
+                return;
+            };
+            let local = conn
+                .quinn()
+                .remote_address()
+                .ip()
+                .to_canonical()
+                .is_loopback();
+            let candidates = endpoints
+                .direct_candidates()
+                .into_iter()
+                .filter(|a| {
+                    a.port() != 0
+                        && !a.ip().is_unspecified()
+                        && !a.ip().is_multicast()
+                        && (local || !a.ip().to_canonical().is_loopback())
+                })
+                .map(Multiaddr::from)
+                .collect();
+            let Ok(endpoints) = EndpointList::new(candidates) else {
+                return;
+            };
+            let _ = tx
+                .send(NetEvent::AnchorEndpoints {
+                    peer,
+                    serial: conn.serial(),
+                    generation,
+                    endpoints,
+                })
+                .await;
+        });
+    }
+
+    fn keep_anchor_hints(&mut self, peer: Digest32, endpoints: EndpointList) -> bool {
+        if endpoints.is_empty()
+            || self
+                .anchor_hints
+                .get(&peer)
+                .is_some_and(|old| old.endpoints == endpoints)
+        {
+            return false;
+        }
+        // Replacement, not accumulation: a remote cannot grow one identity's retained history.
+        // At capacity the oldest retained identity gives way. Every use still checks authority.
+        let old: Vec<_> = self
+            .anchor_hints
+            .nodes()
+            .iter()
+            .filter(|n| n.id != peer)
+            .cloned()
+            .collect();
+        let skip = usize::from(old.len() >= crate::nat::bootstrap::MAX_BOOTSTRAP_NODES);
+        let mut next = BootstrapSet::new();
+        for node in old.into_iter().skip(skip) {
+            let _ = next.add(node);
+        }
+        if let Ok(node) = BootstrapNode::new(peer, endpoints) {
+            let _ = next.add(node);
+        }
+        self.anchor_hints = next;
+        true
+    }
+
+    fn save_anchor_hints(&self) {
+        if !self.anchor_hints_load_error {
+            if let Some(profile) = self.profile.as_ref() {
+                if let Ok(signer) = profile.signer() {
+                    if let Err(error) = crate::node::peer_book::save_anchor_hints(
+                        profile.store(),
+                        signer,
+                        &self.anchor_hints,
+                    ) {
+                        eprintln!("vox: anchor endpoint cache could not be saved: {error}");
+                    }
+                }
             }
         }
     }
@@ -8921,6 +9058,36 @@ impl Node {
             NetEvent::UpgradeFailed { peer, reason } => {
                 let _ = self.event_tx.send(NodeEvent::StillRelayed { peer, reason });
             }
+            NetEvent::AnchorEndpoints {
+                peer,
+                serial,
+                generation,
+                endpoints,
+            } => {
+                if !self.is_kept_anchor(&peer)
+                    || self.net.as_ref().is_none_or(|net| {
+                        net.manager().network_generation() != generation
+                            || net
+                                .manager()
+                                .held(&peer)
+                                .is_none_or(|conn| conn.serial() != serial)
+                    })
+                {
+                    return;
+                }
+                let Some(net) = self.net.as_ref().map(Arc::clone) else {
+                    return;
+                };
+                if net
+                    .manager()
+                    .on_current_network(generation, || self.keep_anchor_hints(peer, endpoints))
+                    == Some(true)
+                {
+                    // Disk sealing is outside the generation read guard; it must not delay a
+                    // new network event. The actor alone serializes writes to this hint cache.
+                    self.save_anchor_hints();
+                }
+            }
             NetEvent::AnchorConnected { conn, generation } => {
                 if self
                     .net
@@ -8977,6 +9144,9 @@ impl Node {
                 // holds is learnt again from the round below, before an address names it (V210-96).
                 self.on_board.retain(|(_, b)| *b != peer);
                 self.adopt_connection(Arc::clone(&conn));
+                if let Some(net) = self.net.as_ref().map(Arc::clone) {
+                    self.learn_anchor_endpoints(&net, Arc::clone(&conn));
+                }
                 self.refresh_network_view().await;
                 let channels: Vec<Digest32> = self.channels.keys().copied().collect();
                 for channel_id in channels {
@@ -16236,6 +16406,16 @@ impl Node {
         // each member fills it again.
         self.peer_book =
             crate::node::peer_book::PeerBook::load(profile.store(), signer).unwrap_or_default();
+        self.anchor_hints_load_error = false;
+        self.anchor_hints = match crate::node::peer_book::load_anchor_hints(profile.store(), signer)
+        {
+            Ok(hints) => hints,
+            Err(error) => {
+                self.anchor_hints_load_error = true;
+                eprintln!("vox: anchor endpoint cache could not be opened; preserving it: {error}");
+                BootstrapSet::new()
+            }
+        };
         self.consent_keys =
             crate::node::pending_consent::PendingConsents::load(profile.store(), signer)?;
         // The decision record is sealed under this identity too (#563): from now it is written,
@@ -16419,6 +16599,8 @@ impl Node {
         self.trust = crate::node::trust::Keyring::new();
         self.dismissed_offers = crate::node::offers::DismissedOffers::default();
         self.peer_book = crate::node::peer_book::PeerBook::new();
+        self.anchor_hints = BootstrapSet::new();
+        self.anchor_hints_due.clear();
         // The sender keys held for consents not yet delivered are room secrets: dropped, and
         // zeroized as they go (V210-76). They are reloaded, sealed, at the next unlock.
         self.consent_keys = crate::node::pending_consent::PendingConsents::default();

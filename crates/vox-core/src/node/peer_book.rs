@@ -83,6 +83,49 @@ fn peer_book_sek(signer: &dyn RootSigner) -> Result<Sek> {
     Ok(Sek::from_bytes(key))
 }
 
+/// Save bounded self-reported anchor hints in the node's existing sealed metadata store.
+/// A different metadata key and segment id keep them separate from addresses actually reached.
+/// This cache supplies no authorization; callers must intersect with current anchor sources.
+pub fn save_anchor_hints(
+    store: &Store,
+    signer: &dyn RootSigner,
+    hints: &crate::nat::bootstrap::BootstrapSet,
+) -> Result<()> {
+    let sealed = seal_segment(
+        &peer_book_sek(signer)?,
+        SegmentKind::Trust,
+        2,
+        &hints.to_bytes(),
+    )?;
+    let mut blob = Vec::with_capacity(NONCE_LEN + sealed.ciphertext.len());
+    blob.extend_from_slice(&sealed.nonce);
+    blob.extend_from_slice(&sealed.ciphertext);
+    store.put_meta("anchor-endpoint-hints", &blob)
+}
+
+/// Read the self-reported hint cache. Malformed/unsupported bytes are an error, never a reset.
+/// Its existing BootstrapSet codec bounds identities and each identity's endpoint list.
+pub fn load_anchor_hints(
+    store: &Store,
+    signer: &dyn RootSigner,
+) -> Result<crate::nat::bootstrap::BootstrapSet> {
+    let Some(blob) = store.get_meta("anchor-endpoint-hints")? else {
+        return Ok(crate::nat::bootstrap::BootstrapSet::new());
+    };
+    if blob.len() < NONCE_LEN {
+        return Err(Error::MalformedAtRest("anchor hint blob too short"));
+    }
+    let (nonce, ciphertext) = blob.split_at(NONCE_LEN);
+    let sealed = SealedSegment {
+        nonce: nonce
+            .try_into()
+            .map_err(|_| Error::MalformedAtRest("anchor hint nonce"))?,
+        ciphertext: ciphertext.to_vec(),
+    };
+    let plain = open_segment(&peer_book_sek(signer)?, SegmentKind::Trust, 2, &sealed)?;
+    crate::nat::bootstrap::BootstrapSet::from_bytes(&plain)
+}
+
 /// Where each member was last reached: `(address, last seen, unix milliseconds)`, most recent
 /// first.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

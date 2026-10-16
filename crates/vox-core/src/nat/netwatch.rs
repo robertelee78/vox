@@ -44,7 +44,7 @@ impl NetShape {
         let (route_v4, route_v6) = tokio::task::spawn_blocking(|| {
             (
                 route_v4_now(),
-                known(crate::nat::portmap::gateway::default_hop_result(true)),
+                known(crate::nat::portmap::gateway::default_path_result(true)),
             )
         })
         .await
@@ -102,7 +102,7 @@ fn route_v4_now() -> Option<Option<Hop>> {
             })
         });
     }
-    known(crate::nat::portmap::gateway::default_hop_result(false))
+    known(crate::nat::portmap::gateway::default_path_result(false))
 }
 
 /// **Test-only: the IPv4 default route's next hop, read from a file** (`VOX_TEST_ROUTE_V4_FILE`, in a
@@ -149,7 +149,8 @@ pub struct NetChange {
 #[derive(Default)]
 pub struct NetworkEvents {
     lost_links: BTreeSet<u32>,
-    lost_routes: BTreeSet<(bool, u32)>,
+    lost_routes: BTreeSet<(IpAddr, u32)>,
+    lost_addrs: BTreeSet<IpAddr>,
     overflow: bool,
 }
 
@@ -163,11 +164,11 @@ impl NetworkEvents {
         }
     }
 
-    fn lost(&self, route: &Option<Hop>, v6: bool) -> bool {
+    fn lost(&self, route: &Option<Hop>) -> bool {
         route.as_ref().is_some_and(|hop| {
             self.overflow
                 || self.lost_links.contains(&hop.index)
-                || self.lost_routes.contains(&(v6, hop.index))
+                || self.lost_routes.contains(&(hop.addr, hop.index))
         })
     }
 
@@ -179,9 +180,17 @@ impl NetworkEvents {
         }
     }
 
-    fn route_lost(&mut self, v6: bool, index: u32) {
+    fn route_lost(&mut self, gateway: IpAddr, index: u32) {
         if self.lost_routes.len() < 128 {
-            self.lost_routes.insert((v6, index));
+            self.lost_routes.insert((gateway, index));
+        } else {
+            self.overflow = true;
+        }
+    }
+
+    fn address_lost(&mut self, address: IpAddr) {
+        if self.lost_addrs.len() < 128 {
+            self.lost_addrs.insert(address);
         } else {
             self.overflow = true;
         }
@@ -206,9 +215,16 @@ impl NetChange {
         let went: Vec<IpAddr> = old.difference(&new).copied().collect();
         let mut routes = Vec::new();
         let said = |route: &Option<Hop>| {
-            route
-                .as_ref()
-                .map_or_else(|| "none".to_owned(), |hop| hop.addr.to_string())
+            route.as_ref().map_or_else(
+                || "none".to_owned(),
+                |hop| {
+                    if hop.addr.is_unspecified() {
+                        "on-link".into()
+                    } else {
+                        hop.addr.to_string()
+                    }
+                },
+            )
         };
         let path =
             |route: &Option<Hop>| route.as_ref().map(|hop| (hop.interface.clone(), hop.index));
@@ -224,8 +240,16 @@ impl NetChange {
                 },
             )
         };
-        let lost_v4 = events.lost(&before.route_v4, false);
-        let lost_v6 = events.lost(&before.route_v6, true);
+        let lost_v4 = events.lost(&before.route_v4)
+            || before
+                .addrs
+                .iter()
+                .any(|a| a.is_ipv4() && events.lost_addrs.contains(a));
+        let lost_v6 = events.lost(&before.route_v6)
+            || before
+                .addrs
+                .iter()
+                .any(|a| a.is_ipv6() && events.lost_addrs.contains(a));
         let moved_v4 =
             before.routes_known.0 && after.routes_known.0 && before.route_v4 != after.route_v4;
         let moved_v6 =
@@ -475,18 +499,42 @@ fn relevant(bytes: &[u8], events: &mut NetworkEvents) -> bool {
                 events.link_lost(u32::from(u16::from_ne_bytes([msg[12], msg[13]])));
             }
         }
-        // RTM_DELETE: only a default route on its named interface, never a neighbour route.
-        if kind == 2 && msg.len() >= 96 {
-            let addrs = u32::from_ne_bytes(msg[12..16].try_into().unwrap_or_default());
-            let index = u32::from(u16::from_ne_bytes([msg[4], msg[5]]));
-            let dst = &msg[92..];
-            let flags = u32::from_ne_bytes(msg[8..12].try_into().unwrap_or_default());
-            if flags & 4 == 0 && addrs & 1 != 0 && usize::from(dst[0]) <= dst.len() {
-                if dst[1] == 2 && dst[0] >= 8 && dst[4..8].iter().all(|b| *b == 0) {
-                    events.route_lost(false, index);
-                } else if dst[1] == 30 && dst[0] >= 24 && dst[8..24].iter().all(|b| *b == 0) {
-                    events.route_lost(true, index);
+        if let Some(path) = crate::nat::portmap::gateway::macos::withdrawn_default(msg) {
+            events.route_lost(path.addr, path.index);
+        }
+        // ifa_msghdr is 20 bytes; RTA_IFA is bit 5. Preserve address removal even if the
+        // address is restored before the settled snapshot and the interface never goes down.
+        if kind == 0xd && msg.len() >= 20 {
+            let addrs = u32::from_ne_bytes(msg[4..8].try_into().unwrap_or_default());
+            let mut pos = 20;
+            for bit in 0..8 {
+                if addrs & (1 << bit) == 0 {
+                    continue;
                 }
+                let Some(&len) = msg.get(pos) else {
+                    break;
+                };
+                let len = usize::from(len);
+                let Some(sa) = msg.get(pos..pos + len) else {
+                    break;
+                };
+                if bit == 5 {
+                    match sa.get(1).copied() {
+                        Some(2) if sa.len() >= 8 => events.address_lost(IpAddr::V4(
+                            std::net::Ipv4Addr::new(sa[4], sa[5], sa[6], sa[7]),
+                        )),
+                        Some(30) if sa.len() >= 24 => {
+                            let mut bytes: [u8; 16] = sa[8..24].try_into().unwrap_or_default();
+                            if bytes[0] == 0xfe && bytes[1] & 0xc0 == 0x80 {
+                                bytes[2] = 0;
+                                bytes[3] = 0;
+                            }
+                            events.address_lost(IpAddr::V6(std::net::Ipv6Addr::from(bytes)));
+                        }
+                        _ => {}
+                    }
+                }
+                pos += if len == 0 { 4 } else { (len + 3) & !3 };
             }
         }
         if len == 0 {
@@ -515,6 +563,29 @@ fn relevant(bytes: &[u8], events: &mut NetworkEvents) -> bool {
         }
         let msg = &bytes[at..at + len];
         found |= KINDS.contains(&kind);
+        if kind == 21 && msg.len() >= 24 {
+            let mut pos = 24;
+            while pos + 4 <= msg.len() {
+                let size = usize::from(u16::from_ne_bytes([msg[pos], msg[pos + 1]]));
+                let attr = u16::from_ne_bytes([msg[pos + 2], msg[pos + 3]]);
+                if size < 4 || pos + size > msg.len() {
+                    break;
+                }
+                let value = &msg[pos + 4..pos + size];
+                if matches!(attr, 1 | 2) {
+                    match (msg[16], value.len()) {
+                        (2, 4) => events.address_lost(IpAddr::V4(std::net::Ipv4Addr::new(
+                            value[0], value[1], value[2], value[3],
+                        ))),
+                        (10, 16) => events.address_lost(IpAddr::V6(std::net::Ipv6Addr::from(
+                            <[u8; 16]>::try_from(value).unwrap_or_default(),
+                        ))),
+                        _ => {}
+                    }
+                }
+                pos += (size + 3) & !3;
+            }
+        }
         if (kind == 16 || kind == 17) && msg.len() >= 32 {
             let index = u32::from_ne_bytes(msg[20..24].try_into().unwrap_or_default());
             let flags = u32::from_ne_bytes(msg[24..28].try_into().unwrap_or_default());
@@ -524,25 +595,45 @@ fn relevant(bytes: &[u8], events: &mut NetworkEvents) -> bool {
         }
         // rtmsg: family, destination prefix length, table; RTA_OIF names the outgoing
         // interface. Only default-route withdrawals can interrupt that family's active path.
-        if kind == 25
-            && msg.len() >= 28
-            && msg[17] == 0
-            && msg[20] == 254
-            && matches!(msg[16], 2 | 10)
-        {
+        if kind == 25 && msg.len() >= 28 && msg[17] == 0 && matches!(msg[16], 2 | 10) {
             let mut pos = 28;
+            let mut table = u32::from(msg[20]);
+            let mut interface = None;
+            let mut gateway = if msg[16] == 10 {
+                IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
+            } else {
+                IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+            };
             while pos + 4 <= msg.len() {
                 let size = usize::from(u16::from_ne_bytes([msg[pos], msg[pos + 1]]));
                 let attr = u16::from_ne_bytes([msg[pos + 2], msg[pos + 3]]);
                 if size < 4 || pos + size > msg.len() {
                     break;
                 }
-                if attr == 4 && size >= 8 {
-                    let index =
-                        u32::from_ne_bytes(msg[pos + 4..pos + 8].try_into().unwrap_or_default());
-                    events.route_lost(msg[16] == 10, index);
+                let value = &msg[pos + 4..pos + size];
+                match (attr, value.len()) {
+                    (4, 4) => {
+                        interface = Some(u32::from_ne_bytes(value.try_into().unwrap_or_default()))
+                    }
+                    (5, 4) if msg[16] == 2 => {
+                        gateway = IpAddr::V4(std::net::Ipv4Addr::new(
+                            value[0], value[1], value[2], value[3],
+                        ))
+                    }
+                    (5, 16) if msg[16] == 10 => {
+                        gateway = IpAddr::V6(std::net::Ipv6Addr::from(
+                            <[u8; 16]>::try_from(value).unwrap_or_default(),
+                        ))
+                    }
+                    (15, 4) => table = u32::from_ne_bytes(value.try_into().unwrap_or_default()),
+                    _ => {}
                 }
                 pos += (size + 3) & !3;
+            }
+            if table == 254 {
+                if let Some(index) = interface {
+                    events.route_lost(gateway, index);
+                }
             }
         }
         at += (len + 3) & !3;

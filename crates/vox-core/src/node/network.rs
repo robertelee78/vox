@@ -1170,6 +1170,10 @@ impl NodeNet {
                 match coordstream::serve_coord(
                     peer,
                     observed,
+                    self.service
+                        .is_served_anchor()
+                        .then(|| self.local_endpoints().ok())
+                        .flatten(),
                     &|p| self.classify(p),
                     &shares_room,
                     &transport,

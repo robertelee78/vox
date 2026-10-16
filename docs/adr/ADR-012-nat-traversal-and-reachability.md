@@ -262,7 +262,8 @@ relay circuit.
   - an **anchor** may open `rendezvous`, `sync`, `coord` and `circuit`;
   - a **pending joiner** may open `join`, `rendezvous`, `pairwise`, `coord` and `circuit`;
   - a **join responder** may open `pairwise`, `rendezvous` and `coord`;
-  - an **unknown** peer may open `rendezvous`, and `coord` for `WHOAMI` only;
+  - an **unknown** peer may open `rendezvous`, and `coord` for `WHOAMI`, plus `ENDPOINTS`
+    only when the responding node explicitly serves as an anchor (N-34);
   - anyone may open `goodbye`.
 
   A refused stream MUST be reset with the same coded rejection an unauthenticated peer gets, so that
@@ -287,6 +288,25 @@ relay circuit.
   room anchor. A removed source MUST cease authorizing its former uses; candidates retained for a
   pending withdrawal MAY be used only to complete that cleanup. Recovery MUST NOT grant trust,
   change room governance, or initiate an anchor search the person did not choose (ADR-032 AN-6).
+
+  **Learn the known anchor's alternate paths (2026-10-15, #937; not yet delivered).** While an
+  authorized anchor is reachable, the node MUST request its own current advertised endpoints
+  over that anchor's authenticated connection. This closes the source-confirmed gap where a
+  LAN-only bootstrap could never learn the same anchor's public route before moving to a hotspot.
+  The existing coord stream is to carry a bounded `ENDPOINTS` / `ADVERTISED` exchange: at most
+  `MAX_ENDPOINTS`, a three-second whole request, initially and no more than once per 30 seconds
+  per connection/path thereafter. Only explicitly served anchors disclose this list to unknown
+  peers; ordinary nodes MUST refuse. The cache MUST be bounded per identity and in total, stored
+  in the node's existing sealed local metadata, and reloaded so a restart on the new network can
+  recover from an originally LAN-only bootstrap. A hint's age MUST NOT discard the only known
+  alternate before trying a fresh authenticated dial. No cached hint may be used when no current
+  source authorizes that identity; removal must suppress its use without a configuration rewrite.
+  Old-generation responses MUST NOT replace current hints. Hints MUST NOT be persisted as proven
+  peer-book observations; later dials MUST prove the same fingerprint. Neither this request nor
+  its response grants trust, relay access, room membership or publication authority. The anchor's
+  own advertised endpoints, not a client's reflexive address or a guessed public IP, supply the
+  alternates. An anchor that has no usable advertised alternate cannot promise one; an unknown
+  public service cannot be discovered after every known path has already been lost.
 - **N-35. Publisher sequence (V29-23).** A publisher's `seq` MUST keep rising across its restarts:
   `max(previous + 1, now in ms)`.
 - **N-36. A peer book (2026-09-25, found by ADR-023's R10 gate).** A node MUST keep each member's last direct addresses (at most

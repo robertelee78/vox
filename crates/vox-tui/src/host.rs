@@ -132,6 +132,7 @@ struct Inner {
 struct MachineAnchors {
     revision: u64,
     specs: Vec<String>,
+    inputs: Vec<(String, String)>,
     set: BootstrapSet,
     skipped: Vec<String>,
 }
@@ -352,6 +353,7 @@ impl Router {
                     manual_anchors: tokio::sync::Mutex::new(MachineAnchors {
                         revision: 0,
                         specs: defaults.anchor_specs.clone(),
+                        inputs: Vec::new(),
                         set: defaults.anchors.clone(),
                         skipped: Vec::new(),
                     }),
@@ -436,32 +438,124 @@ impl Router {
             }
             (state.revision, state.specs.clone(), state.set.clone())
         };
-        let Ok(refresh) = Arc::clone(&self.inner.manual_refresh).try_lock_owned() else {
-            return (
-                previous,
-                vec!["machine anchor resolution is still in progress".into()],
-            );
-        };
         let network = self.machine_network();
         let generation = network.as_ref().map(|network| *network.borrow());
         let account = self.inner.account.clone();
-        let resolved = tokio::task::spawn_blocking(move || {
-            let _refresh = refresh;
-            let mut set = BootstrapSet::new();
-            let mut skipped = vox_core::node::link::merge_machine_anchors(&mut set, &account)
-                .unwrap_or_else(|error| vec![error.to_string()]);
-            for spec in specs {
-                if let Err(error) = vox_core::node::link::merge_anchor_spec(&mut set, &spec) {
-                    skipped.push(format!("anchor {spec} is skipped: {error}"));
+        // Read configuration independently of any outstanding DNS worker. A stuck hostname
+        // must not prevent a newly added numeric candidate from becoming usable.
+        let read = tokio::task::spawn_blocking(move || {
+            let (mut inputs, skipped) = vox_core::node::link::machine_anchor_inputs(&account);
+            inputs.extend(
+                specs
+                    .into_iter()
+                    .map(|spec| (format!("anchor {spec}"), spec)),
+            );
+            (inputs, skipped)
+        });
+        let (inputs, mut skipped) = match tokio::time::timeout(Duration::from_secs(3), read).await {
+            Ok(Ok(inputs)) => inputs,
+            _ => {
+                return (
+                    previous,
+                    vec![
+                        "machine anchor inputs could not be read within 3 seconds; retrying".into(),
+                    ],
+                )
+            }
+        };
+        let mut numeric = BootstrapSet::new();
+        let mut names = Vec::new();
+        for (label, spec) in &inputs {
+            let address = spec
+                .split_once('@')
+                .map(|(_, addr)| addr.trim())
+                .unwrap_or("");
+            let hostname = address.starts_with("/dns")
+                || (!address.is_empty()
+                    && !address.starts_with('/')
+                    && address.parse::<std::net::SocketAddr>().is_err());
+            if hostname {
+                names.push((label.clone(), spec.clone()));
+            } else if let Err(error) = vox_core::node::link::merge_anchor_spec(&mut numeric, spec) {
+                skipped.push(format!("{label} is skipped: {error}"));
+            }
+        }
+        // Retain cached candidates only for still-configured hostname identities while their
+        // resolver is unavailable. Removed authority is never resurrected by this fallback.
+        let mut interim = numeric.clone();
+        for (_, spec) in &names {
+            if let Some(id) = spec
+                .split_once('@')
+                .and_then(|(id, _)| vox_core::node::link::fingerprint_input(id, "anchor").ok())
+            {
+                if let Some(node) = previous.get(&id) {
+                    for spec in vox_core::node::link::anchor_specs(node) {
+                        let _ = vox_core::node::link::merge_anchor_spec(&mut interim, &spec);
+                    }
                 }
             }
-            (set, skipped)
+        }
+        let revision = {
+            let mut state = self.inner.manual_anchors.lock().await;
+            {
+                let current = network.as_ref().map(watch::Receiver::borrow);
+                if state.revision != revision || current.as_deref().copied() != generation {
+                    return (
+                        state.set.clone(),
+                        vec![
+                            "machine anchors or network changed during input read; retrying".into(),
+                        ],
+                    );
+                }
+                if state.inputs != inputs {
+                    state.inputs = inputs;
+                    state.revision = state.revision.wrapping_add(1);
+                }
+                if skipped != state.skipped {
+                    for line in &skipped {
+                        eprintln!("vox daemon: {line}");
+                    }
+                }
+                state.set = interim.clone();
+                state.skipped = skipped.clone();
+            }
+            self.deliver_manual_anchors(&state).await;
+            state.revision
+        };
+        if names.is_empty() {
+            return (interim, skipped);
+        }
+        let Ok(refresh) = Arc::clone(&self.inner.manual_refresh).try_lock_owned() else {
+            skipped.push(
+                "machine anchor DNS is still in progress; numeric endpoints are available".into(),
+            );
+            return (interim, skipped);
+        };
+        let cached = interim.clone();
+        let resolved = tokio::task::spawn_blocking(move || {
+            let mut set = numeric;
+            for (label, spec) in names {
+                if let Err(error) = vox_core::node::link::merge_anchor_spec(&mut set, &spec) {
+                    skipped.push(format!("{label} is skipped: {error}"));
+                    if let Some(id) = spec.split_once('@').and_then(|(id, _)| {
+                        vox_core::node::link::fingerprint_input(id, "anchor").ok()
+                    }) {
+                        if let Some(node) = cached.get(&id) {
+                            for spec in vox_core::node::link::anchor_specs(node) {
+                                let _ = vox_core::node::link::merge_anchor_spec(&mut set, &spec);
+                            }
+                        }
+                    }
+                }
+            }
+            // Hold the refresh guard through publication, not just resolution. A completed
+            // older refresh must not overwrite a newer same-revision refresh out of order.
+            (set, skipped, refresh)
         });
-        let resolved = tokio::time::timeout(Duration::from_secs(3), resolved).await;
-        let (set, skipped) = match resolved {
+        let (set, skipped, _refresh) = match tokio::time::timeout(Duration::from_secs(3), resolved).await {
             Ok(Ok(resolved)) => resolved,
-            Ok(Err(error)) => return (previous, vec![format!("machine anchor refresh did not finish: {error}")]),
-            Err(_) => return (previous, vec!["machine anchor DNS did not finish within 3 seconds; keeping current endpoints and retrying".into()]),
+            Ok(Err(error)) => return (interim, vec![format!("machine anchor refresh did not finish: {error}")]),
+            Err(_) => return (interim, vec!["machine anchor DNS did not finish within 3 seconds; numeric endpoints are available, retrying".into()]),
         };
         let mut state = self.inner.manual_anchors.lock().await;
         {
@@ -477,8 +571,6 @@ impl Router {
                     eprintln!("vox daemon: {line}");
                 }
             }
-            // Publication and the generation comparison share the watch read guard. The
-            // configuration lock is never held across DNS; attachment and inventory stay live.
             state.set = set;
             state.skipped = skipped;
         }
@@ -504,6 +596,8 @@ impl Router {
     ) -> Result<Vec<AnchorInfo>, String> {
         // Lookup is bounded network work outside the writer lock; only its verified result is
         // committed. A supplied fingerprint is an offline configuration input, not reach proof.
+        let network = self.machine_network();
+        let generation = network.as_ref().map(|network| *network.borrow());
         let (add, resolved_add) = match add {
             Some(input) => {
                 let (input, node) = self.resolve_anchor_input(&input).await?;
@@ -531,13 +625,16 @@ impl Router {
             }
             state.set = set;
         }
-        if let Some(node) = resolved_add {
-            // The lookup finished before the writer lock. These are numeric multiaddrs,
-            // so neither publication nor another node's attachment waits for DNS here.
-            for spec in vox_core::node::link::anchor_specs(&node) {
-                vox_core::node::link::merge_anchor_spec(&mut state.set, &spec).map_err(
-                    |error| format!("manual anchor saved but endpoint update failed: {error}"),
-                )?;
+        {
+            let current = network.as_ref().map(watch::Receiver::borrow);
+            if let Some(node) = resolved_add.filter(|_| current.as_deref().copied() == generation) {
+                // The lookup finished before the writer lock. These are numeric multiaddrs,
+                // so neither publication nor another node's attachment waits for DNS here.
+                for spec in vox_core::node::link::anchor_specs(&node) {
+                    vox_core::node::link::merge_anchor_spec(&mut state.set, &spec).map_err(
+                        |error| format!("manual anchor saved but endpoint update failed: {error}"),
+                    )?;
+                }
             }
         }
         self.deliver_manual_anchors(&state).await;

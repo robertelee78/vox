@@ -697,6 +697,13 @@ impl RendezvousService {
         self.rooms.may_anchor(genesis)
     }
 
+    /// Whether this node explicitly serves as an anchor, rather than only holding its own rooms.
+    /// Only that public role offers its endpoint list to arbitrary authenticated peers.
+    #[must_use]
+    pub fn is_served_anchor(&self) -> bool {
+        !matches!(self.rooms, AnchorRooms::Held)
+    }
+
     /// Bind transport registrations to this authenticated network identity.
     pub(crate) fn computer_anchor(&mut self, identity: Digest32) {
         self.computer_anchor = Some(identity);
