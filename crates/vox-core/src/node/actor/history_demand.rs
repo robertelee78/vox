@@ -905,6 +905,16 @@ fn prepare_local(
     if state.binding.room != room || state.binding.instance != instance {
         return Err("The saved history request belongs to a different room or instance.".into());
     }
+    // The live actor retains Cancelled long enough for the command that performed cancellation to
+    // observe its terminal result. Once that actor is gone, a fully reclaimed terminal header is
+    // only a durable fence and binding record, not an active request to reconstruct after restart.
+    // Exposing it again made a cleanly reopened room look permanently cancelled instead of Idle.
+    if matches!(action, Action::Status)
+        && matches!(state.progress(None), demand::Progress::Cancelled)
+        && !state.reclaiming()
+    {
+        return Ok(answer);
+    }
     answer.status = saved_status(state, None, None);
     match action {
         Action::Status => {}
