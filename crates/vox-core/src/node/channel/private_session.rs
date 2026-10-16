@@ -1072,6 +1072,7 @@ impl ChannelState {
             &support_body(&self.channel_id, &me),
             now,
             EntryKind::Content,
+            false,
         )?;
         Ok(())
     }

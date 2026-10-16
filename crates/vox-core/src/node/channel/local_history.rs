@@ -212,7 +212,7 @@ impl ChannelState {
                 return Ok(Some(prepared));
             }
         }
-        self.authored_kind(profile, author, kind, recipient, claimed_ms)
+        self.authored_kind(profile, author, kind, recipient, claimed_ms, false)
             .map(Some)
     }
 
@@ -232,8 +232,16 @@ impl ChannelState {
             return Ok(());
         }
         self.local_content_header = None;
-        let prepared =
-            self.authored_kind(profile, author, SignedEntryKind::Content, None, claimed_ms)?;
+        // This is reached only from an intentional post. Its context control, when required,
+        // is part of that same operation and must share the post's departure exception.
+        let prepared = self.authored_kind(
+            profile,
+            author,
+            SignedEntryKind::Content,
+            None,
+            claimed_ms,
+            true,
+        )?;
         self.local_content_header = Some(prepared);
         Ok(())
     }
@@ -245,12 +253,19 @@ impl ChannelState {
         kind: SignedEntryKind,
         recipient: Option<Digest32>,
         claimed_ms: u64,
+        after_departure: bool,
     ) -> Result<(EntryV2, Vec<Digest32>)> {
         let mut budget = LocalAppendBudget::new();
         budget.reserve_context_preparation()?;
         let (mut context, seen, changed) = self.authored_context(profile.store(), author)?;
         if kind == SignedEntryKind::Content && changed {
-            self.append_control_kind(profile, &[], claimed_ms, EntryKind::Content)?;
+            self.append_control_kind(
+                profile,
+                &[],
+                claimed_ms,
+                EntryKind::Content,
+                after_departure,
+            )?;
             // The inserted control has exactly the selected context and seen references.
             // Reuse that selection; only its new own coordinate changes the post-context.
             let read = self

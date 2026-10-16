@@ -175,7 +175,7 @@ impl ChannelState {
                 first_seq,
                 membership,
             };
-            self.append_control_kind(profile, &floor.wire(), now, EntryKind::Content)?;
+            self.append_control_kind(profile, &floor.wire(), now, EntryKind::Content, false)?;
             self.drive.clear_omissions();
         }
         Ok(())

@@ -5640,7 +5640,7 @@ impl ChannelState {
     /// Append a control entry (a checkpoint) on this identity's own feed: signed and stored
     /// like governance, never folded into the ADR-007 evaluator, since it grants nothing.
     fn append_control(&mut self, profile: &Profile, payload: &[u8], now_ms: u64) -> Result<()> {
-        self.append_control_kind(profile, payload, now_ms, EntryKind::Checkpoint)
+        self.append_control_kind(profile, payload, now_ms, EntryKind::Checkpoint, false)
     }
 
     fn append_control_kind(
@@ -5649,8 +5649,9 @@ impl ChannelState {
         payload: &[u8],
         now_ms: u64,
         kind: EntryKind,
+        after_departure: bool,
     ) -> Result<()> {
-        self.ensure_local_append_available(profile.store())?;
+        self.ensure_local_append_available_for(profile.store(), after_departure)?;
         if self.poisoned {
             return Err(self.save_failure());
         }
