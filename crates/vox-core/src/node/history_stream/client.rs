@@ -188,7 +188,7 @@ impl Receiver {
                             result.status = Status::Busy;
                             return Ok(result);
                         }
-                        Staged::Head { head, tail, author } if *tail > 0 => {
+                        Staged::Head { head, tail, author } => {
                             if result.heads.len() >= MAX_NEEDS {
                                 return Err(Error::SizeLimitExceeded("history head result bound"));
                             }
@@ -197,12 +197,13 @@ impl Receiver {
                                 head: *head,
                                 size: *tail,
                             });
-                            result.need(Query::Header {
-                                head: *head,
-                                seq: *tail,
-                            })?;
+                            if *tail > 0 {
+                                result.need(Query::Header {
+                                    head: *head,
+                                    seq: *tail,
+                                })?;
+                            }
                         }
-                        Staged::Head { .. } => {}
                         Staged::Verifier(binding) => {
                             if result.verifiers.len() == MAX_NEEDS {
                                 return Err(Error::SizeLimitExceeded("history verifier handoff"));
