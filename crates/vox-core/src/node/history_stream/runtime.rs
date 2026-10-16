@@ -826,14 +826,18 @@ impl Flow {
                         } | LocalStep::Control { .. }
                     );
                     if !self.archive && result.need.is_some() && rederive {
-                        // Keep the oldest exact root, not an unbounded ancestry stack.
-                        // Their proof inputs and control-prefix progress are sealed. Any
-                        // exact staged body/slot stays owned by this Flow, unchanged. Once the dependency work
-                        // drains, this root discovers any omitted intermediate work again.
-                        // Verify/Validate, Body, publication, effects, reclaim
-                        // and explicit archive continuations are never compacted.
+                        // Keep the oldest exact root in the scalar replay slot. Once that slot is
+                        // occupied, retain each nested continuation on the existing bounded task
+                        // stack: the dependency pushed below executes first, then the exact entry
+                        // or control operation that requested it can publish its durable result.
+                        // Dropping a nested continuation would finish its proofs but leave no work
+                        // able to apply them, causing the root to repeat the same dependency cycle.
+                        // Verify/Validate, Body, publication, effects, reclaim and explicit archive
+                        // continuations are never compacted.
                         if self.replay.is_none() {
                             self.replay = Some(continuation);
+                        } else {
+                            self.push(continuation)?;
                         }
                     } else {
                         self.push(continuation)?;
