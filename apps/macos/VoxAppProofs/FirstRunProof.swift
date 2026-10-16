@@ -2823,15 +2823,20 @@ final class FirstRunProof: XCTestCase {
         let readyUntil = Date().addingTimeInterval(60)
         var readyPost: (status: Int32, out: String) = (-1, "")
         var readyRead: (status: Int32, out: String) = (-1, "")
-        while Date() < readyUntil && !readyRead.out.contains(readyMarker) {
+        // Post one durable marker, as a person does. Posting another marker on every read poll
+        // starts fresh live-sync work while the two reopened rooms are already reconnecting; the
+        // proof itself could then keep the bounded history buffers busy and prevent its first
+        // marker from being observed.
+        while Date() < readyUntil && readyPost.status != 0 {
             readyPost = run(vox, ["room", "post", "--node", "claude-a", room, readyMarker], env: voxEnv)
-            if readyPost.status == 0 {
-                readyRead = run(vox, ["room", "read", "--node", "alice", room], env: voxEnv)
-            }
+            if readyPost.status != 0 { Thread.sleep(forTimeInterval: 0.5) }
+        }
+        while Date() < readyUntil && !readyRead.out.contains(readyMarker) {
+            readyRead = run(vox, ["room", "read", "--node", "alice", room], env: voxEnv)
             if !readyRead.out.contains(readyMarker) { Thread.sleep(forTimeInterval: 0.5) }
         }
         guard readyPost.status == 0, readyRead.out.contains(readyMarker) else {
-            throw Apparatus("peer readiness was not re-established after Alice's Unlock; post said \(readyPost.out.debugDescription), read said \(readyRead.out.debugDescription)")
+            throw Apparatus("peer readiness was not re-established after Alice's Unlock; post exited \(readyPost.status) saying \(readyPost.out.debugDescription), read exited \(readyRead.status) saying \(readyRead.out.debugDescription)")
         }
         // Claude Code's two sessions, opened by its hook as it runs it.
         let hookEnv = voxEnv.merging(["HOME": home, "VOX_NODE": "claude-a",
