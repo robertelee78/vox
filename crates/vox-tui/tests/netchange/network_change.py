@@ -112,6 +112,7 @@ DAEMONS = {}
 ANCHOR_SPEC = None
 ANCHOR_ID = None
 ANCHOR_PROC = None
+ANCHOR_PORT = None
 code = 2
 results = {}
 
@@ -349,7 +350,7 @@ def trust(w, peer, name):
         while True:
             if time.monotonic() >= deadline:
                 os.kill(pid, signal.SIGKILL)
-                raise Product(f"{w}'s terminal trust add did not finish within 120 s: {out!r}")
+                raise Apparatus(f"mutual-trust staging watchdog expired after 120 s for {w}: {out!r}")
             ready, _, _ = select.select([fd], [], [], 0.2)
             if not ready:
                 continue
@@ -380,12 +381,12 @@ def trust(w, peer, name):
             os.waitpid(pid, 0)
 
 def until(pred, secs, step=0.1):
-    end = time.time() + secs
-    while time.time() < end:
+    end = time.monotonic() + secs
+    while time.monotonic() < end:
         if pred():
-            return True
-        time.sleep(step)
-    return pred()
+            return time.monotonic() <= end
+        time.sleep(min(step, max(0, end - time.monotonic())))
+    return False
 
 def log(w):
     return open(f"{S}/{w}.err").read()
@@ -414,7 +415,7 @@ def start_daemon(w, listen):
         raise Product(f"{w}'s daemon never answered within 60 s: {log(w)}")
 
 def start_anchor():
-    global ANCHOR_SPEC, ANCHOR_ID, ANCHOR_PROC
+    global ANCHOR_SPEC, ANCHOR_ID, ANCHOR_PROC, ANCHOR_PORT
     if b"VOX_TEST_ADVERTISE" not in open(VOX, "rb").read():
         raise Apparatus("anchor alternate staging needs the existing test-knobs build (VOX_TEST_ADVERTISE)")
     for directory in ("data", "cfg"):
@@ -422,6 +423,7 @@ def start_anchor():
     reserve = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     reserve.bind(("0.0.0.0", 0))
     port = reserve.getsockname()[1]
+    ANCHOR_PORT = port
     reserve.close()
     anchor_env = env("anchor")
     # The real anchor's own published list, standing for its LAN and mapped public endpoint.
@@ -469,6 +471,23 @@ try:
     if LINUX:
         start_anchor()
     listen = {"d": "0.0.0.0:0", "p": "10.99.0.2:0"}
+    if LINUX:
+        reserve = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        reserve.bind(("0.0.0.0", 0))
+        d_port = reserve.getsockname()[1]
+        reserve.close()
+        listen["d"] = f"0.0.0.0:{d_port}"
+        # D may learn the alternate address, but cannot ever authenticate a connection there
+        # before its cold restart. Otherwise the ordinary peer book could mask broken hint
+        # persistence. This is external packet staging, with no cache inspection or deletion.
+        rules = f"{S}/unreached-anchor-alternate.nft"
+        open(rules, "w").write(
+            "table inet vox_anchor_bootstrap { chain output { type filter hook output priority 0; policy accept; "
+            f"ip daddr 10.99.0.3 udp sport {d_port} udp dport {ANCHOR_PORT} counter drop; "
+            f"ip saddr 10.99.0.3 udp sport {ANCHOR_PORT} udp dport {d_port} counter drop; " + "} }\n")
+        sh("nft", "-f", rules)
+        print(f"{TAG} D cannot reach the advertised alternate until its cold restart: " +
+              sh("nft", "list", "table", "inet", "vox_anchor_bootstrap"), flush=True)
     for w in ("d", "p"):
         start_daemon(w, listen[w])
 
@@ -570,10 +589,17 @@ try:
     staged("after the move", "10.88.0.2", ["10.88.0.2", "10.99.0.2"], ["10.77.0.2"])
     MOVED = True
     # ---- redial: with nothing sent, D holds a new connection to P within 3 s ----
-    redialled = until(lambda: held_to_p() not in (None, before), 3, 0.1)
-    now = held_to_p()
-    claim("redial", redialled,
-          f"D's connection to P before the change {before}, {time.time() - moved:.2f} s after it {now}")
+    redial_observed = []
+    def new_connection():
+        current = held_to_p()
+        if current not in (None, before):
+            redial_observed.append((time.time(), current))
+            return True
+        return False
+    redialled = until(new_connection, max(0, moved + 3 - time.time()), 0.1)
+    observed, now = redial_observed[0] if redial_observed else (None, None)
+    claim("redial", redialled and observed is not None and observed - moved <= 3,
+          f"D's connection to P before the change {before}, first new connection {now} at {None if observed is None else round(observed - moved, 2)} s after it")
     ok("d", "room", "post", room, "AFTER-THE-MOVE")
     posted = time.time()
 
@@ -605,6 +631,9 @@ try:
         # trust change, address-file edit or new infrastructure is supplied at this boundary.
         DAEMONS["d"].kill()
         DAEMONS["d"].wait(timeout=10)
+        print(f"{TAG} alternate remained blocked until D stopped: " +
+              sh("nft", "list", "table", "inet", "vox_anchor_bootstrap"), flush=True)
+        sh("nft", "delete", "table", "inet", "vox_anchor_bootstrap")
         start_daemon("d", listen["d"])
         anchor_reached = until(lambda: any(row.get("id") == ANCHOR_ID and row.get("reached")
                               for row in status_of("d").get("node_anchors", [])), 20, 0.1)
@@ -661,8 +690,8 @@ except Product as e:
     print(f"{TAG} RED", flush=True)
     code = 1
 except subprocess.TimeoutExpired as t:
-    print(f"{TAG} PRODUCT: {t.cmd!r} did not finish within {t.timeout:.0f} s", flush=True)
-    code = 1
+    print(f"{TAG} APPARATUS: subprocess watchdog expired for {t.cmd!r} after {t.timeout:.0f} s; no result from this observation", flush=True)
+    code = 2
 except Exception:
     print(f"{TAG} APPARATUS: driver crashed: {traceback.format_exc()}", flush=True)
     code = 2
