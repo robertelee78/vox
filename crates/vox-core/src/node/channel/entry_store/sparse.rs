@@ -25,6 +25,17 @@ pub(crate) struct LocalHistoryPublication<'a> {
     pub ranges: &'a [(u64, Descriptor)],
 }
 
+/// Exact locally verified publication whose semantic effects may be marked settled only in
+/// the same append transaction. Fields stay private so no remote or merely observed entry can
+/// manufacture local completion.
+#[must_use]
+pub(crate) struct LocalHistorySettlement {
+    entry: Digest32,
+    head: Digest32,
+    author: Digest32,
+    seq: u64,
+}
+
 const MAX_OBLIGATIONS: u64 = 4096;
 const STATE_BYTES: usize = 256;
 
@@ -1028,7 +1039,7 @@ impl Write<'_, '_> {
     pub(crate) fn publish_local_history(
         &mut self,
         publication: LocalHistoryPublication<'_>,
-    ) -> Result<()> {
+    ) -> Result<LocalHistorySettlement> {
         let LocalHistoryPublication {
             entry,
             header,
@@ -1096,7 +1107,12 @@ impl Write<'_, '_> {
             if !self.keep_history_obligation(&Obligation::authority(signed.id(), entry))? {
                 return Err(invalid("pending local effect obligation capacity reached"));
             }
-            Ok(())
+            Ok(LocalHistorySettlement {
+                entry: entry.entry_hash(),
+                head: signed.id(),
+                author: entry.skeleton.author_id,
+                seq: entry.skeleton.seq,
+            })
         })();
         self.directory.phase = Phase::Switched;
         result
@@ -1150,10 +1166,45 @@ impl Write<'_, '_> {
         entry: &Entry,
         finished: &super::super::sparse_history::FinishedHistoryEffect,
     ) -> Result<()> {
-        self.require_sparse_idle()?;
         if finished.entry_hash() != entry.entry_hash() {
             return Err(invalid("sparse effect token differs"));
         }
+        self.finish_history_effect_bookkeeping(entry, None)
+    }
+
+    /// Consume only the opaque token returned by this exact local publication. The caller has
+    /// already written the entry's semantic rows into the same Batch; a later failure rolls all
+    /// of this back together.
+    pub(crate) fn finish_local_history_effect(
+        &mut self,
+        entry: &Entry,
+        settlement: LocalHistorySettlement,
+    ) -> Result<()> {
+        let promotion = self
+            .directory
+            .promotion
+            .as_ref()
+            .ok_or(invalid("local settlement publication absent"))?;
+        if self.directory.phase != Phase::Switched
+            || promotion.witness_hash != settlement.entry
+            || settlement.entry != entry.entry_hash()
+            || settlement.author != entry.skeleton.author_id
+            || settlement.seq != entry.skeleton.seq
+        {
+            return Err(invalid("local settlement binding"));
+        }
+        self.directory.phase = Phase::Idle;
+        let result = self.finish_history_effect_bookkeeping(entry, Some(settlement.head));
+        self.directory.phase = Phase::Switched;
+        result
+    }
+
+    fn finish_history_effect_bookkeeping(
+        &mut self,
+        entry: &Entry,
+        expected_head: Option<Digest32>,
+    ) -> Result<()> {
+        self.require_sparse_idle()?;
         let roots = self.directory.active;
         let source = Source::Batch(self.batch);
         let held = source
@@ -1224,6 +1275,9 @@ impl Write<'_, '_> {
             head_record,
             MAX_HEADER_BYTES,
         )?)?;
+        if expected_head.is_some_and(|expected| expected != head.id()) {
+            return Err(invalid("local settlement head differs"));
+        }
         self.finish_history_obligation(&Obligation::authority(head.id(), entry))?;
         Ok(())
     }

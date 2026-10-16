@@ -3536,21 +3536,25 @@ impl ChannelState {
         &mut self,
         batch: &mut crate::node::store::Batch<'_>,
         entry: &Entry,
-    ) -> Result<()> {
+    ) -> Result<Option<entry_store::sparse::LocalHistorySettlement>> {
         let mut index = self.entries.write(batch, &self.sek, &self.channel_id)?;
         index.publish_promotion()?;
-        if let Some(prepared) = &self.local_history {
-            index.publish_local_history(entry_store::sparse::LocalHistoryPublication {
-                entry,
-                header: &prepared.header,
-                head: &prepared.head,
-                consistency: &prepared.consistency,
-                included: &prepared.included,
-                pre_context: &prepared.pre,
-                post_context: &prepared.post,
-                ranges: &prepared.ranges,
-            })?;
-        }
+        let settlement = if let Some(prepared) = &self.local_history {
+            Some(
+                index.publish_local_history(entry_store::sparse::LocalHistoryPublication {
+                    entry,
+                    header: &prepared.header,
+                    head: &prepared.head,
+                    consistency: &prepared.consistency,
+                    included: &prepared.included,
+                    pre_context: &prepared.pre,
+                    post_context: &prepared.post,
+                    ranges: &prepared.ranges,
+                })?,
+            )
+        } else {
+            None
+        };
         index.seal()?;
         session_projection::private_index::observe_public(
             batch,
@@ -3558,7 +3562,21 @@ impl ChannelState {
             &self.channel_id,
             entry,
             self.epoch,
-        )
+        )?;
+        Ok(settlement)
+    }
+
+    /// The local append's user-visible effects have been written into `batch`. Seal the exact
+    /// sparse settlement token before the same commit, so neither side can survive alone.
+    fn finish_local_history_effect_into(
+        &self,
+        batch: &mut crate::node::store::Batch<'_>,
+        entry: &Entry,
+        settlement: entry_store::sparse::LocalHistorySettlement,
+    ) -> Result<()> {
+        let mut index = self.entries.write(batch, &self.sek, &self.channel_id)?;
+        index.finish_local_history_effect(entry, settlement)?;
+        index.seal()
     }
 
     fn finish_entry_publication(&mut self, store: &Store) -> Result<()> {
@@ -3700,8 +3718,11 @@ impl ChannelState {
         let persisted = (|| -> Result<()> {
             self.prepare_local_entry(profile, &entry, EntryKind::Content, &key, now_millis)?;
             let mut batch = profile.store().batch()?;
-            self.publish_entry_into(&mut batch, &entry)?;
+            let settlement = self
+                .publish_entry_into(&mut batch, &entry)?
+                .ok_or(Error::Profile("local history settlement missing"))?;
             self.observe_governance_into(profile.store(), &mut batch, &entry, id)?;
+            self.finish_local_history_effect_into(&mut batch, &entry, settlement)?;
             batch.commit()
         })();
         if let Err(e) = persisted {
@@ -5667,8 +5688,11 @@ impl ChannelState {
         let persisted = (|| -> Result<()> {
             self.prepare_local_entry(profile, &entry, kind, &signer.public_key(), now_ms)?;
             let mut batch = profile.store().batch()?;
-            self.publish_entry_into(&mut batch, &entry)?;
+            let settlement = self
+                .publish_entry_into(&mut batch, &entry)?
+                .ok_or(Error::Profile("local history settlement missing"))?;
             self.observe_governance_into(profile.store(), &mut batch, &entry, id)?;
+            self.finish_local_history_effect_into(&mut batch, &entry, settlement)?;
             batch.commit()
         })();
         if let Err(e) = persisted {
@@ -6031,7 +6055,9 @@ impl ChannelState {
         let written = (|| -> Result<()> {
             self.prepare_local_entry(profile, &entry, kind, &key, now_ms)?;
             let mut batch = profile.store().batch()?;
-            self.publish_entry_into(&mut batch, &entry)?;
+            let settlement = self
+                .publish_entry_into(&mut batch, &entry)?
+                .ok_or(Error::Profile("local history settlement missing"))?;
             self.observe_governance_into(profile.store(), &mut batch, &entry, id)?;
             batch.put_segment(&self.channel_id, SegmentKind::LogDb, id, &log_seg)?;
             for (row, seg) in rows {
@@ -6040,6 +6066,7 @@ impl ChannelState {
             if settle_sparse {
                 batch.delete_segment(&self.channel_id, SegmentKind::KeyMaterial, SEG_UNSETTLED)?;
             }
+            self.finish_local_history_effect_into(&mut batch, &entry, settlement)?;
             batch.commit()
         })();
         if let Err(e) = written {
@@ -7965,7 +7992,9 @@ impl ChannelState {
         let persisted = (|| -> Result<()> {
             self.prepare_entry(store, &entry, kind, &key, now_ms)?;
             let mut batch = store.batch()?;
-            self.publish_entry_into(&mut batch, &entry)?;
+            if self.publish_entry_into(&mut batch, &entry)?.is_some() {
+                return Err(Error::Profile("remote entry produced local settlement"));
+            }
             if kind == EntryKind::Content && gov.is_none() && entry.payload.is_some() {
                 self.track_body_into(&mut batch, entry_hash, id, now_ms)?;
             }
@@ -8163,7 +8192,9 @@ impl ChannelState {
         let persisted = (|| -> Result<()> {
             self.prepare_local_entry(profile, &entry, EntryKind::Content, &key, now_millis)?;
             let mut batch = profile.store().batch()?;
-            self.publish_entry_into(&mut batch, &entry)?;
+            let settlement = self
+                .publish_entry_into(&mut batch, &entry)?
+                .ok_or(Error::Profile("local history settlement missing"))?;
             self.observe_governance_into(profile.store(), &mut batch, &entry, id)?;
             batch.put_segment(&self.channel_id, SegmentKind::LogDb, id, &log_seg)?;
             batch.put_segment(
@@ -8197,6 +8228,7 @@ impl ChannelState {
                     cache_id: Some(id),
                 }),
             )?;
+            self.finish_local_history_effect_into(&mut batch, &entry, settlement)?;
             batch.commit()
         })();
         if let Err(e) = persisted {
@@ -8657,7 +8689,9 @@ impl ChannelState {
         let persisted = (|| -> Result<()> {
             self.prepare_local_entry(profile, &entry, EntryKind::Content, &key, now_millis)?;
             let mut batch = profile.store().batch()?;
-            self.publish_entry_into(&mut batch, &entry)?;
+            let settlement = self
+                .publish_entry_into(&mut batch, &entry)?
+                .ok_or(Error::Profile("local history settlement missing"))?;
             self.observe_governance_into(profile.store(), &mut batch, &entry, id)?;
             batch.put_segment(&self.channel_id, SegmentKind::LogDb, id, &log_seg)?;
             batch.put_segment(
@@ -8692,6 +8726,7 @@ impl ChannelState {
                 index.read_sent(sent_ms);
                 index.seal()?;
             }
+            self.finish_local_history_effect_into(&mut batch, &entry, settlement)?;
             batch.commit()
         })();
         if let Err(e) = persisted {
