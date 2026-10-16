@@ -143,6 +143,9 @@ impl ChannelState {
             return Ok(false);
         }
         if let Some(state) = read.sparse_author(&own, LogScope::Public)? {
+            if state.observed_conflict.is_some() {
+                return Ok(false);
+            }
             // A failed proof fetch must not erase knowledge of a signed higher own head.
             // Both slots are bounded scalars; neither requires an ancestry/body scan.
             for id in [state.observed, state.committed].into_iter().flatten() {

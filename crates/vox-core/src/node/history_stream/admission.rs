@@ -64,7 +64,11 @@ pub(super) fn stage(
                 return Ok(Staged::Busy);
             };
             let id = head.id();
-            room.history_write(store, |index| index.observe_history_head(&verified))?;
+            let conflict =
+                room.history_write(store, |index| index.observe_history_head(&verified))?;
+            if conflict {
+                return Err(invalid("conflicting authenticated heads retained"));
+            }
             let departure_receipt = room.history_departure_matches(
                 store,
                 super::HeadHint {

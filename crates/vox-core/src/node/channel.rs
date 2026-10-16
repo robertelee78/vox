@@ -4075,16 +4075,18 @@ impl ChannelState {
         let Some(feed) = self.dag.feed(&me).filter(|f| !f.is_empty()) else {
             return Ok(false);
         };
-        // Each local generation change authors an entry. Once our own contiguous prefix
-        // has been recovered, its scalar sequence bounds every prior generation; v2 must
-        // not decrypt the archive merely to settle. Legacy keeps its existing scan below.
+        // Sparse rotations publish their exact generation in the same Batch as a signed
+        // Presence and key state. Initial generation is zero; each +1 rotation adds an
+        // entry. Catch-up may jump to old seq+2, but adds its own entry atomically, so every
+        // published generation remains <= its published sequence+1. Therefore seq+2 is
+        // strictly fresh. A failed append cannot expose a silent new generation.
         if self.uses_sparse_history(profile.store())? {
             let used = feed.max_seq();
             if self.sender.chain_id() > used {
                 return Ok(false);
             }
             let next_id = used
-                .checked_add(1)
+                .checked_add(2)
                 .ok_or(Error::MalformedBundle("chain_id overflow"))?;
             let next = SenderChain::new(&self.channel_id, self.epoch, &me, next_id, now_ms)?;
             self.rotate_sender_to(profile, next, now_ms)?;
@@ -4145,11 +4147,26 @@ impl ChannelState {
         now_ms: u64,
         narrowing: bool,
     ) -> Result<u64> {
+        self.rotate_sender_with_presence(profile, next, now_ms, narrowing, false)
+    }
+
+    fn rotate_sender_with_presence(
+        &mut self,
+        profile: &Profile,
+        next: SenderChain,
+        now_ms: u64,
+        narrowing: bool,
+        settle_sparse: bool,
+    ) -> Result<u64> {
         self.require_legacy_current(profile.store())?;
         if self.poisoned {
             return Err(self.save_failure());
         }
         let store = profile.store();
+        let sparse = self.uses_sparse_history(store)?;
+        if settle_sparse && (!sparse || self.settled) {
+            return Err(Error::MalformedBundle("sender settlement state differs"));
+        }
         let chain_id = next.chain_id();
         let me = self.me();
         let retired = self.sender.chain_id();
@@ -4197,8 +4214,13 @@ impl ChannelState {
             profile.signer()?,
             self.newest_mint_seq(),
         )?;
+        let mut candidate_origins = if sparse {
+            Some(OriginKeyStore::from_state(&self.origins.to_state())?)
+        } else {
+            None
+        };
         retain_generation(
-            &mut self.origins,
+            candidate_origins.as_mut().unwrap_or(&mut self.origins),
             &self.channel_id,
             self.epoch,
             &me,
@@ -4216,30 +4238,54 @@ impl ChannelState {
             &self.sek,
             SegmentKind::KeyMaterial,
             SEG_ORIGINS,
-            &self.origins.to_state(),
+            &candidate_origins
+                .as_ref()
+                .unwrap_or(&self.origins)
+                .to_state(),
         )?;
-        let persisted = (|| -> Result<()> {
-            let mut batch = store.batch()?;
-            batch.put_segment(
+        if let Some(origins) = candidate_origins {
+            // This is a public control, not encrypted content. It names `next` explicitly;
+            // self.sender/origins remain unchanged until the ordinary effects Batch commits.
+            let here = settle_sparse || !self.said_left(&me);
+            let statement = crate::governance::presence::Presence::build(
+                profile.signer()?,
                 &self.channel_id,
-                SegmentKind::KeyMaterial,
-                SEG_SENDER,
-                &sender_seg,
+                self.epoch,
+                here,
+                chain_id,
             )?;
-            batch.put_segment(
-                &self.channel_id,
-                SegmentKind::KeyMaterial,
-                SEG_ORIGINS,
-                &origins_seg,
+            self.append_governance_with_sender(
+                profile,
+                &statement.to_wire(),
+                now_ms,
+                &[(SEG_SENDER, sender_seg), (SEG_ORIGINS, origins_seg)],
+                settle_sparse,
+                Some((next, origins)),
             )?;
-            batch.commit()
-        })();
-        if let Err(e) = persisted {
-            self.poisoned = true;
-            self.save_error = Some(e.to_string());
-            return Err(e);
+        } else {
+            let persisted = (|| -> Result<()> {
+                let mut batch = store.batch()?;
+                batch.put_segment(
+                    &self.channel_id,
+                    SegmentKind::KeyMaterial,
+                    SEG_SENDER,
+                    &sender_seg,
+                )?;
+                batch.put_segment(
+                    &self.channel_id,
+                    SegmentKind::KeyMaterial,
+                    SEG_ORIGINS,
+                    &origins_seg,
+                )?;
+                batch.commit()
+            })();
+            if let Err(e) = persisted {
+                self.poisoned = true;
+                self.save_error = Some(e.to_string());
+                return Err(e);
+            }
+            self.sender = next;
         }
-        self.sender = next;
         for (target, floor) in owed {
             self.owe_history(store, target, floor)?;
         }
@@ -5911,12 +5957,30 @@ impl ChannelState {
         now_ms: u64,
         rows: &[(u64, SealedSegment)],
     ) -> Result<Digest32> {
+        self.append_governance_with_sender(profile, payload, now_ms, rows, false, None)
+    }
+
+    /// The sparse settlement exception is local-only and publishes presence, sender state
+    /// and removal of the unsettled marker in one effects Batch. No mutable state is exposed
+    /// as settled before that commit; failed preflight keeps the original sender intact.
+    fn append_governance_with_sender(
+        &mut self,
+        profile: &Profile,
+        payload: &[u8],
+        now_ms: u64,
+        rows: &[(u64, SealedSegment)],
+        settle_sparse: bool,
+        sender: Option<(SenderChain, OriginKeyStore)>,
+    ) -> Result<Digest32> {
         self.ensure_local_append_available(profile.store())?;
         if self.poisoned {
             return Err(self.save_failure());
         }
-        if !self.settled {
+        if !self.settled && !settle_sparse {
             return Err(Error::RoomNotSynced);
+        }
+        if settle_sparse && (!self.uses_sparse_history(profile.store())? || self.settled) {
+            return Err(Error::MalformedBundle("sparse settlement state differs"));
         }
         let signer = profile.signer()?;
         let me = signer.fingerprint();
@@ -5944,12 +6008,23 @@ impl ChannelState {
             for (row, seg) in rows {
                 batch.put_segment(&self.channel_id, SegmentKind::KeyMaterial, *row, seg)?;
             }
+            if settle_sparse {
+                batch.delete_segment(&self.channel_id, SegmentKind::KeyMaterial, SEG_UNSETTLED)?;
+            }
             batch.commit()
         })();
         if let Err(e) = written {
             self.poisoned = true;
             self.save_error = Some(e.to_string());
             return Err(e);
+        }
+        if let Some((sender, origins)) = sender {
+            self.sender = sender;
+            self.origins = origins;
+        }
+        if settle_sparse {
+            self.settled = true;
+            self.sparse_settle_pending = false;
         }
         self.entries.committed();
         self.next_log_id = id.saturating_add(1);
@@ -8909,6 +8984,45 @@ impl ChannelState {
             self.sender.chain_id(),
         )?;
         self.append_governance(profile, &statement.to_wire(), now_ms)?;
+        Ok(true)
+    }
+
+    /// Record the exact sparse sender generation and mark settlement atomically. The
+    /// caller has checked current head/control readiness under this same room lock.
+    pub(crate) fn settle_sparse(
+        &mut self,
+        profile: &Profile,
+        now: crate::time::Ms,
+    ) -> Result<bool> {
+        if self.settled {
+            return Ok(false);
+        }
+        #[cfg(feature = "test-knobs")]
+        if std::env::var_os(TEST_NEVER_SETTLE_ENV).is_some_and(|v| !v.is_empty()) {
+            return Ok(false);
+        }
+        if !self.uses_sparse_history(profile.store())? {
+            return Err(Error::MalformedBundle(
+                "sparse settlement requires sparse room",
+            ));
+        }
+        let me = self.me();
+        let seq = self.dag.verified_head(&me);
+        let previous_bound = seq
+            .checked_add(1)
+            .ok_or(Error::MalformedBundle("chain_id overflow"))?;
+        if self.sender.chain_id() > previous_bound {
+            return Err(Error::MalformedBundle(
+                "sender generation exceeds authenticated sparse sequence bound",
+            ));
+        }
+        // Even the initial generation may have been shared during join. Always choose
+        // a fresh generation, including at seq zero, and record it before becoming ready.
+        let next_id = previous_bound
+            .checked_add(1)
+            .ok_or(Error::MalformedBundle("chain_id overflow"))?;
+        let next = SenderChain::new(&self.channel_id, self.epoch, &me, next_id, now.get())?;
+        self.rotate_sender_with_presence(profile, next, now.get(), false, true)?;
         Ok(true)
     }
 

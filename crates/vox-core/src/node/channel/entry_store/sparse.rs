@@ -218,14 +218,24 @@ pub(crate) struct AuthorState {
     pub observed: Option<Digest32>,
     pub committed: Option<Digest32>,
     pub control_ready: Option<Digest32>,
+    /// One attributable same-size contradiction, retaining both exact signed heads.
+    pub observed_conflict: Option<(Digest32, Digest32)>,
 }
 impl AuthorState {
     fn bytes(self) -> Vec<u8> {
         let mut e = Encoder::new();
-        e.array(4).uint(1);
+        e.array(5).uint(2);
         hash_option(&mut e, self.observed);
         hash_option(&mut e, self.committed);
         hash_option(&mut e, self.control_ready);
+        match self.observed_conflict {
+            Some((first, second)) => {
+                e.array(2).bytes(&first).bytes(&second);
+            }
+            None => {
+                e.array(0);
+            }
+        }
         e.finish()
     }
     fn parse(bytes: &[u8]) -> Result<Self> {
@@ -233,13 +243,30 @@ impl AuthorState {
             return Err(invalid("sparse author state size"));
         }
         let mut d = Decoder::new(bytes);
-        if d.array()? != 4 || d.uint()? != 1 {
+        let arity = d.array()?;
+        let version = d.uint()?;
+        if !matches!((arity, version), (4, 1) | (5, 2)) {
             return Err(invalid("sparse author state format"));
         }
         let state = Self {
             observed: read_hash_option(&mut d)?,
             committed: read_hash_option(&mut d)?,
             control_ready: read_hash_option(&mut d)?,
+            observed_conflict: if version >= 2 {
+                match d.array()? {
+                    0 => None,
+                    2 => {
+                        let pair = (read_hash(&mut d)?, read_hash(&mut d)?);
+                        if pair.0 == pair.1 {
+                            return Err(invalid("observed conflict heads equal"));
+                        }
+                        Some(pair)
+                    }
+                    _ => return Err(invalid("observed conflict arity")),
+                }
+            } else {
+                None
+            },
         };
         d.finish()?;
         if state.control_ready.is_some() && state.committed.is_none() {
@@ -471,6 +498,29 @@ impl Source<'_> {
                 return Err(invalid("stored sparse header binding"));
             }
             Ok(entry)
+        })
+        .transpose()
+    }
+    fn sparse_head(
+        &self,
+        sek: &Sek,
+        room: &Digest32,
+        roots: Roots,
+        hash: &Digest32,
+    ) -> Result<Option<SignedHead>> {
+        self.number(
+            sek,
+            room,
+            roots.objects,
+            &object_key(ObjectKind::Head, hash),
+        )?
+        .map(|id| {
+            let head =
+                SignedHead::from_wire(&self.sparse_record(sek, room, id, MAX_HEADER_BYTES)?)?;
+            if head.binding.room != *room || head.id() != *hash {
+                return Err(invalid("stored head binding"));
+            }
+            Ok(head)
         })
         .transpose()
     }
@@ -812,15 +862,8 @@ impl Read<'_> {
         MAX_OBLIGATIONS.saturating_sub(self.directory.active.sparse.obligation_count)
     }
     pub(crate) fn history_head(&self, hash: &Digest32) -> Result<Option<SignedHead>> {
-        self.history_object(ObjectKind::Head, hash)?
-            .map(|bytes| {
-                let head = SignedHead::from_wire(&bytes)?;
-                if head.binding.room != *self.channel || head.id() != *hash {
-                    return Err(invalid("stored head binding"));
-                }
-                Ok(head)
-            })
-            .transpose()
+        self.source()
+            .sparse_head(self.sek, self.channel, self.directory.active.sparse, hash)
     }
     pub(crate) fn history_context(&self, hash: &Digest32) -> Result<Option<ControlContext>> {
         self.history_object(ObjectKind::Context, hash)?
@@ -1608,8 +1651,9 @@ impl Write<'_, '_> {
         }
         Ok(())
     }
-    /// Retain an authenticated hint only. Consistency and control readiness remain separate.
-    pub(crate) fn observe_history_head(&mut self, verified: &VerifiedHead) -> Result<Digest32> {
+    /// Retain authenticated head evidence only. Return true for an attributable conflict;
+    /// the caller refuses it AFTER this Batch commits, so neither witness is rolled back.
+    pub(crate) fn observe_history_head(&mut self, verified: &VerifiedHead) -> Result<bool> {
         self.require_sparse_idle()?;
         let head = verified.head();
         if head.binding.room != *self.channel {
@@ -1627,10 +1671,33 @@ impl Write<'_, '_> {
             )?
             .unwrap_or_default();
         if state.observed != Some(hash) {
-            state.observed = Some(hash);
-            self.save_sparse_author(head.binding, state)?;
+            let held = state
+                .observed
+                .map(|id| {
+                    let prior = Source::Batch(self.batch)
+                        .sparse_head(self.sek, self.channel, self.directory.active.sparse, &id)?
+                        .ok_or(invalid("observed head missing"))?;
+                    if prior.binding != head.binding {
+                        return Err(invalid("observed head author or scope differs"));
+                    }
+                    Ok(prior)
+                })
+                .transpose()?;
+            match held {
+                Some(old) if old.root.leaves > head.root.leaves => {}
+                Some(old) if old.root.leaves == head.root.leaves => {
+                    if state.observed_conflict.is_none() {
+                        state.observed_conflict = Some((old.id(), hash));
+                        self.save_sparse_author(head.binding, state)?;
+                    }
+                }
+                _ => {
+                    state.observed = Some(hash);
+                    self.save_sparse_author(head.binding, state)?;
+                }
+            }
         }
-        Ok(hash)
+        Ok(state.observed_conflict.is_some())
     }
     /// Publish only the exact consistency result against the root still accepted in this
     /// Batch. A stale result cannot replace a newer commitment. No contiguous head changes.

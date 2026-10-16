@@ -18897,17 +18897,21 @@ impl Node {
             {
                 return;
             }
-            if !matches!(ch.settle(profile.store()), Ok(true)) {
-                return;
-            }
-            ch.catch_up_generation(profile, now_ms)
-                .and_then(|_| ch.say_presence(profile, true, now_ms))
-                .map(|back| {
-                    // Shares made while the room was unsettled are said now (V030-25). A share
-                    // left unsaid is offered but unlisted, which is not worth failing the room.
-                    let said = ch.say_unsaid_shares(profile, now_ms).unwrap_or(false);
-                    back || said
-                })
+            let settlement = if ch.uses_sparse_history(profile.store()).unwrap_or(true) {
+                ch.settle_sparse(profile, now_ms)
+            } else {
+                if !matches!(ch.settle(profile.store()), Ok(true)) {
+                    return;
+                }
+                ch.catch_up_generation(profile, now_ms)
+                    .and_then(|_| ch.say_presence(profile, true, now_ms))
+            };
+            settlement.map(|back| {
+                // Shares made while the room was unsettled are said now (V030-25). A share
+                // left unsaid is offered but unlisted, which is not worth failing the room.
+                let said = ch.say_unsaid_shares(profile, now_ms).unwrap_or(false);
+                back || said
+            })
         };
         match back {
             Ok(true) => self.note_local_append(channel_id),
