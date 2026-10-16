@@ -182,6 +182,7 @@ struct Promotion {
     bodyless_prefix: bool,
     reordered: u64,
     accepted: Option<crate::log::dag::PublishedFeed>,
+    sparse_head: Option<Digest32>,
 }
 
 #[derive(Clone, Debug)]
@@ -268,7 +269,7 @@ impl Directory {
                 e.array(0);
             }
             Some(p) => {
-                e.array(17)
+                e.array(18)
                     .bytes(&p.author)
                     .uint(p.from)
                     .uint(p.through)
@@ -289,6 +290,14 @@ impl Directory {
                     Some(state) => {
                         e.array(1);
                         restart::write_feed(state, &mut e);
+                    }
+                    None => {
+                        e.array(0);
+                    }
+                }
+                match p.sparse_head {
+                    Some(head) => {
+                        e.array(1).bytes(&head);
                     }
                     None => {
                         e.array(0);
@@ -376,7 +385,7 @@ impl Directory {
         let promotion_arity = d.array()?;
         let promotion = match promotion_arity {
             0 => None,
-            14 | 16 | 17 => Some(Promotion {
+            14 | 16 | 17 | 18 => Some(Promotion {
                 author: d
                     .bytes()?
                     .try_into()
@@ -411,6 +420,19 @@ impl Directory {
                         0 => None,
                         1 => Some(restart::read_feed(&mut d)?),
                         _ => return Err(invalid("promotion accepted state")),
+                    }
+                } else {
+                    None
+                },
+                sparse_head: if promotion_arity >= 18 {
+                    match d.array()? {
+                        0 => None,
+                        1 => Some(
+                            d.bytes()?
+                                .try_into()
+                                .map_err(|_| invalid("sparse promotion head"))?,
+                        ),
+                        _ => return Err(invalid("sparse promotion head arity")),
                     }
                 } else {
                     None
@@ -562,6 +584,8 @@ impl Directory {
                 || !p.work.retained.valid_for(next_page)
                 || !p.work.sparse.valid_for(next_page)
                 || p.retired >= next_page
+                || (p.sparse_head.is_some()
+                    && (p.accepted.is_some() || p.from != p.through || !p.work.sparse.enabled))
             {
                 return Err(invalid("promotion bounds"));
             }
@@ -1093,6 +1117,10 @@ fn find_hash(
 }
 
 impl EntryRead for Read<'_> {
+    fn get_sparse_published(&self, hash: &Digest32) -> Result<Option<Entry>> {
+        self.source()
+            .published_sparse_entry(self.sek, self.channel, self.directory.active, hash)
+    }
     fn clock(&self, hash: &Digest32) -> Result<Option<u64>> {
         if !self.directory.graph_ready {
             return Err(invalid("DAG facts not yet rebuilt"));
@@ -1463,6 +1491,16 @@ pub(crate) struct Publication<'a> {
     pub origin: u64,
 }
 
+/// One evidence-validated v2 source entry. Control effects still pass the existing
+/// governance fold; this publication never turns a sparse tip into a contiguous feed.
+pub(crate) struct SparsePublication<'a> {
+    pub entry: &'a Entry,
+    pub validated: &'a super::governance::ValidatedSparseEntry,
+    pub first_log: u64,
+    pub received_ms: u64,
+    pub origin: u64,
+}
+
 const PROMOTION_ENTRIES: usize = 64;
 const PROMOTION_BYTES: usize = 1024 * 1024;
 
@@ -1637,6 +1675,7 @@ impl Write<'_, '_> {
             bodyless_prefix,
             reordered: 0,
             accepted: Some(accepted),
+            sparse_head: None,
         });
         self.directory.phase = Phase::Building;
         Ok(())
@@ -1705,12 +1744,14 @@ impl Write<'_, '_> {
             {
                 return Err(invalid("promotion predecessor or witness differs"));
             }
-            restart::advance(
-                p.accepted
-                    .as_mut()
-                    .ok_or(invalid("promotion restart state missing"))?,
-                &entry,
-            )?;
+            if p.sparse_head.is_none() {
+                restart::advance(
+                    p.accepted
+                        .as_mut()
+                        .ok_or(invalid("promotion restart state missing"))?,
+                    &entry,
+                )?;
+            }
             let log = p
                 .first_log
                 .checked_add(p.cursor - p.from)
@@ -1738,6 +1779,9 @@ impl Write<'_, '_> {
                     .put_segment(self.channel, SegmentKind::Index, log, &seen)?;
             }
             p.work = self.index(p.work, &entry, log)?;
+            if p.sparse_head.is_some() {
+                self.index_sparse_source(&mut p.work, &entry)?;
+            }
             p.work = self.index_package(p.work, &entry, log)?;
             if entry.payload.is_none() {
                 // The membership stays unpublished with this authenticated suffix until the
@@ -1781,21 +1825,23 @@ impl Write<'_, '_> {
         if p.cursor <= p.through || !self.directory.work.is_empty() {
             return Err(invalid("promotion suffix or DAG facts incomplete"));
         }
-        let accepted = p
-            .accepted
-            .clone()
-            .ok_or(invalid("promotion accepted state missing"))?;
-        if accepted.seq != p.through || accepted.hash != p.witness_hash {
-            return Err(invalid("promotion accepted witness differs"));
-        }
-        let restart = self
-            .directory
-            .restart
-            .as_mut()
-            .ok_or(invalid("restart state missing at publication"))?;
-        restart.feeds.insert(p.author, accepted);
-        if restart.feeds.len() > super::AUTHORS_HARD_LIMIT {
-            return Err(invalid("restart author bound"));
+        if p.sparse_head.is_none() {
+            let accepted = p
+                .accepted
+                .clone()
+                .ok_or(invalid("promotion accepted state missing"))?;
+            if accepted.seq != p.through || accepted.hash != p.witness_hash {
+                return Err(invalid("promotion accepted witness differs"));
+            }
+            let restart = self
+                .directory
+                .restart
+                .as_mut()
+                .ok_or(invalid("restart state missing at publication"))?;
+            restart.feeds.insert(p.author, accepted);
+            if restart.feeds.len() > super::AUTHORS_HARD_LIMIT {
+                return Err(invalid("restart author bound"));
+            }
         }
         let result = (p.through - p.from + 1, p.after_log);
         let from = p.from;
@@ -1918,6 +1964,11 @@ impl EntryIndex {
         let rebuilding = directory
             .as_ref()
             .is_none_or(|d| d.phase == Phase::Rebuilding);
+        if rebuilding && directory.as_ref().is_some_and(|d| d.active.sparse.enabled) {
+            return Err(invalid(
+                "authenticated history cannot use the legacy archive rebuild",
+            ));
+        }
         drop(snapshot);
         if rebuilding {
             let mut fresh = Directory {
@@ -2047,6 +2098,14 @@ impl EntryIndex {
 }
 
 impl EntryRead for Write<'_, '_> {
+    fn get_sparse_published(&self, hash: &Digest32) -> Result<Option<Entry>> {
+        Source::Batch(self.batch).published_sparse_entry(
+            self.sek,
+            self.channel,
+            self.directory.active,
+            hash,
+        )
+    }
     fn clock(&self, hash: &Digest32) -> Result<Option<u64>> {
         if !self.directory.graph_ready {
             return Err(invalid("DAG facts not yet rebuilt"));
@@ -2258,6 +2317,14 @@ impl View<'_, '_> {
     }
 }
 impl EntryRead for View<'_, '_> {
+    fn get_sparse_published(&self, hash: &Digest32) -> Result<Option<Entry>> {
+        self.transaction.source().published_sparse_entry(
+            self.sek,
+            self.channel,
+            self.directory.active,
+            hash,
+        )
+    }
     fn clock(&self, hash: &Digest32) -> Result<Option<u64>> {
         if !self.directory.graph_ready {
             return Err(invalid("DAG facts not yet rebuilt"));

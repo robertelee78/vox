@@ -16,6 +16,8 @@ pub(crate) struct RestartState {
     pub projection: Option<Vec<u8>>,
     pub retained_step_body: Option<Digest32>,
     pub set_aside: crate::node::channel::SetAside,
+    /// Source positions may be sparse; `feeds` still records only actually contiguous data.
+    pub sparse: bool,
 }
 
 impl RestartState {
@@ -28,10 +30,11 @@ impl RestartState {
             projection: None,
             retained_step_body: None,
             set_aside: crate::node::channel::SetAside::default(),
+            sparse: false,
         }
     }
     pub(super) fn write(&self, e: &mut Encoder) {
-        e.array(7)
+        e.array(8)
             .bytes(&self.room)
             .uint(self.epoch)
             .array(self.feeds.len());
@@ -75,9 +78,11 @@ impl RestartState {
                 e.array(0);
             }
         }
+        e.uint(u64::from(self.sparse));
     }
     pub(super) fn read(d: &mut Decoder<'_>) -> Result<Self> {
-        if d.array()? != 7 {
+        let arity = d.array()?;
+        if !matches!(arity, 7 | 8) {
             return Err(invalid("restart state arity"));
         }
         let room = digest(d)?;
@@ -113,11 +118,9 @@ impl RestartState {
                 2 => Some((d.uint()?, d.uint()?)),
                 _ => return Err(invalid("restart presence back")),
             };
-            if !feeds.get(&author).is_some_and(|f| {
-                last.0 != 0
-                    && last.0 <= f.seq
-                    && back.is_none_or(|(seq, _)| seq != 0 && seq <= last.0)
-            }) || presence.insert(author, Presence { last, back }).is_some()
+            if last.0 == 0
+                || back.is_some_and(|(seq, _)| seq == 0 || seq > last.0)
+                || presence.insert(author, Presence { last, back }).is_some()
             {
                 return Err(invalid("restart presence binding"));
             }
@@ -154,6 +157,16 @@ impl RestartState {
             }
             _ => return Err(invalid("restart projection arity")),
         };
+        let sparse = arity >= 8 && flag(d)?;
+        if !sparse
+            && presence.iter().any(|(author, state)| {
+                !feeds
+                    .get(author)
+                    .is_some_and(|feed| state.last.0 <= feed.seq)
+            })
+        {
+            return Err(invalid("legacy restart presence beyond feed"));
+        }
         Ok(Self {
             room,
             epoch,
@@ -162,6 +175,7 @@ impl RestartState {
             projection,
             retained_step_body,
             set_aside,
+            sparse,
         })
     }
 }

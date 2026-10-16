@@ -423,6 +423,11 @@ impl Dag {
 
     /// Look up a stored entry by its 32-byte hash (the Negentropy key).
     pub fn get_by_hash(&self, entries: &impl EntryRead, hash: &Digest32) -> Result<Option<Entry>> {
+        // A sparse source is separately evidence-validated and atomically published. It
+        // does not become a contiguous Feed merely to be available to local consumers.
+        if let Some(entry) = entries.get_sparse_published(hash)? {
+            return Ok(Some(entry));
+        }
         let Some((author, seq)) = entries.locate(hash)? else {
             return Ok(None);
         };

@@ -57,6 +57,8 @@ mod legacy_session_sender;
 mod private_session;
 pub(crate) mod session_floor;
 pub(crate) mod session_projection;
+mod sparse_history;
+pub(crate) use sparse_history::{HistoryHeader, HistoryPayload};
 
 pub use diagnostics::SetAside;
 pub use entry_store::OrderView;
@@ -1974,6 +1976,9 @@ impl ChannelState {
             if state.room != *channel_id || state.epoch != epoch {
                 return Err(Error::MalformedAtRest("restart room or epoch differs"));
             }
+            if state.sparse != entry_read.sparse_enabled() {
+                return Err(Error::MalformedAtRest("restart history format differs from published roots"));
+            }
             // Each compact head was sealed atomically with its accepted prefix. Verify its
             // bounded source binding, never infer acceptance from an arbitrary locator maximum.
             for (author, head) in &state.feeds {
@@ -2423,6 +2428,7 @@ impl ChannelState {
                 projection: None,
                 retained_step_body,
                 set_aside: set_aside.clone(),
+                sparse: false,
             };
             let mut batch = store.batch()?;
             let mut writer = entries.write(&mut batch, &sek, channel_id)?;

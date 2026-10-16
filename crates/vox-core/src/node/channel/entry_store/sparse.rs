@@ -19,39 +19,57 @@ const STATE_BYTES: usize = 256;
 pub(super) struct Roots {
     objects: u64,
     authors: u64,
-    admitted: u64,
+    validated_positions: u64,
     control_intervals: u64,
     obligations: u64,
     ranges: u64,
+    commitments: u64,
+    source_heads: u64,
+    control_sources: u64,
+    source_prefixes: u64,
+    source_cursors: u64,
+    settled_entries: u64,
     author_count: u64,
     obligation_count: u64,
-    enabled: bool,
+    pub(super) enabled: bool,
 }
 
 impl Roots {
     pub(super) fn write(self, e: &mut Encoder) {
-        e.array(9)
+        e.array(15)
             .uint(self.objects)
             .uint(self.authors)
-            .uint(self.admitted)
+            .uint(self.validated_positions)
             .uint(self.control_intervals)
             .uint(self.obligations)
             .uint(self.ranges)
+            .uint(self.commitments)
+            .uint(self.source_heads)
+            .uint(self.control_sources)
+            .uint(self.source_prefixes)
+            .uint(self.source_cursors)
+            .uint(self.settled_entries)
             .uint(self.author_count)
             .uint(self.obligation_count)
             .uint(u64::from(self.enabled));
     }
     pub(super) fn read(d: &mut Decoder<'_>) -> Result<Self> {
-        if d.array()? != 9 {
+        if d.array()? != 15 {
             return Err(invalid("sparse roots arity"));
         }
         Ok(Self {
             objects: d.uint()?,
             authors: d.uint()?,
-            admitted: d.uint()?,
+            validated_positions: d.uint()?,
             control_intervals: d.uint()?,
             obligations: d.uint()?,
             ranges: d.uint()?,
+            commitments: d.uint()?,
+            source_heads: d.uint()?,
+            control_sources: d.uint()?,
+            source_prefixes: d.uint()?,
+            source_cursors: d.uint()?,
+            settled_entries: d.uint()?,
             author_count: d.uint()?,
             obligation_count: d.uint()?,
             enabled: flag(d)?,
@@ -61,10 +79,16 @@ impl Roots {
         [
             self.objects,
             self.authors,
-            self.admitted,
+            self.validated_positions,
             self.control_intervals,
             self.obligations,
             self.ranges,
+            self.commitments,
+            self.source_heads,
+            self.control_sources,
+            self.source_prefixes,
+            self.source_cursors,
+            self.settled_entries,
         ]
         .iter()
         .all(|root| *root < next)
@@ -256,6 +280,143 @@ impl Obligation {
 }
 
 impl Source<'_> {
+    pub(super) fn published_sparse_entry(
+        &self,
+        sek: &Sek,
+        room: &Digest32,
+        roots: super::Roots,
+        hash: &Digest32,
+    ) -> Result<Option<Entry>> {
+        if !roots.sparse.enabled
+            || self.find_value(sek, room, roots.sparse.settled_entries, &hashed(hash))?
+                != Some(Value::Present)
+        {
+            return Ok(None);
+        }
+        let at = self
+            .find(sek, room, roots.hash, &hashed(hash))?
+            .ok_or(invalid("published sparse source missing locator"))?;
+        let wire = self.history_wire(
+            sek,
+            room,
+            SegmentKind::LogDb,
+            at.log,
+            crate::log::history::MAX_ENTRY_WIRE,
+        )?;
+        let entry = Entry::from_wire(&wire)?;
+        if entry.entry_hash() != *hash
+            || entry.skeleton.channel_id != *room
+            || entry.skeleton.author_id != at.author
+            || entry.skeleton.seq != at.seq
+            || entry.skeleton.v2.is_none()
+        {
+            return Err(invalid("published sparse source differs from locator"));
+        }
+        Ok(Some(entry))
+    }
+    pub(super) fn history_wire(
+        &self,
+        sek: &Sek,
+        room: &Digest32,
+        kind: SegmentKind,
+        id: u64,
+        limit: usize,
+    ) -> Result<Zeroizing<Vec<u8>>> {
+        let sealed = match self {
+            Self::Snapshot(s) | Self::Cached(s, _) | Self::OtherSnapshot(s, _) => {
+                s.get_segment_bounded(room, kind, id, limit)?
+            }
+            Self::Batch(b) | Self::OtherBatch(b, _) => {
+                b.get_segment_bounded(room, kind, id, limit)?
+            }
+        }
+        .ok_or(invalid("history record missing"))?;
+        if sealed.ciphertext.len() > limit + 16 {
+            return Err(invalid("history sealed record size"));
+        }
+        let bytes = open_segment(sek, kind, id, &sealed)?;
+        if bytes.len() > limit {
+            return Err(invalid("history record size"));
+        }
+        Ok(bytes)
+    }
+    pub(super) fn sparse_position_header(
+        &self,
+        sek: &Sek,
+        room: &Digest32,
+        roots: Roots,
+        author: &Digest32,
+        seq: u64,
+    ) -> Result<Option<Entry>> {
+        self.number(sek, room, roots.validated_positions, &position(author, seq))?
+            .map(|id| {
+                let entry =
+                    Entry::from_wire(&self.sparse_record(sek, room, id, MAX_HEADER_BYTES)?)?;
+                if entry.skeleton.channel_id != *room
+                    || entry.skeleton.author_id != *author
+                    || entry.skeleton.seq != seq
+                    || entry.skeleton.v2.is_none()
+                    || entry.payload.is_some()
+                {
+                    return Err(invalid("sparse validated header binding"));
+                }
+                Ok(entry)
+            })
+            .transpose()
+    }
+    pub(super) fn sparse_header(
+        &self,
+        sek: &Sek,
+        room: &Digest32,
+        roots: Roots,
+        hash: &Digest32,
+    ) -> Result<Option<Entry>> {
+        self.number(
+            sek,
+            room,
+            roots.objects,
+            &object_key(ObjectKind::Header, hash),
+        )?
+        .map(|id| {
+            let entry = Entry::from_wire(&self.sparse_record(sek, room, id, MAX_HEADER_BYTES)?)?;
+            if entry.skeleton.channel_id != *room
+                || entry.entry_hash() != *hash
+                || entry.skeleton.v2.is_none()
+                || entry.payload.is_some()
+            {
+                return Err(invalid("stored sparse header binding"));
+            }
+            Ok(entry)
+        })
+        .transpose()
+    }
+    pub(super) fn sparse_context(
+        &self,
+        sek: &Sek,
+        room: &Digest32,
+        roots: Roots,
+        hash: &Digest32,
+    ) -> Result<Option<ControlContext>> {
+        self.number(
+            sek,
+            room,
+            roots.objects,
+            &object_key(ObjectKind::Context, hash),
+        )?
+        .map(|id| {
+            let context = ControlContext::from_wire(&self.sparse_record(
+                sek,
+                room,
+                id,
+                MAX_CONTEXT_BYTES,
+            )?)?;
+            if context.room != *room || context.hash() != *hash {
+                return Err(invalid("stored context binding"));
+            }
+            Ok(context)
+        })
+        .transpose()
+    }
     /// The caller's worker owns its buffer permit before this copy/decryption. No object cache
     /// is retained here; bounds are checked before AEAD and again by each canonical decoder.
     fn sparse_record(
@@ -298,6 +459,119 @@ impl Source<'_> {
 }
 
 impl Read<'_> {
+    /// A consistency-accepted exact head, including an older accepted head for which a
+    /// verification cursor is still finishing. Observed hints do not satisfy this lookup.
+    pub(crate) fn history_head_committed(
+        &self,
+        head: &Digest32,
+        binding: TreeBinding,
+    ) -> Result<bool> {
+        if binding.room != *self.channel {
+            return Ok(false);
+        }
+        if self.source().find_value(
+            self.sek,
+            self.channel,
+            self.directory.active.sparse.commitments,
+            &hashed(head),
+        )? != Some(Value::Present)
+        {
+            return Ok(false);
+        }
+        Ok(self
+            .history_head(head)?
+            .is_some_and(|h| h.binding == binding))
+    }
+    /// An individually evidence-complete published source and its exact inclusion target.
+    /// This does not claim that the governance evaluator has applied the source's effect.
+    pub(crate) fn history_validated_header(
+        &self,
+        author: &Digest32,
+        seq: u64,
+    ) -> Result<Option<(Digest32, Entry)>> {
+        let Some(entry) = self.history_position_header(author, seq)? else {
+            return Ok(None);
+        };
+        let source = self.source();
+        let id = source
+            .number(
+                self.sek,
+                self.channel,
+                self.directory.active.sparse.source_heads,
+                &hashed(&entry.entry_hash()),
+            )?
+            .ok_or(invalid("validated source has no head binding"))?;
+        let bytes = source.sparse_record(self.sek, self.channel, id, MAX_HEADER_BYTES)?;
+        let head = SignedHead::from_wire(&bytes)?;
+        if head.binding.matches_entry(&entry).is_err() || head.binding.room != *self.channel {
+            return Err(invalid("validated source head differs"));
+        }
+        Ok(Some((head.id(), entry)))
+    }
+    /// A durable source-complete prefix receipt, built only from no-omission coverage and
+    /// individually validated control sources. It grants no authority and performs no scan.
+    pub(crate) fn control_sources_complete(&self, head: &Digest32, through: u64) -> Result<bool> {
+        let source = self.source();
+        if source.find_value(
+            self.sek,
+            self.channel,
+            self.directory.active.sparse.commitments,
+            &hashed(head),
+        )? != Some(Value::Present)
+        {
+            return Ok(false);
+        }
+        Ok(source
+            .number(
+                self.sek,
+                self.channel,
+                self.directory.active.sparse.source_prefixes,
+                &hashed(head),
+            )?
+            .unwrap_or(0)
+            >= through)
+    }
+    pub(crate) fn history_position_header(
+        &self,
+        author: &Digest32,
+        seq: u64,
+    ) -> Result<Option<Entry>> {
+        self.source().sparse_position_header(
+            self.sek,
+            self.channel,
+            self.directory.active.sparse,
+            author,
+            seq,
+        )
+    }
+    pub(crate) fn history_entry(&self, hash: &Digest32) -> Result<Option<Entry>> {
+        let source = self.source();
+        let Some(at) = source.find(
+            self.sek,
+            self.channel,
+            self.directory.active.hash,
+            &hashed(hash),
+        )?
+        else {
+            return Ok(None);
+        };
+        let wire = source.history_wire(
+            self.sek,
+            self.channel,
+            SegmentKind::LogDb,
+            at.log,
+            crate::log::history::MAX_ENTRY_WIRE,
+        )?;
+        let entry = Entry::from_wire(&wire)?;
+        if entry.entry_hash() != *hash
+            || entry.skeleton.channel_id != *self.channel
+            || entry.skeleton.author_id != at.author
+            || entry.skeleton.seq != at.seq
+        {
+            return Err(invalid("published history entry binding"));
+        }
+        Ok(Some(entry))
+    }
     pub(crate) fn sparse_enabled(&self) -> bool {
         self.directory.active.sparse.enabled
     }
@@ -472,7 +746,164 @@ impl Read<'_> {
     }
 }
 
+/// One bounded source-closure step; neither Complete nor Progress grants authority.
+#[derive(Clone, Debug)]
+pub(crate) enum SourceProgress {
+    Progress {
+        through: u64,
+    },
+    Complete {
+        through: u64,
+    },
+    MissingCoverage {
+        after: u64,
+    },
+    MissingSource {
+        author: Digest32,
+        seq: u64,
+        hash: Digest32,
+    },
+}
+
 impl Write<'_, '_> {
+    pub(crate) fn begin_sparse_publication(
+        &mut self,
+        publication: SparsePublication<'_>,
+    ) -> Result<()> {
+        self.require_sparse_idle()?;
+        let SparsePublication {
+            entry,
+            validated,
+            first_log,
+            received_ms,
+            origin,
+        } = publication;
+        let included = validated.included();
+        let binding = validated.binding();
+        if binding.room != *self.channel
+            || included.head_id() != validated.head_id()
+            || included.binding() != binding
+            || entry.entry_hash() != validated.entry_hash()
+            || entry.header_wire() != included.header().entry().header_wire()
+            || first_log == 0
+        {
+            return Err(invalid("sparse publication evidence binding"));
+        }
+        binding.matches_entry(entry)?;
+        if let Some(payload) = &entry.payload {
+            if payload.len() as u64 != entry.skeleton.payload_len
+                || sha256(payload) != entry.skeleton.payload_hash
+            {
+                return Err(invalid("sparse publication body differs"));
+            }
+        }
+        let source = Source::Batch(self.batch);
+        if source.find_value(
+            self.sek,
+            self.channel,
+            self.directory.active.sparse.commitments,
+            &hashed(&included.head_id()),
+        )? != Some(Value::Present)
+        {
+            return Err(invalid("sparse entry has no accepted commitment"));
+        }
+        if source
+            .find(
+                self.sek,
+                self.channel,
+                self.directory.active.sequence,
+                &position(&entry.skeleton.author_id, entry.skeleton.seq),
+            )?
+            .is_some()
+        {
+            return Err(invalid(
+                "sparse entry position already held; check duplicate or fork before publication",
+            ));
+        }
+        let v2 = entry
+            .skeleton
+            .v2
+            .as_ref()
+            .ok_or(invalid("sparse publication requires v2"))?;
+        if v2.kind.is_control() && entry.payload.is_none() {
+            return Err(invalid("validated control source has no required body"));
+        }
+        if validated.pre_context().hash() != v2.pre_context
+            || validated.pre_context().scope != v2.scope
+        {
+            return Err(invalid("sparse publication context differs"));
+        }
+        self.keep_history_context(validated.pre_context())?;
+        self.keep_history_header(included.header())?;
+        self.set_origin(origin)?;
+        let witness = self.stage(entry)?;
+        first_log
+            .checked_add(1)
+            .ok_or(invalid("sparse log allocator exhausted"))?;
+        self.directory.promotion = Some(Promotion {
+            author: entry.skeleton.author_id,
+            from: entry.skeleton.seq,
+            through: entry.skeleton.seq,
+            base_hash: entry.skeleton.prev_hash,
+            received_ms,
+            witness,
+            witness_hash: entry.entry_hash(),
+            cursor: entry.skeleton.seq,
+            work: self.directory.active,
+            first_log,
+            after_log: first_log,
+            first_page: self.directory.next_page,
+            after_page: self.directory.next_page,
+            retired: 0,
+            bodyless_prefix: false,
+            reordered: 0,
+            accepted: None,
+            sparse_head: Some(included.head_id()),
+        });
+        self.directory.phase = Phase::Building;
+        Ok(())
+    }
+
+    pub(super) fn index_sparse_source(
+        &mut self,
+        roots: &mut super::Roots,
+        entry: &Entry,
+    ) -> Result<()> {
+        let source = Source::Batch(self.batch);
+        let id = source
+            .number(
+                self.sek,
+                self.channel,
+                roots.sparse.objects,
+                &object_key(ObjectKind::Header, &entry.entry_hash()),
+            )?
+            .ok_or(invalid("sparse validated source header missing"))?;
+        roots.sparse.validated_positions = self.change_value(
+            roots.sparse.validated_positions,
+            position(&entry.skeleton.author_id, entry.skeleton.seq),
+            Some(Value::Number(id)),
+        )?;
+        let head = self
+            .directory
+            .promotion
+            .as_ref()
+            .and_then(|p| p.sparse_head)
+            .ok_or(invalid("sparse source publication lost its head"))?;
+        let head_record = Source::Batch(self.batch)
+            .number(
+                self.sek,
+                self.channel,
+                roots.sparse.objects,
+                &object_key(ObjectKind::Head, &head),
+            )?
+            .ok_or(invalid("sparse source head object missing"))?;
+        roots.sparse.source_heads = self.change_value(
+            roots.sparse.source_heads,
+            hashed(&entry.entry_hash()),
+            Some(Value::Number(head_record)),
+        )?;
+        Ok(())
+    }
     /// Only a genuinely empty new room starts this format. Opening an existing room does
     /// not call this, scan its archive, or reinterpret its legacy feed as a commitment.
     pub(crate) fn initialize_sparse_history(&mut self) -> Result<()> {
@@ -487,6 +918,12 @@ impl Write<'_, '_> {
             return Err(invalid("new history format requires an empty room"));
         }
         self.directory.active.sparse.enabled = true;
+        let restart = self
+            .directory
+            .restart
+            .as_mut()
+            .ok_or(invalid("new history requires initialized restart state"))?;
+        restart.sparse = true;
         Ok(())
     }
     fn require_sparse_idle(&self) -> Result<()> {
@@ -645,9 +1082,9 @@ impl Write<'_, '_> {
     ) -> Result<()> {
         self.require_sparse_idle()?;
         let head = verified.head();
-        if proof.head_id != head.id()
-            || proof.binding != head.binding
-            || proof.root != head.root
+        if proof.head_id() != head.id()
+            || proof.binding() != head.binding
+            || proof.root() != head.root
             || head.binding.room != *self.channel
         {
             return Err(invalid("commitment proof target differs"));
@@ -694,24 +1131,33 @@ impl Write<'_, '_> {
             }
             Descriptor::empty(head.binding)
         };
-        if proof.prefix != prior {
+        if proof.prefix() != prior {
             return Err(invalid("consistency baseline changed before publication"));
         }
         self.save_history_object(ObjectKind::Head, head.id(), &head.to_wire())?;
         state.observed = Some(head.id());
         state.committed = Some(head.id());
+        self.directory.active.sparse.commitments = self.change_value(
+            self.directory.active.sparse.commitments,
+            hashed(&head.id()),
+            Some(Value::Present),
+        )?;
         // Previously ready evidence remains exact to its older head; it is not upgraded by
         // commitment alone. Readers must compare that ID with their requested target.
         self.save_sparse_author(head.binding, state)
     }
     /// Remember cryptographically complete coverage, not semantic control readiness. Bodies,
     /// parent receipts and authority evaluation remain durable obligations owned by admission.
-    pub(crate) fn keep_control_coverage(&mut self, proof: &VerifiedControlRange) -> Result<()> {
+    pub(crate) fn keep_control_coverage(
+        &mut self,
+        proof: &VerifiedControlRange,
+        after: usize,
+    ) -> Result<Option<usize>> {
         self.require_sparse_idle()?;
-        if proof.binding.room != *self.channel
-            || proof.lo == 0
-            || proof.lo > proof.hi
-            || proof.hi > proof.root.leaves
+        if proof.binding().room != *self.channel
+            || proof.lo() == 0
+            || proof.lo() > proof.hi()
+            || proof.hi() > proof.root().leaves
         {
             return Err(invalid("control coverage binding"));
         }
@@ -721,7 +1167,7 @@ impl Write<'_, '_> {
                 self.sek,
                 self.channel,
                 self.directory.active.sparse.objects,
-                &object_key(ObjectKind::Head, &proof.head_id),
+                &object_key(ObjectKind::Head, &proof.head_id()),
             )?
             .ok_or(invalid("control coverage head missing"))?;
         let head = SignedHead::from_wire(&source.sparse_record(
@@ -730,19 +1176,241 @@ impl Write<'_, '_> {
             record,
             MAX_HEADER_BYTES,
         )?)?;
-        if head.id() != proof.head_id || head.binding != proof.binding || head.root != proof.root {
+        if head.id() != proof.head_id()
+            || head.binding != proof.binding()
+            || head.root != proof.root()
+        {
             return Err(invalid("control coverage target differs"));
         }
-        let key = position(&proof.head_id, proof.lo);
+        if after > proof.headers().len() {
+            return Err(invalid("control coverage publication cursor"));
+        }
+        // A completed verifier can contain up to a page of controls. Persist only a bounded
+        // slice of its exact enumeration per transaction; coverage is published last.
+        let end = after.saturating_add(16).min(proof.headers().len());
+        for header in &proof.headers()[after..end] {
+            let entry = header.entry();
+            if entry.skeleton.author_id != proof.binding().author
+                || entry.skeleton.seq < proof.lo()
+                || entry.skeleton.seq > proof.hi()
+                || !entry
+                    .skeleton
+                    .v2
+                    .as_ref()
+                    .is_some_and(|v| v.kind.is_control())
+            {
+                return Err(invalid("control enumeration binding"));
+            }
+            let hash = self.keep_history_header(header)?;
+            let id = Source::Batch(self.batch)
+                .number(
+                    self.sek,
+                    self.channel,
+                    self.directory.active.sparse.objects,
+                    &object_key(ObjectKind::Header, &hash),
+                )?
+                .ok_or(invalid("control enumeration header missing"))?;
+            let key = position(&proof.head_id(), entry.skeleton.seq);
+            let root = self.directory.active.sparse.control_sources;
+            if let Some(prior) =
+                Source::Batch(self.batch).number(self.sek, self.channel, root, &key)?
+            {
+                let wire = Source::Batch(self.batch).sparse_record(
+                    self.sek,
+                    self.channel,
+                    prior,
+                    MAX_HEADER_BYTES,
+                )?;
+                if Entry::from_wire(&wire)?.entry_hash() != hash {
+                    return Err(invalid("control enumeration conflicts"));
+                }
+            } else {
+                self.directory.active.sparse.control_sources =
+                    self.change_value(root, key, Some(Value::Number(id)))?;
+            }
+        }
+        if end < proof.headers().len() {
+            return Ok(Some(end));
+        }
+        // Recheck the complete enumeration before publishing coverage, so an arbitrary
+        // caller-supplied cursor can never skip required source rows. This is bounded by
+        // the protocol's page limit and reads only small authenticated headers.
+        for header in proof.headers() {
+            if Source::Batch(self.batch)
+                .number(
+                    self.sek,
+                    self.channel,
+                    self.directory.active.sparse.control_sources,
+                    &position(&proof.head_id(), header.entry().skeleton.seq),
+                )?
+                .is_none()
+            {
+                return Err(invalid("control enumeration publication incomplete"));
+            }
+        }
+        let key = position(&proof.head_id(), proof.lo());
         let root = self.directory.active.sparse.control_intervals;
-        let prior = source
+        let prior = Source::Batch(self.batch)
             .number(self.sek, self.channel, root, &key)?
             .unwrap_or(0);
-        if proof.hi > prior {
+        if proof.hi() > prior {
             self.directory.active.sparse.control_intervals =
-                self.change_value(root, key, Some(Value::Number(proof.hi)))?;
+                self.change_value(root, key, Some(Value::Number(proof.hi())))?;
         }
-        Ok(())
+        self.directory.active.sparse.source_cursors = self.change_value(
+            self.directory.active.sparse.source_cursors,
+            hashed(&proof.head_id()),
+            None,
+        )?;
+        Ok(None)
+    }
+    /// Advance one covered interval or one enumerated control. A source-complete receipt
+    /// is distinct from governance completion and never requires a whole head ready first.
+    pub(crate) fn advance_control_sources(&mut self, head_id: &Digest32) -> Result<SourceProgress> {
+        self.require_sparse_idle()?;
+        let roots = self.directory.active.sparse;
+        let source = Source::Batch(self.batch);
+        if source.find_value(self.sek, self.channel, roots.commitments, &hashed(head_id))?
+            != Some(Value::Present)
+        {
+            return Err(invalid("control source target is not committed"));
+        }
+        let head_record = source
+            .number(
+                self.sek,
+                self.channel,
+                roots.objects,
+                &object_key(ObjectKind::Head, head_id),
+            )?
+            .ok_or(invalid("control source head missing"))?;
+        let head = SignedHead::from_wire(&source.sparse_record(
+            self.sek,
+            self.channel,
+            head_record,
+            MAX_HEADER_BYTES,
+        )?)?;
+        if head.id() != *head_id || head.binding.room != *self.channel {
+            return Err(invalid("control source head binding"));
+        }
+        let through = source
+            .number(
+                self.sek,
+                self.channel,
+                roots.source_prefixes,
+                &hashed(head_id),
+            )?
+            .unwrap_or(0);
+        if through >= head.root.leaves {
+            return Ok(SourceProgress::Complete { through });
+        }
+        let after = source
+            .number(
+                self.sek,
+                self.channel,
+                roots.source_cursors,
+                &hashed(head_id),
+            )?
+            .unwrap_or(0);
+        let Some((key, value)) = source.first(
+            self.sek,
+            self.channel,
+            roots.control_intervals,
+            &position(
+                head_id,
+                after
+                    .checked_add(1)
+                    .ok_or(invalid("control source cursor overflow"))?,
+            ),
+            0,
+        )?
+        else {
+            return Ok(SourceProgress::MissingCoverage { after: through });
+        };
+        if key[..32] != head_id[..] {
+            return Ok(SourceProgress::MissingCoverage { after: through });
+        }
+        let lo = u64::from_be_bytes(
+            key[32..40]
+                .try_into()
+                .map_err(|_| invalid("coverage start"))?,
+        );
+        let Value::Number(hi) = value else {
+            return Err(invalid("coverage end"));
+        };
+        if lo > through + 1 {
+            return Ok(SourceProgress::MissingCoverage { after: through });
+        }
+        if hi <= through {
+            self.directory.active.sparse.source_cursors = self.change_value(
+                roots.source_cursors,
+                hashed(head_id),
+                Some(Value::Number(lo)),
+            )?;
+            return Ok(SourceProgress::Progress { through });
+        }
+        let next = source.first(
+            self.sek,
+            self.channel,
+            roots.control_sources,
+            &position(head_id, through + 1),
+            0,
+        )?;
+        let (next_through, finish_interval) = match next {
+            Some((key, Value::Number(id))) if key[..32] == head_id[..] => {
+                let seq = u64::from_be_bytes(
+                    key[32..40]
+                        .try_into()
+                        .map_err(|_| invalid("control source position"))?,
+                );
+                if seq > hi {
+                    (hi, true)
+                } else {
+                    let wire =
+                        source.sparse_record(self.sek, self.channel, id, MAX_HEADER_BYTES)?;
+                    let expected = Entry::from_wire(&wire)?;
+                    let actual = source.sparse_position_header(
+                        self.sek,
+                        self.channel,
+                        roots,
+                        &head.binding.author,
+                        seq,
+                    )?;
+                    if !actual.is_some_and(|entry| entry.entry_hash() == expected.entry_hash()) {
+                        return Ok(SourceProgress::MissingSource {
+                            author: head.binding.author,
+                            seq,
+                            hash: expected.entry_hash(),
+                        });
+                    }
+                    (seq, seq == hi)
+                }
+            }
+            Some((key, _)) if key[..32] == head_id[..] => {
+                return Err(invalid("control source locator"))
+            }
+            _ => (hi, true),
+        };
+        self.directory.active.sparse.source_prefixes = self.change_value(
+            roots.source_prefixes,
+            hashed(head_id),
+            Some(Value::Number(next_through)),
+        )?;
+        if finish_interval {
+            self.directory.active.sparse.source_cursors = self.change_value(
+                roots.source_cursors,
+                hashed(head_id),
+                Some(Value::Number(lo)),
+            )?;
+        }
+        Ok(if next_through >= head.root.leaves {
+            SourceProgress::Complete {
+                through: next_through,
+            }
+        } else {
+            SourceProgress::Progress {
+                through: next_through,
+            }
+        })
     }
     /// Bounded durable pending work. At the cap the caller yields before staging more objects.
     pub(crate) fn keep_history_obligation(&mut self, obligation: &Obligation) -> Result<bool> {
