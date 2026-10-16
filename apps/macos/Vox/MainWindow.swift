@@ -1131,6 +1131,38 @@ private struct RoomTimelineView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .voxPadding(.horizontal, Space.s12).voxPadding(.top, Space.s8)
                     .accessibilityIdentifier("timeline-title")
+                if !model.showingSession {
+                    VStack(alignment: .leading, spacing: Space.s4) {
+                        HStack {
+                            Button("Load older history") { Task { await model.requestOlderHistory() } }
+                                .disabled(model.roomHistoryBusy || model.roomHistoryCanResume)
+                                .accessibilityIdentifier("room-history-older")
+                            Button("Load newest history") { Task { await model.requestNewestHistory() } }
+                                .disabled(model.roomHistoryBusy || model.roomHistoryCanResume)
+                                .accessibilityIdentifier("room-history-newest")
+                            if model.roomHistoryCanResume {
+                                Button("Resume") { Task { await model.resumeRoomHistory() } }
+                                    .disabled(model.roomHistorySending)
+                                    .accessibilityIdentifier("room-history-resume")
+                            }
+                            if model.roomHistoryCanCancel {
+                                Button("Cancel") { Task { await model.cancelRoomHistory() } }
+                                    .disabled(model.roomHistorySending)
+                                    .accessibilityIdentifier("room-history-cancel")
+                            }
+                        }
+                        if model.roomHistoryBusy { ProgressView("Loading requested history…").controlSize(.small) }
+                        if let state = model.roomHistoryStatus {
+                            Text(state.detail).secondaryText()
+                                .accessibilityIdentifier("room-history-status")
+                        }
+                        if let error = model.roomHistoryError {
+                            Text(error).secondaryText()
+                            Button("Check history request") { Task { await model.checkRoomHistory() } }
+                                .disabled(model.roomHistorySending)
+                        }
+                    }.voxPadding(.horizontal, Space.s12)
+                }
                 if let header = model.sessionHeader {
                     Text(header)
                         .frame(maxWidth: .infinity, alignment: .leading)

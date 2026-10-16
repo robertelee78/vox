@@ -810,9 +810,90 @@ pub struct AnchoredChannel {
     pub holding: Vec<(Digest32, Vec<String>)>,
 }
 
+/// An explicit local request for bounded peer history. Cache queries never construct this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum HistoryDemandAction {
+    /// Select a bounded missing interval near the newest accepted head.
+    Newest,
+    /// Select an older interval before this exact cached message.
+    Older { before: Digest32 },
+    /// Resume this exact retained operation, preserving its original bounds.
+    Resume { request: [u8; 16] },
+    /// Cancel this exact retained operation, including provisional body storage.
+    Cancel { request: [u8; 16] },
+    /// Inspect saved progress; never starts or resumes traffic.
+    Status,
+}
+
+/// Public progress for one explicit archive operation; partial progress is not synchronization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryDemandPhase {
+    /// No retained request exists.
+    Idle,
+    /// This bounded selection is already available locally.
+    Cached,
+    /// Local bounded selection or durable request preparation is running.
+    Preparing,
+    /// The explicit request is queued or running.
+    Pending,
+    /// This quantum ended with more within the original selection; explicit resume is required.
+    More,
+    /// Retained work is inactive, including after restart.
+    Paused,
+    /// The requested evidence or a suitable peer is presently unavailable.
+    Unavailable,
+    /// This bounded logical selection completed; older history may still exist.
+    Complete,
+    /// The request is cancelled; bounded provisional cleanup may remain.
+    Cancelled,
+    /// Another bounded operation owns the available reservation.
+    Busy,
+}
+
+/// Redaction-safe, bounded progress returned to the CLI and app.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HistoryDemandStatus {
+    /// Selected room.
+    pub room: Digest32,
+    /// Exact saved room incarnation.
+    pub instance: [u8; 16],
+    /// Current operation, when one was durably created.
+    pub request: Option<[u8; 16]>,
+    /// Public operation state.
+    pub phase: HistoryDemandPhase,
+    /// Author selected for this exact-head page.
+    pub author: Option<Digest32>,
+    /// Original accepted head, never widened by a peer continuation.
+    pub head: Option<Digest32>,
+    /// Remaining authorized entries, at most 128.
+    pub remaining: usize,
+    /// Persisted partial-body offset; ACK never precedes it.
+    pub offset: u64,
+    /// Maximum headers authorized for the logical page.
+    pub headers: usize,
+    /// Maximum total wire bytes per response quantum, including protocol traffic.
+    pub wire_bytes: usize,
+    /// Short operational explanation, never a body or secret.
+    pub detail: String,
+}
+
 /// A command from a client to the node.
 #[derive(Debug)]
 pub enum NodeCommand {
+    /// Explicit local archive demand, distinct from all cache/page/watch APIs.
+    HistoryDemand {
+        /// Selected room.
+        channel_id: Digest32,
+        /// Exact saved room incarnation from the caller's displayed selection.
+        instance: [u8; 16],
+        /// One explicit start, continuation, cancellation or status operation.
+        action: HistoryDemandAction,
+        /// Answer after bounded local preparation; no peer round trip blocks the actor.
+        reply: tokio::sync::oneshot::Sender<Result<HistoryDemandStatus, String>>,
+    },
     /// One private bounded attention operation, authenticated by the receiving transport.
     Attention {
         /// Exact room.

@@ -1887,6 +1887,67 @@ async fn rows_of(
 /// `vox.room.row/1` object per line. The entry hash **is** the cursor. With `--notices` too, what
 /// was done to the room, as `vox.room.notice/1` objects among them.
 ///
+async fn history_exchange(
+    client: &mut IpcClient,
+    channel_id: Digest32,
+    instance: [u8; 16],
+    action: vox_core::node::api::HistoryDemandAction,
+) -> Result<vox_core::node::api::HistoryDemandStatus, AppError> {
+    match client
+        .request(&Request::HistoryDemand {
+            channel_id,
+            instance,
+            action,
+        })
+        .await?
+    {
+        Frame::HistoryDemand { status }
+            if status.room == channel_id && status.instance == instance =>
+        {
+            Ok(status)
+        }
+        Frame::Error { reason } => Err(AppError::Usage(reason)),
+        other => Err(crate::client::unexpected(&other)),
+    }
+}
+
+async fn request_history(
+    client: &mut IpcClient,
+    channel_id: Digest32,
+    instance: [u8; 16],
+    action: &str,
+    before: Option<Digest32>,
+) -> Result<vox_core::node::api::HistoryDemandStatus, AppError> {
+    use vox_core::node::api::{HistoryDemandAction as Action, HistoryDemandPhase as Phase};
+    let chosen = match action {
+        "newest" => Action::Newest,
+        "older" => Action::Older {
+            before: before
+                .ok_or_else(|| AppError::Usage("--history older requires --before ENTRY".into()))?,
+        },
+        "status" => Action::Status,
+        "resume" | "cancel" => {
+            let mut current =
+                history_exchange(client, channel_id, instance, Action::Status).await?;
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+            while current.phase == Phase::Preparing && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                current = history_exchange(client, channel_id, instance, Action::Status).await?;
+            }
+            let request = current.request.ok_or_else(|| {
+                AppError::Usage(format!("No saved request is ready: {}", current.detail))
+            })?;
+            if action == "resume" {
+                Action::Resume { request }
+            } else {
+                Action::Cancel { request }
+            }
+        }
+        _ => return Err(AppError::Usage("Unknown history action".into())),
+    };
+    history_exchange(client, channel_id, instance, chosen).await
+}
+
 /// # Errors
 /// If the node cannot be reached, the room is unknown, or the cursor is not in it.
 #[allow(clippy::too_many_arguments)]
@@ -1900,6 +1961,7 @@ pub async fn read(
     only_late: bool,
     with_notices: bool,
     unread: bool,
+    history: Option<&str>,
     tagged: &Tagged,
 ) -> Result<(), AppError> {
     let (mut client, channel_id, room_key) = open_room(paths, room).await?;
@@ -1909,6 +1971,40 @@ pub async fn read(
         Some(s) => Some(parse_cursor(s)?),
     };
     let before = before.map(parse_cursor).transpose()?;
+    let history = history.or_else(|| {
+        (!crate::coord::agent_marked()
+            && since.is_none()
+            && !unread
+            && !only_late
+            && !with_notices
+            && tagged.tags.is_empty())
+        .then_some(if before.is_some() { "older" } else { "newest" })
+    });
+    if let Some(action) = history {
+        match request_history(&mut client, channel_id, footer_instance, action, before).await {
+            Ok(state) => {
+                if action == "status" || action == "cancel" || action == "resume" {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::json!({"schema":"vox.room.history/1", "status":state})
+                        );
+                    } else {
+                        println!("history {:?}: {}", state.phase, state.detail);
+                    }
+                    return Ok(());
+                }
+                eprintln!("vox: history {:?}: {}", state.phase, state.detail);
+            }
+            Err(error) => {
+                // A failed network-history request must not erase or prevent cached reads.
+                eprintln!("vox: history request unavailable: {error}; showing cached messages");
+                if matches!(action, "status" | "cancel" | "resume") {
+                    return Err(error);
+                }
+            }
+        }
+    }
     if !json {
         // No further than `--limit` (V210-120): a limit was applied only after every row past
         // the cursor had been read. `--late` filters, so it reads on and keeps `--limit` of those.

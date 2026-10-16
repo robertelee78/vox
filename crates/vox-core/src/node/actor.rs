@@ -49,6 +49,7 @@ mod computer;
 mod governance;
 mod local_trust;
 mod recovery;
+mod history_demand;
 use crate::node::prekeys::{self, PrekeyRing};
 use crate::node::profile::Profile;
 use crate::node::status::PublishCause;
@@ -539,6 +540,7 @@ fn command_name(c: &NodeCommand) -> &'static str {
         NodeCommand::OpenChannel { .. } => "opening a room",
         NodeCommand::SendText { .. } | NodeCommand::SendTextAt { .. } => "sending a message",
         NodeCommand::Sync { .. } => "syncing",
+        NodeCommand::HistoryDemand { .. } => "requesting bounded room history",
         NodeCommand::Agree { .. } => "asking members to agree on a claim",
         NodeCommand::Serve { .. } => "publishing a service",
         NodeCommand::Up { .. } => "bringing the proxy up",
@@ -619,6 +621,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::Status(_) => "reporting status",
         NetEvent::Names(_) | NetEvent::Resolve { .. } => "resolving a .vox name",
         NetEvent::SessionActivity { .. } => "reading a page of a room's Session entries",
+        NetEvent::HistoryDemandPrepared { .. } => "preparing explicit room history",
         NetEvent::RoomHistory { .. } => "reading a page of a room's history",
         NetEvent::SessionProjection { .. } => "reading bounded Session metadata",
         NetEvent::SessionFiles { .. } => "reading bounded Session file offers",
@@ -1045,6 +1048,7 @@ enum NetEvent {
             std::result::Result<crate::node::channel::session_projection::FileReply, String>,
         >,
     },
+    HistoryDemandPrepared { token: u64 },
     RoomHistory {
         channel_id: Digest32,
         query: crate::node::channel::history::Query,
@@ -4616,6 +4620,7 @@ struct RoomPublication {
 
 /// The node actor's state (owned by its task).
 pub struct Node {
+    history_demand: history_demand::Controller,
     history_budget: Arc<crate::node::history_budget::Budget>,
     governance_work: governance::Maintenance,
     paths: Paths,
@@ -5374,6 +5379,7 @@ impl Node {
                 Err(error) => (Vec::new(), Some(error.to_string())),
             };
         let node = Self {
+            history_demand: history_demand::Controller::default(),
             history_budget,
             paths,
             decisions,
@@ -6031,6 +6037,10 @@ impl Node {
             return Outcome::Failed(Fault::ComputerPolicy);
         }
         match command {
+            NodeCommand::HistoryDemand { channel_id, instance, action, reply } => {
+                let _ = reply.send(self.begin_history_demand(channel_id, instance, action));
+                Outcome::Done
+            }
             NodeCommand::Attention {
                 channel_id,
                 by,
@@ -10113,6 +10123,11 @@ impl Node {
                 };
                 let _ = reply.send(result);
             }
+            NetEvent::HistoryDemandPrepared { token } => {
+                if self.history_demand.preparing.as_ref().is_some_and(|p| p.token == token) {
+                    self.accept_history_demand();
+                }
+            }
             NetEvent::RoomHistory {
                 channel_id,
                 query,
@@ -13753,6 +13768,7 @@ impl Node {
     /// FIFO within a peer, re-checking their need when their turn comes. Returns whether a session
     /// started.
     async fn schedule(&mut self) -> bool {
+        self.accept_history_demand();
         if self.net.is_none() {
             self.sched_rooms.clear();
             self.sched_all = false;
@@ -16741,6 +16757,8 @@ impl Node {
     /// up to one Argon2id derivation, it would answer nobody meanwhile (V210-71). Until then the
     /// node is *locking* ([`NodeView::locking`]). The returned receiver fires once it has settled.
     async fn lock_all(&mut self) -> oneshot::Receiver<()> {
+        let mut history_demand = std::mem::take(&mut self.history_demand);
+        history_demand.fence();
         self.cancel_room_validations(None, Fault::Locked);
         self.passphrase_entered_at
             .store(0, std::sync::atomic::Ordering::Relaxed);
@@ -16871,6 +16889,7 @@ impl Node {
         let tx = self.net_tx.clone();
         tokio::spawn(async move {
             let mut aborted = aborted;
+            history_demand.retire().await;
             if let Some(task) = reopening {
                 let _ = task.await;
             }

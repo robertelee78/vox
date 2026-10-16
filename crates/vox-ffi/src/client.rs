@@ -1144,6 +1144,25 @@ pub struct FfiRoomRead {
     pub before: Option<String>,
 }
 
+/// Status of one explicitly requested, bounded peer-history operation. Cached reads do not start it.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiHistoryDemandStatus {
+    /// Room whose saved operation was inspected.
+    pub room: String,
+    /// Exact saved-room instance; never reusable after replacement.
+    pub instance: Vec<u8>,
+    /// Exact durable operation required by resume and cancel.
+    pub request: Option<Vec<u8>>,
+    /// Idle, preparing, pending, paused, more, unavailable, complete, cached, cancelled or busy.
+    pub phase: String,
+    /// Current bounded outcome for the person requesting history.
+    pub detail: String,
+    /// Entries left within the original selected interval.
+    pub remaining: u64,
+    /// Durably acknowledged byte offset of the one staged body.
+    pub offset: u64,
+}
+
 /// One bounded thread window. Earlier/later navigation replaces the held window.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct FfiThreadRead {
@@ -3837,6 +3856,95 @@ impl VoxClient {
         let _cancel = CancelRead(read);
         task.await
             .map_err(|_| failed("The member metadata read was cancelled."))?
+    }
+
+    /// Explicitly request one bounded peer-history quantum, or inspect/resume/cancel its saved state.
+    /// Watchers and cache-only room reads never call this operation.
+    ///
+    /// # Errors
+    /// Malformed action or binding, changed node/room, or current authorization refusal.
+    pub async fn room_history_demand(
+        &self,
+        room: String,
+        node: String,
+        instance: Vec<u8>,
+        action: String,
+        before: Option<String>,
+        request: Option<Vec<u8>>,
+    ) -> Result<FfiHistoryDemandStatus, VoxError> {
+        use vox_core::node::api::{HistoryDemandAction as Action, HistoryDemandPhase as Phase};
+        let channel_id = digest(&room, "room id")?;
+        let actor = input_fingerprint(&node)?;
+        let instance: [u8; 16] = instance
+            .try_into()
+            .map_err(|_| failed("The saved room identity must contain exactly 16 bytes."))?;
+        let request = request
+            .map(|r| {
+                r.try_into()
+                    .map_err(|_| failed("The history request must contain exactly 16 bytes."))
+            })
+            .transpose()?;
+        let action = match action.as_str() {
+            "newest" if request.is_none() && before.is_none() => Action::Newest,
+            "older" if request.is_none() => Action::Older {
+                before: digest(
+                    before
+                        .as_deref()
+                        .ok_or_else(|| failed("Older history requires its displayed entry."))?,
+                    "entry",
+                )?,
+            },
+            "status" if request.is_none() && before.is_none() => Action::Status,
+            "resume" if before.is_none() => Action::Resume {
+                request: request.ok_or_else(|| failed("Resume requires the saved request."))?,
+            },
+            "cancel" if before.is_none() => Action::Cancel {
+                request: request.ok_or_else(|| failed("Cancel requires the saved request."))?,
+            },
+            _ => return Err(failed("The history action or its arguments are invalid.")),
+        };
+        on_held!(self, |c| {
+            if c.me() != Some(actor) {
+                return Err(failed("The acting node changed before requesting history."));
+            }
+            match ask(
+                c,
+                &Request::HistoryDemand {
+                    channel_id,
+                    instance,
+                    action,
+                },
+            )
+            .await?
+            {
+                Frame::HistoryDemand { status }
+                    if status.room == channel_id && status.instance == instance =>
+                {
+                    let phase = match status.phase {
+                        Phase::Idle => "idle",
+                        Phase::Cached => "cached",
+                        Phase::Preparing => "preparing",
+                        Phase::Pending => "pending",
+                        Phase::More => "more",
+                        Phase::Paused => "paused",
+                        Phase::Unavailable => "unavailable",
+                        Phase::Complete => "complete",
+                        Phase::Cancelled => "cancelled",
+                        Phase::Busy => "busy",
+                    };
+                    Ok(FfiHistoryDemandStatus {
+                        room: b32_encode(&channel_id),
+                        instance: instance.to_vec(),
+                        request: status.request.map(|id| id.to_vec()),
+                        phase: phase.into(),
+                        detail: status.detail,
+                        remaining: status.remaining as u64,
+                        offset: status.offset,
+                    })
+                }
+                other => Err(unexpected(&other)),
+            }
+        })
     }
 
     /// Open a room at its newest bounded history page (ADR-034 FR-4).

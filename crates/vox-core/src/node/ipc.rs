@@ -235,6 +235,8 @@ const T_RETENTION_ABOVE_ROOM: u64 = 3803;
 const T_OK: u64 = 3;
 const T_ERROR: u64 = 4;
 const T_ROWS: u64 = 5;
+const T_HISTORY_DEMAND_REQ: u64 = 94101;
+const T_HISTORY_DEMAND: u64 = 94102;
 const T_FILTERED_ROWS: u64 = 87201;
 const T_MEMBERS: u64 = 6;
 /// [`Frame::MemberConsents`] (V030-17).
@@ -501,6 +503,15 @@ const T_OFFERS: u64 = 4952;
 /// is accident prevention on top of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
+    /// Explicit peer-history demand. All ordinary room pages remain cache-only.
+    HistoryDemand {
+        /// Selected room.
+        channel_id: Digest32,
+        /// Exact saved room incarnation.
+        instance: [u8; 16],
+        /// Bounded local action; continuation requires a new explicit resume.
+        action: crate::node::api::HistoryDemandAction,
+    },
     /// One stateless daemon-folded work-board page (ADR-033 WD).
     WorkBoard {
         /// Selected readable room.
@@ -1351,6 +1362,17 @@ impl Request {
                 e.array(3).uint(T_ROOM_PAGE_REQ).bytes(channel_id);
                 governance_page::put_query(&mut e, query);
             }
+            Request::HistoryDemand {
+                channel_id,
+                instance,
+                action,
+            } => {
+                e.array(4)
+                    .uint(T_HISTORY_DEMAND_REQ)
+                    .bytes(channel_id)
+                    .bytes(instance)
+                    .text(&serde_json::to_string(action).expect("bounded history action"));
+            }
             Request::RoomViewPage {
                 channel_id,
                 view,
@@ -2189,6 +2211,25 @@ impl Request {
                     instance,
                     revision,
                     before,
+                })
+            }
+            (T_HISTORY_DEMAND_REQ, 4) => {
+                let channel_id = digest(&mut d)?;
+                let instance = d
+                    .bytes()?
+                    .try_into()
+                    .map_err(|_| Error::MalformedIpc("history demand instance"))?;
+                let text = d.text()?;
+                if text.len() > 1024 {
+                    return Err(Error::MalformedIpc("history demand action bound"));
+                }
+                let action = serde_json::from_str(text)
+                    .map_err(|_| Error::MalformedIpc("history demand action"))?;
+                d.finish()?;
+                Ok(Request::HistoryDemand {
+                    channel_id,
+                    instance,
+                    action,
                 })
             }
             (T_ROOM_VIEW_PAGE_REQ, 6) => {
@@ -3065,6 +3106,10 @@ pub struct SharedService {
 /// how a `Lagged` report comes to be silently swallowed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
+    /// Durable progress of the explicitly selected bounded history operation.
+    HistoryDemand {
+        status: crate::node::api::HistoryDemandStatus,
+    },
     /// One daemon-owned work-board projection, never a client-side fold.
     WorkBoard {
         /// JSON encoding of work_board::Page, bounded to one displayed page.
@@ -3487,6 +3532,11 @@ impl Frame {
             Frame::GovernancePage { page } => {
                 e.array(2).uint(T_ROOM_PAGE);
                 governance_page::put_page(&mut e, page);
+            }
+            Frame::HistoryDemand { status } => {
+                e.array(2)
+                    .uint(T_HISTORY_DEMAND)
+                    .text(&serde_json::to_string(status).expect("bounded history status"));
             }
             Frame::RoomPage { rows, older } => {
                 e.array(3)
@@ -4495,6 +4545,22 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 instance,
                 next,
             });
+        }
+        (T_HISTORY_DEMAND, 2) => {
+            let text = d.text()?;
+            if text.len() > 4096 {
+                return Err(Error::MalformedIpc("history demand status bound"));
+            }
+            let status: crate::node::api::HistoryDemandStatus = serde_json::from_str(text)
+                .map_err(|_| Error::MalformedIpc("history demand status"))?;
+            if status.headers > 128
+                || status.remaining > status.headers
+                || status.wire_bytes > 1024 * 1024
+                || status.detail.len() > 512
+            {
+                return Err(Error::MalformedIpc("history demand status limits"));
+            }
+            return Ok(Frame::HistoryDemand { status });
         }
         (T_ROOM_PAGE, 2) => {
             return Ok(Frame::GovernancePage {
@@ -7285,7 +7351,8 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
     // A preparing room is not empty, closed, or waiting for another passphrase. Refuse
     // its operation promptly without blocking node controls or creating a second opener.
     let room = match &request {
-        Request::WorkBoard { channel_id, .. }
+        Request::HistoryDemand { channel_id, .. }
+        | Request::WorkBoard { channel_id, .. }
         | Request::Footers { channel_id, .. }
         | Request::ArrivalHead { channel_id, .. }
         | Request::ArrivalPage { channel_id, .. }
@@ -7488,6 +7555,33 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             }
             .await;
             answer.unwrap_or_else(|reason| Frame::Error { reason })
+        }
+        Request::HistoryDemand {
+            channel_id,
+            instance,
+            action,
+        } => {
+            let (reply, receive) = tokio::sync::oneshot::channel();
+            match handle
+                .apply(crate::node::api::NodeCommand::HistoryDemand {
+                    channel_id,
+                    instance,
+                    action,
+                    reply,
+                })
+                .await
+            {
+                crate::node::api::Outcome::Done => match receive.await {
+                    Ok(Ok(status)) => Frame::HistoryDemand { status },
+                    Ok(Err(reason)) => Frame::Error { reason },
+                    Err(_) => Frame::Error {
+                        reason: "history demand preparation stopped".into(),
+                    },
+                },
+                other => Frame::Error {
+                    reason: other.to_string(),
+                },
+            }
         }
         Request::ArrivalHead { channel_id } => {
             match handle.history_reader().arrival_head(channel_id).await {

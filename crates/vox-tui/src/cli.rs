@@ -1513,6 +1513,10 @@ pub struct RoomSessionsArgs {
 /// `vox room read`
 #[derive(Args, Debug, Clone)]
 pub struct RoomReadArgs {
+    /// Explicit bounded peer history: newest, older (with --before), resume, cancel or status.
+    /// Ordinary human reads request newest once; agent/watch/cursor reads remain cache-only.
+    #[arg(long, value_parser = ["newest", "older", "resume", "cancel", "status"], conflicts_with_all = ["since", "unread", "tag", "late", "hashes"])]
+    pub history: Option<String>,
     #[command(flatten)]
     pub profile: NodeArgs,
     /// The room's id, or a unique prefix of it.
@@ -2773,6 +2777,7 @@ pub fn run() -> ExitCode {
                                 a.late,
                                 a.notices,
                                 a.unread,
+                                a.history.as_deref(),
                                 &crate::room_cli::Tagged {
                                     tags: a.tag.clone(),
                                     from: a.from.clone(),
