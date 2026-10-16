@@ -4562,7 +4562,7 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 .map_err(|_| Error::MalformedIpc("history demand status"))?;
             if status.headers > 128
                 || status.remaining > status.headers
-                || status.wire_bytes > 1024 * 1024
+                || status.wire_bytes > crate::log::sync::LEGACY_QUANTUM_BYTES
                 || status.detail.len() > 512
             {
                 return Err(Error::MalformedIpc("history demand status limits"));
