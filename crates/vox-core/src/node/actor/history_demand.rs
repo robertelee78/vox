@@ -84,6 +84,25 @@ impl Controller {
             self.status = Some(status);
         }
     }
+    /// A failed quantum leaves its durable request available for an explicit resume.
+    pub(super) fn failed(&mut self, request: RequestId, generation: Digest32, detail: &str) {
+        if !self
+            .running
+            .as_ref()
+            .is_some_and(|r| r.request == request && r.generation == generation)
+        {
+            return;
+        }
+        if let Some(running) = self.running.take() {
+            running.fence.retire();
+            running.cancellation.cancel();
+        }
+        self.ready = None;
+        if let Some(status) = self.status.as_mut().filter(|s| s.request == Some(request)) {
+            status.phase = Phase::Paused;
+            status.detail = detail.chars().take(128).collect();
+        }
+    }
     fn stop_request(&mut self, room: Digest32, instance: [u8; 16], request: RequestId) {
         if !self
             .status
