@@ -866,6 +866,15 @@ impl NodeConfig {
     }
 }
 
+/// One current-network attempt at one bounded candidate set. The actor owns cancellation
+/// and retirement; a queued result is accepted only while its attempt token still matches.
+struct AnchorDial {
+    generation: u64,
+    attempt: u64,
+    candidates: Vec<std::net::SocketAddr>,
+    _cancel: oneshot::Sender<()>,
+}
+
 /// The longest an anchor that keeps failing waits between dials (V210-57, #243). A lost or
 /// failing anchor is dialled on the next tick, then after 1, 2, 4… seconds, doubling to this.
 /// It used to be the *only* redial: every anchor was checked once per 30 s, so a node whose
@@ -1084,6 +1093,7 @@ enum NetEvent {
     /// bookkeeping, the `Anchor` class, and every open channel's records.
     AnchorConnected {
         generation: u64,
+        attempt: u64,
         /// The connection to the anchor.
         conn: Arc<VoxConnection>,
     },
@@ -1103,6 +1113,8 @@ enum NetEvent {
     /// event after `ChannelOpened`.
     ReachFailed {
         generation: u64,
+        /// Only the still-current anchor attempt may publish a failure.
+        anchor_attempt: Option<u64>,
         /// The peer that could not be reached.
         peer: Digest32,
         /// What the attempt reported.
@@ -4682,7 +4694,8 @@ pub struct Node {
     /// The anchors being dialled right now, so none is dialled twice at once (V210-57): a node
     /// starting up dialled each anchor from both its start and its first tick, and the
     /// duplicate lost a tie-break against the first on every start.
-    anchor_dials: Arc<std::sync::Mutex<BTreeMap<Digest32, u64>>>,
+    anchor_dials: BTreeMap<Digest32, AnchorDial>,
+    next_anchor_dial: u64,
     /// Per shared, unconfigured anchor whose rooms name more than [`ANCHOR_DIAL_CANDIDATES`]
     /// addresses: where the next dial's window starts in their union (V210-75). Moved on by
     /// each failed dial, dropped when one connects.
@@ -5393,7 +5406,8 @@ impl Node {
             store_recovery: BTreeMap::new(),
             store_recovered: BTreeMap::new(),
             anchor_backoff: BTreeMap::new(),
-            anchor_dials: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            anchor_dials: BTreeMap::new(),
+            next_anchor_dial: 0,
             anchor_window: BTreeMap::new(),
             anchor_hints: BootstrapSet::new(),
             anchor_hints_load_error: false,
@@ -7733,10 +7747,7 @@ impl Node {
         self.anchor_backoff.clear();
         self.anchor_connected_at.clear();
         self.anchor_hints_due.clear();
-        self.anchor_dials
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
+        self.anchor_dials.clear();
         self.member_dialed_at.clear();
         self.nearby_dialed.clear();
         self.last_upgrade.clear();
@@ -7831,6 +7842,9 @@ impl Node {
         self.room_anchors.retain(|room, _| open.contains_key(room));
         self.sync_anchor_scopes(&net);
         let known = self.kept_anchors();
+        // Dropping the cancellation sender retires an attempt whose final source was removed.
+        self.anchor_dials
+            .retain(|id, _| known.iter().any(|(known, _)| known == id));
         self.anchor_hints_due
             .retain(|id, _| known.iter().any(|(known, _)| known == id));
         // **A loss is noticed however the anchor went** (V210-93), in every build. A clean stop
@@ -8106,6 +8120,18 @@ impl Node {
         }
     }
 
+    fn finish_anchor_dial(&mut self, peer: Digest32, generation: u64, attempt: u64) -> bool {
+        if !self
+            .anchor_dials
+            .get(&peer)
+            .is_some_and(|dial| dial.generation == generation && dial.attempt == attempt)
+        {
+            return false;
+        }
+        self.anchor_dials.remove(&peer);
+        true
+    }
+
     /// Dial the anchor `id` unless it is connected or already being dialled; whether a dial was
     /// started. The one place an anchor is dialled from (V210-57): the node's start, a room's
     /// anchors, and the redial each used to spawn their own, and at start two of them raced.
@@ -8119,50 +8145,55 @@ impl Node {
             return false;
         }
         let generation = net.manager().network_generation();
+        if self
+            .anchor_dials
+            .get(&id)
+            .is_some_and(|dial| dial.generation == generation && dial.candidates == candidates)
         {
-            let mut dials = self
-                .anchor_dials
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if dials.get(&id) == Some(&generation) {
-                return false;
-            }
-            dials.insert(id, generation);
+            return false;
         }
+        self.next_anchor_dial = self.next_anchor_dial.wrapping_add(1);
+        let attempt = self.next_anchor_dial;
+        let (cancel, cancelled) = oneshot::channel();
+        // DNS may finish after the network-change retry started with cached endpoints.
+        // Replace that exact attempt now; a fresh endpoint must not wait for its old timeout.
+        self.anchor_dials.insert(
+            id,
+            AnchorDial {
+                generation,
+                attempt,
+                candidates: candidates.clone(),
+                _cancel: cancel,
+            },
+        );
         let now = self.now_ms().get();
         self.anchor_unreached_since.entry(id).or_insert(now);
-        // Untold until a publish round says it holds this node's records (`PublishDone`): a
-        // circuit it refuses as a stranger meanwhile is asked again then.
         net.board_untold(id);
-        let (net, tx, dials) = (
-            Arc::clone(net),
-            self.net_tx.clone(),
-            Arc::clone(&self.anchor_dials),
-        );
+        let (net, tx) = (Arc::clone(net), self.net_tx.clone());
         tokio::spawn(async move {
-            let dialled = net.manager().connect_to(id, &candidates).await;
-            {
-                let mut dials = dials
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if dials.get(&id) == Some(&generation) {
-                    dials.remove(&id);
-                }
-            }
+            let dialled = tokio::select! {
+                biased;
+                _ = cancelled => return,
+                result = net.manager().connect_to(id, &candidates) => result,
+            };
             if net.manager().network_generation() != generation {
                 return;
             }
             match dialled {
                 Ok(conn) => {
                     let _ = tx
-                        .send(NetEvent::AnchorConnected { conn, generation })
+                        .send(NetEvent::AnchorConnected {
+                            conn,
+                            generation,
+                            attempt,
+                        })
                         .await;
                 }
                 Err(e) => {
-                    net.board_told(&id);
                     let _ = tx
                         .send(NetEvent::ReachFailed {
                             generation,
+                            anchor_attempt: Some(attempt),
                             peer: id,
                             why: e.to_string(),
                         })
@@ -9010,13 +9041,24 @@ impl Node {
                 peer,
                 why,
                 generation,
+                anchor_attempt,
             } => {
+                if let Some(attempt) = anchor_attempt {
+                    if !self.finish_anchor_dial(peer, generation, attempt) {
+                        return;
+                    }
+                }
                 if self
                     .net
                     .as_ref()
                     .is_none_or(|n| n.manager().network_generation() != generation)
                 {
                     return;
+                }
+                if anchor_attempt.is_some() {
+                    if let Some(net) = self.net.as_ref() {
+                        net.board_told(&peer);
+                    }
                 }
                 // An anchor that failed to connect waits before its next dial, doubling to
                 // `ANCHOR_UNREACHED_REDIAL_MS` (V210-57, V210-86), jittered once it is there, a
@@ -9117,7 +9159,14 @@ impl Node {
                     self.save_anchor_hints();
                 }
             }
-            NetEvent::AnchorConnected { conn, generation } => {
+            NetEvent::AnchorConnected {
+                conn,
+                generation,
+                attempt,
+            } => {
+                if !self.finish_anchor_dial(conn.peer_id(), generation, attempt) {
+                    return;
+                }
                 if self
                     .net
                     .as_ref()
@@ -15933,6 +15982,7 @@ impl Node {
                         let _ = tx
                             .send(NetEvent::ReachFailed {
                                 generation,
+                                anchor_attempt: None,
                                 peer: target,
                                 why: e.to_string(),
                             })
@@ -16111,6 +16161,7 @@ impl Node {
                     let _ = tx
                         .send(NetEvent::ReachFailed {
                             generation,
+                            anchor_attempt: None,
                             peer,
                             why: e.to_string(),
                         })
