@@ -49,16 +49,20 @@ fn key_package_for(entry: &Entry, recipient: &Digest32) -> bool {
 mod attention;
 mod diagnostics;
 pub(crate) mod entry_store;
-mod governance;
+pub(crate) mod governance;
 pub(crate) mod history;
 pub(crate) mod key_package_queue;
 mod legacy_session;
 mod legacy_session_sender;
+mod local_history;
 mod private_session;
 pub(crate) mod session_floor;
 pub(crate) mod session_projection;
 mod sparse_history;
-pub(crate) use sparse_history::{HistoryHeader, HistoryPayload};
+pub(crate) use sparse_history::{
+    HistoryEffectCursor, HistoryEffectProgress, HistoryHeadHint, HistoryHeadPage, HistoryHeader,
+    HistoryPayload, HistorySourceStart,
+};
 
 pub use diagnostics::SetAside;
 pub use entry_store::OrderView;
@@ -1066,6 +1070,12 @@ pub struct ChannelState {
     skipped: std::collections::VecDeque<(Digest32, Vec<Digest32>)>,
     poisoned: bool,
     save_error: Option<String>,
+    /// Only one synchronous authored append may hold this bounded metadata. No value
+    /// is an accepted head until the existing entry/sender transaction commits.
+    local_pre_context: Option<crate::log::history::ControlContext>,
+    local_append_budget: Option<crate::log::history::LocalAppendBudget>,
+    local_content_header: Option<(crate::log::history::EntryV2, Vec<Digest32>)>,
+    local_history: Option<local_history::Prepared>,
     /// Whether this node holds its own feed in the room as the room does (V210-164). A room
     /// joined starts without: this identity may have been in it before — it left, or its
     /// profile is new — and its earlier entries are with the other members. Writing before they
@@ -1863,6 +1873,10 @@ impl ChannelState {
             skipped: std::collections::VecDeque::new(),
             poisoned: false,
             save_error: None,
+            local_pre_context: None,
+            local_append_budget: None,
+            local_content_header: None,
+            local_history: None,
             settled: true,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             readmitted: BTreeMap::new(),
@@ -1977,7 +1991,9 @@ impl ChannelState {
                 return Err(Error::MalformedAtRest("restart room or epoch differs"));
             }
             if state.sparse != entry_read.sparse_enabled() {
-                return Err(Error::MalformedAtRest("restart history format differs from published roots"));
+                return Err(Error::MalformedAtRest(
+                    "restart history format differs from published roots",
+                ));
             }
             // Each compact head was sealed atomically with its accepted prefix. Verify its
             // bounded source binding, never infer acceptance from an arbitrary locator maximum.
@@ -2509,6 +2525,10 @@ impl ChannelState {
             skipped: std::collections::VecDeque::new(),
             poisoned: false,
             save_error: None,
+            local_pre_context: None,
+            local_append_budget: None,
+            local_content_header: None,
+            local_history: None,
             settled,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             readmitted: BTreeMap::new(),
@@ -2755,6 +2775,10 @@ impl ChannelState {
             skipped: std::collections::VecDeque::new(),
             poisoned: false,
             save_error: None,
+            local_pre_context: None,
+            local_append_budget: None,
+            local_content_header: None,
+            local_history: None,
             settled: false,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             readmitted: BTreeMap::new(),
@@ -3435,6 +3459,18 @@ impl ChannelState {
     ) -> Result<()> {
         let mut index = self.entries.write(batch, &self.sek, &self.channel_id)?;
         index.publish_promotion()?;
+        if let Some(prepared) = &self.local_history {
+            index.publish_local_history(entry_store::sparse::LocalHistoryPublication {
+                entry,
+                header: &prepared.header,
+                head: &prepared.head,
+                consistency: &prepared.consistency,
+                included: &prepared.included,
+                pre_context: &prepared.pre,
+                post_context: &prepared.post,
+                ranges: &prepared.ranges,
+            })?;
+        }
         index.seal()?;
         session_projection::private_index::observe_public(
             batch,
@@ -3446,6 +3482,10 @@ impl ChannelState {
     }
 
     fn finish_entry_publication(&mut self, store: &Store) -> Result<()> {
+        self.local_history = None;
+        self.local_pre_context = None;
+        self.local_append_budget = None;
+        self.local_content_header = None;
         self.key_packages.published(self.next_log_id);
         let result = (|| -> Result<()> {
             loop {
@@ -3539,6 +3579,7 @@ impl ChannelState {
         package: &crate::node::keypackage::KeyPackage,
         now_millis: u64,
     ) -> Result<Digest32> {
+        self.ensure_local_append_available(profile.store())?;
         if self.poisoned {
             return Err(self.save_failure());
         }
@@ -3551,20 +3592,14 @@ impl ChannelState {
             return Err(Error::Profile("this identity is not an author of the room"));
         }
         let payload = package.to_wire();
-        let skeleton = self.next_skeleton(profile.store(), &me, &payload, now_millis)?;
+        let skeleton = self.next_skeleton(profile, &me, &payload, now_millis)?;
         let entry = Entry::build_signed(signer, skeleton, payload)?;
         let entry_hash = entry.entry_hash();
         let id = self.next_log_id;
         let key = signer.public_key();
 
         let persisted = (|| -> Result<()> {
-            self.prepare_entry(
-                profile.store(),
-                &entry,
-                EntryKind::Content,
-                &key,
-                now_millis,
-            )?;
+            self.prepare_local_entry(profile, &entry, EntryKind::Content, &key, now_millis)?;
             let mut batch = profile.store().batch()?;
             self.publish_entry_into(&mut batch, &entry)?;
             self.observe_governance_into(profile.store(), &mut batch, &entry, id)?;
@@ -5421,6 +5456,7 @@ impl ChannelState {
         now_ms: u64,
         kind: EntryKind,
     ) -> Result<()> {
+        self.ensure_local_append_available(profile.store())?;
         if self.poisoned {
             return Err(self.save_failure());
         }
@@ -5429,12 +5465,12 @@ impl ChannelState {
         }
         let signer = profile.signer()?;
         let me = signer.fingerprint();
-        let skeleton = self.next_skeleton(profile.store(), &me, payload, now_ms)?;
+        let skeleton = self.next_skeleton(profile, &me, payload, now_ms)?;
         let entry = Entry::build_signed(signer, skeleton, payload.to_vec())?;
         let id = self.next_log_id;
 
         let persisted = (|| -> Result<()> {
-            self.prepare_entry(profile.store(), &entry, kind, &signer.public_key(), now_ms)?;
+            self.prepare_local_entry(profile, &entry, kind, &signer.public_key(), now_ms)?;
             let mut batch = profile.store().batch()?;
             self.publish_entry_into(&mut batch, &entry)?;
             self.observe_governance_into(profile.store(), &mut batch, &entry, id)?;
@@ -5754,6 +5790,7 @@ impl ChannelState {
         now_ms: u64,
         rows: &[(u64, SealedSegment)],
     ) -> Result<Digest32> {
+        self.ensure_local_append_available(profile.store())?;
         if self.poisoned {
             return Err(self.save_failure());
         }
@@ -5765,7 +5802,7 @@ impl ChannelState {
         if !self.authors.contains_key(&me) {
             return Err(Error::Profile("this identity is not an author of the room"));
         }
-        let skeleton = self.next_skeleton(profile.store(), &me, payload, now_ms)?;
+        let skeleton = self.next_skeleton(profile, &me, payload, now_ms)?;
         let entry = Entry::build_signed(signer, skeleton, payload.to_vec())?;
         let hash = entry.entry_hash();
         let wire = entry.to_wire();
@@ -5778,7 +5815,7 @@ impl ChannelState {
         let kind = classify_payload(payload)?;
 
         let written = (|| -> Result<()> {
-            self.prepare_entry(profile.store(), &entry, kind, &key, now_ms)?;
+            self.prepare_local_entry(profile, &entry, kind, &key, now_ms)?;
             let mut batch = profile.store().batch()?;
             self.publish_entry_into(&mut batch, &entry)?;
             self.observe_governance_into(profile.store(), &mut batch, &entry, id)?;
@@ -7730,6 +7767,7 @@ impl ChannelState {
         // caller still thinking in seconds should fail to compile rather than stamp 1970.
         now_millis: u64,
     ) -> Result<Rendered> {
+        self.ensure_local_append_available(profile.store())?;
         if self.poisoned {
             return Err(self.save_failure());
         }
@@ -7749,6 +7787,7 @@ impl ChannelState {
         }
         let (now_millis, skipped) = self.stamp_after_held(profile.store(), now_millis)?;
         let content = Content::text(now_millis, text)?;
+        self.prepare_content_context(profile, &me, now_millis)?;
         let plaintext = Zeroizing::new(content.to_canonical_vec());
         let msg = self.sender.encrypt(&plaintext)?;
         let payload = msg.to_wire();
@@ -7770,7 +7809,7 @@ impl ChannelState {
             payload
         };
 
-        let skeleton = self.next_skeleton(profile.store(), &me, &payload, now_millis)?;
+        let skeleton = self.next_skeleton(profile, &me, &payload, now_millis)?;
         let entry = Entry::build_signed(signer, skeleton, payload)?;
         let entry_hash = entry.entry_hash();
         let wire = entry.to_wire();
@@ -7811,13 +7850,7 @@ impl ChannelState {
         let key = signer.public_key();
 
         let persisted = (|| -> Result<()> {
-            self.prepare_entry(
-                profile.store(),
-                &entry,
-                EntryKind::Content,
-                &key,
-                now_millis,
-            )?;
+            self.prepare_local_entry(profile, &entry, EntryKind::Content, &key, now_millis)?;
             let mut batch = profile.store().batch()?;
             self.publish_entry_into(&mut batch, &entry)?;
             self.observe_governance_into(profile.store(), &mut batch, &entry, id)?;
@@ -8252,6 +8285,7 @@ impl ChannelState {
         read: Vec<Digest32>,
         now_millis: u64,
     ) -> Result<Digest32> {
+        self.ensure_local_append_available(profile.store())?;
         if self.poisoned {
             return Err(self.save_failure());
         }
@@ -8269,10 +8303,11 @@ impl ChannelState {
         let sent_ms = now_millis;
         let (now_millis, _) = self.stamp_after_held(profile.store(), now_millis)?;
         let record = crate::node::content::ReadRecord::new(now_millis, read)?;
+        self.prepare_content_context(profile, &me, now_millis)?;
         let plaintext = Zeroizing::new(record.to_canonical_vec());
         let msg = self.sender.encrypt(&plaintext)?;
         let payload = msg.to_wire();
-        let skeleton = self.next_skeleton(profile.store(), &me, &payload, now_millis)?;
+        let skeleton = self.next_skeleton(profile, &me, &payload, now_millis)?;
         let entry = Entry::build_signed(signer, skeleton, payload)?;
         let entry_hash = entry.entry_hash();
         let wire = entry.to_wire();
@@ -8305,13 +8340,7 @@ impl ChannelState {
         let key = signer.public_key();
 
         let persisted = (|| -> Result<()> {
-            self.prepare_entry(
-                profile.store(),
-                &entry,
-                EntryKind::Content,
-                &key,
-                now_millis,
-            )?;
+            self.prepare_local_entry(profile, &entry, EntryKind::Content, &key, now_millis)?;
             let mut batch = profile.store().batch()?;
             self.publish_entry_into(&mut batch, &entry)?;
             self.observe_governance_into(profile.store(), &mut batch, &entry, id)?;
@@ -8370,11 +8399,13 @@ impl ChannelState {
     /// places the entry after everything its author could have read.
     fn next_skeleton(
         &mut self,
-        store: &Store,
+        profile: &Profile,
         author: &Digest32,
         payload: &[u8],
         claimed_ms: u64,
     ) -> Result<EntrySkeleton> {
+        let typed = self.authored_v2(profile, author, payload, claimed_ms)?;
+        let store = profile.store();
         let result = (|| -> Result<EntrySkeleton> {
             let feed = self.dag.feed(author);
             let max = feed.map_or(0, |f| f.max_seq());
@@ -8389,7 +8420,7 @@ impl ChannelState {
                     .ok_or(Error::MalformedAtRest("local feed predecessor missing"))
             };
             Ok(EntrySkeleton {
-                v2: None,
+                v2: typed.as_ref().map(|(v2, _)| v2.clone()),
                 author_id: *author,
                 seq,
                 prev_hash: if seq == 1 {
@@ -8409,10 +8440,13 @@ impl ChannelState {
                 payload_len: payload.len() as u64,
                 end_of_feed: false,
                 claimed_ms,
-                seen: self.dag.seen_for(
-                    &self.entries.read(store, &self.sek, &self.channel_id)?,
-                    author,
-                )?,
+                seen: match &typed {
+                    Some((_, seen)) => seen.clone(),
+                    None => self.dag.seen_for(
+                        &self.entries.read(store, &self.sek, &self.channel_id)?,
+                        author,
+                    )?,
+                },
             })
         })();
         if let Err(ref error) = result {

@@ -15,6 +15,7 @@ use crate::log::history::{
 pub(crate) struct ValidatedSparseEntry {
     included: IncludedHeader,
     pre_context: ControlContext,
+    payload_state: SparsePayloadState,
 }
 impl ValidatedSparseEntry {
     pub(crate) fn included(&self) -> &IncludedHeader {
@@ -31,6 +32,9 @@ impl ValidatedSparseEntry {
     }
     pub(crate) fn entry_hash(&self) -> Digest32 {
         self.included.header().entry().entry_hash()
+    }
+    pub(crate) fn payload_state(&self) -> SparsePayloadState {
+        self.payload_state
     }
 }
 
@@ -59,6 +63,16 @@ impl VerifiedParentPrefix {
 /// recipient-side key application result. Private ciphertext is never decrypted here.
 pub(crate) struct TypedSparseBody {
     hash: Digest32,
+    state: SparsePayloadState,
+}
+
+/// Holding an addressed ciphertext is not applying its key. Key installation and private
+/// access always retain their existing recipient, namespace, generation and trust checks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SparsePayloadState {
+    Held,
+    ContentAbsent,
+    KeyPackagePending { recipient: Digest32 },
 }
 
 pub(crate) enum PayloadValidation {
@@ -85,9 +99,17 @@ pub(crate) struct SparseValidation {
     parent_coordinate: usize,
     coordinate: usize,
     finished: bool,
+    payload_state: SparsePayloadState,
 }
 
 impl TypedSparseBody {
+    pub(crate) fn entry_hash(&self) -> Digest32 {
+        self.hash
+    }
+    pub(crate) fn state(&self) -> SparsePayloadState {
+        self.state
+    }
+
     /// The caller already owns the large-record envelope for a present payload. Borrow the
     /// content ciphertext rather than making another maximum-sized allocation just to type it.
     pub(crate) fn verify(
@@ -105,13 +127,17 @@ impl TypedSparseBody {
             .ok_or(Error::MalformedBundle("v2 body required"))?;
         let hash = entry.entry_hash();
         let Some(payload) = entry.payload.as_deref() else {
-            return Ok(
-                if matches!(v2.kind, Content | KeyPackage | ContextUpdate | Termination) {
-                    PayloadValidation::Complete(Self { hash })
-                } else {
-                    PayloadValidation::BodyRequired(hash)
+            let state = match v2.kind {
+                Content => SparsePayloadState::ContentAbsent,
+                KeyPackage => SparsePayloadState::KeyPackagePending {
+                    recipient: v2
+                        .recipient
+                        .ok_or(Error::MalformedBundle("key recipient missing"))?,
                 },
-            );
+                ContextUpdate | Termination => SparsePayloadState::Held,
+                _ => return Ok(PayloadValidation::BodyRequired(hash)),
+            };
+            return Ok(PayloadValidation::Complete(Self { hash, state }));
         };
         if payload.len() as u64 != entry.skeleton.payload_len
             || sha256(payload) != entry.skeleton.payload_hash
@@ -201,7 +227,10 @@ impl TypedSparseBody {
                 }
             }
         }
-        Ok(PayloadValidation::Complete(Self { hash }))
+        Ok(PayloadValidation::Complete(Self {
+            hash,
+            state: SparsePayloadState::Held,
+        }))
     }
 }
 
@@ -256,6 +285,7 @@ impl SparseValidation {
             parent_coordinate: 0,
             coordinate: 0,
             finished: false,
+            payload_state: body.state,
         })
     }
 
@@ -382,6 +412,7 @@ impl SparseValidation {
         Ok(SparseValidationStep::Complete(ValidatedSparseEntry {
             included: self.included.clone(),
             pre_context: pre,
+            payload_state: self.payload_state,
         }))
     }
 }

@@ -402,6 +402,214 @@ pub trait ContextSource {
     fn context(&self, hash: &Digest32) -> Result<Option<ControlContext>>;
 }
 
+/// Local immutable range lookup used while appending an authored entry. Like context reads,
+/// this is a bounded local-store operation; it never fetches a missing archive range.
+pub(crate) trait TreeRangeSource: ContextSource {
+    fn range(&self, binding: TreeBinding, range: TreeRange) -> Result<Option<Descriptor>>;
+}
+
+/// A single trusted local append has a separate, explicit hard quota. It constructs at
+/// most 49 right-spine descriptors and reuses the ordinary inclusion/consistency verifiers.
+/// This type cannot be supplied to a peer verifier as a resettable remote-turn budget.
+pub(crate) struct LocalAppendBudget {
+    work: WorkBudget,
+}
+impl LocalAppendBudget {
+    // Up to sixteen peer-prefix joins, eighteen context loads and bounded hash/compare
+    // passes. The metadata reserve covers each admitted author's tip + clock and the
+    // selected prefix/head lookups. These are prepaid once, not reset per object.
+    const PREP_VISITS: usize =
+        (4 * (super::entry::MAX_SEEN + 2) + 6 * super::entry::MAX_SEEN + 24) * MAX_CONTEXT_AUTHORS;
+    const PREP_OBJECTS: usize = 2 * MAX_CONTEXT_AUTHORS + 4 * super::entry::MAX_SEEN;
+    pub(crate) fn new() -> Self {
+        const DESCRIPTORS: usize = 4 * (MAX_TREE_DEPTH + 1);
+        Self {
+            work: WorkBudget {
+                signatures_left: 2,
+                descriptors_left: DESCRIPTORS,
+                coordinates_left: DESCRIPTORS * 20 * MAX_CONTEXT_AUTHORS + Self::PREP_VISITS,
+                object_loads_left: 4 * DESCRIPTORS + Self::PREP_OBJECTS,
+            },
+        }
+    }
+    /// Prepay the bounded context selection before any store read or map allocation:
+    /// at most 2048 tip/header + clock reads, 16 prefix/context pairs, one own head,
+    /// and one updated own context after an inserted ContextUpdate. No archive scan.
+    pub(crate) fn reserve_context_preparation(&mut self) -> Result<()> {
+        const OBJECTS: usize = LocalAppendBudget::PREP_OBJECTS;
+        const VISITS: usize = LocalAppendBudget::PREP_VISITS;
+        if self.work.object_loads_left < OBJECTS || self.work.coordinates_left < VISITS {
+            return Err(Error::SizeLimitExceeded("local context preparation quota"));
+        }
+        self.work.object_loads_left -= OBJECTS;
+        self.work.coordinates_left -= VISITS;
+        Ok(())
+    }
+    pub(crate) fn check_context(
+        &mut self,
+        source: &impl ContextSource,
+        context: &ControlContext,
+    ) -> Result<()> {
+        if !self.work.take_context_load() {
+            return Err(Error::SizeLimitExceeded("local context comparison quota"));
+        }
+        if source.context(&context.hash())?.as_ref() != Some(context) {
+            return Err(Error::MalformedAtRest(
+                "authored context dependency missing",
+            ));
+        }
+        Ok(())
+    }
+    pub(crate) fn verify_header(
+        &mut self,
+        entry: &Entry,
+        binding: TreeBinding,
+        key: &CompositePublicKey,
+    ) -> Result<VerifiedHeader> {
+        match VerifiedHeader::verify(entry, binding, key, &mut self.work)? {
+            HistoryStep::Complete(value) => Ok(value),
+            _ => Err(Error::SizeLimitExceeded("local header work quota")),
+        }
+    }
+    pub(crate) fn verify_head(
+        &mut self,
+        head: &SignedHead,
+        key: &CompositePublicKey,
+    ) -> Result<VerifiedHead> {
+        match head.verify(key, &mut self.work)? {
+            HistoryStep::Complete(value) => Ok(value),
+            _ => Err(Error::SizeLimitExceeded("local head work quota")),
+        }
+    }
+    pub(crate) fn inclusion(
+        &mut self,
+        verifier: &mut InclusionVerifier,
+        source: &impl ContextSource,
+    ) -> Result<HistoryStep<IncludedHeader>> {
+        verifier.advance(source, &mut self.work)
+    }
+    pub(crate) fn consistency(
+        &mut self,
+        verifier: &mut ConsistencyVerifier,
+        source: &impl ContextSource,
+    ) -> Result<HistoryStep<ConsistentPrefix>> {
+        verifier.advance(source, &mut self.work)
+    }
+    pub(crate) fn range(
+        &mut self,
+        source: &impl TreeRangeSource,
+        binding: TreeBinding,
+        range: TreeRange,
+    ) -> Result<Option<Descriptor>> {
+        if !self.work.take_object_load() {
+            return Err(Error::SizeLimitExceeded("local range work quota"));
+        }
+        source.range(binding, range)
+    }
+}
+
+/// One new right-spine range. The caller retains only one shared post-context
+/// and scalar descriptors, never an archive of intermediate frontier maps.
+pub(crate) enum LocalTreeStep {
+    Range {
+        start: u64,
+        descriptor: Descriptor,
+        context: ControlContext,
+    },
+    Complete(Descriptor),
+    MissingContext(Digest32),
+    MissingRange(TreeRange),
+    Yielded,
+}
+
+/// Bounded canonical right-spine append for an individually signed local v2 header.
+/// This constructs bytes only: the ordinary consistency/admission and atomic publication
+/// paths still own acceptance. A scheduler must not reset a budget inside a hidden drain loop.
+pub(crate) struct LocalTreeAppend {
+    binding: TreeBinding,
+    header: VerifiedHeader,
+    left: Vec<TreeRange>,
+    current: Option<Descriptor>,
+    start: u64,
+}
+impl LocalTreeAppend {
+    pub(crate) fn new(binding: TreeBinding, header: VerifiedHeader) -> Result<Self> {
+        binding.matches_entry(header.entry())?;
+        let mut start = 1;
+        let mut leaves = header.entry().skeleton.seq;
+        let mut left = Vec::new();
+        while leaves > 1 {
+            let size = split(leaves)?;
+            left.push(TreeRange {
+                start,
+                leaves: size,
+            });
+            start += size;
+            leaves -= size;
+        }
+        if left.len() > MAX_TREE_DEPTH {
+            return Err(Error::SizeLimitExceeded("local append depth"));
+        }
+        Ok(Self {
+            binding,
+            header,
+            left,
+            current: None,
+            start,
+        })
+    }
+
+    pub(crate) fn advance(
+        &mut self,
+        source: &impl TreeRangeSource,
+        budget: &mut LocalAppendBudget,
+    ) -> Result<LocalTreeStep> {
+        let budget = &mut budget.work;
+        let Some(current) = self.current else {
+            return match leaf_descriptor(self.binding, self.header.entry(), source, budget)? {
+                HistoryStep::Complete((descriptor, context)) => {
+                    self.current = Some(descriptor);
+                    Ok(LocalTreeStep::Range {
+                        start: self.start,
+                        descriptor,
+                        context,
+                    })
+                }
+                HistoryStep::MissingContext(hash) => Ok(LocalTreeStep::MissingContext(hash)),
+                _ => Ok(LocalTreeStep::Yielded),
+            };
+        };
+        let Some(left) = self.left.last().copied() else {
+            return Ok(LocalTreeStep::Complete(current));
+        };
+        if !budget.take_object_load() {
+            return Ok(LocalTreeStep::Yielded);
+        }
+        let Some(descriptor) = source.range(self.binding, left)? else {
+            return Ok(LocalTreeStep::MissingRange(left));
+        };
+        if descriptor.leaves != left.leaves
+            || left.start.checked_add(left.leaves) != Some(self.start)
+        {
+            return Err(Error::MalformedAtRest("local append range binding"));
+        }
+        match join_descriptors(self.binding, descriptor, current, source, budget)? {
+            HistoryStep::Complete((descriptor, context)) => {
+                self.left.pop();
+                self.start = left.start;
+                self.current = Some(descriptor);
+                Ok(LocalTreeStep::Range {
+                    start: self.start,
+                    descriptor,
+                    context,
+                })
+            }
+            HistoryStep::MissingContext(hash) => Ok(LocalTreeStep::MissingContext(hash)),
+            _ => Ok(LocalTreeStep::Yielded),
+        }
+    }
+}
+
 /// Conservative remaining work in one cooperative verification slice.
 #[derive(Clone, Debug)]
 pub struct WorkBudget {
