@@ -25,6 +25,9 @@ pub const FORMAT_VERSION: u8 = 1;
 /// them in seconds.
 pub const MS_FORMAT_VERSION: u8 = 2;
 
+/// A room genesis whose signed body binds authenticated sparse history (ADR-036).
+pub const HISTORY_GENESIS_VERSION: u8 = 3;
+
 /// The ADR-008 struct-type tag registry. The 2-byte tag identifies the
 /// structure so identical canonical bytes are never cross-interpreted (the
 /// serialization analogue of ADR-003's algorithm prefixes).
@@ -181,17 +184,17 @@ impl StructTag {
             .ok_or(Error::UnknownStructTag(v))
     }
 
-    /// The format version this build writes the struct at: [`MS_FORMAT_VERSION`] for a struct
-    /// that carries a time, [`FORMAT_VERSION`] otherwise.
+    /// The format version this build writes: authenticated-history genesis at version 3,
+    /// other timed structs at version 2, and the remaining structs at version 1.
     #[must_use]
     pub const fn format_version(self) -> u8 {
         match self {
+            StructTag::GenesisRecord => HISTORY_GENESIS_VERSION,
             StructTag::RendezvousRecord
             | StructTag::PreJoinRecord
             | StructTag::MemberBundleRecord
             | StructTag::JoinWitness
             | StructTag::BoardWithdraw
-            | StructTag::GenesisRecord
             | StructTag::AdminCert
             | StructTag::PolicyRotation
             | StructTag::RoomLifecycle
@@ -242,6 +245,9 @@ impl StructTag {
         if matches!(self, StructTag::LogEntry) && version == 2 {
             return "vox/log-entry/v2";
         }
+        if matches!(self, StructTag::GenesisRecord) && version == MS_FORMAT_VERSION {
+            return "vox/genesis/v2";
+        }
         if version == self.format_version() {
             return self.domain_sep();
         }
@@ -260,7 +266,7 @@ impl StructTag {
             StructTag::MemberBundleRecord => "vox/member-bundle-record/v2",
             StructTag::JoinWitness => "vox/join-witness/v2",
             StructTag::BoardWithdraw => "vox/board-withdraw/v2",
-            StructTag::GenesisRecord => "vox/genesis/v2",
+            StructTag::GenesisRecord => "vox/genesis/v3",
             StructTag::AdminCert => "vox/admin-cert/v2",
             StructTag::PolicyRotation => "vox/policy-rotation/v2",
             StructTag::RoomLifecycle => "vox/room-lifecycle/v2",
@@ -349,7 +355,12 @@ pub fn parse_frame(bytes: &[u8]) -> Result<Frame<'_>> {
         tag: tag_val,
         version: 0,
     })?;
-    if version != tag.format_version() && !(tag == StructTag::LogEntry && version == 2) {
+    let legacy_genesis =
+        tag == StructTag::GenesisRecord && matches!(version, FORMAT_VERSION | MS_FORMAT_VERSION);
+    if version != tag.format_version()
+        && !(tag == StructTag::LogEntry && version == 2)
+        && !legacy_genesis
+    {
         if version == FORMAT_VERSION && tag.format_version() == MS_FORMAT_VERSION {
             if !tag.reads_seconds_format() {
                 return Err(Error::OlderFormat {

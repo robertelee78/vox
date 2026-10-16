@@ -1805,6 +1805,9 @@ impl ChannelState {
         let mut index = entries.write(&mut batch, &sek, &channel_id)?;
         index.finish_rebuild()?;
         index.initialize_restart(epoch)?;
+        if genesis.body.authenticated_history() {
+            index.initialize_sparse_history()?;
+        }
         index.empty_rendered()?;
         index.seal()?;
         session_projection::private_index::initialize(&mut batch, &sek, &channel_id)?;
@@ -2707,6 +2710,9 @@ impl ChannelState {
         let mut index = entries.write(&mut batch, &sek, channel_id)?;
         index.finish_rebuild()?;
         index.initialize_restart(epoch)?;
+        if genesis.body.authenticated_history() {
+            index.initialize_sparse_history()?;
+        }
         index.empty_rendered()?;
         index.seal()?;
         session_projection::private_index::initialize(&mut batch, &sek, channel_id)?;

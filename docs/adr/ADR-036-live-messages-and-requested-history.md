@@ -295,6 +295,18 @@ milliseconds are `u64`, algorithm identifiers are `u16`, and kind/scope discrimi
 Arithmetic, proof indexes and offset sums use checked operations. Direct schema decoding has a
 maximum nesting depth of 32; using the low-level decoder does not waive that bound.
 
+**Fresh-room activation.** A newly created room MUST bind this history format in its signed
+and hashed genesis, not infer it from a peer version or an empty local store. Genesis tag
+`0x000D` version 3 uses signing domain `vox/genesis/v3`. Its canonical body is the existing
+six-field genesis body followed by the unsigned integer `2` (authenticated history format);
+its wire body appends the creator signature as field eight. Unknown values and extra fields
+are refused. Genesis versions 1 and 2 retain their exact bytes, hashes and signing domains.
+Creating or joining a verified version-3 room initializes the sparse index in the existing
+atomic empty-room transaction, before any authored entry. Reopening a room preserves its
+published format; an empty local join store is not authorization to activate a legacy room.
+This marker does not convert an existing room, create a reset fence or authorize the legacy
+exception below.
+
 **Entries and kinds.** Preserve tag `0x0001` version 1, its bytes, hash and signature domain
 exactly. Version 2 is an explicit supported version of that tag, signed with `vox/log-entry/v2`.
 Its canonical signed skeleton is this 16-field array:
@@ -420,8 +432,8 @@ control bodies leave verification pending. A context object is at most 160 KiB.
 prefix and HELLO. Mode bit `0x04` selects this format; failure cannot fall back to archive-drain
 mode. The new preamble is `[2, room, current_epoch, scope, purpose, request_id]`, at most
 128 bytes. Purpose 0 is required control, 1 is live, and 2 is explicit history. The identifiable
-old two-field preamble does not authorize legacy conversion. A v2 stream serves one request
-direction; duplex streams still count against the daemon's shared budgets. HAVE is a sorted
+old two-field preamble does not authorize legacy conversion. A v2 stream serves one bounded
+request exchange; both directions count against the daemon's shared budgets. HAVE is a sorted
 list of at most 2,048 `[author, size, HeadID]` hints, not verified state.
 
 WANT (`0x03`) is `[request_id, query]`, where query is exactly one of:
@@ -433,7 +445,13 @@ WANT (`0x03`) is `[request_id, query]`, where query is exactly one of:
 [3, HeadID, seq, offset]                          # one entry/body continuation
 [4, HeadID, lo, hi, entry_limit, wire_limit]       # bounded page
 [5, HeadID, seq]                                 # signed header only; no body
+[6]                                             # current head inventory; control purpose only
 ```
+
+Inventory is `WANT -> client HAVE -> server HAVE -> DONE`, with the full bidirectional
+exchange charged to the same 1 MiB wire quantum. Hints convey no body permission or authority.
+Only newly queued, bounded exact head hints wake metadata verification; accepted/in-flight
+hints are deduplicated, and neither an inventory nor its completion requests archive bodies.
 
 Proof kinds 0/1/2 mean inclusion/consistency/control range. Inclusion requires `from == to == p`;
 consistency uses old/new sizes. Requests are bound to the authenticated author/scope and the
