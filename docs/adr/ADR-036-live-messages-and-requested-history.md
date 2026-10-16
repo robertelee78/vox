@@ -61,9 +61,18 @@ NOT authorize an action from an incomplete closure or accept another node's unsi
 snapshot as authority. Control work MUST itself be bounded and resumable; missing evidence
 remains pending rather than triggering content-archive download.
 
-The exact bounded representation of the complete control frontier, and the authenticated
-transition from existing v0.4.5 records that lack these commitments, are review questions below.
-They MUST be resolved before this protocol is execution-ready.
+Content MUST bind the full effective control context by hash. A context object is immutable and
+bounded by the existing room author cap; an author MUST publish a new context before its next
+content entry whenever its applied control frontier changes. Each frontier position names the
+author, counter and hash, not a counter alone. Context inheritance MUST preserve the prior
+context and the control context of explicit causal parents. A missing context is pending, not an
+empty frontier. This may reuse a separately carried, canonical sorted frontier object; it does
+not require an inline vector in every message or a new consensus service.
+
+The exact independent control-chain completeness rule, classification of every security-relevant
+entry, and transition from existing v0.4.5 records remain review questions below. They MUST be
+resolved before this protocol is execution-ready. Merely signing a claimed current control tip
+does not prove that a skipped interval contains no control action.
 
 ### H-3. Authenticate a requested interval without claiming a full prefix
 
@@ -78,6 +87,26 @@ actually establish. It MUST NOT silently replace full contiguous validation with
 pretend an unsigned gap was validated, or discard a later conflict found during backfill.
 Sparse positions and their evidence MUST be durable; requesting an older page MUST fill only its
 missing intervals, merge idempotently and preserve actual message bodies and ordering.
+
+The selected prefix-consistency primitive is an author-signed append-only Merkle head with the
+leaf/internal hash domain separation, inclusion and consistency proof rules of RFC 9162 §2.1.
+This uses the tree algorithms, not a certificate service, external log or consensus system.
+The signature binds format, author, room, epoch, tree size, root and control context. The head
+MUST be separate from a leaf containing its own hash, or commit only to the preceding prefix,
+so the encoding has no circular commitment. Proof lengths and tree sizes are checked before
+allocation or traversal.
+
+Advancing a durable accepted root requires a valid consistency proof from that root. Receiving
+an entry requires its ordinary authentication and an inclusion proof at its exact position.
+These prove an unchanged committed prefix and membership, not semantic validity of unfetched
+payloads or old `prev` links. Keep committed positions, individually validated entries and the
+actually held contiguous legacy prefix distinct. Authority MUST derive from complete required
+control evidence, never from the word "committed."
+
+Two valid signed statements for the same position/size and binding that disagree can supply
+fork evidence. A missing or invalid consistency proof alone is a refusal or pending result,
+not proof that the author forked: a relay can supply a bad proof. Preserve signed evidence and
+existing local revocation/fork restrictions when any later page reveals a contradiction.
 
 ### H-4. Bound demand across the daemon
 
@@ -126,6 +155,32 @@ requirement is to be silently deferred in order to call the release complete.
    content or trusting a remote state summary? Which authority must sign any transition fence?
 4. Can the existing entry framing carry a valid 16 MiB entry within bounded aggregate buffers,
    or must the existing stream be extended with authenticated chunked entry delivery?
+
+## Adversarial plan review, 2026-10-15
+
+GLM-5.3, Kimi K3 and Fable reviewed this plan, then reviewed concrete counterexamples. All three
+withdrew their initial claim that a selected Lipmaa path proves append-only consistency. A
+receiver holding signed A1 can be shown signed H4 whose skip link reaches A1 while its immediate
+parent B3 descends from conflicting B1. The offered path verifies without exposing that fork.
+The Merkle consistency requirement above addresses prefix identity; it does not solve control
+completeness by itself.
+
+An own-control pointer also loses a cross-author revocation learned between that control record
+and a later content entry. Complete signed context and explicit inheritance are necessary.
+All security-sensitive payload classes must participate, not only the current Governance enum.
+
+Legacy records already sign room and epoch, but do not sign kind or this complete control
+context. A receiver holding prefix 100 is not thereby synchronized with an author's head 10000.
+An opaque fence, a local reconstruction checkpoint or a peer's evaluated snapshot cannot prove
+the missing interval contains no applicable revocation or terminal room End. A newly signed
+"active" baseline cannot override an unseen valid End under existing governance rules.
+
+The operator has been asked whether the upgrade may perform a one-time bounded, resumable
+verification of missing legacy history, while preserving data and keeping other ready work
+responsive. This is a proposed exception for existing-format conversion, not permission already
+received, not an automatic archive drain on normal startup, and not a requirement deferred to
+another release. Until that decision and the exact protocol are resolved, H-1–H-5 remain in
+design and MUST NOT be described as implementation-ready.
 
 ## Consequences
 
