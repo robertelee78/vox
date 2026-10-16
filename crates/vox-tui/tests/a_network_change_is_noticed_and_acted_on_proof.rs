@@ -1,10 +1,10 @@
-//! ADR-012 N-49–N-52 (#413, #414) — **a move to another network is noticed and acted on at once**,
+//! ADR-012 N-34, N-49–N-52 (#413, #414, #937) — **a move to another network is noticed and acted on at once**,
 //! through the shipped `vox`.
 //!
 //! The work is in `tests/netchange/network_change.py`: a daemon D, which listens on every address
 //! and advertises A, and its peer P, which can reach D only at A, share a room. The machine then
-//! gains B, routes by it, and loses A, as a real interface change the operating system says. Four
-//! claims, each printed as a `CLAIM <name> ok|RED` line:
+//! gains B, routes by it, and loses A, as a real interface change the operating system says. Nine Linux
+//! claims (four on macOS), each printed as a `CLAIM <name> ok|RED` line:
 //!
 //! - `redial`: with nothing sent, D holds a new connection to P within 3 s (it found the one it
 //!   accepted stranded, closed it and dialled P again);
@@ -15,7 +15,15 @@
 //! - `router` (Linux only): before the move, the default route alone changes its next hop, with no
 //!   address coming or going, and D says that one change, naming the route, within 1 s (N-50,
 //!   N-53). The macOS form does not stage it, since it would change the machine's own default
-//!   route.
+//!   route;
+//! - `flap` (Linux): active-path down/up inside one 500 ms settle interval, with identical final
+//!   addresses and gateway, is noticed and a new message is delivered;
+//! - `anchor-cache` (Linux): after losing the only configured LAN endpoint, a restarted node
+//!   reaches its authenticated anchor's learned alternate and delivers a new message;
+//! - `anchor-assisted` (Linux): a real namespace packet filter blocks the established direct
+//!   path; a new message is delivered through the known anchor without operator action;
+//! - `direct-restored` (Linux): after removing that filter, a new message goes direct, including
+//!   after stopping the unneeded anchor, with identities, trust and room membership unchanged.
 //!
 //! **Linux** is the proof: an unprivileged user and network namespace, whose interfaces the
 //! driver changes itself. **macOS** is opt-in heavy (`VOX_PROOF_NETCHANGE_MACOS=1`): the driver
@@ -24,12 +32,18 @@
 //! **Mutations that must turn it red:** the event socket never opened (`NetWatch::open` returning
 //! its error) → `said`, `status`, `redial` and `reads` red; no redial of the stranded peers
 //! (`dial_stranded` doing nothing) → `redial` red; a default route's move ignored
-//! (`NetChange::between` comparing the addresses only) → `router` red.
+//! (`NetChange::between` comparing the addresses only) → `router` red; ignoring recorded path
+//! loss within a settle interval → `flap` red; omitting learned-hint persistence → `anchor-cache`
+//! red; not redialling stranded outgoing direct connections → `anchor-assisted` red; retaining
+//! old-network upgrade backoff → `direct-restored` red. These inverses exercise the actual binary;
+//! no assertion reads an internal value. The anchor advertises two genuinely listening addresses
+//! through the existing `VOX_TEST_ADVERTISE` knob; only its LAN address is configured on clients.
 //!
 //! A second test, `a_peer_on_loopback_is_not_cut_off_when_the_default_route_moves`, runs on every
 //! platform without privilege: it stages a move of the default route through the daemon's own
 //! change path (`VOX_TEST_ROUTE_V4_FILE`) and proves a join over loopback survives it. First it
-//! stages a route lookup the kernel did not answer, and proves the daemon says no move for it.
+//! starts with an unanswered route lookup, learns the route, and proves a subsequent unanswered
+//! lookup says no move while an actual withdrawal does. This also proves the learned baseline is adopted.
 //! Mutation: an unanswered lookup compared as "no route" (`NetShape::now` marking every route
 //! known) → red, alice saying "192.168.1.1 → none".
 //!
@@ -52,8 +66,8 @@ use std::time::{Duration, Instant};
 
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 
-/// How many claims the driver makes here: `router` is staged on Linux only.
-const CLAIMS: usize = if cfg!(target_os = "linux") { 5 } else { 4 };
+/// Four base claims, plus five namespace-only recovery claims on Linux.
+const CLAIMS: usize = if cfg!(target_os = "linux") { 9 } else { 4 };
 
 /// Run the driver and judge what it printed.
 fn drive() {
@@ -100,6 +114,7 @@ fn drive() {
 #[ignore = "real daemons and a real network change in an unprivileged namespace; run in release"]
 fn a_move_to_another_network_is_noticed_and_acted_on() {
     watchdog::arm();
+    test_knobs::require(&["VOX_TEST_ADVERTISE"]);
     drive();
 }
 
@@ -264,13 +279,17 @@ fn a_peer_on_loopback_is_not_cut_off_when_the_default_route_moves() {
     test_knobs::require(&["VOX_TEST_ROUTE_V4_FILE", "VOX_TEST_SOLVE_AT_LEAST_MS"]);
     let tmp = tempfile::tempdir().expect("APPARATUS: a temporary directory");
     let route = tmp.path().join("route");
-    std::fs::write(&route, "192.168.1.1").expect("APPARATUS: the staged route");
+    std::fs::write(&route, "unanswered").expect("APPARATUS: the initially unknown route");
     let alice = Loopback::start(&tmp.path().join("alice"), &route, &[]);
     let agent = Loopback::start(
         &tmp.path().join("agent"),
         &route,
         &[("VOX_TEST_SOLVE_AT_LEAST_MS", "4000")],
     );
+    // Learn a route without changing any address. A watcher that updates its baseline only
+    // after a real change will miss the later known-route → none move asserted below (#937).
+    std::fs::write(&route, "192.168.1.1").expect("APPARATUS: reveal the route");
+    std::thread::sleep(Duration::from_secs(2));
     let (ok, said) = alice.vox(
         &[
             "room",
