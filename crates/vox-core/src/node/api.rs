@@ -891,7 +891,7 @@ pub struct HistoryDemandStatus {
     pub author: Option<Digest32>,
     /// Original accepted head, never widened by a peer continuation.
     pub head: Option<Digest32>,
-    /// Remaining authorized entries, at most 128.
+    /// Remaining entries in the original authorized interval; this may exceed one quantum.
     pub remaining: usize,
     /// Persisted partial-body offset; ACK never precedes it.
     pub offset: u64,

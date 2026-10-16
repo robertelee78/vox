@@ -4561,7 +4561,6 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             let status: crate::node::api::HistoryDemandStatus = serde_json::from_str(text)
                 .map_err(|_| Error::MalformedIpc("history demand status"))?;
             if status.headers > 128
-                || status.remaining > status.headers
                 || status.wire_bytes > crate::log::sync::LEGACY_QUANTUM_BYTES
                 || status.detail.len() > 512
             {
