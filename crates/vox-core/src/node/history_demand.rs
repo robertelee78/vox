@@ -290,6 +290,7 @@ pub struct Active {
     serial: u64,
     valid: bool,
     binding: Binding,
+    cancellation: Cancellation,
 }
 
 impl Active {
@@ -301,6 +302,7 @@ impl Active {
     }
     pub fn matches(&self, state: &State) -> bool {
         self.valid
+            && !self.cancellation.is_cancelled()
             && self.scope == state.scope
             && self.request == state.request
             && self.serial == state.serial
@@ -472,6 +474,7 @@ pub fn start(
         serial,
         valid: true,
         binding,
+        cancellation: context.cancellation(),
     })
 }
 
@@ -506,6 +509,7 @@ pub fn resume(
         serial: state.serial,
         valid: true,
         binding,
+        cancellation: context.cancellation(),
     })
 }
 
