@@ -526,6 +526,32 @@ impl Node {
                         crate::node::status::BackoffKind::Busy,
                     );
                 } else {
+                    // A local bounded slice advanced. An earlier capacity yield must not make
+                    // the next ordinary yield inherit an escalating peer-port failure count:
+                    // that turns expected cooperative scheduling into multi-second stalls.
+                    // Preserve transport and policy failures; only successful local progress
+                    // clears the Busy pacing that it has disproved.
+                    let cleared_busy =
+                        self.ports
+                            .get_mut(&(work.room, work.peer))
+                            .is_some_and(|port| {
+                                if port.backoff.is_some_and(|backoff| {
+                                    backoff.kind == crate::node::status::BackoffKind::Busy
+                                }) {
+                                    port.clear_backoff();
+                                    true
+                                } else {
+                                    false
+                                }
+                            });
+                    if cleared_busy {
+                        crate::node::status::SyncBook::with(
+                            &self.sync_book,
+                            work.room,
+                            work.peer,
+                            |counts| counts.backoff = None,
+                        );
+                    }
                     self.sched_rooms.insert(work.room);
                 }
             }
