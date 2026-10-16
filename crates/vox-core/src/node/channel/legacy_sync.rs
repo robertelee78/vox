@@ -7,6 +7,7 @@ use super::*;
 pub(crate) struct LegacySync {
     pub owner: LegacyProvisionalOwner,
     pub through: u64,
+    pub expected_head: Digest32,
     pub node: Digest32,
     pub epoch: u64,
     pub grant: Digest32,
@@ -47,8 +48,12 @@ impl LegacySync {
 }
 
 impl ChannelState {
-    pub(crate) fn legacy_accepted_head(&self, author: &Digest32) -> u64 {
-        self.dag.verified_head(author)
+    pub(crate) fn legacy_accepted_head(&self, store: &Store, author: &Digest32) -> Result<u64> {
+        let read = self.entries.read(store, &self.sek, &self.channel_id)?;
+        let restart = read.restart_state().ok_or(Error::MalformedAtRest(
+            "legacy accepted restart state missing",
+        ))?;
+        Ok(restart.feeds.get(author).map_or(0, |feed| feed.seq))
     }
     fn attach_legacy_feed(&mut self, state: LegacyProvisionalState) -> Result<()> {
         self.dag.restore_legacy_provisional(
@@ -148,6 +153,11 @@ impl ChannelState {
                         "Legacy witness author is no longer admitted",
                     ))?;
                 entry.verify(&key)?;
+                if entry.skeleton.seq == request.through
+                    && entry.entry_hash() != request.expected_head
+                {
+                    return Err(Error::StreamRefused("legacy selected tip hash changed"));
+                }
                 // This exact witness was already linked when staged, and the bounded
                 // promotion has now built all prefix facts. The final effects transaction
                 // atomically switches those roots, exactly as ordinary sync does.
@@ -204,6 +214,10 @@ impl ChannelState {
                     "Legacy witness author is no longer admitted",
                 ))?;
             entry.verify(&key)?;
+            if entry.skeleton.seq == request.through && entry.entry_hash() != request.expected_head
+            {
+                return Err(Error::StreamRefused("legacy selected tip hash changed"));
+            }
             self.begin_legacy_witness(store, request.owner, &entry, self.next_log_id, now.get())?;
         }
         Ok(Some(out))

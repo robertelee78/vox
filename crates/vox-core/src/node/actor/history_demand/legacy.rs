@@ -64,7 +64,9 @@ pub(super) fn prepare_legacy(
                 "No authenticated legacy prefix gap is currently known. Cached history remains available.");
             return Ok(answer);
         };
-        let base = room.legacy_accepted_head(&required.author);
+        let base = room
+            .legacy_accepted_head(store, &required.author)
+            .map_err(|e| e.to_string())?;
         let plan = demand::LegacyPlan {
             author: required.author,
             from: base.saturating_add(1),
@@ -99,8 +101,10 @@ pub(super) fn prepare_legacy(
     answer.status.author = Some(plan.author);
     answer.status.head = Some(bounds.head);
     answer.status.remaining = usize::try_from(
-        plan.through
-            .saturating_sub(room.legacy_accepted_head(&plan.author)),
+        plan.through.saturating_sub(
+            room.legacy_accepted_head(store, &plan.author)
+                .map_err(|e| e.to_string())?,
+        ),
     )
     .unwrap_or(usize::MAX);
     answer.status.headers = bounds.entries;
@@ -214,7 +218,7 @@ impl Node {
                 let context=dispatch.staging.context.clone();
                 let active=dispatch.staging.active.clone();
                 let sync=LegacySync { owner:LegacyProvisionalOwner{request,instance:dispatch.instance,author:dispatch.plan.author},
-                    through:dispatch.plan.through,node,epoch:context_binding_epoch(&active)?,grant:generation };
+                    through:dispatch.plan.through,expected_head:dispatch.bounds.head,node,epoch:context_binding_epoch(&active)?,grant:generation };
                 let work=(|| ->Result<Status,String> {
                     let local={let mut room=lock_room(&shared,&dispatch.fence,deadline)?;
                         room.prepare_legacy_sync(&store,sync,now).map_err(|e|e.to_string())?};
@@ -257,16 +261,18 @@ impl Node {
                     let (base,pending)={let room=lock_room(&shared,&dispatch.fence,deadline)?;
                         let state=room.legacy_provisional_state(&store).map_err(|e|e.to_string())?;
                         let pending=if state.is_some(){room.legacy_publication_progress(&store,sync.owner).map_err(|e|e.to_string())?.is_some()}else{false};
-                        (room.legacy_accepted_head(&dispatch.plan.author),pending)};
+                        (room.legacy_accepted_head(&store,&dispatch.plan.author).map_err(|e|e.to_string())?,pending)};
                     let remaining=usize::try_from(dispatch.plan.through.saturating_sub(base)).map_err(|_|"Legacy interval is too large.")?;
-                    let progress=if report.fail.is_some(){demand::Progress::Unavailable}
+                    let progress=if report.fail.is_some() || report.out.legacy_unavailable {demand::Progress::Unavailable}
                         else if remaining==0&&!pending{demand::Progress::Complete}else{demand::Progress::More};
                     let mut active=active.lock().map_err(|_|"Legacy history state poisoned.")?;
                     demand::checkpoint_legacy(&context,&mut active,&dispatch.plan,remaining,progress,&job).map_err(|e|e.to_string())?;
                     let saved=demand::inspect(&context,&job).map_err(|e|e.to_string())?.ok_or("Legacy request disappeared.")?;
                     let mut status=saved_status(saved.state(),Some(dispatch.plan.author),Some(&active));
                     status.wire_bytes=crate::log::sync::LEGACY_QUANTUM_BYTES;
-                    let stopped = report.fail.as_ref().map(|failure| format!("Legacy recovery paused: {failure}. ")).unwrap_or_default();
+                    let stopped = if report.out.legacy_unavailable {
+                        "Legacy recovery unavailable: a signed feed entry cannot be classified. The required prefix remains unresolved. ".to_owned()
+                    } else { report.fail.as_ref().map(|failure| format!("Legacy recovery paused: {failure}. ")).unwrap_or_default() };
                     status.detail=format!("{stopped}Received {} wire bytes; {} positions still need accepted history{}. {}",report.out.wire_received,remaining,if pending{"; signed publication or cleanup remains"}else{""},if progress==demand::Progress::Complete{"The selected interval is complete."}else{"Resume explicitly to continue."});
                     Ok(status)
                 })();

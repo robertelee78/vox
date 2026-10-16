@@ -186,6 +186,8 @@ struct Promotion {
     sparse_head: Option<Digest32>,
     /// Exact local request owning a remote sparse publication; never an authority grant.
     sparse_request: Option<[u8; 16]>,
+    /// Sealed local cleanup cursor over provisional hash locators, never entry bodies.
+    cleanup_hash: Option<Key>,
 }
 
 /// An authenticated current v1 tip observed from a peer. This records a missing
@@ -365,7 +367,7 @@ impl Directory {
                 e.array(0);
             }
             Some(p) => {
-                e.array(19)
+                e.array(20)
                     .bytes(&p.author)
                     .uint(p.from)
                     .uint(p.through)
@@ -402,6 +404,14 @@ impl Directory {
                 match p.sparse_request {
                     Some(request) => {
                         e.array(1).bytes(&request);
+                    }
+                    None => {
+                        e.array(0);
+                    }
+                }
+                match p.cleanup_hash {
+                    Some(cursor) => {
+                        e.array(1).bytes(&cursor);
                     }
                     None => {
                         e.array(0);
@@ -506,7 +516,7 @@ impl Directory {
         let promotion_arity = d.array()?;
         let promotion = match promotion_arity {
             0 => None,
-            14 | 16 | 17 | 18 | 19 => Some(Promotion {
+            14 | 16 | 17 | 18 | 19 | 20 => Some(Promotion {
                 author: d
                     .bytes()?
                     .try_into()
@@ -567,6 +577,19 @@ impl Directory {
                                 .map_err(|_| invalid("sparse publication request"))?,
                         ),
                         _ => return Err(invalid("sparse publication request arity")),
+                    }
+                } else {
+                    None
+                },
+                cleanup_hash: if promotion_arity >= 20 {
+                    match d.array()? {
+                        0 => None,
+                        1 => Some(
+                            d.bytes()?
+                                .try_into()
+                                .map_err(|_| invalid("promotion cleanup cursor"))?,
+                        ),
+                        _ => return Err(invalid("promotion cleanup cursor arity")),
                     }
                 } else {
                     None
@@ -2020,6 +2043,7 @@ impl Write<'_, '_> {
             accepted: Some(accepted),
             sparse_head: None,
             sparse_request: None,
+            cleanup_hash: None,
         });
         self.directory.phase = Phase::Building;
         Ok(())
@@ -2240,16 +2264,23 @@ impl Write<'_, '_> {
         let Some(mut p) = self.directory.promotion.clone() else {
             return Ok(true);
         };
+        let mut budget = ProvisionalCleanupBudget::new(&self.directory)?;
         match self.directory.phase {
             Phase::Building => {
-                for _ in 0..PROMOTION_ENTRIES {
+                for _ in 0..CLEANUP_ROWS {
                     if p.after_log > p.first_log {
+                        if !budget.reserve_deletes(2) {
+                            break;
+                        }
                         p.after_log -= 1;
                         self.batch
                             .delete_segment(self.channel, SegmentKind::LogDb, p.after_log)?;
                         self.batch
                             .delete_segment(self.channel, SegmentKind::Index, p.after_log)?;
                     } else if p.after_page > p.first_page {
+                        if !budget.reserve_deletes(1) {
+                            break;
+                        }
                         p.after_page -= 1;
                         self.batch.delete_segment(
                             self.channel,
@@ -2265,19 +2296,68 @@ impl Write<'_, '_> {
                 }
             }
             Phase::Switched => {
-                for _ in 0..PROMOTION_ENTRIES {
+                let mut scanned = 0;
+                for _ in 0..CLEANUP_ROWS {
                     if p.retired == 0 {
-                        if p.cursor <= p.through {
-                            self.remove_staged(&p.author, p.cursor)?;
-                            p.cursor = p
-                                .cursor
-                                .checked_add(1)
-                                .ok_or(invalid("promotion cleanup overflow"))?;
-                            continue;
+                        if scanned >= PROVISIONAL_CLEANUP_ENTRIES {
+                            break;
                         }
-                        self.directory.phase = Phase::Idle;
-                        self.directory.promotion = None;
-                        return Ok(true);
+                        let roots = self.directory.provisional;
+                        let Some((key, value)) = Source::Batch(self.batch).first(
+                            self.sek,
+                            self.channel,
+                            roots.hash,
+                            &p.cleanup_hash.unwrap_or([0; 64]),
+                            0,
+                        )?
+                        else {
+                            self.directory.phase = Phase::Idle;
+                            self.directory.promotion = None;
+                            return Ok(true);
+                        };
+                        scanned += 1;
+                        let at = value.locator()?;
+                        if key[32..] != [0; 32]
+                            || at.log == 0
+                            || at.log >= self.directory.next_provisional
+                        {
+                            return Err(invalid("promotion cleanup hash locator"));
+                        }
+                        if at.author == p.author && (p.from..=p.through).contains(&at.seq) {
+                            let sequence_key = position(&at.author, at.seq);
+                            let pages = self.provisional_delete_pages(roots.hash, &key, at)?
+                                + self.provisional_delete_pages(
+                                    roots.sequence,
+                                    &sequence_key,
+                                    at,
+                                )?;
+                            if !budget.reserve_pair(pages) {
+                                if budget.rows == 1 {
+                                    return Err(Error::SizeLimitExceeded(
+                                        "promotion cleanup storage quantum",
+                                    ));
+                                }
+                                break;
+                            }
+                            self.directory.provisional.hash = self.change(roots.hash, key, None)?;
+                            self.directory.provisional.sequence =
+                                self.change(roots.sequence, sequence_key, None)?;
+                            self.batch.delete_segment(
+                                self.channel,
+                                SegmentKind::ProvisionalLog,
+                                at.log,
+                            )?;
+                            p.cursor = p.cursor.saturating_add(1).min(p.through.saturating_add(1));
+                        }
+                        // Every hash key has a zero suffix, so this strictly greater key
+                        // exists even for an all-ones hash. Skipped unrelated rows stay intact.
+                        let mut next = key;
+                        next[63] = 1;
+                        p.cleanup_hash = Some(next);
+                        continue;
+                    }
+                    if !budget.reserve_deletes(2) {
+                        break;
                     }
                     let ledger = p.retired;
                     let bytes = Source::Batch(self.batch)
@@ -2610,6 +2690,18 @@ impl ProvisionalCleanupBudget {
             ));
         }
         Ok(Self { rows: 1, bytes })
+    }
+    fn reserve_deletes(&mut self, count: usize) -> bool {
+        // Deletion writes only keys/tombstones; no old ciphertext is loaded or copied.
+        let bytes = count.saturating_mul(CLEANUP_KEY_BYTES);
+        if self.rows.saturating_add(count) > CLEANUP_ROWS
+            || self.bytes.saturating_add(bytes) > CLEANUP_BYTES
+        {
+            return false;
+        }
+        self.rows += count;
+        self.bytes += bytes;
+        true
     }
     fn reserve_pair(&mut self, path_pages: usize) -> bool {
         // Two operations per page: replacement put + old-page delete. A path that

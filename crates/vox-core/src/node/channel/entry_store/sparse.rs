@@ -1337,6 +1337,7 @@ impl Write<'_, '_> {
             accepted: None,
             sparse_head: Some(included.head_id()),
             sparse_request: Some(request),
+            cleanup_hash: None,
         });
         self.directory.phase = Phase::Building;
         Ok(())

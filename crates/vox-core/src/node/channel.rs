@@ -601,6 +601,7 @@ pub struct SyncOutcome {
     /// An exact explicit legacy interval reached a signed invalid/frozen feed boundary.
     /// This cancels recovery; it never credits the missing suffix as accepted history.
     pub(crate) legacy_invalid: bool,
+    pub(crate) legacy_unavailable: bool,
     /// Received protocol bytes including transport length prefixes.
     pub(crate) wire_received: usize,
     /// Next exact legacy position retained by the explicit request, including sealed staging.
@@ -6495,7 +6496,13 @@ impl ChannelState {
                     }
                     ch.finish_legacy_sync(store, request).map(|()| 0)
                 } else {
-                    ch.discard_unverified(store)
+                    match ch.legacy_provisional_state(store) {
+                        // A current session may finish between explicit recovery's lock
+                        // slices. It never owns that attached suffix or its durable spool.
+                        Ok(Some(_)) => Ok(0),
+                        Ok(None) => ch.discard_unverified(store),
+                        Err(error) => Err(error),
+                    }
                 };
                 match cleanup {
                     Ok(_) => {}
@@ -9399,7 +9406,53 @@ impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
                 };
             }
         };
-        if self.legacy.is_some() {
+        if self.legacy.is_none() && legacy_state.is_some() {
+            let accepted = ch
+                .entries
+                .read(self.store, &ch.sek, &ch.channel_id)
+                .and_then(|read| {
+                    read.restart_state().cloned().ok_or(Error::MalformedAtRest(
+                        "legacy accepted restart state missing",
+                    ))
+                });
+            let accepted = match accepted {
+                Ok(accepted) => accepted,
+                Err(error) => {
+                    *self.fatal.borrow_mut() = Some(error);
+                    return crate::log::sync::ApplyReport {
+                        fail: Some(crate::wire::WireError::TransportFailed),
+                        ..Default::default()
+                    };
+                }
+            };
+            if staged.iter().any(|wire| {
+                Entry::from_wire(wire).is_ok_and(|entry| {
+                    entry.skeleton.seq
+                        > accepted
+                            .feeds
+                            .get(&entry.skeleton.author_id)
+                            .map_or(0, |feed| feed.seq)
+                })
+            }) {
+                // This WANT may have preceded acquisition of the exact legacy owner.
+                return crate::log::sync::ApplyReport {
+                    classes: vec![crate::log::sync::EntryClass::Unlinked; staged.len()],
+                    ..Default::default()
+                };
+            }
+        }
+        if let Some(request) = self.legacy {
+            if staged.iter().any(|wire| {
+                Entry::from_wire(wire).is_ok_and(|entry| {
+                    entry.skeleton.seq == request.through
+                        && entry.entry_hash() != request.expected_head
+                })
+            }) {
+                return crate::log::sync::ApplyReport {
+                    fail: Some(crate::wire::WireError::AuthenticatorInvalid),
+                    ..Default::default()
+                };
+            }
             if legacy_state.is_some_and(|state| state.pending_witness != 0) {
                 return crate::log::sync::ApplyReport {
                     classes: vec![crate::log::sync::EntryClass::Unlinked; staged.len()],
@@ -9466,13 +9519,15 @@ impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
                 return Ok(result);
             }
             if let (Some(request), Some(state)) = (self.legacy, legacy_state) {
-                if let Some(from) = ch
+                if ch
                     .dag
                     .refused_from(&request.owner.author)
-                    .filter(|from| *from <= request.through)
+                    .is_some_and(|from| from <= request.through)
                 {
-                    index.resolve_legacy_required_invalid(&request.owner.author, from)?;
-                    self.out.borrow_mut().legacy_invalid = true;
+                    // This refusal is volatile, unlike a retained fork or accepted End.
+                    // Keep the sealed prerequisite and exact request; never claim that
+                    // its missing suffix was accepted or durably proved impossible.
+                    self.out.borrow_mut().legacy_unavailable = true;
                 } else if ch.dag.is_frozen(&request.owner.author) {
                     // keep_forks persists the attributable proof before the explicit worker
                     // cancels its demand. Do not label this invalid interval completed.
