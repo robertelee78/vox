@@ -1513,7 +1513,7 @@ final class NodeModel: ObservableObject {
             if outcome?.operation == "", outcome?.backgroundConnectivity == true { outcome = nil }
             if Int(view.peers) != peers { peers = Int(view.peers) }
             if view.keyring != keyring { keyring = view.keyring }
-            if fresh.first(where: { $0.name == node })?.state == "attached" {
+            if fresh.first(where: { $0.name == node })?.state == "attached", !recovering {
                 ended = nil
             }
             if recovering && restartObservation {
@@ -1537,6 +1537,14 @@ final class NodeModel: ObservableObject {
                 // Reachability and installed observation do not establish a published inventory.
                 // Keep recovery owned by the follow loop until the authoritative refresh lands.
                 guard refreshed else { observationNeedsRestart = true; return }
+                if case let .room(id) = selection {
+                    guard await show(.room(id), whileRecovering: true) else {
+                        observationNeedsRestart = true
+                        return
+                    }
+                } else {
+                    ended = nil
+                }
                 observationNeedsRestart = false
                 await reconcileUnread()
                 guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
@@ -1842,13 +1850,26 @@ final class NodeModel: ObservableObject {
     /// Show `selection`. A room shown is not read by being chosen: each message is read as it is
     /// drawn in view with the window in front ([`drawn`], ADR-028 R-6).
     func show(_ selection: Selection?) async {
+        _ = await show(selection, whileRecovering: false)
+    }
+
+    /// Reload the selected room while a stopped observer is reconnecting. Its old ordinary
+    /// timeline stays visible, but `ended` keeps every action unavailable until the new page and
+    /// roster have both arrived and are published together.
+    @discardableResult
+    private func show(_ selection: Selection?, whileRecovering: Bool) async -> Bool {
         select(selection)
         if case .decisions = selection {
             decisionEvents = await decisions()
         }
-        guard case let .room(id) = selection, ended == nil else { return }
-        guard rooms.first(where: { $0.id == id })?.preparing != true else { return }
-        watchReads(id)
+        guard case let .room(id) = selection,
+              ended == nil || whileRecovering && observationNeedsRestart else { return false }
+        guard rooms.first(where: { $0.id == id })?.preparing != true else {
+            // Preparing has no authoritative page or roster yet. Keep reconnect's unavailable
+            // state and its action boundary until this room can publish both.
+            return !whileRecovering
+        }
+        if !whileRecovering { watchReads(id) }
         let view = selectedRoomView, viewGeneration = roomViewGeneration
         let generation = roomReadGeneration
         let messageRevision = roomMessageRevision
@@ -1863,7 +1884,9 @@ final class NodeModel: ObservableObject {
             let unread = try await readUnreadSummary(id)
             let page = try await client.roomViewRead(room: id, view: view)
             let read = page.messages
-            guard viewGeneration == roomViewGeneration, generation == roomReadGeneration, self.selection == .room(id), ended == nil else { return }
+            guard viewGeneration == roomViewGeneration, generation == roomReadGeneration,
+                  self.selection == .room(id),
+                  ended == nil || whileRecovering && observationNeedsRestart else { return false }
             let services = try await client.servicesPage(room: id, after: nil, revision: nil)
             let rows = try await memberRows(id)
             let kept = (try? await client.retention(room: id)) ?? ""
@@ -1871,8 +1894,10 @@ final class NodeModel: ObservableObject {
             let done = try await client.noticesPage(room: id, before: nil, revision: nil)
             let livePage = try await client.sessionsOpenPage(room: id, after: liveAfter)
             let historyPage = try await client.sessionsPage(room: id, after: historyAfter)
-            guard viewGeneration == roomViewGeneration, generation == roomReadGeneration, self.selection == .room(id), ended == nil else { return }
-            guard messageRevision == roomMessageRevision else { return }
+            guard viewGeneration == roomViewGeneration, generation == roomReadGeneration,
+                  self.selection == .room(id),
+                  ended == nil || whileRecovering && observationNeedsRestart else { return false }
+            guard messageRevision == roomMessageRevision else { return false }
             // The page and its inspector replace the prior view together, after both reads
             // have succeeded. An ordinary refresh must not publish a half-empty room.
             roomInstance = page.instance
@@ -1904,16 +1929,27 @@ final class NodeModel: ObservableObject {
                 sessionsOpenNext = livePage.next
                 sessionsHistoryNext = historyPage.next
             }
+            // Only this joint room-page/roster publication retires reconnect's unavailable state.
+            if whileRecovering { ended = nil }
             await loadStepRetention()
-            guard !Task.isCancelled, generation == roomReadGeneration, selection == .room(id), ended == nil else { return }
+            guard !Task.isCancelled, generation == roomReadGeneration,
+                  self.selection == .room(id), ended == nil else { return false }
             await loadRoomAnchorState()
-            guard viewGeneration == roomViewGeneration, generation == roomReadGeneration, self.selection == .room(id), ended == nil else { return }
+            guard viewGeneration == roomViewGeneration, generation == roomReadGeneration,
+                  self.selection == .room(id), ended == nil else { return false }
             // A Session restored as this room's last view is read once the room lists it (D12).
-            if showingSession { await readSession() }
+            if showingSession {
+                if whileRecovering { await readSelectedSessionMetadata() }
+                if showingSession { await readSession() }
+            }
             watchReads(id)
+            return true
         } catch {
-            guard viewGeneration == roomViewGeneration, generation == roomReadGeneration, self.selection == .room(id), ended == nil else { return }
+            guard viewGeneration == roomViewGeneration, generation == roomReadGeneration,
+                  self.selection == .room(id),
+                  ended == nil || whileRecovering && observationNeedsRestart else { return false }
             reportBackground(error)
+            return false
         }
     }
 
@@ -3685,10 +3721,16 @@ final class NodeModel: ObservableObject {
         invalidateRoomAnchorState(preservingSnapshot: true)
         rejectedRoomMark = nil
         // A transport end invalidates the authority of the selected room, but not the bounded
-        // snapshot the person was already reading. Keep that timeline in place until the
-        // reconnect path replaces its page and inspector together. A confirmed detach/lock is
-        // handled by readFacts below and releases history only after the node state is known.
-        if case .room = selection { roomNeedsPage = true }
+        // ordinary-room snapshot the person was already reading. Session bodies require current
+        // drive authorization, so they are withheld until reconnect checks that exact Session.
+        // The room's actions remain unavailable until its page and inspector replace the snapshot
+        // together. A confirmed detach/lock releases the rest after the node state is known.
+        if case .room = selection {
+            let snapshot = messages
+            releaseHistoryViews()
+            messages = snapshot
+            roomNeedsPage = true
+        }
         ended = "Node \(node) is unavailable."
         machineStateKnown = false
         daemonReachable = text.localizedCaseInsensitiveContains("detached")
