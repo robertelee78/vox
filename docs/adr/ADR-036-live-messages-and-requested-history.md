@@ -69,10 +69,39 @@ context and the control context of explicit causal parents. A missing context is
 empty frontier. This may reuse a separately carried, canonical sorted frontier object; it does
 not require an inline vector in every message or a new consensus service.
 
-The exact independent control-chain completeness rule, classification of every security-relevant
-entry, and transition from existing v0.4.5 records remain review questions below. They MUST be
-resolved before this protocol is execution-ready. Merely signing a claimed current control tip
-does not prove that a skipped interval contains no control action.
+The proposed completeness rule is H-3's single augmented commitment. A separately claimed latest
+control pointer is insufficient. Context objects are canonical sorted maps with at most 2,048
+distinct author fingerprints, each naming an exact control position and entry hash. Equal
+positions with different hashes conflict; advancing a position requires authenticated continuity
+of that author's feed. Store unchanged objects once by hash rather than copying a full map into
+every entry or adding another frontier tree.
+
+For a new entry, verify a receipt for its own immediately preceding prefix and each explicit
+`seen` parent. A receipt binds the exact parent position/hash to the control frontier of its
+authenticated prefix, not merely a context claimed in its header. The entry's signed pre-entry
+context MUST include the join of those frontiers. Extra coordinates are explicit causal
+references and need the same control verification. Each cited position requires complete control
+verification up to that position, not only inclusion of the last cited control. Context changes
+MUST precede content as control records; parent receipts and verified closures are reusable.
+
+The following dispatch boundaries are mandatory. A signed kind selects its only handler; an
+ordinary-content or addressed-key payload MUST NOT reach a room-governance handler.
+
+| Existing payload/effect | New-format scope and verification |
+| --- | --- |
+| Every `GovBody` variant, including consent, revocation, lifecycle, retention, presence, service sharing, room names and anchors | Public room/author control; full original authority and causal checks. |
+| Step policy, public Session floors and private-stream support marker | Public control; preserve policy, recipient, generation and continuity rules. Support declares transport capability and grants nothing. |
+| Authentication checkpoint and feed termination | Author control; termination cannot hide in a skipped content interval. |
+| Key package | Addressed key-delivery control; retain the existing public recipient and encrypted namespace. Other readers verify the authenticated header without requiring recipient decryption. Only the intended recipient may open it and apply existing namespace, generation and trust checks. |
+| Legacy drive-generation headers and encrypted legacy Session indexes | Conversion evidence with the original audience; no new public authority source or public dependency on private bodies. |
+| Text and read records | Content; no permission, generation or lifecycle effect. |
+| Private Session opening/end and activity | Remain within the existing drive stream/namespace and uninterrupted generation eligibility. Lifecycle is control only in that private scope; activity is private content. |
+
+Public readiness MUST NOT depend on private control closure. Public control may constrain private
+access, but no private key, Session identity, lifecycle record or body becomes public proof data.
+Every private page request still passes the current Drive and generation checks. The same proof
+machinery may be reused within the private scope where necessary; this does not merge its history
+or authority with the public room.
 
 ### H-3. Authenticate a requested interval without claiming a full prefix
 
@@ -88,16 +117,26 @@ pretend an unsigned gap was validated, or discard a later conflict found during 
 Sparse positions and their evidence MUST be durable; requesting an older page MUST fill only its
 missing intervals, merge idempotently and preserve actual message bodies and ordering.
 
-The selected prefix-consistency primitive is an author-signed append-only Merkle head with the
-leaf/internal hash domain separation, inclusion and consistency proof rules of RFC 9162 §2.1.
-This uses the tree algorithms, not a certificate service, external log or consensus system.
-The signature binds format, author, room, epoch, tree size, root and control context. The head
-MUST be separate from a leaf containing its own hash, or commit only to the preceding prefix,
-so the encoding has no circular commitment. Proof lengths and tree sizes are checked before
-allocation or traversal.
+The proposed prefix-consistency primitive is an author-signed append-only Merkle head, using
+RFC 9162 §2.1's canonical split and proof algorithms with a **Vox-specific augmentation**. This
+is not the RFC's unmodified hash encoding and requires review as such. It uses no certificate
+service, external log or consensus system. A descriptor carries leaf count, mandatory-control
+count, frontier-object hash and node hash. A leaf's count follows its signed kind; its frontier
+is its verified inherited context, extended by itself if it contributes a control fact. An
+internal node recomputes both checked counts and the join of its children's frontiers, and
+hashes the complete child descriptors and resulting frontier. Counts are nonnegative, cannot
+exceed subtree length, and are checked at every reconstructed node. A count or frontier supplied
+alongside an ordinary unaugmented root is not proof.
+
+The signed head binds format, author, room, epoch, scope and its complete descriptor. It is
+separate from the included entry hash so the encoding has no circular commitment. Existing heads
+or authenticated prefixes supply parent receipts. Leaf/internal/empty domains and encodings are
+distinct and canonical; all sizes, depth, arithmetic, context cardinality and proof bytes are
+bounded before allocation or traversal.
 
 Advancing a durable accepted root requires a valid consistency proof from that root. Receiving
 an entry requires its ordinary authentication and an inclusion proof at its exact position.
+These proofs reconstruct complete descriptors, including their checked sums and frontier joins.
 These prove an unchanged committed prefix and membership, not semantic validity of unfetched
 payloads or old `prev` links. Keep committed positions, individually validated entries and the
 actually held contiguous legacy prefix distinct. Authority MUST derive from complete required
@@ -107,6 +146,24 @@ Two valid signed statements for the same position/size and binding that disagree
 fork evidence. A missing or invalid consistency proof alone is a refusal or pending result,
 not proof that the author forked: a relay can supply a bad proof. Preserve signed evidence and
 existing local revocation/fork restrictions when any later page reveals a contradiction.
+
+A control-range proof reconstructs the same target descriptor and covers the requested interval
+exactly. Within that interval it may collapse only zero-control subtrees; every positive-control
+branch must yield all its control headers, and all required bodies and authority dependencies
+must validate. A control becomes operative only with valid inclusion under this same commitment.
+It cannot validate inside a collapsed zero-control subtree. Cited parent-prefix receipts must
+verify their complete control frontier; inclusion of a single latest action is insufficient.
+Partial verification is durable and keyed to the exact target descriptor, not just its size.
+Budget exhaustion never promotes a head to control-ready. Persist promotion and derived indexes
+atomically; restart reuses completed work and retains pending obligations.
+
+The new-format causal model is explicitly the authenticated control projection of included
+entries and validated references. This preserves verified control dependencies and honest
+`prev`/`seen` inheritance without walking all content ancestors. A malformed, unvalidated skipped
+leaf does not acquire an operative causal edge merely from its signature. It does not claim
+universal semantic validation of omitted content, knowledge of globally unseen controls, or
+instant verification of unlimited essential control history. A first-contact peer can withhold
+or fork what it presents; existing partition provisionality and cross-peer fork evidence remain.
 
 ### H-4. Bound demand across the daemon
 
@@ -147,10 +204,11 @@ requirement is to be silently deferred in order to call the release complete.
 
 ## Review questions
 
-1. What is the smallest authenticated control-causal frontier representation that preserves
-   ADR-007 through skipped content without an unbounded inline vector or a new consensus system?
-2. What exact sparse-feed proof/acceptance rule replaces the all-prefix assumption while retaining
-   detectable equivocation and honest distinctions between an observed tip and validated history?
+1. Does the proposed counted, frontier-augmented commitment plus parent-prefix receipt establish
+   complete applicable control and causal inheritance under the stated relative-to-commitment
+   semantics? Review malformed summaries, skipped cross-author edges and scoped private controls.
+2. Does the proposed sparse-feed proof/acceptance rule retain detectable equivocation and the
+   honest distinctions between observed, committed, control-ready and individually validated data?
 3. How can existing authenticated local v0.4.5 state transition without replaying all archived
    content or trusting a remote state summary? Which authority must sign any transition fence?
 4. Can the existing entry framing carry a valid 16 MiB entry within bounded aggregate buffers,
