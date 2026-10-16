@@ -13270,7 +13270,7 @@ impl Node {
             // Materialize only this member's bounded history, not every member's batches at
             // once. Durable obligations stay in the channel until the recipient acknowledges.
             let owes_history = history.contains_key(&target);
-            let keys = {
+            let mut keys = {
                 let channel = shared.lock().await;
                 let Some(profile) = self.profile.as_ref() else {
                     return delivered;
@@ -13286,6 +13286,16 @@ impl Node {
                     Err(_) => continue,
                 }
             };
+            if owes_history {
+                // Live communication wins over retained history. `history_skdms` returns the
+                // entitled generations oldest first, but every fresh key delivery consumes its
+                // own one-time prekey. A newly joined member therefore received an old generation,
+                // then waited for another published bundle while the current generation sat at
+                // the end of the batch. Messages posted after the join were unreadable during
+                // that wait. Deliver the current generation first; the older generations remain
+                // durably owed and follow as fresh prekeys arrive.
+                keys.reverse();
+            }
             // A delivery opened for a key no longer owed was superseded (ADR-030 D-4).
             // Retire it even while the member is unavailable, so it cannot pin capacity forever.
             let owed_now: BTreeSet<u64> = keys.iter().map(|k| k.body.chain_id).collect();
