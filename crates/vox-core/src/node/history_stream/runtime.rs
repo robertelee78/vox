@@ -84,7 +84,6 @@ pub(crate) struct Flow {
     pub(crate) archive: bool,
     pub(crate) inventory: bool,
     pub(crate) archive_request: Option<RequestId>,
-    _state_charge: crate::node::history_budget::BufferCharge,
     pub(crate) hint: Option<super::HeadHint>,
     pub(crate) waiting: bool,
     pub(crate) published: bool,
@@ -111,6 +110,8 @@ pub(crate) struct Flow {
     archive_next: Option<u64>,
     pub(crate) request_fence: Option<Arc<Fence>>,
     initialized: bool,
+    // Declared last: actual state/capabilities die before the shared admission is returned.
+    _state_charge: crate::node::history_budget::FlowStateCharge,
 }
 impl Flow {
     #[allow(clippy::too_many_arguments)]
@@ -124,7 +125,7 @@ impl Flow {
         control: Arc<Context>,
         hint: Option<super::HeadHint>,
         required: Option<(Digest32, u64)>,
-        state_charge: crate::node::history_budget::BufferCharge,
+        state_charge: crate::node::history_budget::FlowStateCharge,
         slots: Arc<BodySlots>,
         cleanup_store: Arc<Store>,
         cleanup_job: Job,
@@ -218,7 +219,7 @@ impl Flow {
         query: Query,
         request: RequestId,
         fence: Arc<Fence>,
-        state_charge: crate::node::history_budget::BufferCharge,
+        state_charge: crate::node::history_budget::FlowStateCharge,
         slots: Arc<BodySlots>,
         cleanup_store: Arc<Store>,
         cleanup_job: Job,

@@ -16,6 +16,8 @@ const MIB: usize = 1024 * 1024;
 const QUEUED_PER_LANE: usize = 64;
 const ARCHIVE_JOBS: usize = 2;
 const FOREGROUND_JOBS: usize = 64;
+const RETAINED_FLOWS: usize = 16;
+const FLOW_STATE_BYTES: usize = 128 * 1024;
 const CONTROL_TURNS_BEFORE_LIVE: usize = 3;
 const LIVE_GRANTS: usize = 64;
 const LIVE_GRANT_LIFETIME: std::time::Duration = std::time::Duration::from_secs(300);
@@ -121,6 +123,7 @@ pub struct Budget {
     state: Mutex<State>,
     changed: Notify,
     control_bytes: AtomicUsize,
+    retained_flows: AtomicUsize,
     foreground_bytes: AtomicUsize,
 }
 
@@ -276,6 +279,30 @@ impl Drop for Worker {
 pub struct Job(Arc<Worker>);
 
 impl Job {
+    /// Persistent flow metadata may occupy at most two MiB and sixteen small-control
+    /// worker slots across the whole daemon. Leave the remaining control capacity available
+    /// for current requests that free or advance this retained work.
+    pub(crate) fn reserve_flow_state(&self) -> Option<FlowStateCharge> {
+        if self.0.lane != Lane::Control {
+            return None;
+        }
+        self.0
+            .budget
+            .retained_flows
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                held.checked_add(1).filter(|next| *next <= RETAINED_FLOWS)
+            })
+            .ok()?;
+        let Some(charge) = self.reserve(FLOW_STATE_BYTES) else {
+            self.0.budget.retained_flows.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        };
+        Some(FlowStateCharge {
+            budget: self.0.budget.clone(),
+            _charge: charge,
+        })
+    }
+
     /// Start only at the presently held tail. Later quanta may finish that exact body at the
     /// last durable ACK, even if another message arrived meanwhile. The fixed volatile map
     /// is not history storage; restart or expiration removes the grant, without auto-resume.
@@ -491,5 +518,17 @@ impl Drop for BufferCharge {
         if let Some(shared) = self.worker.shared_bytes() {
             shared.fetch_sub(self.bytes, Ordering::AcqRel);
         }
+    }
+}
+
+/// One daemon-wide retained-flow admission, inseparable from its real Control byte charge.
+/// The Flow stores it after its state fields so allocations die before capacity is returned.
+pub(crate) struct FlowStateCharge {
+    budget: Arc<Budget>,
+    _charge: BufferCharge,
+}
+impl Drop for FlowStateCharge {
+    fn drop(&mut self) {
+        self.budget.retained_flows.fetch_sub(1, Ordering::AcqRel);
     }
 }

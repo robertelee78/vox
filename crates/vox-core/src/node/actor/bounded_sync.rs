@@ -482,7 +482,7 @@ impl Node {
                 else {
                     return false;
                 };
-                let Some(state_charge) = state_job.reserve(128 * 1024) else {
+                let Some(state_charge) = state_job.reserve_flow_state() else {
                     return false;
                 };
 
