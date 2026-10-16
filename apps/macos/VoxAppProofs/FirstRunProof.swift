@@ -3494,7 +3494,40 @@ final class FirstRunProof: XCTestCase {
         words(ui, Key.id("card-failed"), timeout: 15,
               "Trust with the field empty, alice's identity having a passphrase, must say it is needed",
               until: { $0.contains("This node's identity has a passphrase") })
-        tap(ui, Key.id("keyring-passphrase-cancel"), "Cancel in the passphrase form")
+        // XCTest can keep this button non-hittable after the failed submit even though it is
+        // drawn in the same row as the Trust button just clicked. Click its visible point as a
+        // person does, bounded to this card and window; the result below still decides whether
+        // Cancel worked.
+        guard present(ui, Key.id("keyring-passphrase-cancel"), timeout: 10,
+                      "the passphrase form must show Cancel") else { return }
+        let cancel = el(ui, Key.id("keyring-passphrase-cancel"))
+        let cancelFrame = cancel.frame
+        let cardFrame = el(ui, Key.id("node-card")).frame
+        func drawn(_ frame: CGRect) -> Bool {
+            frame.minX.isFinite && frame.minY.isFinite && frame.maxX.isFinite
+                && frame.maxY.isFinite && frame.width > 0 && frame.height > 0
+        }
+        guard drawn(cancelFrame), drawn(cardFrame), cardFrame.contains(cancelFrame),
+              let window = ui.windows.allElementsBoundByIndex.first(where: {
+                  drawn($0.frame) && $0.frame.contains(cancelFrame)
+              }) else {
+            keepTree(ui, "Cancel was not visibly inside the passphrase card")
+            throw Apparatus("Cancel in the passphrase form has no card-and-window-contained click point: \(cancelFrame)")
+        }
+        let cancelAt = CGPoint(x: cancelFrame.midX, y: cancelFrame.midY)
+        let clearBy = Date().addingTimeInterval(20)
+        var overlay = systemOverlayOver(cancelAt, targetHittable: cancel.isHittable)
+        while overlay != nil, Date() < clearBy {
+            Thread.sleep(forTimeInterval: 0.5)
+            overlay = systemOverlayOver(cancelAt, targetHittable: cancel.isHittable)
+        }
+        guard overlay == nil else {
+            keepTree(ui, "a system window covered Cancel in the passphrase form")
+            throw Apparatus("\(overlay!) covered Cancel in the passphrase form for 20 s")
+        }
+        let origin = window.frame.origin
+        window.coordinate(withNormalizedOffset: CGVector(dx: 0, dy: 0))
+            .withOffset(CGVector(dx: cancelAt.x - origin.x, dy: cancelAt.y - origin.y)).click()
         present(ui, Key.id("card-trust-confirm"), timeout: 10, "Cancel must bring back the card's Trust")
         tap(ui, Key.id("card-alias"), "Focus Carol's alias after cancelling")
         el(ui, Key.id("card-alias")).typeKey("a", modifierFlags: .command)
