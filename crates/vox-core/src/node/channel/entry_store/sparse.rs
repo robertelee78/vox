@@ -28,6 +28,17 @@ pub(crate) struct LocalHistoryPublication<'a> {
 const MAX_OBLIGATIONS: u64 = 4096;
 const STATE_BYTES: usize = 256;
 
+fn expected_entry_wire(header: &Entry) -> Result<usize> {
+    let length = usize::try_from(header.skeleton.payload_len)
+        .map_err(|_| invalid("history payload length"))?;
+    if length > crate::log::history::MAX_PAYLOAD_BYTES {
+        return Err(invalid("history payload exceeds format bound"));
+    }
+    length
+        .checked_add(MAX_HEADER_BYTES + 9)
+        .ok_or(invalid("history entry size overflow"))
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct Roots {
     objects: u64,
@@ -366,12 +377,15 @@ impl Source<'_> {
         let at = self
             .find(sek, room, roots.hash, &hashed(hash))?
             .ok_or(invalid("published sparse source missing locator"))?;
+        let header = self
+            .sparse_header(sek, room, roots.sparse, hash)?
+            .ok_or(invalid("published sparse header missing"))?;
         let wire = self.history_wire(
             sek,
             room,
             SegmentKind::LogDb,
             at.log,
-            crate::log::history::MAX_ENTRY_WIRE,
+            expected_entry_wire(&header)?,
         )?;
         let entry = Entry::from_wire(&wire)?;
         if entry.entry_hash() != *hash
@@ -734,12 +748,15 @@ impl Read<'_> {
         else {
             return Ok(None);
         };
+        let header = source
+            .sparse_header(self.sek, self.channel, self.directory.active.sparse, hash)?
+            .ok_or(invalid("published history header missing"))?;
         let wire = source.history_wire(
             self.sek,
             self.channel,
             SegmentKind::LogDb,
             at.log,
-            crate::log::history::MAX_ENTRY_WIRE,
+            expected_entry_wire(&header)?,
         )?;
         let entry = Entry::from_wire(&wire)?;
         if entry.entry_hash() != *hash

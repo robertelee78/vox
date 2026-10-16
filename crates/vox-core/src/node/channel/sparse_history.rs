@@ -439,6 +439,7 @@ impl ChannelState {
         store: &Store,
         cursor: &mut HistoryEffectCursor,
         now: crate::time::Ms,
+        on_admitted: impl FnOnce(&mut Batch<'_>, Digest32) -> Result<()>,
     ) -> Result<HistoryEffectProgress> {
         use crate::log::history::SignedEntryKind;
         let hash = &cursor.hash;
@@ -588,6 +589,7 @@ impl ChannelState {
             }
             self.queue_receivers(&mut batch)?;
             self.queue_private_generations(&mut batch)?;
+            on_admitted(&mut batch, *hash)?;
             batch.commit()?;
             self.entries.committed();
             self.key_packages.published(self.next_log_id);
@@ -652,6 +654,7 @@ impl ChannelState {
         entry: &Entry,
         body: &governance::TypedSparseBody,
         now: crate::time::Ms,
+        on_admitted: impl FnOnce(&mut Batch<'_>, Digest32) -> Result<()>,
     ) -> Result<HistoryEffectProgress> {
         use crate::log::history::SignedEntryKind;
         if self.poisoned {
@@ -734,6 +737,9 @@ impl ChannelState {
                 }
                 self.queue_receivers(&mut batch)?;
                 self.queue_private_generations(&mut batch)?;
+            }
+            if settled {
+                on_admitted(&mut batch, hash)?;
             }
             batch.commit()?;
             self.entries.committed();

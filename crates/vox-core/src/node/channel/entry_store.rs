@@ -20,6 +20,7 @@ use crate::log::entry::{Entry, EntryRead, EntryWrite};
 use crate::node::store::{Batch, Snapshot, Store};
 
 const PAGE_BYTES: usize = 16 * 1024;
+const DIRECTORY_BYTES: usize = 1024 * 1024;
 const PAGE_ITEMS: usize = 128;
 const CACHE_BYTES: usize = 4 * 1024 * 1024;
 const CACHE_ITEMS: usize = 128;
@@ -358,7 +359,7 @@ impl Directory {
         Zeroizing::new(e.finish())
     }
     fn parse(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() > 1024 * 1024 {
+        if bytes.len() > DIRECTORY_BYTES {
             return Err(invalid("entry directory exceeds bounded author state"));
         }
         let mut d = Decoder::new(bytes);
@@ -860,12 +861,33 @@ impl Source<'_> {
         kind: SegmentKind,
         id: u64,
     ) -> Result<Option<Zeroizing<Vec<u8>>>> {
+        let limit = if kind == SegmentKind::EntryIndex {
+            if id == DIRECTORY {
+                DIRECTORY_BYTES
+            } else {
+                PAGE_BYTES
+            }
+        } else {
+            crate::log::history::MAX_ENTRY_WIRE
+        };
+        self.open_bounded(sek, channel, kind, id, limit)
+    }
+    fn open_bounded(
+        &self,
+        sek: &Sek,
+        channel: &Digest32,
+        kind: SegmentKind,
+        id: u64,
+        limit: usize,
+    ) -> Result<Option<Zeroizing<Vec<u8>>>> {
         let sealed = match self {
             Self::Snapshot(snapshot)
             | Self::Cached(snapshot, _)
-            | Self::OtherSnapshot(snapshot, _) => snapshot.get_segment(channel, kind, id)?,
+            | Self::OtherSnapshot(snapshot, _) => {
+                snapshot.get_segment_bounded(channel, kind, id, limit)?
+            }
             Self::Batch(batch) | Self::OtherBatch(batch, _) => {
-                batch.get_segment(channel, kind, id)?
+                batch.get_segment_bounded(channel, kind, id, limit)?
             }
         };
         sealed
@@ -883,7 +905,7 @@ impl Source<'_> {
             _ => SegmentKind::EntryIndex,
         };
         let bytes = self
-            .open(sek, channel, kind, id)?
+            .open_bounded(sek, channel, kind, id, PAGE_BYTES)?
             .ok_or(invalid("entry index page missing"))?;
         let page = Page::parse(&bytes)?;
         if let Self::Cached(_, cache) = self {
