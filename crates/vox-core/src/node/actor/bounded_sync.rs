@@ -24,6 +24,7 @@ struct Running {
 struct Cleanup {
     result: Arc<StdMutex<Option<(Flow, crate::error::Result<bool>)>>>,
     task: tokio::task::JoinHandle<()>,
+    cancellations: Vec<crate::node::history_demand::Cancellation>,
 }
 #[derive(Default)]
 pub(super) struct Controller {
@@ -47,7 +48,9 @@ impl Controller {
             + usize::from(self.cleanup.is_some())
     }
     fn dispose(&mut self, flow: Flow) {
-        flow.cancel();
+        // Exclusive ownership moves to the retirement queue. Its only permitted next work is
+        // Flow::retire_slice's exact local cleanup; that slice cancels every capability before
+        // returning. Controller::fence still cancels queued cleanup immediately on node lock.
         self.retiring.push_back(flow);
         self.poll_cleanup();
     }
@@ -85,6 +88,7 @@ impl Controller {
         let Some(mut flow) = self.retiring.pop_front() else {
             return;
         };
+        let cancellations = flow.cancellation_handles();
         let result = Arc::new(StdMutex::new(None));
         let output = result.clone();
         let task = tokio::spawn(async move {
@@ -93,7 +97,11 @@ impl Controller {
                 *result = Some((flow, outcome));
             }
         });
-        self.cleanup = Some(Cleanup { result, task });
+        self.cleanup = Some(Cleanup {
+            result,
+            task,
+            cancellations,
+        });
     }
     async fn join_cleanup(&mut self) -> crate::error::Result<()> {
         if let Some(cleanup) = self.cleanup.take() {
@@ -120,14 +128,12 @@ impl Controller {
         for slot in &mut self.ready {
             if slot.as_ref().is_some_and(|flow| flow.room == room) {
                 let flow = slot.take().expect("matched room");
-                flow.cancel();
                 self.retiring.push_back(flow);
             }
         }
         let mut keep = VecDeque::new();
         while let Some(flow) = self.deferred.pop_front() {
             if flow.room == room {
-                flow.cancel();
                 self.retiring.push_back(flow);
             } else {
                 keep.push_back(flow);
@@ -195,7 +201,6 @@ impl Controller {
                 .is_some_and(|flow| flow.room == room && flow.peer == peer)
             {
                 if let Some(flow) = slot.take() {
-                    flow.cancel();
                     self.retiring.push_back(flow);
                 }
             }
@@ -211,7 +216,6 @@ impl Controller {
         let mut keep = VecDeque::new();
         while let Some(flow) = self.deferred.pop_front() {
             if flow.room == room && flow.peer == peer {
-                flow.cancel();
                 self.retiring.push_back(flow);
             } else {
                 keep.push_back(flow);
@@ -223,8 +227,18 @@ impl Controller {
         self.poll_cleanup();
     }
     pub(super) fn fence(&self) {
-        for flow in self.deferred.iter().chain(self.ready.iter().flatten()) {
+        for flow in self
+            .deferred
+            .iter()
+            .chain(self.ready.iter().flatten())
+            .chain(self.retiring.iter())
+        {
             flow.cancel();
+        }
+        if let Some(cleanup) = &self.cleanup {
+            for cancellation in &cleanup.cancellations {
+                cancellation.cancel();
+            }
         }
         for work in self.running.iter().flatten() {
             work.fence.retire();

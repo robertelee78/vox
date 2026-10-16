@@ -325,6 +325,17 @@ impl Flow {
             _ => Lane::Control,
         }
     }
+    pub(crate) fn cancellation_handles(&self) -> Vec<demand::Cancellation> {
+        let mut handles = Vec::with_capacity(3);
+        if let Some(context) = &self.live_context {
+            handles.push(context.cancellation());
+        }
+        handles.push(self.control_context.cancellation());
+        if let Some(staging) = &self.history {
+            handles.push(staging.context.cancellation());
+        }
+        handles
+    }
     pub(crate) fn cancel(&self) {
         for (index, owner) in self.owners.iter().enumerate() {
             if let Some(request) = owner {
@@ -339,12 +350,8 @@ impl Flow {
             }
         }
 
-        if let Some(context) = &self.live_context {
-            context.cancellation().cancel();
-        }
-        self.control_context.cancellation().cancel();
-        if let Some(staging) = &self.history {
-            staging.context.cancellation().cancel();
+        for cancellation in self.cancellation_handles() {
+            cancellation.cancel();
         }
     }
     /// The Controller owns this future and awaits it before dropping an abandoned flow.
