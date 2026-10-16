@@ -92,7 +92,9 @@ impl Controller {
     ) -> Option<(RequestId, Digest32, [u8; 16])> {
         self.ready
             .as_ref()
-            .filter(|dispatch| dispatch.room == room && dispatch.peer == peer)
+            .filter(|dispatch| {
+                dispatch.room == room && dispatch.peer == peer && !dispatch.fence.is_retired()
+            })
             .map(|dispatch| (dispatch.request, dispatch.generation, dispatch.instance))
     }
 
