@@ -326,7 +326,7 @@ signal.signal(signal.SIGINT, interrupted)
 
 def env(w):
     e = {k: os.environ[k] for k in ("PATH", "TMPDIR") if k in os.environ}
-    e.update(HOME=f"{S}/{w}", VOX_DATA_DIR=f"{S}/{w}/data", VOX_CONFIG_DIR=f"{S}/{w}/cfg")
+    e.update(HOME=f"{S}/{w}", VOX_DATA_DIR=f"{S}/{w}/data", VOX_CONFIG_DIR=f"{S}/{w}/cfg", VOX_PROXY="127.0.0.1:0")
     return e
 
 def run(w, *args, stdin=None, secs=120):
@@ -369,7 +369,7 @@ def trust(w, peer, name):
         _, status = os.waitpid(pid, 0)
         pid = None
         if os.waitstatus_to_exitcode(status) != 0:
-            raise Product(f"{w}'s terminal trust add failed: {out.decode('utf-8', 'replace')}")
+            raise Apparatus(f"mutual-trust setup was not achieved: {w}'s terminal trust add said: {out.decode('utf-8', 'replace')}")
     finally:
         os.close(fd)
         if pid is not None:
@@ -476,6 +476,8 @@ try:
     ok("d", "room", "create", "--passphrase-file", "-", "--name", "r", stdin="room pass\n")
     room = ok("d", "room", "list").split()[0]
     link = ok("d", "room", "link", room).strip()
+    if ANCHOR_ID and f"a={ANCHOR_ID}" in link:
+        raise Apparatus(f"the learned-endpoint claim needs LAN-only machine bootstrap, but the room link also carries the anchor: {link}")
     if "10.77.0.2" not in link:
         raise Apparatus(f"D's invite link does not name A (10.77.0.2), so P would not dial it there: {link}")
     ok("p", "room", "join", "--passphrase-file", "-", link, stdin="room pass\n", secs=490)
@@ -487,7 +489,14 @@ try:
     print(f"{TAG} P reads D before the change", flush=True)
     trust_before = {w: ok(w, "trust", "list").strip() for w in ("d", "p")}
     if fp["p"] not in trust_before["d"] or fp["d"] not in trust_before["p"]:
-        raise Product("the peers' trust lists do not contain one another after trust add")
+        raise Apparatus("mutual-trust setup was not achieved: the public trust lists do not contain both peer fingerprints")
+    if LINUX:
+        for w in ("d", "p"):
+            inventory = json.loads(ok(w, "anchor", "list", "--json"))
+            item = next((a for a in inventory.get("anchors", []) if a.get("fingerprint") == ANCHOR_ID), None)
+            if item is None or not item.get("addresses") or any("10.77.0.2" not in a for a in item["addresses"]) or item.get("sources") != [{"kind": "added-by-hand"}]:
+                raise Apparatus(f"{w}'s anchor inputs do not stage only a manual LAN bootstrap: {inventory!r}")
+            print(f"{TAG} {w}'s public anchor inventory confirms only the LAN bootstrap and manual source: {item}", flush=True)
     time.sleep(2)
     SAID = "vox: the network changed:"
     def said_lines():
