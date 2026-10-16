@@ -38,6 +38,7 @@ mod receipt_facts;
 mod render_facts;
 mod restart;
 mod retention_facts;
+pub(crate) mod sparse;
 pub(crate) use restart::RestartState;
 pub(crate) mod session_tree;
 pub use dag_facts::OrderView;
@@ -98,11 +99,12 @@ pub(crate) struct Roots {
     key_packages: u64,
     key_latest: u64,
     key_tip: u64,
+    sparse: sparse::Roots,
 }
 
 impl Roots {
     fn write(self, e: &mut Encoder) {
-        e.array(15)
+        e.array(16)
             .uint(self.sequence)
             .uint(self.hash)
             .uint(self.clock)
@@ -118,10 +120,11 @@ impl Roots {
             .uint(self.key_packages)
             .uint(self.key_latest)
             .uint(self.key_tip);
+        self.sparse.write(e);
     }
     fn read(d: &mut Decoder<'_>) -> Result<Self> {
         let arity = d.array()?;
-        if !matches!(arity, 12 | 15) {
+        if !matches!(arity, 12 | 15 | 16) {
             return Err(invalid("entry roots arity"));
         }
         Ok(Self {
@@ -140,6 +143,11 @@ impl Roots {
             key_packages: if arity >= 15 { d.uint()? } else { 0 },
             key_latest: if arity >= 15 { d.uint()? } else { 0 },
             key_tip: if arity >= 15 { d.uint()? } else { 0 },
+            sparse: if arity >= 16 {
+                sparse::Roots::read(d)?
+            } else {
+                sparse::Roots::default()
+            },
         })
     }
 }
@@ -243,7 +251,7 @@ impl Directory {
     }
     fn bytes(&self) -> Zeroizing<Vec<u8>> {
         let mut e = Encoder::new();
-        e.array(23).uint(9);
+        e.array(23).uint(10);
         self.active.write(&mut e);
         self.provisional.write(&mut e);
         e.uint(self.next_page)
@@ -350,7 +358,7 @@ impl Directory {
         // This unpublished format includes durable receipts, pending local read marks,
         // canonical operation members and retained conflict witnesses. Older partial roots
         // cannot be treated as empty without silently losing accepted work.
-        if !matches!((arity, version), (19, 8) | (23, 9)) {
+        if !matches!((arity, version), (19, 8) | (23, 9) | (23, 10)) {
             return Err(invalid("entry directory format"));
         }
         let active = Roots::read(&mut d)?;
@@ -518,6 +526,8 @@ impl Directory {
             .any(|id| *id >= next_page)
             || !active.rendered.valid_for(next_page)
             || !active.retained.valid_for(next_page)
+            || !active.sparse.valid_for(next_page)
+            || !provisional.sparse.valid_for(next_page)
             || !work.valid_for(next_page, phase)
             || matches!(phase, Phase::Building | Phase::Switched) != promotion.is_some()
         {
@@ -550,6 +560,7 @@ impl Directory {
                 || p.work.key_tip >= next_package
                 || !p.work.rendered.valid_for(next_page)
                 || !p.work.retained.valid_for(next_page)
+                || !p.work.sparse.valid_for(next_page)
                 || p.retired >= next_page
             {
                 return Err(invalid("promotion bounds"));

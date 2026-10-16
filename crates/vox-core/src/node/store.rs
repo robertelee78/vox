@@ -792,6 +792,32 @@ pub(crate) struct Snapshot {
 }
 
 impl Snapshot {
+    /// Bound a sealed object's serialized size before copying ciphertext out of redb.
+    /// The caller reserves its plaintext/ciphertext working set before this read.
+    pub(crate) fn get_segment_bounded(
+        &self,
+        channel: &Digest32,
+        kind: SegmentKind,
+        id: u64,
+        plaintext_limit: usize,
+    ) -> Result<Option<SealedSegment>> {
+        let table = self
+            .txn
+            .open_table(SEGMENTS)
+            .map_err(storage("open segments"))?;
+        let value = table
+            .get((*channel, kind_code(kind), id))
+            .map_err(storage("read segment"))?;
+        value
+            .map(|value| {
+                // Version, nonce, AEAD tag and canonical CBOR byte-string headers fit in 64 bytes.
+                if value.value().len() > plaintext_limit.saturating_add(64) {
+                    return Err(Error::MalformedAtRest("sealed object exceeds read bound"));
+                }
+                sealed_segment_from_slice(value.value())
+            })
+            .transpose()
+    }
     /// Read the last segment key without opening its sealed body.
     pub(crate) fn last_segment_id(
         &self,
@@ -893,6 +919,30 @@ pub struct Batch<'a> {
 }
 
 impl Batch<'_> {
+    /// Read this transaction's bounded object without first copying an unbounded value.
+    pub(crate) fn get_segment_bounded(
+        &self,
+        channel: &Digest32,
+        kind: SegmentKind,
+        id: u64,
+        plaintext_limit: usize,
+    ) -> Result<Option<SealedSegment>> {
+        let table = self
+            .txn
+            .open_table(SEGMENTS)
+            .map_err(storage("open segments"))?;
+        let value = table
+            .get((*channel, kind_code(kind), id))
+            .map_err(storage("read segment"))?;
+        value
+            .map(|value| {
+                if value.value().len() > plaintext_limit.saturating_add(64) {
+                    return Err(Error::MalformedAtRest("sealed object exceeds read bound"));
+                }
+                sealed_segment_from_slice(value.value())
+            })
+            .transpose()
+    }
     /// Read the last segment key without opening its sealed body.
     pub(crate) fn last_segment_id(
         &self,
