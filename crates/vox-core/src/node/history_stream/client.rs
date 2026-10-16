@@ -1187,6 +1187,10 @@ impl Receiver {
         let effect_result = |progress| -> LocalResult {
             match progress {
                 Effect::Progress => LocalResult::next(step),
+                Effect::RefillPending { governance: true } => {
+                    LocalResult::wait(step, LocalNeed::Governance)
+                }
+                Effect::RefillPending { governance: false } => LocalResult::next(step),
                 Effect::ControlPending { head, through } => LocalResult::wait(
                     step,
                     LocalNeed::Control {
@@ -1390,6 +1394,10 @@ impl Receiver {
                 match value.value.1 {
                     complete @ Effect::Complete { .. } => effect_result(complete),
                     Effect::Progress => LocalResult::next(next(EntryPhase::Effect(None))),
+                    Effect::RefillPending { governance: true } => {
+                        LocalResult::wait(step, LocalNeed::Governance)
+                    }
+                    Effect::RefillPending { governance: false } => LocalResult::next(step),
                     other => effect_result(other),
                 }
             }
@@ -1400,6 +1408,14 @@ impl Receiver {
                     return Ok(LocalResult::busy(step));
                 };
                 let (cursor, progress) = value.value.1;
+                if let Effect::RefillPending { governance } = progress {
+                    let refill = next(EntryPhase::Refill);
+                    return Ok(if governance {
+                        LocalResult::wait(refill, LocalNeed::Governance)
+                    } else {
+                        LocalResult::next(refill)
+                    });
+                }
                 let mut result = effect_result(progress);
                 if result.next.is_some() {
                     result.next = Some(next(EntryPhase::Effect(Some(cursor))));

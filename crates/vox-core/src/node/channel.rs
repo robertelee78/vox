@@ -848,6 +848,25 @@ pub struct Rendered {
     pub owed: bool,
 }
 
+/// The result of projecting one authenticated content body. `Deferred` means the body is valid
+/// and retained, but a transient governance/receiver-chain dependency prevents a truthful
+/// admission result yet. Callers that own an explicit history demand must not clear it in that
+/// case.
+enum ContentProjection {
+    Visible(Rendered),
+    Applied,
+    Deferred,
+}
+
+impl ContentProjection {
+    fn into_row(self) -> Option<Rendered> {
+        match self {
+            Self::Visible(row) => Some(row),
+            Self::Applied | Self::Deferred => None,
+        }
+    }
+}
+
 /// One line a person is told about the room, in its timeline but not a message (ADR-028 E-5):
 /// `ann renamed the room to family`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6549,7 +6568,7 @@ impl ChannelState {
                     }
                     self.track_body_into(&mut batch, entry_hash, id, now_ms)?;
                     let before_expired = expired.len();
-                    let row = self.render_content_into(
+                    let projection = self.render_content_into(
                         &mut batch,
                         author,
                         entry_hash,
@@ -6557,8 +6576,9 @@ impl ChannelState {
                         now_ms,
                         &mut expired,
                     )?;
-                    chains_advanced |= row.is_some() || expired.len() > before_expired;
-                    rows.extend(row);
+                    chains_advanced |= matches!(&projection, ContentProjection::Visible(_))
+                        || expired.len() > before_expired;
+                    rows.extend(projection.into_row());
                     Ok(Ok(rows))
                 })();
             match step {
@@ -7512,8 +7532,9 @@ impl ChannelState {
             if !matches!(classify_payload(&payload), Ok(EntryKind::Content)) {
                 continue;
             }
-            if let Some(row) =
-                self.render_content_into(batch, author, hash, &payload, now_ms, expired)?
+            if let Some(row) = self
+                .render_content_into(batch, author, hash, &payload, now_ms, expired)?
+                .into_row()
             {
                 rows.push(row);
             }
@@ -7572,7 +7593,7 @@ impl ChannelState {
         let mut expired: Vec<(Digest32, Tracked)> = Vec::new();
         let persisted = (|| -> Result<Option<Rendered>> {
             let mut batch = store.batch()?;
-            let row = self.render_content_into(
+            let projection = self.render_content_into(
                 &mut batch,
                 author,
                 entry_hash,
@@ -7580,11 +7601,14 @@ impl ChannelState {
                 now_ms,
                 &mut expired,
             )?;
+            let deferred = matches!(&projection, ContentProjection::Deferred);
+            let row = projection.into_row();
             if row.is_none()
                 && expired.is_empty()
                 && self.drive.pending.is_empty()
                 && !self.chains_advanced
                 && !self.legacy_sessions.dirty()
+                && !deferred
             {
                 return Ok(None);
             }
@@ -7609,10 +7633,9 @@ impl ChannelState {
         }
     }
 
-    /// Decrypt one content payload and queue its sealed plaintext-cache row into `batch`,
-    /// returning the rendered row for the caller to place in the timeline **once the batch has
-    /// committed** ([`Self::place_committed`]) — or `None` when this node may not, or cannot,
-    /// read it (see [`Self::render_content`]).
+    /// Decrypt one content payload and queue its sealed plaintext-cache row into `batch`.
+    /// `Visible` carries the row the caller places after commit; `Applied` records an intentional
+    /// non-row; `Deferred` preserves an explicit demand until transient projection state advances.
     ///
     /// **One transaction per pass, not two per entry.** Each entry used to commit its own cache
     /// row and its own copy of the receiver chains — two durable commits, about 17 ms apiece on
@@ -7633,7 +7656,7 @@ impl ChannelState {
         payload: &[u8],
         now_ms: u64,
         expired: &mut Vec<(Digest32, Tracked)>,
-    ) -> Result<Option<Rendered>> {
+    ) -> Result<ContentProjection> {
         let me = self.me();
         if author != me {
             let allowed = match governance::View::current_in_batch(
@@ -7648,32 +7671,32 @@ impl ChannelState {
             };
             match allowed {
                 Some(true) => {}
-                Some(false) => return Ok(None),
+                Some(false) => return Ok(ContentProjection::Applied),
                 None => {
                     let mut writer = self.entries.write(batch, &self.sek, &self.channel_id)?;
                     writer.queue_backfill(author, Some(1))?;
                     writer.seal()?;
-                    return Ok(None);
+                    return Ok(ContentProjection::Deferred);
                 }
             }
         }
         let msg = match GroupMessage::from_wire(payload) {
             Ok(m) => m,
-            Err(_) => return Ok(None),
+            Err(_) => return Ok(ContentProjection::Applied),
         };
         // **A Session entry opens only with its node's drive key** (ADR-029 SC-2): a member
         // without it skips the entry, quietly; it is never owed, never a row.
         if msg.header.channel_id == drive_channel(&self.channel_id) {
             self.render_session_into(batch, author, entry_hash, &msg, now_ms, expired)?;
-            return Ok(None);
+            return Ok(ContentProjection::Applied);
         }
         let slot = (author, msg.header.chain_id);
         let Some(chain) = self.receivers.get_mut(&slot) else {
-            return Ok(None);
+            return Ok(ContentProjection::Deferred);
         };
         let plaintext = match chain.decrypt(&msg) {
             Ok(p) => Zeroizing::new(p),
-            Err(_) => return Ok(None),
+            Err(_) => return Ok(ContentProjection::Applied),
         };
         self.chains_advanced = true;
         // **Skipped, not propagated** — matching the three `Ok(None)` paths above it.
@@ -7701,7 +7724,7 @@ impl ChannelState {
                         self.retention_get_in(Transaction::Batch(batch), &entry_hash)?
                             .map(|t| (entry_hash, t)),
                     );
-                    return Ok(None);
+                    return Ok(ContentProjection::Applied);
                 }
                 let id = self.next_log_id;
                 let row = ReadRow {
@@ -7729,15 +7752,15 @@ impl ChannelState {
                     index.seal()?;
                 }
                 self.next_log_id = id.saturating_add(1);
-                return Ok(None);
+                return Ok(ContentProjection::Applied);
             }
             // A Session entry sealed under the sender key is not one: its node gave it to every
             // reader, and the Session is only for those with drive (SC-2). Not shown.
             Ok(Decoded::LegacySessionIndex(index)) => {
                 self.accept_legacy_index(batch, entry_hash, author, index, now_ms)?;
-                return Ok(None);
+                return Ok(ContentProjection::Applied);
             }
-            Ok(Decoded::Session(_)) | Err(_) => return Ok(None),
+            Ok(Decoded::Session(_)) | Err(_) => return Ok(ContentProjection::Applied),
         };
         if self.already_expired(
             Transaction::Batch(batch),
@@ -7750,7 +7773,7 @@ impl ChannelState {
                 self.retention_get_in(Transaction::Batch(batch), &entry_hash)?
                     .map(|t| (entry_hash, t)),
             );
-            return Ok(None);
+            return Ok(ContentProjection::Applied);
         }
         // The cache row shares the entry's log id space; use a fresh id so it never
         // collides with an authored row. It is also the row's arrival (ADR-023 decision 1).
@@ -7785,7 +7808,7 @@ impl ChannelState {
         }
         // A cache row, not an entry: the generation counts entries only (ADR-025 D1).
         self.next_log_id = id.saturating_add(1);
-        Ok(Some(rendered))
+        Ok(ContentProjection::Visible(rendered))
     }
 
     /// The data commit has completed. Give its bounded rows one visibility time before

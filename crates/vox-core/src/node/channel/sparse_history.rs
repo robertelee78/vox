@@ -592,6 +592,7 @@ impl HistoryEffectCursor {
 
 pub(crate) enum HistoryEffectProgress {
     Progress,
+    RefillPending { governance: bool },
     ControlPending { head: Digest32, through: u64 },
     GovernancePending,
     CheckpointPending { author: Digest32, seq: u64 },
@@ -730,7 +731,7 @@ impl ChannelState {
         // A changed grant is an ordinary cancellation before projection/index mutation.
         // The held Batch serializes trust writes through the final publication.
         check_binding(&batch)?;
-        let applied = (|| -> Result<bool> {
+        let applied = (|| -> Result<(bool, bool, bool)> {
             let finished = FinishedHistoryEffect { hash: *hash };
             let mut index = self
                 .entries
@@ -752,10 +753,12 @@ impl ChannelState {
             }
             let mut expired = Vec::new();
             let mut rows = Vec::new();
+            let refill_pending = kind == SignedEntryKind::Content && entry.payload.is_none();
+            let mut projection_deferred = false;
             if kind == SignedEntryKind::Content {
                 if let Some(payload) = &entry.payload {
                     self.track_body_into(&mut batch, *hash, log, now.get())?;
-                    if let Some(row) = self.render_content_into(
+                    match self.render_content_into(
                         &mut batch,
                         entry.skeleton.author_id,
                         *hash,
@@ -763,13 +766,17 @@ impl ChannelState {
                         now.get(),
                         &mut expired,
                     )? {
-                        rows.push(row);
+                        super::ContentProjection::Visible(row) => rows.push(row),
+                        super::ContentProjection::Applied => {}
+                        super::ContentProjection::Deferred => projection_deferred = true,
                     }
                 }
             }
             self.queue_receivers(&mut batch)?;
             self.queue_private_generations(&mut batch)?;
-            on_admitted(&mut batch, *hash)?;
+            if !refill_pending && !projection_deferred {
+                on_admitted(&mut batch, *hash)?;
+            }
             batch.commit()?;
             self.entries.committed();
             // The settled-tip index and presence update are now durable in the same Batch.
@@ -791,16 +798,21 @@ impl ChannelState {
             let rendered = !rows.is_empty();
             self.place_committed(store, rows, &expired)?;
             self.settle_display_order(store)?;
-            Ok(rendered)
+            Ok((rendered, refill_pending, projection_deferred))
         })();
-        let rendered = match applied {
-            Ok(rendered) => rendered,
+        let (rendered, refill_pending, projection_deferred) = match applied {
+            Ok(outcome) => outcome,
             Err(error) => {
                 self.poison(&error);
                 return Err(error);
             }
         };
         cursor.rendered |= rendered;
+        if refill_pending || projection_deferred {
+            return Ok(HistoryEffectProgress::RefillPending {
+                governance: projection_deferred,
+            });
+        }
         match self.advance_history_contiguous(store, &entry.skeleton.author_id) {
             Ok(_) => Ok(HistoryEffectProgress::Complete {
                 rendered: cursor.rendered,
@@ -924,9 +936,10 @@ impl ChannelState {
             index.seal()?;
             let mut expired = Vec::new();
             let mut rows = Vec::new();
+            let mut deferred = false;
             if settled && kind == SignedEntryKind::Content {
                 self.track_body_into(&mut batch, hash, log, now.get())?;
-                if let Some(row) = self.render_content_into(
+                match self.render_content_into(
                     &mut batch,
                     entry.skeleton.author_id,
                     hash,
@@ -937,12 +950,14 @@ impl ChannelState {
                     now.get(),
                     &mut expired,
                 )? {
-                    rows.push(row);
+                    super::ContentProjection::Visible(row) => rows.push(row),
+                    super::ContentProjection::Applied => {}
+                    super::ContentProjection::Deferred => deferred = true,
                 }
                 self.queue_receivers(&mut batch)?;
                 self.queue_private_generations(&mut batch)?;
             }
-            if settled {
+            if settled && !deferred {
                 on_admitted(&mut batch, hash)?;
             }
             batch.commit()?;
@@ -955,15 +970,20 @@ impl ChannelState {
             self.gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let rendered = !rows.is_empty();
             self.place_committed(store, rows, &expired)?;
-            Ok(if settled {
+            Ok(if deferred {
+                HistoryEffectProgress::RefillPending { governance: true }
+            } else if settled {
                 HistoryEffectProgress::Complete { rendered }
             } else {
                 HistoryEffectProgress::Progress
             })
         })();
-        if let Err(error) = &applied {
-            self.poison(error);
+        match applied {
+            Ok(progress) => Ok(progress),
+            Err(error) => {
+                self.poison(&error);
+                Err(error)
+            }
         }
-        applied
     }
 }
