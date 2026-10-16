@@ -128,6 +128,8 @@ impl Context {
 #[serde(deny_unknown_fields)]
 pub struct Binding {
     pub room: Digest32,
+    /// Saved room incarnation captured by the explicit local selection.
+    pub instance: [u8; 16],
     pub epoch: u64,
     /// Public scope or the digest of the exact private audience.
     pub audience: Digest32,
@@ -388,7 +390,21 @@ fn live(
     if active.node != context.fingerprint() || !active.matches(&state) {
         return Err(invalid("history demand is paused, cancelled or replaced"));
     }
+    authorize_in(batch, context, state.binding)?;
     Ok(state)
+}
+fn authorize_in(batch: &Batch<'_>, context: &Context, binding: Binding) -> Result<()> {
+    let current = super::history_stream::authorization_generation_in(
+        batch,
+        context.node,
+        binding.room,
+        binding.instance,
+        binding.epoch,
+    )?;
+    if current != binding.grant {
+        return Err(invalid("history demand authorization changed"));
+    }
+    Ok(())
 }
 fn commit_context(batch: Batch<'_>, context: &Context) -> Result<()> {
     context.check()?;
@@ -439,6 +455,7 @@ pub fn start(
     let key = key(context)?;
     let scope = scope(context);
     let mut batch = context.store().batch()?;
+    authorize_in(&batch, context, binding)?;
     let serial = match load(&batch, key, &scope)? {
         Some(previous) => {
             if !previous.progress.terminal() || previous.cleanup.is_some() {
@@ -489,6 +506,7 @@ pub fn resume(
     let key = key(context)?;
     let scope = scope(context);
     let mut batch = context.store().batch()?;
+    authorize_in(&batch, context, binding)?;
     let mut state = load(&batch, key, &scope)?.ok_or_else(|| invalid("no history demand"))?;
     if state.request != request || state.binding != binding || state.progress.terminal() {
         return Err(invalid(
