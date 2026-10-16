@@ -1699,6 +1699,14 @@ final class FirstRunProof: XCTestCase {
                          "--identity-passphrase-file", pass("alice")], env: voxEnv)
         try staged(vox, ["trust", "add", "--node", "bob", aliceFp, "--name", "alice",
                          "--identity-passphrase-file", pass("bob")], env: voxEnv)
+        // Bob's addressed post comes from an agent Session. Open it through the same first-turn
+        // hook a real Claude Code session runs; a VOX_SESSION marker alone is not registration.
+        let opened = run(vox, ["agent", "hook", "--node", "bob", "--room", room, "--format", "text"],
+                         env: voxEnv.merging(["CLAUDE_CODE_ENTRYPOINT": "cli"]) { $1 },
+                         input: "{\"session_id\":\"bob-proof\",\"hook_event_name\":\"UserPromptSubmit\",\"cwd\":\"/tmp\",\"transcript_path\":\"/tmp/t.jsonl\",\"prompt\":\"notify alice\"}")
+        guard opened.status == 0 else {
+            throw Apparatus("bob's Claude Code hook, to open the notification sender Session, exited \(opened.status): \(opened.out)")
+        }
         // Forward-only keys: bob posts until one is readable to alice.
         var readable = false
         let staging = Date().addingTimeInterval(120)
