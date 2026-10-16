@@ -115,6 +115,12 @@ impl Receiver {
         request: RequestId,
         query: Query,
     ) -> Result<LocalProof> {
+        // Head, proof construction and verifier staging temporarily overlap. Admit that bounded
+        // envelope on the existing large-control lane instead of repeatedly exhausting the
+        // ordinary 8-MiB control slice before admission can persist the verifier.
+        let Some(work_job) = job.record_job(12 * 1024 * 1024) else {
+            return Ok(LocalProof::Busy);
+        };
         let Query::Proof {
             head,
             kind,
@@ -127,7 +133,7 @@ impl Receiver {
         let local = self.node;
         let signed = self
             .read(
-                job,
+                &work_job,
                 crate::log::history::MAX_HEADER_BYTES,
                 move |room, store| {
                     let input = room.history_read(store)?;
@@ -144,7 +150,7 @@ impl Receiver {
         };
         let proof = match self
             .source
-            .proof(job, &signed.value, kind, from, to)
+            .proof(&work_job, &signed.value, kind, from, to)
             .await?
         {
             Lookup::Found(proof) => proof,
@@ -153,7 +159,7 @@ impl Receiver {
         };
         let generation = self.generation;
         let staged = self
-            .read(job, VERIFY_ENVELOPE, move |room, store| {
+            .read(&work_job, VERIFY_ENVELOPE, move |room, store| {
                 admission::stage(
                     room,
                     store,
