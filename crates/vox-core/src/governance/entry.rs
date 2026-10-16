@@ -268,6 +268,15 @@ impl GovEntry {
     /// # Errors
     /// The payload is absent, is not a governance body, or names another channel or epoch.
     pub fn body_bound_to(entry: &Entry) -> Result<GovBody> {
+        if let Some(v2) = &entry.skeleton.v2 {
+            use crate::log::history::SignedEntryKind;
+            if !matches!(
+                v2.kind,
+                SignedEntryKind::Governance | SignedEntryKind::StepPolicy
+            ) {
+                return Err(Error::MalformedGovernance("signed kind is not governance"));
+            }
+        }
         // 2. The framed governance struct lives in the retained payload.
         let payload = entry.payload.as_deref().ok_or(Error::MalformedGovernance(
             "governance entry payload pruned",
@@ -278,6 +287,19 @@ impl GovEntry {
         //     disagree with the epoch the author actually signed (genesis carries
         //     epoch 0, matching a genesis log entry's skeleton epoch).
         let body = GovBody::parse_framed(payload)?;
+        if let Some(v2) = &entry.skeleton.v2 {
+            let step = matches!(body, GovBody::StepPolicyUpdate(_));
+            if step != (v2.kind == crate::log::history::SignedEntryKind::StepPolicy) {
+                return Err(Error::MalformedGovernance(
+                    "signed governance kind differs from body",
+                ));
+            }
+            if body.issuer_id() != entry.skeleton.author_id {
+                return Err(Error::MalformedGovernance(
+                    "signed governance author differs from issuer",
+                ));
+            }
+        }
         let (body_channel, body_epoch) = body.channel_and_epoch();
         if body_channel != entry.skeleton.channel_id {
             return Err(Error::MalformedGovernance(

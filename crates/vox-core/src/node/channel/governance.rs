@@ -7,7 +7,14 @@ mod channel;
 mod context;
 mod facts;
 mod fold;
+mod sparse;
 mod view;
+
+pub(crate) use sparse::{
+    sparse_control_evaluation, ControlEvaluation, PayloadValidation, SettledGovernanceControl,
+    SparseValidation, SparseValidationStep, TypedSparseBody, ValidatedSparseEntry,
+    VerifiedParentPrefix,
+};
 
 use super::entry_store::EntryIndex;
 use crate::atrest::sek::Sek;
@@ -49,10 +56,18 @@ fn advance_frontiers(
         let hash = work
             .entry
             .ok_or(Error::MalformedAtRest("governance work entry missing"))?;
-        let entry = input
-            .get_by_hash(&hash)?
-            .filter(|entry| entry.entry_hash() == hash)
-            .ok_or(Error::MalformedAtRest("governance causal entry missing"))?;
+        // Format 2 retains its individually signed header independently of the body.
+        // Causal projection never decrypts a large content body just to read that header.
+        let entry = if input.sparse_enabled() {
+            input
+                .history_object(super::entry_store::sparse::ObjectKind::Header, &hash)?
+                .map(|wire| crate::log::entry::Entry::from_wire(&wire))
+                .transpose()?
+        } else {
+            input.get_by_hash(&hash)?
+        }
+        .filter(|entry| entry.entry_hash() == hash)
+        .ok_or(Error::MalformedAtRest("governance causal entry missing"))?;
         let size = entry.to_wire().len();
         // One oversized entry must still make progress; no body survives this turn.
         if rows > 0 && bytes.saturating_add(size) > INPUT_BYTES {
@@ -72,8 +87,32 @@ fn advance_frontiers(
         )?;
         work.changed |= writer.raise(&hash, &entry.skeleton.author_id, entry.skeleton.seq)?;
         remaining -= 1;
+        // A v2 source was admitted with its exact signed parent/control closure. Its
+        // authority frontier is that immutable pre-context plus itself. Inheriting a
+        // receiver's newer parent frontier would change strict-past authorization.
+        let signed_context = entry
+            .skeleton
+            .v2
+            .as_ref()
+            .map(|v2| {
+                let context = input
+                    .history_context(&v2.pre_context)?
+                    .ok_or(Error::MalformedAtRest("validated causal context missing"))?;
+                if context.hash() != v2.pre_context
+                    || context.room != *room
+                    || context.scope != v2.scope
+                {
+                    return Err(Error::MalformedAtRest("validated causal context binding"));
+                }
+                Ok(context)
+            })
+            .transpose()?;
         let own_parent = usize::from(entry.skeleton.seq > 1);
-        let parent_count = own_parent + entry.skeleton.seen.len();
+        let parent_count = if signed_context.is_some() {
+            1
+        } else {
+            own_parent + entry.skeleton.seen.len()
+        };
         let mut complete = false;
         while remaining > 0 {
             remaining -= 1;
@@ -85,6 +124,21 @@ fn advance_frontiers(
                 ));
             }
             if at < parent_count {
+                if let Some(context) = &signed_context {
+                    let at = work.author.map_or(0, |after| {
+                        context
+                            .coordinates
+                            .partition_point(|coordinate| coordinate.author <= after)
+                    });
+                    if let Some(coordinate) = context.coordinates.get(at) {
+                        work.changed |= writer.raise(&hash, &coordinate.author, coordinate.seq)?;
+                        work.author = Some(coordinate.author);
+                    } else {
+                        work.parent += 1;
+                        work.author = None;
+                    }
+                    continue;
+                }
                 let parent = if at == 0 && own_parent != 0 {
                     &entry.skeleton.prev_hash
                 } else {
@@ -167,9 +221,18 @@ fn observe(
     let Some(payload) = entry.payload.as_deref() else {
         return Ok(());
     };
-    if !matches!(classify_payload(payload), Ok(EntryKind::Governance))
-        && !crate::governance::step_policy::is_step_policy(payload)
-    {
+    let governance = match &entry.skeleton.v2 {
+        Some(v2) => matches!(
+            v2.kind,
+            crate::log::history::SignedEntryKind::Governance
+                | crate::log::history::SignedEntryKind::StepPolicy
+        ),
+        None => {
+            matches!(classify_payload(payload), Ok(EntryKind::Governance))
+                || crate::governance::step_policy::is_step_policy(payload)
+        }
+    };
+    if !governance {
         return Ok(());
     }
     if writer
@@ -182,13 +245,19 @@ fn observe(
     let key = authors
         .get(&entry.skeleton.author_id)
         .ok_or(Error::MalformedAtRest("governance source author unknown"))?;
-    let Ok(body) = GovEntry::body_bound_to(entry) else {
-        return Ok(());
+    let body = match GovEntry::body_bound_to(entry) {
+        Ok(body) => body,
+        Err(error) if entry.skeleton.v2.is_some() => return Err(error),
+        Err(_) => return Ok(()),
     };
     // Malformed/unauthenticated nested statements confer nothing, just as in
     // the original pass-1 evaluator. Local Store/index errors above remain errors.
-    if body.verify(key).is_err() {
-        return Ok(());
+    if let Err(error) = body.verify(key) {
+        return if entry.skeleton.v2.is_some() {
+            Err(error)
+        } else {
+            Ok(())
+        };
     }
     writer.barrier(log);
     writer.verified(&hash, &entry.skeleton.author_id, entry.skeleton.seq, log)?;

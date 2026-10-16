@@ -767,6 +767,12 @@ fn u16_from(v: u64) -> Result<u16> {
 /// Fallible access to a room's encrypted, disk-backed entries. Callers retain owned entries
 /// only for the current operation; absence is distinct from a failed local store read.
 pub trait EntryRead {
+    /// Resolve a published evidence-complete sparse source without pretending that its
+    /// position belongs to the contiguous feed. This grants no governance authority.
+    /// Unpublished staging readers retain the absent default.
+    fn get_sparse_published(&self, _hash: &Digest32) -> Result<Option<Entry>> {
+        Ok(None)
+    }
     /// The entry at an exact author position, if held.
     fn get(&self, author: &Digest32, seq: u64) -> Result<Option<Entry>>;
     /// Resolve an exact entry hash through the authenticated entry index.

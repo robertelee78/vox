@@ -433,7 +433,7 @@ impl WorkBudget {
         self.signatures_left -= 1;
         true
     }
-    fn take_context_load(&mut self) -> bool {
+    pub(crate) fn take_context_load(&mut self) -> bool {
         // Decode, validation and canonical-hash passes, conservatively charged before a
         // disk-backed provider can allocate or walk even a maximum-sized context.
         let visits = 4 * MAX_CONTEXT_AUTHORS;
@@ -442,6 +442,13 @@ impl WorkBudget {
         }
         self.object_loads_left -= 1;
         self.coordinates_left -= visits;
+        true
+    }
+    pub(crate) fn take_object_load(&mut self) -> bool {
+        if self.object_loads_left == 0 {
+            return false;
+        }
+        self.object_loads_left -= 1;
         true
     }
     fn take_descriptor(&mut self, coordinates: usize) -> bool {
