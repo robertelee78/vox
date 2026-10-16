@@ -17667,16 +17667,20 @@ impl Node {
             })
         };
 
-        let turn = if let Some(shared) = self.channels.get(&id).cloned() {
+        let turn = if let Some(prepared) = self.preparing_rooms.get_mut(&id) {
+            apply(prepared.channel.get_mut())
+                .unwrap_or_else(|error| Turn::Failed(error.to_string()))
+        } else if self.store_recovery.contains_key(&id) {
+            // The published instance is poisoned while its replacement opens. Cleanup belongs
+            // to that replacement and must retain its exact owner until it enters preparation.
+            Turn::Again(owner)
+        } else if let Some(shared) = self.channels.get(&id).cloned() {
             match shared.try_lock() {
                 Ok(mut room) => {
                     apply(&mut room).unwrap_or_else(|error| Turn::Failed(error.to_string()))
                 }
                 Err(_) => Turn::Again(owner),
             }
-        } else if let Some(prepared) = self.preparing_rooms.get_mut(&id) {
-            apply(prepared.channel.get_mut())
-                .unwrap_or_else(|error| Turn::Failed(error.to_string()))
         } else if self.opening_rooms.contains_key(&id) || self.reopening.contains(&id) {
             // Cancellation can finish while the blocking opener still owns this room. Keep the
             // exact cleanup owner until adoption; dropping it here would preserve a stale spool.
