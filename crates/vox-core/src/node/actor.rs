@@ -8742,10 +8742,13 @@ impl Node {
                     // which refused the newcomer's records until something else refreshed it
                     // (V210-80).
                     self.refresh_network_view().await;
-                    // No longer waiting to join, so its pre-join record goes, and this node's
-                    // board stops counting it as pending (V210-102).
+                    // Keep the verified pre-join bundle through the admission consent window.
+                    // `apply_join_outcome` releases a trusted host's sender key before the joiner
+                    // hears success. Deleting the only bundle here made that release wait for the
+                    // joiner's later member-record publication, permanently losing messages posted
+                    // in the ForwardOnly gap. Successful key sealing, an untrusted admission or
+                    // the joiner's address publication removes it below (V210-102).
                     if let Some(net) = self.net.as_ref() {
-                        net.forget_prejoin(&channel_id, &identity.fingerprint());
                         if let Some(wire) = &notice {
                             let _ = net.publish_local(wire);
                         }
@@ -10986,6 +10989,14 @@ impl Node {
         // joiner for good. The actor is serial, so releasing here — before any later
         // command is served — means everything posted after the join is readable.
         self.deliver_owed_consents(None).await;
+        // An untrusted joiner is owed no key, so its candidate pre-join material has no admission
+        // purpose left. A trusted joiner's record stays only until `key_left`, or until its own
+        // address publication removes it from the board.
+        if !self.trust.is_trusted(&peer) {
+            if let Some(net) = self.net.as_ref() {
+                net.forget_prejoin(&channel_id, &peer);
+            }
+        }
         self.joins_answered
             .retain(|_, at| at.elapsed() < JOINER_SEAL_GRACE);
         self.joins_answered
@@ -13459,6 +13470,9 @@ impl Node {
         let pair = (*channel_id, target);
         self.key_waits_said.remove(&pair);
         self.key_waiting.remove(&pair);
+        if let Some(net) = self.net.as_ref() {
+            net.forget_prejoin(channel_id, &target);
+        }
     }
 
     /// The bundle a fresh delivery to `target` opens against: [`Self::delivery_bundle`], which waits
@@ -16584,17 +16598,33 @@ impl Node {
         target: Digest32,
         on_spent: prekeys::SpentOneTime,
     ) -> Result<crate::identity::keyagreement::PrekeyBundlePublic, prekeys::BundleWait> {
-        let epoch = match self.channels.get(channel_id).map(Arc::clone) {
-            Some(shared) => shared.lock().await.join_context().ok().map(|c| c.epoch),
-            None => None,
-        };
-        let record = match (self.net.as_ref(), epoch) {
-            (Some(net), Some(epoch)) => net.board_bundle(channel_id, epoch, &target),
-            _ => None,
-        }
-        .ok_or(prekeys::BundleWait::NoBundle)?;
+        let shared = self
+            .channels
+            .get(channel_id)
+            .map(Arc::clone)
+            .ok_or(prekeys::BundleWait::NoBundle)?;
+        let room = shared.lock().await;
+        let epoch = room
+            .join_context()
+            .ok()
+            .map(|context| context.epoch)
+            .ok_or(prekeys::BundleWait::NoBundle)?;
+        let admitted_member = room.is_member(&target);
+        drop(room);
+        let net = self.net.as_ref().ok_or(prekeys::BundleWait::NoBundle)?;
+        let bundle = net
+            .board_bundle(channel_id, epoch, &target)
+            .map(|record| record.prekey_bundle)
+            // A pre-join bundle is self-signed and root-bound, but conveys no room authority.
+            // It is usable here only while this exact identity is an active admitted room member.
+            .or_else(|| {
+                admitted_member
+                    .then(|| net.board_prejoin_bundle(channel_id, &target))
+                    .flatten()
+            })
+            .ok_or(prekeys::BundleWait::NoBundle)?;
         prekeys::delivery_bundle(
-            &record.prekey_bundle,
+            &bundle,
             self.now_ms().get(),
             &self.refused_otps.of(&target),
             on_spent,

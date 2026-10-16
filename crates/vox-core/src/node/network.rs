@@ -969,6 +969,26 @@ impl NodeNet {
             .forget_prejoin(channel_id, peer);
     }
 
+    /// The verified pre-join bundle `peer` presented for `channel_id`, while it is still live.
+    ///
+    /// This remains candidate key material only. The caller must separately establish room
+    /// authority before using it; a pre-join record alone never makes its presenter a member.
+    #[must_use]
+    pub fn board_prejoin_bundle(
+        &self,
+        channel_id: &Digest32,
+        peer: &Digest32,
+    ) -> Option<crate::identity::keyagreement::PrekeyBundlePublic> {
+        let now = self.now_ms();
+        let store = self.service.store();
+        let guard = store.lock().unwrap_or_else(PoisonError::into_inner);
+        guard
+            .current_prejoins(channel_id, now)
+            .into_iter()
+            .find(|record| record.asserted_id() == *peer)
+            .map(|record| record.prekey_bundle.clone())
+    }
+
     /// Whether the board knows `peer` as a member of some channel it anchors: the
     /// creator named by a genesis it holds, or the author of a live member record
     /// (which the board only admitted from an authenticated member).
