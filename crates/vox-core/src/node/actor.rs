@@ -10062,8 +10062,21 @@ impl Node {
                     }
                     self.sched_rooms.insert(channel_id);
                 }
-                if departure_receipt {
-                    self.drop_port(&channel_id, &peer);
+                let still_departed = if departure_receipt {
+                    match self.channels.get(&channel_id) {
+                        Some(shared) => {
+                            let room = shared.lock().await;
+                            room.is_author(&peer) && room.has_left(&peer)
+                        }
+                        None => false,
+                    }
+                } else {
+                    false
+                };
+                if still_departed {
+                    // This exact attempt is already gone. Preserve another validated receipt
+                    // attempt if present; otherwise retire the departed peer's idle port.
+                    self.retire_departed_port(channel_id, peer);
                 }
                 // A finite response neither consumes pending local requests nor follows the
                 // peer's continuation. Sparse scheduling never falls back to legacy archive.

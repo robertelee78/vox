@@ -350,8 +350,8 @@ impl Flow {
     /// The Controller owns this future and awaits it before dropping an abandoned flow.
     /// Each transaction is bounded; no transport or authority effect runs during retirement.
     pub(crate) async fn retire_slice(&mut self) -> Result<bool> {
-        self.cancel();
         if !self.initialized {
+            self.cancel();
             return Ok(true);
         }
         // A published current body queues only local exact-request reclamation. If its peer
@@ -372,6 +372,11 @@ impl Flow {
         if reclaim_control && !self.reclaim_stage(Purpose::Control, &cleanup_job).await? {
             return Ok(false);
         }
+        // No worker owns this Flow while it is retiring. Retain its already-fenced local
+        // capability only through the exact queued reclamation above, then cancel it before
+        // any general publication/verifier cleanup. Nothing here opens a stream or schedules
+        // another turn.
+        self.cancel();
         // Retained flow metadata is charged to the daemon's small control reservation.
         // Cleanup must not need that same pool to free it: several hosted nodes can fill
         // its headroom. Use an independently admitted foreground-control envelope instead.
