@@ -85,11 +85,21 @@ impl ChannelState {
     /// The actor also checks this before dispatching a mutating command. In particular a
     /// remote publication already in progress must not be discovered only after encryption.
     pub(crate) fn ensure_local_append_available(&self, store: &Store) -> Result<()> {
+        self.ensure_local_append_available_for(store, false)
+    }
+
+    /// An automatic append may not pass this identity's departure. The only callers that may
+    /// set `after_departure` are an intentional post, which explicitly undoes a pending leave,
+    /// and the authenticated return presence written while a rejoin settles.
+    pub(super) fn ensure_local_append_available_for(
+        &self,
+        store: &Store,
+        after_departure: bool,
+    ) -> Result<()> {
         // The departure statement must remain this author's tail until another member has
         // acknowledged it. Background key, receipt, session, or share work cannot make a node
-        // appear to rejoin after the person chose Leave. An actual join first readmits the
-        // identity, so its presence(true) append remains available.
-        if self.has_left(&self.me()) {
+        // appear to rejoin after the person chose Leave.
+        if self.has_left(&self.me()) && !after_departure {
             return Err(Error::Profile("this identity has left the room"));
         }
         let read = self.entries.read(store, &self.sek, &self.channel_id)?;

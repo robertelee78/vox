@@ -4287,6 +4287,7 @@ impl ChannelState {
                 &[(SEG_SENDER, sender_seg), (SEG_ORIGINS, origins_seg)],
                 settle_sparse,
                 Some((next, origins)),
+                settle_sparse,
             )?;
         } else {
             let persisted = (|| -> Result<()> {
@@ -5983,7 +5984,7 @@ impl ChannelState {
         now_ms: u64,
         rows: &[(u64, SealedSegment)],
     ) -> Result<Digest32> {
-        self.append_governance_with_sender(profile, payload, now_ms, rows, false, None)
+        self.append_governance_with_sender(profile, payload, now_ms, rows, false, None, false)
     }
 
     /// The sparse settlement exception is local-only and publishes presence, sender state
@@ -5997,8 +5998,9 @@ impl ChannelState {
         rows: &[(u64, SealedSegment)],
         settle_sparse: bool,
         sender: Option<(SenderChain, OriginKeyStore)>,
+        after_departure: bool,
     ) -> Result<Digest32> {
-        self.ensure_local_append_available(profile.store())?;
+        self.ensure_local_append_available_for(profile.store(), after_departure)?;
         if self.poisoned {
             return Err(self.save_failure());
         }
@@ -8073,7 +8075,9 @@ impl ChannelState {
         // caller still thinking in seconds should fail to compile rather than stamp 1970.
         now_millis: u64,
     ) -> Result<Rendered> {
-        self.ensure_local_append_available(profile.store())?;
+        // A person's post deliberately undoes a departure that no peer has acknowledged yet
+        // (V210-164). Automatic key, receipt, session, and share work has no such exception.
+        self.ensure_local_append_available_for(profile.store(), true)?;
         if self.poisoned {
             return Err(self.save_failure());
         }
@@ -9009,7 +9013,15 @@ impl ChannelState {
             here,
             self.sender.chain_id(),
         )?;
-        self.append_governance(profile, &statement.to_wire(), now_ms)?;
+        self.append_governance_with_sender(
+            profile,
+            &statement.to_wire(),
+            now_ms,
+            &[],
+            false,
+            None,
+            here,
+        )?;
         Ok(true)
     }
 
