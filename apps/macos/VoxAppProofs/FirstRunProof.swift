@@ -2090,7 +2090,6 @@ final class FirstRunProof: XCTestCase {
                                             stderr: computerRoot.appendingPathComponent("native-host.stderr").path)
         defer { nativeHost.terminate() }
         _ = try nativeHost.command("title Pairing native OpenCode")
-        _ = try nativeHost.command("turn NATIVE-799-INITIAL")
         func nativeEvent(_ object: [String: Any]) throws {
             let json = try JSONSerialization.data(withJSONObject: object)
             _ = try nativeHost.command("event " + String(decoding: json, as: UTF8.self))
@@ -2100,6 +2099,29 @@ final class FirstRunProof: XCTestCase {
         let initialText: [String: Any] = ["type": "message.part.updated", "properties": ["part":
             ["id": "part_799_user", "messageID": "msg_799_user", "sessionID": nativeSession,
              "type": "text", "text": "NATIVE-799-INITIAL"]]]
+        let nativeOpenUntil = Date().addingTimeInterval(20)
+        var nativeOwner = (status: Int32(-1), out: "")
+        var nativeTurnAnswers: [[String: Any]] = []
+        repeat {
+            // A bounded first turn can truthfully say that this freshly attached node is still
+            // preparing and to try again next turn. Model only that documented next turn. Events
+            // cannot establish the Session before the plugin hook has opened it, so replaying only
+            // the bus events (the old apparatus) could wait forever for a Session that did not exist.
+            let answer = try nativeHost.command("turn NATIVE-799-INITIAL")
+            nativeTurnAnswers.append(answer)
+            let observeUntil = min(nativeOpenUntil, Date().addingTimeInterval(1))
+            repeat {
+                nativeOwner = run(vox, ["room", "session", "--node", "protected", "--json", keptRoom, nativeSession], env: computerB)
+                if nativeOwner.status == 0 { break }
+                Thread.sleep(forTimeInterval: 0.1)
+            } while Date() < observeUntil
+            if nativeOwner.status == 0 { break }
+            let text = answer["text"] as? String ?? ""
+            guard text.contains("try again next turn") || text.contains("is preparing node") else { break }
+        } while Date() < nativeOpenUntil
+        guard nativeOwner.status == 0 else {
+            throw Apparatus("the native OpenCode hook did not establish its repo-bound Session on protected; native turns said \(nativeTurnAnswers); owner's `vox room session --json` exited \(nativeOwner.status) saying \(nativeOwner.out)")
+        }
         let nativeInitialUntil = Date().addingTimeInterval(60)
         var nativeInitial = ""
         while Date() < nativeInitialUntil {
@@ -2109,7 +2131,7 @@ final class FirstRunProof: XCTestCase {
             Thread.sleep(forTimeInterval: 0.3)
         }
         guard nativeInitial.contains("NATIVE-799-INITIAL") else {
-            throw Apparatus("the repo-bound native Session was not established for the personal receiver: \(nativeInitial)")
+            throw Product("the computer-trusted personal node did not receive the protected node's established native Session within 60 seconds; it said \(nativeInitial)")
         }
         tap(pairingUI, Key.id("session-\(nativeSession.prefix(8))"), "The native OpenCode Session in the joined room")
         guard present(pairingUI, Key.id("session-compose"), timeout: 30,
