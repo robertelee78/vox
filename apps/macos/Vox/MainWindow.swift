@@ -114,7 +114,11 @@ struct MainWindow: View {
                 }
                 }
                 .textSelection(.enabled)
+                .contentSurface()
             }
+            // The sidebar is a rounded pane inside the split view. Its narrow outer gutter shows
+            // the split view's canvas, so that canvas is panel too; the detail above owns bg.base.
+            .background(PanelFill())
             Hairline()
             StatusBar(model: model)
                 .raisedSurface()
