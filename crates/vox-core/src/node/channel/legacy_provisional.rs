@@ -7,6 +7,15 @@ pub(crate) use entry_store::{
 };
 
 impl ChannelState {
+    /// Background maintenance only advances a previously identified orphan, never a paused
+    /// owner's publication. The caller schedules another turn if CleanupPending remains.
+    pub(crate) fn cleanup_legacy_orphan(&self, store: &Store) -> Result<entry_store::Preparation> {
+        if self.poisoned {
+            return Err(self.save_failure());
+        }
+        self.entries
+            .cleanup_orphan_provisional(store, &self.sek, &self.channel_id)
+    }
     pub(crate) fn legacy_provisional_state(
         &self,
         store: &Store,
