@@ -2,7 +2,9 @@
 
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in BCP 14 [RFC 2119] [RFC 8174] when, and only when, they appear in all capitals, as shown here.
 
-**Status**: Accepted. Built on integrate/v0.3.0: M21.1–M21.10, in `crates/vox-agentcomms/src/{claim,ops,version,envelope}.rs`
+**Status**: Accepted. The 2026-10-15 clarifications to §5.3, §5.4 and §5.6 are to be implemented
+for v0.4.6 (#938). The earlier M21.1–M21.10 requirements were built on integrate/v0.3.0, in
+`crates/vox-agentcomms/src/{claim,ops,version,envelope}.rs`
 and `crates/vox-tui/src/{room_cli,coord,agent_hook}.rs`, each with a real-binary proof in
 `crates/vox-tui/tests/`. M21.4's read-back is proved by
 `work_op_proof::a_conflict_that_lands_after_the_lookup_is_found_by_the_read_back`, M21.5's
@@ -160,19 +162,31 @@ them, and the threat model is cooperating workers that may be buggy, never adver
 - **5.2** The fold MUST apply only operations stamped with the folding worker's own version; others
   change nothing and are reported. An upgrade therefore ends every claim made under the previous
   version.
-- **5.3** A worker is a participant if it is in the room's roster, its latest claim-protocol
-  operation or work `hello` is not a `bye`, and either that message is within the participation
+- **5.3** A counted participation record is a claim-protocol operation, a work `hello` carrying
+  `data.vox`, or a `bye`. The latest record is the maximum `(created_millis, entry_hash)`, the same
+  ordering for every lookup in this section. A worker is a participant if it is in the room's
+  roster, its latest counted record is not a `bye`, and either that message is within the participation
   horizon (24 hours, by the checking worker's clock) or it holds or is the target of a resource. Its
   version is that message's stamp, missing if none. A worker MUST exclude its own fingerprint from
   the table.
 - **5.4** A participating verb MUST post a stamped `hello` when its session has not announced, and
-  only then build the version table. The drain hook does not announce.
+  only then build the version table. A session has announced the current version only when a
+  current-version `hello` exists for its exact `(author fingerprint, session)`, and both the latest
+  counted record for that pair and the latest counted record for that author are not `bye` and
+  carry exactly the caller's version. A historical matching `hello` MUST NOT suppress a fresh
+  announcement after a later record supersedes it with another, missing or unknown version, or
+  with a `bye`. The new `hello` MUST use only the calling node's identity and the calling session;
+  it does not announce for another session or node. The drain hook and idle clients do not
+  announce. Updating a daemon or harness integration alone does not rewrite room participation.
 - **5.5** When any participant's version is mismatched, missing or unknown: every claim-protocol
   verb and every `post --work` MUST refuse before posting, with exit status 3; the drain hook MUST
   tell the session every turn that coordination is refused and why; `board --json` MUST report
   `coordination: refused` with the table. Plain conversation MUST NOT be refused.
-- **5.6** The refusal MUST name the incompatible worker (fingerprint, session), its version and the
-  required version (the refuser's own).
+- **5.6** The refusal MUST name the incompatible worker (fingerprint, session), its last announced
+  version, the recorded time of that announcement and the required version (the refuser's own).
+  Refusal and doctor output MUST describe the last counted room record, not claim that the stored
+  stamp identifies a currently running daemon, CLI or harness plugin. These diagnostics and the
+  refresh in §5.4 MUST NOT weaken the exact-version gate or the version-filtered claim fold.
 - **5.7** Known limits: workers whose clocks disagree may disagree about a participant at the
   horizon's edge, which can shift a refusal but not an owner; a binary that predates this gate
   enforces nothing, and its operations read as missing stamps.
