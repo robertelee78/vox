@@ -372,8 +372,7 @@ private struct RoomForm: View {
         Task {
             let ok = joining ? await model.joinRoom(l, passphrase: secret)
                 : await model.createRoom(n, passphrase: secret, anchors: kept, context: context) {
-                    submission == request && app.nodeWindowGeneration == owner
-                        && app.node === model && app.signedInAs == model.node
+                    app.nodeWindowGeneration == owner && app.node === model && app.signedInAs == model.node
                         && app.phase == .attached(node: model.node, fingerprint: actor)
                 }
             guard !Task.isCancelled, submission == request, model.me == actor,

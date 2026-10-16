@@ -2543,8 +2543,9 @@ final class NodeModel: ObservableObject {
         let editor = sheetInstance, origin = selection
         // The mutation opens a room, so its ChannelOpened event may restart observation and
         // retire the old read epoch. That does not retire the person's creation intent.
-        // Keep the exact sheet and navigation fences; reads still use their own fresh epochs.
-        func current(_ expected: Selection?) -> Bool {
+        // Keep the exact sheet and navigation fences until creation succeeds; reads use their
+        // own fresh epochs after the successful sheet is dismissed.
+        func currentEditor(_ expected: Selection?) -> Bool {
             currentOwner() && !Task.isCancelled && sheet == .newRoom && sheetInstance == editor && selection == expected
         }
         do {
@@ -2552,23 +2553,27 @@ final class NodeModel: ObservableObject {
             defer { passphrase.wipe() }
             let room = try await client.createRoomWithAnchors(name: name, passphrase: passphrase,
                                                              anchors: anchors, node: me)
-            guard current(origin) else { return false }
+            guard currentEditor(origin) else { return false }
             report(operation: operation, done: "Created the room.")
-            // Publish the successful navigation before yielding to observation recovery.
+            // Publish the successful navigation and dismiss its modal editor before yielding to
+            // observation recovery. Native room commands (including Command-L) must be available
+            // as soon as creation succeeds; a full sidebar/page refresh may take much longer.
             // Keep the room inventory coherent with that navigation at the same boundary: room
             // commands may run while the authoritative refresh is still reading the sidebar.
-            // Neither a cancelled sheet nor a later navigation may be taken over on return.
             let destination = Selection.room(room)
             if !rooms.contains(where: { $0.id == room }) {
                 rooms.append(Room(id: room, name: name, open: true, preparing: false))
             }
             select(destination)
+            sheet = nil
             await refresh()
-            guard current(destination) else { return false }
+            // Creation is already complete. A later choice may supersede its background reads;
+            // never navigate back over it when those reads return.
+            guard currentOwner(), !Task.isCancelled, selection == destination else { return true }
             await show(destination)
-            return current(destination)
+            return true
         } catch {
-            guard current(origin) else { return false }
+            guard currentEditor(origin) else { return false }
             report(error, operation: operation)
             return false
         }
