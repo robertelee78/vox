@@ -1177,7 +1177,16 @@ impl ChannelState {
     }
 
     fn save_private_pulls(&self, store: &Store) -> Result<()> {
-        if self.private_sessions.cursors.len() > AUTHORS_HARD_LIMIT {
+        self.save_private_pull_candidate(store, &self.private_sessions.cursors, None)
+    }
+
+    fn save_private_pull_candidate(
+        &self,
+        store: &Store,
+        cursors: &BTreeMap<Digest32, Cursor>,
+        authority: Option<TrustNonce>,
+    ) -> Result<()> {
+        if cursors.len() > AUTHORS_HARD_LIMIT {
             return Err(Error::MalformedAtRest("private pull peer bound"));
         }
         let mut e = Encoder::new();
@@ -1190,8 +1199,8 @@ impl ChannelState {
                     .map_or(&[][..], |v| &v[..]),
             )
             .bytes(&self.private_pull_binding())
-            .array(self.private_sessions.cursors.len());
-        for (peer, cursor) in &self.private_sessions.cursors {
+            .array(cursors.len());
+        for (peer, cursor) in cursors {
             e.array(3)
                 .bytes(peer)
                 .bytes(&cursor.incarnation)
@@ -1203,12 +1212,22 @@ impl ChannelState {
             SEG_PRIVATE_PULLS,
             &e.finish(),
         )?;
-        store.put_segment(
+        let mut batch = store.batch()?;
+        if let Some(expected) = authority {
+            if batch.get_meta_prefix::<{ crate::atrest::sek::NONCE_LEN }>(
+                crate::node::trust::TRUST_META_KEY,
+            )? != expected
+            {
+                return Err(Error::StreamRefused(TRUST_CHANGED));
+            }
+        }
+        batch.put_segment(
             &self.channel_id,
             SegmentKind::KeyMaterial,
             SEG_PRIVATE_PULLS,
             &segment,
-        )
+        )?;
+        batch.commit()
     }
 
     fn queue_private_progress(&self, batch: &mut crate::node::store::Batch<'_>) -> Result<()> {
@@ -2208,11 +2227,15 @@ impl ChannelState {
             self.take_private_record(store, wire, now, Some(trust_nonce))?;
         }
         if self.private_sessions.cursors.get(&peer) != Some(&page.cursor) {
-            self.private_sessions.cursors.insert(peer, page.cursor);
-            if let Err(error) = self.save_private_pulls(store) {
-                self.private_save_failed(&error);
+            let mut next = self.private_sessions.cursors.clone();
+            next.insert(peer, page.cursor);
+            if let Err(error) = self.save_private_pull_candidate(store, &next, Some(trust_nonce)) {
+                if !matches!(&error, Error::StreamRefused(reason) if *reason == TRUST_CHANGED) {
+                    self.private_save_failed(&error);
+                }
                 return Err(error);
             }
+            self.private_sessions.cursors = next;
         }
         Ok(false) // No private archive is scheduled automatically, even when a gap remains.
     }
