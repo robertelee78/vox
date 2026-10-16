@@ -56,6 +56,10 @@ fn missing() -> Error {
     Error::MalformedAtRest("authored history dependency missing")
 }
 
+fn authored_missing(stage: &'static str) -> Error {
+    Error::MalformedAtRest(stage)
+}
+
 fn classify(payload: &[u8]) -> Result<(SignedEntryKind, Option<Digest32>)> {
     use SignedEntryKind::*;
     let kind = if payload.is_empty() {
@@ -141,13 +145,17 @@ impl ChannelState {
             let head_id = read
                 .sparse_author(author, LogScope::Public)?
                 .and_then(|state| state.committed)
-                .ok_or_else(missing)?;
-            let head = read.history_head(&head_id)?.ok_or_else(missing)?;
+                .ok_or_else(|| authored_missing("authored history own committed head missing"))?;
+            let head = read
+                .history_head(&head_id)?
+                .ok_or_else(|| authored_missing("authored history own head record missing"))?;
             if head.binding != binding || head.root.leaves != own_seq {
-                return Err(missing());
+                return Err(authored_missing(
+                    "authored history own head binding differs",
+                ));
             }
             read.history_context(&head.root.frontier)?
-                .ok_or_else(missing)?
+                .ok_or_else(|| authored_missing("authored history own frontier context missing"))?
         };
         let original = context.hash();
         let mut tips = BTreeMap::new();
@@ -157,7 +165,9 @@ impl ChannelState {
             };
             let hash = tip.entry_hash();
             let Some(clock) = read.clock(&hash)? else {
-                return Err(missing());
+                return Err(authored_missing(
+                    "authored history settled peer clock missing",
+                ));
             };
             tips.insert(
                 (clock, hash),
@@ -180,10 +190,10 @@ impl ChannelState {
             };
             let prefix = read
                 .history_range(b, 1, reference.seq)?
-                .ok_or_else(missing)?;
-            let frontier = read
-                .history_context(&prefix.frontier)?
-                .ok_or_else(missing)?;
+                .ok_or_else(|| authored_missing("authored history settled peer prefix missing"))?;
+            let frontier = read.history_context(&prefix.frontier)?.ok_or_else(|| {
+                authored_missing("authored history settled peer frontier context missing")
+            })?;
             context = context.join(&frontier)?;
         }
         let changed = context.hash() != original;
