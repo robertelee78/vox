@@ -157,7 +157,7 @@ fn status(room: Digest32, instance: [u8; 16], phase: Phase, detail: &str) -> Sta
         detail: detail.into(),
     }
 }
-pub(super) fn saved_status(
+pub(crate) fn saved_status(
     state: &demand::State,
     author: Option<Digest32>,
     active: Option<&demand::Active>,
