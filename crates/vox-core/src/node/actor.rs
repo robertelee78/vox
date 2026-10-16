@@ -9925,15 +9925,14 @@ impl Node {
                 // acknowledge the new bundle. The round finishing now did not necessarily carry it.
                 let current_bundle_answered =
                     holds_room && !self.publish_again.contains_key(&(channel_id, board));
-                if current_bundle_answered && self.prekey_publish_owed.remove(&(channel_id, board))
-                {
-                    if !self
+                if current_bundle_answered
+                    && self.prekey_publish_owed.remove(&(channel_id, board))
+                    && !self
                         .prekey_publish_owed
                         .iter()
                         .any(|(room, _)| *room == channel_id)
-                    {
-                        self.prekeys_changed.remove(&channel_id);
-                    }
+                {
+                    self.prekeys_changed.remove(&channel_id);
                 }
                 self.answer_addresses(channel_id).await;
                 if holds_room && self.anchor_owed.remove(&(channel_id, board)).is_some() {
