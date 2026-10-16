@@ -438,6 +438,15 @@ Proof kinds 0/1/2 mean inclusion/consistency/control range. Inclusion requires `
 consistency uses old/new sizes. Requests are bound to the authenticated author/scope and the
 original local operation; a peer cannot widen demand through a returned continuation.
 
+The consistency META proof body is `[claimed_prefix_descriptor, consistency]`, carrying the
+prefix descriptor already required by the receipt above. Its leaf count MUST equal `from`.
+This descriptor is untrusted input: the ordinary consistency verifier must bind it to the exact
+signed target head. For head advancement it must additionally equal this receiver's accepted
+baseline. For a previously unseen parent, the verifier may authenticate that claimed prefix
+relative to the target without pretending it was a previously accepted head. In particular a
+power-of-two prefix is not implicitly available from an RFC consistency path. No unsigned
+prefix descriptor alone grants continuity, control completeness or authority.
+
 | Frame | Exact payload |
 | --- | --- |
 | `0x06 META` | `[request_id, object_type, body]`; types 0/1 are framed head/context bytes, 2 is `[proof_kind, proof]`, 3 is signed entry-header bytes |
