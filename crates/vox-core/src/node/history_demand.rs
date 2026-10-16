@@ -305,7 +305,10 @@ impl State {
         }
         if let Some(legacy) = &self.legacy {
             legacy.validate(self.bounds)?;
-            if self.body.is_some() || self.cursor.is_some() {
+            if self.body.is_some()
+                || self.cursor.is_some()
+                || (self.progress == Progress::Complete && self.remaining != 0)
+            {
                 return Err(bad());
             }
         }
@@ -1070,6 +1073,7 @@ pub(crate) fn checkpoint_legacy(
     let mut state = live(&batch, key, &scope, context, active)?;
     if state.legacy.as_ref() != Some(expected)
         || remaining > state.remaining
+        || (progress == Progress::Complete && remaining != 0)
         || !matches!(
             progress,
             Progress::More | Progress::Complete | Progress::Unavailable
