@@ -479,9 +479,12 @@ impl Receiver {
                                 None,
                             )
                             .await?;
-                        // Do not accept another entry while this provisional body still needs
-                        // opaque inclusion/control/authority admission. The actor owns that work.
-                        io.abort(WireError::SessionBusy);
+                        // The ACK must reach the source so it can release this completed Live
+                        // grant. Gracefully finish the send direction; resetting it here can
+                        // discard the buffered ACK. The actor still owns the provisional body's
+                        // opaque inclusion/control/authority admission, and this stream accepts
+                        // no additional entry.
+                        io.finish()?;
                         result.status = Status::ControlPending;
                         return Ok(result);
                     }

@@ -598,8 +598,13 @@ async fn entry(
             }
         }
     }
+    // The receiver has durably persisted the complete body before it sends this ACK.
+    // Release the daemon-wide Live grant now: the receiver does not depend on the
+    // final DONE, and retaining completed grants can starve fresh messages behind
+    // old history until the grant expiry.
+    if let Some(bound) = live {
+        job.finish_live(bound);
+    }
     result.status = Status::Complete;
-    // Keep this bounded, expiring completed grant long enough to recover a lost final DONE.
-    // It authorizes no next entry, no larger offset and no additional archive work.
     Ok(result)
 }
