@@ -1058,6 +1058,14 @@ pub enum NodeCommand {
         /// The saved room incarnation observed before sending.
         instance: [u8; 16],
     },
+    /// Capture the exact open room incarnation before a plain post may wait. Internal to node
+    /// clients; the result crosses its own typed reply and is never accepted from IPC.
+    PreparePost {
+        /// The channel to post to.
+        channel_id: Digest32,
+        /// The incarnation observed under the room lock, or the exact refusal.
+        reply: tokio::sync::oneshot::Sender<Result<[u8; 16], Fault>>,
+    },
     /// Note that these entries of an open channel were shown to this node's person, or drained
     /// into its agent's turn (ADR-028 RR-1). Done means their local read marks are durably
     /// stored. The node later publishes a signed read record, at most one per room per
@@ -1391,6 +1399,8 @@ pub enum Fault {
     PostSelectionChanged,
     /// A prior local room change/open still owes its checked publication; no new write began.
     RoomChangePending,
+    /// This node already has its bounded number of posts waiting to enter the actor.
+    PostBusy,
     /// One admin removal is already being applied over bounded actor turns.
     AdminChangePending,
     /// A previous hosted room deletion is still awaiting its bounded daemon handoff.
@@ -1643,6 +1653,9 @@ impl Fault {
             Fault::RoomChangePending => {
                 "a previous change to this room is still being applied; this request made no change\n       wait for its answer before changing the room again"
             }
+            Fault::PostBusy => {
+                "this node already has too many posts waiting; this message was not posted\n       wait for those posts to finish, then try again"
+            }
             Fault::AdminChangePending => {
                 "an admin change is already being applied on this node\n       wait for its answer before making another admin change"
             }
@@ -1873,6 +1886,7 @@ fault_names!(
     ReadSelectionChanged,
     PostSelectionChanged,
     RoomChangePending,
+    PostBusy,
     AdminChangePending,
     SessionCleanupBusy,
     SessionCleanupUnavailable,

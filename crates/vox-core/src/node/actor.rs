@@ -540,7 +540,9 @@ fn command_name(c: &NodeCommand) -> &'static str {
         NodeCommand::JoinChannel { .. } => "joining a room",
         NodeCommand::CreateChannel { .. } => "creating a room",
         NodeCommand::OpenChannel { .. } => "opening a room",
-        NodeCommand::SendText { .. } | NodeCommand::SendTextAt { .. } => "sending a message",
+        NodeCommand::SendText { .. }
+        | NodeCommand::SendTextAt { .. }
+        | NodeCommand::PreparePost { .. } => "preparing a message",
         NodeCommand::Sync { .. } => "syncing",
         NodeCommand::HistoryDemand { .. } => "requesting bounded room history",
         NodeCommand::Agree { .. } => "asking members to agree on a claim",
@@ -4030,6 +4032,9 @@ pub struct NodeHandle {
     computer: Option<Arc<crate::node::computer::Computer>>,
     computer_revision: Arc<std::sync::atomic::AtomicU64>,
     cmd_tx: mpsc::Sender<(NodeCommand, oneshot::Sender<Outcome>)>,
+    /// Posts waiting for one room's bounded publication owner to yield. The command queue does
+    /// not bound sleeping client futures, so their retained text has its own fixed node budget.
+    post_slots: Arc<Semaphore>,
     view_rx: watch::Receiver<NodeView>,
     /// Kept so a client may subscribe at any time after the node started.
     event_tx: broadcast::Sender<NodeEvent>,
@@ -4056,6 +4061,98 @@ pub struct NodeHandle {
     paths: Paths,
     /// The node's decision record (ADR-028 §7), which only the node opens (#563).
     decisions: crate::node::decisions::DecisionLog,
+}
+
+async fn apply_command(
+    cmd_tx: &mpsc::Sender<(NodeCommand, oneshot::Sender<Outcome>)>,
+    command: NodeCommand,
+) -> Outcome {
+    let (tx, rx) = oneshot::channel();
+    if cmd_tx.send((command, tx)).await.is_err() {
+        return Outcome::Failed(Fault::ShuttingDown);
+    }
+    rx.await.unwrap_or(Outcome::Failed(Fault::ShuttingDown))
+}
+
+/// Reserve a command slot only before this post's patience ends. Once enqueued, await the
+/// actor's real answer: timing out an in-flight append would make its outcome unknowable.
+async fn apply_post_attempt(
+    cmd_tx: &mpsc::Sender<(NodeCommand, oneshot::Sender<Outcome>)>,
+    command: NodeCommand,
+    deadline: tokio::time::Instant,
+) -> Option<Outcome> {
+    let permit = match tokio::time::timeout_at(deadline, cmd_tx.reserve()).await {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(_)) => return Some(Outcome::Failed(Fault::ShuttingDown)),
+        Err(_) => return None,
+    };
+    if tokio::time::Instant::now() >= deadline {
+        return None;
+    }
+    let (tx, rx) = oneshot::channel();
+    permit.send((command, tx));
+    Some(rx.await.unwrap_or(Outcome::Failed(Fault::ShuttingDown)))
+}
+
+/// Submit one post in the room incarnation its caller observed. Retained-history work may own
+/// the room's publication scratch briefly; wait outside the actor while that work advances.
+/// Only pre-mutation publication/readiness refusals are retried, so a lost success can never
+/// duplicate a post. This gives direct app/TUI clients the same just-joined patience as IPC.
+pub(crate) async fn apply_post_command(
+    cmd_tx: &mpsc::Sender<(NodeCommand, oneshot::Sender<Outcome>)>,
+    post_slots: &Semaphore,
+    channel_id: Digest32,
+    text: String,
+    instance: Option<[u8; 16]>,
+) -> Outcome {
+    if text.len() > crate::node::content::MAX_TEXT_LEN {
+        return Outcome::Failed(Fault::TooLong);
+    }
+    let Ok(_slot) = post_slots.try_acquire() else {
+        return Outcome::Failed(Fault::PostBusy);
+    };
+    let instance = match instance {
+        Some(instance) => instance,
+        None => {
+            let (reply, rx) = oneshot::channel();
+            match apply_command(cmd_tx, NodeCommand::PreparePost { channel_id, reply }).await {
+                Outcome::Done => match rx.await {
+                    Ok(Ok(instance)) => instance,
+                    Ok(Err(fault)) => return Outcome::Failed(fault),
+                    Err(_) => return Outcome::Failed(Fault::ShuttingDown),
+                },
+                Outcome::Failed(fault) => return Outcome::Failed(fault),
+                _ => return Outcome::Failed(Fault::Internal),
+            }
+        }
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut first = true;
+    let mut waiting = Fault::PostBusy;
+    loop {
+        if !first && tokio::time::Instant::now() >= deadline {
+            return Outcome::Failed(waiting);
+        }
+        first = false;
+        let command = NodeCommand::SendTextAt {
+            channel_id,
+            text: text.clone(),
+            instance,
+        };
+        let Some(outcome) = apply_post_attempt(cmd_tx, command, deadline).await else {
+            return Outcome::Failed(waiting);
+        };
+        match outcome {
+            Outcome::Failed(fault @ (Fault::RoomChangePending | Fault::RoomNotSynced)) => {
+                waiting = fault;
+                tokio::time::sleep_until(
+                    (tokio::time::Instant::now() + Duration::from_millis(100)).min(deadline),
+                )
+                .await;
+            }
+            outcome => return outcome,
+        }
+    }
 }
 
 /// When the identity passphrase was last entered, shared with the actor, and the actor's clock.
@@ -4509,11 +4606,26 @@ impl NodeHandle {
     /// Apply a command and await its outcome. [`Fault::ShuttingDown`] if the
     /// actor has stopped.
     pub async fn apply(&self, command: NodeCommand) -> Outcome {
-        let (tx, rx) = oneshot::channel();
-        if self.cmd_tx.send((command, tx)).await.is_err() {
-            return Outcome::Failed(Fault::ShuttingDown);
+        match command {
+            NodeCommand::SendText { channel_id, text } => {
+                apply_post_command(&self.cmd_tx, &self.post_slots, channel_id, text, None).await
+            }
+            NodeCommand::SendTextAt {
+                channel_id,
+                text,
+                instance,
+            } => {
+                apply_post_command(
+                    &self.cmd_tx,
+                    &self.post_slots,
+                    channel_id,
+                    text,
+                    Some(instance),
+                )
+                .await
+            }
+            command => apply_command(&self.cmd_tx, command).await,
         }
-        rx.await.unwrap_or(Outcome::Failed(Fault::ShuttingDown))
     }
 
     /// An independent event stream for this client.
@@ -5655,6 +5767,7 @@ impl Node {
             });
         }
         let view_rx = node.view_tx.subscribe();
+        let post_slots = Arc::new(Semaphore::new(COMMAND_QUEUE));
         let sync_book = Arc::clone(&node.sync_book);
         let keyring = KeyringWindow {
             entered: Arc::clone(&node.passphrase_entered_at),
@@ -5682,6 +5795,7 @@ impl Node {
             cmd_tx.downgrade(),
             node.view_tx.subscribe(),
             handle_event_tx.clone(),
+            Arc::clone(&post_slots),
             node.computer
                 .clone()
                 .map(|c| (c, Arc::clone(&node.computer_revision))),
@@ -5705,6 +5819,7 @@ impl Node {
             computer,
             computer_revision,
             cmd_tx,
+            post_slots,
             view_rx,
             event_tx: handle_event_tx,
             events: Arc::new(Mutex::new(event_rx)),
@@ -6273,6 +6388,34 @@ impl Node {
                 #[cfg(feature = "test-knobs")]
                 test_panic_on_text(&text);
                 self.send_text(&channel_id, &text, Some(instance)).await
+            }
+            NodeCommand::PreparePost { channel_id, reply } => {
+                let result = match (
+                    self.profile.as_ref(),
+                    self.channels.get(&channel_id).map(Arc::clone),
+                ) {
+                    (None, _) => Err(Fault::NoIdentity),
+                    (_, None) => Err(Fault::ChannelNotOpen),
+                    (Some(profile), Some(shared)) => {
+                        let mut ch = shared.lock().await;
+                        match ch.history_instance(profile.store()) {
+                            Ok(instance) => Ok(instance),
+                            Err(error) => {
+                                let fault = fault_of(&error);
+                                if matches!(fault, Fault::Internal) {
+                                    eprintln!(
+                                        "vox: capturing history instance before posting to room {}: {error}",
+                                        crate::node::link::b32_encode(&channel_id)
+                                    );
+                                    ch.poison(&error);
+                                }
+                                Err(fault)
+                            }
+                        }
+                    }
+                };
+                let _ = reply.send(result);
+                Outcome::Done
             }
             NodeCommand::MarkRead {
                 channel_id,
@@ -22260,6 +22403,9 @@ pub fn fault_of(e: &Error) -> Fault {
         Error::Profile("identity already exists on this node") => Fault::IdentityExists,
         Error::Profile("locked") => Fault::Locked,
         Error::Profile("no such room on this node") => Fault::UnknownChannel,
+        Error::Profile("room publication is busy; retry this operation") => {
+            Fault::RoomChangePending
+        }
         Error::AtRestUnlockFailed => Fault::WrongPassphrase,
         Error::AtRestLocked => Fault::Locked,
         Error::ProfileBusy => Fault::ProfileBusy,
