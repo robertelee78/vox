@@ -243,7 +243,11 @@ pub(super) fn advance(state: &mut PublishedFeed, entry: &Entry) -> Result<()> {
     state.seq = entry.skeleton.seq;
     state.hash = entry.entry_hash();
     state.ended = entry.skeleton.end_of_feed;
-    if let Some(payload) = entry.payload.as_deref() {
+    if let Some(payload) = entry
+        .payload
+        .as_deref()
+        .filter(|_| entry.skeleton.v2.is_none())
+    {
         if let Some(cp) = crate::log::checkpoint::Checkpoint::from_payload(payload)? {
             if cp.seq >= state.seq {
                 return Err(invalid("restart checkpoint position"));
@@ -260,6 +264,9 @@ impl super::Write<'_, '_> {
     /// A valid checkpoint body can arrive after its signed skeleton was accepted. Its
     /// durable control state must accompany that body, without advancing the accepted head.
     pub(super) fn note_checkpoint_refill(&mut self, entry: &Entry) -> Result<()> {
+        if entry.skeleton.v2.is_some() {
+            return Ok(());
+        }
         let Some(payload) = entry.payload.as_deref().filter(|_| entry.is_signed()) else {
             return Ok(());
         };

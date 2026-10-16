@@ -7,10 +7,23 @@
 use super::*;
 use crate::hash::sha256;
 use crate::log::history::{
-    ConsistentPrefix, ControlContext, Descriptor, LogScope, SignedHead, TreeBinding,
-    VerifiedControlRange, VerifiedHead, VerifiedHeader, MAX_CONTEXT_AUTHORS, MAX_CONTEXT_BYTES,
-    MAX_FRAME_BYTES, MAX_HEADER_BYTES,
+    ConsistentPrefix, ControlContext, Descriptor, IncludedHeader, LogScope, SignedHead,
+    TreeBinding, VerifiedControlRange, VerifiedHead, VerifiedHeader, MAX_CONTEXT_AUTHORS,
+    MAX_CONTEXT_BYTES, MAX_FRAME_BYTES, MAX_HEADER_BYTES,
 };
+
+/// Locally signed material verified by the same v2 proof primitives. Only the final
+/// contiguous publication transaction may attach it to the newly active roots.
+pub(crate) struct LocalHistoryPublication<'a> {
+    pub entry: &'a Entry,
+    pub header: &'a VerifiedHeader,
+    pub head: &'a VerifiedHead,
+    pub consistency: &'a ConsistentPrefix,
+    pub included: &'a IncludedHeader,
+    pub pre_context: &'a ControlContext,
+    pub post_context: &'a ControlContext,
+    pub ranges: &'a [(u64, Descriptor)],
+}
 
 const MAX_OBLIGATIONS: u64 = 4096;
 const STATE_BYTES: usize = 256;
@@ -29,6 +42,11 @@ pub(super) struct Roots {
     source_prefixes: u64,
     source_cursors: u64,
     settled_entries: u64,
+    effect_prefixes: u64,
+    effect_cursors: u64,
+    terminations: u64,
+    settled_tips: u64,
+    prior_heads: u64,
     author_count: u64,
     obligation_count: u64,
     pub(super) enabled: bool,
@@ -36,7 +54,7 @@ pub(super) struct Roots {
 
 impl Roots {
     pub(super) fn write(self, e: &mut Encoder) {
-        e.array(15)
+        e.array(20)
             .uint(self.objects)
             .uint(self.authors)
             .uint(self.validated_positions)
@@ -49,12 +67,17 @@ impl Roots {
             .uint(self.source_prefixes)
             .uint(self.source_cursors)
             .uint(self.settled_entries)
+            .uint(self.effect_prefixes)
+            .uint(self.effect_cursors)
+            .uint(self.terminations)
+            .uint(self.settled_tips)
+            .uint(self.prior_heads)
             .uint(self.author_count)
             .uint(self.obligation_count)
             .uint(u64::from(self.enabled));
     }
     pub(super) fn read(d: &mut Decoder<'_>) -> Result<Self> {
-        if d.array()? != 15 {
+        if d.array()? != 20 {
             return Err(invalid("sparse roots arity"));
         }
         Ok(Self {
@@ -70,6 +93,11 @@ impl Roots {
             source_prefixes: d.uint()?,
             source_cursors: d.uint()?,
             settled_entries: d.uint()?,
+            effect_prefixes: d.uint()?,
+            effect_cursors: d.uint()?,
+            terminations: d.uint()?,
+            settled_tips: d.uint()?,
+            prior_heads: d.uint()?,
             author_count: d.uint()?,
             obligation_count: d.uint()?,
             enabled: flag(d)?,
@@ -89,6 +117,11 @@ impl Roots {
             self.source_prefixes,
             self.source_cursors,
             self.settled_entries,
+            self.effect_prefixes,
+            self.effect_cursors,
+            self.terminations,
+            self.settled_tips,
+            self.prior_heads,
         ]
         .iter()
         .all(|root| *root < next)
@@ -104,13 +137,22 @@ pub(crate) enum ObjectKind {
     Head = 1,
     Header = 2,
     Proof = 3,
+    Verifier = 4,
+    ParentReceipt = 5,
+    InclusionReceipt = 6,
+    PrefixReceipt = 7,
+    PendingHeader = 8,
 }
 impl ObjectKind {
     pub(crate) const fn limit(self) -> usize {
         match self {
             Self::Context => MAX_CONTEXT_BYTES,
-            Self::Head | Self::Header => MAX_HEADER_BYTES,
+            Self::Head | Self::Header | Self::PendingHeader => MAX_HEADER_BYTES,
             Self::Proof => MAX_FRAME_BYTES,
+            Self::Verifier => MAX_FRAME_BYTES + 12 * MAX_HEADER_BYTES + 512,
+            Self::ParentReceipt | Self::InclusionReceipt | Self::PrefixReceipt => {
+                4 * MAX_HEADER_BYTES
+            }
         }
     }
 }
@@ -204,6 +246,8 @@ pub(crate) enum ObligationKind {
     ControlRange,
     ControlBody,
     Authority,
+    KeyBody,
+    Verifier,
 }
 impl ObligationKind {
     fn code(self) -> u64 {
@@ -213,6 +257,8 @@ impl ObligationKind {
             Self::ControlRange => 2,
             Self::ControlBody => 3,
             Self::Authority => 4,
+            Self::KeyBody => 5,
+            Self::Verifier => 6,
         }
     }
     fn read(n: u64) -> Result<Self> {
@@ -222,6 +268,8 @@ impl ObligationKind {
             2 => Ok(Self::ControlRange),
             3 => Ok(Self::ControlBody),
             4 => Ok(Self::Authority),
+            5 => Ok(Self::KeyBody),
+            6 => Ok(Self::Verifier),
             _ => Err(invalid("sparse obligation kind")),
         }
     }
@@ -236,6 +284,16 @@ pub(crate) struct Obligation {
     pub through: u64,
 }
 impl Obligation {
+    fn authority(head: Digest32, entry: &Entry) -> Self {
+        Self {
+            head,
+            kind: ObligationKind::Authority,
+            object: entry.entry_hash(),
+            author: entry.skeleton.author_id,
+            from: entry.skeleton.seq,
+            through: entry.skeleton.seq,
+        }
+    }
     fn bytes(&self) -> Result<Vec<u8>> {
         if self.from > self.through || self.through > crate::log::feed::MAX_SEQ {
             return Err(invalid("sparse obligation interval"));
@@ -280,6 +338,18 @@ impl Obligation {
 }
 
 impl Source<'_> {
+    pub(super) fn sparse_effect_finished(
+        &self,
+        sek: &Sek,
+        room: &Digest32,
+        roots: Roots,
+        hash: &Digest32,
+    ) -> Result<bool> {
+        Ok(
+            self.find_value(sek, room, roots.settled_entries, &hashed(hash))?
+                == Some(Value::Present),
+        )
+    }
     pub(super) fn published_sparse_entry(
         &self,
         sek: &Sek,
@@ -459,6 +529,115 @@ impl Source<'_> {
 }
 
 impl Read<'_> {
+    pub(crate) fn history_settled_tip(&self, author: &Digest32) -> Result<Option<Entry>> {
+        let source = self.source();
+        let Some(id) = source.number(
+            self.sek,
+            self.channel,
+            self.directory.active.sparse.settled_tips,
+            &hashed(author),
+        )?
+        else {
+            return Ok(None);
+        };
+        let wire = source.sparse_record(self.sek, self.channel, id, MAX_HEADER_BYTES)?;
+        let header = Entry::from_wire(&wire)?;
+        if header.skeleton.channel_id != *self.channel
+            || header.skeleton.author_id != *author
+            || header.skeleton.v2.is_none()
+            || !self.history_effect_finished(&header.entry_hash())?
+        {
+            return Err(invalid("settled sparse tip binding"));
+        }
+        Ok(Some(header))
+    }
+    pub(crate) fn history_effect_finished(&self, hash: &Digest32) -> Result<bool> {
+        Ok(self.source().find_value(
+            self.sek,
+            self.channel,
+            self.directory.active.sparse.settled_entries,
+            &hashed(hash),
+        )? == Some(Value::Present))
+    }
+    pub(crate) fn control_effects_complete(&self, head: &Digest32, through: u64) -> Result<bool> {
+        let source = self.source();
+        if source.find_value(
+            self.sek,
+            self.channel,
+            self.directory.active.sparse.commitments,
+            &hashed(head),
+        )? != Some(Value::Present)
+        {
+            return Ok(false);
+        }
+        Ok(source
+            .number(
+                self.sek,
+                self.channel,
+                self.directory.active.sparse.effect_prefixes,
+                &hashed(head),
+            )?
+            .unwrap_or(0)
+            >= through)
+    }
+    pub(crate) fn history_termination(&self, author: &Digest32) -> Result<Option<u64>> {
+        self.source().number(
+            self.sek,
+            self.channel,
+            self.directory.active.sparse.terminations,
+            &hashed(author),
+        )
+    }
+
+    pub(crate) fn history_author_after(
+        &self,
+        after: Option<Digest32>,
+    ) -> Result<Option<(Digest32, AuthorState)>> {
+        let mut key = after.map_or([0; 64], |author| author_key(&author, LogScope::Public));
+        if after.is_some() {
+            let Some(next) = dag_facts::successor(key) else {
+                return Ok(None);
+            };
+            key = next;
+        }
+        let source = self.source();
+        let Some((key, Value::Number(record))) = source.first(
+            self.sek,
+            self.channel,
+            self.directory.active.sparse.authors,
+            &key,
+            0,
+        )?
+        else {
+            return Ok(None);
+        };
+        if key[32] != LogScope::Public as u8 || key[33..].iter().any(|v| *v != 0) {
+            return Err(invalid("sparse author key"));
+        }
+        let author = key[..32]
+            .try_into()
+            .map_err(|_| invalid("sparse author identity"))?;
+        let state = AuthorState::parse(&source.sparse_record(
+            self.sek,
+            self.channel,
+            record,
+            STATE_BYTES,
+        )?)?;
+        Ok(Some((author, state)))
+    }
+    pub(crate) fn publication_busy(&self) -> bool {
+        self.directory.phase != Phase::Idle
+    }
+
+    pub(crate) fn sparse_publication_source(&self) -> Result<Option<(Digest32, u64)>> {
+        let Some(promotion) = &self.directory.promotion else {
+            return Ok(None);
+        };
+        if promotion.sparse_head.is_none() {
+            return Ok(None);
+        }
+        Ok(Some((promotion.witness_hash, promotion.first_log)))
+    }
     /// A consistency-accepted exact head, including an older accepted head for which a
     /// verification cursor is still finishing. Observed hints do not satisfy this lookup.
     pub(crate) fn history_head_committed(
@@ -603,6 +782,11 @@ impl Read<'_> {
             )?
             .map(|id| source.sparse_record(self.sek, self.channel, id, kind.limit()))
             .transpose()
+    }
+    /// A source may require both a semantic-effect receipt and its addressed key body.
+    /// Callers reserve this small capacity before mutating local sender state.
+    pub(crate) fn history_obligation_capacity(&self) -> u64 {
+        MAX_OBLIGATIONS.saturating_sub(self.directory.active.sparse.obligation_count)
     }
     pub(crate) fn history_head(&self, hash: &Digest32) -> Result<Option<SignedHead>> {
         self.history_object(ObjectKind::Head, hash)?
@@ -758,6 +942,19 @@ pub(crate) enum SourceProgress {
     MissingCoverage {
         after: u64,
     },
+    PendingEffect {
+        hash: Digest32,
+    },
+    PendingPrefix {
+        head: Digest32,
+        through: u64,
+    },
+    ConflictingSource {
+        author: Digest32,
+        seq: u64,
+        expected: Digest32,
+        actual: Digest32,
+    },
     MissingSource {
         author: Digest32,
         seq: u64,
@@ -766,6 +963,202 @@ pub(crate) enum SourceProgress {
 }
 
 impl Write<'_, '_> {
+    pub(crate) fn publish_local_history(
+        &mut self,
+        publication: LocalHistoryPublication<'_>,
+    ) -> Result<()> {
+        let LocalHistoryPublication {
+            entry,
+            header,
+            head,
+            consistency,
+            included,
+            pre_context,
+            post_context,
+            ranges,
+        } = publication;
+        let signed = head.head();
+        let v2 = entry
+            .skeleton
+            .v2
+            .as_ref()
+            .ok_or(invalid("local history entry is legacy"))?;
+        let promotion = self
+            .directory
+            .promotion
+            .as_ref()
+            .ok_or(invalid("local history publication absent"))?;
+        if self.directory.phase != Phase::Switched
+            || promotion.sparse_head.is_some()
+            || promotion.witness_hash != entry.entry_hash()
+            || !self.directory.active.sparse.enabled
+            || entry.header_wire() != header.entry().header_wire()
+            || included.header().entry().header_wire() != header.entry().header_wire()
+            || included.head_id() != signed.id()
+            || included.binding() != signed.binding
+            || included.root() != signed.root
+            || signed.root.leaves != entry.skeleton.seq
+            || pre_context.hash() != v2.pre_context
+            || post_context.hash() != signed.root.frontier
+            || pre_context.room != *self.channel
+            || post_context.room != *self.channel
+            || pre_context.scope != v2.scope
+            || post_context.scope != v2.scope
+            || ranges.len() > crate::log::history::MAX_TREE_DEPTH + 1
+        {
+            return Err(invalid("local history publication binding"));
+        }
+        signed.binding.matches_entry(entry)?;
+        // This is one final existing append Batch: no observer can see this temporary
+        // mutation phase or an object/root before the original root switch commits.
+        self.directory.phase = Phase::Idle;
+        let result = (|| {
+            self.keep_history_context(pre_context)?;
+            self.keep_history_context(post_context)?;
+            self.keep_history_header(header)?;
+            self.keep_history_inclusion_receipt(included)?;
+            self.commit_history_head(head, consistency)?;
+            for (start, range) in ranges {
+                self.keep_history_range(signed.binding, *start, *range)?;
+            }
+            let mut roots = self.directory.active;
+            self.index_source_head(&mut roots, entry, signed.id())?;
+            self.directory.active = roots;
+            self.keep_single_control_coverage(included)?;
+            if !self.keep_history_obligation(&Obligation::authority(signed.id(), entry))? {
+                return Err(invalid("pending local effect obligation capacity reached"));
+            }
+            Ok(())
+        })();
+        self.directory.phase = Phase::Switched;
+        result
+    }
+
+    /// Inclusion of one exact signed header is complete class coverage of that one position.
+    fn keep_single_control_coverage(&mut self, included: &IncludedHeader) -> Result<()> {
+        let entry = included.header().entry();
+        if entry
+            .skeleton
+            .v2
+            .as_ref()
+            .is_some_and(|v| v.kind.is_control())
+        {
+            let id = Source::Batch(self.batch)
+                .number(
+                    self.sek,
+                    self.channel,
+                    self.directory.active.sparse.objects,
+                    &object_key(ObjectKind::Header, &entry.entry_hash()),
+                )?
+                .ok_or(invalid("control header object absent"))?;
+            self.directory.active.sparse.control_sources = self.change_value(
+                self.directory.active.sparse.control_sources,
+                position(&included.head_id(), entry.skeleton.seq),
+                Some(Value::Number(id)),
+            )?;
+        }
+        self.directory.active.sparse.control_intervals = self.change_value(
+            self.directory.active.sparse.control_intervals,
+            position(&included.head_id(), entry.skeleton.seq),
+            Some(Value::Number(entry.skeleton.seq)),
+        )?;
+        self.directory.active.sparse.source_cursors = self.change_value(
+            self.directory.active.sparse.source_cursors,
+            hashed(&included.head_id()),
+            None,
+        )?;
+        self.directory.active.sparse.effect_cursors = self.change_value(
+            self.directory.active.sparse.effect_cursors,
+            hashed(&included.head_id()),
+            None,
+        )?;
+        Ok(())
+    }
+    /// The token can only be constructed by the channel's typed effect dispatcher after
+    /// its exact signed context and current checks finish. This method grants nothing by
+    /// source-completeness alone; all changes share the effect transaction.
+    pub(crate) fn finish_history_effect(
+        &mut self,
+        entry: &Entry,
+        finished: &super::super::sparse_history::FinishedHistoryEffect,
+    ) -> Result<()> {
+        self.require_sparse_idle()?;
+        if finished.entry_hash() != entry.entry_hash() {
+            return Err(invalid("sparse effect token differs"));
+        }
+        let roots = self.directory.active;
+        let source = Source::Batch(self.batch);
+        let held = source
+            .sparse_position_header(
+                self.sek,
+                self.channel,
+                roots.sparse,
+                &entry.skeleton.author_id,
+                entry.skeleton.seq,
+            )?
+            .ok_or(invalid("effect source not published"))?;
+        if held.entry_hash() != entry.entry_hash() {
+            return Err(invalid("effect source conflicts"));
+        }
+        let at = source
+            .find(
+                self.sek,
+                self.channel,
+                roots.hash,
+                &hashed(&entry.entry_hash()),
+            )?
+            .ok_or(invalid("effect locator missing"))?;
+        self.directory.active.sparse.settled_entries = self.change_value(
+            roots.sparse.settled_entries,
+            hashed(&entry.entry_hash()),
+            Some(Value::Present),
+        )?;
+        let tip = Source::Batch(self.batch)
+            .number(
+                self.sek,
+                self.channel,
+                roots.sparse.settled_tips,
+                &hashed(&entry.skeleton.author_id),
+            )?
+            .map(|id| {
+                Source::Batch(self.batch)
+                    .sparse_record(self.sek, self.channel, id, MAX_HEADER_BYTES)
+                    .and_then(|wire| Entry::from_wire(&wire))
+            })
+            .transpose()?;
+        if tip.is_none_or(|held| held.skeleton.seq < entry.skeleton.seq) {
+            let id = Source::Batch(self.batch)
+                .number(
+                    self.sek,
+                    self.channel,
+                    roots.sparse.objects,
+                    &object_key(ObjectKind::Header, &entry.entry_hash()),
+                )?
+                .ok_or(invalid("settled header object missing"))?;
+            self.directory.active.sparse.settled_tips = self.change_value(
+                roots.sparse.settled_tips,
+                hashed(&entry.skeleton.author_id),
+                Some(Value::Number(id)),
+            )?;
+        }
+        self.directory.active = self.index_package(self.directory.active, entry, at.log)?;
+        let head_record = Source::Batch(self.batch)
+            .number(
+                self.sek,
+                self.channel,
+                self.directory.active.sparse.source_heads,
+                &hashed(&entry.entry_hash()),
+            )?
+            .ok_or(invalid("settled source head missing"))?;
+        let head = SignedHead::from_wire(&Source::Batch(self.batch).sparse_record(
+            self.sek,
+            self.channel,
+            head_record,
+            MAX_HEADER_BYTES,
+        )?)?;
+        self.finish_history_obligation(&Obligation::authority(head.id(), entry))?;
+        Ok(())
+    }
     pub(crate) fn begin_sparse_publication(
         &mut self,
         publication: SparsePublication<'_>,
@@ -777,6 +1170,7 @@ impl Write<'_, '_> {
             first_log,
             received_ms,
             origin,
+            local_id,
         } = publication;
         let included = validated.included();
         let binding = validated.binding();
@@ -790,6 +1184,18 @@ impl Write<'_, '_> {
             return Err(invalid("sparse publication evidence binding"));
         }
         binding.matches_entry(entry)?;
+        if Source::Batch(self.batch)
+            .number(
+                self.sek,
+                self.channel,
+                self.directory.active.sparse.terminations,
+                &hashed(&entry.skeleton.author_id),
+            )?
+            .is_some_and(|seq| entry.skeleton.seq > seq)
+        {
+            return Err(invalid("sparse source follows a terminated feed"));
+        }
+
         if let Some(payload) = &entry.payload {
             if payload.len() as u64 != entry.skeleton.payload_len
                 || sha256(payload) != entry.skeleton.payload_hash
@@ -825,8 +1231,40 @@ impl Write<'_, '_> {
             .v2
             .as_ref()
             .ok_or(invalid("sparse publication requires v2"))?;
-        if v2.kind.is_control() && entry.payload.is_none() {
-            return Err(invalid("validated control source has no required body"));
+        use super::super::governance::SparsePayloadState;
+        use crate::log::history::SignedEntryKind;
+        let implicit_empty = matches!(
+            v2.kind,
+            SignedEntryKind::ContextUpdate | SignedEntryKind::Termination
+        ) && entry.skeleton.payload_len == 0
+            && entry.skeleton.payload_hash == sha256(&[]);
+        match validated.payload_state() {
+            SparsePayloadState::Held if entry.payload.is_some() || implicit_empty => {}
+            SparsePayloadState::ContentAbsent
+                if v2.kind == SignedEntryKind::Content && entry.payload.is_none() => {}
+            SparsePayloadState::KeyPackagePending { recipient }
+                if v2.kind == SignedEntryKind::KeyPackage
+                    && v2.recipient == Some(recipient)
+                    && entry.payload.is_none() =>
+            {
+                if recipient == local_id
+                    && !self.keep_history_obligation(&Obligation {
+                        head: included.head_id(),
+                        kind: ObligationKind::KeyBody,
+                        object: entry.entry_hash(),
+                        author: entry.skeleton.author_id,
+                        from: entry.skeleton.seq,
+                        through: entry.skeleton.seq,
+                    })?
+                {
+                    return Err(invalid("pending key body obligation capacity reached"));
+                }
+            }
+            _ => {
+                return Err(invalid(
+                    "sparse source body disposition differs from validation",
+                ))
+            }
         }
         if validated.pre_context().hash() != v2.pre_context
             || validated.pre_context().scope != v2.scope
@@ -835,8 +1273,23 @@ impl Write<'_, '_> {
         }
         self.keep_history_context(validated.pre_context())?;
         self.keep_history_header(included.header())?;
+        self.keep_single_control_coverage(included)?;
+        if !self.keep_history_obligation(&Obligation::authority(included.head_id(), entry))? {
+            return Err(invalid("pending source effect obligation capacity reached"));
+        }
         self.set_origin(origin)?;
-        let witness = self.stage(entry)?;
+        let empty_entry;
+        let staged = if implicit_empty && entry.payload.is_none() {
+            empty_entry = Entry {
+                skeleton: entry.skeleton.clone(),
+                authenticator: entry.authenticator.clone(),
+                payload: Some(Vec::new()),
+            };
+            &empty_entry
+        } else {
+            entry
+        };
+        let witness = self.stage(staged)?;
         first_log
             .checked_add(1)
             .ok_or(invalid("sparse log allocator exhausted"))?;
@@ -869,6 +1322,20 @@ impl Write<'_, '_> {
         roots: &mut super::Roots,
         entry: &Entry,
     ) -> Result<()> {
+        let head = self
+            .directory
+            .promotion
+            .as_ref()
+            .and_then(|p| p.sparse_head)
+            .ok_or(invalid("sparse source publication lost its head"))?;
+        self.index_source_head(roots, entry, head)
+    }
+    fn index_source_head(
+        &mut self,
+        roots: &mut super::Roots,
+        entry: &Entry,
+        head: Digest32,
+    ) -> Result<()> {
         let source = Source::Batch(self.batch);
         let id = source
             .number(
@@ -883,12 +1350,6 @@ impl Write<'_, '_> {
             position(&entry.skeleton.author_id, entry.skeleton.seq),
             Some(Value::Number(id)),
         )?;
-        let head = self
-            .directory
-            .promotion
-            .as_ref()
-            .and_then(|p| p.sparse_head)
-            .ok_or(invalid("sparse source publication lost its head"))?;
         let head_record = Source::Batch(self.batch)
             .number(
                 self.sek,
@@ -902,6 +1363,22 @@ impl Write<'_, '_> {
             hashed(&entry.entry_hash()),
             Some(Value::Number(head_record)),
         )?;
+        if entry.skeleton.end_of_feed {
+            let prior = Source::Batch(self.batch).number(
+                self.sek,
+                self.channel,
+                roots.sparse.terminations,
+                &hashed(&entry.skeleton.author_id),
+            )?;
+            if prior.is_some_and(|seq| seq != entry.skeleton.seq) {
+                return Err(invalid("conflicting terminal source"));
+            }
+            roots.sparse.terminations = self.change_value(
+                roots.sparse.terminations,
+                hashed(&entry.skeleton.author_id),
+                Some(Value::Number(entry.skeleton.seq)),
+            )?;
+        }
         Ok(())
     }
     /// Only a genuinely empty new room starts this format. Opening an existing room does
@@ -1090,6 +1567,31 @@ impl Write<'_, '_> {
             return Err(invalid("commitment proof target differs"));
         }
         let source = Source::Batch(self.batch);
+        if head.root.leaves != 0 {
+            let key = receipt_key(&head.id(), &head.binding.author, head.root.leaves);
+            let id = source
+                .number(
+                    self.sek,
+                    self.channel,
+                    self.directory.active.sparse.objects,
+                    &object_key(ObjectKind::InclusionReceipt, &key),
+                )?
+                .ok_or(invalid("head terminal inclusion is pending"))?;
+            let receipt = IncludedHeader::from_authenticated_receipt(&source.sparse_record(
+                self.sek,
+                self.channel,
+                id,
+                ObjectKind::InclusionReceipt.limit(),
+            )?)?;
+            if receipt.head_id() != head.id()
+                || receipt.binding() != head.binding
+                || receipt.root() != head.root
+                || receipt.header().entry().skeleton.seq != head.root.leaves
+                || receipt.header().entry().skeleton.epoch != head.tail_epoch
+            {
+                return Err(invalid("head terminal inclusion differs"));
+            }
+        }
         let mut state = source
             .sparse_author(
                 self.sek,
@@ -1099,6 +1601,18 @@ impl Write<'_, '_> {
                 head.binding.scope,
             )?
             .unwrap_or_default();
+        if source.find_value(
+            self.sek,
+            self.channel,
+            self.directory.active.sparse.commitments,
+            &hashed(&head.id()),
+        )? == Some(Value::Present)
+        {
+            // Reusing an older accepted target finishes its outstanding work; it must not
+            // roll back the current head or create a cycle in prior-head receipts.
+            return Ok(());
+        }
+        let prior_id = state.committed;
         let prior = if let Some(id) = state.committed {
             let record = source
                 .number(
@@ -1119,12 +1633,11 @@ impl Write<'_, '_> {
             }
             old.root
         } else {
-            if self
-                .directory
-                .restart
-                .as_ref()
-                .is_some_and(|r| r.feeds.contains_key(&head.binding.author))
-            {
+            if self.directory.restart.as_ref().is_some_and(|r| {
+                r.feeds
+                    .get(&head.binding.author)
+                    .is_some_and(|feed| !(r.sparse && feed.seq == 1 && head.root.leaves == 1))
+            }) {
                 return Err(invalid(
                     "legacy prefix cannot use an empty consistency baseline",
                 ));
@@ -1135,8 +1648,26 @@ impl Write<'_, '_> {
             return Err(invalid("consistency baseline changed before publication"));
         }
         self.save_history_object(ObjectKind::Head, head.id(), &head.to_wire())?;
+        if let Some(prior_id) = prior_id {
+            let record = Source::Batch(self.batch)
+                .number(
+                    self.sek,
+                    self.channel,
+                    self.directory.active.sparse.objects,
+                    &object_key(ObjectKind::Head, &prior_id),
+                )?
+                .ok_or(invalid("consistency baseline head object missing"))?;
+            self.directory.active.sparse.prior_heads = self.change_value(
+                self.directory.active.sparse.prior_heads,
+                hashed(&head.id()),
+                Some(Value::Number(record)),
+            )?;
+        }
         state.observed = Some(head.id());
         state.committed = Some(head.id());
+        if head.root.leaves != 0 {
+            self.keep_history_range(head.binding, 1, head.root)?;
+        }
         self.directory.active.sparse.commitments = self.change_value(
             self.directory.active.sparse.commitments,
             hashed(&head.id()),
@@ -1262,13 +1793,38 @@ impl Write<'_, '_> {
             hashed(&proof.head_id()),
             None,
         )?;
+        self.directory.active.sparse.effect_cursors = self.change_value(
+            self.directory.active.sparse.effect_cursors,
+            hashed(&proof.head_id()),
+            None,
+        )?;
         Ok(None)
     }
     /// Advance one covered interval or one enumerated control. A source-complete receipt
     /// is distinct from governance completion and never requires a whole head ready first.
     pub(crate) fn advance_control_sources(&mut self, head_id: &Digest32) -> Result<SourceProgress> {
+        self.advance_control_receipt(head_id, false)
+    }
+    pub(crate) fn advance_control_effects(&mut self, head_id: &Digest32) -> Result<SourceProgress> {
+        self.advance_control_receipt(head_id, true)
+    }
+    fn advance_control_receipt(
+        &mut self,
+        head_id: &Digest32,
+        effects: bool,
+    ) -> Result<SourceProgress> {
         self.require_sparse_idle()?;
         let roots = self.directory.active.sparse;
+        let prefix_root = if effects {
+            roots.effect_prefixes
+        } else {
+            roots.source_prefixes
+        };
+        let cursor_root = if effects {
+            roots.effect_cursors
+        } else {
+            roots.source_cursors
+        };
         let source = Source::Batch(self.batch);
         if source.find_value(self.sek, self.channel, roots.commitments, &hashed(head_id))?
             != Some(Value::Present)
@@ -1293,23 +1849,55 @@ impl Write<'_, '_> {
             return Err(invalid("control source head binding"));
         }
         let through = source
-            .number(
-                self.sek,
-                self.channel,
-                roots.source_prefixes,
-                &hashed(head_id),
-            )?
+            .number(self.sek, self.channel, prefix_root, &hashed(head_id))?
             .unwrap_or(0);
         if through >= head.root.leaves {
+            if effects {
+                self.publish_control_ready(&head)?;
+            }
             return Ok(SourceProgress::Complete { through });
         }
-        let after = source
-            .number(
+        if let Some(record) =
+            source.number(self.sek, self.channel, roots.prior_heads, &hashed(head_id))?
+        {
+            let prior = SignedHead::from_wire(&source.sparse_record(
                 self.sek,
                 self.channel,
-                roots.source_cursors,
-                &hashed(head_id),
-            )?
+                record,
+                MAX_HEADER_BYTES,
+            )?)?;
+            if prior.binding != head.binding
+                || prior.id() == *head_id
+                || prior.root.leaves > head.root.leaves
+            {
+                return Err(invalid("control receipt consistency baseline"));
+            }
+            if through < prior.root.leaves {
+                let inherited = source
+                    .number(self.sek, self.channel, prefix_root, &hashed(&prior.id()))?
+                    .unwrap_or(0)
+                    .min(prior.root.leaves);
+                if inherited > through {
+                    let updated = self.change_value(
+                        prefix_root,
+                        hashed(head_id),
+                        Some(Value::Number(inherited)),
+                    )?;
+                    if effects {
+                        self.directory.active.sparse.effect_prefixes = updated;
+                    } else {
+                        self.directory.active.sparse.source_prefixes = updated;
+                    }
+                    return Ok(SourceProgress::Progress { through: inherited });
+                }
+                return Ok(SourceProgress::PendingPrefix {
+                    head: prior.id(),
+                    through: prior.root.leaves,
+                });
+            }
+        }
+        let after = source
+            .number(self.sek, self.channel, cursor_root, &hashed(head_id))?
             .unwrap_or(0);
         let Some((key, value)) = source.first(
             self.sek,
@@ -1341,11 +1929,13 @@ impl Write<'_, '_> {
             return Ok(SourceProgress::MissingCoverage { after: through });
         }
         if hi <= through {
-            self.directory.active.sparse.source_cursors = self.change_value(
-                roots.source_cursors,
-                hashed(head_id),
-                Some(Value::Number(lo)),
-            )?;
+            let updated =
+                self.change_value(cursor_root, hashed(head_id), Some(Value::Number(lo)))?;
+            if effects {
+                self.directory.active.sparse.effect_cursors = updated;
+            } else {
+                self.directory.active.sparse.source_cursors = updated;
+            }
             return Ok(SourceProgress::Progress { through });
         }
         let next = source.first(
@@ -1375,10 +1965,33 @@ impl Write<'_, '_> {
                         &head.binding.author,
                         seq,
                     )?;
-                    if !actual.is_some_and(|entry| entry.entry_hash() == expected.entry_hash()) {
-                        return Ok(SourceProgress::MissingSource {
-                            author: head.binding.author,
-                            seq,
+                    match actual {
+                        None => {
+                            return Ok(SourceProgress::MissingSource {
+                                author: head.binding.author,
+                                seq,
+                                hash: expected.entry_hash(),
+                            })
+                        }
+                        Some(actual) if actual.entry_hash() != expected.entry_hash() => {
+                            return Ok(SourceProgress::ConflictingSource {
+                                author: head.binding.author,
+                                seq,
+                                expected: expected.entry_hash(),
+                                actual: actual.entry_hash(),
+                            });
+                        }
+                        Some(_) => {}
+                    }
+                    if effects
+                        && source.find_value(
+                            self.sek,
+                            self.channel,
+                            roots.settled_entries,
+                            &hashed(&expected.entry_hash()),
+                        )? != Some(Value::Present)
+                    {
+                        return Ok(SourceProgress::PendingEffect {
                             hash: expected.entry_hash(),
                         });
                     }
@@ -1390,17 +2003,27 @@ impl Write<'_, '_> {
             }
             _ => (hi, true),
         };
-        self.directory.active.sparse.source_prefixes = self.change_value(
-            roots.source_prefixes,
+        let updated = self.change_value(
+            prefix_root,
             hashed(head_id),
             Some(Value::Number(next_through)),
         )?;
+        if effects {
+            self.directory.active.sparse.effect_prefixes = updated;
+        } else {
+            self.directory.active.sparse.source_prefixes = updated;
+        }
         if finish_interval {
-            self.directory.active.sparse.source_cursors = self.change_value(
-                roots.source_cursors,
-                hashed(head_id),
-                Some(Value::Number(lo)),
-            )?;
+            let updated =
+                self.change_value(cursor_root, hashed(head_id), Some(Value::Number(lo)))?;
+            if effects {
+                self.directory.active.sparse.effect_cursors = updated;
+            } else {
+                self.directory.active.sparse.source_cursors = updated;
+            }
+        }
+        if effects && next_through >= head.root.leaves {
+            self.publish_control_ready(&head)?;
         }
         Ok(if next_through >= head.root.leaves {
             SourceProgress::Complete {
@@ -1411,6 +2034,22 @@ impl Write<'_, '_> {
                 through: next_through,
             }
         })
+    }
+    fn publish_control_ready(&mut self, head: &SignedHead) -> Result<()> {
+        let mut state = Source::Batch(self.batch)
+            .sparse_author(
+                self.sek,
+                self.channel,
+                self.directory.active.sparse,
+                &head.binding.author,
+                head.binding.scope,
+            )?
+            .ok_or(invalid("control-ready author missing"))?;
+        if state.committed == Some(head.id()) && state.control_ready != Some(head.id()) {
+            state.control_ready = Some(head.id());
+            self.save_sparse_author(head.binding, state)?;
+        }
+        Ok(())
     }
     /// Bounded durable pending work. At the cap the caller yields before staging more objects.
     pub(crate) fn keep_history_obligation(&mut self, obligation: &Obligation) -> Result<bool> {
@@ -1447,6 +2086,507 @@ impl Write<'_, '_> {
                 .checked_sub(1)
                 .ok_or(invalid("sparse obligation counter"))?;
         }
+        Ok(())
+    }
+}
+
+/// The existing Feed predicate needs only authenticated headers for backlinks. This local
+/// view avoids decrypting maximum-sized bodies merely to advance the actual contiguous line.
+struct HeaderRead<'a, 'b> {
+    source: Source<'a>,
+    sek: &'b Sek,
+    room: &'b Digest32,
+    roots: super::Roots,
+}
+impl EntryRead for HeaderRead<'_, '_> {
+    fn get(&self, author: &Digest32, seq: u64) -> Result<Option<Entry>> {
+        self.source
+            .sparse_position_header(self.sek, self.room, self.roots.sparse, author, seq)
+    }
+    fn locate(&self, hash: &Digest32) -> Result<Option<(Digest32, u64)>> {
+        Ok(self
+            .source
+            .find(self.sek, self.room, self.roots.hash, &hashed(hash))?
+            .map(|at| (at.author, at.seq)))
+    }
+    fn clock(&self, hash: &Digest32) -> Result<Option<u64>> {
+        self.source
+            .number(self.sek, self.room, self.roots.clock, &hashed(hash))
+    }
+    fn order_next(&self, after: Option<(u64, Digest32)>) -> Result<Option<(u64, Digest32)>> {
+        self.source
+            .order_next(self.sek, self.room, self.roots.order, after)
+    }
+    fn order_previous(&self, before: Option<(u64, Digest32)>) -> Result<Option<(u64, Digest32)>> {
+        self.source
+            .order_previous(self.sek, self.room, self.roots.order, before)
+    }
+    fn referenced(&self, author: &Digest32, other: &Digest32) -> Result<u64> {
+        let mut key = [0; 64];
+        key[..32].copy_from_slice(author);
+        key[32..].copy_from_slice(other);
+        Ok(self
+            .source
+            .number(self.sek, self.room, self.roots.referenced, &key)?
+            .unwrap_or(0))
+    }
+}
+
+impl Write<'_, '_> {
+    /// At most one actually held, semantically settled next position. There is no scan,
+    /// guessed prefix, or promotion to the signed head's leaf count.
+    pub(crate) fn advance_sparse_contiguous(
+        &mut self,
+        author: &Digest32,
+    ) -> Result<Option<crate::log::dag::PublishedFeed>> {
+        self.require_sparse_idle()?;
+        let restart = self
+            .directory
+            .restart
+            .as_ref()
+            .ok_or(invalid("sparse restart state absent"))?;
+        let mut state = restart.feeds.get(author).cloned().unwrap_or_default();
+        if state.ended {
+            return Ok(None);
+        }
+        let next = state
+            .seq
+            .checked_add(1)
+            .ok_or(invalid("contiguous sequence overflow"))?;
+        let headers = HeaderRead {
+            source: Source::Batch(self.batch),
+            sek: self.sek,
+            room: self.channel,
+            roots: self.directory.active,
+        };
+        let Some(entry) = headers.get(author, next)? else {
+            return Ok(None);
+        };
+        if headers.source.find_value(
+            self.sek,
+            self.channel,
+            self.directory.active.sparse.settled_entries,
+            &hashed(&entry.entry_hash()),
+        )? != Some(Value::Present)
+        {
+            return Ok(None);
+        }
+        let feed = if state.seq == 0 {
+            crate::log::feed::Feed::default()
+        } else {
+            crate::log::feed::Feed::restore_published(
+                *author,
+                state.seq,
+                state.hash,
+                state.first_claimed_ms,
+                state.ended,
+            )?
+        };
+        feed.validate_next(&headers, &entry)
+            .map_err(|error| match error {
+                crate::log::feed::FeedError::Invalid(error)
+                | crate::log::feed::FeedError::Local(error) => error,
+            })?;
+        restart::advance(&mut state, &entry)?;
+        self.directory
+            .restart
+            .as_mut()
+            .ok_or(invalid("sparse restart state vanished"))?
+            .feeds
+            .insert(*author, state.clone());
+        Ok(Some(state))
+    }
+}
+
+impl crate::log::history::ContextSource for Read<'_> {
+    fn context(&self, hash: &Digest32) -> Result<Option<ControlContext>> {
+        self.history_context(hash)
+    }
+}
+
+/// Exact local operation ownership of a verifier cursor. This metadata cannot grant a
+/// request: the operation owner rechecks its current authorization and cancellation serial.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CursorBinding {
+    pub request: [u8; 16],
+    pub room: Digest32,
+    pub head: Digest32,
+    pub author: Digest32,
+    pub proof_kind: u8,
+    pub from: u64,
+    pub through: u64,
+    pub generation: Digest32,
+}
+impl CursorBinding {
+    fn bytes(self) -> Result<Vec<u8>> {
+        if self.proof_kind > 3
+            || self.from > self.through
+            || self.through > crate::log::feed::MAX_SEQ
+            || (self.proof_kind != 1 && self.from == 0)
+        {
+            return Err(invalid("verifier cursor bounds"));
+        }
+        let mut e = Encoder::new();
+        e.array(9)
+            .uint(1)
+            .bytes(&self.request)
+            .bytes(&self.room)
+            .bytes(&self.head)
+            .bytes(&self.author)
+            .uint(self.proof_kind as u64)
+            .uint(self.from)
+            .uint(self.through)
+            .bytes(&self.generation);
+        Ok(e.finish())
+    }
+    fn id(self) -> Result<Digest32> {
+        let mut input = b"vox/local-history-verifier/v1".to_vec();
+        input.extend_from_slice(&self.bytes()?);
+        Ok(sha256(&input))
+    }
+    fn obligation(self) -> Result<Obligation> {
+        Ok(Obligation {
+            head: self.head,
+            kind: ObligationKind::Verifier,
+            object: self.id()?,
+            author: self.author,
+            from: self.from,
+            through: self.through,
+        })
+    }
+}
+
+/// Only these already-constructed verifier types can populate a trusted local checkpoint.
+/// There is deliberately no setter accepting peer-supplied checkpoint bytes.
+pub(crate) enum HistoryVerifier {
+    Inclusion(crate::log::history::InclusionVerifier),
+    Consistency(crate::log::history::ConsistencyVerifier),
+    ControlRange(crate::log::history::ControlRangeVerifier),
+    Validation(super::super::governance::SparseValidation),
+}
+impl HistoryVerifier {
+    fn checkpoint(&self, binding: CursorBinding) -> Result<Vec<u8>> {
+        let (kind, target, bytes) = match self {
+            Self::Inclusion(v) => (0, v.checkpoint_target(), v.checkpoint()?),
+            Self::Consistency(v) => (1, v.checkpoint_target(), v.checkpoint()?),
+            Self::ControlRange(v) => (2, v.checkpoint_target(), v.checkpoint()?),
+            Self::Validation(v) => (3, v.checkpoint_target(), v.checkpoint()?),
+        };
+        if binding.proof_kind != kind
+            || target.0 != binding.head
+            || target.1.room != binding.room
+            || target.1.author != binding.author
+            || target.1.scope != LogScope::Public
+            || target.2 != binding.from
+            || target.3 != binding.through
+        {
+            return Err(invalid("verifier cursor target differs"));
+        }
+        Ok(bytes)
+    }
+    fn restore(binding: CursorBinding, bytes: &[u8]) -> Result<Self> {
+        use crate::log::history::{ConsistencyVerifier, ControlRangeVerifier, InclusionVerifier};
+        let result = match binding.proof_kind {
+            0 => Self::Inclusion(InclusionVerifier::from_authenticated_checkpoint(bytes)?),
+            1 => Self::Consistency(ConsistencyVerifier::from_authenticated_checkpoint(bytes)?),
+            2 => Self::ControlRange(ControlRangeVerifier::from_authenticated_checkpoint(bytes)?),
+            3 => Self::Validation(
+                super::super::governance::SparseValidation::from_authenticated_checkpoint(bytes)?,
+            ),
+            _ => return Err(invalid("verifier cursor kind")),
+        };
+        // Authenticated local bytes still retain exact operation and proof bindings.
+        result.checkpoint(binding)?;
+        Ok(result)
+    }
+}
+
+fn receipt_key(head: &Digest32, author: &Digest32, seq: u64) -> Digest32 {
+    let mut bytes = b"vox/local-parent-receipt/v1".to_vec();
+    bytes.extend_from_slice(head);
+    bytes.extend_from_slice(author);
+    bytes.extend_from_slice(&seq.to_be_bytes());
+    sha256(&bytes)
+}
+
+impl Read<'_> {
+    /// The caller owns the four-MiB verifier envelope through restoration and use.
+    /// This is the only checkpoint read boundary; bytes come from authenticated local AEAD.
+    pub(crate) fn history_verifier_cursor(
+        &self,
+        binding: CursorBinding,
+    ) -> Result<Option<HistoryVerifier>> {
+        if binding.room != *self.channel {
+            return Err(invalid("verifier cursor room"));
+        }
+        let Some(bytes) = self.history_object(ObjectKind::Verifier, &binding.id()?)? else {
+            return Ok(None);
+        };
+        let mut d = Decoder::new(&bytes);
+        if d.array()? != 3 || d.uint()? != 1 || d.bytes()? != binding.bytes()? {
+            return Err(invalid("stored verifier cursor binding"));
+        }
+        let checkpoint = d.bytes()?;
+        let result = HistoryVerifier::restore(binding, checkpoint)?;
+        d.finish()?;
+        Ok(Some(result))
+    }
+    pub(crate) fn history_parent_receipt(
+        &self,
+        head: &Digest32,
+        author: &Digest32,
+        seq: u64,
+    ) -> Result<Option<super::super::governance::VerifiedParentPrefix>> {
+        let Some(bytes) =
+            self.history_object(ObjectKind::ParentReceipt, &receipt_key(head, author, seq))?
+        else {
+            return Ok(None);
+        };
+        let result =
+            super::super::governance::VerifiedParentPrefix::from_authenticated_checkpoint(&bytes)?;
+        let included = result.included();
+        if included.head_id() != *head
+            || included.binding().room != *self.channel
+            || included.binding().author != *author
+            || included.header().entry().skeleton.seq != seq
+        {
+            return Err(invalid("stored parent receipt binding"));
+        }
+        Ok(Some(result))
+    }
+}
+impl Write<'_, '_> {
+    /// Replace one operation's cursor atomically with its exact pending-work pointer.
+    /// Returns false before storing when the existing bounded work queue is full.
+    pub(crate) fn keep_history_verifier_cursor(
+        &mut self,
+        binding: CursorBinding,
+        cursor: &HistoryVerifier,
+    ) -> Result<bool> {
+        self.require_sparse_idle()?;
+        if binding.room != *self.channel {
+            return Err(invalid("verifier cursor room"));
+        }
+        let checkpoint = cursor.checkpoint(binding)?;
+        if !self.keep_history_obligation(&binding.obligation()?)? {
+            return Ok(false);
+        }
+        let mut e = Encoder::new();
+        e.array(3)
+            .uint(1)
+            .bytes(&binding.bytes()?)
+            .bytes(&checkpoint);
+        let bytes = e.finish();
+        let key = object_key(ObjectKind::Verifier, &binding.id()?);
+        let root = self.directory.active.sparse.objects;
+        let prior = Source::Batch(self.batch).number(self.sek, self.channel, root, &key)?;
+        let id = self.save_sparse_record(prior, &bytes, ObjectKind::Verifier.limit())?;
+        self.directory.active.sparse.objects =
+            self.change_value(root, key, Some(Value::Number(id)))?;
+        Ok(true)
+    }
+    pub(crate) fn finish_history_verifier_cursor(&mut self, binding: CursorBinding) -> Result<()> {
+        self.require_sparse_idle()?;
+        if binding.room != *self.channel {
+            return Err(invalid("verifier cursor room"));
+        }
+        let key = object_key(ObjectKind::Verifier, &binding.id()?);
+        let root = self.directory.active.sparse.objects;
+        if let Some(id) = Source::Batch(self.batch).number(self.sek, self.channel, root, &key)? {
+            self.retire(id)?;
+            self.directory.active.sparse.objects = self.change_value(root, key, None)?;
+        }
+        self.finish_history_obligation(&binding.obligation()?)
+    }
+    pub(crate) fn keep_history_parent_receipt(
+        &mut self,
+        receipt: &super::super::governance::VerifiedParentPrefix,
+    ) -> Result<()> {
+        let included = receipt.included();
+        if included.binding().room != *self.channel {
+            return Err(invalid("parent receipt room"));
+        }
+        let key = receipt_key(
+            &included.head_id(),
+            &included.binding().author,
+            included.header().entry().skeleton.seq,
+        );
+        self.save_history_object(ObjectKind::ParentReceipt, key, &receipt.checkpoint()?)
+    }
+}
+
+impl Read<'_> {
+    pub(crate) fn history_inclusion_receipt(
+        &self,
+        head: &Digest32,
+        author: &Digest32,
+        seq: u64,
+    ) -> Result<Option<IncludedHeader>> {
+        let Some(bytes) = self.history_object(
+            ObjectKind::InclusionReceipt,
+            &receipt_key(head, author, seq),
+        )?
+        else {
+            return Ok(None);
+        };
+        let result = IncludedHeader::from_authenticated_receipt(&bytes)?;
+        if result.head_id() != *head
+            || result.binding().room != *self.channel
+            || result.binding().author != *author
+            || result.header().entry().skeleton.seq != seq
+        {
+            return Err(invalid("stored inclusion receipt binding"));
+        }
+        Ok(Some(result))
+    }
+    pub(crate) fn history_prefix_receipt(
+        &self,
+        head: &Digest32,
+        author: &Digest32,
+        seq: u64,
+    ) -> Result<Option<ConsistentPrefix>> {
+        let Some(bytes) =
+            self.history_object(ObjectKind::PrefixReceipt, &receipt_key(head, author, seq))?
+        else {
+            return Ok(None);
+        };
+        let result = ConsistentPrefix::from_authenticated_receipt(&bytes)?;
+        if result.head_id() != *head
+            || result.binding().room != *self.channel
+            || result.binding().author != *author
+            || result.prefix().leaves != seq
+        {
+            return Err(invalid("stored prefix receipt binding"));
+        }
+        Ok(Some(result))
+    }
+}
+impl Write<'_, '_> {
+    pub(crate) fn keep_history_inclusion_receipt(
+        &mut self,
+        receipt: &IncludedHeader,
+    ) -> Result<()> {
+        if receipt.binding().room != *self.channel {
+            return Err(invalid("inclusion receipt room"));
+        }
+        let key = receipt_key(
+            &receipt.head_id(),
+            &receipt.binding().author,
+            receipt.header().entry().skeleton.seq,
+        );
+        self.save_history_object(ObjectKind::InclusionReceipt, key, &receipt.local_receipt()?)
+    }
+    pub(crate) fn keep_history_prefix_receipt(&mut self, receipt: &ConsistentPrefix) -> Result<()> {
+        if receipt.binding().room != *self.channel {
+            return Err(invalid("prefix receipt room"));
+        }
+        let key = receipt_key(
+            &receipt.head_id(),
+            &receipt.binding().author,
+            receipt.prefix().leaves,
+        );
+        self.save_history_object(ObjectKind::PrefixReceipt, key, &receipt.local_receipt()?)
+    }
+}
+
+fn pending_header_key(head: &Digest32, seq: u64) -> Digest32 {
+    let mut bytes = b"vox/local-pending-header/v1".to_vec();
+    bytes.extend_from_slice(head);
+    bytes.extend_from_slice(&seq.to_be_bytes());
+    sha256(&bytes)
+}
+fn check_pending_header(head: &SignedHead, entry: &Entry) -> Result<()> {
+    head.binding.matches_entry(entry)?;
+    if entry.skeleton.seq > head.root.leaves
+        || (entry.skeleton.seq == head.root.leaves && entry.skeleton.epoch != head.tail_epoch)
+    {
+        return Err(invalid("pending header target position or epoch"));
+    }
+    Ok(())
+}
+impl Read<'_> {
+    /// Authenticated provisional header only; this locator is neither inclusion nor admission.
+    pub(crate) fn history_pending_header(
+        &self,
+        head: &Digest32,
+        seq: u64,
+    ) -> Result<Option<Entry>> {
+        let Some(bytes) =
+            self.history_object(ObjectKind::PendingHeader, &pending_header_key(head, seq))?
+        else {
+            return Ok(None);
+        };
+        let target = self
+            .history_head(head)?
+            .ok_or(invalid("pending header head missing"))?;
+        let entry = Entry::from_wire(&bytes)?;
+        check_pending_header(&target, &entry)?;
+        if entry.skeleton.seq != seq || entry.payload.is_some() {
+            return Err(invalid("pending header binding"));
+        }
+        Ok(Some(entry))
+    }
+}
+impl Write<'_, '_> {
+    pub(crate) fn keep_history_pending_header(
+        &mut self,
+        head: &Digest32,
+        header: &VerifiedHeader,
+    ) -> Result<()> {
+        self.require_sparse_idle()?;
+        let source = Source::Batch(self.batch);
+        let id = source
+            .number(
+                self.sek,
+                self.channel,
+                self.directory.active.sparse.objects,
+                &object_key(ObjectKind::Head, head),
+            )?
+            .ok_or(invalid("pending header head missing"))?;
+        let target = SignedHead::from_wire(&source.sparse_record(
+            self.sek,
+            self.channel,
+            id,
+            MAX_HEADER_BYTES,
+        )?)?;
+        if target.id() != *head || target.binding.room != *self.channel {
+            return Err(invalid("pending header head binding"));
+        }
+        check_pending_header(&target, header.entry())?;
+        self.keep_history_header(header)?;
+        let hash = pending_header_key(head, header.entry().skeleton.seq);
+        let key = object_key(ObjectKind::PendingHeader, &hash);
+        let source = Source::Batch(self.batch);
+        if let Some(prior) = source.number(
+            self.sek,
+            self.channel,
+            self.directory.active.sparse.objects,
+            &key,
+        )? {
+            let held = Entry::from_wire(&source.sparse_record(
+                self.sek,
+                self.channel,
+                prior,
+                MAX_HEADER_BYTES,
+            )?)?;
+            if held.entry_hash() != header.entry().entry_hash() {
+                return Err(invalid("pending header conflicts"));
+            }
+            return Ok(());
+        }
+        let id = source
+            .number(
+                self.sek,
+                self.channel,
+                self.directory.active.sparse.objects,
+                &object_key(ObjectKind::Header, &header.entry().entry_hash()),
+            )?
+            .ok_or(invalid("pending header object missing"))?;
+        self.directory.active.sparse.objects = self.change_value(
+            self.directory.active.sparse.objects,
+            key,
+            Some(Value::Number(id)),
+        )?;
         Ok(())
     }
 }

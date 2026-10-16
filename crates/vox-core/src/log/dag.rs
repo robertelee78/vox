@@ -302,6 +302,33 @@ impl Dag {
         Ok(dag)
     }
 
+    /// Apply one compact state only after the matching header-only Feed validation and
+    /// sealed restart update commit. This never invents a prefix from a sparse tip.
+    pub(crate) fn restore_contiguous_author(
+        &mut self,
+        author: Digest32,
+        state: &PublishedFeed,
+    ) -> Result<()> {
+        let feed = Feed::restore_published(
+            author,
+            state.seq,
+            state.hash,
+            state.first_claimed_ms,
+            state.ended,
+        )?;
+        if self
+            .feeds
+            .get(&author)
+            .is_some_and(|old| old.max_seq() > state.seq)
+        {
+            return Err(Error::MalformedAtRest(
+                "contiguous author state moved backwards",
+            ));
+        }
+        self.feeds.insert(author, feed);
+        Ok(())
+    }
+
     pub(crate) fn swept_positions(&self) -> impl Iterator<Item = (&Digest32, &u64)> {
         self.swept_to.iter()
     }
@@ -586,10 +613,11 @@ impl Dag {
         // Below its author's checkpoint, nothing new is taken: every position there is
         // already held (the feed is contiguous), so a different entry for one is refused as
         // pre-checkpoint — not raised as a fork.
-        if self
-            .checkpoints
-            .get(&author)
-            .is_some_and(|(below, _)| seq <= *below)
+        if entry.skeleton.v2.is_none()
+            && self
+                .checkpoints
+                .get(&author)
+                .is_some_and(|(below, _)| seq <= *below)
         {
             self.refused_below_checkpoint = self.refused_below_checkpoint.saturating_add(1);
             return Err(Rejected::PreCheckpoint);
@@ -673,7 +701,7 @@ impl Dag {
         } else {
             self.unverified_from.entry(author).or_insert(seq);
         }
-        if let Some(cp) = checkpoint {
+        if let Some(cp) = checkpoint.filter(|_| entry.skeleton.v2.is_none()) {
             let held = self.checkpoints.entry(author).or_insert((0, cp.entry_hash));
             if cp.seq > held.0 {
                 *held = (cp.seq, cp.entry_hash);

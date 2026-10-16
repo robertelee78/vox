@@ -1414,7 +1414,16 @@ impl<'s> Write<'_, 's> {
         self.batch
             .put_segment(self.channel, SegmentKind::LogDb, log, &sealed)?;
         self.directory.active = self.index(self.directory.active, entry, log)?;
-        self.directory.active = self.index_package(self.directory.active, entry, log)?;
+        if entry.skeleton.v2.is_none()
+            || Source::Batch(self.batch).sparse_effect_finished(
+                self.sek,
+                self.channel,
+                self.directory.active.sparse,
+                &entry.entry_hash(),
+            )?
+        {
+            self.directory.active = self.index_package(self.directory.active, entry, log)?;
+        }
         self.note_checkpoint_refill(entry)?;
         // A refill settles recovery atomically with its durable wire. Rewriting a body as
         // a skeleton for local retention deliberately does not create recovery work.
@@ -1499,6 +1508,7 @@ pub(crate) struct SparsePublication<'a> {
     pub first_log: u64,
     pub received_ms: u64,
     pub origin: u64,
+    pub local_id: Digest32,
 }
 
 const PROMOTION_ENTRIES: usize = 64;
@@ -1531,16 +1541,41 @@ impl Write<'_, '_> {
         let restart = self
             .directory
             .restart
-            .as_mut()
+            .as_ref()
             .ok_or(invalid("presence without restart state"))?;
-        if !restart
+        let contiguous = restart
             .feeds
             .get(&author)
-            .is_some_and(|f| state.last.0 <= f.seq)
-        {
-            return Err(invalid("presence beyond published feed"));
+            .is_some_and(|f| state.last.0 <= f.seq);
+        let sparse = if restart.sparse {
+            let source = Source::Batch(self.batch);
+            match source.sparse_position_header(
+                self.sek,
+                self.channel,
+                self.directory.active.sparse,
+                &author,
+                state.last.0,
+            )? {
+                Some(header) => source.sparse_effect_finished(
+                    self.sek,
+                    self.channel,
+                    self.directory.active.sparse,
+                    &header.entry_hash(),
+                )?,
+                None => false,
+            }
+        } else {
+            false
+        };
+        if !contiguous && !sparse {
+            return Err(invalid("presence beyond a semantically published position"));
         }
-        restart.presence.insert(author, state);
+        self.directory
+            .restart
+            .as_mut()
+            .ok_or(invalid("presence restart state vanished"))?
+            .presence
+            .insert(author, state);
         Ok(())
     }
     pub(crate) fn note_swept(&mut self, dag: &crate::log::dag::Dag) -> Result<()> {
@@ -1782,7 +1817,9 @@ impl Write<'_, '_> {
             if p.sparse_head.is_some() {
                 self.index_sparse_source(&mut p.work, &entry)?;
             }
-            p.work = self.index_package(p.work, &entry, log)?;
+            if p.sparse_head.is_none() {
+                p.work = self.index_package(p.work, &entry, log)?;
+            }
             if entry.payload.is_none() {
                 // The membership stays unpublished with this authenticated suffix until the
                 // witness's effects and root switch commit together.
