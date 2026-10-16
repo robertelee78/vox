@@ -34,6 +34,7 @@ pub(crate) struct Receiver {
     generation: Digest32,
     node: Digest32,
     staging: Option<Staging>,
+    historical: bool,
 }
 
 pub(crate) enum LocalProof {
@@ -90,6 +91,7 @@ impl Receiver {
         generation: Digest32,
         node: Digest32,
         staging: Option<Staging>,
+        historical: bool,
         fence: Arc<crate::transport::stream_transport::Fence>,
         deadline: tokio::time::Instant,
     ) -> Self {
@@ -98,6 +100,7 @@ impl Receiver {
             generation,
             node,
             staging,
+            historical,
         }
     }
 
@@ -916,6 +919,7 @@ impl Receiver {
         let job = record.job.clone();
         let staging = self.staging.clone();
         let grant = self.grant();
+        let historical = self.historical;
         self.read_precharged(&job, 64 * 1024, record, move |room, store, record| {
             let room_id = room.channel_id();
             let instance = room.history_instance(store)?;
@@ -926,6 +930,7 @@ impl Receiver {
                 &mut cursor,
                 now,
                 body_expected,
+                historical,
                 |batch| grant.check_batch(batch, room_id, instance, epoch),
                 |batch, hash| complete_staged(batch, staging.as_ref(), record, hash),
             )?;
@@ -944,6 +949,7 @@ impl Receiver {
         let job = record.job.clone();
         let staging = self.staging.clone();
         let grant = self.grant();
+        let historical = self.historical;
         self.read_precharged(&job, 64 * 1024, record, move |room, store, record| {
             use crate::node::channel::governance::{PayloadValidation, TypedSparseBody};
             let key = room
@@ -965,6 +971,7 @@ impl Receiver {
                 &record.entry,
                 &body,
                 now,
+                historical,
                 |batch| grant.check_batch(batch, room_id, instance, epoch),
                 |batch, hash| complete_staged(batch, staging.as_ref(), record, hash),
             )
@@ -1193,6 +1200,7 @@ impl Receiver {
                     LocalResult::wait(step, LocalNeed::Governance)
                 }
                 Effect::RefillPending { governance: false } => LocalResult::next(step),
+                Effect::BodyUnavailable => LocalResult::wait(step, LocalNeed::StagedBody),
                 Effect::ControlPending { head, through } => LocalResult::wait(
                     step,
                     LocalNeed::Control {
@@ -1400,6 +1408,7 @@ impl Receiver {
                         LocalResult::wait(step, LocalNeed::Governance)
                     }
                     Effect::RefillPending { governance: false } => LocalResult::next(step),
+                    Effect::BodyUnavailable => LocalResult::wait(step, LocalNeed::StagedBody),
                     other => effect_result(other),
                 }
             }

@@ -514,6 +514,7 @@ impl Flow {
             self.generation,
             self.node,
             self.stage(purpose),
+            purpose == Purpose::History,
             fence,
             deadline,
         )

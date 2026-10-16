@@ -307,8 +307,10 @@ const SENDER_STATE_VERSION: u64 = 2;
 /// The sender-chain state's version 1, its creation time in seconds: still read.
 const SENDER_STATE_VERSION_SECONDS: u64 = 1;
 
-/// At-rest version of a [`ReceiverChain`] state blob.
-const RECEIVER_STATE_VERSION: u64 = 1;
+/// At-rest version of a [`ReceiverChain`] state blob. Version 2 keeps the earliest
+/// authenticated history release separately from the advancing live ratchet.
+const RECEIVER_STATE_VERSION: u64 = 2;
+const RECEIVER_STATE_VERSION_LIVE_ONLY: u64 = 1;
 
 /// The receive side of one `(author_id, chain_id)` generation: derives message
 /// keys forward from a starting iteration, with a bounded skip/replay window.
@@ -324,6 +326,11 @@ pub struct ReceiverChain {
     chain_key: ChainKey,
     /// The next iteration the live chain key corresponds to.
     next_iteration: u64,
+    /// The earliest consented release retained for bounded, explicit history reads. It never
+    /// advances and is never used by live delivery, so cache eviction cannot consume the only
+    /// key capable of reopening an older authenticated entry.
+    history_key: ChainKey,
+    history_iteration: u64,
     /// Skipped (out-of-order) message keys, keyed by iteration, bounded.
     skipped: HashMap<u64, MessageKey>,
 }
@@ -373,6 +380,8 @@ impl ReceiverChain {
             signing_pubkey,
             chain_key: skdm.body.chain_key.clone(),
             next_iteration: skdm.body.iteration,
+            history_key: skdm.body.chain_key.clone(),
+            history_iteration: skdm.body.iteration,
             skipped: HashMap::new(),
         })
     }
@@ -388,7 +397,7 @@ impl ReceiverChain {
     #[must_use]
     pub fn to_state(&self) -> Zeroizing<Vec<u8>> {
         let mut e = Encoder::for_secrets();
-        e.array(9)
+        e.array(11)
             .uint(RECEIVER_STATE_VERSION)
             .bytes(&self.channel_id)
             .uint(self.epoch)
@@ -396,7 +405,9 @@ impl ReceiverChain {
             .uint(self.chain_id)
             .bytes(&self.signing_pubkey.to_bytes())
             .bytes(self.chain_key.bytes())
-            .uint(self.next_iteration);
+            .uint(self.next_iteration)
+            .bytes(self.history_key.bytes())
+            .uint(self.history_iteration);
         // Skipped keys in iteration order, so the bytes are canonical.
         let mut skipped: Vec<(&u64, &MessageKey)> = self.skipped.iter().collect();
         skipped.sort_by_key(|(i, _)| **i);
@@ -410,10 +421,15 @@ impl ReceiverChain {
     /// Restore a receiver chain from [`ReceiverChain::to_state`].
     pub fn from_state(bytes: &[u8]) -> Result<Self> {
         let mut d = Decoder::new(bytes);
-        if d.array()? != 9 {
+        let arity = d.array()?;
+        if arity != 9 && arity != 11 {
             return Err(Error::MalformedBundle("receiver chain state arity"));
         }
-        if d.uint()? != RECEIVER_STATE_VERSION {
+        let version = d.uint()?;
+        if !matches!(
+            (version, arity),
+            (RECEIVER_STATE_VERSION_LIVE_ONLY, 9) | (RECEIVER_STATE_VERSION, 11)
+        ) {
             return Err(Error::MalformedBundle("receiver chain state version"));
         }
         let channel_id: Digest32 = d
@@ -436,6 +452,21 @@ impl ReceiverChain {
             .try_into()
             .map_err(|_| Error::MalformedBundle("receiver chain state chain_key"))?;
         let next_iteration = d.uint()?;
+        let (history_key, history_iteration) = if version == RECEIVER_STATE_VERSION {
+            let key: [u8; 32] = d
+                .bytes()?
+                .try_into()
+                .map_err(|_| Error::MalformedBundle("receiver history chain_key"))?;
+            let iteration = d.uint()?;
+            if iteration > next_iteration {
+                return Err(Error::MalformedBundle("receiver history iteration"));
+            }
+            (ChainKey::from_bytes(key), iteration)
+        } else {
+            // A v1 profile can safely continue from its current live head. An authenticated
+            // earlier SKDM later widens this floor without rewinding live replay protection.
+            (ChainKey::from_bytes(ck), next_iteration)
+        };
         let n = d.array()?;
         if n > MAX_CACHE {
             return Err(Error::SizeLimitExceeded("receiver chain skipped cache"));
@@ -465,6 +496,8 @@ impl ReceiverChain {
             signing_pubkey,
             chain_key: ChainKey::from_bytes(ck),
             next_iteration,
+            history_key,
+            history_iteration,
             skipped,
         })
     }
@@ -552,6 +585,51 @@ impl ReceiverChain {
             .checked_add(1)
             .ok_or(Error::MalformedBundle("group iteration overflow"))?;
         Ok(pt)
+    }
+
+    /// Open an authenticated entry for an explicit history read without rewinding or weakening
+    /// the live ratchet. Current/out-of-order delivery still consumes its ordinary one-time key;
+    /// an older key that the live path already consumed is derived from the separately retained
+    /// consent floor and changes no replay state.
+    pub(crate) fn decrypt_history(&mut self, msg: &GroupMessage) -> Result<Vec<u8>> {
+        self.check_binding(&msg.header)?;
+        let iteration = msg.header.iteration;
+        if iteration >= self.next_iteration || self.skipped.contains_key(&iteration) {
+            return self.decrypt(msg);
+        }
+        let gap = iteration
+            .checked_sub(self.history_iteration)
+            .ok_or(Error::MalformedBundle(
+                "group iteration before history release",
+            ))?;
+        if gap > MAX_SKIP {
+            return Err(Error::MalformedBundle("group history gap exceeds MAX_SKIP"));
+        }
+        let mut key = self.history_key.clone();
+        for _ in 0..gap {
+            key = key.advance()?;
+        }
+        let message_key = key.message_key()?;
+        msg.open(&message_key, &self.signing_pubkey)
+    }
+
+    /// Keep an earlier authenticated release for history without replacing the advancing live
+    /// chain. Returns whether durable receiver state changed.
+    pub(crate) fn retain_history_release(&mut self, release: &Self) -> Result<bool> {
+        if self.channel_id != release.channel_id
+            || self.epoch != release.epoch
+            || self.author_id != release.author_id
+            || self.chain_id != release.chain_id
+            || self.signing_pubkey.to_bytes() != release.signing_pubkey.to_bytes()
+        {
+            return Err(Error::MalformedBundle("history release receiver binding"));
+        }
+        if release.history_iteration >= self.history_iteration {
+            return Ok(false);
+        }
+        self.history_key = release.history_key.clone();
+        self.history_iteration = release.history_iteration;
+        Ok(true)
     }
 
     /// Reject a message whose binding does not match this chain (the

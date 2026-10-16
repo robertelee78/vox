@@ -856,13 +856,14 @@ enum ContentProjection {
     Visible(Rendered),
     Applied,
     Deferred,
+    Unavailable,
 }
 
 impl ContentProjection {
     fn into_row(self) -> Option<Rendered> {
         match self {
             Self::Visible(row) => Some(row),
-            Self::Applied | Self::Deferred => None,
+            Self::Applied | Self::Deferred | Self::Unavailable => None,
         }
     }
 }
@@ -6574,6 +6575,7 @@ impl ChannelState {
                         entry_hash,
                         payload,
                         now_ms,
+                        false,
                         &mut expired,
                     )?;
                     chains_advanced |= matches!(&projection, ContentProjection::Visible(_))
@@ -6795,10 +6797,28 @@ impl ChannelState {
         let chain = ReceiverChain::from_skdm(skdm, &key, &self.channel_id, self.epoch)?;
         let slot = (author, chain.chain_id());
         // A second SKDM for a generation we already hold would rewind the chain
-        // head and re-enable consumed iterations; keep the live one. Still renew the bounded
-        // rendering obligation: a prior process may have committed the key immediately before
-        // it could commit that cursor.
-        if self.receivers.contains_key(&slot) {
+        // head and re-enable consumed iterations; keep the live one. An earlier authenticated
+        // history release widens only the separate history floor. Persist that floor with the
+        // bounded rendering obligation so an upgraded v1 profile can recover old cache rows.
+        if let Some(existing) = self.receivers.get_mut(&slot) {
+            let widened = existing.retain_history_release(&chain)?;
+            if widened {
+                let saved = (|| -> Result<()> {
+                    let mut batch = store.batch()?;
+                    self.queue_receivers(&mut batch)?;
+                    let mut writer = self
+                        .entries
+                        .write(&mut batch, &self.sek, &self.channel_id)?;
+                    writer.queue_backfill(author, Some(1))?;
+                    writer.seal()?;
+                    batch.commit()
+                })();
+                if let Err(error) = saved {
+                    self.poison(&error);
+                    return Err(error);
+                }
+                self.entries.committed();
+            }
             return self.backfill(store, &author, now_ms);
         }
         if self.receivers.len() >= MAX_RECEIVER_CHAINS {
@@ -7533,7 +7553,7 @@ impl ChannelState {
                 continue;
             }
             if let Some(row) = self
-                .render_content_into(batch, author, hash, &payload, now_ms, expired)?
+                .render_content_into(batch, author, hash, &payload, now_ms, true, expired)?
                 .into_row()
             {
                 rows.push(row);
@@ -7599,6 +7619,7 @@ impl ChannelState {
                 entry_hash,
                 payload,
                 now_ms,
+                false,
                 &mut expired,
             )?;
             let deferred = matches!(&projection, ContentProjection::Deferred);
@@ -7655,6 +7676,7 @@ impl ChannelState {
         entry_hash: Digest32,
         payload: &[u8],
         now_ms: u64,
+        historical: bool,
         expired: &mut Vec<(Digest32, Tracked)>,
     ) -> Result<ContentProjection> {
         let me = self.me();
@@ -7691,11 +7713,33 @@ impl ChannelState {
             return Ok(ContentProjection::Applied);
         }
         let slot = (author, msg.header.chain_id);
+        if historical {
+            let writer = self.entries.write(batch, &self.sek, &self.channel_id)?;
+            let already = writer.has_rendered(&entry_hash)?
+                || writer.read_receipt_cache(&entry_hash)?.is_some()
+                || writer
+                    .retention(&entry_hash)?
+                    .is_some_and(|record| record.cache_id.is_some())
+                || self.private_contains_in(writer.batch(), &entry_hash)?
+                || self
+                    .drive
+                    .pending
+                    .iter()
+                    .any(|(row, _)| row.entry_hash == entry_hash);
+            if already {
+                return Ok(ContentProjection::Applied);
+            }
+        }
         let Some(chain) = self.receivers.get_mut(&slot) else {
             return Ok(ContentProjection::Deferred);
         };
-        let plaintext = match chain.decrypt(&msg) {
+        let plaintext = match if historical {
+            chain.decrypt_history(&msg)
+        } else {
+            chain.decrypt(&msg)
+        } {
             Ok(p) => Zeroizing::new(p),
+            Err(_) if historical => return Ok(ContentProjection::Unavailable),
             Err(_) => return Ok(ContentProjection::Applied),
         };
         self.chains_advanced = true;

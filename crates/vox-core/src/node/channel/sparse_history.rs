@@ -593,6 +593,7 @@ impl HistoryEffectCursor {
 pub(crate) enum HistoryEffectProgress {
     Progress,
     RefillPending { governance: bool },
+    BodyUnavailable,
     ControlPending { head: Digest32, through: u64 },
     GovernancePending,
     CheckpointPending { author: Digest32, seq: u64 },
@@ -609,6 +610,7 @@ impl ChannelState {
         cursor: &mut HistoryEffectCursor,
         now: crate::time::Ms,
         body_expected: bool,
+        historical: bool,
         check_binding: impl FnOnce(&Batch<'_>) -> Result<()>,
         on_admitted: impl FnOnce(&mut Batch<'_>, Digest32) -> Result<()>,
     ) -> Result<HistoryEffectProgress> {
@@ -732,7 +734,7 @@ impl ChannelState {
         // A changed grant is an ordinary cancellation before projection/index mutation.
         // The held Batch serializes trust writes through the final publication.
         check_binding(&batch)?;
-        let applied = (|| -> Result<(bool, bool, bool)> {
+        let applied = (|| -> Result<(bool, bool, bool, bool)> {
             let finished = FinishedHistoryEffect { hash: *hash };
             let mut index = self
                 .entries
@@ -757,6 +759,7 @@ impl ChannelState {
             let refill_pending =
                 body_expected && kind == SignedEntryKind::Content && entry.payload.is_none();
             let mut projection_deferred = false;
+            let mut body_unavailable = false;
             if kind == SignedEntryKind::Content {
                 if let Some(payload) = &entry.payload {
                     self.track_body_into(&mut batch, *hash, log, now.get())?;
@@ -766,18 +769,20 @@ impl ChannelState {
                         *hash,
                         payload,
                         now.get(),
+                        historical,
                         &mut expired,
                     )? {
                         super::ContentProjection::Visible(row) => rows.push(row),
                         super::ContentProjection::Applied => {}
                         super::ContentProjection::Deferred => projection_deferred = true,
+                        super::ContentProjection::Unavailable => body_unavailable = true,
                     }
                 }
             }
             let staged_deferred = body_expected && projection_deferred;
             self.queue_receivers(&mut batch)?;
             self.queue_private_generations(&mut batch)?;
-            if !(refill_pending || staged_deferred) {
+            if !(refill_pending || staged_deferred || body_unavailable) {
                 on_admitted(&mut batch, *hash)?;
             }
             batch.commit()?;
@@ -801,9 +806,9 @@ impl ChannelState {
             let rendered = !rows.is_empty();
             self.place_committed(store, rows, &expired)?;
             self.settle_display_order(store)?;
-            Ok((rendered, refill_pending, staged_deferred))
+            Ok((rendered, refill_pending, staged_deferred, body_unavailable))
         })();
-        let (rendered, refill_pending, projection_deferred) = match applied {
+        let (rendered, refill_pending, projection_deferred, body_unavailable) = match applied {
             Ok(outcome) => outcome,
             Err(error) => {
                 self.poison(&error);
@@ -811,6 +816,9 @@ impl ChannelState {
             }
         };
         cursor.rendered |= rendered;
+        if body_unavailable {
+            return Ok(HistoryEffectProgress::BodyUnavailable);
+        }
         if refill_pending || projection_deferred {
             return Ok(HistoryEffectProgress::RefillPending {
                 governance: projection_deferred,
@@ -869,6 +877,7 @@ impl ChannelState {
         entry: &Entry,
         body: &governance::TypedSparseBody,
         now: crate::time::Ms,
+        historical: bool,
         check_binding: impl FnOnce(&Batch<'_>) -> Result<()>,
         on_admitted: impl FnOnce(&mut Batch<'_>, Digest32) -> Result<()>,
     ) -> Result<HistoryEffectProgress> {
@@ -940,6 +949,7 @@ impl ChannelState {
             let mut expired = Vec::new();
             let mut rows = Vec::new();
             let mut deferred = false;
+            let mut unavailable = false;
             if settled && kind == SignedEntryKind::Content {
                 self.track_body_into(&mut batch, hash, log, now.get())?;
                 match self.render_content_into(
@@ -951,16 +961,18 @@ impl ChannelState {
                         .as_deref()
                         .ok_or(Error::MalformedBundle("refill body vanished"))?,
                     now.get(),
+                    historical,
                     &mut expired,
                 )? {
                     super::ContentProjection::Visible(row) => rows.push(row),
                     super::ContentProjection::Applied => {}
                     super::ContentProjection::Deferred => deferred = true,
+                    super::ContentProjection::Unavailable => unavailable = true,
                 }
                 self.queue_receivers(&mut batch)?;
                 self.queue_private_generations(&mut batch)?;
             }
-            if settled && !deferred {
+            if settled && !deferred && !unavailable {
                 on_admitted(&mut batch, hash)?;
             }
             batch.commit()?;
@@ -973,7 +985,9 @@ impl ChannelState {
             self.gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let rendered = !rows.is_empty();
             self.place_committed(store, rows, &expired)?;
-            Ok(if deferred {
+            Ok(if unavailable {
+                HistoryEffectProgress::BodyUnavailable
+            } else if deferred {
                 HistoryEffectProgress::RefillPending { governance: true }
             } else if settled {
                 HistoryEffectProgress::Complete { rendered }
