@@ -17124,6 +17124,12 @@ impl Node {
         let dh_secret = *signer.x25519_identity_secret();
         let (ring, _created) =
             prekeys::load_or_create(profile.store(), signer, &dh_secret, now_ms)?;
+        // Seed the exact bundle network startup is about to publish. If the first pairwise
+        // exchange consumes its one-time key before the next maintenance tick, that tick must
+        // compare against this pre-consumption bundle and immediately republish the fresh one.
+        // Starting with `None` instead took the already-consumed bundle as its baseline, so a
+        // key refused while a joined room was still preparing waited forever for a bundle update.
+        self.prekeys_offered = Some(ring.offered());
         self.prekeys = Some(Arc::new(tokio::sync::Mutex::new(ring)));
         // The keyring is sealed under this identity, so it can only be opened now
         // (ADR-020 §3). Without this the node would hold an empty keyring and
