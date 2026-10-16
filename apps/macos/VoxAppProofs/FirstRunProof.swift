@@ -2823,10 +2823,12 @@ final class FirstRunProof: XCTestCase {
             let bytes = (try? JSONSerialization.data(withJSONObject: e)) ?? Data()
             return String(decoding: bytes, as: UTF8.self)
         }
-        func hook(_ json: String) throws {
+        @discardableResult
+        func hook(_ json: String) throws -> String {
             let r = stager.run(["/bin/sh", "-c", "cd \"$1\" && exec \"$2\" agent hook --node claude-a --room \"$3\"",
                                 "hook", work, vox, room], env: hookEnv, input: json)
             guard r.status == 0 else { throw Apparatus("`vox agent hook` exited \(r.status): \(r.out)") }
+            return r.out
         }
 
         let asked = root.appendingPathComponent("asked")
@@ -2835,13 +2837,34 @@ final class FirstRunProof: XCTestCase {
         if selectedStep.isEmpty {
             for (session, words) in [(s1, "S1-WORDS"), (s2, "S2-WORDS")] {
                 try stager.write(Data(("{\"type\":\"custom-title\",\"customTitle\":\"" + words + "\"}\n").utf8), to: work + "/\(session).jsonl")
-                try hook(event(session, "UserPromptSubmit", ["prompt": words]))
+                // A bounded hook says to try again on the next turn when the daemon is still
+                // preparing or did not answer promptly. Model that next turn only for that exact
+                // answer, and first verify on the Session owner's node so peer replication cannot
+                // be mistaken for hook staging.
+                let openUntil = Date().addingTimeInterval(20)
+                var opened = (status: Int32(-1), out: "")
+                var hookAnswers: [String] = []
+                repeat {
+                    let answer = try hook(event(session, "UserPromptSubmit", ["prompt": words]))
+                    hookAnswers.append(answer)
+                    let observeUntil = min(openUntil, Date().addingTimeInterval(1))
+                    repeat {
+                        opened = run(vox, ["room", "session", "--node", "claude-a", "--json", room, session], env: voxEnv)
+                        if opened.status == 0 { break }
+                        Thread.sleep(forTimeInterval: 0.1)
+                    } while Date() < observeUntil
+                    if opened.status == 0 { break }
+                    guard answer.contains("try again next turn") || answer.contains("is preparing node") else { break }
+                } while Date() < openUntil
+                guard opened.status == 0 else {
+                    throw Apparatus("staging not achieved: Claude's \(words) hook did not open Session \(session) on claude-a; hook said \(hookAnswers.debugDescription); `vox room session --json` exited \(opened.status) saying \(opened.out.debugDescription)")
+                }
             }
             // S1 asks an approval: its hook waits for the answer, in the background, its pid kept.
             // Only the hook itself goes to the background, with its own output in a file, so nothing
             // left running holds the stager's pipe open; `&&` would background a subshell holding it.
             let touch: [String: Any] = ["command": "touch p1", "description": "Make p1"]
-            try hook(event(s1, "PreToolUse", ["tool_name": "Bash", "tool_input": touch, "tool_use_id": "toolu_P1"]))
+            let preToolAnswer = try hook(event(s1, "PreToolUse", ["tool_name": "Bash", "tool_input": touch, "tool_use_id": "toolu_P1"]))
             try stager.write(Data(event(s1, "PermissionRequest", ["tool_name": "Bash", "tool_input": touch,
                                                                    "permission_suggestions": []]).utf8),
                              to: asked.path + ".json")
@@ -2863,7 +2886,8 @@ final class FirstRunProof: XCTestCase {
                 if !s1Now.contains("\"waiting\":true") { Thread.sleep(forTimeInterval: 0.5) }
             }
             guard s1Now.contains("\"waiting\":true") else {
-                throw Apparatus("staging not achieved: S1's request is not waiting on alice within 20 s; `vox room session --json` said \(s1Now.debugDescription)")
+                let requestAnswer = stager.run(["/bin/cat", asked.path + ".out"], env: [:]).out
+                throw Apparatus("staging not achieved: S1's request is not waiting on alice within 20 s; PreToolUse hook said \(preToolAnswer.debugDescription); PermissionRequest hook said \(requestAnswer.debugDescription); `vox room session --json` said \(s1Now.debugDescription)")
             }
 
         }
