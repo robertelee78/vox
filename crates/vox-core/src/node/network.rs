@@ -563,7 +563,11 @@ impl NodeNet {
         );
         service.computer_anchor(endpoint.local_id());
         Self {
-            manager: Arc::new(ConnectionManager::new(endpoint, Arc::clone(&clock))),
+            manager: Arc::new(ConnectionManager::with_network(
+                endpoint,
+                Arc::clone(&clock),
+                presence.network_generation(),
+            )),
             anchor_scopes: Mutex::new(AnchorScopes::default()),
             presence,
             reaching: Mutex::new(HashMap::new()),
@@ -780,12 +784,11 @@ impl NodeNet {
 
     /// The endpoints this node advertises.
     ///
-    /// Once the presence has run the ADR-012 ladder
+    /// Once the presence has composed its local addresses
     /// ([`NetPresence::advertised_now`](crate::node::presence::NetPresence::advertised_now)),
-    /// this is its composed set (routable address, port-mapped address, loopback). Before it — and if the
-    /// ladder found nothing — it falls back to the bound socket, which is right for a
-    /// node bound to a concrete address and merely useless for one bound to the
-    /// wildcard.
+    /// this is its composed set (routable address, any port-mapped address, loopback).
+    /// Gateway work enriches that set without delaying its first publication. Before local
+    /// discovery, a concrete bind is usable; an unspecified bind is never an endpoint.
     pub fn local_endpoints(&self) -> Result<EndpointList> {
         #[cfg(feature = "test-knobs")]
         if let Some(list) = test_advertise() {
@@ -1166,6 +1169,10 @@ impl NodeNet {
                 match coordstream::serve_coord(
                     peer,
                     observed,
+                    self.service
+                        .is_served_anchor()
+                        .then(|| self.local_endpoints().ok())
+                        .flatten(),
                     &|p| self.classify(p),
                     &shares_room,
                     &transport,
@@ -1252,12 +1259,14 @@ impl NodeNet {
     /// Ask `peer` what source address it sees for this node and remember the answer
     /// (ADR-012 rung 3). One small round trip per connection.
     pub async fn learn_observed(&self, peer: Digest32) -> Result<Multiaddr> {
+        let generation = self.manager.network_generation();
         let conn = self
             .manager
             .existing(&peer)
             .ok_or(Error::Unreachable("no connection to ask"))?;
         let addr = coordstream::ask_observed(&conn).await?;
-        self.presence.note_observed(self.local_id(), peer, addr);
+        self.presence
+            .note_observed_at(generation, self.local_id(), peer, addr);
         Ok(addr)
     }
 
@@ -1323,6 +1332,22 @@ impl NodeNet {
         endpoints: &EndpointList,
         context: &HelperContext,
     ) -> Result<Arc<VoxConnection>> {
+        let generation = self.manager.network_generation();
+        self.manager
+            .on_network(
+                generation,
+                self.reach_current(peer, endpoints, context, generation),
+            )
+            .await
+    }
+
+    async fn reach_current(
+        &self,
+        peer: Digest32,
+        endpoints: &EndpointList,
+        context: &HelperContext,
+        generation: u64,
+    ) -> Result<Arc<VoxConnection>> {
         #[cfg(feature = "test-knobs")]
         if let Some(ms) = std::env::var(TEST_HOLD_REACH_ENV)
             .ok()
@@ -1361,7 +1386,9 @@ impl NodeNet {
                     finished: false,
                     started: std::time::Instant::now(),
                 };
-                let result = self.reach_ladder(peer, endpoints, context).await;
+                let result = self
+                    .reach_ladder(peer, endpoints, context, generation)
+                    .await;
                 owner.finished = true;
                 return result;
             };
@@ -1403,6 +1430,7 @@ impl NodeNet {
         peer: Digest32,
         endpoints: &EndpointList,
         context: &HelperContext,
+        generation: u64,
     ) -> Result<Arc<VoxConnection>> {
         if let Some(conn) = self.manager.existing(&peer) {
             return Ok(conn);
@@ -1540,7 +1568,7 @@ impl NodeNet {
                     Some(addr) => Some(addr),
                     None => match coordstream::ask_observed(&coordinator).await {
                         Ok(addr) => {
-                            presence.note_observed(me, coordinator.peer_id(), addr);
+                            presence.note_observed_at(generation, me, coordinator.peer_id(), addr);
                             Some(addr)
                         }
                         Err(_) => None,
@@ -1822,7 +1850,7 @@ impl NodeNet {
                             );
                         }
                     }
-                    let won = self.manager.adopt(conn).await;
+                    let won = self.manager.adopt_on_network(conn, generation).await?;
                     // **Every connection a rung made is filed, not only the first** (#335). Two
                     // circuits through two helpers connect within milliseconds of each other, and
                     // the far end accepts both and keeps the one with the lower `tie_key`. Dropped
@@ -1837,7 +1865,7 @@ impl NodeNet {
                     set.abort_all();
                     while let Some(late) = set.join_next().await {
                         if let Ok((_, Ok(conn))) = late {
-                            self.manager.adopt(conn).await;
+                            let _ = self.manager.adopt_on_network(conn, generation).await;
                         }
                     }
                     return Ok(self.manager.existing(&peer).unwrap_or(won));
@@ -1869,6 +1897,22 @@ impl NodeNet {
         peer: Digest32,
         endpoints: &EndpointList,
         context: &HelperContext,
+    ) -> Result<Arc<VoxConnection>> {
+        let generation = self.manager.network_generation();
+        self.manager
+            .on_network(
+                generation,
+                self.upgrade_current(peer, endpoints, context, generation),
+            )
+            .await
+    }
+
+    async fn upgrade_current(
+        &self,
+        peer: Digest32,
+        endpoints: &EndpointList,
+        context: &HelperContext,
+        generation: u64,
     ) -> Result<Arc<VoxConnection>> {
         let Some(current) = self.manager.existing(&peer) else {
             return Err(Error::Unreachable("no connection to upgrade"));
@@ -1924,7 +1968,7 @@ impl NodeNet {
         while let Some(joined) = set.join_next().await {
             match joined {
                 Ok(Ok(conn)) => {
-                    let filed = self.manager.adopt(conn).await;
+                    let filed = self.manager.adopt_on_network(conn, generation).await?;
                     // `adopt` keeps the better of the two; only a real replacement is an
                     // upgrade.
                     if !std::ptr::eq(Arc::as_ptr(&filed), current.as_ptr()) {
@@ -2023,6 +2067,7 @@ impl NodeNet {
         coordinator: &VoxConnection,
         peer: Digest32,
     ) -> Result<Arc<VoxConnection>> {
+        let generation = self.manager.network_generation();
         let (mut send, mut recv) = coordstream::open_punch_session(coordinator, peer).await?;
         let observed = self.observed_or_ask(coordinator.peer_id()).await;
         let local = coordstream::punch_endpoints(observed, &self.local_endpoints()?);
@@ -2034,7 +2079,7 @@ impl NodeNet {
             self.now_ms(),
         )
         .await?;
-        Ok(self.manager.adopt(conn).await)
+        self.manager.adopt_on_network(conn, generation).await
     }
 
     /// Rung 4 on its own: ask `relay` to carry a circuit to `peer` and dial `peer`
@@ -2045,10 +2090,11 @@ impl NodeNet {
         relay: &Arc<VoxConnection>,
         peer: Digest32,
     ) -> Result<Arc<VoxConnection>> {
+        let generation = self.manager.network_generation();
         let conn =
             circuitstream::connect_through(relay, peer, self.manager.endpoint(), self.now_ms())
                 .await?;
-        Ok(self.manager.adopt(conn).await)
+        self.manager.adopt_on_network(conn, generation).await
     }
 
     /// The responder's side of rung 3, on a session a coordinator relayed here: run the
@@ -2060,6 +2106,7 @@ impl NodeNet {
         mut send: SendStream,
         mut recv: RecvStream,
     ) -> Result<Arc<VoxConnection>> {
+        let generation = self.manager.network_generation();
         let t0 = std::time::Instant::now();
         let observed = self.observed_or_ask(coordinator).await;
         let asked_ms = t0.elapsed().as_millis();
@@ -2093,7 +2140,7 @@ impl NodeNet {
                 ),
             },
         );
-        Ok(self.manager.adopt(dialled?).await)
+        self.manager.adopt_on_network(dialled?, generation).await
     }
 
     /// What this node's board anchors: every channel it holds a genesis for, with

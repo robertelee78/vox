@@ -9,7 +9,11 @@ the reachability ladder run in the node (`crates/vox-core/src/nat/`,
 Not built: a DHT (N-31). UPnP-IGD has not yet been checked against a real router (N-14). Built in
 v0.3.1: network-change detection and the action on it (N-49–N-52). Not built, for v0.3.1: gateway
 discovery off Linux and the PCP mapping lifecycle (N-53–N-57).
+The 2026-10-15 recovery amendment to N-34 and N-49–N-58 is required for v0.4.6 and is **not yet
+implemented**. Its technical plan is under review; the earlier delivery statements do not claim
+that this amendment has been delivered.
 **Date**: 2026-06-19
+**Updated**: 2026-10-15
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: nat, bootstrap, rendezvous, ipv6, port-mapping, relay, anchor
 
@@ -258,7 +262,8 @@ relay circuit.
   - an **anchor** may open `rendezvous`, `sync`, `coord` and `circuit`;
   - a **pending joiner** may open `join`, `rendezvous`, `pairwise`, `coord` and `circuit`;
   - a **join responder** may open `pairwise`, `rendezvous` and `coord`;
-  - an **unknown** peer may open `rendezvous`, and `coord` for `WHOAMI` only;
+  - an **unknown** peer may open `rendezvous`, and `coord` for `WHOAMI`, plus `ENDPOINTS`
+    only when the responding node explicitly serves as an anchor (N-34);
   - anyone may open `goodbye`.
 
   A refused stream MUST be reset with the same coded rejection an unauthenticated peer gets, so that
@@ -267,10 +272,41 @@ relay circuit.
 ### Bootstrap and publishing
 
 - **N-34. Bootstrap (M15.1).** Cold start MUST use a bootstrap set the user controls. The configured
-  anchors MUST be dialled when the network starts, named in invite links with their fingerprints, and
-  persisted per room. With no anchor, the invite link's addresses are the bootstrap. Bootstrap nodes
-  only introduce peers; a hostile or absent one MUST be able to degrade availability only, never
-  confidentiality or authenticity.
+  anchors MUST be dialled when the network starts, within their scopes: hand-added machine anchors
+  for each node's own reach, and room anchors for their room only (ADR-032 AN-2, AN-5). Invite links
+  MUST name only their room's anchors, with fingerprints, as ADR-032 AN-11 requires. With no anchor,
+  the invite link's addresses are the bootstrap. A hostile or absent bootstrap node MUST be able
+  to degrade availability only, never confidentiality or authenticity.
+
+  **Same-identity endpoints (2026-10-15).** When several permitted sources name the same anchor
+  fingerprint, the node MUST combine their current endpoint candidates instead of letting one
+  source hide the others. A stale machine LAN endpoint MUST NOT suppress a room's usable endpoint
+  for that same identity. Attempts MUST be bounded and MUST give the other candidates a chance;
+  every successful dial MUST authenticate the expected fingerprint (ADR-011).
+  Combining dial hints MUST NOT combine authority: room publication, rendezvous and withdrawal
+  MUST keep their original room scopes, and machine configuration MUST NOT turn an anchor into a
+  room anchor. A removed source MUST cease authorizing its former uses; candidates retained for a
+  pending withdrawal MAY be used only to complete that cleanup. Recovery MUST NOT grant trust,
+  change room governance, or initiate an anchor search the person did not choose (ADR-032 AN-6).
+
+  **Learn the known anchor's alternate paths (2026-10-15, #937; not yet delivered).** While an
+  authorized anchor is reachable, the node MUST request its own current advertised endpoints
+  over that anchor's authenticated connection. This closes the source-confirmed gap where a
+  LAN-only bootstrap could never learn the same anchor's public route before moving to a hotspot.
+  The existing coord stream is to carry a bounded `ENDPOINTS` / `ADVERTISED` exchange: at most
+  `MAX_ENDPOINTS`, a three-second whole request, initially and no more than once per 30 seconds
+  per connection/path thereafter. Only explicitly served anchors disclose this list to unknown
+  peers; ordinary nodes MUST refuse. The cache MUST be bounded per identity and in total, stored
+  in the node's existing sealed local metadata, and reloaded so a restart on the new network can
+  recover from an originally LAN-only bootstrap. A hint's age MUST NOT discard the only known
+  alternate before trying a fresh authenticated dial. No cached hint may be used when no current
+  source authorizes that identity; removal must suppress its use without a configuration rewrite.
+  Old-generation responses MUST NOT replace current hints. Hints MUST NOT be persisted as proven
+  peer-book observations; later dials MUST prove the same fingerprint. Neither this request nor
+  its response grants trust, relay access, room membership or publication authority. The anchor's
+  own advertised endpoints, not a client's reflexive address or a guessed public IP, supply the
+  alternates. An anchor that has no usable advertised alternate cannot promise one; an unknown
+  public service cannot be discovered after every known path has already been lost.
 - **N-35. Publisher sequence (V29-23).** A publisher's `seq` MUST keep rising across its restarts:
   `max(previous + 1, now in ms)`.
 - **N-36. A peer book (2026-09-25, found by ADR-023's R10 gate).** A node MUST keep each member's last direct addresses (at most
@@ -320,9 +356,11 @@ tests were deleted in v0.4.1 (AGENTS.md: no unit tests).
 - **N-48.** The hole punch's attempt timeout (`PUNCH_ATTEMPT_TIMEOUT`) MUST be re-measured with the
   identity exchange in place.
 
-### Network change and the mapping lifecycle (v0.3.1)
+### Network change and the mapping lifecycle (v0.3.1; recovery amendment for v0.4.6)
 
-N-49–N-57 are built in v0.3.1. Proofs, each against the shipped binary:
+The original N-49–N-57 behavior was built in v0.3.1. The 2026-10-15 recovery requirements below
+are not yet implemented; the existing proofs are to be extended only for changed behavior.
+Earlier proofs, each against the shipped binary:
 - N-49–N-52 (`nat::netwatch`, `NetPresence::changed`, `close_stranded`):
   `a_network_change_is_noticed_and_acted_on_proof` on Linux, and its opt-in macOS form;
 - N-53: `vox_status_names_the_router_proof` (macOS: `route -n get [-inet6] default`; the Linux
@@ -359,25 +397,52 @@ Found by an outside review (2026-10-04) and confirmed in code at integrate `3d52
   (`RTM_NEWADDR`, `RTM_DELADDR`, `RTM_IFINFO`, `RTM_ADD`, `RTM_DELETE`, `RTM_CHANGE`). On Linux it
   MUST subscribe to rtnetlink (`RTMGRP_LINK`, `RTMGRP_IPV4_IFADDR`, `RTMGRP_IPV6_IFADDR`,
   `RTMGRP_IPV4_ROUTE`, `RTMGRP_IPV6_ROUTE`). Elsewhere it MUST say once that changes are not
-  detected.
-- **N-50.** Events MUST be coalesced for `NETWORK_SETTLE` (500 ms) after the last one. A change is
-  real only if the routable addresses (`local_route_ips`) or a default route differ from the
-  previous ones. Events that change neither MUST NOT start N-51.
-- **N-51.** On a real change the daemon MUST, at once and in this order:
-  - discard every observed (reflexive) address (`refresh_observed`);
-  - drop mappings held for an internal address the machine no longer has (RFC 6887 §11.5), and
-    advertise the new routable addresses at once (`routable_endpoints`), with no gateway work;
-  - publish every attached node's address record to its own board and to every anchor, without
-    waiting for the record's renewal;
-  - probe every connection this end accepted, and every anchor's, and close and redial each one
-    that does not answer within the probe's patience (`close_stranded`). QUIC lets only the
-    dialling end migrate (RFC 9000 §9), so an accepted connection on an address that went does
-    not survive the move; one that answers did, and is kept;
-  - then run the full publish side (`rediscover`), gateway work included.
+  detected. On a supported platform, a watcher open or read failure MUST be reported and retried
+  with bounded backoff, without restarting the daemon. Reopening MUST reconcile the current
+  network with the last known state, rather than lose changes that happened while it was down.
+- **N-50.** Events MUST be coalesced for `NETWORK_SETTLE` (500 ms) after the last one. A real change
+  includes a change in routable addresses (`local_route_ips`), a default next hop, or the active
+  path's outgoing interface or IPv6 scope. Losing and regaining the active path MUST also count
+  when the resulting numeric addresses and next hop repeat, including within one coalesced batch.
+  The watcher MUST retain evidence from the event sequence in that batch; comparing only its
+  starting and ending snapshots cannot establish that no path loss occurred.
+  Unrelated interface or route chatter MUST NOT start N-51. Route observation MUST distinguish a
+  known route, known absence, and a failed or unavailable observation: an error is not evidence
+  that a route disappeared. Every successful observation MUST update the comparison baseline,
+  including the first known route after an unknown baseline, even when there is insufficient
+  evidence to declare a real change.
+- **N-51.** Recovery MUST reuse the daemon's shared presence and the existing reachability ladder.
+  On a real change the daemon MUST promptly:
+  - invalidate old-path reflexive observations and mappings for every affected address family.
+    A lease belongs to the path and gateway where it was obtained, not just to its internal IP:
+    retaining that IP on a different gateway or interface MUST NOT retain or renew the old lease;
+  - advertise current routable addresses (`routable_endpoints`) and publish every attached node's
+    address record to its own board and authorized anchors, preserving N-34's scopes, without
+    waiting for gateway discovery, record renewal or old-network retry delays;
+  - probe connections affected by the change, including outgoing direct connections as well as
+    accepted and anchor connections, and close and redial those that do not answer within the
+    probe's patience (`close_stranded`). Connections that remain usable and unaffected loopback
+    connections MUST be kept. QUIC migration alone MUST NOT be assumed to repair both ends;
+  - refresh known hostname endpoints for the current network and retry eligible peers and anchors
+    through the existing direct, rendezvous, punching and relay paths. DNS work MUST be bounded
+    and MUST NOT hold up local IPC, node attachment or a usable numeric endpoint;
+  - run the full publish side (`rediscover`), gateway work included, and publish any newly usable
+    endpoints. Old-network dial, DNS, discovery or mapping results MUST NOT replace newer path
+    state, publish stale endpoints, or suppress current-network attempts. Retries MUST remain
+    bounded; discarding old-network failures MUST NOT create a busy retry loop.
+
+  **Established peers (2026-10-15).** After a network move, an established peer relationship MUST
+  recover without a restart, rejoin, new trust grant, manual anchor edit or other operator action:
+  directly where possible, otherwise through a known authorized anchor as rendezvous or relay,
+  and back to direct when direct reach becomes usable. Actual new messages MUST flow after
+  recovery, with the same identities, trust and room membership. N-2 and N-11 still apply: an
+  absent or broken anchor MUST NOT impede a usable direct connection. This does not promise to
+  discover unknown infrastructure; when no direct path or known usable helper exists, N-38's
+  truthful reachability limitation still applies.
 - **N-52.** The daemon MUST say each real change once in its log and to every attached client:
-  which addresses came and went, which default routes changed, and what was republished
-  (`NodeEvent::NetworkChanged`). `vox status --json` MUST name the last change, its time and what
-  it was (`network_changed: {at, change}`).
+  which addresses came and went, which default routes or active paths changed, and what was
+  republished (`NodeEvent::NetworkChanged`). `vox status --json` MUST name the last change, its time
+  and what it was (`network_changed: {at, change}`).
 
 #### Finding the gateway
 
@@ -407,6 +472,12 @@ Found by an outside review (2026-10-04) and confirmed in code at integrate `3d52
 #### Proofs
 
 - **N-58.** Each of N-49–N-57 MUST have a real-binary proof that a person could repeat:
+
+  The v0.4.6 recovery proofs MUST extend existing user journeys and run on demand under ADR-018,
+  rather than add a permanent test harness or CI gate. A proof MUST distinguish a PRODUCT failure
+  from an APPARATUS failure; preserved greens are repeated only when the relevant behavior changes
+  or smoke justifies it. Each changed claim MUST have its own mutant red on the user's outcome.
+
   - **Network change (N-49–N-52).** A peer holds a connection to a daemon, and the daemon's machine
     gains an address and loses the one in use, staged as a real interface change. On Linux this is
     an unprivileged network namespace (`unshare --user --net`) with dummy interfaces. On macOS it is
@@ -415,6 +486,23 @@ Found by an outside review (2026-10-04) and confirmed in code at integrate `3d52
     show the new advertised addresses within 2 s of the change. With nothing sent, the daemon MUST
     hold a new connection to the peer within 3 s, and the peer MUST read a post sent after the
     change within 5 s, not after `SILENCE_IS_DEATH` (`a_network_change_is_noticed_and_acted_on_proof`).
+  - **Direct, then anchor-assisted, then direct (N-34, N-49–N-52).** Extend that journey with a
+    known authorized anchor: establish direct message delivery, move the peer to a network where
+    that direct path fails but the anchor is reachable, then restore direct reach. At each stage
+    a new post MUST reach the other peer without restart, rejoin, trust changes or manual
+    configuration. The product's connection status MUST show the recovered path and eventual
+    return to direct. Removing the unneeded anchor MUST NOT interrupt the direct leg. A stale
+    machine endpoint and a working room endpoint for the same anchor identity MUST still permit
+    recovery, without publishing another room to that anchor or changing its authority.
+  - **Path and observer recovery (N-49–N-52).** Staged real network changes MUST cover a gateway
+    change while the internal IP stays the same, an outgoing interface or scoped path change
+    with repeated numeric addresses, and active-path loss and restoration inside one settle
+    interval. After an initially unavailable route observation becomes known, a later route-only
+    change MUST still recover message delivery. After an interrupted watcher recovers, a change
+    made during that interruption MUST also recover delivery without a daemon restart. These
+    claims MUST be judged by the running product's advertised reach, connection status and new
+    message delivery, not assertions on its internal counters or state. Fault injection belongs
+    in external apparatus or a `test-knobs` build, never in the packaged binary.
   - **Gateway (N-53, N-54).** `vox status --json` on macOS and on Linux MUST name the same IPv4 and
     IPv6 default next hops that `route -n get default` and `route -n get -inet6 default` (or `ip
     route`, `ip -6 route`) print.

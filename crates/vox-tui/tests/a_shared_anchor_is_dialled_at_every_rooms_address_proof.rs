@@ -11,7 +11,7 @@
 //!
 //! **The scene.** A real anchor (`vox node`), alice (`vox daemon --anchor` it) with two rooms,
 //! and bob (`vox daemon` with **no anchor of his own**), who joins both from invites alice
-//! issued, edited as a stale invite would be:
+//! issued for explicitly anchored rooms (`room create --room-anchor`), edited as a stale invite would be:
 //! - the room that sorts **first** (the order the node walks its rooms in, by room id) names the
 //!   anchor at **eight dead ports** only;
 //! - the other names it at its one real address.
@@ -20,7 +20,11 @@
 //! the second through the anchor. Then the anchor is stopped (SIGINT) and started again on the
 //! same port, so bob's connection to it is gone and only his redial can bring it back.
 //!
-//! **Asserted:** bob has no anchors file; both joins succeed; within [`BACK_WITHIN`] of the
+//! After both joins Bob adds a stale machine address for that same anchor identity (#937).
+//! The manual source must not suppress the working room endpoint or the other room's candidates.
+//!
+//! **Asserted:** bob initially has no anchors file; both joins and the manual addition succeed;
+//! within [`BACK_WITHIN`] of the
 //! anchor's restart bob says `connected to this anchor` again.
 //!
 //! **Which side a red is on.** `PRODUCT:` quotes what vox said or did (a join refused, an anchor
@@ -35,7 +39,8 @@
 //!
 //! **Mutation that must turn it red:** the union filled room by room and cut at eight
 //! (`kept_anchors` in `actor.rs`, candidate 2): the first room's eight dead ports are all bob
-//! redials, and he never reaches the anchor again.
+//! redials, and he never reaches the anchor again. For #937, restore the manual-source early
+//! return in `kept_anchors`: only the machine's dead address is dialled and the same outcome is red.
 //!
 //! The window that walks a union larger than one dial (`ANCHOR_DIAL_CANDIDATES`, 32 addresses,
 //! five rooms of eight distinct stale addresses each) rests on review.
@@ -323,7 +328,16 @@ fn a_shared_anchor_is_redialled_at_every_rooms_address() {
     for name in ["one", "two"] {
         let (ok, _, err) = vox(
             &alice_dir,
-            &["room", "create", "--passphrase-file", "-", "--name", name],
+            &[
+                "room",
+                "create",
+                "--passphrase-file",
+                "-",
+                "--name",
+                name,
+                "--room-anchor",
+                &spec,
+            ],
             Some(ROOM_PASS),
         );
         assert!(ok, "PRODUCT (staging): alice's room create: {err}");
@@ -408,6 +422,15 @@ fn a_shared_anchor_is_redialled_at_every_rooms_address() {
         held.contains(&first) && held.contains(&second),
         "PRODUCT: bob joined both rooms and `vox room list` does not show both: {held:?}"
     );
+    let stale_manual = format!("{anchor_id}@{}", dead[0]);
+    let (ok, out, err) = vox(&bob_dir, &["anchor", "add", &stale_manual], None);
+    assert!(
+        ok,
+        "PRODUCT (staging): bob could not add the stale manual endpoint: {out}{err}"
+    );
+    println!(
+        "[proof] bob's stale machine endpoint: {stale_manual}; room two still supplies {real_addr}"
+    );
     // The second join reached the anchor itself (its board), so bob holds a connection to it
     // now, filed by the join rather than by an anchor dial; the restart takes it away.
     std::thread::sleep(Duration::from_secs(3));
@@ -488,7 +511,7 @@ fn a_shared_anchor_is_redialled_at_every_rooms_address() {
         panic!(
             "PRODUCT: bob never reached the anchor again within {:?} of its restart. Two rooms name it: \
              {first} at {} dead ports, {second} at {real_addr}; he must redial it at both \
-             rooms' addresses, not only the first room's eight.\nbob's stderr:\n{}",
+             rooms' addresses, not only the first room's eight or the stale manual source.\nbob's stderr:\n{}",
             BACK_WITHIN + PATIENCE,
             dead.len(),
             std::fs::read_to_string(&bob_err).unwrap_or_default()
