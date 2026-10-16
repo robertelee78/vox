@@ -7669,6 +7669,7 @@ impl ChannelState {
     /// been used, so the caller still queues the chains, and the body is pushed onto `expired` to
     /// be pruned **after** the commit — pruning writes, and a write opened while `batch` is open
     /// blocks forever (redb).
+    #[allow(clippy::too_many_arguments)]
     fn render_content_into(
         &mut self,
         batch: &mut crate::node::store::Batch<'_>,

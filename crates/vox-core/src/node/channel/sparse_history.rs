@@ -604,6 +604,7 @@ pub(crate) enum HistoryEffectProgress {
 impl ChannelState {
     /// One signed-context coordinate per call. The caller retains only (hash,next), never
     /// a full context/map, and holds the shared read/verification envelope for this turn.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn advance_history_effect(
         &mut self,
         store: &Store,
@@ -633,11 +634,27 @@ impl ChannelState {
             ))?;
         if finished {
             let author = header.skeleton.author_id;
+            // Header/effect completion does not prove that an explicitly selected content body
+            // was retained. Sparse history can settle the authenticated header first and fetch
+            // its body in a later bounded turn. Keep that exact body staged until refill has run
+            // it through the ordinary projection and durable-cache transaction.
+            let refill_pending = body_expected
+                && header
+                    .skeleton
+                    .v2
+                    .as_ref()
+                    .is_some_and(|v2| v2.kind == SignedEntryKind::Content)
+                && input
+                    .retention(hash)?
+                    .is_none_or(|tracked| tracked.cache_id.is_none());
             drop(input);
             // Feed restoration is local accepted-header maintenance. Advance at most one
-            // successor in this bounded turn, but do not retain the source capability after
-            // this exact entry's semantic effect has already completed.
+            // successor in this bounded turn, including while the exact staged body continues
+            // through refill below.
             self.advance_history_contiguous(store, &author)?;
+            if refill_pending {
+                return Ok(HistoryEffectProgress::RefillPending { governance: false });
+            }
             return Ok(HistoryEffectProgress::Complete {
                 rendered: cursor.rendered,
             });
@@ -871,6 +888,7 @@ impl ChannelState {
 impl ChannelState {
     /// Refill an exact missing body after typed validation, without changing its signed
     /// identity. A large-record envelope owns `entry` through this transaction and rendering.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn refill_history_body(
         &mut self,
         store: &Store,

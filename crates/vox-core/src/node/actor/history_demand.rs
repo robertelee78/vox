@@ -1057,7 +1057,9 @@ fn prepare(
         if state.request != request {
             return Err("The history request changed.".into());
         }
-        if state.remaining == 0 || state.cursor.is_some_and(|c| c.next_seq > state.bounds.hi) {
+        if state.body.is_none()
+            && (state.remaining == 0 || state.cursor.is_some_and(|c| c.next_seq > state.bounds.hi))
+        {
             return Err("This history interval has no remaining entries.".into());
         }
         let head = room
