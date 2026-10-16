@@ -18,7 +18,8 @@ use super::transport::{Read, Transport};
 use super::{Continuation, Frame, ProofKind, Query, RequestId, Status};
 
 const VERIFY_ENVELOPE: usize = 4 * 1024 * 1024;
-const MAX_NEEDS: usize = 128;
+// One atomic metadata object, or one selected staged body, per receiver handoff.
+const MAX_NEEDS: usize = 1;
 
 /// Owned activation supplied by the actor after explicit archive demand or current live/control
 /// scheduling. Constructing a receiver never starts, resumes or replaces that activation.
@@ -1162,15 +1163,16 @@ impl Receiver {
                     admission::Preflight::Need(query) => {
                         LocalResult::wait(step, LocalNeed::Wire(query))
                     }
-                    admission::Preflight::Entry { head, seq } => {
-                        LocalResult::wait(step, LocalNeed::Entry { head, seq })
-                    }
-                    admission::Preflight::Control { head, through } => LocalResult::wait(
+                    admission::Preflight::Control {
+                        head,
+                        through,
+                        effects,
+                    } => LocalResult::wait(
                         step,
                         LocalNeed::Control {
                             head,
                             through,
-                            effects: true,
+                            effects,
                         },
                     ),
                     admission::Preflight::Busy => LocalResult::busy(step),
@@ -1329,9 +1331,9 @@ impl Receiver {
                 drop(input);
                 let progress = room.history_write(store, |index| {
                     if effects {
-                        index.advance_control_effects(&head)
+                        index.advance_control_effects(&head, through)
                     } else {
-                        index.advance_control_sources(&head)
+                        index.advance_control_sources(&head, through)
                     }
                 })?;
                 let needed = if let SourceProgress::PendingEffect { hash } = &progress {
@@ -1372,14 +1374,6 @@ impl Receiver {
                     from: after + 1,
                     to: through,
                 }),
-            ),
-            (SourceProgress::PendingPrefix { head, through }, _) => LocalResult::wait(
-                step,
-                LocalNeed::Control {
-                    head,
-                    through,
-                    effects,
-                },
             ),
             (
                 SourceProgress::MissingSource { seq, .. }

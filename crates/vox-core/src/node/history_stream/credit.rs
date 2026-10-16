@@ -13,6 +13,7 @@ pub(super) struct Response {
     wire_limit: usize,
     wire_used: usize,
     headers_left: usize,
+    metadata_left: usize,
     body: Option<BodyCredit>,
     done: bool,
     inventory_seen: bool,
@@ -37,12 +38,18 @@ impl Response {
             Query::Entry { .. } | Query::Header { .. } => (MAX_RESPONSE_BYTES, 1),
             _ => (MAX_RESPONSE_BYTES, 0),
         };
+        let metadata_left = match query {
+            Query::Page { entries, .. } => entries,
+            Query::Inventory => 0,
+            _ => 1,
+        };
         Ok(Self {
             request,
             query,
             wire_limit,
             wire_used: 0,
             headers_left,
+            metadata_left,
             body: None,
             done: false,
             inventory_seen: false,
@@ -144,6 +151,14 @@ impl Response {
                 self.inventory_seen = true;
             }
             Frame::Meta { request, object } if *request == self.request => {
+                // Atomic object queries have exactly one metadata result. Keep reading
+                // DONE (including its status/continuation), but reject duplicate objects
+                // before they can multiply verifier/dependency handoffs. Page headers
+                // retain their explicitly requested count; the receiver stages one body.
+                self.metadata_left = self
+                    .metadata_left
+                    .checked_sub(1)
+                    .ok_or(Error::SizeLimitExceeded("history metadata objects"))?;
                 if self
                     .body
                     .as_ref()

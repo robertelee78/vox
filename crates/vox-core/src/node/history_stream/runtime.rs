@@ -93,6 +93,9 @@ pub(crate) struct Flow {
     pub(crate) external: Option<(Digest32, u64)>,
     pub(crate) archive_status: Option<crate::node::api::HistoryDemandStatus>,
     tasks: Vec<Task>,
+    // One exact suspended foreground root. Intermediate pre-body continuations
+    // are re-derived from durable receipts after the current dependency finishes.
+    replay: Option<Task>,
     slots: Arc<BodySlots>,
     owners: [Option<RequestId>; 2],
     no_progress: u8,
@@ -114,6 +117,13 @@ pub(crate) struct Flow {
     // Declared last: actual state/capabilities die before the shared admission is returned.
     _state_charge: crate::node::history_budget::FlowStateCharge,
 }
+// The retained-flow permit includes the exact Vec allocation, the scalar replay root,
+// and conservative room for the one-object receiver handoff and small staging handles.
+// Dependency depth cannot increase this allocation: pre-body ancestry is replayed above.
+const _: () = assert!(
+    std::mem::size_of::<Flow>() + MAX_TASKS * std::mem::size_of::<Task>() + 4096
+        <= crate::node::history_budget::FLOW_STATE_BYTES
+);
 impl Flow {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn foreground(
@@ -152,7 +162,8 @@ impl Flow {
             admitted_authors: 0,
             external: None,
             archive_status: None,
-            tasks: Vec::new(),
+            tasks: Vec::with_capacity(MAX_TASKS),
+            replay: None,
             slots,
             owners: [None, None],
             no_progress: 0,
@@ -255,11 +266,16 @@ impl Flow {
             cleanup_store,
             cleanup_job,
             cleanup_after: None,
-            tasks: vec![Task {
-                request,
-                purpose: Purpose::History,
-                operation: Operation::Wire(query),
-            }],
+            tasks: {
+                let mut tasks = Vec::with_capacity(MAX_TASKS);
+                tasks.push(Task {
+                    request,
+                    purpose: Purpose::History,
+                    operation: Operation::Wire(query),
+                });
+                tasks
+            },
+            replay: None,
             live_context: None,
             control_context: control,
             live: None,
@@ -282,13 +298,14 @@ impl Flow {
         self.inventory && !self.initialized
     }
     pub(crate) fn done(&self) -> bool {
-        self.tasks.is_empty()
+        self.tasks.is_empty() && self.replay.is_none()
     }
     pub(crate) fn lane(&self) -> crate::node::history_budget::Lane {
         use crate::node::history_budget::Lane;
         match self
             .tasks
             .last()
+            .or(self.replay.as_ref())
             .map(|task| (&task.operation, task.purpose))
         {
             Some((Operation::Wire(Query::Entry { .. } | Query::Page { .. }), Purpose::History)) => {
@@ -482,6 +499,11 @@ impl Flow {
             (self.instance, self.generation) = value.value;
             self.initialized = true;
             return Ok(());
+        }
+        if self.tasks.is_empty() {
+            if let Some(root) = self.replay.take() {
+                self.tasks.push(root);
+            }
         }
         let Some(task) = self.tasks.pop() else {
             return Ok(());
@@ -702,10 +724,30 @@ impl Flow {
             Operation::Local(step) => {
                 let result = receiver.local_step(job, step, crate::time::Ms(now)).await?;
                 if let Some(next) = result.next {
-                    self.push(Task {
+                    let continuation = Task {
                         operation: Operation::Local(next),
                         ..task.clone()
-                    })?;
+                    };
+                    let rederive = matches!(
+                        next,
+                        LocalStep::Entry {
+                            phase: EntryPhase::Start | EntryPhase::Preflight { .. },
+                            ..
+                        } | LocalStep::Control { .. }
+                    );
+                    if !self.archive && result.need.is_some() && rederive {
+                        // Keep the oldest exact root, not an unbounded ancestry stack.
+                        // Their proof inputs and control-prefix progress are sealed. Any
+                        // exact staged body/slot stays owned by this Flow, unchanged. Once the dependency work
+                        // drains, this root discovers any omitted intermediate work again.
+                        // Verify/Validate, Body, publication, effects, reclaim
+                        // and explicit archive continuations are never compacted.
+                        if self.replay.is_none() {
+                            self.replay = Some(continuation);
+                        }
+                    } else {
+                        self.push(continuation)?;
+                    }
                 }
                 if result.busy {
                     self.waiting = true;

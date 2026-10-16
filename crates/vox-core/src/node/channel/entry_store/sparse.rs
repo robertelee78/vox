@@ -968,10 +968,6 @@ pub(crate) enum SourceProgress {
     PendingEffect {
         hash: Digest32,
     },
-    PendingPrefix {
-        head: Digest32,
-        through: u64,
-    },
     ConflictingSource {
         author: Digest32,
         seq: u64,
@@ -1888,15 +1884,24 @@ impl Write<'_, '_> {
     }
     /// Advance one covered interval or one enumerated control. A source-complete receipt
     /// is distinct from governance completion and never requires a whole head ready first.
-    pub(crate) fn advance_control_sources(&mut self, head_id: &Digest32) -> Result<SourceProgress> {
-        self.advance_control_receipt(head_id, false)
+    pub(crate) fn advance_control_sources(
+        &mut self,
+        head_id: &Digest32,
+        required: u64,
+    ) -> Result<SourceProgress> {
+        self.advance_control_receipt(head_id, required, false)
     }
-    pub(crate) fn advance_control_effects(&mut self, head_id: &Digest32) -> Result<SourceProgress> {
-        self.advance_control_receipt(head_id, true)
+    pub(crate) fn advance_control_effects(
+        &mut self,
+        head_id: &Digest32,
+        required: u64,
+    ) -> Result<SourceProgress> {
+        self.advance_control_receipt(head_id, required, true)
     }
     fn advance_control_receipt(
         &mut self,
         head_id: &Digest32,
+        required: u64,
         effects: bool,
     ) -> Result<SourceProgress> {
         self.require_sparse_idle()?;
@@ -1937,8 +1942,11 @@ impl Write<'_, '_> {
         let through = source
             .number(self.sek, self.channel, prefix_root, &hashed(head_id))?
             .unwrap_or(0);
-        if through >= head.root.leaves {
-            if effects {
+        if required == 0 || required > head.root.leaves {
+            return Err(invalid("control receipt requested prefix"));
+        }
+        if through >= required {
+            if effects && through >= head.root.leaves {
                 self.publish_control_ready(&head)?;
             }
             return Ok(SourceProgress::Complete { through });
@@ -1962,7 +1970,8 @@ impl Write<'_, '_> {
                 let inherited = source
                     .number(self.sek, self.channel, prefix_root, &hashed(&prior.id()))?
                     .unwrap_or(0)
-                    .min(prior.root.leaves);
+                    .min(prior.root.leaves)
+                    .min(required);
                 if inherited > through {
                     let updated = self.change_value(
                         prefix_root,
@@ -1976,10 +1985,9 @@ impl Write<'_, '_> {
                     }
                     return Ok(SourceProgress::Progress { through: inherited });
                 }
-                return Ok(SourceProgress::PendingPrefix {
-                    head: prior.id(),
-                    through: prior.root.leaves,
-                });
+                // Prior-head receipts are only reusable progress. If absent, prove the
+                // requested prefix under this already consistency-accepted head itself;
+                // do not recursively walk an arbitrarily long chain of prior heads.
             }
         }
         let after = source
@@ -2024,6 +2032,10 @@ impl Write<'_, '_> {
             }
             return Ok(SourceProgress::Progress { through });
         }
+        // A strict-past request must never require a later control (possibly the entry
+        // whose own admission is waiting here). Keep the interval cursor until its real
+        // end is reached, so a later request can continue this same authenticated range.
+        let stop = hi.min(required);
         let next = source.first(
             self.sek,
             self.channel,
@@ -2038,8 +2050,8 @@ impl Write<'_, '_> {
                         .try_into()
                         .map_err(|_| invalid("control source position"))?,
                 );
-                if seq > hi {
-                    (hi, true)
+                if seq > stop {
+                    (stop, stop == hi)
                 } else {
                     let wire =
                         source.sparse_record(self.sek, self.channel, id, MAX_HEADER_BYTES)?;
@@ -2087,7 +2099,7 @@ impl Write<'_, '_> {
             Some((key, _)) if key[..32] == head_id[..] => {
                 return Err(invalid("control source locator"))
             }
-            _ => (hi, true),
+            _ => (stop, stop == hi),
         };
         let updated = self.change_value(
             prefix_root,
@@ -2111,7 +2123,7 @@ impl Write<'_, '_> {
         if effects && next_through >= head.root.leaves {
             self.publish_control_ready(&head)?;
         }
-        Ok(if next_through >= head.root.leaves {
+        Ok(if next_through >= required {
             SourceProgress::Complete {
                 through: next_through,
             }

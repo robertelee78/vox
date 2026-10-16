@@ -631,10 +631,16 @@ pub(super) fn advance_entry(
 /// authenticated frontier as well as the claimed pre-context, so an underclaim cannot occupy
 /// the sole control-body slot before its omitted prerequisite control has been received.
 pub(super) enum Preflight {
-    Progress { parent: usize, next: usize },
+    Progress {
+        parent: usize,
+        next: usize,
+    },
     Need(Query),
-    Entry { head: Digest32, seq: u64 },
-    Control { head: Digest32, through: u64 },
+    Control {
+        head: Digest32,
+        through: u64,
+        effects: bool,
+    },
     Complete,
     Busy,
 }
@@ -732,6 +738,24 @@ pub(super) fn preflight(
         if receipt.included().header().entry().entry_hash() != reference.hash {
             return Err(invalid("preflight parent receipt differs"));
         }
+        // SparseValidation requires this exact parent prefix, not only the
+        // control coordinates named in its frontier. Finish it before taking a body
+        // slot; validation then cannot recursively discover an earlier control.
+        let through = receipt.prefix().prefix().leaves;
+        for effects in [false, true] {
+            let complete = if effects {
+                input.control_effects_complete(&parent_head, through)?
+            } else {
+                input.control_sources_complete(&parent_head, through)?
+            };
+            if !complete {
+                return Ok(Preflight::Control {
+                    head: parent_head,
+                    through,
+                    effects,
+                });
+            }
+        }
         receipt.prefix().prefix().frontier
     };
     let Some(context) = input.history_context(&context_id)? else {
@@ -761,19 +785,30 @@ pub(super) fn preflight(
             if target.root.leaves < coordinate.seq {
                 return Ok(Preflight::Need(Query::Head(coordinate.author)));
             }
-            return Ok(Preflight::Entry {
+            // Advance the authenticated control range from its durable prefix.
+            // Fetching its latest coordinate directly recursively descends the chain.
+            return Ok(Preflight::Control {
                 head: control_head,
-                seq: coordinate.seq,
+                through: coordinate.seq,
+                effects: false,
             });
         };
         if control.entry_hash() != coordinate.hash {
             return Err(invalid("preflight control coordinate differs"));
         }
-        if !input.control_effects_complete(&control_head, coordinate.seq)? {
-            return Ok(Preflight::Control {
-                head: control_head,
-                through: coordinate.seq,
-            });
+        for effects in [false, true] {
+            let complete = if effects {
+                input.control_effects_complete(&control_head, coordinate.seq)?
+            } else {
+                input.control_sources_complete(&control_head, coordinate.seq)?
+            };
+            if !complete {
+                return Ok(Preflight::Control {
+                    head: control_head,
+                    through: coordinate.seq,
+                    effects,
+                });
+            }
         }
     }
     Ok(if end < context.coordinates.len() {
