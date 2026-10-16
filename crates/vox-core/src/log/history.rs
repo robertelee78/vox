@@ -161,6 +161,17 @@ pub struct TreeBinding {
     pub author: Digest32,
 }
 impl TreeBinding {
+    fn decode(d: &mut Decoder<'_>) -> Result<Self> {
+        arity(d, 4, "tree binding arity")?;
+        if d.uint()? != 2 {
+            return Err(Error::MalformedBundle("tree binding format"));
+        }
+        Ok(Self {
+            room: digest(d)?,
+            scope: LogScope::decode(d.uint()?)?,
+            author: digest(d)?,
+        })
+    }
     fn encode(&self, e: &mut Encoder) {
         e.array(4)
             .uint(2)
@@ -650,6 +661,16 @@ impl WorkBudget {
         }
         self.object_loads_left -= 1;
         self.coordinates_left -= visits;
+        true
+    }
+    pub(crate) fn take_control_lookup(&mut self) -> bool {
+        // A control source locator, its bounded signed header and its completion receipt,
+        // plus binary-search/hash binding work in the already loaded canonical maps.
+        if self.object_loads_left < 3 || self.coordinates_left < 32 {
+            return false;
+        }
+        self.object_loads_left -= 3;
+        self.coordinates_left -= 32;
         true
     }
     pub(crate) fn take_object_load(&mut self) -> bool {
@@ -1165,6 +1186,38 @@ pub struct IncludedHeader {
     header: VerifiedHeader,
 }
 impl IncludedHeader {
+    pub(crate) fn local_receipt(&self) -> Result<Vec<u8>> {
+        let mut e = Encoder::new();
+        e.array(5).uint(1).bytes(&self.head_id);
+        self.binding.encode(&mut e);
+        self.root.encode(&mut e);
+        e.bytes(&self.header.entry().header_wire());
+        checkpoint_bytes(e)
+    }
+    /// Only bytes authenticated by the local sealed receipt store may call this. This is
+    /// not a wire decoder or an alternate peer signature/inclusion verification path.
+    pub(crate) fn from_authenticated_receipt(bytes: &[u8]) -> Result<Self> {
+        let mut d = checkpoint_decoder(bytes)?;
+        arity(&mut d, 5, "included receipt arity")?;
+        if d.uint()? != 1 {
+            return Err(Error::MalformedAtRest("included receipt version"));
+        }
+        let head_id = digest(&mut d)?;
+        let binding = TreeBinding::decode(&mut d)?;
+        let root = Descriptor::decode(&mut d)?;
+        let header = local_header(&mut d)?;
+        d.finish()?;
+        binding.matches_entry(header.entry())?;
+        if header.entry().skeleton.seq > root.leaves {
+            return Err(Error::MalformedAtRest("included receipt position"));
+        }
+        Ok(Self {
+            head_id,
+            binding,
+            root,
+            header,
+        })
+    }
     /// Exact authenticated target head identity.
     pub fn head_id(&self) -> Digest32 {
         self.head_id
@@ -1195,6 +1248,16 @@ pub struct InclusionVerifier {
     current: Option<Descriptor>,
 }
 impl InclusionVerifier {
+    /// Exact immutable target of an authenticated local checkpoint, checked by its store slot.
+    pub(crate) fn checkpoint_target(&self) -> (Digest32, TreeBinding, u64, u64) {
+        let (from, through) = (self.proof.position, self.proof.position);
+        (
+            self.head.head().id(),
+            self.head.head().binding,
+            from,
+            through,
+        )
+    }
     /// Bind this reconstruction cursor to its exact immutable inputs.
     pub fn new(head: VerifiedHead, header: VerifiedHeader, proof: InclusionProof) -> Result<Self> {
         proof.validate()?;
@@ -1287,6 +1350,38 @@ pub struct ConsistentPrefix {
     root: Descriptor,
 }
 impl ConsistentPrefix {
+    pub(crate) fn local_receipt(&self) -> Result<Vec<u8>> {
+        let mut e = Encoder::new();
+        e.array(5).uint(1).bytes(&self.head_id);
+        self.binding.encode(&mut e);
+        self.prefix.encode(&mut e);
+        self.root.encode(&mut e);
+        checkpoint_bytes(e)
+    }
+    /// Restore only from the authenticated local receipt store, never peer bytes.
+    pub(crate) fn from_authenticated_receipt(bytes: &[u8]) -> Result<Self> {
+        let mut d = checkpoint_decoder(bytes)?;
+        arity(&mut d, 5, "prefix receipt arity")?;
+        if d.uint()? != 1 {
+            return Err(Error::MalformedAtRest("prefix receipt version"));
+        }
+        let head_id = digest(&mut d)?;
+        let binding = TreeBinding::decode(&mut d)?;
+        let prefix = Descriptor::decode(&mut d)?;
+        let root = Descriptor::decode(&mut d)?;
+        d.finish()?;
+        if prefix.leaves > root.leaves
+            || (prefix.leaves == 0 && prefix != Descriptor::empty(binding))
+        {
+            return Err(Error::MalformedAtRest("prefix receipt bounds"));
+        }
+        Ok(Self {
+            head_id,
+            binding,
+            prefix,
+            root,
+        })
+    }
     /// Exact authenticated target head identity.
     pub fn head_id(&self) -> Digest32 {
         self.head_id
@@ -1320,6 +1415,16 @@ pub struct ConsistencyVerifier {
     old_joined: bool,
 }
 impl ConsistencyVerifier {
+    /// Exact immutable target of an authenticated local checkpoint, checked by its store slot.
+    pub(crate) fn checkpoint_target(&self) -> (Digest32, TreeBinding, u64, u64) {
+        let (from, through) = (self.proof.from, self.proof.to);
+        (
+            self.head.head().id(),
+            self.head.head().binding,
+            from,
+            through,
+        )
+    }
     /// Bind this reconstruction cursor to its exact immutable inputs.
     pub fn new(head: VerifiedHead, prefix: Descriptor, proof: ConsistencyProof) -> Result<Self> {
         proof.validate()?;
@@ -1615,6 +1720,16 @@ pub struct ControlRangeVerifier {
     headers: Vec<VerifiedHeader>,
 }
 impl ControlRangeVerifier {
+    /// Exact immutable target of an authenticated local checkpoint, checked by its store slot.
+    pub(crate) fn checkpoint_target(&self) -> (Digest32, TreeBinding, u64, u64) {
+        let (from, through) = (self.proof.lo, self.proof.hi);
+        (
+            self.head.head().id(),
+            self.head.head().binding,
+            from,
+            through,
+        )
+    }
     /// Bind this reconstruction cursor to its exact immutable inputs.
     pub fn new(head: VerifiedHead, proof: ControlRangeProof) -> Result<Self> {
         proof.validate()?;

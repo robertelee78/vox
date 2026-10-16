@@ -45,6 +45,39 @@ pub(crate) struct VerifiedParentPrefix {
     prefix: ConsistentPrefix,
 }
 impl VerifiedParentPrefix {
+    pub(crate) fn included(&self) -> &IncludedHeader {
+        &self.included
+    }
+    pub(crate) fn prefix(&self) -> &ConsistentPrefix {
+        &self.prefix
+    }
+    pub(crate) fn checkpoint(&self) -> Result<Vec<u8>> {
+        let mut e = crate::cbor::Encoder::new();
+        e.array(3)
+            .uint(1)
+            .bytes(&self.included.local_receipt()?)
+            .bytes(&self.prefix.local_receipt()?);
+        let bytes = e.finish();
+        if bytes.len() > 32 * 1024 {
+            return Err(Error::SizeLimitExceeded("parent receipt"));
+        }
+        Ok(bytes)
+    }
+    /// Authenticated sealed-local state only; peer bytes must use the normal verifiers.
+    pub(crate) fn from_authenticated_checkpoint(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() > 32 * 1024 {
+            return Err(Error::SizeLimitExceeded("parent receipt"));
+        }
+        let mut d = crate::cbor::Decoder::new(bytes);
+        if d.array()? != 3 || d.uint()? != 1 {
+            return Err(Error::MalformedAtRest("parent receipt format"));
+        }
+        let included = IncludedHeader::from_authenticated_receipt(d.bytes()?)?;
+        let prefix = ConsistentPrefix::from_authenticated_receipt(d.bytes()?)?;
+        d.finish()?;
+        Self::new(included, prefix)
+    }
+
     pub(crate) fn new(included: IncludedHeader, prefix: ConsistentPrefix) -> Result<Self> {
         if included.head_id() != prefix.head_id()
             || included.binding() != prefix.binding()
@@ -235,6 +268,114 @@ impl TypedSparseBody {
 }
 
 impl SparseValidation {
+    pub(crate) fn checkpoint_target(&self) -> (Digest32, TreeBinding, u64, u64) {
+        let seq = self.included.header().entry().skeleton.seq;
+        (self.included.head_id(), self.included.binding(), seq, seq)
+    }
+    pub(crate) fn checkpoint(&self) -> Result<Vec<u8>> {
+        let mut e = crate::cbor::Encoder::new();
+        e.array(8)
+            .uint(1)
+            .bytes(&self.included.local_receipt()?)
+            .array(self.parents.len());
+        for parent in &self.parents {
+            e.bytes(&parent.checkpoint()?);
+        }
+        e.uint(self.parent as u64)
+            .uint(self.parent_coordinate as u64)
+            .uint(self.coordinate as u64)
+            .uint(u64::from(self.finished));
+        match self.payload_state {
+            SparsePayloadState::Held => {
+                e.array(1).uint(0);
+            }
+            SparsePayloadState::ContentAbsent => {
+                e.array(1).uint(1);
+            }
+            SparsePayloadState::KeyPackagePending { recipient } => {
+                e.array(2).uint(2).bytes(&recipient);
+            }
+        }
+        let bytes = e.finish();
+        if bytes.len() > 352 * 1024 {
+            return Err(Error::SizeLimitExceeded("sparse validation checkpoint"));
+        }
+        Ok(bytes)
+    }
+    /// Restore only an authenticated local operation; all source/authority facts are still
+    /// rechecked by advance. Peer input has no route to this decoder.
+    pub(crate) fn from_authenticated_checkpoint(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() > 352 * 1024 {
+            return Err(Error::SizeLimitExceeded("sparse validation checkpoint"));
+        }
+        let mut d = crate::cbor::Decoder::new(bytes);
+        if d.array()? != 8 || d.uint()? != 1 {
+            return Err(Error::MalformedAtRest("sparse validation checkpoint"));
+        }
+        let included = IncludedHeader::from_authenticated_receipt(d.bytes()?)?;
+        let count = d.array()?;
+        if count > 17 {
+            return Err(Error::MalformedAtRest("sparse checkpoint parent count"));
+        }
+        let mut parents = Vec::with_capacity(count);
+        for _ in 0..count {
+            parents.push(VerifiedParentPrefix::from_authenticated_checkpoint(
+                d.bytes()?,
+            )?);
+        }
+        let parent = usize::try_from(d.uint()?)
+            .map_err(|_| Error::MalformedAtRest("sparse checkpoint offset"))?;
+        let parent_coordinate = usize::try_from(d.uint()?)
+            .map_err(|_| Error::MalformedAtRest("sparse checkpoint offset"))?;
+        let coordinate = usize::try_from(d.uint()?)
+            .map_err(|_| Error::MalformedAtRest("sparse checkpoint offset"))?;
+        let finished = match d.uint()? {
+            0 => false,
+            1 => true,
+            _ => return Err(Error::MalformedAtRest("sparse checkpoint finished")),
+        };
+        let shape = (d.array()?, d.uint()?);
+        let state = match shape {
+            (1, 0) => SparsePayloadState::Held,
+            (1, 1) => SparsePayloadState::ContentAbsent,
+            (2, 2) => SparsePayloadState::KeyPackagePending {
+                recipient: d
+                    .bytes()?
+                    .try_into()
+                    .map_err(|_| Error::MalformedAtRest("sparse checkpoint recipient"))?,
+            },
+            _ => return Err(Error::MalformedAtRest("sparse checkpoint body state")),
+        };
+        d.finish()?;
+        if parent > count
+            || parent_coordinate > crate::log::history::MAX_CONTEXT_AUTHORS
+            || coordinate > crate::log::history::MAX_CONTEXT_AUTHORS
+            || (parent == count && parent_coordinate != 0)
+        {
+            return Err(Error::MalformedAtRest("sparse checkpoint cursor bounds"));
+        }
+        let header = included.header().entry();
+        let v2 = header
+            .skeleton
+            .v2
+            .as_ref()
+            .ok_or(Error::MalformedAtRest("sparse checkpoint header"))?;
+        if matches!(state, SparsePayloadState::ContentAbsent) && v2.kind != SignedEntryKind::Content
+            || matches!(state, SparsePayloadState::KeyPackagePending { recipient } if v2.kind != SignedEntryKind::KeyPackage || v2.recipient != Some(recipient))
+        {
+            return Err(Error::MalformedAtRest("sparse checkpoint body binding"));
+        }
+        let body = TypedSparseBody {
+            hash: header.entry_hash(),
+            state,
+        };
+        let mut cursor = Self::new(included, body, parents)?;
+        cursor.parent = parent;
+        cursor.parent_coordinate = parent_coordinate;
+        cursor.coordinate = coordinate;
+        cursor.finished = finished;
+        Ok(cursor)
+    }
     pub(crate) fn new(
         included: IncludedHeader,
         body: TypedSparseBody,
@@ -323,6 +464,11 @@ impl SparseValidation {
         {
             return Err(Error::MalformedBundle("sparse signed context binding"));
         }
+        if self.coordinate > pre.coordinates.len() {
+            return Err(Error::MalformedAtRest(
+                "sparse checkpoint coordinate exceeds context",
+            ));
+        }
         if !input.history_head_committed(&self.included.head_id(), self.included.binding())? {
             return Err(Error::MalformedBundle(
                 "sparse head has no accepted consistency",
@@ -351,6 +497,11 @@ impl SparseValidation {
             let Some(frontier) = input.history_context(&hash)? else {
                 return Ok(SparseValidationStep::MissingContext(hash));
             };
+            if self.parent_coordinate > frontier.coordinates.len() {
+                return Err(Error::MalformedAtRest(
+                    "sparse checkpoint coordinate exceeds parent",
+                ));
+            }
             if frontier.room != pre.room || frontier.scope != pre.scope {
                 return Err(Error::MalformedBundle(
                     "parent frontier room or scope differs",
@@ -365,7 +516,12 @@ impl SparseValidation {
                     "content changes control context without a control",
                 ));
             }
-            if let Some(earlier) = frontier.coordinates.get(self.parent_coordinate) {
+            let stop = self
+                .parent_coordinate
+                .saturating_add(16)
+                .min(frontier.coordinates.len());
+            while self.parent_coordinate < stop {
+                let earlier = &frontier.coordinates[self.parent_coordinate];
                 let Ok(at) = pre
                     .coordinates
                     .binary_search_by_key(&earlier.author, |coordinate| coordinate.author)
@@ -385,27 +541,36 @@ impl SparseValidation {
                 // A higher coordinate is not by itself a continuity proof. Both endpoints
                 // must belong to this node's consistency-accepted author commitment. This
                 // also rejects a malformed context hidden in an omitted content leaf.
-                if !budget.take_object_load() {
+                if !budget.take_control_lookup() {
                     return Ok(SparseValidationStep::Yielded);
                 }
                 if let Some(pending) = validate_control_coordinate(input, &pre, earlier)? {
                     return Ok(pending);
                 }
                 self.parent_coordinate += 1;
+            }
+            if self.parent_coordinate < frontier.coordinates.len() {
                 return Ok(SparseValidationStep::Progress);
             }
             self.parent += 1;
             self.parent_coordinate = 0;
             return Ok(SparseValidationStep::Progress);
         }
-        if let Some(coordinate) = pre.coordinates.get(self.coordinate) {
-            if !budget.take_object_load() {
+        let stop = self
+            .coordinate
+            .saturating_add(16)
+            .min(pre.coordinates.len());
+        while self.coordinate < stop {
+            let coordinate = &pre.coordinates[self.coordinate];
+            if !budget.take_control_lookup() {
                 return Ok(SparseValidationStep::Yielded);
             }
             if let Some(pending) = validate_control_coordinate(input, &pre, coordinate)? {
                 return Ok(pending);
             }
             self.coordinate += 1;
+        }
+        if self.coordinate < pre.coordinates.len() {
             return Ok(SparseValidationStep::Progress);
         }
         self.finished = true;

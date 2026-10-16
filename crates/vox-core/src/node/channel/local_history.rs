@@ -85,10 +85,9 @@ impl ChannelState {
     /// The actor also checks this before dispatching a mutating command. In particular a
     /// remote publication already in progress must not be discovered only after encryption.
     pub(crate) fn ensure_local_append_available(&self, store: &Store) -> Result<()> {
-        if self
-            .entries
-            .read(store, &self.sek, &self.channel_id)?
-            .publication_busy()
+        let read = self.entries.read(store, &self.sek, &self.channel_id)?;
+        if read.publication_busy()
+            || (read.sparse_enabled() && read.history_obligation_capacity() < 2)
         {
             return Err(Error::Profile(
                 "room publication is busy; retry this operation",
