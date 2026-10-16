@@ -1086,6 +1086,19 @@ impl Flow {
                     ));
                 }
                 if result.status == Status::EvidenceUnavailable && !self.archive {
+                    if matches!(query, Query::Head(author) if self.hint.is_some_and(|hint| hint.author == author))
+                        && !self.departure_probe
+                        && self.last_head.is_none()
+                        && self.replay.is_none()
+                    {
+                        // Inventory is an unauthoritative scalar hint. A peer that no longer
+                        // holds the initially named head retires only this hint; treating that
+                        // as a transport failure backs off the whole room/peer port and can leave
+                        // a later fresh head waiting behind stale third-party hints. Dependency
+                        // failures after a head was selected remain hard failures below.
+                        self.tasks.clear();
+                        return Ok(());
+                    }
                     return Err(Error::Unreachable(
                         "required current evidence is unavailable",
                     ));
@@ -1134,7 +1147,11 @@ impl Flow {
                     self.push(Task {
                         request: task.request,
                         purpose: Purpose::Control,
-                        operation: Operation::Wire(query),
+                        operation: if matches!(query, Query::Proof { .. }) {
+                            Operation::LocalProof(query)
+                        } else {
+                            Operation::Wire(query)
+                        },
                     })?;
                 }
                 for binding in result.verifiers.into_iter().rev() {
@@ -1231,13 +1248,7 @@ impl Flow {
                         self.push(Task {
                             request: task.request,
                             purpose,
-                            operation: if matches!(
-                                query,
-                                Query::Proof {
-                                    kind: super::ProofKind::Control,
-                                    ..
-                                }
-                            ) {
+                            operation: if matches!(query, Query::Proof { .. }) {
                                 Operation::LocalProof(query)
                             } else {
                                 Operation::Wire(query)
