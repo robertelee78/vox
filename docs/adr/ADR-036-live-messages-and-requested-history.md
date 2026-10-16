@@ -257,6 +257,28 @@ and post-sync scheduling may request required current control/live work, not eve
 Retry only the still-authorized bounded request; current key/control delivery remains distinct
 from private history. Keep each private request's current Drive, generation and audience checks.
 
+The existing signed and Drive-encrypted private record bytes remain unchanged. Version private
+stream 13's request/page envelope so each request is exactly one of `LiveTail`, `Lifecycle` or
+`ExplicitArchive`; refuse unknown purposes rather than interpreting them as an older-page pull.
+The logical `ExplicitArchive` operation uses separate bounded inventory and exact-record requests;
+neither subrequest may widen the operation.
+`LiveTail` samples a fixed newest window of at most 32 records and 1 MiB and advances a separate
+durable live watermark only after those records and the lifecycle evidence they require are
+accepted. An old watermark never turns the intervening gap into requested history. `Lifecycle`
+names the exact author, Session identity, descriptor version, slot and bounded part cursor and
+serves only the existing signed opening/end and current name, harness and working-directory
+metadata sources selected by that Session index descriptor; it does not carry activity.
+
+`ExplicitArchive` binds the selected donor, its current trust/Drive incarnation and an immutable
+upper arrival bound. It first exchanges a bounded inventory for the selected interval, then asks
+for at most 32 exact missing `(position, hash)` records within 1 MiB. A continuation is only a
+transport locator inside those original bounds; it grants no authority and never resumes by
+itself. Its durable state shares the node's one archive operation, status, pause, resume and
+cancel contract with public history while retaining an explicit private scope. Private cache
+hits suppress retransmission only after exact positions and hashes agree. Ratchet generation,
+replay and `MAX_SKIP` rules remain unchanged; public v2 heads or contexts never authorize a
+private record.
+
 Session history retains ADR-031's join/drive boundary: a request for older room history MUST NOT
 grant earlier private Session steps or widen trust. Retention and unavailable-peer outcomes
 remain explicit. No automatic reset or deletion of existing node data is permitted.
