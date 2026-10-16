@@ -33,6 +33,8 @@ struct Prepared {
     generation: Digest32,
     status: Status,
     dispatch: Option<Dispatch>,
+    local_only: bool,
+    selection_after: Option<Option<Digest32>>,
 }
 pub(super) struct Preparation {
     pub(super) token: u64,
@@ -54,6 +56,7 @@ pub(super) struct Controller {
     ready: Option<Dispatch>,
     running: Option<Running>,
     status: Option<Status>,
+    selection: Option<(Digest32, [u8; 16], Option<Digest32>)>,
 }
 impl Controller {
     pub(super) fn take_ready(&mut self, room: Digest32, peer: Digest32) -> Option<Dispatch> {
@@ -81,7 +84,14 @@ impl Controller {
             self.status = Some(status);
         }
     }
-    fn stop_request(&mut self, request: RequestId) {
+    fn stop_request(&mut self, room: Digest32, instance: [u8; 16], request: RequestId) {
+        if !self
+            .status
+            .as_ref()
+            .is_some_and(|s| s.room == room && s.instance == instance && s.request == Some(request))
+        {
+            return;
+        }
         if let Some(running) = self.running.as_ref().filter(|r| r.request == request) {
             running.fence.retire();
             running.cancellation.cancel();
@@ -89,6 +99,19 @@ impl Controller {
             self.ready = None;
         }
     }
+    pub(super) fn retire_room(&mut self, room: Digest32) {
+        if !self.status.as_ref().is_some_and(|s| s.room == room) {
+            return;
+        }
+        self.fence();
+        self.running = None;
+        self.ready = None;
+        if let Some(status) = &mut self.status {
+            status.phase = Phase::Paused;
+            status.detail = "This room is no longer active; its saved history request can be cancelled locally.".into();
+        }
+    }
+
     /// Stop admission synchronously; the lock settling task then owns and retires this controller.
     pub(super) fn fence(&self) {
         if let Some(running) = &self.running {
@@ -200,7 +223,17 @@ impl Node {
             ));
         }
         if let Action::Cancel { request } = action {
-            self.history_demand.stop_request(request);
+            if self.history_demand.running.is_some()
+                && !self.history_demand.status.as_ref().is_some_and(|s| {
+                    s.room == room && s.instance == instance && s.request == Some(request)
+                })
+            {
+                return Err(
+                    "The running history request belongs to a different room, instance or request."
+                        .into(),
+                );
+            }
+            self.history_demand.stop_request(room, instance, request);
         } else if self.history_demand.running.is_some() {
             return Ok(self
                 .history_demand
@@ -218,11 +251,16 @@ impl Node {
         }
         let profile = self.profile.as_ref().ok_or("node is locked")?;
         let node = profile.fingerprint();
-        let shared = self
-            .channels
-            .get(&room)
-            .cloned()
-            .ok_or("room is not open")?;
+        let local_only = matches!(action, Action::Status | Action::Cancel { .. });
+        let shared = self.channels.get(&room).cloned();
+        if !local_only && shared.is_none() {
+            return Err("room is not open".into());
+        }
+        let selection_after = self
+            .history_demand
+            .selection
+            .filter(|(r, i, _)| *r == room && *i == instance)
+            .and_then(|(_, _, after)| after);
         let secret_work = Arc::new(
             self.secret_work
                 .clone()
@@ -257,23 +295,29 @@ impl Node {
         let result_out = result.clone();
         let worker_fence = fence.clone();
         let tx = self.net_tx.clone();
-        let weak = Arc::downgrade(&shared);
+        let weak = shared.as_ref().map(Arc::downgrade).unwrap_or_default();
         let now = self.now_ms().get();
         let task = tokio::spawn(async move {
             let work = async {
                 let Some(charge) = job.reserve(5 * 1024 * 1024) else { return Err("history preparation buffers are busy".into()); };
                 let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-                let room_guard = tokio::select! {
-                    biased;
-                    () = worker_fence.retired() => return Err("history preparation cancelled".into()),
-                    guard = tokio::time::timeout_at(deadline, shared.lock_owned()) => guard.map_err(|_| "history room is busy".to_owned())?,
+                let room_guard = if local_only { None } else {
+                    let shared = shared.ok_or("room is not open")?;
+                    Some(tokio::select! {
+                        biased;
+                        () = worker_fence.retired() => return Err("history preparation cancelled".into()),
+                        guard = tokio::time::timeout_at(deadline, shared.lock_owned()) => guard.map_err(|_| "history room is busy".to_owned())?,
+                    })
                 };
                 let read_fence = worker_fence.clone();
                 // Do not detach this read on cancellation: retire() awaits its bounded completion.
                 tokio::task::spawn_blocking(move || {
                     let _charge = charge;
                     if read_fence.is_retired() || tokio::time::Instant::now() >= deadline { return Err("history preparation cancelled or expired".into()); }
-                    let answer = prepare(&room_guard, &store, node, instance, action, context, &job, peers, weak, read_fence.clone(), now, deadline);
+                    let answer = match room_guard {
+                        Some(guard) => prepare(&guard, &store, node, instance, action, context, &job, peers, weak, read_fence.clone(), now, deadline, selection_after),
+                        None => prepare_local(node, room, instance, action, context, &job, &read_fence, deadline),
+                    };
                     if read_fence.is_retired() || tokio::time::Instant::now() >= deadline { return Err("history preparation cancelled or expired".into()); }
                     answer
                 }).await.map_err(|_| "history preparation worker stopped".to_owned())?
@@ -322,18 +366,19 @@ impl Node {
                         .get(&prepared.status.room)
                         .map(|room| (profile, room))
                 });
-            let valid = current.is_some_and(|(profile, shared)| {
-                if !prepared
-                    .room
-                    .upgrade()
-                    .is_some_and(|old| Arc::ptr_eq(&old, shared))
-                {
-                    return false;
-                }
+            let valid = if prepared.local_only {
+                self.profile
+                    .as_ref()
+                    .is_some_and(|p| p.fingerprint() == prepared.node)
+            } else if let Some((profile, shared)) = current {
                 let Ok(room) = shared.try_lock() else {
                     return false;
                 };
-                room.epoch() == prepared.epoch
+                prepared
+                    .room
+                    .upgrade()
+                    .is_some_and(|old| Arc::ptr_eq(&old, shared))
+                    && room.epoch() == prepared.epoch
                     && room.history_instance(profile.store()).ok() == Some(prepared.status.instance)
                     && room.is_member(&prepared.node)
                     && !room.has_left(&prepared.node)
@@ -347,10 +392,9 @@ impl Node {
                     )
                     .ok()
                         == Some(prepared.generation)
-            });
-            if current.is_some_and(|(_, shared)| shared.try_lock().is_err()) {
-                return false;
-            }
+            } else {
+                false
+            };
             if !valid {
                 if let Some(Ok(prepared)) = result.take() {
                     if let Some(dispatch) = prepared.dispatch {
@@ -379,6 +423,10 @@ impl Node {
                 }
             }
             Ok(prepared) => {
+                if let Some(after) = prepared.selection_after {
+                    self.history_demand.selection =
+                        Some((prepared.status.room, prepared.status.instance, after));
+                }
                 self.history_demand.status = Some(prepared.status);
                 if let Some(dispatch) = prepared.dispatch {
                     self.history_demand.running = Some(Running {
@@ -399,6 +447,75 @@ impl Node {
     }
 }
 
+fn cancel_exact(
+    context: &Context,
+    request: RequestId,
+    job: &Job,
+    fence: &Fence,
+    deadline: tokio::time::Instant,
+) -> Result<(), String> {
+    if fence.is_retired() || tokio::time::Instant::now() >= deadline {
+        return Err("History cleanup cancelled or expired.".into());
+    }
+    demand::cancel(context, request, job).map_err(|e| e.to_string())?;
+    while !demand::reclaim(context, request, job).map_err(|e| e.to_string())? {
+        if fence.is_retired() || tokio::time::Instant::now() >= deadline {
+            return Err(
+                "History cleanup cancelled or expired; retry cancel to finish cleanup.".into(),
+            );
+        }
+        std::thread::yield_now();
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)] // One exact locally authorized cleanup/status operation.
+fn prepare_local(
+    node: Digest32,
+    room: Digest32,
+    instance: [u8; 16],
+    action: Action,
+    context: Arc<Context>,
+    job: &Job,
+    fence: &Fence,
+    deadline: tokio::time::Instant,
+) -> Result<Prepared, String> {
+    let mut answer = Prepared {
+        node,
+        room: Weak::new(),
+        epoch: 0,
+        generation: [0; 32],
+        status: status(
+            room,
+            instance,
+            Phase::Idle,
+            "No history request is saved for this room.",
+        ),
+        dispatch: None,
+        local_only: true,
+        selection_after: None,
+    };
+    let saved = demand::inspect(&context, job).map_err(|e| e.to_string())?;
+    let Some(saved) = saved else {
+        return Ok(answer);
+    };
+    let state = saved.state();
+    if state.binding.room != room || state.binding.instance != instance {
+        return Err("The saved history request belongs to a different room or instance.".into());
+    }
+    answer.status = saved_status(state, None, None);
+    match action {
+        Action::Status => {}
+        Action::Cancel { request } if request == state.request => {
+            cancel_exact(&context, request, job, fence, deadline)?;
+            answer.status.phase = Phase::Cancelled;
+            answer.status.detail = "History request cancelled; provisional bytes reclaimed.".into();
+        }
+        _ => return Err("The saved history request changed.".into()),
+    }
+    Ok(answer)
+}
+
 #[allow(clippy::too_many_arguments)] // One explicit local activation and its fixed captured guards.
 fn prepare(
     room: &ChannelState,
@@ -413,6 +530,7 @@ fn prepare(
     fence: Arc<Fence>,
     now: u64,
     deadline: tokio::time::Instant,
+    selection_after: Option<Digest32>,
 ) -> Result<Prepared, String> {
     let id = room.channel_id();
     if room.history_instance(store).map_err(|e| e.to_string())? != instance
@@ -438,6 +556,8 @@ fn prepare(
         generation,
         status: status(id, instance, Phase::Idle, "No history request is saved."),
         dispatch: None,
+        local_only: false,
+        selection_after: None,
     };
     let mut saved = demand::inspect(&context, job).map_err(|e| e.to_string())?;
     if saved.as_ref().is_some_and(|s| {
@@ -450,6 +570,18 @@ fn prepare(
     }) {
         saved = None;
     }
+    if let Some(previous) = saved.as_ref() {
+        let state = previous.state();
+        let replaced = state.binding.room == id && state.binding.instance != instance;
+        let removed = store
+            .get_sek_wrap(&state.binding.room)
+            .map_err(|e| e.to_string())?
+            .is_none();
+        if (replaced || removed) && matches!(action, Action::Newest | Action::Older { .. }) {
+            cancel_exact(&context, state.request, job, &fence, deadline)?;
+            saved = None;
+        }
+    }
     if let Some(saved) = saved.as_ref() {
         if saved.state().binding.room != id || saved.state().binding.instance != instance {
             return Err(
@@ -458,32 +590,6 @@ fn prepare(
             );
         }
         answer.status = saved_status(saved.state(), None, None);
-    }
-    match action {
-        Action::Status => return Ok(answer),
-        Action::Cancel { request } => {
-            let Some(saved) = saved.as_ref() else {
-                return Err("No history request is saved.".into());
-            };
-            if saved.state().request != request {
-                return Err("The history request changed.".into());
-            }
-            demand::cancel(&context, request, job).map_err(|e| e.to_string())?;
-            // Reclaim only this fixed slot, in <=1MiB/64-row transactions; no peer traffic.
-            while !demand::reclaim(&context, request, job).map_err(|e| e.to_string())? {
-                if fence.is_retired() || tokio::time::Instant::now() >= deadline {
-                    return Err(
-                        "History cleanup cancelled or expired; retry cancel to finish cleanup."
-                            .into(),
-                    );
-                }
-                std::thread::yield_now();
-            }
-            answer.status.phase = Phase::Cancelled;
-            answer.status.detail = "History request cancelled.".into();
-            return Ok(answer);
-        }
-        _ => {}
     }
     let (bounds, author, query, active, remaining) = if let Action::Resume { request } = action {
         let saved = saved.as_ref().ok_or("No history request is saved.")?;
@@ -541,10 +647,17 @@ fn prepare(
                 return Ok(answer);
             }
         }
-        let Some((bounds, author)) =
-            select(room, store, action, &fence, deadline).map_err(|e| e.to_string())?
-        else {
-            answer.status=status(id,instance,Phase::Cached,"The selected bounded content is already cached; this does not claim all history is held.");
+        let selected = select(room, store, action, &fence, deadline, selection_after)
+            .map_err(|e| e.to_string())?;
+        if matches!(action, Action::Newest) {
+            answer.selection_after = Some(selected.after);
+        }
+        let Some((bounds, author)) = selected.found else {
+            answer.status = if selected.more {
+                status(id, instance, Phase::More, "This bounded scan is cached. Request newest again to check the next authors; unchecked history remains.")
+            } else {
+                status(id, instance, Phase::Cached, "The selected bounded content is already cached; older history may still exist.")
+            };
             return Ok(answer);
         };
         let request = crate::identity::rng::random_array::<16>().map_err(|e| e.to_string())?;
@@ -606,6 +719,12 @@ fn prepare(
     Ok(answer)
 }
 
+struct Selection {
+    found: Option<(Bounds, Digest32)>,
+    after: Option<Digest32>,
+    more: bool,
+}
+
 /// Only signed headers and retained-body facts are read; a held body is never decoded to select it.
 fn select(
     room: &ChannelState,
@@ -613,9 +732,11 @@ fn select(
     action: Action,
     fence: &Fence,
     deadline: tokio::time::Instant,
-) -> crate::error::Result<Option<(Bounds, Digest32)>> {
+    after: Option<Digest32>,
+) -> crate::error::Result<Selection> {
     use crate::log::history::SignedEntryKind;
     let read = room.history_read(store)?;
+    let mut page_after = None;
     let candidates = match action {
         Action::Older { before } => {
             let bytes = read.history_object(ObjectKind::Header, &before)?.ok_or(
@@ -642,7 +763,15 @@ fn select(
             )]
         }
         Action::Newest => {
-            let heads = room.history_head_hints(store, None)?;
+            let heads = room.history_head_hints(store, after)?;
+            page_after = heads.next;
+            if heads.heads.is_empty() && (after.is_some() || heads.next.is_some()) {
+                return Ok(Selection {
+                    found: None,
+                    after: heads.next,
+                    more: heads.next.is_some(),
+                });
+            }
             if heads.heads.is_empty() {
                 return Err(crate::error::Error::Profile("Authenticated history heads are not available yet; cached messages remain available."));
             }
@@ -659,7 +788,14 @@ fn select(
         }
     };
     let mut examined = 0;
-    for (head, author, hi) in candidates {
+    let count = candidates.len();
+    let mut next = page_after;
+    for (position, (head, author, hi)) in candidates.into_iter().enumerate() {
+        next = if position + 1 < count || page_after.is_some() {
+            Some(author)
+        } else {
+            None
+        };
         if hi == 0 {
             continue;
         }
@@ -698,19 +834,27 @@ fn select(
             }
         }
         if let Some((lo, hi)) = missing {
-            return Ok(Some((
-                Bounds {
-                    head,
-                    lo,
-                    hi,
-                    entries: (hi - lo + 1) as usize,
-                },
-                author,
-            )));
+            return Ok(Selection {
+                found: Some((
+                    Bounds {
+                        head,
+                        lo,
+                        hi,
+                        entries: (hi - lo + 1) as usize,
+                    },
+                    author,
+                )),
+                after: next,
+                more: next.is_some(),
+            });
         }
         if examined == 64 {
             break;
         }
     }
-    Ok(None)
+    Ok(Selection {
+        found: None,
+        after: next,
+        more: next.is_some(),
+    })
 }

@@ -140,6 +140,7 @@ final class NodeModel: ObservableObject {
     }
     private var roomReadGeneration = UUID() {
         didSet {
+            invalidateHistoryObservation()
             cancelSidebarSelection()
             invalidateSessionPause()
             invalidateSessionAttention()
@@ -910,6 +911,7 @@ final class NodeModel: ObservableObject {
     @Published private(set) var daemonReachable = true
     private var nodeObservationEpoch = UUID() {
         didSet {
+            invalidateHistoryObservation()
             cancelSidebarSelection()
             invalidateSessionPause()
             invalidateSessionAttention()
@@ -997,6 +999,7 @@ final class NodeModel: ObservableObject {
     @Published private(set) var ended: String? {
         didSet {
             if ended != nil {
+                invalidateHistoryObservation()
                 cancelSidebarSelection()
                 clearThreadState()
                 invalidateSessionPause()
@@ -1261,6 +1264,16 @@ final class NodeModel: ObservableObject {
         roomReloadNeeded = true
     }
 
+    private func invalidateHistoryObservation() {
+        let uncertain = roomHistoryStatus != nil || roomHistorySending
+        roomHistoryPoll?.cancel()
+        roomHistoryPoll = nil
+        roomHistoryRequest = UUID()
+        roomHistorySending = false
+        roomHistoryStatus = nil
+        if uncertain { roomHistoryError = "History status changed. Check the saved request before resuming." }
+    }
+
     /// This button is the peer-history demand boundary. Scrolling and watchers remain cache-only.
     func requestOlderHistory() async {
         guard !roomHistoryBusy else { return }
@@ -1322,14 +1335,19 @@ final class NodeModel: ObservableObject {
                             let fresh = try await self.client.roomHistoryDemand(room: room, node: self.me,
                                 instance: instance, action: "status", before: nil, request: nil)
                             guard self.roomHistoryRequest == token, !Task.isCancelled,
-                                  self.roomOnScreen == room, self.roomInstance == instance else { return }
+                                  self.roomOnScreen == room, self.roomInstance == instance,
+                                  self.nodeObservationEpoch == epoch, self.roomReadGeneration == generation,
+                                  self.ended == nil else { return }
                             self.roomHistoryStatus = fresh
                             if !["preparing", "pending"].contains(fresh.phase) {
                                 await self.refreshRequestedHistory(room: room, instance: instance, token: token)
                                 return
                             }
                         } catch {
-                            guard self.roomHistoryRequest == token, !Task.isCancelled else { return }
+                            guard self.roomHistoryRequest == token, !Task.isCancelled,
+                                  self.roomOnScreen == room, self.roomInstance == instance,
+                                  self.nodeObservationEpoch == epoch, self.roomReadGeneration == generation,
+                                  self.ended == nil else { return }
                             self.roomHistoryError = String(describing: error)
                             return
                         }

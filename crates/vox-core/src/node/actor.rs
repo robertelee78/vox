@@ -17663,6 +17663,7 @@ impl Node {
     }
 
     async fn close_channel(&mut self, channel_id: &Digest32) -> Outcome {
+        self.history_demand.retire_room(*channel_id);
         // Closed on purpose, so not reopened at the next unlock (#208). Forgotten first: a room
         // that stayed in the set would come back by itself, which is not what closing it meant.
         // A room still reopening is closed too: it leaves `reopening`, so its state is dropped
@@ -17724,6 +17725,7 @@ impl Node {
     /// ([`Self::finish_leave_if_heard`]). Waiting is what makes the leave seen: a room deleted
     /// first would take the only copy of the departure with it.
     async fn begin_leave(&mut self, channel_id: Digest32, reply: oneshot::Sender<Outcome>) {
+        self.history_demand.retire_room(channel_id);
         let Some(shared) = self.channels.get(&channel_id).map(Arc::clone) else {
             let held = self
                 .profile
@@ -18137,6 +18139,7 @@ impl Node {
     /// and then the store is rewritten so none of the deleted bytes stay in the file. A room left
     /// (V210-164) or ended (the decider, 2026-10-03) goes this way.
     async fn purge_room(&mut self, channel_id: &Digest32) -> Outcome {
+        self.history_demand.retire_room(*channel_id);
         if self
             .session_rooms_retiring
             .iter()

@@ -7351,6 +7351,12 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
     // A preparing room is not empty, closed, or waiting for another passphrase. Refuse
     // its operation promptly without blocking node controls or creating a second opener.
     let room = match &request {
+        Request::HistoryDemand {
+            action:
+                crate::node::api::HistoryDemandAction::Status
+                | crate::node::api::HistoryDemandAction::Cancel { .. },
+            ..
+        } => None,
         Request::HistoryDemand { channel_id, .. }
         | Request::WorkBoard { channel_id, .. }
         | Request::Footers { channel_id, .. }

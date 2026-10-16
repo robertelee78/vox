@@ -1881,12 +1881,23 @@ async fn rows_of(
     }
 }
 
-/// `vox room read` — the room's messages, optionally only what follows a cursor.
-///
-/// Each line is `<entry-hash> <author> <text>`; with `--json`, one
-/// `vox.room.row/1` object per line. The entry hash **is** the cursor. With `--notices` too, what
-/// was done to the room, as `vox.room.notice/1` objects among them.
-///
+fn history_id(bytes: &[u8; 16]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+fn parse_history_id(text: &str) -> Result<[u8; 16], AppError> {
+    if text.len() != 32 || !text.is_ascii() {
+        return Err(AppError::Usage(
+            "History instance/request must contain exactly 32 hex digits.".into(),
+        ));
+    }
+    let mut value = [0u8; 16];
+    for (i, byte) in value.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&text[i * 2..i * 2 + 2], 16)
+            .map_err(|_| AppError::Usage("History instance/request is not hexadecimal.".into()))?;
+    }
+    Ok(value)
+}
+
 async fn history_exchange(
     client: &mut IpcClient,
     channel_id: Digest32,
@@ -1917,6 +1928,7 @@ async fn request_history(
     instance: [u8; 16],
     action: &str,
     before: Option<Digest32>,
+    saved_request: Option<[u8; 16]>,
 ) -> Result<vox_core::node::api::HistoryDemandStatus, AppError> {
     use vox_core::node::api::{HistoryDemandAction as Action, HistoryDemandPhase as Phase};
     let chosen = match action {
@@ -1927,6 +1939,19 @@ async fn request_history(
         },
         "status" => Action::Status,
         "resume" | "cancel" => {
+            if let Some(request) = saved_request {
+                return history_exchange(
+                    client,
+                    channel_id,
+                    instance,
+                    if action == "resume" {
+                        Action::Resume { request }
+                    } else {
+                        Action::Cancel { request }
+                    },
+                )
+                .await;
+            }
             let mut current =
                 history_exchange(client, channel_id, instance, Action::Status).await?;
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -1948,6 +1973,12 @@ async fn request_history(
     history_exchange(client, channel_id, instance, chosen).await
 }
 
+/// `vox room read` — the room's messages, optionally only what follows a cursor.
+///
+/// Each line is `<entry-hash> <author> <text>`; with `--json`, one
+/// `vox.room.row/1` object per line. The entry hash **is** the cursor. With `--notices` too, what
+/// was done to the room, as `vox.room.notice/1` objects among them.
+///
 /// # Errors
 /// If the node cannot be reached, the room is unknown, or the cursor is not in it.
 #[allow(clippy::too_many_arguments)]
@@ -1962,10 +1993,35 @@ pub async fn read(
     with_notices: bool,
     unread: bool,
     history: Option<&str>,
+    history_instance: Option<&str>,
+    history_request: Option<&str>,
     tagged: &Tagged,
 ) -> Result<(), AppError> {
-    let (mut client, channel_id, room_key) = open_room(paths, room).await?;
-    let footer_instance = footer_instance(&mut client, channel_id).await?;
+    let retained_instance = history_instance.map(parse_history_id).transpose()?;
+    let retained_request = history_request.map(parse_history_id).transpose()?;
+    if retained_instance.is_some() && !matches!(history, Some("status" | "cancel" | "resume")) {
+        return Err(AppError::Usage(
+            "A retained instance is only for history status, cancel or resume.".into(),
+        ));
+    }
+    if retained_instance.is_some()
+        && matches!(history, Some("cancel" | "resume"))
+        && retained_request.is_none()
+    {
+        return Err(AppError::Usage(
+            "A retained instance requires its exact --history-request for cancel or resume.".into(),
+        ));
+    }
+    let (mut client, channel_id, room_key) = if retained_instance.is_some() {
+        let cid = parse_cursor(room)?;
+        (attach(paths).await?, cid, id(&cid))
+    } else {
+        open_room(paths, room).await?
+    };
+    let footer_instance = match retained_instance {
+        Some(instance) => instance,
+        None => footer_instance(&mut client, channel_id).await?,
+    };
     let since = match since {
         None => None,
         Some(s) => Some(parse_cursor(s)?),
@@ -1981,16 +2037,29 @@ pub async fn read(
         .then_some(if before.is_some() { "older" } else { "newest" })
     });
     if let Some(action) = history {
-        match request_history(&mut client, channel_id, footer_instance, action, before).await {
+        match request_history(
+            &mut client,
+            channel_id,
+            footer_instance,
+            action,
+            before,
+            retained_request,
+        )
+        .await
+        {
             Ok(state) => {
                 if action == "status" || action == "cancel" || action == "resume" {
                     if json {
                         println!(
                             "{}",
-                            serde_json::json!({"schema":"vox.room.history/1", "status":state})
+                            serde_json::json!({"schema":"vox.room.history/1", "instance": history_id(&state.instance), "request":state.request.as_ref().map(history_id), "status":state})
                         );
                     } else {
                         println!("history {:?}: {}", state.phase, state.detail);
+                        println!("saved instance: {}", history_id(&state.instance));
+                        if let Some(request) = &state.request {
+                            println!("saved request: {}", history_id(request));
+                        }
                     }
                     return Ok(());
                 }
