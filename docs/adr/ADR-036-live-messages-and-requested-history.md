@@ -305,11 +305,12 @@ cache under current trust, Drive and retention checks and expose the exact saved
 and Cancel. Publication-dependent writes may return `Legacy history required`; neither this state
 nor an unverified suffix may be reported as fully current. Cancellation and orphan reclamation may
 run as bounded local maintenance without accepting history. Completed recovery or cancellation
-MUST eventually restore an Idle entry index and ordinary writes, including after a crash. The
-live-before-archive and live-during-archive journey above applies to the authenticated new format;
-existing v1 rooms separately prove responsive cached recovery, preserved restart-paused progress,
-and recovery to writable Idle. This does not authorize format conversion, weaken governance, or
-grant the unresolved legacy activation exception.
+MUST eventually restore an Idle entry index, including after a crash. Ordinary writes resume once
+no authenticated essential gap remains; cancellation never discards such evidence or certifies
+current authority. The live-before-archive and live-during-archive journey above applies to the
+authenticated new format; existing v1 rooms separately prove responsive cached recovery,
+preserved restart-paused progress, and recovery to Idle. This does not authorize format
+conversion, weaken governance, or grant the unresolved legacy activation exception.
 
 Adversarial apparatus MUST exercise omitted control/revocation, conflicting overlapping history,
 wrong room/epoch, missing required authority and malformed proof limits against the real binary.
