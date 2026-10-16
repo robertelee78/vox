@@ -330,6 +330,7 @@ impl ChannelState {
         store: &Store,
         entry: &Entry,
         now: crate::time::Ms,
+        on_publish: impl FnOnce(&mut Batch<'_>) -> Result<()>,
     ) -> Result<()> {
         if self.poisoned {
             return Err(self.save_failure());
@@ -348,6 +349,7 @@ impl ChannelState {
         let late = read.child_after(&hash, None)?.is_some();
         drop(read);
         let mut batch = store.batch()?;
+        on_publish(&mut batch)?;
         let mut index = self
             .entries
             .write(&mut batch, &self.sek, &self.channel_id)?;
@@ -410,6 +412,7 @@ impl FinishedHistoryEffect {
     }
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct HistoryEffectCursor {
     hash: Digest32,
     next: usize,
@@ -446,6 +449,7 @@ impl ChannelState {
         store: &Store,
         cursor: &mut HistoryEffectCursor,
         now: crate::time::Ms,
+        check_binding: impl FnOnce(&Batch<'_>) -> Result<()>,
         on_admitted: impl FnOnce(&mut Batch<'_>, Digest32) -> Result<()>,
     ) -> Result<HistoryEffectProgress> {
         use crate::log::history::SignedEntryKind;
@@ -556,9 +560,12 @@ impl ChannelState {
             }
             Err(error) => return Err(error),
         }
+        let mut batch = store.batch()?;
+        // A changed grant is an ordinary cancellation before projection/index mutation.
+        // The held Batch serializes trust writes through the final publication.
+        check_binding(&batch)?;
         let applied = (|| -> Result<HistoryEffectProgress> {
             let finished = FinishedHistoryEffect { hash: *hash };
-            let mut batch = store.batch()?;
             let mut index = self
                 .entries
                 .write(&mut batch, &self.sek, &self.channel_id)?;
@@ -661,6 +668,7 @@ impl ChannelState {
         entry: &Entry,
         body: &governance::TypedSparseBody,
         now: crate::time::Ms,
+        check_binding: impl FnOnce(&Batch<'_>) -> Result<()>,
         on_admitted: impl FnOnce(&mut Batch<'_>, Digest32) -> Result<()>,
     ) -> Result<HistoryEffectProgress> {
         use crate::log::history::SignedEntryKind;
@@ -708,8 +716,11 @@ impl ChannelState {
                 Err(error) => return Err(error),
             }
         }
+        let mut batch = store.batch()?;
+        // A changed grant is an ordinary cancellation before projection/index mutation.
+        // The held Batch serializes trust writes through the final publication.
+        check_binding(&batch)?;
         let applied = (|| -> Result<HistoryEffectProgress> {
-            let mut batch = store.batch()?;
             let mut index = self
                 .entries
                 .write(&mut batch, &self.sek, &self.channel_id)?;
