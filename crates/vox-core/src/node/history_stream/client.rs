@@ -763,9 +763,8 @@ impl Receiver {
             room.commit_history_source(store, &record.entry, now, |batch| {
                 grant.check_batch(batch, room_id, instance, epoch)
             })?;
-            // The accepted source is already durable. This is only bounded operation cleanup;
-            // a crash before it leaves a resumable cursor, never an unrecorded admission.
-            room.history_write(store, |index| index.finish_history_verifier_cursor(binding))?;
+            // Publication is now Switched, not Idle. Keep the exact verifier until the
+            // bounded cleanup phase finishes; sparse metadata cannot mutate these roots yet.
             Ok(Some(()))
         })
         .await
@@ -774,10 +773,37 @@ impl Receiver {
     pub(super) async fn cleanup_source(
         &self,
         record: Arc<Record>,
+        binding: CursorBinding,
     ) -> Result<Lookup<(Arc<Record>, bool)>> {
+        if binding.generation != self.generation {
+            return Err(Error::Profile("history cleanup activation changed"));
+        }
         let job = record.job.clone();
-        self.read_precharged(&job, 64 * 1024, record, move |room, store, _| {
-            room.cleanup_history_source(store).map(Some)
+        self.read_precharged(&job, 64 * 1024, record, move |room, store, record| {
+            if binding.room != room.channel_id()
+                || binding.author != record.entry.skeleton.author_id
+                || binding.from != record.entry.skeleton.seq
+                || binding.through != record.entry.skeleton.seq
+                || binding.proof_kind != 3
+            {
+                return Err(Error::Profile("history cleanup record changed"));
+            }
+            let input = room.history_read(store)?;
+            let included = input
+                .history_inclusion_receipt(&binding.head, &binding.author, binding.from)?
+                .ok_or(Error::Profile("history cleanup inclusion missing"))?;
+            if included.header().entry().header_wire() != record.entry.header_wire() {
+                return Err(Error::Profile("history cleanup head/entry changed"));
+            }
+            drop(input);
+            let done = room.cleanup_history_source(store)?;
+            if done {
+                // The same room lock spans cleanup's transition to Idle and this exact
+                // cursor retirement. A crash between them leaves only a resumable cursor;
+                // the accepted source is already durable and is never rolled back here.
+                room.history_write(store, |index| index.finish_history_verifier_cursor(binding))?;
+            }
+            Ok(Some(done))
         })
         .await
     }
@@ -906,7 +932,7 @@ pub(crate) enum EntryPhase {
     Begin(CursorBinding),
     Prepare(CursorBinding),
     Commit(CursorBinding),
-    Cleanup,
+    Cleanup(CursorBinding),
     Refill,
     Effect(Option<crate::node::channel::HistoryEffectCursor>),
 }
@@ -1259,10 +1285,10 @@ impl Receiver {
                 let Lookup::Found(_) = self.commit_source(record, binding, now).await? else {
                     return Ok(LocalResult::busy(step));
                 };
-                LocalResult::next(next(EntryPhase::Cleanup))
+                LocalResult::next(next(EntryPhase::Cleanup(binding)))
             }
-            EntryPhase::Cleanup => {
-                let Lookup::Found(value) = self.cleanup_source(record).await? else {
+            EntryPhase::Cleanup(binding) => {
+                let Lookup::Found(value) = self.cleanup_source(record, binding).await? else {
                     return Ok(LocalResult::busy(step));
                 };
                 LocalResult::next(next(if value.value.1 {
