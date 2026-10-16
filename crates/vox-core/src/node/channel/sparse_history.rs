@@ -102,6 +102,16 @@ impl ChannelState {
         {
             return Ok(None);
         }
+        // A brand-new member's own feed has an authenticated, committed head with zero leaves.
+        // There is no entry at position zero, so no inclusion receipt can exist for it. Requiring
+        // one left every freshly joined sparse room permanently unsettled: its first post was
+        // refused even after the peer had echoed this exact signed head. The completed head flow
+        // is the proof for the empty case; only this room's own author may use it to settle.
+        if hint.author == self.me() && hint.size == 0 {
+            drop(read);
+            self.sparse_settle_pending |= !self.settled;
+            return Ok(None);
+        }
         let Some(included) = read.history_inclusion_receipt(&hint.head, &hint.author, hint.size)?
         else {
             return Ok(None);
