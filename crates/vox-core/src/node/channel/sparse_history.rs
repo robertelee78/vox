@@ -630,6 +630,16 @@ impl ChannelState {
                 "pending history source header missing",
             ))?;
         if finished {
+            let refill_pending = body_expected
+                && header
+                    .skeleton
+                    .v2
+                    .as_ref()
+                    .is_some_and(|v2| v2.kind == SignedEntryKind::Content)
+                && input.retention(hash)?.is_none();
+            if refill_pending {
+                return Ok(HistoryEffectProgress::RefillPending { governance: false });
+            }
             let author = header.skeleton.author_id;
             drop(input);
             // Feed restoration is local accepted-header maintenance. Advance at most one
