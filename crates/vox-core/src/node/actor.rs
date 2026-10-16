@@ -20672,7 +20672,14 @@ impl Node {
                 Ok(_) => return Outcome::Failed(Fault::PostSelectionChanged),
                 Err(error) => {
                     ch.poison(&error);
-                    return Outcome::Failed(fault_of(&error));
+                    let fault = fault_of(&error);
+                    if matches!(fault, Fault::Internal) {
+                        eprintln!(
+                            "vox: checking history instance before posting to room {}: {error}",
+                            crate::node::link::b32_encode(channel_id)
+                        );
+                    }
+                    return Outcome::Failed(fault);
                 }
             }
         }
@@ -20682,7 +20689,18 @@ impl Node {
         let now_millis = (self.millis_clock)();
         let appended = match ch.append_text(profile, text, now_millis) {
             Ok(r) => row_of(&r),
-            Err(e) => return Outcome::Failed(fault_of(&e)),
+            Err(error) => {
+                let fault = fault_of(&error);
+                if matches!(fault, Fault::Internal) {
+                    // Internal promises a log detail. Keep only the error and public room ID,
+                    // never the post, sender state, or profile's secret material.
+                    eprintln!(
+                        "vox: posting to room {}: {error}",
+                        crate::node::link::b32_encode(channel_id)
+                    );
+                }
+                return Outcome::Failed(fault);
+            }
         };
         // ADR-006's scheduled rotation: at `N` messages or `T` elapsed the sender key
         // is retired and the next message rides a generation nobody holds yet, so the
