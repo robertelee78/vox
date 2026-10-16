@@ -482,9 +482,9 @@ try:
         # persistence. This is external packet staging, with no cache inspection or deletion.
         rules = f"{S}/unreached-anchor-alternate.nft"
         open(rules, "w").write(
-            "table inet vox_anchor_bootstrap { chain output { type filter hook output priority 0; policy accept; "
-            f"ip daddr 10.99.0.3 udp sport {d_port} udp dport {ANCHOR_PORT} counter drop; "
-            f"ip saddr 10.99.0.3 udp sport {ANCHOR_PORT} udp dport {d_port} counter drop; " + "} }\n")
+            "table inet vox_anchor_bootstrap {\n chain output {\n  type filter hook output priority 0; policy accept;\n"
+            f"  ip daddr 10.99.0.3 udp sport {d_port} udp dport {ANCHOR_PORT} counter drop;\n"
+            f"  ip saddr 10.99.0.3 udp sport {ANCHOR_PORT} udp dport {d_port} counter drop;\n" + " }\n}\n")
         sh("nft", "-f", rules)
         print(f"{TAG} D cannot reach the advertised alternate until its cold restart: " +
               sh("nft", "list", "table", "inet", "vox_anchor_bootstrap"), flush=True)
@@ -652,9 +652,9 @@ try:
         d_port, p_port = udp_port("d"), udp_port("p")
         rules = f"{S}/direct-path-loss.nft"
         open(rules, "w").write(
-            "table inet vox_netchange { chain output { type filter hook output priority 0; policy accept; "
-            f"udp sport {d_port} udp dport {p_port} counter drop; "
-            f"udp sport {p_port} udp dport {d_port} counter drop; " + "} }\n")
+            "table inet vox_netchange {\n chain output {\n  type filter hook output priority 0; policy accept;\n"
+            f"  udp sport {d_port} udp dport {p_port} counter drop;\n"
+            f"  udp sport {p_port} udp dport {d_port} counter drop;\n" + " }\n}\n")
         sh("nft", "-f", rules)  # this process's disposable user/net namespace only
         print(f"{TAG} direct packets blocked only between the two peer UDP ports: " +
               sh("nft", "list", "table", "inet", "vox_netchange"), flush=True)
