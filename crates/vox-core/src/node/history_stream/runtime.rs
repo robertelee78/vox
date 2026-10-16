@@ -507,6 +507,8 @@ impl Flow {
         result
     }
 
+    // One bounded turn uses the same stream, job, hint inbox and deadline throughout.
+    #[allow(clippy::too_many_arguments)]
     async fn turn_inner(
         &mut self,
         store: Arc<Store>,

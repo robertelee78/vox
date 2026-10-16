@@ -21,8 +21,10 @@ struct Running {
     result: Arc<StdMutex<Option<Returned>>>,
     task: tokio::task::JoinHandle<()>,
 }
+type CleanupResult = (Flow, crate::error::Result<bool>);
+
 struct Cleanup {
-    result: Arc<StdMutex<Option<(Flow, crate::error::Result<bool>)>>>,
+    result: Arc<StdMutex<Option<CleanupResult>>>,
     task: tokio::task::JoinHandle<()>,
     cancellations: Vec<crate::node::history_demand::Cancellation>,
 }
@@ -163,8 +165,7 @@ impl Controller {
             self.cancel_archive_admission();
         }
         for slot in &mut self.ready {
-            if slot.as_ref().is_some_and(|flow| flow.room == room) {
-                let flow = slot.take().expect("matched room");
+            if let Some(flow) = slot.take_if(|flow| flow.room == room) {
                 self.retiring.push_back(flow);
             }
         }
@@ -178,8 +179,7 @@ impl Controller {
         }
         self.deferred = keep;
         for slot in &mut self.running {
-            if slot.as_ref().is_some_and(|work| work.room == room) {
-                let work = slot.take().expect("matched room");
+            if let Some(work) = slot.take_if(|work| work.room == room) {
                 work.fence.retire();
                 let _ = work.task.await;
                 if let Ok(mut result) = work.result.lock() {
@@ -192,7 +192,11 @@ impl Controller {
         self.required.retain(|(r, _, _, _)| *r != room);
         self.join_cleanup().await?;
         while let Some(at) = self.retiring.iter().position(|flow| flow.room == room) {
-            let mut flow = self.retiring.remove(at).expect("matched retiring room");
+            let Some(mut flow) = self.retiring.remove(at) else {
+                return Err(crate::error::Error::Profile(
+                    "retiring history flow vanished",
+                ));
+            };
             match flow.retire_slice().await {
                 Ok(true) => {}
                 Ok(false) => {
@@ -356,6 +360,8 @@ impl Controller {
         }
     }
 
+    // The queue ticket binds one exact node, room, peer and retained request.
+    #[allow(clippy::too_many_arguments)]
     fn archive_turn(
         &mut self,
         budget: &Arc<crate::node::history_budget::Budget>,
@@ -521,9 +527,10 @@ impl Node {
             let Some(mut returned) = returned else {
                 continue;
             };
-            let work = self.bounded_sync.running[index]
-                .take()
-                .expect("bounded worker retained");
+            let Some(work) = self.bounded_sync.running[index].take() else {
+                self.bounded_sync.dispose(returned.flow);
+                continue;
+            };
             let current = self
                 .ports
                 .get_mut(&(work.room, work.peer))
@@ -755,9 +762,10 @@ impl Node {
         });
         let mut admitted_archive = None;
         let mut flow = if let Some(index) = existing {
-            self.bounded_sync.ready[index]
-                .take()
-                .expect("selected ready flow")
+            let Some(flow) = self.bounded_sync.ready[index].take() else {
+                return false;
+            };
+            flow
         } else {
             // A retained waiting slice is retried by the existing bounded port backoff. It
             // cannot monopolize the other lane or cause an archive continuation to run.
@@ -769,9 +777,10 @@ impl Node {
                             && (!flow.archive || self.bounded_sync.required.is_empty())
                     })
             }) {
-                self.bounded_sync.ready[index]
-                    .take()
-                    .expect("selected pending flow")
+                let Some(flow) = self.bounded_sync.ready[index].take() else {
+                    return false;
+                };
+                flow
             } else {
                 if self.bounded_sync.flow_count() >= 12 {
                     return false;

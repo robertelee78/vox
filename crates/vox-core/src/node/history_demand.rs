@@ -428,12 +428,12 @@ fn node_scope(node: Digest32, slot: Slot) -> Digest32 {
     sha256(&bytes)
 }
 
+type RetainedLegacyOwner = (Digest32, RequestId, [u8; 16], Digest32);
+
 /// The exact paused legacy owner retained in the one archive slot, if there is one.
 /// Reopen uses this bounded header read before touching provisional room roots. It does not
 /// create an active handle or authorize network work; an explicit Resume is still required.
-pub(crate) fn retained_legacy_owner(
-    profile: &Profile,
-) -> Result<Option<(Digest32, RequestId, [u8; 16], Digest32)>> {
+pub(crate) fn retained_legacy_owner(profile: &Profile) -> Result<Option<RetainedLegacyOwner>> {
     let key = crate::atrest::seal::sek(profile.signer()?, b"vox/history-demand-sek/v1")?;
     let scope = node_scope(profile.fingerprint(), Slot::Archive);
     let Some(segment) =

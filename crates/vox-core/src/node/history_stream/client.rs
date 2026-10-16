@@ -80,6 +80,8 @@ impl Received {
 }
 
 impl Receiver {
+    // The receiver retains one exact room, peer, grant, staging slot and cancellation scope.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         room: Arc<Mutex<ChannelState>>,
         store: Arc<Store>,

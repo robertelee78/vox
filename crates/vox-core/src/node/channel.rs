@@ -6019,6 +6019,8 @@ impl ChannelState {
     /// The sparse settlement exception is local-only and publishes presence, sender state
     /// and removal of the unsettled marker in one effects Batch. No mutable state is exposed
     /// as settled before that commit; failed preflight keeps the original sender intact.
+    // Sender advancement and the exact governance append share one transaction.
+    #[allow(clippy::too_many_arguments)]
     fn append_governance_with_sender(
         &mut self,
         profile: &Profile,
@@ -6635,6 +6637,8 @@ impl ChannelState {
         Self::sync_over_room_mode(shared, store, peer, transport, now, fence, on_stored, None)
     }
 
+    // The explicit legacy owner stays bound to this one room transport session.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn sync_over_room_mode<T: Transport>(
         shared: &tokio::sync::Mutex<Self>,
         store: &Store,

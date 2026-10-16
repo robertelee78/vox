@@ -1961,7 +1961,7 @@ impl ChannelState {
         let mut wire_bytes = PAGE_OVERHEAD;
         let permitted = |saved: &Stored| -> Result<bool> {
             Ok(!self.private_expired(saved, self.now_hint)
-                && !(saved.record.message.header.author_id == self.me() && !holders.contains(peer))
+                && (saved.record.message.header.author_id != self.me() || holders.contains(peer))
                 && self.private_permitted(store, &saved.record, peer)?)
         };
         match &ask.query {

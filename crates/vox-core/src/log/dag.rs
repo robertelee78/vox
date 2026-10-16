@@ -333,6 +333,8 @@ impl Dag {
     /// staged row already passed admission and contiguous/skip linkage when it was written;
     /// this avoids replaying that unsigned suffix on each explicit Resume. It is not accepted
     /// history: `verified_head` remains at `base`, and ordinary frontiers must use that boundary.
+    // The exact sealed base and tail scalars are checked together; no history is loaded.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn restore_legacy_provisional(
         &mut self,
         author: Digest32,

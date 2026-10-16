@@ -1367,11 +1367,15 @@ impl Request {
                 instance,
                 action,
             } => {
+                // This concrete derived type contains only JSON-representable primitives;
+                // to_string has no external writer and cannot reject any of its values.
+                #[allow(clippy::expect_used)]
+                let json = serde_json::to_string(action).expect("bounded history action");
                 e.array(4)
                     .uint(T_HISTORY_DEMAND_REQ)
                     .bytes(channel_id)
                     .bytes(instance)
-                    .text(&serde_json::to_string(action).expect("bounded history action"));
+                    .text(&json);
             }
             Request::RoomViewPage {
                 channel_id,
@@ -3535,9 +3539,11 @@ impl Frame {
                 governance_page::put_page(&mut e, page);
             }
             Frame::HistoryDemand { status } => {
-                e.array(2)
-                    .uint(T_HISTORY_DEMAND)
-                    .text(&serde_json::to_string(status).expect("bounded history status"));
+                // This concrete derived type contains only JSON-representable primitives;
+                // to_string has no external writer and cannot reject any of its values.
+                #[allow(clippy::expect_used)]
+                let json = serde_json::to_string(status).expect("bounded history status");
+                e.array(2).uint(T_HISTORY_DEMAND).text(&json);
             }
             Frame::RoomPage { rows, older } => {
                 e.array(3)

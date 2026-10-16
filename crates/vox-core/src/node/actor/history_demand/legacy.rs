@@ -41,7 +41,6 @@ pub(super) fn prepare_legacy(
             .ok_or("The saved legacy history request changed.")?;
         let plan = state
             .legacy
-            .clone()
             .ok_or("The saved request is not legacy history.")?;
         let active = demand::resume(&context, request, binding, job).map_err(|e| e.to_string())?;
         (plan, state.bounds, active)
@@ -80,7 +79,7 @@ pub(super) fn prepare_legacy(
             entries: crate::log::sync::LEGACY_QUANTUM_ENTRIES,
         };
         let request = crate::identity::rng::random_array::<16>().map_err(|e| e.to_string())?;
-        let active = demand::start_legacy(&context, request, binding, bounds, plan.clone(), job)
+        let active = demand::start_legacy(&context, request, binding, bounds, plan, job)
             .map_err(|e| e.to_string())?;
         (plan, bounds, active)
     };

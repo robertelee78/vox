@@ -181,7 +181,7 @@ impl Controller {
         }
     }
     pub(super) fn retire_room(&mut self, room: Digest32) {
-        if !self.status.as_ref().is_some_and(|s| s.room == room) {
+        if self.status.as_ref().is_none_or(|s| s.room != room) {
             return;
         }
         self.fence();
@@ -302,16 +302,16 @@ impl Node {
     ) -> Result<Status, String> {
         let completed = self.accept_history_demand();
         if let Some(current) = &self.history_demand.status {
-            if current.room == room && current.instance == instance {
-                if matches!(action, Action::Status)
-                    && (completed
-                        || self.history_demand.preparing.is_some()
-                        || self.history_demand.running.is_some()
-                        || current.request.is_some()
-                        || !matches!(current.phase, Phase::Unavailable | Phase::Paused))
-                {
-                    return Ok(current.clone());
-                }
+            if current.room == room
+                && current.instance == instance
+                && matches!(action, Action::Status)
+                && (completed
+                    || self.history_demand.preparing.is_some()
+                    || self.history_demand.running.is_some()
+                    || current.request.is_some()
+                    || !matches!(current.phase, Phase::Unavailable | Phase::Paused))
+            {
+                return Ok(current.clone());
             }
         }
         if self.history_demand.preparing.is_some() {
@@ -655,7 +655,9 @@ impl Node {
                 return true;
             }
         }
-        let ready = result.take().expect("checked history preparation");
+        let Some(ready) = result.take() else {
+            return false;
+        };
         drop(result);
         self.history_demand.preparing = None;
         match ready {

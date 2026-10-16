@@ -114,6 +114,8 @@ pub(crate) enum PayloadValidation {
     Yielded,
 }
 
+// A bounded transient result covered by the existing verifier working reservation.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum SparseValidationStep {
     Complete(ValidatedSparseEntry),
     Progress,

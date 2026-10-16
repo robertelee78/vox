@@ -55,7 +55,7 @@ impl HintInbox {
             return Err(Error::SizeLimitExceeded("inventory insertion slice"));
         }
         let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        if generation != state.generation {
+        if generation == u64::MAX || generation != state.generation {
             return Err(Error::Unreachable("history inventory retired"));
         }
         let mut outcome = Offer::default();
@@ -117,10 +117,8 @@ impl HintInbox {
     }
     pub(crate) fn retire_peer(&self, room: Digest32, peer: Digest32) {
         let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        state.generation = state
-            .generation
-            .checked_add(1)
-            .expect("inventory generation exhausted");
+        // MAX is a permanently retired generation: offer refuses it rather than wrapping.
+        state.generation = state.generation.saturating_add(1);
         state.pending.retain(|p| p.room != room || p.peer != peer);
         Self::release_empty(&mut state);
     }
@@ -128,10 +126,8 @@ impl HintInbox {
         let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         // Retire workers that could still return hints for the removed room. Other retained
         // hints remain useful; their next worker captures the new inventory generation.
-        state.generation = state
-            .generation
-            .checked_add(1)
-            .expect("inventory generation exhausted");
+        // MAX is a permanently retired generation: offer refuses it rather than wrapping.
+        state.generation = state.generation.saturating_add(1);
         state.pending.retain(|p| p.room != room);
         Self::release_empty(&mut state);
     }
@@ -146,10 +142,8 @@ impl HintInbox {
     }
     pub(crate) fn clear(&self) {
         let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        state.generation = state
-            .generation
-            .checked_add(1)
-            .expect("inventory generation exhausted");
+        // MAX is a permanently retired generation: offer refuses it rather than wrapping.
+        state.generation = state.generation.saturating_add(1);
         state.pending = Vec::new();
         state.charge = None;
     }

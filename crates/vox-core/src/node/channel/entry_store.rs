@@ -2477,12 +2477,10 @@ impl EntryIndex {
             if existing
                 .as_ref()
                 .is_some_and(|d| d.phase != Phase::Rebuilding)
-            {
-                if self.cleanup_orphan_provisional(store, sek, channel)?
+                && self.cleanup_orphan_provisional(store, sek, channel)?
                     == Preparation::CleanupPending
-                {
-                    return Ok(Preparation::CleanupPending);
-                }
+            {
+                return Ok(Preparation::CleanupPending);
             }
         }
         // No request remains active across reopen. Recover only the capped verifier-work

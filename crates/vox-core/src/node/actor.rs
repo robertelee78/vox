@@ -14990,6 +14990,8 @@ impl Node {
     /// peer likes. Nothing here checked the two against each other, so a member of room A who
     /// had ever seen room B's `.vox` name was handed B's whole log (PRD-001 D5). See
     /// [`Self::may_sync`] for who counts.
+    // One authenticated stream carries its room, peer and admission context.
+    #[allow(clippy::too_many_arguments)]
     async fn run_sync_session(
         &mut self,
         conn: Arc<VoxConnection>,

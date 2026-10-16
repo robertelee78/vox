@@ -690,9 +690,9 @@ impl ChannelState {
                 .transpose()?
                 .flatten()
                 .ok_or(Error::MalformedAtRest("checkpoint body missing"))?;
-            if !input
+            if input
                 .history_position_header(&entry.skeleton.author_id, checkpoint.seq)?
-                .is_some_and(|named| named.entry_hash() == checkpoint.entry_hash)
+                .is_none_or(|named| named.entry_hash() != checkpoint.entry_hash)
             {
                 return Ok(HistoryEffectProgress::CheckpointPending {
                     author: entry.skeleton.author_id,

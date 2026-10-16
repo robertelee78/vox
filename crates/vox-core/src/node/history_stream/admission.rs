@@ -14,6 +14,8 @@ use crate::node::store::Store;
 use super::{Object, Proof, ProofKind, Query, RequestId};
 use entry_store::sparse::{CursorBinding, HistoryVerifier};
 
+// A bounded transient result covered by the existing verifier working reservation.
+#[allow(clippy::large_enum_variant)]
 pub(super) enum Staged {
     Object,
     Head {
@@ -245,6 +247,8 @@ pub(super) fn advance(
         .history_author_key(&binding.author)
         .ok_or(invalid("verifier author is no longer admitted"))?;
     let mut work = WorkBudget::default();
+    // A bounded transient result covered by the existing verifier working reservation.
+    #[allow(clippy::large_enum_variant)]
     enum ResultStep {
         Context(ControlContext),
         Missing(Digest32),
@@ -424,6 +428,8 @@ pub(super) enum EntryStart {
 
 /// Start structural/typed-body closure only after exact inclusion. The body may be absent
 /// for ordinary content or a recipient-scoped key package; that never claims its effect.
+// All scalar bindings belong to this exact entry and current validation phase.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn start_entry(
     room: &ChannelState,
     store: &Store,
@@ -575,6 +581,8 @@ pub(super) fn start_entry(
     Ok(EntryStart::Cursor(binding))
 }
 
+// A bounded transient result covered by the existing verifier working reservation.
+#[allow(clippy::large_enum_variant)]
 pub(super) enum EntryAdvanced {
     Progress,
     Need(Query),

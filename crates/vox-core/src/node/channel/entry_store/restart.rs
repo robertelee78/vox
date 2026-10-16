@@ -159,11 +159,9 @@ impl RestartState {
         };
         let sparse = arity >= 8 && flag(d)?;
         if !sparse
-            && presence.iter().any(|(author, state)| {
-                !feeds
-                    .get(author)
-                    .is_some_and(|feed| state.last.0 <= feed.seq)
-            })
+            && presence
+                .iter()
+                .any(|(author, state)| feeds.get(author).is_none_or(|feed| state.last.0 > feed.seq))
         {
             return Err(invalid("legacy restart presence beyond feed"));
         }
