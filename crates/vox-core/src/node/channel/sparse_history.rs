@@ -426,9 +426,17 @@ impl ChannelState {
         if self.history_publication_busy(store)? {
             return Ok((false, after));
         }
-        self.history_write(store, |index| {
-            index.cleanup_history_verifiers(request, after)
-        })
+        let mut batch = store.batch()?;
+        let mut index = self
+            .entries
+            .write(&mut batch, &self.sek, &self.channel_id)?;
+        let (done, next, changed) = index.cleanup_history_verifiers(request, after)?;
+        if changed {
+            index.seal()?;
+            batch.commit()?;
+            self.entries.committed();
+        }
+        Ok((done, next))
     }
 }
 

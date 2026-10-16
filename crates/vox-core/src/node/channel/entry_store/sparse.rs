@@ -2426,8 +2426,14 @@ impl Write<'_, '_> {
         &mut self,
         request: [u8; 16],
         after: Option<Key>,
-    ) -> Result<(bool, Option<Key>)> {
-        self.cleanup_verifiers(Some(request), after)
+    ) -> Result<(bool, Option<Key>, bool)> {
+        let before = self.directory.active.sparse.obligation_count;
+        let (done, next) = self.cleanup_verifiers(Some(request), after)?;
+        Ok((
+            done,
+            next,
+            self.directory.active.sparse.obligation_count != before,
+        ))
     }
 
     /// Reopen has no live verifier owner. Explicit history keeps its separate body/cursor;
