@@ -21,7 +21,7 @@
 
 use vox_agentcomms::claim::{self, Fold, Posted};
 use vox_agentcomms::envelope::{
-    is_valid_name, shown, Context, Envelope, HELLO, MAX_NAME, SHOWN_NAME, WORK_KEY,
+    is_valid_name, shown, Context, Envelope, BYE, HELLO, MAX_NAME, SHOWN_NAME, WORK_KEY,
 };
 use vox_agentcomms::ops::{self, OpIndex, Verdict};
 use vox_agentcomms::version::{self, Stamp, VersionTable, VOX_KEY};
@@ -311,15 +311,40 @@ impl Snapshot {
         idx
     }
 
-    /// Whether `session` of this node has announced itself with this version.
+    /// Whether this session's announcement still agrees with its and this node's latest
+    /// participation records. An old matching hello may have been superseded since.
     #[must_use]
     pub fn announced(&self, session: &str) -> bool {
-        self.posted.iter().any(|p| {
+        let mut hello = false;
+        let mut latest_author: Option<&Posted> = None;
+        let mut latest_session: Option<&Posted> = None;
+        // Keep the counted records and ordering identical to version::version_table.
+        for p in self.posted.iter().filter(|p| {
             p.author == self.me
-                && p.envelope.kind == HELLO
-                && p.envelope.from == session
-                && version::stamp_of(&p.envelope, VERSION) == Stamp::Match
-        })
+                && (claim::is_claim_protocol(&p.envelope)
+                    || (p.envelope.kind == HELLO && p.envelope.data.contains_key(VOX_KEY))
+                    || p.envelope.kind == BYE)
+        }) {
+            let newer = |previous: &Posted| {
+                (p.created_millis, p.entry_hash) > (previous.created_millis, previous.entry_hash)
+            };
+            if latest_author.is_none_or(newer) {
+                latest_author = Some(p);
+            }
+            if p.envelope.from == session {
+                hello |= p.envelope.kind == HELLO
+                    && version::stamp_of(&p.envelope, VERSION) == Stamp::Match;
+                if latest_session.is_none_or(newer) {
+                    latest_session = Some(p);
+                }
+            }
+        }
+        let current = |record: Option<&Posted>| {
+            record.is_some_and(|p| {
+                p.envelope.kind != BYE && version::stamp_of(&p.envelope, VERSION) == Stamp::Match
+            })
+        };
+        hello && current(latest_author) && current(latest_session)
     }
 }
 
@@ -713,7 +738,7 @@ pub fn refusal(room: &str, table: &VersionTable) -> AppError {
     );
     for p in table.mismatched() {
         msg.push_str(&format!(
-            "\n  worker {} session {} runs vox {}; required {}",
+            "\n  worker {} session {} last announced vox {} at {}; required {}",
             crate::ident::name_of(&p.author),
             if p.session.is_empty() {
                 "(none)".to_owned()
@@ -721,6 +746,7 @@ pub fn refusal(room: &str, table: &VersionTable) -> AppError {
                 shown(&p.session, SHOWN_NAME)
             },
             p.stamp.describe(&table.mine),
+            crate::room_cli::millis_as_time(p.last_millis),
             table.mine
         ));
     }
@@ -942,8 +968,8 @@ fn conflict(op: &str, group: &[Digest32]) -> AppError {
     }
 }
 
-/// Take part in work coordination: announce this session if it has not, then refuse
-/// if any participant runs another version.
+/// Take part in work coordination: refresh this session's announcement if superseded,
+/// then refuse if another participant's last announced version does not match.
 ///
 /// The announcement comes **first**. A worker that checked before announcing would,
 /// after an upgrade of every worker, see only the others' old-version messages and

@@ -975,12 +975,20 @@ async fn versions(client: &mut IpcClient, channel_id: Digest32) -> Vec<Check> {
                 p.session
             );
             match &p.stamp {
-                vox_agentcomms::version::Stamp::Match => ok(id, format!("runs vox {}", table.mine)),
+                vox_agentcomms::version::Stamp::Match => ok(
+                    id,
+                    format!(
+                        "last announced vox {} at {}",
+                        table.mine,
+                        crate::room_cli::millis_as_time(p.last_millis)
+                    ),
+                ),
                 other => warn(
                     id,
                     format!(
-                        "runs {}, this is vox {}: work coordination is refused until they match",
+                        "last announced vox {} at {}, this is vox {}: work coordination is refused until they match",
                         other.describe(&table.mine),
+                        crate::room_cli::millis_as_time(p.last_millis),
                         table.mine
                     ),
                     "run the same vox on every machine in the room",

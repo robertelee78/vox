@@ -4090,8 +4090,8 @@ pub async fn board(
                                 "last_millis": p.last_millis, "entry_hash": claim::b32(&p.entry_hash)})
                             )?;
                         } else if p.stamp != vox_agentcomms::version::Stamp::Match {
-                            writeln!(out, "work coordination refused: worker {} session {} runs vox {}; required {}",
-                                crate::ident::name_of(&p.author), session_name(&p.session), p.stamp.describe(&page.version), page.version)?;
+                            writeln!(out, "work coordination refused: worker {} session {} last announced vox {} at {}; required {}",
+                                crate::ident::name_of(&p.author), session_name(&p.session), p.stamp.describe(&page.version), millis_as_time(p.last_millis), page.version)?;
                         }
                         count += 1;
                     }
