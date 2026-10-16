@@ -2582,72 +2582,167 @@ impl EntryIndex {
     }
 }
 
+// Cleanup counts actual segment puts/deletes, not just logical entries. Each deletion
+// rewrites at most one page per existing path level (deletion cannot split a page), and
+// removes its old page. Reserve the final Directory write and conservative encoding/key
+// overhead before touching either index. Store engine/WAL pages are not segment rows.
+const PROVISIONAL_CLEANUP_ENTRIES: usize = 4;
+const CLEANUP_ROWS: usize = 64;
+const CLEANUP_BYTES: usize = 1024 * 1024;
+const CLEANUP_SEAL_OVERHEAD: usize = 64; // AES-GCM nonce/tag plus sealed CBOR framing
+const CLEANUP_KEY_BYTES: usize = 64; // (room, kind, id), conservatively encoded
+const CLEANUP_DIRECTORY_GROWTH: usize = 128; // root/allocator/revision integer growth
+
+struct ProvisionalCleanupBudget {
+    rows: usize,
+    bytes: usize,
+}
+
+impl ProvisionalCleanupBudget {
+    fn new(directory: &Directory) -> Result<Self> {
+        let bytes = directory.bytes().len()
+            + CLEANUP_DIRECTORY_GROWTH
+            + CLEANUP_SEAL_OVERHEAD
+            + CLEANUP_KEY_BYTES;
+        if bytes > CLEANUP_BYTES {
+            return Err(Error::SizeLimitExceeded(
+                "provisional cleanup directory quantum",
+            ));
+        }
+        Ok(Self { rows: 1, bytes })
+    }
+    fn reserve_pair(&mut self, path_pages: usize) -> bool {
+        // Two operations per page: replacement put + old-page delete. A path that
+        // collapses to empty uses fewer. One further operation deletes the spool record.
+        let rows = path_pages * 2 + 1;
+        let bytes = path_pages * (PAGE_BYTES + CLEANUP_SEAL_OVERHEAD + 2 * CLEANUP_KEY_BYTES)
+            + CLEANUP_KEY_BYTES;
+        if self.rows + rows > CLEANUP_ROWS || self.bytes + bytes > CLEANUP_BYTES {
+            return false;
+        }
+        self.rows += rows;
+        self.bytes += bytes;
+        true
+    }
+}
+
 impl Write<'_, '_> {
-    /// Detach one Idle orphan in constant work. An occupied retirement slot gets only one
-    /// bounded reclaim slice; the caller returns and schedules another local turn.
+    /// Detach one Idle orphan in constant work. When the retirement slot is occupied,
+    /// discard only the bounded current orphan: old garbage must not delay current use.
     fn quarantine_provisional(&mut self) -> Result<(bool, bool)> {
         if self.directory.phase != Phase::Idle {
             return Err(invalid("provisional quarantine requires idle publication"));
         }
         if self.directory.provisional == Roots::default() {
-            let changed = self.directory.legacy_provisional.take().is_some();
-            return Ok((true, changed));
+            if self.directory.legacy_provisional.is_none() {
+                return Ok((true, false));
+            }
+            let _budget = ProvisionalCleanupBudget::new(&self.directory)?;
+            self.directory.legacy_provisional = None;
+            return Ok((true, true));
         }
         if self.directory.retired_provisional != Roots::default() {
-            let (_, changed) = self.reclaim_retired_provisional()?;
-            return Ok((false, changed));
+            let (roots, mut changed) =
+                self.discard_provisional_roots(self.directory.provisional)?;
+            self.directory.provisional = roots;
+            let done = roots == Roots::default();
+            if done {
+                changed |= self.directory.legacy_provisional.take().is_some();
+            }
+            return Ok((done, changed));
         }
+        let _budget = ProvisionalCleanupBudget::new(&self.directory)?;
         self.directory.retired_provisional = self.directory.provisional;
         self.directory.provisional = Roots::default();
         self.directory.legacy_provisional = None;
         Ok((true, true))
     }
 
-    /// Delete at most sixteen exact retired locator pairs and their ciphertext. Never
-    /// consult current roots: an identical hash/position may now be staged under a new id.
+    /// Reclaim only the detached root; a new stage can hold the same hash/position with
+    /// another spool id. Deletion never looks up that position in current/active roots.
     fn reclaim_retired_provisional(&mut self) -> Result<(bool, bool)> {
-        if self.directory.phase != Phase::Idle {
-            return Err(invalid(
-                "retired provisional cleanup requires idle publication",
-            ));
+        let (roots, changed) =
+            self.discard_provisional_roots(self.directory.retired_provisional)?;
+        self.directory.retired_provisional = roots;
+        Ok((roots == Roots::default(), changed))
+    }
+
+    /// Count the exact deletion path and verify its locator before any mutation. Ranked
+    /// trees and absent keys are storage errors, never permission to delete a nearby row.
+    fn provisional_delete_pages(&self, mut root: u64, key: &Key, at: Locator) -> Result<usize> {
+        for depth in 1..=MAX_DEPTH {
+            if root == 0 {
+                return Err(invalid("provisional cleanup locator missing"));
+            }
+            match Source::Batch(self.batch).page(self.sek, self.channel, root)? {
+                Page::Leaf(rows) => {
+                    let found = rows
+                        .binary_search_by_key(key, |r| r.0)
+                        .ok()
+                        .map(|index| rows[index].1.locator())
+                        .transpose()?;
+                    if found != Some(at) {
+                        return Err(invalid("provisional cleanup locator differs"));
+                    }
+                    return Ok(depth);
+                }
+                Page::Branch(rows) => {
+                    root = rows
+                        .iter()
+                        .find(|r| r.0 >= *key)
+                        .ok_or(invalid("provisional cleanup path missing"))?
+                        .1;
+                }
+                Page::Ranked(_) => return Err(invalid("ranked provisional cleanup path")),
+            }
         }
+        Err(invalid("provisional cleanup cycle or depth"))
+    }
+
+    /// Return only this root's bounded cleanup result. No bodies are copied or decoded.
+    fn discard_provisional_roots(&mut self, mut roots: Roots) -> Result<(Roots, bool)> {
+        if self.directory.phase != Phase::Idle {
+            return Err(invalid("provisional cleanup requires idle publication"));
+        }
+        if roots == Roots::default() {
+            return Ok((roots, false));
+        }
+        let mut budget = ProvisionalCleanupBudget::new(&self.directory)?;
         let mut changed = false;
-        for _ in 0..16 {
-            let roots = self.directory.retired_provisional;
+        for _ in 0..PROVISIONAL_CLEANUP_ENTRIES {
             let Some((key, value)) =
                 Source::Batch(self.batch).first(self.sek, self.channel, roots.hash, &[0; 64], 0)?
             else {
                 if roots.sequence != 0 {
-                    return Err(invalid("retired provisional locator roots disagree"));
+                    return Err(invalid("provisional cleanup locator roots disagree"));
                 }
-                return Ok((true, changed));
+                return Ok((roots, changed));
             };
             let at = value.locator()?;
             if at.log == 0 || at.log >= self.directory.next_provisional {
-                return Err(invalid("retired provisional log bounds"));
+                return Err(invalid("provisional cleanup log bounds"));
             }
             let sequence_key = position(&at.author, at.seq);
-            if Source::Batch(self.batch).find(
-                self.sek,
-                self.channel,
-                roots.sequence,
-                &sequence_key,
-            )? != Some(at)
-            {
-                return Err(invalid("retired provisional cleanup locator differs"));
+            let pages = self.provisional_delete_pages(roots.hash, &key, at)?
+                + self.provisional_delete_pages(roots.sequence, &sequence_key, at)?;
+            if !budget.reserve_pair(pages) {
+                if !changed {
+                    return Err(Error::SizeLimitExceeded(
+                        "provisional cleanup storage quantum",
+                    ));
+                }
+                break; // Persist prior progress; this pair has not mutated either tree.
             }
-            self.directory.retired_provisional.hash = self.change(roots.hash, key, None)?;
-            self.directory.retired_provisional.sequence =
-                self.change(roots.sequence, sequence_key, None)?;
+            roots.hash = self.change(roots.hash, key, None)?;
+            roots.sequence = self.change(roots.sequence, sequence_key, None)?;
             self.batch
                 .delete_segment(self.channel, SegmentKind::ProvisionalLog, at.log)?;
             changed = true;
         }
-        let roots = self.directory.retired_provisional;
         if (roots.hash == 0) != (roots.sequence == 0) {
-            return Err(invalid("retired provisional locator roots disagree"));
+            return Err(invalid("provisional cleanup locator roots disagree"));
         }
-        Ok((roots == Roots::default(), changed))
+        Ok((roots, changed))
     }
 }
 
