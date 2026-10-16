@@ -226,6 +226,9 @@ pub struct Port {
     pub req_done: u64,
     /// The room generation credited to the peer: monotonic within the room instance.
     pub done_gen: u64,
+    /// Scheduler-only watermark after one current-only exchange found a legacy gap.
+    /// This is not evidence that the peer received this generation; agreement still uses done_gen.
+    pub legacy_checked_gen: Option<u64>,
     /// When a completion last made progress, for concurrent completions (progress wins).
     pub last_progress: Option<Instant>,
     /// When this node's own outbound session last completed cleanly, so the periodic request
@@ -248,6 +251,7 @@ impl Port {
             req_gen: 1,
             req_done: 0,
             done_gen: 0,
+            legacy_checked_gen: None,
             last_progress: None,
             last_clean_out: None,
         }
@@ -257,7 +261,9 @@ impl Port {
     #[must_use]
     pub fn needs(&self) -> bool {
         !self.poisoned
-            && (self.gen.load(Ordering::Relaxed) > self.done_gen || self.req_gen > self.req_done)
+            && (self.gen.load(Ordering::Relaxed)
+                > self.done_gen.max(self.legacy_checked_gen.unwrap_or(0))
+                || self.req_gen > self.req_done)
     }
 
     /// Raise a request (ADR-025 D2).

@@ -14534,6 +14534,10 @@ impl Node {
                 // Future explicit requests or independent metadata wakes may retry;
                 // no partial-history progress recursively raises an archive request.
                 port.req_done = port.req_done.max(attempt.req_at_start);
+                if let Some(generation) = o.gen_have {
+                    port.legacy_checked_gen =
+                        Some(port.legacy_checked_gen.unwrap_or(0).max(generation));
+                }
                 if attempt.dir == crate::node::ports::Dir::Out {
                     port.last_clean_out = Some(std::time::Instant::now());
                 }
