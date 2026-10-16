@@ -104,6 +104,28 @@ impl Source {
         self.read_charged(job, held, DIRECTORY_ENVELOPE, read).await
     }
 
+    /// Reuse a working envelope already owned by an assembled record. The owned guard must
+    /// include directory decoding and every temporary allocation the callback performs; only
+    /// its returned value receives a new charge. Moving the guard into the blocking closure
+    /// keeps that existing reservation alive even when the async waiter is cancelled.
+    pub(super) async fn read_precharged<T, G, F>(
+        &self,
+        job: &Job,
+        envelope: usize,
+        guard: Arc<G>,
+        read: F,
+    ) -> Result<Lookup<T>>
+    where
+        T: Send + 'static,
+        G: Send + Sync + 'static,
+        F: FnOnce(&mut ChannelState, &Store, &G) -> Result<Option<T>> + Send + 'static,
+    {
+        self.read_charged(job, envelope, 0, move |room, store| {
+            read(room, store, &guard)
+        })
+        .await
+    }
+
     async fn read_charged<T, F>(
         &self,
         job: &Job,
