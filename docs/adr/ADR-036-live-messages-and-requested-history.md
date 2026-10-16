@@ -319,6 +319,12 @@ This deliberately preserves v1 dropped-signature behavior and adds no alternate 
 signature-authentication path. An unsigned sparse record cannot acquire authenticity merely
 by arriving or being described as checkpointed.
 
+A v2 checkpoint still names an exact earlier position/hash on its own authenticated feed;
+missing source evidence stays pending. Because v2 retains each signed header, that checkpoint
+neither drops signatures nor imposes v1's blanket refusal of previously unheld positions below
+the checkpoint. Explicit backfill may authenticate those positions normally. It does not restore
+expired bodies, override retention or certify a contiguous prefix that was never verified.
+
 | Kind | Sole dispatch |
 | --- | --- |
 | 0 | Ordinary content: text/read records; no control handler |
@@ -469,6 +475,20 @@ proof object is at most 256 KiB. Work yields after the first of four composite v
 operation may finish; join/proof cursors must resume rather than restart their completed work.
 Persist through existing at-most-64-row/1-MiB commit slices. Missing essential control may require
 multiple such slices, but cannot monopolize the node actor or turn into ordinary archive demand.
+
+The locally authored append has a separate, private `LocalAppendBudget`: it preserves the
+existing atomic sender-state/entry commit without replaying a partly executed user command.
+Its exact signature, descriptor, context-visit and object-load limits MUST be derived from
+`MAX_TREE_DEPTH` and `MAX_CONTEXT_AUTHORS`, including pre-context construction and every reused
+inclusion/consistency verification pass. It uses the same authentication predicates and only
+durable, already authenticated parents. It MUST NOT fetch, scan an archive, reset a spent budget
+or expose this quota to a remote verification path. A missing own-parent object or exhausted
+derived quota is an invariant/storage failure, never permission to retry encryption or commit a
+partial append. New leaf-dependent descriptors, head, entry and sender state commit atomically;
+unchanged context objects are shared by hash. Intermediate context maps MUST NOT accumulate.
+The numerical bound is not a latency claim: a bounded diagnostic spike must establish the cost
+before activation, and expensive execution must stay off the shared node actor. This exception
+does not alter the remote 4/32/65,536 verification slices or authorize legacy conversion.
 
 The transient application-buffer contract is **288 MiB across the daemon**: 192 MiB archive
 (two jobs of at most 96 MiB each, at most one per node, serving and receiving combined), plus

@@ -266,6 +266,10 @@ PRD-001 R5.
 
 ADR-023 decision 3 (M23.6).
 
+These shedding and pre-checkpoint refusal rules describe v1. ADR-036's v2 format retains every
+signed header and permits authenticated requested backfill below a checkpoint; its checkpoint
+still requires the exact earlier own-feed source and grants no unverified contiguous prefix.
+
 - **LS-38.** Authenticator type `0` ("dropped under a checkpoint") MUST carry an empty byte string.
 - **LS-39.** Struct tag `0x0016` is an author's checkpoint on its own feed, `[seq, entry_hash]`,
   carried as the payload of an ordinary signed entry of that feed.

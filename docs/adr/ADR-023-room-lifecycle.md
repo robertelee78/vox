@@ -106,6 +106,12 @@ million-message room holds about 3.5 GB of skeletons after every body has expire
 
 ### Decision 3. Skeleton growth: checkpoints (R1)
 
+ADR-036 amends this decision for v2: all signed headers remain available as sparse parent
+evidence. A v2 checkpoint retains its authenticated own-feed source check but does not shed
+signatures or refuse authenticated requested backfill merely because it is older. Retention
+still governs bodies; no checkpoint manufactures a verified contiguous prefix. The v1 rules
+below remain unchanged.
+
 - **RL-3.1. Only the author checkpoints, and only its own feed.** A checkpoint MUST be the payload of
   an ordinary signed entry in the author's own feed (struct tag `0x0016`, `vox/checkpoint/v1`, body
   `[seq, entry_hash]`). A checkpoint by anyone else MUST NOT be honoured: it would let one member
