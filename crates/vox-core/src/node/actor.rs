@@ -7759,9 +7759,11 @@ impl Node {
     /// So a failed round schedules its own retry, per `(room, board)`: after 1, 2, 4 … up to 30s
     /// ([`publish_retry_after`]), jittered so many rooms failing to one board together do not retry
     /// together, until a round finishes. A round that finished — even one the board refused — clears
-    /// the count: a refusal is an answer, and asking again would get the same one. One retry is
-    /// pending per pair at most; the event carries only the pair, and [`NetEvent::PublishRetry`]
-    /// drops it if the room or the board has gone meanwhile.
+    /// the count: a refusal is normally an answer, and asking again would get the same one. The one
+    /// exception is a fresh-prekey publication owed to a newly admitted member: its board can refuse
+    /// before its side of the join has installed the room, and that refusal becomes curable as soon
+    /// as the join finishes. One retry is pending per pair at most; the event carries only the pair,
+    /// and [`NetEvent::PublishRetry`] drops it if the room or the board has gone meanwhile.
     fn note_publish_round(&mut self, channel_id: Digest32, board: Digest32, failed: bool) {
         let key = (channel_id, board);
         if !failed {
@@ -9920,7 +9922,17 @@ impl Node {
                         .insert((channel_id, board), said.join("; "));
                 }
                 self.report_publish(&channel_id, board, outcomes);
-                self.note_publish_round(channel_id, board, failed);
+                // Admission is committed on the responder before the joiner installs the room.
+                // The immediate fresh-prekey publication added for that admission can therefore
+                // receive a prompt policy refusal from the joiner's board. That is an answered
+                // round, but unlike a standing policy refusal it is expected to become valid once
+                // the other side finishes the same join. Keep the existing bounded retry alive
+                // until this specific durable obligation is acknowledged by `holds_room`; otherwise
+                // the joiner keeps advertising the one-time prekey the join already consumed and
+                // the first consent in either direction cannot open.
+                let owed_prekey_not_taken =
+                    !holds_room && self.prekey_publish_owed.contains(&(channel_id, board));
+                self.note_publish_round(channel_id, board, failed || owed_prekey_not_taken);
                 // If this renewal was folded behind an older round, only the following round can
                 // acknowledge the new bundle. The round finishing now did not necessarily carry it.
                 let current_bundle_answered =
