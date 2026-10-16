@@ -114,6 +114,18 @@ fn route_v4_now() -> Option<Option<Hop>> {
 #[cfg(feature = "test-knobs")]
 pub const TEST_ROUTE_V4_FILE_ENV: &str = "VOX_TEST_ROUTE_V4_FILE";
 
+/// Optional real-binary apparatus: `unavailable` makes the OS observer fail at its
+/// open/read boundary until the file changes. Packaged builds contain no such control.
+#[cfg(feature = "test-knobs")]
+pub const TEST_WATCH_FILE_ENV: &str = "VOX_TEST_NETWATCH_FILE";
+
+#[cfg(feature = "test-knobs")]
+fn test_watch_unavailable() -> bool {
+    std::env::var_os(TEST_WATCH_FILE_ENV)
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .is_some_and(|value| value.trim() == "unavailable")
+}
+
 /// The lookup the [`TEST_ROUTE_V4_FILE_ENV`] file stages, as [`known`] gives it: `None` when the
 /// knob is not set (the real route is read), `Some(None)` for `unanswered`, `Some(Some(None))` for
 /// `none`.
@@ -357,6 +369,10 @@ impl NetWatch {
     /// # Errors
     /// Why no socket could be opened.
     pub fn open() -> Result<Self, String> {
+        #[cfg(feature = "test-knobs")]
+        if test_watch_unavailable() {
+            return Err("network observer unavailable (proof apparatus)".to_owned());
+        }
         let fd = open_socket()?;
         rustix::io::ioctl_fionbio(&fd, true)
             .map_err(|e| format!("cannot make the network event socket non-blocking: {e}"))?;
@@ -382,18 +398,31 @@ impl NetWatch {
     /// connection lasts: a move to another network was never noticed, and nothing was redialled.
     pub async fn settled(&mut self) -> std::io::Result<NetworkEvents> {
         #[cfg(feature = "test-knobs")]
-        if std::env::var_os(TEST_ROUTE_V4_FILE_ENV).is_some() {
+        {
             let seen = test_route_v4();
             let staged = async {
+                if std::env::var_os(TEST_ROUTE_V4_FILE_ENV).is_none() {
+                    std::future::pending::<()>().await;
+                }
                 while test_route_v4() == seen {
                     tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            };
+            let unavailable = async {
+                if std::env::var_os(TEST_WATCH_FILE_ENV).is_none() {
+                    std::future::pending::<()>().await;
+                }
+                while !test_watch_unavailable() {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
                 }
             };
             return tokio::select! {
                 r = self.settled_os() => r,
                 () = staged => Ok(NetworkEvents::default()),
+                () = unavailable => Err(std::io::Error::other("network observer read failed (proof apparatus)")),
             };
         }
+        #[cfg(not(feature = "test-knobs"))]
         self.settled_os().await
     }
 
