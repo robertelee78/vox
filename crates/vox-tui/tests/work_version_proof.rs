@@ -116,7 +116,7 @@ fn claims_by(w: &Worker, reader: &Worker, r: &str) -> usize {
 }
 
 #[test]
-#[ignore = "two networked nodes and production Argon2id; CI runs it in release"]
+#[ignore = "on-demand proof with two networked nodes and production Argon2id; run in release"]
 fn a_worker_on_another_version_is_refused_by_name() {
     watchdog::arm();
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -128,6 +128,37 @@ fn a_worker_on_another_version_is_refused_by_name() {
     let room = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
     let (alice, bob) = (&room.workers[0], &room.workers[1]);
     let r = room.id.as_str();
+
+    // A harness's sending session must be registered before it can post (RA-3).
+    // Stage through the same public hook used by the harness, with no real wake endpoint.
+    // Registration is a precondition here; this journey measures version recovery.
+    for (worker, session) in [(alice, "a1"), (bob, "b1")] {
+        let hook = worker.vox(
+            None,
+            &[
+                "agent",
+                "hook",
+                "--node",
+                "default",
+                "--room",
+                r,
+                "--format",
+                "text",
+                "--session",
+                session,
+            ],
+        );
+        let doctor = worker.vox(None, &["agent", "doctor", "--node", "default", "--json"]);
+        let report: serde_json::Value = serde_json::from_str(&doctor.stdout).unwrap_or_else(|_| {
+            panic!("APPARATUS: session staging report unavailable: {doctor:?}")
+        });
+        assert!(
+            hook.ok && report["checks"].as_array().is_some_and(|checks| checks
+                .iter()
+                .any(|check| check["check"] == format!("session {session}"))),
+            "APPARATUS: sending session {session} was not registered; hook={hook:?}; doctor={doctor:?}"
+        );
+    }
 
     // ---- (1) missing: a pre-ADR-021 claim, and a fresh current worker is refused ----
     // Exactly what a release before ADR-021 wrote for `vox room claim`: no `data.vox`.
