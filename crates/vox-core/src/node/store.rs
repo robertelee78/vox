@@ -726,6 +726,24 @@ impl Store {
             .map(|v| v.value().to_vec()))
     }
 
+    /// Copy only a fixed metadata prefix, without allocating the rest of an at-rest value.
+    /// Used for an existing sealed record's incarnation nonce, never to authenticate its body.
+    pub(crate) fn get_meta_prefix<const N: usize>(&self, name: &str) -> Result<Option<[u8; N]>> {
+        let txn = self.begin_read()?;
+        let meta = txn.open_table(META).map_err(storage("open meta"))?;
+        let value = meta.get(name).map_err(storage("read meta"))?;
+        value
+            .map(|value| {
+                value
+                    .value()
+                    .get(..N)
+                    .ok_or(Error::MalformedAtRest("metadata prefix missing"))?
+                    .try_into()
+                    .map_err(|_| Error::MalformedAtRest("metadata prefix length"))
+            })
+            .transpose()
+    }
+
     /// Read and replace one metadata entry in **one** write transaction, so two callers cannot
     /// interleave between the read and the write (redb admits one writer at a time). `f` is
     /// given the current value and returns the new one, plus whatever it wants to hand back.
@@ -920,6 +938,22 @@ pub struct Batch<'a> {
 }
 
 impl Batch<'_> {
+    /// Read a fixed metadata incarnation inside the same serialized publication transaction.
+    pub(crate) fn get_meta_prefix<const N: usize>(&self, name: &str) -> Result<Option<[u8; N]>> {
+        let meta = self.txn.open_table(META).map_err(storage("open meta"))?;
+        let value = meta.get(name).map_err(storage("read meta"))?;
+        value
+            .map(|value| {
+                value
+                    .value()
+                    .get(..N)
+                    .ok_or(Error::MalformedAtRest("metadata prefix missing"))?
+                    .try_into()
+                    .map_err(|_| Error::MalformedAtRest("metadata prefix length"))
+            })
+            .transpose()
+    }
+
     /// Read this transaction's bounded object without first copying an unbounded value.
     pub(crate) fn get_segment_bounded(
         &self,

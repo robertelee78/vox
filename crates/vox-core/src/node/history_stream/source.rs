@@ -86,22 +86,25 @@ impl Source {
             .await
     }
 
-    /// A body envelope already includes directory decoding. Retain only the body allocation
-    /// after the read so a maximum-sized body does not reserve the same workspace twice.
+    /// A body envelope includes directory decoding and temporary ciphertext/plaintext copies.
+    /// Retain only the returned allocation after decoding; keeping the now-unused copies'
+    /// reservation would prevent a cohosted receiver from accepting the signed header.
     pub(super) async fn read_body<T, F>(
         &self,
         job: &Job,
         envelope: usize,
+        retained: usize,
         read: F,
     ) -> Result<Lookup<T>>
     where
         T: Send + 'static,
         F: FnOnce(&mut ChannelState, &Store) -> Result<Option<T>> + Send + 'static,
     {
-        let held = envelope
-            .checked_sub(DIRECTORY_ENVELOPE)
+        let temporary = envelope
+            .checked_sub(retained)
+            .filter(|temporary| *temporary >= DIRECTORY_ENVELOPE)
             .ok_or(Error::SizeLimitExceeded("history body envelope"))?;
-        self.read_charged(job, held, DIRECTORY_ENVELOPE, read).await
+        self.read_charged(job, retained, temporary, read).await
     }
 
     /// Reuse a working envelope already owned by an assembled record. The owned guard must

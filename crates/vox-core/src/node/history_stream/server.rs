@@ -384,9 +384,12 @@ async fn entry(
         return Ok(result);
     };
     let payload = match source
-        .read_body(&record_job, envelope, move |room, store| {
-            Ok(Some(room.history_payload(store, &hash)?))
-        })
+        .read_body(
+            &record_job,
+            envelope,
+            length as usize + MAX_HEADER_BYTES + 9,
+            move |room, store| Ok(Some(room.history_payload(store, &hash)?)),
+        )
         .await?
     {
         Lookup::Found(held) => held,

@@ -4,10 +4,14 @@
 //! every object to its request, verifies author/control evidence, and rechecks current access.
 //! Payload slices borrow the charged input frame rather than making another queued copy.
 
+mod admission;
+mod client;
 mod credit;
 mod server;
 mod source;
 mod transport;
+
+pub(crate) use client::Staging;
 
 use super::history_budget::{BufferCharge, Job};
 use crate::cbor::{Decoder, Encoder};
@@ -23,6 +27,55 @@ use crate::log::history::{
 pub type RequestId = [u8; 16];
 pub const MAX_PREAMBLE: usize = 128;
 pub const DONE_RESERVE: usize = 512;
+
+/// Exact local request incarnation. The sealed keyring nonce changes on a durable trust edit,
+/// including removal followed by an otherwise identical regrant; unchanged restart preserves
+/// it. This digest grants no rights. Current room membership and body admission still apply.
+pub(crate) fn authorization_generation(
+    store: &super::store::Store,
+    node: Digest32,
+    room: Digest32,
+    instance: [u8; 16],
+    epoch: u64,
+) -> Result<Digest32> {
+    let nonce =
+        store.get_meta_prefix::<{ crate::atrest::sek::NONCE_LEN }>(super::trust::TRUST_META_KEY)?;
+    Ok(generation_from_nonce(node, room, instance, epoch, nonce))
+}
+
+/// Recheck the trust incarnation inside the accepted-entry transaction, so a concurrent trust
+/// edit cannot slip between an earlier read and durable publication/ACK eligibility.
+pub(crate) fn authorization_generation_in(
+    batch: &super::store::Batch<'_>,
+    node: Digest32,
+    room: Digest32,
+    instance: [u8; 16],
+    epoch: u64,
+) -> Result<Digest32> {
+    let nonce =
+        batch.get_meta_prefix::<{ crate::atrest::sek::NONCE_LEN }>(super::trust::TRUST_META_KEY)?;
+    Ok(generation_from_nonce(node, room, instance, epoch, nonce))
+}
+
+fn generation_from_nonce(
+    node: Digest32,
+    room: Digest32,
+    instance: [u8; 16],
+    epoch: u64,
+    nonce: Option<[u8; crate::atrest::sek::NONCE_LEN]>,
+) -> Digest32 {
+    let mut bytes = Vec::with_capacity(192);
+    bytes.extend_from_slice(b"vox/history-authorization/v1");
+    bytes.extend_from_slice(&node);
+    bytes.extend_from_slice(&room);
+    bytes.extend_from_slice(&instance);
+    bytes.extend_from_slice(&epoch.to_be_bytes());
+    bytes.push(u8::from(nonce.is_some()));
+    if let Some(nonce) = nonce {
+        bytes.extend_from_slice(&nonce);
+    }
+    crate::hash::sha256(&bytes)
+}
 
 /// Run one admitted incoming request with a fixed lifetime. This never asks for another page.
 #[allow(clippy::too_many_arguments)]
@@ -66,7 +119,11 @@ async fn serve_request(
     {
         return Err(invalid("history HELLO mode"));
     }
-    let mut overhead = first.wire_len() + preamble.encode().len() + 4;
+    let mut overhead = first.wire_len()
+        + preamble.encode().len()
+        + 4
+        + crate::transport::streams::StreamKind::Sync.frame().len()
+        + 4;
     drop(first);
     let hello = Frame::Hello(crate::wire::SYNC_MODE_BOUNDED_HISTORY);
     let Some(encoded) = hello.encode(io.job())? else {

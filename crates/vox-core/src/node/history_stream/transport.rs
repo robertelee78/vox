@@ -108,12 +108,27 @@ impl Transport {
     /// The credit ledger measures this exact encoding before it commits wire credit. Keeping
     /// it charged here avoids re-encoding after the ledger has accepted a frame.
     pub(super) async fn write_encoded(&mut self, encoded: &Encoded) -> Result<()> {
+        self.write_bytes(encoded.as_slice()).await
+    }
+
+    /// The fixed preamble is charged separately from ordinary frame encodings.
+    pub(super) async fn write_preamble(&mut self, preamble: super::Preamble) -> Result<usize> {
+        let _charge = self
+            .job
+            .reserve(super::MAX_PREAMBLE * 2)
+            .ok_or(Error::Unreachable("history preamble buffer busy"))?;
+        let bytes = preamble.encode();
+        self.write_bytes(&bytes).await?;
+        Ok(bytes.len() + 4)
+    }
+
+    async fn write_bytes(&mut self, bytes: &[u8]) -> Result<()> {
         let until = self.until();
         let fence = Arc::clone(&self.fence);
         let result = tokio::select! {
             biased;
             () = fence.retired() => Err(Error::Unreachable("history request cancelled")),
-            result = tokio::time::timeout_at(until, write_frame(&mut self.send, encoded.as_slice())) => {
+            result = tokio::time::timeout_at(until, write_frame(&mut self.send, bytes)) => {
                 result.unwrap_or(Err(Error::Unreachable("history frame deadline elapsed")))
             }
         };
