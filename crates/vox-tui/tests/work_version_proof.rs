@@ -3,8 +3,8 @@
 //!
 //! Mixed-version coordination is not supported: the operator upgrades every worker
 //! together. What must therefore be proved is not compatibility but **refusal** — a
-//! worker that would coordinate with another version stops, before it posts anything
-//! that participates, and says exactly who and what:
+//! worker that would coordinate with another version announces itself, then stops
+//! before posting its claim or work message, and says exactly who and what:
 //!
 //! 1. **missing** — a claim with no version stamp, as every release before ADR-021 wrote
 //!    it. A current worker that has **never posted in the room** then has its first
@@ -18,7 +18,8 @@
 //! 4. **plain conversation survives** a refusal, so the operator can still talk;
 //! 5. **recovery needs nobody**: once the stale worker runs the current binary, its
 //!    first participating verb announces the current version, and coordination
-//!    resumes for everyone.
+//!    resumes for everyone, including an existing session whose old matching hello
+//!    was superseded by a different session's stamp or a `bye`.
 //!
 //! Every foreign stamp is written onto the control socket as exactly the envelope another
 //! version writes, because this build cannot be made to *be* another version. The
@@ -64,15 +65,15 @@ fn another_version() -> String {
     format!("{major}.{minor}.{}", patch + 1)
 }
 
-/// How a refusal names a worker's stamp: `runs vox "banana"` for one that is not a version,
-/// `runs vox 0.2.11` for another version. Matched as that phrase, never as the bare stamp: every
+/// How a refusal names a worker's last announcement, without claiming which binary is running.
+/// Matched as that phrase, never as the bare stamp: every
 /// refusal also says `required <this version>`, so a bare "0.2.9" matched any refusal on a 0.2.9
 /// tree, and the proof passed on a stale one without testing the version at all.
-fn runs(stamp: &str, is_version: bool) -> String {
+fn announced(stamp: &str, is_version: bool) -> String {
     if is_version {
-        format!("runs vox {stamp}")
+        format!("last announced vox {stamp}")
     } else {
-        format!("runs vox {stamp:?}")
+        format!("last announced vox {stamp:?}")
     }
 }
 
@@ -82,11 +83,12 @@ fn refused_naming(o: &Out, who: &Worker, what: &str) {
         Some(3),
         "PRODUCT: a version refusal must exit 3: {o:?}"
     );
-    // The reader (alice, always) names the worker by her own name for it, the one `vox trust
+    // The reader names the worker by its own name for it, the one `vox trust
     // add --name` gave (V210-162), not by a fingerprint prefix.
     for needle in [
         &format!("worker {} session", who.name),
         what,
+        " at ",
         &format!("required {VERSION}"),
     ] {
         assert!(
@@ -95,6 +97,13 @@ fn refused_naming(o: &Out, who: &Worker, what: &str) {
             o.stderr
         );
     }
+}
+
+fn participant_is(o: &Out, who: &Worker, session: &str, version: &str) -> bool {
+    o.ok && o.json()["participants"].as_array().is_some_and(|ps| {
+        ps.iter()
+            .any(|p| p["author"] == who.b32() && p["session"] == session && p["version"] == version)
+    })
 }
 
 fn claims_by(w: &Worker, reader: &Worker, r: &str) -> usize {
@@ -107,7 +116,7 @@ fn claims_by(w: &Worker, reader: &Worker, r: &str) -> usize {
 }
 
 #[test]
-#[ignore = "two networked nodes and production Argon2id; CI runs it in release"]
+#[ignore = "on-demand proof with two networked nodes and production Argon2id; run in release"]
 fn a_worker_on_another_version_is_refused_by_name() {
     watchdog::arm();
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -119,6 +128,37 @@ fn a_worker_on_another_version_is_refused_by_name() {
     let room = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
     let (alice, bob) = (&room.workers[0], &room.workers[1]);
     let r = room.id.as_str();
+
+    // A harness's sending session must be registered before it can post (RA-3).
+    // Stage through the same public hook used by the harness, with no real wake endpoint.
+    // Registration is a precondition here; this journey measures version recovery.
+    for (worker, session) in [(alice, "a1"), (bob, "b1")] {
+        let hook = worker.vox(
+            None,
+            &[
+                "agent",
+                "hook",
+                "--node",
+                "default",
+                "--room",
+                r,
+                "--format",
+                "text",
+                "--session",
+                session,
+            ],
+        );
+        let doctor = worker.vox(None, &["agent", "doctor", "--node", "default", "--json"]);
+        let report: serde_json::Value = serde_json::from_str(&doctor.stdout).unwrap_or_else(|_| {
+            panic!("APPARATUS: session staging report unavailable: {doctor:?}")
+        });
+        assert!(
+            hook.ok && report["checks"].as_array().is_some_and(|checks| checks
+                .iter()
+                .any(|check| check["check"] == format!("session {session}"))),
+            "APPARATUS: sending session {session} was not registered; hook={hook:?}; doctor={doctor:?}"
+        );
+    }
 
     // ---- (1) missing: a pre-ADR-021 claim, and a fresh current worker is refused ----
     // Exactly what a release before ADR-021 wrote for `vox room claim`: no `data.vox`.
@@ -269,8 +309,8 @@ fn a_worker_on_another_version_is_refused_by_name() {
     // ---- (2) unknown, then different ----
     let other = another_version();
     for (stamp, named) in [
-        ("banana".to_owned(), runs("banana", false)),
-        (other.clone(), runs(&other, true)),
+        ("banana".to_owned(), announced("banana", false)),
+        (other.clone(), announced(&other, true)),
     ] {
         let hello = serde_json::json!({
             "v": 1, "type": "hello", "from": "b-foreign", "body": "a foreign worker",
@@ -311,5 +351,91 @@ fn a_worker_on_another_version_is_refused_by_name() {
     assert_eq!(
         b["coordination"], "ok",
         "PRODUCT: board --json must say ok once everyone is current: {b}"
+    );
+
+    // An existing session must refresh both its own and its author's latest stamp.
+    // Alice's a1 is stale even though a-second most recently announced the current version;
+    // bob's b1 is current, but another session of his node most recently announced an old one.
+    for (worker, reader, session, stamp) in [
+        (alice, bob, "a1", other.as_str()),
+        (alice, bob, "a-second", VERSION),
+        (bob, alice, "b-previous", other.as_str()),
+    ] {
+        let hello = serde_json::json!({
+            "v": 1, "type": "hello", "from": session, "body": "a later announcement",
+            "data": { "vox": stamp, "op": format!("op-later-{session}") }
+        })
+        .to_string();
+        rt.block_on(post_raw(worker, room.cid, &hello));
+        until(
+            reader,
+            None,
+            "the peer board to show the superseding announcement",
+            &["room", "board", r, "--json"],
+            |o| participant_is(o, worker, session, stamp),
+        );
+    }
+    let working = [
+        "room",
+        "post",
+        r,
+        "--type",
+        "working",
+        "--work",
+        "gh:IOMachines/repo-to-cve#1237",
+        "resuming work after an upgrade",
+    ];
+    let o = alice.vox(Some("a1"), &working);
+    refused_naming(&o, bob, &announced(&other, true));
+    // Even a refused verb announces its caller, without changing another worker's stamp.
+    until(
+        bob,
+        None,
+        "alice's existing a1 session to announce itself before refusal",
+        &["room", "board", r, "--json"],
+        |o| participant_is(o, alice, "a1", VERSION),
+    );
+    let o = bob.vox(Some("b1"), &working);
+    assert!(o.ok, "PRODUCT: bob's resumed work post was refused: {o:?}");
+    // A working post does not count as a version announcement. Using a claim here would
+    // conceal a missing hello, since the claim itself carries the current version.
+    until(
+        alice,
+        None,
+        "bob's existing b1 session to replace his later foreign announcement",
+        &["room", "board", r, "--json"],
+        |o| participant_is(o, bob, "b1", VERSION),
+    );
+    let o = alice.vox(Some("a1"), &["room", "claim", r, "resumed-work"]);
+    assert!(
+        o.ok && o.stdout.contains("you hold resumed-work"),
+        "PRODUCT: current sessions must coordinate after refreshing their announcements: {o:?}"
+    );
+
+    // A bye supersedes a current hello too. Reusing b1 must make it visible again.
+    let bye = serde_json::json!({
+        "v": 1, "type": "bye", "from": "b1", "body": "leaving work"
+    })
+    .to_string();
+    rt.block_on(post_raw(bob, room.cid, &bye));
+    until(
+        alice,
+        None,
+        "bob's bye to remove him from the participants",
+        &["room", "board", r, "--json"],
+        |o| {
+            o.ok && o.json()["participants"]
+                .as_array()
+                .is_some_and(|ps| ps.iter().all(|p| p["author"] != bob.b32()))
+        },
+    );
+    let o = bob.vox(Some("b1"), &working);
+    assert!(o.ok, "PRODUCT: bob's return after bye was refused: {o:?}");
+    until(
+        alice,
+        None,
+        "bob's returning b1 session to announce itself after bye",
+        &["room", "board", r, "--json"],
+        |o| participant_is(o, bob, "b1", VERSION),
     );
 }
