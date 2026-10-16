@@ -132,19 +132,40 @@ impl Controller {
             status.detail = detail.chars().take(128).collect();
         }
     }
-    fn stop_request(&mut self, room: Digest32, instance: [u8; 16], request: RequestId) {
+    fn stop_request(&mut self, room: Digest32, instance: [u8; 16], request: RequestId) -> bool {
         if !self
             .status
             .as_ref()
             .is_some_and(|s| s.room == room && s.instance == instance && s.request == Some(request))
         {
-            return;
+            return false;
         }
         if let Some(running) = self.running.as_ref().filter(|r| r.request == request) {
             running.fence.retire();
             running.cancellation.cancel();
             self.running = None;
             self.ready = None;
+        }
+        true
+    }
+    /// The daemon's bounded archive queue could not retain this request. Keep its durable
+    /// identity available for an explicit retry, but report the capacity refusal honestly.
+    pub(super) fn busy(&mut self, request: RequestId, generation: Digest32, detail: &str) {
+        if !self
+            .running
+            .as_ref()
+            .is_some_and(|r| r.request == request && r.generation == generation)
+        {
+            return;
+        }
+        if let Some(running) = self.running.take() {
+            running.fence.retire();
+            running.cancellation.cancel();
+        }
+        self.ready = None;
+        if let Some(status) = self.status.as_mut().filter(|s| s.request == Some(request)) {
+            status.phase = Phase::Busy;
+            status.detail = detail.chars().take(128).collect();
         }
     }
     pub(super) fn retire_room(&mut self, room: Digest32) {
@@ -300,7 +321,9 @@ impl Node {
                         .into(),
                 );
             }
-            self.history_demand.stop_request(room, instance, request);
+            if self.history_demand.stop_request(room, instance, request) {
+                self.bounded_sync.cancel_archive(room, instance, request);
+            }
         } else if self.history_demand.running.is_some() {
             return Ok(self
                 .history_demand

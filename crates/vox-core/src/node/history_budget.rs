@@ -99,9 +99,11 @@ struct State {
 }
 
 impl State {
-    fn available(&self, lane: Lane) -> bool {
+    fn available(&self, node: Digest32, lane: Lane) -> bool {
         match lane {
-            Lane::Archive => self.archive_nodes.len() < ARCHIVE_JOBS,
+            Lane::Archive => {
+                self.archive_nodes.len() < ARCHIVE_JOBS && !self.archive_nodes.contains(&node)
+            }
             Lane::Control => self.control < FOREGROUND_JOBS,
             Lane::LargeControl => {
                 self.foreground < FOREGROUND_JOBS
@@ -121,7 +123,7 @@ impl State {
 #[derive(Default)]
 pub struct Budget {
     state: Mutex<State>,
-    changed: Notify,
+    changed: Arc<Notify>,
     control_bytes: AtomicUsize,
     retained_flows: AtomicUsize,
     foreground_bytes: AtomicUsize,
@@ -144,10 +146,7 @@ impl Budget {
     pub fn enqueue(self: &Arc<Self>, node: Digest32, lane: Lane) -> Option<Ticket> {
         let mut state = self.state();
         let queue = &state.queues[lane.index()];
-        if queue.len() >= QUEUED_PER_LANE
-            || queue.iter().any(|entry| entry.node == node)
-            || (lane == Lane::Archive && state.archive_nodes.contains(&node))
-        {
+        if queue.len() >= QUEUED_PER_LANE || queue.iter().any(|entry| entry.node == node) {
             return None;
         }
         let ticket = state.next_ticket.checked_add(1)?;
@@ -180,15 +179,30 @@ pub struct Ticket {
 }
 
 impl Ticket {
-    fn try_admit(&mut self) -> Option<Job> {
+    /// Register before attempting admission, so a permit released between the check and the
+    /// actor's wake task cannot be missed. This future owns only the notification subscription;
+    /// the controller retains the queue ticket and can cancel it synchronously.
+    pub(crate) fn wake(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        let mut wake = Box::pin(Arc::clone(&self.budget.changed).notified_owned());
+        wake.as_mut().enable();
+        wake
+    }
+
+    pub(crate) fn try_admit(&mut self) -> Option<Job> {
         let mut state = self.budget.state();
-        if !self.queued
-            || !state.available(self.lane)
-            || state.queues[self.lane.index()].front()?.ticket != self.ticket
-        {
+        if !self.queued || !state.available(self.node, self.lane) {
             return None;
         }
-        state.queues[self.lane.index()].pop_front();
+        let at = match self.lane {
+            Lane::Archive => state.queues[self.lane.index()]
+                .iter()
+                .position(|waiting| !state.archive_nodes.contains(&waiting.node))?,
+            _ => 0,
+        };
+        if state.queues[self.lane.index()].get(at)?.ticket != self.ticket {
+            return None;
+        }
+        state.queues[self.lane.index()].remove(at);
         match self.lane {
             Lane::Archive => {
                 state.archive_nodes.insert(self.node);
@@ -214,21 +228,6 @@ impl Ticket {
             lane: self.lane,
             bytes: AtomicUsize::new(0),
         })))
-    }
-
-    /// Cancellation of this future releases the queue position. The caller supplies its
-    /// request deadline; a timeout cannot strand a slot or silently resume older history.
-    pub async fn wait(mut self) -> Job {
-        loop {
-            let budget = Arc::clone(&self.budget);
-            let changed = budget.changed.notified();
-            tokio::pin!(changed);
-            changed.as_mut().enable();
-            if let Some(job) = self.try_admit() {
-                return job;
-            }
-            changed.await;
-        }
     }
 }
 

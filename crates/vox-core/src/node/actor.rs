@@ -583,6 +583,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::PrivateSessionDone { .. } => "filing private Session records",
         NetEvent::RoomStored { .. } => "evaluating a room whose log grew",
         NetEvent::SlotFreed => "starting a queued sync",
+        NetEvent::ArchiveAdmissionReady { .. } => "starting admitted archive work",
         NetEvent::BackoffExpired { .. } => "retrying a sync whose backoff is due",
         NetEvent::SkdmRefused { .. } => "re-owing a key the recipient did not take",
         NetEvent::PublishDone { .. } => "filing what a board said to a publish",
@@ -1275,6 +1276,12 @@ enum NetEvent {
     },
     /// An outbound slot was given back (ADR-025 D6).
     SlotFreed,
+    /// This node's retained archive request reached the head of the daemon-wide fair queue.
+    ArchiveAdmissionReady {
+        token: u64,
+        room: Digest32,
+        peer: Digest32,
+    },
     /// A port's backoff is due (ADR-025 D5).
     BackoffExpired {
         /// The room.
@@ -9852,6 +9859,16 @@ impl Node {
             }
             NetEvent::SlotFreed => {
                 // Queued ports are evaluated at the end of every event; nothing more to do here.
+            }
+            NetEvent::ArchiveAdmissionReady { token, room, peer } => {
+                if self.port_eligible(&(room, peer), std::time::Instant::now()) {
+                    self.sched_rooms.insert(room);
+                } else {
+                    // Admission happened after this exact port stopped being runnable. Return the
+                    // permit now; the event that makes the retained flow eligible queues it again.
+                    self.bounded_sync
+                        .release_archive_admission(token, room, peer);
+                }
             }
             NetEvent::BackoffExpired {
                 channel_id,
