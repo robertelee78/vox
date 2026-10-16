@@ -309,7 +309,10 @@ impl State {
                 return Err(bad());
             }
         }
-        if self.serial == 0 || self.remaining > self.bounds.entries {
+        let maximum_remaining = self.legacy.map_or(Ok(self.bounds.entries), |legacy| {
+            usize::try_from(legacy.through - legacy.expected_base).map_err(|_| bad())
+        })?;
+        if self.serial == 0 || self.remaining > maximum_remaining {
             return Err(bad());
         }
         if let Some(body) = &self.body {
@@ -626,7 +629,9 @@ fn start_plan(
         request,
         binding,
         bounds,
-        remaining: bounds.entries,
+        remaining: legacy.map_or(Ok(bounds.entries), |plan| {
+            usize::try_from(plan.through - plan.expected_base).map_err(|_| bad())
+        })?,
         body: None,
         cursor: None,
         private,
@@ -671,11 +676,6 @@ pub fn resume(
     }
     state.serial = next_serial(state.serial)?;
     state.progress = Progress::Pending;
-    if state.legacy.is_some() {
-        // One explicit Resume authorizes one new legacy quantum, within the original
-        // immutable interval. The spool supplies its next position; restart never does this.
-        state.remaining = state.bounds.entries;
-    }
     put(&mut batch, key, &scope, &state)?;
     commit_context(batch, context)?;
     Ok(Active {
@@ -1052,8 +1052,9 @@ pub(crate) fn checkpoint_private(
     Ok(())
 }
 
-/// A legacy worker acknowledges only the bounded quantum whose exact spool effects are
-/// already durable. It cannot change the original author, interval or accepted base.
+/// A legacy worker acknowledges only already-durable accepted prefix progress. Unsigned
+/// staging and building never decrease remaining; signed publication does. Each explicit
+/// quantum has its separate fixed bounds.entries cap, without resetting the original count.
 pub(crate) fn checkpoint_legacy(
     context: &Context,
     active: &mut Active,
