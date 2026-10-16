@@ -3572,8 +3572,16 @@ impl ChannelState {
         &self,
         batch: &mut crate::node::store::Batch<'_>,
         entry: &Entry,
-        settlement: entry_store::sparse::LocalHistorySettlement,
+        settlement: Option<entry_store::sparse::LocalHistorySettlement>,
     ) -> Result<()> {
+        let settlement = match (entry.skeleton.v2.is_some(), settlement) {
+            (true, Some(settlement)) => settlement,
+            (false, None) => return Ok(()),
+            (true, None) => return Err(Error::Profile("local history settlement missing")),
+            (false, Some(_)) => {
+                return Err(Error::Profile("legacy entry produced local settlement"))
+            }
+        };
         let mut index = self.entries.write(batch, &self.sek, &self.channel_id)?;
         index.finish_local_history_effect(entry, settlement)?;
         index.seal()
@@ -3718,9 +3726,7 @@ impl ChannelState {
         let persisted = (|| -> Result<()> {
             self.prepare_local_entry(profile, &entry, EntryKind::Content, &key, now_millis)?;
             let mut batch = profile.store().batch()?;
-            let settlement = self
-                .publish_entry_into(&mut batch, &entry)?
-                .ok_or(Error::Profile("local history settlement missing"))?;
+            let settlement = self.publish_entry_into(&mut batch, &entry)?;
             self.observe_governance_into(profile.store(), &mut batch, &entry, id)?;
             self.finish_local_history_effect_into(&mut batch, &entry, settlement)?;
             batch.commit()
@@ -5688,9 +5694,7 @@ impl ChannelState {
         let persisted = (|| -> Result<()> {
             self.prepare_local_entry(profile, &entry, kind, &signer.public_key(), now_ms)?;
             let mut batch = profile.store().batch()?;
-            let settlement = self
-                .publish_entry_into(&mut batch, &entry)?
-                .ok_or(Error::Profile("local history settlement missing"))?;
+            let settlement = self.publish_entry_into(&mut batch, &entry)?;
             self.observe_governance_into(profile.store(), &mut batch, &entry, id)?;
             self.finish_local_history_effect_into(&mut batch, &entry, settlement)?;
             batch.commit()
@@ -6055,9 +6059,7 @@ impl ChannelState {
         let written = (|| -> Result<()> {
             self.prepare_local_entry(profile, &entry, kind, &key, now_ms)?;
             let mut batch = profile.store().batch()?;
-            let settlement = self
-                .publish_entry_into(&mut batch, &entry)?
-                .ok_or(Error::Profile("local history settlement missing"))?;
+            let settlement = self.publish_entry_into(&mut batch, &entry)?;
             self.observe_governance_into(profile.store(), &mut batch, &entry, id)?;
             batch.put_segment(&self.channel_id, SegmentKind::LogDb, id, &log_seg)?;
             for (row, seg) in rows {
@@ -8192,9 +8194,7 @@ impl ChannelState {
         let persisted = (|| -> Result<()> {
             self.prepare_local_entry(profile, &entry, EntryKind::Content, &key, now_millis)?;
             let mut batch = profile.store().batch()?;
-            let settlement = self
-                .publish_entry_into(&mut batch, &entry)?
-                .ok_or(Error::Profile("local history settlement missing"))?;
+            let settlement = self.publish_entry_into(&mut batch, &entry)?;
             self.observe_governance_into(profile.store(), &mut batch, &entry, id)?;
             batch.put_segment(&self.channel_id, SegmentKind::LogDb, id, &log_seg)?;
             batch.put_segment(
@@ -8689,9 +8689,7 @@ impl ChannelState {
         let persisted = (|| -> Result<()> {
             self.prepare_local_entry(profile, &entry, EntryKind::Content, &key, now_millis)?;
             let mut batch = profile.store().batch()?;
-            let settlement = self
-                .publish_entry_into(&mut batch, &entry)?
-                .ok_or(Error::Profile("local history settlement missing"))?;
+            let settlement = self.publish_entry_into(&mut batch, &entry)?;
             self.observe_governance_into(profile.store(), &mut batch, &entry, id)?;
             batch.put_segment(&self.channel_id, SegmentKind::LogDb, id, &log_seg)?;
             batch.put_segment(
