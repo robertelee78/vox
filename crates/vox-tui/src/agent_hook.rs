@@ -1924,7 +1924,7 @@ pub async fn run(
             let words = Unregistered::NotAttached(node.clone()).said(&input, &daemon.account);
             eprintln!("vox agent hook: {words}");
             if crate::wake::first_detached_notice(paths, &input.session_id) {
-                crate::notify::needs_passphrase(paths, node.as_str(), &words);
+                crate::notify::needs_passphrase_from_hook(paths, node.as_str(), &words);
                 emit(format, &raw, &input.event, &format!("{words}\n"), "");
             }
             return Ok(());

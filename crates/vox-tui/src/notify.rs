@@ -211,6 +211,74 @@ pub fn needs_passphrase(paths: &Paths, node: &str, body: &str) {
     raise(&note, command.as_deref());
 }
 
+/// Tell the person that `node` waits for its passphrase without holding an agent hook open.
+///
+/// A hook runs on the harness's turn path. Waiting for `open`, `osascript`, `notify-send`, or a
+/// configured notification program made that turn inherit the desktop notifier's variable
+/// latency. The independent child owns no hook pipe and a process group of its own, so the hook
+/// can return as soon as the notification has been handed off. On macOS the child still tries
+/// Vox.app first and falls back to the ordinary desktop notification if the app cannot be opened.
+pub fn needs_passphrase_from_hook(paths: &Paths, node: &str, body: &str) {
+    if disabled(paths) {
+        return;
+    }
+    let note = Note {
+        title: format!("Vox: node {node} needs its passphrase"),
+        body: body.to_owned(),
+    };
+    if let Some(command) = command(paths) {
+        let mut child = std::process::Command::new(command);
+        child.arg(&note.title).arg(&note.body);
+        spawn_hook_notification(&mut child);
+        return;
+    }
+    if cfg!(target_os = "macos") {
+        let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+        let script = format!(
+            "display notification \"{}\" with title \"{}\"",
+            esc(&note.body),
+            esc(&note.title)
+        );
+        if vox_core::node::paths::default_data_root().is_ok_and(|root| root == paths.data_root) {
+            // Values are positional arguments, never shell text. The helper preserves the existing
+            // app-first/fallback behavior after the hook that launched it has gone.
+            let mut child = std::process::Command::new("/bin/sh");
+            child
+                .arg("-c")
+                .arg(
+                    "if /usr/bin/open -g -b us.vox.app \"$1\"; then exit 0; fi; \
+                     exec /usr/bin/osascript -e \"$2\"",
+                )
+                .arg("vox-hook-notification")
+                .arg(format!("vox://attach-node?node={node}"))
+                .arg(script);
+            spawn_hook_notification(&mut child);
+        } else {
+            let mut child = std::process::Command::new("osascript");
+            child.arg("-e").arg(script);
+            spawn_hook_notification(&mut child);
+        }
+    } else if cfg!(target_os = "linux") {
+        let mut child = std::process::Command::new("notify-send");
+        child.arg(&note.title).arg(&note.body);
+        spawn_hook_notification(&mut child);
+    }
+}
+
+/// Start one hook-owned notifier without leaving the harness's captured pipes open.
+fn spawn_hook_notification(command: &mut std::process::Command) {
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    let _ = command.spawn();
+}
+
 /// Raise `note` from the TUI (ADR-028 R-10): to the node's notification program when it has one
 /// (`notify-command`, `VOX_NOTIFY_COMMAND`), run off the TUI's thread; else to the terminal the TUI
 /// draws in, as an OSC 9 desktop notification, or as a bell over SSH, where a terminal's OSC 9
