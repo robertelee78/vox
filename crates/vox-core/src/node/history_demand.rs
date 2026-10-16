@@ -47,6 +47,8 @@ pub struct Context {
     store: Arc<Store>,
     key: Sek,
     cancellation: Cancellation,
+    // Declared after the key: release the lock-completion barrier only after secrets drop.
+    _secret_work: Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,19 +73,30 @@ impl Cancellation {
 
 impl Context {
     /// Explicit archive commands only. A retained record cannot create or resume this context.
-    pub fn unlocked(profile: &Profile) -> Result<Self> {
-        Self::with_slot(profile, Slot::Archive)
+    pub fn unlocked(
+        profile: &Profile,
+        secret_work: Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
+    ) -> Result<Self> {
+        Self::with_slot(profile, Slot::Archive, secret_work)
     }
     /// Current-purpose work only; a network handler cannot use this to start archive demand.
-    pub fn current_unlocked(profile: &Profile, purpose: Purpose) -> Result<Self> {
+    pub fn current_unlocked(
+        profile: &Profile,
+        purpose: Purpose,
+        secret_work: Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
+    ) -> Result<Self> {
         let slot = match purpose {
             Purpose::Live => Slot::Live,
             Purpose::Control => Slot::Control,
             Purpose::History => return Err(invalid("archive requires explicit local demand")),
         };
-        Self::with_slot(profile, slot)
+        Self::with_slot(profile, slot, secret_work)
     }
-    fn with_slot(profile: &Profile, slot: Slot) -> Result<Self> {
+    fn with_slot(
+        profile: &Profile,
+        slot: Slot,
+        secret_work: Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
+    ) -> Result<Self> {
         let key = crate::atrest::seal::sek(profile.signer()?, b"vox/history-demand-sek/v1")?;
         let node = profile.fingerprint();
         let mut bytes = b"vox/history-demand-scope/v1".to_vec();
@@ -100,6 +113,7 @@ impl Context {
             store: profile.store_handle(),
             key,
             cancellation: Cancellation(Arc::new(AtomicBool::new(false))),
+            _secret_work: secret_work,
         })
     }
     pub fn slot(&self) -> Slot {
