@@ -347,6 +347,11 @@ impl ReceiverChain {
         iteration >= self.next_iteration || self.skipped.contains_key(&iteration)
     }
 
+    /// Automatic private delivery cannot treat a ratchet with unresolved gaps as contiguous.
+    pub(crate) fn has_skipped_iterations(&self) -> bool {
+        !self.skipped.is_empty()
+    }
+
     /// Build a receiver chain from a **verified** SKDM. The caller MUST have
     /// called [`Skdm::verify`] (or [`Skdm::verify_and_signing_key`]) first; this
     /// re-verifies the SKDM against `author_root` and the expected channel/epoch

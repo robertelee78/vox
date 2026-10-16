@@ -167,30 +167,16 @@ pub(crate) struct Cursor {
     pub incarnation: Digest32,
     pub after: u64,
 }
-
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Locator {
     pub id: u64,
     pub hash: Digest32,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct LifecycleCursor {
-    pub version: Digest32,
-    pub slot: u8,
-    pub after: u64,
-}
-
-/// Purpose is explicit before any private body is read. A returned cursor is never permission
-/// to turn a current-tail request into an archive request.
+/// Current delivery never authorizes older private history.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Query {
     LiveTail,
-    Lifecycle {
-        author: Digest32,
-        session: String,
-        cursor: Option<LifecycleCursor>,
-    },
     ArchiveInventory {
         lo: u64,
         hi: u64,
@@ -204,13 +190,10 @@ pub(crate) enum Query {
 }
 impl Query {
     pub(crate) fn archive(&self) -> bool {
-        matches!(
-            self,
-            Self::ArchiveInventory { .. } | Self::ArchiveRecords { .. }
-        )
+        !matches!(self, Self::LiveTail)
     }
     fn validate(&self) -> Result<()> {
-        let interval = |lo, hi| {
+        let interval = |lo: u64, hi: u64| {
             if lo == 0 || lo > hi || hi - lo >= PAGE_RECORDS as u64 {
                 Err(Error::MalformedBundle("private history interval"))
             } else {
@@ -219,35 +202,25 @@ impl Query {
         };
         match self {
             Self::LiveTail => Ok(()),
-            Self::Lifecycle {
-                session, cursor, ..
-            } => {
-                if session.is_empty()
-                    || session.len() > crate::node::content::MAX_SESSION_ID_LEN
-                    || cursor.as_ref().is_some_and(|c| c.slot > 5)
-                {
-                    return Err(Error::MalformedBundle("private lifecycle selection"));
-                }
-                Ok(())
-            }
             Self::ArchiveInventory { lo, hi, before } => {
                 interval(*lo, *hi)?;
-                if *before < *lo || *before > hi.saturating_add(1) {
-                    return Err(Error::MalformedBundle("private history inventory cursor"));
+                if *before
+                    != hi
+                        .checked_add(1)
+                        .ok_or(Error::MalformedBundle("private history bound"))?
+                {
+                    return Err(Error::MalformedBundle("private history inventory boundary"));
                 }
                 Ok(())
             }
             Self::ArchiveRecords { lo, hi, positions } => {
                 interval(*lo, *hi)?;
-                if positions.is_empty() || positions.len() > PAGE_RECORDS {
-                    return Err(Error::MalformedBundle("private history positions"));
-                }
-                let mut previous = hi.saturating_add(1);
-                for position in positions {
-                    if position.id < *lo || position.id > *hi || position.id >= previous {
-                        return Err(Error::MalformedBundle("private history position binding"));
-                    }
-                    previous = position.id;
+                if positions.is_empty()
+                    || positions.len() > PAGE_RECORDS
+                    || positions.iter().any(|p| p.id < *lo || p.id > *hi)
+                    || positions.windows(2).any(|p| p[0].id >= p[1].id)
+                {
+                    return Err(Error::MalformedBundle("private history exact selection"));
                 }
                 Ok(())
             }
@@ -257,14 +230,6 @@ impl Query {
         match self {
             Self::LiveTail => {
                 e.array(1).uint(0);
-            }
-            Self::Lifecycle {
-                author,
-                session,
-                cursor,
-            } => {
-                e.array(4).uint(1).bytes(author).text(session);
-                put_lifecycle(e, cursor.as_ref());
             }
             Self::ArchiveInventory { lo, hi, before } => {
                 e.array(4).uint(2).uint(*lo).uint(*hi).uint(*before);
@@ -278,18 +243,6 @@ impl Query {
     fn read(d: &mut Decoder<'_>) -> Result<Self> {
         let query = match (d.array()?, d.uint()?) {
             (1, 0) => Self::LiveTail,
-            (4, 1) => {
-                let author = digest(d)?;
-                let session = d.text()?;
-                if session.len() > crate::node::content::MAX_SESSION_ID_LEN {
-                    return Err(Error::SizeLimitExceeded("private lifecycle session"));
-                }
-                Self::Lifecycle {
-                    author,
-                    session: session.into(),
-                    cursor: read_lifecycle(d)?,
-                }
-            }
             (4, 2) => Self::ArchiveInventory {
                 lo: d.uint()?,
                 hi: d.uint()?,
@@ -325,7 +278,6 @@ pub(crate) struct Page {
     pub records: Vec<Vec<u8>>,
     pub positions: Vec<u64>,
     pub hints: Vec<Locator>,
-    pub lifecycle: Option<LifecycleCursor>,
     /// Keeps the daemon-wide reservation alive through durable application.
     pub charge: BufferCharge,
 }
@@ -334,37 +286,6 @@ fn digest(d: &mut Decoder<'_>) -> Result<Digest32> {
     d.bytes()?
         .try_into()
         .map_err(|_| Error::MalformedBundle("private Session digest"))
-}
-fn put_lifecycle(e: &mut Encoder, value: Option<&LifecycleCursor>) {
-    e.array(usize::from(value.is_some()));
-    if let Some(value) = value {
-        e.array(3)
-            .bytes(&value.version)
-            .uint(value.slot.into())
-            .uint(value.after);
-    }
-}
-fn read_lifecycle(d: &mut Decoder<'_>) -> Result<Option<LifecycleCursor>> {
-    match d.array()? {
-        0 => Ok(None),
-        1 => {
-            if d.array()? != 3 {
-                return Err(Error::MalformedBundle("private lifecycle cursor"));
-            }
-            let version = digest(d)?;
-            let slot = u8::try_from(d.uint()?)
-                .map_err(|_| Error::MalformedBundle("private lifecycle slot"))?;
-            if slot > 5 {
-                return Err(Error::MalformedBundle("private lifecycle slot"));
-            }
-            Ok(Some(LifecycleCursor {
-                version,
-                slot,
-                after: d.uint()?,
-            }))
-        }
-        _ => Err(Error::MalformedBundle("private lifecycle cursor")),
-    }
 }
 fn put_locators(e: &mut Encoder, positions: &[Locator]) {
     e.array(positions.len());
@@ -436,7 +357,7 @@ pub(crate) async fn answer(mut send: SendStream, page: Page) -> Result<()> {
     }
     let _charge = page.charge;
     let mut e = Encoder::new();
-    e.array(7)
+    e.array(6)
         .uint(2)
         .bytes(&page.cursor.incarnation)
         .uint(page.cursor.after)
@@ -449,7 +370,6 @@ pub(crate) async fn answer(mut send: SendStream, page: Page) -> Result<()> {
         e.array(2).uint(id).bytes(&record);
     }
     put_locators(&mut e, &page.hints);
-    put_lifecycle(&mut e, page.lifecycle.as_ref());
     let wire = e.finish();
     if wire.len() + 4 > MAX_PAGE {
         return Err(Error::SizeLimitExceeded("private Session page"));
@@ -471,7 +391,7 @@ pub(crate) async fn pull(conn: &VoxConnection, ask: Ask, job: Job) -> Result<Pag
         .await?
         .ok_or(Error::MalformedBundle("private Session answer missing"))?;
     let mut d = Decoder::new(&bytes);
-    if d.array()? != 7 || d.uint()? != 2 {
+    if d.array()? != 6 || d.uint()? != 2 {
         return Err(Error::MalformedBundle("private Session answer version"));
     }
     let cursor = Cursor {
@@ -501,7 +421,6 @@ pub(crate) async fn pull(conn: &VoxConnection, ask: Ask, job: Job) -> Result<Pag
         records.push(record.to_vec());
     }
     let hints = read_locators(&mut d)?;
-    let lifecycle = read_lifecycle(&mut d)?;
     d.finish()?;
     if ask.query.archive() && cursor.incarnation != ask.cursor.incarnation {
         return Err(Error::MalformedBundle("private history donor changed"));
@@ -509,7 +428,6 @@ pub(crate) async fn pull(conn: &VoxConnection, ask: Ask, job: Job) -> Result<Pag
     match &ask.query {
         Query::LiveTail => {
             if !hints.is_empty()
-                || lifecycle.is_some()
                 || (cursor.incarnation == ask.cursor.incarnation && cursor.after < ask.cursor.after)
                 || positions.iter().any(|id| {
                     *id == 0 || *id > cursor.after || cursor.after - *id >= PAGE_RECORDS as u64
@@ -519,31 +437,14 @@ pub(crate) async fn pull(conn: &VoxConnection, ask: Ask, job: Job) -> Result<Pag
                 return Err(Error::MalformedBundle("private live tail binding"));
             }
         }
-        Query::Lifecycle {
-            cursor: previous, ..
-        } => {
-            if !hints.is_empty()
-                || records.is_empty()
-                || more != lifecycle.is_some()
-                || previous
-                    .as_ref()
-                    .zip(lifecycle.as_ref())
-                    .is_some_and(|(a, b)| {
-                        a.version != b.version || (b.slot, b.after) <= (a.slot, a.after)
-                    })
-            {
-                return Err(Error::MalformedBundle("private lifecycle continuation"));
-            }
-        }
         Query::ArchiveInventory { lo, hi, before } => {
             if !records.is_empty()
-                || lifecycle.is_some()
                 || cursor.after < *lo
                 || cursor.after > *before
                 || hints
                     .iter()
                     .any(|p| p.id < *lo || p.id > *hi || p.id >= *before)
-                || hints.windows(2).any(|p| p[0].id <= p[1].id)
+                || hints.windows(2).any(|p| p[0].id >= p[1].id)
             {
                 return Err(Error::MalformedBundle("private history inventory binding"));
             }
@@ -552,7 +453,6 @@ pub(crate) async fn pull(conn: &VoxConnection, ask: Ask, job: Job) -> Result<Pag
             positions: wanted, ..
         } => {
             if !hints.is_empty()
-                || lifecycle.is_some()
                 || records.is_empty()
                 || records.len() > wanted.len()
                 || more != (records.len() < wanted.len())
@@ -577,7 +477,6 @@ pub(crate) async fn pull(conn: &VoxConnection, ask: Ask, job: Job) -> Result<Pag
         records,
         positions,
         hints,
-        lifecycle,
         charge,
     })
 }

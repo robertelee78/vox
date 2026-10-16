@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 use super::session_projection::{floor_index, private_index};
 use super::*;
 use crate::node::sessionstream::{
-    Ask, Cursor, LifecycleCursor, Locator, Page, Query as PrivateQuery, Record, MAX_PAGE,
-    MAX_RECORD, PAGE_OVERHEAD, PAGE_RECORDS,
+    Ask, Cursor, Locator, Page, Query as PrivateQuery, Record, MAX_PAGE, MAX_RECORD, PAGE_OVERHEAD,
+    PAGE_RECORDS,
 };
 
 const SUPPORT: &str = "vox/private-session-stream/v1";
@@ -81,18 +81,6 @@ pub(super) struct Stored {
     attention_after: Option<AttentionOpening>,
 }
 
-struct LifecycleDependency {
-    author: Digest32,
-    session: String,
-    cursor: Option<LifecycleCursor>,
-    tail: Cursor,
-}
-
-struct TailLifecycle {
-    boundary: Cursor,
-    checked: BTreeSet<(Digest32, String)>,
-}
-
 #[derive(Default)]
 pub(super) struct PrivateSessions {
     pub(super) legacy_pending: LegacyPending,
@@ -113,8 +101,7 @@ pub(super) struct PrivateSessions {
     next: u64,
     incarnation: Option<Digest32>,
     cursors: BTreeMap<Digest32, Cursor>,
-    lifecycle: BTreeMap<Digest32, LifecycleDependency>,
-    tail_lifecycle: BTreeMap<Digest32, TailLifecycle>,
+    observed_tips: BTreeMap<Digest32, Cursor>,
     pulling: BTreeSet<Digest32>,
     attempted: BTreeMap<Digest32, Instant>,
     revision: u64,
@@ -1914,7 +1901,6 @@ impl ChannelState {
             records: Vec::new(),
             positions: Vec::new(),
             hints: Vec::new(),
-            lifecycle: None,
             charge,
         };
         let mut wire_bytes = PAGE_OVERHEAD;
@@ -1971,53 +1957,6 @@ impl ChannelState {
                 page.records.reverse();
                 page.more |= lower > seen.saturating_add(1);
             }
-            PrivateQuery::Lifecycle {
-                author,
-                session,
-                cursor,
-            } => {
-                let mut current = cursor.clone();
-                for _ in 0..PAGE_RECORDS {
-                    let (positions, next) = private_index::lifecycle_sources(
-                        &store.snapshot()?,
-                        &self.sek,
-                        &self.channel_id,
-                        author,
-                        session,
-                        current.as_ref(),
-                        1,
-                    )?;
-                    let Some(position) = positions.first() else {
-                        break;
-                    };
-                    let saved = self
-                        .private_at(store, position.id)?
-                        .ok_or(Error::StreamRefused("private lifecycle source unavailable"))?;
-                    if saved.record.hash() != position.hash || !permitted(&saved)? {
-                        return Err(Error::StreamRefused(
-                            "private lifecycle source not authorized",
-                        ));
-                    }
-                    let wire = saved.record.wire();
-                    if wire.len() > MAX_RECORD {
-                        return Err(Error::SizeLimitExceeded("private Session record"));
-                    }
-                    if wire_bytes + wire.len() + 16 > MAX_PAGE {
-                        page.lifecycle = current;
-                        page.more = true;
-                        break;
-                    }
-                    wire_bytes += wire.len() + 16;
-                    page.positions.push(position.id);
-                    page.records.push(wire);
-                    current = next;
-                    page.lifecycle = current.clone();
-                    page.more = current.is_some();
-                    if current.is_none() {
-                        break;
-                    }
-                }
-            }
             PrivateQuery::ArchiveInventory { lo, hi, before } => {
                 if ask.cursor.incarnation != incarnation {
                     return Err(Error::StreamRefused(
@@ -2052,6 +1991,7 @@ impl ChannelState {
                         });
                     }
                 }
+                page.hints.reverse();
                 page.cursor.after = before.max(*lo);
                 page.more = private_index::arrival_before(
                     &store.snapshot()?,
@@ -2108,7 +2048,12 @@ impl ChannelState {
             || self.drive.receivers.is_empty()
             || !self.supports_private(store, &peer)?
             || !self.drive_members().contains(&peer)
-            || self.private_sessions.pulling.contains(&peer)
+            || (self.private_sessions.pulling.contains(&peer)
+                && self
+                    .private_sessions
+                    .attempted
+                    .get(&peer)
+                    .is_some_and(|at| at.elapsed() < Duration::from_secs(30)))
             || self
                 .private_sessions
                 .attempted
@@ -2123,14 +2068,7 @@ impl ChannelState {
             revision: self.private_sessions.revision,
             room: self.channel_id,
             epoch: self.epoch,
-            query: self.private_sessions.lifecycle.get(&peer).map_or(
-                PrivateQuery::LiveTail,
-                |dependency| PrivateQuery::Lifecycle {
-                    author: dependency.author,
-                    session: dependency.session.clone(),
-                    cursor: dependency.cursor.clone(),
-                },
-            ),
+            query: PrivateQuery::LiveTail,
             cursor: self
                 .private_sessions
                 .cursors
@@ -2148,162 +2086,99 @@ impl ChannelState {
         now: u64,
     ) -> Result<bool> {
         self.private_sessions.pulling.remove(&peer);
-        let page = match page {
-            Ok(page) => page,
-            Err(error) => {
-                // A changed donor descriptor is retried from a new current tail, never by
-                // carrying its obsolete lifecycle cursor into another incarnation.
-                self.private_sessions.lifecycle.remove(&peer);
-                return Err(error);
-            }
-        };
+        let page = page?;
         self.require_governance_ready(store, crate::time::Ms(now))?;
-        if self.poisoned || !self.drive_members().contains(&peer) {
-            return Err(Error::StreamRefused("private Session room unavailable"));
+        if self.poisoned
+            || !self.drive_members().contains(&peer)
+            || page.revision != self.private_sessions.revision
+            || page.query != PrivateQuery::LiveTail
+        {
+            return Err(Error::StreamRefused(
+                "private live request or authority changed",
+            ));
         }
         self.index_session_floors(store)?;
-        if page.query.archive() {
-            return Err(Error::StreamRefused(
-                "private archive requires its explicit local operation",
-            ));
-        }
-        if page.revision != self.private_sessions.revision {
-            return Err(Error::StreamRefused(
-                "private grant changed during delivery",
-            ));
-        }
-        if matches!(page.query, PrivateQuery::LiveTail) {
-            let retained = self
-                .private_sessions
-                .tail_lifecycle
-                .entry(peer)
-                .or_insert_with(|| TailLifecycle {
-                    boundary: page.cursor.clone(),
-                    checked: BTreeSet::new(),
-                });
-            if retained.boundary != page.cursor {
-                retained.boundary = page.cursor.clone();
-                retained.checked.clear();
+        // This is a donor-local locator hint, not a completeness statement or a watermark.
+        // Authenticate the whole advertised page before retaining even that bounded hint.
+        for wire in &page.records {
+            let record = Record::read(wire)?;
+            let author = record.message.header.author_id;
+            let key = self
+                .authors
+                .get(&author)
+                .ok_or(Error::StreamRefused("private Session author unknown"))?;
+            record.verify(&self.channel_id, key)?;
+            if !self.private_permitted(store, &record, &self.me())? {
+                return Err(Error::StreamRefused(
+                    "private Session has no current Drive grant",
+                ));
             }
         }
+        if page.records.is_empty()
+            && page.cursor.after > self.private_recovery_after(&peer, page.cursor.incarnation)
+        {
+            return Err(Error::StreamRefused(
+                "private donor advertised a gap without authenticated records",
+            ));
+        }
+        self.private_sessions
+            .observed_tips
+            .insert(peer, page.cursor.clone());
         for wire in &page.records {
-            let row = self.preview_private_record(store, wire)?;
-            if let Some(row) = &row {
-                match &page.query {
-                    PrivateQuery::Lifecycle {
-                        author, session, ..
-                    } => {
-                        let metadata = vox_agentcomms::envelope::Envelope::parse(&row.body)
-                            .is_ok_and(|env| env.from == *session && env.at.session_name.is_some());
-                        if row.author != *author
-                            || row.session_id != *session
-                            || !(crate::node::sessions::is_record(&row.body) || metadata)
-                        {
-                            return Err(Error::StreamRefused(
-                                "private lifecycle reply contained unrelated activity",
-                            ));
-                        }
-                    }
-                    PrivateQuery::LiveTail if row.session_id != crate::node::drive::KEY_CHANGED => {
-                        let checked =
-                            self.private_sessions
-                                .tail_lifecycle
-                                .get(&peer)
-                                .is_some_and(|state| {
-                                    state
-                                        .checked
-                                        .contains(&(row.author, row.session_id.clone()))
-                                });
-                        if !checked {
-                            self.private_sessions.lifecycle.insert(
-                                peer,
-                                LifecycleDependency {
-                                    author: row.author,
-                                    session: row.session_id.clone(),
-                                    cursor: None,
-                                    tail: page.cursor.clone(),
-                                },
-                            );
-                            self.private_sessions.attempted.remove(&peer);
-                            return Ok(true); // only a named lifecycle dependency, never older activity
-                        }
-                        use super::session_projection::{Query, Reply};
-                        if !matches!(
-                            self.session_query(
-                                store,
-                                Query::Lookup {
-                                    node: row.author,
-                                    id: row.session_id.clone()
-                                },
-                                1,
-                                now
-                            ),
-                            Ok(Reply::Lookup(Some(_)))
-                        ) {
-                            // The exact lifecycle bodies are durable; its bounded local fold must
-                            // finish before exposing activity or advancing the live watermark.
-                            return Ok(false);
-                        }
-                    }
-                    _ => {}
+            let record = Record::read(wire)?;
+            let header = &record.message.header;
+            if !self.private_cached(store, &record.hash())? && header.author_id != self.me() {
+                let receiver = self
+                    .drive
+                    .receivers
+                    .get(&(header.author_id, header.chain_id))
+                    .ok_or(Error::StreamRefused(
+                        "private lifecycle/history unavailable; explicit recovery required",
+                    ))?;
+                if receiver.has_skipped_iterations()
+                    || header.iteration != receiver.next_iteration()
+                {
+                    return Err(Error::StreamRefused(
+                        "private lifecycle/history gap; explicit recovery required",
+                    ));
+                }
+            }
+            let row = self
+                .preview_private_record(store, wire)?
+                .ok_or(Error::StreamRefused(
+                    "private lifecycle/history unavailable; explicit recovery required",
+                ))?;
+            if !crate::node::sessions::is_record(&row.body)
+                && row.session_id != crate::node::drive::KEY_CHANGED
+            {
+                use super::session_projection::{Query, Reply};
+                if !matches!(
+                    self.session_query(
+                        store,
+                        Query::Lookup {
+                            node: row.author,
+                            id: row.session_id.clone()
+                        },
+                        1,
+                        now
+                    ),
+                    Ok(Reply::Lookup(Some(_)))
+                ) {
+                    return Err(Error::StreamRefused(
+                        "private lifecycle unavailable; explicit recovery required",
+                    ));
                 }
             }
             self.take_private_record(store, wire, now)?;
         }
-        match &page.query {
-            PrivateQuery::LiveTail => {
-                if self.private_sessions.cursors.get(&peer) != Some(&page.cursor) {
-                    self.private_sessions.cursors.insert(peer, page.cursor);
-                    if let Err(error) = self.save_private_pulls(store) {
-                        self.private_save_failed(&error);
-                        return Err(error);
-                    }
-                }
-                Ok(false) // Older gaps require explicit demand even when the donor says more.
+        if self.private_sessions.cursors.get(&peer) != Some(&page.cursor) {
+            self.private_sessions.cursors.insert(peer, page.cursor);
+            if let Err(error) = self.save_private_pulls(store) {
+                self.private_save_failed(&error);
+                return Err(error);
             }
-            PrivateQuery::Lifecycle {
-                author, session, ..
-            } => {
-                let dependency = self
-                    .private_sessions
-                    .lifecycle
-                    .get_mut(&peer)
-                    .ok_or(Error::StreamRefused("private lifecycle request retired"))?;
-                if dependency.author != *author || dependency.session != *session {
-                    return Err(Error::StreamRefused("private lifecycle request changed"));
-                }
-                if let Some(cursor) = page.lifecycle {
-                    dependency.cursor = Some(cursor);
-                } else {
-                    let dependency = self
-                        .private_sessions
-                        .lifecycle
-                        .remove(&peer)
-                        .expect("checked dependency");
-                    let state = self
-                        .private_sessions
-                        .tail_lifecycle
-                        .entry(peer)
-                        .or_insert_with(|| TailLifecycle {
-                            boundary: dependency.tail.clone(),
-                            checked: BTreeSet::new(),
-                        });
-                    if state.boundary == dependency.tail {
-                        if state.checked.len() >= PAGE_RECORDS
-                            && !state.checked.contains(&(*author, session.clone()))
-                        {
-                            return Err(Error::SizeLimitExceeded(
-                                "private tail lifecycle dependencies",
-                            ));
-                        }
-                        state.checked.insert((*author, session.clone()));
-                    }
-                }
-                self.private_sessions.attempted.remove(&peer);
-                Ok(true) // Retry the same tail; the saved live watermark has not advanced.
-            }
-            _ => unreachable!("explicit archive was refused above"),
         }
+        Ok(false) // No private archive is scheduled automatically, even when a gap remains.
     }
 
     fn preview_private_record(&self, store: &Store, wire: &[u8]) -> Result<Option<SessionRow>> {
@@ -2353,9 +2228,137 @@ impl ChannelState {
         }))
     }
 
+    /// Stable generation scope for explicit private history. Ratchet iteration advances do
+    /// not change it; a durable receiver generation or membership change does.
+    pub(crate) fn private_history_scope(
+        &self,
+        store: &Store,
+        peer: &Digest32,
+    ) -> Result<(Cursor, Digest32)> {
+        self.require_governance_ready(store, crate::time::Ms(self.now_hint))?;
+        if self.poisoned
+            || !self.drive_members().contains(peer)
+            || !self.private_controls_ready(store)?
+        {
+            return Err(Error::StreamRefused(
+                "private history authority is unavailable",
+            ));
+        }
+        let boundary = self
+            .private_sessions
+            .observed_tips
+            .get(peer)
+            .or_else(|| self.private_sessions.cursors.get(peer))
+            .cloned()
+            .ok_or(Error::StreamRefused(
+                "current private donor boundary is not available yet",
+            ))?;
+        Ok((boundary, self.private_pull_binding()))
+    }
+
+    pub(crate) fn private_history_ask(
+        &self,
+        store: &Store,
+        bounds: crate::node::history_demand::Bounds,
+        plan: &crate::node::history_demand::PrivatePlan,
+    ) -> Result<Ask> {
+        let (boundary, grant) = self.private_history_scope(store, &plan.donor)?;
+        if boundary.incarnation != bounds.head || grant != plan.grant || bounds.hi > boundary.after
+        {
+            return Err(Error::StreamRefused(
+                "private history donor or Drive generation changed",
+            ));
+        }
+        let query = if !plan.inventory_done {
+            PrivateQuery::ArchiveInventory {
+                lo: bounds.lo,
+                hi: bounds.hi,
+                before: bounds
+                    .hi
+                    .checked_add(1)
+                    .ok_or(Error::SizeLimitExceeded("private history boundary"))?,
+            }
+        } else {
+            PrivateQuery::ArchiveRecords {
+                lo: bounds.lo,
+                hi: bounds.hi,
+                positions: plan.positions.clone(),
+            }
+        };
+        Ok(Ask {
+            revision: self.private_sessions.revision,
+            room: self.channel_id,
+            epoch: self.epoch,
+            cursor: Cursor {
+                incarnation: bounds.head,
+                after: bounds.hi,
+            },
+            query,
+        })
+    }
+
+    /// One explicit quantum only. The caller persists this exact updated plan after these
+    /// idempotent record effects commit and before reporting progress to the person.
+    pub(crate) fn finish_private_history(
+        &mut self,
+        store: &Store,
+        bounds: crate::node::history_demand::Bounds,
+        plan: &mut crate::node::history_demand::PrivatePlan,
+        page: Page,
+        now: u64,
+    ) -> Result<()> {
+        let ask = self.private_history_ask(store, bounds, plan)?;
+        if page.revision != ask.revision || page.query != ask.query {
+            return Err(Error::StreamRefused(
+                "private history request changed during transfer",
+            ));
+        }
+        self.index_session_floors(store)?;
+        match &page.query {
+            PrivateQuery::ArchiveInventory { .. } => {
+                if page.more {
+                    return Err(Error::StreamRefused(
+                        "private inventory did not finish its fixed interval",
+                    ));
+                }
+                let mut missing = Vec::new();
+                for position in page.hints {
+                    if !self.private_cached(store, &position.hash)? {
+                        missing.push(position);
+                    }
+                }
+                plan.positions = missing;
+                plan.inventory_done = true;
+            }
+            PrivateQuery::ArchiveRecords { .. } => {
+                for wire in &page.records {
+                    self.preview_private_record(store, wire)?
+                        .ok_or(Error::StreamRefused(
+                            "requested private history key is no longer retained",
+                        ))?;
+                    self.take_private_record(store, wire, now)?;
+                }
+                plan.positions.drain(..page.records.len());
+            }
+            PrivateQuery::LiveTail => {
+                return Err(Error::StreamRefused(
+                    "live delivery is not an archive quantum",
+                ))
+            }
+        }
+        Ok(())
+    }
+
     /// Fixed metadata for an explicit private history request; never starts transfer.
     pub(crate) fn private_live_boundary(&self, peer: &Digest32) -> Option<Cursor> {
         self.private_sessions.cursors.get(peer).cloned()
+    }
+    pub(crate) fn private_recovery_after(&self, peer: &Digest32, incarnation: Digest32) -> u64 {
+        self.private_sessions
+            .cursors
+            .get(peer)
+            .filter(|c| c.incarnation == incarnation)
+            .map_or(0, |c| c.after)
     }
     pub(crate) fn private_cached(&self, store: &Store, hash: &Digest32) -> Result<bool> {
         let Some(id) = self.private_id(store, hash)? else {
@@ -2450,8 +2453,7 @@ impl ChannelState {
     pub(super) fn reset_private_pulls(&mut self) {
         self.private_sessions.revision = self.private_sessions.revision.wrapping_add(1);
         self.private_sessions.cursors.clear();
-        self.private_sessions.lifecycle.clear();
-        self.private_sessions.tail_lifecycle.clear();
+        self.private_sessions.observed_tips.clear();
         self.private_sessions.attempted.clear();
     }
 

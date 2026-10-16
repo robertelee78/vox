@@ -1929,10 +1929,18 @@ async fn request_history(
     action: &str,
     before: Option<Digest32>,
     saved_request: Option<[u8; 16]>,
+    private_peer: Option<Digest32>,
 ) -> Result<vox_core::node::api::HistoryDemandStatus, AppError> {
     use vox_core::node::api::{HistoryDemandAction as Action, HistoryDemandPhase as Phase};
     let chosen = match action {
         "newest" => Action::Newest,
+        "private-recover" => Action::PrivateRecover {
+            peer: private_peer.ok_or_else(|| {
+                AppError::Usage(
+                    "--history private-recover requires --history-peer FINGERPRINT".into(),
+                )
+            })?,
+        },
         "older" => Action::Older {
             before: before
                 .ok_or_else(|| AppError::Usage("--history older requires --before ENTRY".into()))?,
@@ -1995,10 +2003,17 @@ pub async fn read(
     history: Option<&str>,
     history_instance: Option<&str>,
     history_request: Option<&str>,
+    history_peer: Option<&str>,
     tagged: &Tagged,
 ) -> Result<(), AppError> {
     let retained_instance = history_instance.map(parse_history_id).transpose()?;
     let retained_request = history_request.map(parse_history_id).transpose()?;
+    let private_peer = history_peer.map(parse_cursor).transpose()?;
+    if private_peer.is_some() && history != Some("private-recover") {
+        return Err(AppError::Usage(
+            "Private history selectors require --history private-recover.".into(),
+        ));
+    }
     if retained_instance.is_some() && !matches!(history, Some("status" | "cancel" | "resume")) {
         return Err(AppError::Usage(
             "A retained instance is only for history status, cancel or resume.".into(),
@@ -2044,11 +2059,12 @@ pub async fn read(
             action,
             before,
             retained_request,
+            private_peer,
         )
         .await
         {
             Ok(state) => {
-                if action == "status" || action == "cancel" || action == "resume" {
+                if matches!(action, "status" | "cancel" | "resume" | "private-recover") {
                     if json {
                         println!(
                             "{}",

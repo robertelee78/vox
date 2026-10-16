@@ -218,6 +218,32 @@ struct Cleanup {
     last: u64,
 }
 
+/// A private operation uses the same archive slot and immutable original interval.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PrivatePlan {
+    pub donor: Digest32,
+    pub grant: Digest32,
+    pub inventory_done: bool,
+    pub positions: Vec<super::sessionstream::Locator>,
+}
+impl PrivatePlan {
+    fn validate(&self, bounds: Bounds) -> Result<()> {
+        if bounds.hi - bounds.lo >= super::sessionstream::PAGE_RECORDS as u64
+            || self.positions.len() > super::sessionstream::PAGE_RECORDS
+            || (!self.inventory_done && !self.positions.is_empty())
+            || self
+                .positions
+                .iter()
+                .any(|p| p.id < bounds.lo || p.id > bounds.hi)
+            || self.positions.windows(2).any(|p| p[0].id >= p[1].id)
+        {
+            return Err(bad());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct State {
@@ -230,6 +256,8 @@ pub struct State {
     pub remaining: usize,
     pub body: Option<Body>,
     pub cursor: Option<Cursor>,
+    #[serde(default)]
+    pub(crate) private: Option<PrivatePlan>,
     progress: Progress,
     serial: u64,
     cleanup: Option<Cleanup>,
@@ -251,6 +279,12 @@ impl State {
 
     fn validate(&self) -> Result<()> {
         self.bounds.validate()?;
+        if let Some(private) = &self.private {
+            private.validate(self.bounds)?;
+            if self.body.is_some() || self.cursor.is_some() {
+                return Err(bad());
+            }
+        }
         if self.serial == 0 || self.remaining > self.bounds.entries {
             return Err(bad());
         }
@@ -464,6 +498,28 @@ pub fn start(
     bounds: Bounds,
     job: &Job,
 ) -> Result<Active> {
+    start_plan(context, request, binding, bounds, None, job)
+}
+
+pub(crate) fn start_private(
+    context: &Context,
+    request: RequestId,
+    binding: Binding,
+    bounds: Bounds,
+    plan: PrivatePlan,
+    job: &Job,
+) -> Result<Active> {
+    plan.validate(bounds)?;
+    start_plan(context, request, binding, bounds, Some(plan), job)
+}
+fn start_plan(
+    context: &Context,
+    request: RequestId,
+    binding: Binding,
+    bounds: Bounds,
+    private: Option<PrivatePlan>,
+    job: &Job,
+) -> Result<Active> {
     let _charge = charge(job, STATE_WORK)?;
     bounds.validate()?;
     let key = key(context)?;
@@ -492,6 +548,7 @@ pub fn start(
         remaining: bounds.entries,
         body: None,
         cursor: None,
+        private,
         progress: Progress::Pending,
         serial,
         cleanup: None,
@@ -858,6 +915,47 @@ pub fn checkpoint(
     } else {
         None
     };
+    state.progress = progress;
+    put(&mut batch, key, &scope, &state)?;
+    commit(batch, active, context)?;
+    if progress.terminal() {
+        active.valid = false;
+    }
+    Ok(())
+}
+
+/// Effects are committed before this acknowledgement. Repeated body admission is idempotent;
+/// a crash before this commit retries the same exact positions rather than skipping them.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn checkpoint_private(
+    context: &Context,
+    active: &mut Active,
+    expected: &PrivatePlan,
+    next: PrivatePlan,
+    remaining: usize,
+    progress: Progress,
+    job: &Job,
+) -> Result<()> {
+    let _charge = charge(job, STATE_WORK)?;
+    let key = key(context)?;
+    let scope = scope(context);
+    let mut batch = context.store().batch()?;
+    let mut state = live(&batch, key, &scope, context, active)?;
+    next.validate(state.bounds)?;
+    if state.private.as_ref() != Some(expected)
+        || next.donor != expected.donor
+        || next.grant != expected.grant
+        || remaining > state.remaining
+        || !matches!(
+            progress,
+            Progress::More | Progress::Complete | Progress::Unavailable
+        )
+        || (progress == Progress::Complete && (!next.inventory_done || !next.positions.is_empty()))
+    {
+        return Err(invalid("private history checkpoint binding"));
+    }
+    state.private = Some(next);
+    state.remaining = remaining;
     state.progress = progress;
     put(&mut batch, key, &scope, &state)?;
     commit(batch, active, context)?;

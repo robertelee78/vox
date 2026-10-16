@@ -1015,8 +1015,8 @@ enum NetEvent {
     PrivateSessionDone {
         channel_id: Digest32,
         peer: Digest32,
-        room: SharedChannel,
-        page: crate::error::Result<crate::node::sessionstream::Page>,
+        room: std::sync::Weak<tokio::sync::Mutex<crate::node::channel::ChannelState>>,
+        result: Result<(), String>,
     },
     /// A program asked, through the app API, to open an app stream to `peer`: reach it
     /// through the ladder and hand the connection back (ADR-022 decision 7).
@@ -9840,70 +9840,69 @@ impl Node {
                     crate::transport::streams::refuse(&mut send, &mut recv);
                     return;
                 };
-                let Some(job) = self.history_budget.try_start(
-                    profile.fingerprint(),
-                    crate::node::history_budget::Lane::Live,
-                ) else {
-                    if self.owed_a_reason(&ask.room, &peer, ask.epoch) {
-                        crate::node::net::refuse_stream_because(
-                            &mut send,
-                            &mut recv,
-                            crate::wire::WireError::SessionBusy,
-                        );
-                    } else {
-                        crate::transport::streams::refuse(&mut send, &mut recv);
-                    }
+                let lane = if ask.query.archive() {
+                    crate::node::history_budget::Lane::Archive
+                } else {
+                    crate::node::history_budget::Lane::Live
+                };
+                let Some(job) = self.history_budget.try_start(profile.fingerprint(), lane) else {
+                    crate::transport::streams::refuse(&mut send, &mut recv);
+                    return;
+                };
+                let Some((store, guard)) = self.current_private_context() else {
+                    crate::transport::streams::refuse(&mut send, &mut recv);
                     return;
                 };
                 let Some(charge) = job.reserve(crate::node::sessionstream::PAGE_ENVELOPE) else {
                     crate::transport::streams::refuse(&mut send, &mut recv);
                     return;
                 };
-                let page = shared.lock().await.private_page(
-                    profile.store(),
-                    &ask,
-                    &peer,
-                    &holders,
-                    charge,
-                );
-                match page {
-                    Ok(page) => {
-                        tokio::spawn(async move {
-                            let _connection = conn;
-                            let _ = crate::node::sessionstream::answer(send, page).await;
-                        });
+                self.join_tasks.spawn(async move {
+                    let _connection = conn;
+                    let page = history_demand::current_private_room(
+                        shared,
+                        store,
+                        job,
+                        guard,
+                        move |room, store| room.private_page(store, &ask, &peer, &holders, charge),
+                    )
+                    .await;
+                    match page {
+                        Ok(page) => {
+                            let _ = tokio::time::timeout(
+                                Duration::from_secs(10),
+                                crate::node::sessionstream::answer(send, page),
+                            )
+                            .await;
+                        }
+                        Err(_) => crate::transport::streams::refuse(&mut send, &mut recv),
                     }
-                    Err(_) => crate::transport::streams::refuse(&mut send, &mut recv),
-                }
+                });
             }
             NetEvent::PrivateSessionDone {
                 channel_id,
                 peer,
                 room,
-                page,
+                result,
             } => {
-                let (Some(shared), Some(store)) = (
-                    self.channels.get(&channel_id).map(Arc::clone),
-                    self.log_store(),
-                ) else {
-                    return;
-                };
-                // A result for a room closed and reopened while the network task ran belongs
-                // to the old state, never the freshly loaded keys or recovery cursors.
-                if !Arc::ptr_eq(&shared, &room) {
+                if !self
+                    .channels
+                    .get(&channel_id)
+                    .zip(room.upgrade().as_ref())
+                    .is_some_and(|(current, old)| Arc::ptr_eq(current, old))
+                {
                     return;
                 }
-                let result = shared.lock().await.finish_private_pull(
-                    &store,
-                    peer,
-                    page,
-                    (self.millis_clock)(),
-                );
+                if let Err(reason) = result {
+                    crate::node::status::SyncBook::with(
+                        &self.sync_book,
+                        channel_id,
+                        peer,
+                        |status| status.last_failure = Some(reason),
+                    );
+                }
                 self.say_session_news(&channel_id).await;
                 self.refresh_network_view().await;
-                if result.is_ok_and(|more| more) {
-                    self.pull_private_sessions(channel_id, peer).await;
-                }
             }
             NetEvent::BoundedRoomAdvanced {
                 channel_id,
@@ -10186,11 +10185,12 @@ impl Node {
                 let _ = reply.send(result);
             }
             NetEvent::HistoryDemandPrepared { token } => {
-                if self
-                    .history_demand
-                    .preparing
-                    .as_ref()
-                    .is_some_and(|p| p.token == token)
+                if token == 0
+                    || self
+                        .history_demand
+                        .preparing
+                        .as_ref()
+                        .is_some_and(|p| p.token == token)
                 {
                     self.accept_history_demand();
                 }
@@ -19855,34 +19855,52 @@ impl Node {
         ) else {
             return;
         };
-        let ask = {
-            let mut ch = shared.lock().await;
-            match ch.start_private_pull(profile.store(), peer) {
-                Ok(Some(ask)) => ask,
-                Ok(None) => return,
-                Err(error) => {
-                    ch.poison(&error);
-                    return;
-                }
-            }
+        let Some((store, guard)) = self.current_private_context() else {
+            return;
         };
         let tx = self.net_tx.clone();
-        tokio::spawn(async move {
+        let clock = self.millis_clock.clone();
+        self.join_tasks.spawn(async move {
             let _slot = slot;
-            let page = tokio::time::timeout(
-                Duration::from_secs(10),
-                crate::node::sessionstream::pull(&conn, ask, job),
-            )
+            let weak = Arc::downgrade(&shared);
+            let result = async {
+                let ask = history_demand::current_private_room(
+                    shared.clone(),
+                    store.clone(),
+                    job.clone(),
+                    guard.clone(),
+                    move |room, store| room.start_private_pull(store, peer),
+                )
+                .await?;
+                let Some(ask) = ask else {
+                    return Ok(());
+                };
+                let page = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    crate::node::sessionstream::pull(&conn, ask, job.clone()),
+                )
+                .await
+                .unwrap_or(Err(crate::error::Error::Unreachable(
+                    "private Session page timed out",
+                )));
+                let now = clock();
+                history_demand::current_private_room(
+                    shared,
+                    store,
+                    job,
+                    guard,
+                    move |room, store| room.finish_private_pull(store, peer, page, now).map(|_| ()),
+                )
+                .await
+            }
             .await
-            .unwrap_or(Err(crate::error::Error::Unreachable(
-                "private Session page timed out",
-            )));
+            .map_err(|e: crate::error::Error| e.to_string());
             let _ = tx
                 .send(NetEvent::PrivateSessionDone {
                     channel_id,
                     peer,
-                    room: shared,
-                    page,
+                    room: weak,
+                    result,
                 })
                 .await;
         });

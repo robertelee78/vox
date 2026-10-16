@@ -258,26 +258,29 @@ Retry only the still-authorized bounded request; current key/control delivery re
 from private history. Keep each private request's current Drive, generation and audience checks.
 
 The existing signed and Drive-encrypted private record bytes remain unchanged. Version private
-stream 13's request/page envelope so each request is exactly one of `LiveTail`, `Lifecycle` or
-`ExplicitArchive`; refuse unknown purposes rather than interpreting them as an older-page pull.
-The logical `ExplicitArchive` operation uses separate bounded inventory and exact-record requests;
-neither subrequest may widen the operation.
-`LiveTail` samples a fixed newest window of at most 32 records and 1 MiB and advances a separate
-durable live watermark only after those records and the lifecycle evidence they require are
-accepted. An old watermark never turns the intervening gap into requested history. `Lifecycle`
-names the exact author, Session identity, descriptor version, slot and bounded part cursor and
-serves only the existing signed opening/end and current name, harness and working-directory
-metadata sources selected by that Session index descriptor; it does not carry activity.
+stream 13's request/page envelope so each request is exactly `LiveTail` or `ExplicitArchive`;
+refuse unknown purposes rather than interpreting them as an older-page pull. The logical
+`ExplicitArchive` operation uses separate bounded inventory and exact-record requests; neither
+subrequest may widen the operation.
 
-`ExplicitArchive` binds the selected donor, its current trust/Drive incarnation and an immutable
-upper arrival bound. It first exchanges a bounded inventory for the selected interval, then asks
-for at most 32 exact missing `(position, hash)` records within 1 MiB. A continuation is only a
-transport locator inside those original bounds; it grants no authority and never resumes by
-itself. Its durable state shares the node's one archive operation, status, pause, resume and
-cancel contract with public history while retaining an explicit private scope. Private cache
-hits suppress retransmission only after exact positions and hashes agree. Ratchet generation,
-replay and `MAX_SKIP` rules remain unchanged; public v2 heads or contexts never authorize a
-private record.
+`LiveTail` samples a fixed newest window of at most 32 records and 1 MiB. Automatic acceptance
+requires each unseen record to be the next contiguous iteration of its sender-key chain, with
+no unresolved skipped iterations. Locally retained or co-delivered signed lifecycle facts govern
+activity; an unknown lifecycle or gap leaves the durable live watermark unchanged and reports
+that explicit private history recovery is required. A donor's unsigned descriptor or cursor
+cannot prove that a later end, rename or metadata change was not omitted. No donor-selected
+lifecycle completion is treated as currentness or authority.
+
+Explicit private recovery binds the selected donor, its current trust/Drive incarnation and
+one immutable ascending interval of at most 32 arrival positions. It exchanges a bounded
+inventory, then asks for exact missing `(position, hash)` records within 1 MiB per quantum.
+Genuine records may be cached under the existing signature, Drive, ratchet generation, replay
+and `MAX_SKIP` rules; an unsigned inventory never proves global completeness. One quantum stops
+and requires an explicit Resume; another interval also needs explicit selection. The durable
+state shares the node's one archive operation, status, restart-paused, resume and cancel contract
+with public history, while retaining explicit private scope and original bounds. Cache hits
+suppress retransmission only after exact positions and hashes agree. Public v2 heads or contexts
+never authorize a private record. Existing real data is not reset or silently migrated.
 
 Session history retains ADR-031's join/drive boundary: a request for older room history MUST NOT
 grant earlier private Session steps or widen trust. Retention and unavailable-peer outcomes

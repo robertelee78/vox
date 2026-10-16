@@ -26,6 +26,23 @@ pub(super) struct Dispatch {
     pub fence: Arc<Fence>,
 }
 
+struct PrivateDispatch {
+    room: Digest32,
+    instance: [u8; 16],
+    peer: Digest32,
+    request: RequestId,
+    generation: Digest32,
+    bounds: Bounds,
+    plan: demand::PrivatePlan,
+    staging: Staging,
+    fence: Arc<Fence>,
+}
+struct PrivateWork {
+    result: Arc<StdMutex<Option<Result<Status, String>>>>,
+    request: RequestId,
+    generation: Digest32,
+    task: tokio::task::JoinHandle<()>,
+}
 struct Prepared {
     node: Digest32,
     room: Weak<Mutex<ChannelState>>,
@@ -33,6 +50,7 @@ struct Prepared {
     generation: Digest32,
     status: Status,
     dispatch: Option<Dispatch>,
+    private: Option<PrivateDispatch>,
     local_only: bool,
     selection_after: Option<Option<Digest32>>,
 }
@@ -55,6 +73,7 @@ pub(super) struct Controller {
     pub(super) preparing: Option<Preparation>,
     ready: Option<Dispatch>,
     running: Option<Running>,
+    private_work: Option<PrivateWork>,
     status: Option<Status>,
     selection: Option<(Digest32, [u8; 16], Option<Digest32>)>,
 }
@@ -158,11 +177,17 @@ impl Controller {
                 *result = None;
             }
         }
+        if let Some(work) = self.private_work.take() {
+            let _ = work.task.await;
+        }
         self.status = None;
     }
 }
 fn status(room: Digest32, instance: [u8; 16], phase: Phase, detail: &str) -> Status {
     Status {
+        private_peer: None,
+        private_lo: None,
+        private_hi: None,
         room,
         instance,
         request: None,
@@ -190,6 +215,9 @@ pub(crate) fn saved_status(
         demand::Progress::Cancelled => Phase::Cancelled,
     };
     Status {
+        private_peer: state.private.as_ref().map(|p| p.donor),
+        private_lo: state.private.as_ref().map(|_| state.bounds.lo),
+        private_hi: state.private.as_ref().map(|_| state.bounds.hi),
         room: state.binding.room,
         instance: state.binding.instance,
         request: Some(state.request),
@@ -198,9 +226,15 @@ pub(crate) fn saved_status(
         head: Some(state.bounds.head),
         remaining: state.remaining,
         offset: state
-            .body
+            .private
             .as_ref()
-            .map_or_else(|| state.cursor.map_or(0, |c| c.offset), |body| body.offset),
+            .map(|p| p.positions.first().map_or(state.bounds.lo, |v| v.id))
+            .unwrap_or_else(|| {
+                state
+                    .body
+                    .as_ref()
+                    .map_or_else(|| state.cursor.map_or(0, |c| c.offset), |body| body.offset)
+            }),
         headers: state.bounds.entries,
         wire_bytes: 1024 * 1024,
         detail: if state.reclaiming() {
@@ -268,6 +302,21 @@ impl Node {
                     )
                 }));
         }
+        let prior_private = if matches!(action, Action::Cancel { .. }) {
+            self.history_demand.private_work.take()
+        } else {
+            if self.history_demand.private_work.is_some() {
+                return Ok(self.history_demand.status.clone().unwrap_or_else(|| {
+                    status(
+                        room,
+                        instance,
+                        Phase::Busy,
+                        "Private history work is settling.",
+                    )
+                }));
+            }
+            None
+        };
         let profile = self.profile.as_ref().ok_or("node is locked")?;
         let node = profile.fingerprint();
         let local_only = matches!(action, Action::Status | Action::Cancel { .. });
@@ -318,6 +367,7 @@ impl Node {
         let now = self.now_ms().get();
         let task = tokio::spawn(async move {
             let work = async {
+                if let Some(prior) = prior_private { let _ = prior.task.await; }
                 let Some(charge) = job.reserve(5 * 1024 * 1024) else { return Err("history preparation buffers are busy".into()); };
                 let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
                 let room_guard = if local_only { None } else {
@@ -364,8 +414,127 @@ impl Node {
         Ok(pending)
     }
 
+    fn start_private_history(&mut self, dispatch: PrivateDispatch) {
+        let Some(profile) = self.profile.as_ref() else {
+            self.history_demand.failed(
+                dispatch.request,
+                dispatch.generation,
+                "Node locked; private recovery is paused.",
+            );
+            return;
+        };
+        let node = profile.fingerprint();
+        let store = profile.store_handle();
+        let Some(shared) = self.channels.get(&dispatch.room).cloned() else {
+            self.history_demand.failed(
+                dispatch.request,
+                dispatch.generation,
+                "Room closed; private recovery is paused.",
+            );
+            return;
+        };
+        let Some(conn) = self
+            .net
+            .as_ref()
+            .and_then(|net| net.manager().existing(&dispatch.peer))
+        else {
+            self.history_demand.failed(
+                dispatch.request,
+                dispatch.generation,
+                "Private donor is offline; resume after it reconnects.",
+            );
+            return;
+        };
+        let Some(job) = self.history_budget.try_start(node, Lane::Archive) else {
+            self.history_demand.failed(
+                dispatch.request,
+                dispatch.generation,
+                "Archive worker is busy; resume this request later.",
+            );
+            return;
+        };
+        let Some(slot) =
+            crate::node::ports::Slots::take(&self.slots, dispatch.peer, Box::new(|| {}))
+        else {
+            self.history_demand.failed(
+                dispatch.request,
+                dispatch.generation,
+                "Peer transfer slots are busy; resume this request later.",
+            );
+            return;
+        };
+        let request = dispatch.request;
+        let generation = dispatch.generation;
+        let result = Arc::new(StdMutex::new(None));
+        let output = result.clone();
+        let tx = self.net_tx.clone();
+        let now = self.now_ms().get();
+        let task = tokio::spawn(async move {
+            let _slot = slot;
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+            let work = async {
+                let bounds = dispatch.bounds;
+                let plan = dispatch.plan.clone();
+                let check = PrivateGuard { node, room: dispatch.room, instance: dispatch.instance, generation, context: dispatch.staging.context.clone(), fence: dispatch.fence.clone(), deadline };
+                let ask = private_room(shared.clone(), store.clone(), job.clone(), check.clone(), move |room, store| {
+                    room.private_history_ask(store, bounds, &plan).map_err(|e| e.to_string())
+                }).await?;
+                let page = tokio::select! {
+                    biased;
+                    () = dispatch.fence.retired() => return Err("Private recovery cancelled.".into()),
+                    answer = tokio::time::timeout_at(deadline, crate::node::sessionstream::pull(&conn, ask, job.clone())) => answer.map_err(|_| "Private recovery deadline elapsed.")?.map_err(|e| e.to_string())?,
+                };
+                let context = dispatch.staging.context.clone();
+                let active = dispatch.staging.active.clone();
+                let expected = dispatch.plan;
+                let checkpoint_job = job.clone();
+                private_room(shared, store, job, check, move |room, store| {
+                    let mut next = expected.clone();
+                    room.finish_private_history(store, bounds, &mut next, page, now).map_err(|e| e.to_string())?;
+                    let remaining = next.positions.len();
+                    let progress = if next.inventory_done && remaining == 0 { demand::Progress::Complete } else { demand::Progress::More };
+                    let mut active = active.lock().map_err(|_| "Private recovery state poisoned.")?;
+                    demand::checkpoint_private(&context, &mut active, &expected, next, remaining, progress, &checkpoint_job).map_err(|e| e.to_string())?;
+                    let saved = demand::inspect(&context, &checkpoint_job).map_err(|e| e.to_string())?.ok_or("Private recovery state disappeared.")?;
+                    let mut status = saved_status(saved.state(), None, Some(&active));
+                    status.detail = if progress == demand::Progress::Complete {
+                        "The selected donor interval was examined. This does not prove complete private history; another interval requires an explicit request."
+                    } else {
+                        "This private recovery quantum is retained. Resume explicitly to continue the same interval."
+                    }.into();
+                    Ok(status)
+                }).await
+            }.await;
+            if let Ok(mut result) = output.lock() {
+                *result = Some(work);
+            }
+            let _ = tx.try_send(NetEvent::HistoryDemandPrepared { token: 0 });
+        });
+        self.history_demand.private_work = Some(PrivateWork {
+            result,
+            request,
+            generation,
+            task,
+        });
+    }
+
     /// Metadata-only event; a single private result slot owns any not-yet-dispatched context.
     pub(super) fn accept_history_demand(&mut self) -> bool {
+        if let Some(work) = &self.history_demand.private_work {
+            if let Ok(mut result) = work.result.try_lock() {
+                if let Some(answer) = result.take() {
+                    let request = work.request;
+                    let generation = work.generation;
+                    drop(result);
+                    self.history_demand.private_work = None;
+                    match answer {
+                        Ok(status) => self.history_demand.completed(request, generation, status),
+                        Err(reason) => self.history_demand.failed(request, generation, &reason),
+                    }
+                    return true;
+                }
+            }
+        }
         let Some(preparation) = self.history_demand.preparing.as_ref() else {
             return false;
         };
@@ -447,6 +616,15 @@ impl Node {
                         Some((prepared.status.room, prepared.status.instance, after));
                 }
                 self.history_demand.status = Some(prepared.status);
+                if let Some(dispatch) = prepared.private {
+                    self.history_demand.running = Some(Running {
+                        request: dispatch.request,
+                        generation: dispatch.generation,
+                        fence: dispatch.fence.clone(),
+                        cancellation: dispatch.staging.context.cancellation(),
+                    });
+                    self.start_private_history(dispatch);
+                }
                 if let Some(dispatch) = prepared.dispatch {
                     self.history_demand.running = Some(Running {
                         request: dispatch.request,
@@ -464,6 +642,129 @@ impl Node {
         }
         true
     }
+}
+
+#[derive(Clone)]
+struct PrivateGuard {
+    node: Digest32,
+    room: Digest32,
+    instance: [u8; 16],
+    generation: Digest32,
+    context: Arc<Context>,
+    fence: Arc<Fence>,
+    deadline: tokio::time::Instant,
+}
+impl PrivateGuard {
+    fn check(&self, room: &ChannelState, store: &Store) -> Result<(), String> {
+        if self.fence.is_retired()
+            || self.context.cancellation().is_cancelled()
+            || tokio::time::Instant::now() >= self.deadline
+            || room.channel_id() != self.room
+            || room.history_instance(store).ok() != Some(self.instance)
+            || !room.is_member(&self.node)
+            || room.has_left(&self.node)
+            || stream::authorization_generation(
+                store,
+                self.node,
+                self.room,
+                self.instance,
+                room.epoch(),
+            )
+            .ok()
+                != Some(self.generation)
+        {
+            return Err("Private recovery authority changed or request cancelled.".into());
+        }
+        Ok(())
+    }
+}
+async fn private_room<T: Send + 'static>(
+    room: Arc<Mutex<ChannelState>>,
+    store: Arc<Store>,
+    job: Job,
+    guard: PrivateGuard,
+    work: impl FnOnce(&mut ChannelState, &Store) -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    let charge = job
+        .reserve(4 * 1024 * 1024)
+        .ok_or("Private recovery disk buffers are busy.")?;
+    let mut room = tokio::select! {
+        biased;
+        () = guard.fence.retired() => return Err("Private recovery cancelled.".into()),
+        room = tokio::time::timeout_at(guard.deadline, room.lock_owned()) => room.map_err(|_| "Private recovery room lock deadline elapsed.")?,
+    };
+    // The context/secret-work lease, charge and slot stay held until the actual disk call ends.
+    tokio::task::spawn_blocking(move || {
+        let _job = job;
+        let _charge = charge;
+        guard.check(&room, &store)?;
+        let result = work(&mut room, &store)?;
+        guard.check(&room, &store)?;
+        Ok(result)
+    })
+    .await
+    .map_err(|_| "Private recovery disk worker stopped.".to_owned())?
+}
+
+/// Existing current private delivery is tracked by join_tasks. Its blocking work retains the
+/// secret-work lease and daemon reservation even when its async caller is aborted at lock.
+#[derive(Clone)]
+pub(super) struct CurrentPrivateGuard {
+    lease: Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
+    nonce: Option<[u8; crate::atrest::sek::NONCE_LEN]>,
+    deadline: tokio::time::Instant,
+}
+impl Node {
+    pub(super) fn current_private_context(&self) -> Option<(Arc<Store>, CurrentPrivateGuard)> {
+        let profile = self.profile.as_ref().filter(|p| p.is_unlocked())?;
+        let lease = Arc::new(self.secret_work.clone().try_read_owned().ok()?);
+        let store = profile.store_handle();
+        let nonce = store
+            .get_meta_prefix::<{ crate::atrest::sek::NONCE_LEN }>(
+                crate::node::trust::TRUST_META_KEY,
+            )
+            .ok()?;
+        Some((
+            store,
+            CurrentPrivateGuard {
+                lease,
+                nonce,
+                deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+            },
+        ))
+    }
+}
+pub(super) async fn current_private_room<T: Send + 'static>(
+    room: Arc<Mutex<ChannelState>>,
+    store: Arc<Store>,
+    job: Job,
+    guard: CurrentPrivateGuard,
+    work: impl FnOnce(&mut ChannelState, &Store) -> crate::error::Result<T> + Send + 'static,
+) -> crate::error::Result<T> {
+    use crate::error::Error;
+    let charge = job
+        .reserve(4 * 1024 * 1024)
+        .ok_or(Error::StreamRefused("private disk buffers are busy"))?;
+    let mut room = tokio::time::timeout_at(guard.deadline, room.lock_owned())
+        .await
+        .map_err(|_| Error::StreamRefused("private room lock deadline elapsed"))?;
+    tokio::task::spawn_blocking(move || {
+        let _lease = guard.lease;
+        let _job = job;
+        let _charge = charge;
+        if tokio::time::Instant::now() >= guard.deadline
+            || store.get_meta_prefix::<{ crate::atrest::sek::NONCE_LEN }>(
+                crate::node::trust::TRUST_META_KEY,
+            )? != guard.nonce
+        {
+            return Err(Error::StreamRefused(
+                "private authority changed or request expired",
+            ));
+        }
+        work(&mut room, &store)
+    })
+    .await
+    .map_err(|_| Error::StreamRefused("private disk worker stopped"))?
 }
 
 fn cancel_exact(
@@ -511,6 +812,7 @@ fn prepare_local(
             "No history request is saved for this room.",
         ),
         dispatch: None,
+        private: None,
         local_only: true,
         selection_after: None,
     };
@@ -575,6 +877,7 @@ fn prepare(
         generation,
         status: status(id, instance, Phase::Idle, "No history request is saved."),
         dispatch: None,
+        private: None,
         local_only: false,
         selection_after: None,
     };
@@ -596,7 +899,12 @@ fn prepare(
             .get_sek_wrap(&state.binding.room)
             .map_err(|e| e.to_string())?
             .is_none();
-        if (replaced || removed) && matches!(action, Action::Newest | Action::Older { .. }) {
+        if (replaced || removed)
+            && matches!(
+                action,
+                Action::Newest | Action::Older { .. } | Action::PrivateRecover { .. }
+            )
+        {
             cancel_exact(&context, state.request, job, &fence, deadline)?;
             saved = None;
         }
@@ -609,6 +917,24 @@ fn prepare(
             );
         }
         answer.status = saved_status(saved.state(), None, None);
+    }
+    if matches!(action, Action::PrivateRecover { .. })
+        || (matches!(action, Action::Resume { .. })
+            && saved.as_ref().is_some_and(|s| s.state().private.is_some()))
+    {
+        return prepare_private(
+            room,
+            store,
+            node,
+            instance,
+            action,
+            context,
+            job,
+            peers,
+            answer,
+            saved.as_ref().map(|s| s.state()),
+            fence,
+        );
     }
     let (bounds, author, query, active, remaining) = if let Action::Resume { request } = action {
         let saved = saved.as_ref().ok_or("No history request is saved.")?;
@@ -729,6 +1055,139 @@ fn prepare(
         generation,
         query,
         bounds,
+        staging: Staging {
+            context,
+            active: Arc::new(StdMutex::new(active)),
+        },
+        fence,
+    });
+    Ok(answer)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_private(
+    room: &ChannelState,
+    store: &Store,
+    node: Digest32,
+    instance: [u8; 16],
+    action: Action,
+    context: Arc<Context>,
+    job: &Job,
+    peers: Vec<Digest32>,
+    mut answer: Prepared,
+    saved: Option<&demand::State>,
+    fence: Arc<Fence>,
+) -> Result<Prepared, String> {
+    let peer = match action {
+        Action::PrivateRecover { peer } => peer,
+        Action::Resume { request } => {
+            let state = saved
+                .filter(|s| s.request == request)
+                .ok_or("The private history request changed.")?;
+            state
+                .private
+                .as_ref()
+                .ok_or("The saved request is public history.")?
+                .donor
+        }
+        _ => return Err("Private history needs an explicit selection or resume.".into()),
+    };
+    let (boundary, private_grant) = room
+        .private_history_scope(store, &peer)
+        .map_err(|e| e.to_string())?;
+    let binding = Binding {
+        room: room.channel_id(),
+        instance,
+        epoch: room.epoch(),
+        audience: peer,
+        grant: answer.generation,
+    };
+    let (bounds, plan, mut active) = if let Action::Resume { request } = action {
+        let state = saved.ok_or("No saved private history request.")?;
+        let plan = state
+            .private
+            .clone()
+            .ok_or("The saved request is public history.")?;
+        if state.binding != binding
+            || plan.grant != private_grant
+            || state.bounds.head != boundary.incarnation
+        {
+            return Err(
+                "Private history authorization or donor incarnation changed; cancel this request."
+                    .into(),
+            );
+        }
+        let active = demand::resume(&context, request, binding, job).map_err(|e| e.to_string())?;
+        (state.bounds, plan, active)
+    } else {
+        if let Some(state) = saved.filter(|s| {
+            !matches!(
+                s.progress(None),
+                demand::Progress::Complete | demand::Progress::Cancelled
+            ) || s.reclaiming()
+        }) {
+            answer.status = saved_status(state, None, None);
+            answer.status.detail = "A saved request exists. Resume or cancel it explicitly.".into();
+            return Ok(answer);
+        }
+        let mut after = room.private_recovery_after(&peer, boundary.incarnation);
+        if let Some(prior) = saved.filter(|s| {
+            s.progress(None) == demand::Progress::Complete
+                && s.bounds.head == boundary.incarnation
+                && s.private
+                    .as_ref()
+                    .is_some_and(|p| p.donor == peer && p.grant == private_grant)
+        }) {
+            after = after.max(prior.bounds.hi);
+        }
+        if after >= boundary.after {
+            answer.status = status(room.channel_id(), instance, Phase::Cached, "The currently advertised private interval has been examined; this is not proof of donor completeness.");
+            return Ok(answer);
+        }
+        let lo = after
+            .checked_add(1)
+            .ok_or("Private arrival position exhausted.")?;
+        let hi = after.saturating_add(32).min(boundary.after);
+        let bounds = Bounds {
+            head: boundary.incarnation,
+            lo,
+            hi,
+            entries: (hi - lo + 1) as usize,
+        };
+        let plan = demand::PrivatePlan {
+            donor: peer,
+            grant: private_grant,
+            inventory_done: false,
+            positions: Vec::new(),
+        };
+        let request = crate::identity::rng::random_array::<16>().map_err(|e| e.to_string())?;
+        let active = demand::start_private(&context, request, binding, bounds, plan.clone(), job)
+            .map_err(|e| e.to_string())?;
+        (bounds, plan, active)
+    };
+    let snapshot = demand::inspect(&context, job)
+        .map_err(|e| e.to_string())?
+        .ok_or("Private history state disappeared.")?;
+    answer.status = saved_status(snapshot.state(), None, Some(&active));
+    if !peers.contains(&peer) || peer == node {
+        demand::pause(&context, &mut active, job).map_err(|e| e.to_string())?;
+        answer.status.phase = Phase::Paused;
+        answer.status.detail =
+            "The selected private donor is unavailable; resume explicitly after it reconnects."
+                .into();
+        return Ok(answer);
+    }
+    answer.status.phase = Phase::Pending;
+    answer.status.detail =
+        "One bounded private history quantum is queued; another requires explicit resume.".into();
+    answer.private = Some(PrivateDispatch {
+        room: room.channel_id(),
+        instance,
+        peer,
+        request: active.request(),
+        generation: answer.generation,
+        bounds,
+        plan,
         staging: Staging {
             context,
             active: Arc::new(StdMutex::new(active)),

@@ -818,6 +818,8 @@ pub enum HistoryDemandAction {
     Newest,
     /// Select an older interval before this exact cached message.
     Older { before: Digest32 },
+    /// Recover the next bounded sequential private interval from this exact donor.
+    PrivateRecover { peer: Digest32 },
     /// Resume this exact retained operation, preserving its original bounds.
     Resume { request: [u8; 16] },
     /// Cancel this exact retained operation, including provisional body storage.
@@ -856,6 +858,14 @@ pub enum HistoryDemandPhase {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HistoryDemandStatus {
+    /// Private Drive scope; absent for public room history.
+    #[serde(default)]
+    pub private_peer: Option<Digest32>,
+    /// Original donor-local private interval; unchanged by continuation.
+    #[serde(default)]
+    pub private_lo: Option<u64>,
+    #[serde(default)]
+    pub private_hi: Option<u64>,
     /// Selected room.
     pub room: Digest32,
     /// Exact saved room incarnation.
