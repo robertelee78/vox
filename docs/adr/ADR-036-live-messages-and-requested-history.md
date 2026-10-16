@@ -298,6 +298,19 @@ is fetched, an explicit older page retrieved with its exact bodies, and another 
 delivered while that work runs. Restart MUST retain the received page without refetching it.
 Exercise multiple local nodes to expose aggregate scheduling, not just one peer's limit.
 
+**Existing v1 recovery.** A signed v1 witness may cover an unbounded retained suffix. Its
+publication MUST advance only through explicit bounded Resume quanta; startup MUST NOT finish it
+automatically. A room with paused Building or Switched work MUST reopen its published accepted
+cache under current trust, Drive and retention checks and expose the exact saved request's Resume
+and Cancel. Publication-dependent writes may return `Legacy history required`; neither this state
+nor an unverified suffix may be reported as fully current. Cancellation and orphan reclamation may
+run as bounded local maintenance without accepting history. Completed recovery or cancellation
+MUST eventually restore an Idle entry index and ordinary writes, including after a crash. The
+live-before-archive and live-during-archive journey above applies to the authenticated new format;
+existing v1 rooms separately prove responsive cached recovery, preserved restart-paused progress,
+and recovery to writable Idle. This does not authorize format conversion, weaken governance, or
+grant the unresolved legacy activation exception.
+
 Adversarial apparatus MUST exercise omitted control/revocation, conflicting overlapping history,
 wrong room/epoch, missing required authority and malformed proof limits against the real binary.
 Each negative verdict MUST come from the product; apparatus failures are named separately.
