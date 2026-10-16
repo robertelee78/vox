@@ -11179,6 +11179,22 @@ impl Node {
             self.publish_channel_to_anchors(&channel_id, PublishCause::Join)
                 .await;
         }
+        // The join consumed one of this responder's prekeys off the actor, before the admission
+        // above completed. A maintenance tick in that gap can publish the replacement while the
+        // joiner is absent from the room's member snapshot; no later bundle change would then owe
+        // that joiner the current bundle, and its first consent to us waits on the spent prekey.
+        // Seed the durable obligation now that admission is final, and put the current own records
+        // directly on its authenticated board. A displaced connection leaves the obligation for
+        // `NetEvent::Connected` to retry; only the board's answer retires it.
+        self.prekey_publish_owed.insert((channel_id, peer));
+        if let Some(conn) = self
+            .net
+            .as_ref()
+            .and_then(|net| net.manager().existing(&peer))
+        {
+            self.publish_channel_to_anchor(&channel_id, &conn, PublishCause::Renewal)
+                .await;
+        }
         self.adopt_join_session(channel_id, peer, outcome.session, false)
             .await;
         if let Some(net) = self.net.as_ref() {
