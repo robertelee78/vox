@@ -223,6 +223,7 @@ impl ChannelState {
         profile: &Profile,
         author: &Digest32,
         claimed_ms: u64,
+        after_departure: bool,
     ) -> Result<()> {
         if !self
             .entries
@@ -232,15 +233,15 @@ impl ChannelState {
             return Ok(());
         }
         self.local_content_header = None;
-        // This is reached only from an intentional post. Its context control, when required,
-        // is part of that same operation and must share the post's departure exception.
+        // An intentional post's context control, when required, is part of that same operation
+        // and shares its departure exception. Automatic read records pass false.
         let prepared = self.authored_kind(
             profile,
             author,
             SignedEntryKind::Content,
             None,
             claimed_ms,
-            true,
+            after_departure,
         )?;
         self.local_content_header = Some(prepared);
         Ok(())

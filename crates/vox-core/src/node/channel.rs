@@ -8098,7 +8098,7 @@ impl ChannelState {
         }
         let (now_millis, skipped) = self.stamp_after_held(profile.store(), now_millis)?;
         let content = Content::text(now_millis, text)?;
-        self.prepare_content_context(profile, &me, now_millis)?;
+        self.prepare_content_context(profile, &me, now_millis, true)?;
         let plaintext = Zeroizing::new(content.to_canonical_vec());
         let msg = self.sender.encrypt(&plaintext)?;
         let payload = msg.to_wire();
@@ -8618,7 +8618,7 @@ impl ChannelState {
         let sent_ms = now_millis;
         let (now_millis, _) = self.stamp_after_held(profile.store(), now_millis)?;
         let record = crate::node::content::ReadRecord::new(now_millis, read)?;
-        self.prepare_content_context(profile, &me, now_millis)?;
+        self.prepare_content_context(profile, &me, now_millis, false)?;
         let plaintext = Zeroizing::new(record.to_canonical_vec());
         let msg = self.sender.encrypt(&plaintext)?;
         let payload = msg.to_wire();
