@@ -384,6 +384,8 @@ Found by an outside review (2026-10-04) and confirmed in code at integrate `3d52
   includes a change in routable addresses (`local_route_ips`), a default next hop, or the active
   path's outgoing interface or IPv6 scope. Losing and regaining the active path MUST also count
   when the resulting numeric addresses and next hop repeat, including within one coalesced batch.
+  The watcher MUST retain evidence from the event sequence in that batch; comparing only its
+  starting and ending snapshots cannot establish that no path loss occurred.
   Unrelated interface or route chatter MUST NOT start N-51. Route observation MUST distinguish a
   known route, known absence, and a failed or unavailable observation: an error is not evidence
   that a route disappeared. Every successful observation MUST update the comparison baseline,

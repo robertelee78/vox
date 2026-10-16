@@ -217,7 +217,9 @@ fn interface_index(iface: &str) -> Option<u32> {
 pub fn default_gateway_v4() -> Result<Ipv4Addr> {
     let table = std::fs::read_to_string("/proc/net/route")
         .map_err(|_| Error::PortMappingFailed("gateway: cannot read /proc/net/route"))?;
-    parse_proc_net_route(&table).ok_or(Error::PortMappingFailed(NO_ROUTE))
+    parse_proc_net_route(&table)
+        .map(|(ip, _)| ip)
+        .ok_or(Error::PortMappingFailed(NO_ROUTE))
 }
 
 /// The IPv4 default route's next hop on macOS, by `RTM_GET` ([`macos::default_route`], N-53).
@@ -245,11 +247,11 @@ pub fn default_gateway_v4() -> Result<std::net::Ipv4Addr> {
 /// of the IPv4 address. The default route has `Destination == 00000000`; among
 /// several, the lowest `Metric` wins.
 #[cfg(target_os = "linux")]
-fn parse_proc_net_route(contents: &str) -> Option<Ipv4Addr> {
-    let mut best: Option<(u32, Ipv4Addr)> = None;
+fn parse_proc_net_route(contents: &str) -> Option<(Ipv4Addr, String)> {
+    let mut best: Option<(u32, Ipv4Addr, String)> = None;
     for line in contents.lines().skip(1) {
         let mut cols = line.split_whitespace();
-        let _iface = cols.next()?;
+        let iface = cols.next()?;
         let dest = cols.next()?;
         let gateway = cols.next()?;
         let _flags = cols.next()?;
@@ -265,11 +267,11 @@ fn parse_proc_net_route(contents: &str) -> Option<Ipv4Addr> {
             continue; // a default route with a 0.0.0.0 gateway is on-link, not a hop
         }
         match best {
-            Some((bm, _)) if bm <= m => {}
-            _ => best = Some((m, gw)),
+            Some((bm, _, _)) if bm <= m => {}
+            _ => best = Some((m, gw, iface.to_owned())),
         }
     }
-    best.map(|(_, gw)| gw)
+    best.map(|(_, gw, iface)| (gw, iface))
 }
 
 /// Decode an 8-hex-digit little-endian IPv4 (the `/proc/net/route` field encoding)
@@ -301,20 +303,54 @@ pub struct Hop {
 /// family (or no way to ask).
 #[must_use]
 pub fn default_hop(v6: bool) -> Option<Hop> {
+    default_hop_result(v6).ok()
+}
+
+/// The route with its outgoing interface, preserving an absent route versus a failed lookup.
+/// The watcher needs that distinction and the interface even when the numeric next hop repeats.
+///
+/// # Errors
+/// The kernel's route lookup failed or reported no default next hop.
+pub fn default_hop_result(v6: bool) -> Result<Hop> {
     #[cfg(target_os = "macos")]
     {
-        macos::default_route(v6).ok()
+        macos::default_route(v6)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        let (addr, interface) = if v6 {
+            let table = std::fs::read_to_string("/proc/net/ipv6_route").map_err(|_| {
+                Error::PortMappingFailed("gateway: cannot read /proc/net/ipv6_route")
+            })?;
+            let (ip, interface) =
+                parse_proc_net_ipv6_route(&table).ok_or(Error::PortMappingFailed(NO_ROUTE_V6))?;
+            (std::net::IpAddr::V6(ip), interface)
+        } else {
+            let table = std::fs::read_to_string("/proc/net/route")
+                .map_err(|_| Error::PortMappingFailed("gateway: cannot read /proc/net/route"))?;
+            let (ip, interface) =
+                parse_proc_net_route(&table).ok_or(Error::PortMappingFailed(NO_ROUTE))?;
+            (std::net::IpAddr::V4(ip), interface)
+        };
+        let index = interface_index(&interface).ok_or(Error::PortMappingFailed(
+            "gateway: default route has no interface index",
+        ))?;
+        Ok(Hop {
+            addr,
+            interface: Some(interface),
+            index,
+        })
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         if v6 {
-            default_gateway_v6().ok().map(|(a, index)| Hop {
+            default_gateway_v6().map(|(a, index)| Hop {
                 addr: std::net::IpAddr::V6(a),
                 interface: None,
                 index,
             })
         } else {
-            default_gateway_v4().ok().map(|a| Hop {
+            default_gateway_v4().map(|a| Hop {
                 addr: std::net::IpAddr::V4(a),
                 interface: None,
                 index: 0,

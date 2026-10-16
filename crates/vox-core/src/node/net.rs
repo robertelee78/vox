@@ -482,6 +482,7 @@ type Unanswered = Vec<(Arc<VoxConnection>, u64)>;
 /// One QUIC connection per peer fingerprint (see the module docs).
 pub struct ConnectionManager {
     endpoint: Arc<VoxEndpoint>,
+    network: tokio::sync::watch::Receiver<u64>,
     conns: Mutex<HashMap<Digest32, Arc<VoxConnection>>>,
     /// Connections a better path displaced, with the time each may be closed. They
     /// keep serving what is already on them; nothing new is opened on them.
@@ -544,6 +545,7 @@ impl ConnectionManager {
     pub fn with_retire_grace(endpoint: Arc<VoxEndpoint>, clock: Clock, grace_secs: u64) -> Self {
         Self {
             endpoint,
+            network: tokio::sync::watch::channel(0).1,
             conns: Mutex::new(HashMap::new()),
             retiring: Mutex::new(Vec::new()),
             heard: Mutex::new(HashMap::new()),
@@ -552,6 +554,47 @@ impl ConnectionManager {
             clock,
             notes: Mutex::new(None),
             dialling: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// A manager on the daemon's shared network generation.
+    pub(crate) fn with_network(
+        endpoint: Arc<VoxEndpoint>,
+        clock: Clock,
+        network: tokio::sync::watch::Receiver<u64>,
+    ) -> Self {
+        Self {
+            network,
+            ..Self::new(endpoint, clock)
+        }
+    }
+
+    /// The path on which a new attempt starts.
+    #[must_use]
+    pub fn network_generation(&self) -> u64 {
+        *self.network.borrow()
+    }
+
+    /// Cancel old-path work promptly so it cannot hold a current-path peer's dial slot.
+    pub async fn on_network<T>(
+        &self,
+        generation: u64,
+        work: impl std::future::Future<Output = Result<T>>,
+    ) -> Result<T> {
+        let mut changes = self.network.clone();
+        if *changes.borrow_and_update() != generation {
+            return Err(crate::error::Error::Unreachable(
+                "the network changed during this attempt",
+            ));
+        }
+        tokio::select! {
+            result = work => result,
+            () = async {
+                while changes.changed().await.is_ok() {
+                    if *changes.borrow_and_update() != generation { return; }
+                }
+                std::future::pending::<()>().await;
+            } => Err(crate::error::Error::Unreachable("the network changed during this attempt")),
         }
     }
 
@@ -987,13 +1030,22 @@ impl ConnectionManager {
         if let Some(conn) = self.existing(&peer) {
             return Ok(conn);
         }
-        // Counted until the connection is filed, so a reach waiting on it never sees neither.
-        let dial = self.direct_dial(peer);
-        let conn =
-            connect_direct(Arc::clone(&self.endpoint), candidates, peer, (self.clock)()).await?;
-        let filed = self.file(conn).await;
-        drop(dial);
-        Ok(filed)
+        let generation = self.network_generation();
+        let work = async {
+            // Counted until publication, including cancellation on a network change.
+            let _dial = self.direct_dial(peer);
+            let conn = connect_direct(Arc::clone(&self.endpoint), candidates, peer, (self.clock)())
+                .await?;
+            self.adopt_on_network(conn, generation).await
+        };
+        if candidates
+            .iter()
+            .all(|a| a.ip().to_canonical().is_loopback())
+        {
+            work.await
+        } else {
+            self.on_network(generation, work).await
+        }
     }
 
     /// Whether `peer` answers at `candidates` (V210-167): `Ok` only if a connection authenticated
@@ -1017,9 +1069,13 @@ impl ConnectionManager {
                 return Ok(conn);
             }
         }
-        let conn =
-            connect_direct(Arc::clone(&self.endpoint), candidates, peer, (self.clock)()).await?;
-        Ok(self.file(conn).await)
+        let generation = self.network_generation();
+        self.on_network(generation, async {
+            let conn = connect_direct(Arc::clone(&self.endpoint), candidates, peer, (self.clock)())
+                .await?;
+            self.adopt_on_network(conn, generation).await
+        })
+        .await
     }
 
     /// Accept the next inbound connection under `admission` and file it under the
@@ -1051,6 +1107,31 @@ impl ConnectionManager {
     /// produced (ADR-012 rung 3) — under the same one-per-peer rule.
     pub async fn adopt(&self, conn: VoxConnection) -> Arc<VoxConnection> {
         self.file(conn).await
+    }
+
+    /// Publish a dial/punch/relay result only on its originating network. The watch read guard
+    /// is held through the synchronous table mutation, not merely checked before an await.
+    pub async fn adopt_on_network(
+        &self,
+        conn: VoxConnection,
+        generation: u64,
+    ) -> Result<Arc<VoxConnection>> {
+        let unanswered = self.probe_held(&conn).await;
+        let current = self.network.borrow();
+        let local_direct = path_class(&self.endpoint, &conn) == PathClass::Direct
+            && conn
+                .quinn()
+                .remote_address()
+                .ip()
+                .to_canonical()
+                .is_loopback();
+        if *current != generation && !local_direct {
+            conn.close(WireError::Unresponsive);
+            return Err(crate::error::Error::Unreachable(
+                "discarded a connection from the previous network",
+            ));
+        }
+        Ok(self.file_inner(conn, false, unanswered).kept)
     }
 
     /// File a connection under its peer id. One connection per peer is a
@@ -1440,7 +1521,7 @@ impl ConnectionManager {
     }
 
     /// **Close every held connection the machine's network change stranded** (ADR-012 N-51):
-    /// each connection this end accepted, and each to a peer in `dialled_too` (the anchors), is
+    /// each direct, accepted or anchor connection is
     /// probed at once; one that does not answer within its probe's patience is closed, said, and
     /// its peer returned for the caller to dial again. A connection this end accepted cannot follow
     /// the move: QUIC lets only the dialling end migrate (RFC 9000 §9), so the peer keeps sending to
@@ -1450,16 +1531,14 @@ impl ConnectionManager {
     /// it, so it is not probed. Probed, a peer on this machine that was busy for the probe's
     /// quarter second (a join solving its puzzle on a loaded machine) lost its connection, and its
     /// join in flight, to a default route that moved.
-    pub async fn close_stranded(
-        &self,
-        dialled_too: &std::collections::BTreeSet<Digest32>,
-    ) -> Vec<Digest32> {
+    pub async fn close_stranded(&self) -> Vec<Digest32> {
+        let generation = self.network_generation();
         let held: Vec<Arc<VoxConnection>> = lock(&self.conns)
             .values()
             .filter(|c| is_live(c))
-            .filter(|c| !c.quinn().remote_address().ip().to_canonical().is_loopback())
             .filter(|c| {
-                c.quinn().side() == quinn::Side::Server || dialled_too.contains(&c.peer_id())
+                path_class(&self.endpoint, c) != PathClass::Direct
+                    || !c.quinn().remote_address().ip().to_canonical().is_loopback()
             })
             .map(Arc::clone)
             .collect();
@@ -1472,6 +1551,10 @@ impl ConnectionManager {
             let Ok(Some((conn, before))) = done else {
                 continue;
             };
+            let current = self.network.borrow();
+            if *current != generation {
+                break;
+            }
             if !is_live(&conn) || heard_count(conn.quinn()) != before {
                 continue;
             }

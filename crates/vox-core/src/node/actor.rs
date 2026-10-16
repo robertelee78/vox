@@ -567,7 +567,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::AnchorConnected { .. } => "publishing every room to an anchor that answered",
         NetEvent::AddressesDiscovered => "publishing every room at a new address",
         NetEvent::NetworkChanged(_) => "acting on a change of the machine's network",
-        NetEvent::Stranded(_) => "dialling again peers a network change stranded",
+        NetEvent::Stranded { .. } => "dialling again peers a network change stranded",
         NetEvent::SyncDone { .. } => "filing a sync that finished",
         NetEvent::PrivateSessionAsk { .. } => "authorizing private Session records",
         NetEvent::PrivateSessionDone { .. } => "filing private Session records",
@@ -1070,10 +1070,14 @@ enum NetEvent {
     /// N-51): republish, and dial again whatever did not survive the move.
     NetworkChanged(Arc<crate::nat::netwatch::NetChange>),
     /// Peers whose connection the network change stranded, closed now: dialled again at once.
-    Stranded(Vec<Digest32>),
+    Stranded {
+        peers: Vec<Digest32>,
+        generation: u64,
+    },
     /// A configured anchor answered its dial (ADR-016 M15.1): it gets the ordinary
     /// bookkeeping, the `Anchor` class, and every open channel's records.
     AnchorConnected {
+        generation: u64,
         /// The connection to the anchor.
         conn: Arc<VoxConnection>,
     },
@@ -1085,6 +1089,7 @@ enum NetEvent {
     /// looking like patience. Measured: a member whose own view showed `epoch-timeline=0` and no
     /// event after `ChannelOpened`.
     ReachFailed {
+        generation: u64,
         /// The peer that could not be reached.
         peer: Digest32,
         /// What the attempt reported.
@@ -4649,7 +4654,7 @@ pub struct Node {
     /// The anchors being dialled right now, so none is dialled twice at once (V210-57): a node
     /// starting up dialled each anchor from both its start and its first tick, and the
     /// duplicate lost a tie-break against the first on every start.
-    anchor_dials: Arc<std::sync::Mutex<BTreeSet<Digest32>>>,
+    anchor_dials: Arc<std::sync::Mutex<BTreeMap<Digest32, u64>>>,
     /// Per shared, unconfigured anchor whose rooms name more than [`ANCHOR_DIAL_CANDIDATES`]
     /// addresses: where the next dial's window starts in their union (V210-75). Moved on by
     /// each failed dial, dropped when one connects.
@@ -5351,7 +5356,7 @@ impl Node {
             store_recovery: BTreeMap::new(),
             store_recovered: BTreeMap::new(),
             anchor_backoff: BTreeMap::new(),
-            anchor_dials: Arc::new(std::sync::Mutex::new(BTreeSet::new())),
+            anchor_dials: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             anchor_window: BTreeMap::new(),
             anchor_connected_at: BTreeMap::new(),
             anchors_up: BTreeMap::new(),
@@ -6013,6 +6018,9 @@ impl Node {
                 // Room provenance remains independent, including a room that also names a
                 // removed manual anchor.
                 self.anchors = anchors;
+                if let Some(net) = self.net.as_ref() {
+                    self.sync_anchor_scopes(net);
+                }
                 // Dial straight away rather than waiting for the throttle: the caller
                 // refreshed because something changed, and the whole point is not to sit
                 // on a stale address.
@@ -7598,28 +7606,23 @@ impl Node {
     }
 
     /// Every anchor this node keeps a connection to, with the addresses its next dial tries:
-    /// the configured set first, then each open room's own that is not configured (V210-75).
-    /// One identity appears once: at the addresses the configured set gives it if it is there,
-    /// and otherwise at the addresses **every** room that shares it names, a room at a time and
+    /// the configured set and each open room's own (V210-75, ADR-012 N-34).
+    /// One identity appears once, with the addresses **every** permitted source names, a source at a time and
     /// at most [`ANCHOR_DIAL_CANDIDATES`] per dial, so one room's stale addresses for it cannot
     /// pin the redial to where it no longer is.
     fn kept_anchors(&self) -> Vec<(Digest32, Vec<std::net::SocketAddr>)> {
-        let mut all: Vec<(Digest32, Vec<std::net::SocketAddr>)> = self
+        let mut shared: Vec<(Digest32, Vec<Vec<std::net::SocketAddr>>)> = self
             .anchors
             .nodes()
             .iter()
-            .map(|n| (n.id, n.endpoints.direct_candidates()))
+            .map(|n| (n.id, vec![n.endpoints.direct_candidates()]))
             .collect();
-        // Each unconfigured anchor's addresses, one list per room that names it.
-        let mut shared: Vec<(Digest32, Vec<Vec<std::net::SocketAddr>>)> = Vec::new();
+        // Dial hints combine; sync_anchor_scopes retains separate publication/helper authority.
         for (room, set) in &self.room_anchors {
             if !self.channels.contains_key(room) {
                 continue;
             }
             for n in set.nodes() {
-                if all.iter().any(|(id, _)| *id == n.id) {
-                    continue;
-                }
                 let addrs = n.endpoints.direct_candidates();
                 match shared.iter_mut().find(|(id, _)| *id == n.id) {
                     Some((_, rooms)) => rooms.push(addrs),
@@ -7631,15 +7634,13 @@ impl Node {
         // needs the original route, even though no open room keeps that anchor now.
         for pending in self.withdrawn.values() {
             for (id, addresses) in &pending.routes {
-                if all.iter().any(|(configured, _)| configured == id) {
-                    continue;
-                }
                 match shared.iter_mut().find(|(anchor, _)| anchor == id) {
                     Some((_, rooms)) => rooms.push(addresses.clone()),
                     None => shared.push((*id, vec![addresses.clone()])),
                 }
             }
         }
+        let mut all = Vec::with_capacity(shared.len());
         for (id, rooms) in shared {
             let mut union: Vec<std::net::SocketAddr> = Vec::new();
             let deepest = rooms.iter().map(Vec::len).max().unwrap_or(0);
@@ -7679,6 +7680,30 @@ impl Node {
     /// say the change; and probe, off the actor, every connection this node accepted and every
     /// anchor's, dialling again whatever did not survive ([`NetEvent::Stranded`]).
     async fn network_changed(&mut self, change: &crate::nat::netwatch::NetChange) {
+        self.anchor_backoff.clear();
+        self.anchor_connected_at.clear();
+        self.anchor_dials
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        self.member_dialed_at.clear();
+        self.nearby_dialed.clear();
+        self.last_upgrade.clear();
+        self.sync_dials.clear();
+        for ((room, peer), port) in &mut self.ports {
+            if port
+                .backoff
+                .is_some_and(|b| b.kind == crate::node::status::BackoffKind::Unreachable)
+            {
+                port.backoff = None;
+                crate::node::status::SyncBook::with(&self.sync_book, *room, *peer, |c| {
+                    c.backoff = None;
+                    c.consecutive_failures = 0;
+                    c.failing_since = None;
+                });
+            }
+        }
+        self.sched_all = true;
         let channels: Vec<Digest32> = self.channels.keys().copied().collect();
         for channel_id in &channels {
             self.publish_channel_locally(channel_id).await;
@@ -7708,13 +7733,19 @@ impl Node {
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
             return;
         };
-        let anchors: std::collections::BTreeSet<Digest32> =
-            self.kept_anchors().into_iter().map(|(id, _)| id).collect();
+        self.redial_anchors_if_due();
+        self.retry_upgrades_if_due().await;
+        let generation = net.manager().network_generation();
         let tx = self.net_tx.clone();
         tokio::spawn(async move {
-            let stranded = net.manager().close_stranded(&anchors).await;
+            let stranded = net.manager().close_stranded().await;
             if !stranded.is_empty() {
-                let _ = tx.send(NetEvent::Stranded(stranded)).await;
+                let _ = tx
+                    .send(NetEvent::Stranded {
+                        peers: stranded,
+                        generation,
+                    })
+                    .await;
             }
         });
     }
@@ -7923,13 +7954,16 @@ impl Node {
         if id == net.local_id() || net.manager().existing(&id).is_some() {
             return false;
         }
-        if !self
-            .anchor_dials
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(id)
+        let generation = net.manager().network_generation();
         {
-            return false;
+            let mut dials = self
+                .anchor_dials
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if dials.get(&id) == Some(&generation) {
+                return false;
+            }
+            dials.insert(id, generation);
         }
         let now = self.now_ms().get();
         self.anchor_unreached_since.entry(id).or_insert(now);
@@ -7943,18 +7977,28 @@ impl Node {
         );
         tokio::spawn(async move {
             let dialled = net.manager().connect_to(id, &candidates).await;
-            dials
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&id);
+            {
+                let mut dials = dials
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if dials.get(&id) == Some(&generation) {
+                    dials.remove(&id);
+                }
+            }
+            if net.manager().network_generation() != generation {
+                return;
+            }
             match dialled {
                 Ok(conn) => {
-                    let _ = tx.send(NetEvent::AnchorConnected { conn }).await;
+                    let _ = tx
+                        .send(NetEvent::AnchorConnected { conn, generation })
+                        .await;
                 }
                 Err(e) => {
                     net.board_told(&id);
                     let _ = tx
                         .send(NetEvent::ReachFailed {
+                            generation,
                             peer: id,
                             why: e.to_string(),
                         })
@@ -8011,11 +8055,10 @@ impl Node {
             }
             self.anchor_ids.insert(anchor.id);
             let addresses = self
-                .anchors
-                .get(&anchor.id)
-                .unwrap_or(anchor)
-                .endpoints
-                .direct_candidates();
+                .kept_anchors()
+                .into_iter()
+                .find_map(|(id, addresses)| (id == anchor.id).then_some(addresses))
+                .unwrap_or_else(|| anchor.endpoints.direct_candidates());
             self.dial_anchor(&net, anchor.id, addresses);
         }
         // **A member the room's address names is reached as a member** (V030-51): left out of the
@@ -8433,6 +8476,9 @@ impl Node {
                 board,
                 helpers,
             } => {
+                if conn.quinn().close_reason().is_some() {
+                    return;
+                }
                 let peer = conn.peer_id();
                 self.sync_dials.remove(&peer);
                 self.adopt_connection(Arc::clone(&conn));
@@ -8786,16 +8832,33 @@ impl Node {
                 }
             }
             NetEvent::NetworkChanged(change) => self.network_changed(&change).await,
-            NetEvent::Stranded(peers) => self.dial_stranded(&peers).await,
-            NetEvent::ReachFailed { peer, why } => {
+            NetEvent::Stranded { peers, generation } => {
+                if self
+                    .net
+                    .as_ref()
+                    .is_some_and(|n| n.manager().network_generation() == generation)
+                {
+                    self.dial_stranded(&peers).await;
+                }
+            }
+            NetEvent::ReachFailed {
+                peer,
+                why,
+                generation,
+            } => {
+                if self
+                    .net
+                    .as_ref()
+                    .is_none_or(|n| n.manager().network_generation() != generation)
+                {
+                    return;
+                }
                 // An anchor that failed to connect waits before its next dial, doubling to
                 // `ANCHOR_UNREACHED_REDIAL_MS` (V210-57, V210-86), jittered once it is there, a
                 // room's own as well as a configured one (V210-75).
                 if self.is_kept_anchor(&peer) {
                     // A union too large for one dial tries its next window next time (V210-75).
-                    if self.anchors.get(&peer).is_none() {
-                        *self.anchor_window.entry(peer).or_insert(0) += ANCHOR_DIAL_CANDIDATES;
-                    }
+                    *self.anchor_window.entry(peer).or_insert(0) += ANCHOR_DIAL_CANDIDATES;
                     let wait = self
                         .anchor_backoff
                         .get(&peer)
@@ -8858,7 +8921,14 @@ impl Node {
             NetEvent::UpgradeFailed { peer, reason } => {
                 let _ = self.event_tx.send(NodeEvent::StillRelayed { peer, reason });
             }
-            NetEvent::AnchorConnected { conn } => {
+            NetEvent::AnchorConnected { conn, generation } => {
+                if self
+                    .net
+                    .as_ref()
+                    .is_none_or(|n| n.manager().network_generation() != generation)
+                {
+                    return;
+                }
                 let peer = conn.peer_id();
                 // **Watched from the moment it is made** (V210-93), not from the next tick's look:
                 // a connection lost before any tick had seen it was never said to be gone. In a
@@ -15478,6 +15548,7 @@ impl Node {
             self.member_dialed_at.insert(target, now);
             let tx = self.net_tx.clone();
             let room = *channel_id;
+            let generation = net.manager().network_generation();
             tokio::spawn(async move {
                 // Nothing known for it here: read a connected board before bridging (V210-122,
                 // V030-22).
@@ -15486,6 +15557,9 @@ impl Node {
                 } else {
                     endpoints
                 };
+                if net.manager().network_generation() != generation {
+                    return;
+                }
                 match net
                     .reach(
                         target,
@@ -15507,6 +15581,7 @@ impl Node {
                     Err(e) => {
                         let _ = tx
                             .send(NetEvent::ReachFailed {
+                                generation,
                                 peer: target,
                                 why: e.to_string(),
                             })
@@ -15655,10 +15730,14 @@ impl Node {
         }
         let room = *channel_id;
         let tx = self.net_tx.clone();
+        let generation = net.manager().network_generation();
         tokio::spawn(async move {
             // This node's board record, or a connected board's when it holds none yet (V210-122,
             // V030-22).
             let endpoints = net.member_endpoints(&room, peer).await;
+            if net.manager().network_generation() != generation {
+                return;
+            }
             match net
                 .reach(
                     peer,
@@ -15680,6 +15759,7 @@ impl Node {
                 Err(e) => {
                     let _ = tx
                         .send(NetEvent::ReachFailed {
+                            generation,
                             peer,
                             why: e.to_string(),
                         })
