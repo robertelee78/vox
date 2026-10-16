@@ -480,23 +480,9 @@ impl Router {
                 skipped.push(format!("{label} is skipped: {error}"));
             }
         }
-        // Retain cached candidates only for still-configured hostname identities while their
-        // resolver is unavailable. Removed authority is never resurrected by this fallback.
-        let mut interim = numeric.clone();
-        for (_, spec) in &names {
-            if let Some(id) = spec
-                .split_once('@')
-                .and_then(|(id, _)| vox_core::node::link::fingerprint_input(id, "anchor").ok())
-            {
-                if let Some(node) = previous.get(&id) {
-                    for spec in vox_core::node::link::anchor_specs(node) {
-                        let _ = vox_core::node::link::merge_anchor_spec(&mut interim, &spec);
-                    }
-                }
-            }
-        }
-        let revision = {
+        let (revision, interim) = {
             let mut state = self.inner.manual_anchors.lock().await;
+            let mut interim = numeric.clone();
             {
                 let current = network.as_ref().map(watch::Receiver::borrow);
                 if state.revision != revision || current.as_deref().copied() != generation {
@@ -506,6 +492,20 @@ impl Router {
                             "machine anchors or network changed during input read; retrying".into(),
                         ],
                     );
+                }
+                // Keep still-authorized hostname hints from the latest published set, never
+                // the pre-read snapshot: another refresh may have resolved a newer endpoint.
+                for (_, spec) in &names {
+                    if let Some(id) = spec.split_once('@').and_then(|(id, _)| {
+                        vox_core::node::link::fingerprint_input(id, "anchor").ok()
+                    }) {
+                        if let Some(node) = state.set.get(&id) {
+                            for spec in vox_core::node::link::anchor_specs(node) {
+                                let _ =
+                                    vox_core::node::link::merge_anchor_spec(&mut interim, &spec);
+                            }
+                        }
+                    }
                 }
                 if state.inputs != inputs {
                     state.inputs = inputs;
@@ -520,7 +520,7 @@ impl Router {
                 state.skipped = skipped.clone();
             }
             self.deliver_manual_anchors(&state).await;
-            state.revision
+            (state.revision, interim)
         };
         if names.is_empty() {
             return (interim, skipped);
