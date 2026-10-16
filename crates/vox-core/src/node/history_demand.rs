@@ -1,9 +1,12 @@
-//! One explicit archive operation per node, including paused work (ADR-036 H-4/H-7).
+//! Bounded durable staging for explicit archive and current live/control (ADR-036 H-4/H-7).
 //!
 //! The disk record never authorizes traffic. Only an explicit start/resume produces an Active
 //! handle, and every mutation checks its durable fencing serial. Callers recheck current room,
 //! trust and audience authority before use. Partial pages are sealed provisional bytes, never
 //! canonical LogDb entries. Obtain a shared Job outside actor locks before calling this module.
+//! Archive has one fixed slot per node, including paused work. Live and control each have one
+//! separate fixed slot so neither a paused archive nor a large live body blocks essential control.
+//! Those slots add no workers or memory pool; their actual buffers use the shared foreground jobs.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -12,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use super::history_budget::{BufferCharge, Job};
-use super::history_stream::{Continuation, RequestId};
+use super::history_stream::{Continuation, Purpose, RequestId};
 use super::profile::Profile;
 use super::store::{Batch, Snapshot as StoreSnapshot, Store};
 use crate::atrest::sek::Sek;
@@ -40,9 +43,17 @@ const RECLAIM_ROWS: u64 = ((1024 * 1024 - STATE_BYTES) / (PAGE_BYTES + PAGE_PREF
 pub struct Context {
     node: Digest32,
     scope: Digest32,
+    slot: Slot,
     store: Arc<Store>,
     key: Sek,
     cancellation: Cancellation,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Slot {
+    Archive,
+    Live,
+    Control,
 }
 
 /// The actor retains this handle to fence a worker even when a blocking disk call cannot abort.
@@ -59,18 +70,40 @@ impl Cancellation {
 }
 
 impl Context {
+    /// Explicit archive commands only. A retained record cannot create or resume this context.
     pub fn unlocked(profile: &Profile) -> Result<Self> {
+        Self::with_slot(profile, Slot::Archive)
+    }
+    /// Current-purpose work only; a network handler cannot use this to start archive demand.
+    pub fn current_unlocked(profile: &Profile, purpose: Purpose) -> Result<Self> {
+        let slot = match purpose {
+            Purpose::Live => Slot::Live,
+            Purpose::Control => Slot::Control,
+            Purpose::History => return Err(invalid("archive requires explicit local demand")),
+        };
+        Self::with_slot(profile, slot)
+    }
+    fn with_slot(profile: &Profile, slot: Slot) -> Result<Self> {
         let key = crate::atrest::seal::sek(profile.signer()?, b"vox/history-demand-sek/v1")?;
         let node = profile.fingerprint();
         let mut bytes = b"vox/history-demand-scope/v1".to_vec();
         bytes.extend_from_slice(&node);
+        bytes.push(match slot {
+            Slot::Archive => 0,
+            Slot::Live => 1,
+            Slot::Control => 2,
+        });
         Ok(Self {
             node,
             scope: sha256(&bytes),
+            slot,
             store: profile.store_handle(),
             key,
             cancellation: Cancellation(Arc::new(AtomicBool::new(false))),
         })
+    }
+    pub fn slot(&self) -> Slot {
+        self.slot
     }
     pub fn cancellation(&self) -> Cancellation {
         self.cancellation.clone()
@@ -172,6 +205,9 @@ struct Cleanup {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct State {
+    // Reconstructed from the authenticated envelope, never supplied by serialized state.
+    #[serde(skip)]
+    scope: Digest32,
     pub request: RequestId,
     pub binding: Binding,
     pub bounds: Bounds,
@@ -249,6 +285,7 @@ impl Snapshot {
 /// Never serialized or reconstructed during restart. A commit failure invalidates this handle.
 pub struct Active {
     node: Digest32,
+    scope: Digest32,
     request: RequestId,
     serial: u64,
     valid: bool,
@@ -264,6 +301,7 @@ impl Active {
     }
     pub fn matches(&self, state: &State) -> bool {
         self.valid
+            && self.scope == state.scope
             && self.request == state.request
             && self.serial == state.serial
             && self.binding == state.binding
@@ -309,11 +347,12 @@ fn decode(
         return Err(bad());
     }
     let bytes = open_segment(key, KIND, HEADER, segment)?;
-    let (version, bound, state): (u8, Digest32, State) =
+    let (version, bound, mut state): (u8, Digest32, State) =
         serde_json::from_slice(&bytes).map_err(|_| bad())?;
     if version != 1 || bound != *scope {
         return Err(bad());
     }
+    state.scope = *scope;
     state.validate()?;
     Ok(state)
 }
@@ -413,6 +452,7 @@ pub fn start(
         None => 1,
     };
     let state = State {
+        scope,
         request,
         binding,
         bounds,
@@ -427,6 +467,7 @@ pub fn start(
     commit_context(batch, context)?;
     Ok(Active {
         node: context.fingerprint(),
+        scope,
         request,
         serial,
         valid: true,
@@ -460,6 +501,7 @@ pub fn resume(
     commit_context(batch, context)?;
     Ok(Active {
         node: context.fingerprint(),
+        scope,
         request,
         serial: state.serial,
         valid: true,
@@ -467,8 +509,9 @@ pub fn resume(
     })
 }
 
-/// Record one already-authenticated header before any body bytes. Repetition consumes no count.
-/// Signature, inclusion and current governance checks belong to the caller's admission path.
+/// Record one authenticated exact-request header before provisional body bytes. Repetition
+/// consumes no count. Full inclusion/control/governance may still be pending; no entry or effect
+/// is admitted until entry_admitted runs in the final verified canonical-publication transaction.
 #[allow(clippy::too_many_arguments)] // One exact authenticated header/body binding.
 pub fn begin_body(
     context: &Context,
