@@ -22,7 +22,7 @@
 //!   still needs a session after its turn goes to the tail.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
@@ -79,9 +79,22 @@ pub struct Attempt {
     pub fence: Arc<Fence>,
     /// Its place among the port's running sessions in `vox status`, removed when it drops.
     pub running: crate::node::status::Running,
+    /// Set only after a bounded inbound request has decoded the exact
+    /// `Control/Head(peer)` query. If that peer departs while the response is in flight,
+    /// lifecycle cleanup may retain this attempt long enough to return its semantic receipt;
+    /// it grants no inventory, body, proof, archive or membership access.
+    pub departure_receipt: Option<Arc<AtomicBool>>,
 }
 
 impl Attempt {
+    /// Whether this inbound attempt has decoded the one query a departed peer may finish.
+    #[must_use]
+    pub fn is_departure_receipt(&self) -> bool {
+        self.departure_receipt
+            .as_ref()
+            .is_some_and(|receipt| receipt.load(Ordering::Acquire))
+    }
+
     /// Stop it: the fence first, so a worker already running stops at its next step, then the
     /// task. Consumes the attempt, so this happens once.
     pub fn retire(self) {

@@ -263,6 +263,75 @@ impl Controller {
     }
 }
 impl Node {
+    /// Retire every operation for a departed member except an already decoded
+    /// `Control/Head(peer)` response. That response is bounded by its existing fence and
+    /// deadline and can return only the peer's own semantic departure receipt.
+    pub(super) fn retire_departed_port(&mut self, room: Digest32, peer: Digest32) {
+        let keep_receipt = self.ports.get(&(room, peer)).is_some_and(|port| {
+            port.inbound
+                .values()
+                .any(|attempt| attempt.is_departure_receipt())
+        });
+        if !keep_receipt {
+            if self.ports.contains_key(&(room, peer)) {
+                self.drop_port(&room, &peer);
+            }
+            return;
+        }
+
+        self.bounded_sync.retire_port(room, peer);
+        self.history_hints.retire_peer(room, peer);
+        let mut retired = Vec::new();
+        if let Some(port) = self.ports.get_mut(&(room, peer)) {
+            if let Some(attempt) = port.out.take() {
+                retired.push(attempt);
+            }
+            let ordinary: Vec<_> = port
+                .inbound
+                .iter()
+                .filter_map(|(token, attempt)| (!attempt.is_departure_receipt()).then_some(*token))
+                .collect();
+            for token in ordinary {
+                if let Some(attempt) = port.inbound.remove(&token) {
+                    retired.push(attempt);
+                }
+            }
+            port.queued = false;
+            port.poisoned = true;
+        }
+        for attempt in retired {
+            attempt.retire();
+        }
+        self.port_queue.remove(&room, &peer);
+    }
+
+    /// Retire bounded workers for `room` and release the exact actor attempts they owned.
+    /// The controller removes a running work item before awaiting it, so its ordinary
+    /// completion can no longer reach `accept_bounded_sync` to take the matching port token.
+    /// Capture those tokens first and clear them after the worker lifetime ends, including
+    /// the cleanup-error path; unrelated inbound and later attempts keep their own tokens.
+    pub(super) async fn retire_bounded_room(&mut self, room: Digest32) -> crate::error::Result<()> {
+        let attempts: Vec<_> = self
+            .bounded_sync
+            .running
+            .iter()
+            .flatten()
+            .filter(|work| work.room == room)
+            .map(|work| (work.peer, work.token))
+            .collect();
+        let result = self.bounded_sync.retire_room(room).await;
+        for (peer, token) in attempts {
+            if let Some(attempt) = self
+                .ports
+                .get_mut(&(room, peer))
+                .and_then(|port| port.take(token))
+            {
+                attempt.retire();
+            }
+        }
+        result
+    }
+
     pub(super) fn accept_bounded_sync(&mut self) {
         self.bounded_sync.poll_cleanup();
         for index in 0..2 {
@@ -722,6 +791,7 @@ impl Node {
             abort: None,
             fence: fence.clone(),
             running,
+            departure_receipt: None,
         });
         let archive = flow
             .archive_request

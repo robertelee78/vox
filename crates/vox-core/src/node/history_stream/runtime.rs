@@ -354,6 +354,24 @@ impl Flow {
         if !self.initialized {
             return Ok(true);
         }
+        // A published current body queues only local exact-request reclamation. If its peer
+        // departs before the next network turn, finish that bounded cleanup here; membership is
+        // never restored and no archive, wire request or new effect is run.
+        let reclaim_live = self
+            .tasks
+            .iter()
+            .any(|task| matches!(task.operation, Operation::Reclaim(Purpose::Live)));
+        let reclaim_control = self
+            .tasks
+            .iter()
+            .any(|task| matches!(task.operation, Operation::Reclaim(Purpose::Control)));
+        let cleanup_job = self.cleanup_job.clone();
+        if reclaim_live && !self.reclaim_stage(Purpose::Live, &cleanup_job).await? {
+            return Ok(false);
+        }
+        if reclaim_control && !self.reclaim_stage(Purpose::Control, &cleanup_job).await? {
+            return Ok(false);
+        }
         // Retained flow metadata is charged to the daemon's small control reservation.
         // Cleanup must not need that same pool to free it: several hosted nodes can fill
         // its headroom. Use an independently admitted foreground-control envelope instead.

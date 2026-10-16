@@ -94,6 +94,7 @@ pub(crate) async fn serve(
     job: Job,
     fence: std::sync::Arc<crate::transport::stream_transport::Fence>,
     inbox: std::sync::Arc<HintInbox>,
+    departure_receipt: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> (Result<Status>, bool) {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     let source = source::Source::new(room, store, preamble.epoch, peer, fence.clone(), deadline);
@@ -107,6 +108,7 @@ pub(crate) async fn serve(
         &inbox,
         generation,
         &mut inventory_added,
+        &departure_receipt,
     )
     .await;
     if let Err(error) = &result {
@@ -128,6 +130,7 @@ async fn serve_request(
     inbox: &HintInbox,
     inbox_generation: u64,
     inventory_added: &mut bool,
+    departure_receipt: &std::sync::atomic::AtomicBool,
 ) -> Result<Status> {
     let first = match io.read(MAX_FRAME_BYTES + 4).await? {
         transport::Read::Frame(frame) => frame,
@@ -174,6 +177,14 @@ async fn serve_request(
         _ => return Err(invalid("history expected bound WANT")),
     };
     drop(next);
+    // Parsed and request-bound before publication. If the peer's departure is applied while
+    // this response is in flight, lifecycle cleanup may retain only this exact query. The server
+    // and Source still restrict the response to the peer's own settled, included head.
+    if preamble.purpose == Purpose::Control
+        && matches!(&query, Query::Head(author) if *author == source.peer)
+    {
+        departure_receipt.store(true, std::sync::atomic::Ordering::Release);
+    }
     server::answer(
         source,
         io,

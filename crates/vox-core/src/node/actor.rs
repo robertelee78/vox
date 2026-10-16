@@ -10034,6 +10034,9 @@ impl Node {
                     .ports
                     .get_mut(&(channel_id, peer))
                     .and_then(|port| port.take(token));
+                let departure_receipt = current
+                    .as_ref()
+                    .is_some_and(|attempt| attempt.is_departure_receipt());
                 if current.is_some() {
                     crate::node::status::SyncBook::with(
                         &self.sync_book,
@@ -10058,6 +10061,9 @@ impl Node {
                         port.raise();
                     }
                     self.sched_rooms.insert(channel_id);
+                }
+                if departure_receipt {
+                    self.drop_port(&channel_id, &peer);
                 }
                 // A finite response neither consumes pending local requests nor follows the
                 // peer's continuation. Sparse scheduling never falls back to legacy archive.
@@ -14311,6 +14317,7 @@ impl Node {
             abort: None,
             fence: Arc::clone(&fence),
             running,
+            departure_receipt: None,
         });
         crate::node::status::SyncBook::with(&self.sync_book, channel_id, peer, |c| c.opened += 1);
         let admit_store = self.profile.as_ref().map(Profile::store_handle);
@@ -14452,6 +14459,7 @@ impl Node {
                 abort: None,
                 fence: Arc::clone(&fence),
                 running,
+                departure_receipt: None,
             },
         );
         crate::node::status::SyncBook::with(&self.sync_book, channel_id, peer, |c| {
@@ -15123,6 +15131,7 @@ impl Node {
         let token = self.next_token;
         self.next_token += 1;
         let fence = crate::transport::stream_transport::Fence::new();
+        let departure_receipt = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let running = crate::node::status::Running::start(
             &self.sync_book,
             channel_id,
@@ -15142,13 +15151,23 @@ impl Node {
                 abort: None,
                 fence: Arc::clone(&fence),
                 running,
+                departure_receipt: Some(Arc::clone(&departure_receipt)),
             },
         );
         let tx = self.net_tx.clone();
         let inbox = Arc::clone(&self.history_hints);
         let task = tokio::spawn(async move {
             let (result, inventory_added) = crate::node::history_stream::serve(
-                shared, store, peer, preamble, send, recv, job, fence, inbox,
+                shared,
+                store,
+                peer,
+                preamble,
+                send,
+                recv,
+                job,
+                fence,
+                inbox,
+                departure_receipt,
             )
             .await;
             let _ = tx
@@ -18101,7 +18120,7 @@ impl Node {
     async fn close_channel(&mut self, channel_id: &Digest32) -> Outcome {
         self.history_demand.retire_room(*channel_id);
         self.history_hints.retire_room(*channel_id);
-        if let Err(error) = self.bounded_sync.retire_room(*channel_id).await {
+        if let Err(error) = self.retire_bounded_room(*channel_id).await {
             return Outcome::Failed(fault_of(&error));
         }
         // Closed on purpose, so not reopened at the next unlock (#208). Forgotten first: a room
@@ -18168,7 +18187,7 @@ impl Node {
     async fn begin_leave(&mut self, channel_id: Digest32, reply: oneshot::Sender<Outcome>) {
         self.history_demand.retire_room(channel_id);
         self.history_hints.retire_room(channel_id);
-        if let Err(error) = self.bounded_sync.retire_room(channel_id).await {
+        if let Err(error) = self.retire_bounded_room(channel_id).await {
             let _ = reply.send(Outcome::Failed(fault_of(&error)));
             return;
         }
@@ -18587,7 +18606,7 @@ impl Node {
     async fn purge_room(&mut self, channel_id: &Digest32) -> Outcome {
         self.history_demand.retire_room(*channel_id);
         self.history_hints.retire_room(*channel_id);
-        if let Err(error) = self.bounded_sync.retire_room(*channel_id).await {
+        if let Err(error) = self.retire_bounded_room(*channel_id).await {
             return Outcome::Failed(fault_of(&error));
         }
         if self
@@ -18770,9 +18789,14 @@ impl Node {
                 .collect();
             let ended_here = ch.ended(now_ms).is_some();
             *seen = departed.iter().copied().collect();
-            if let Some(store) = store.as_ref() {
-                for b in back {
+            for b in back {
+                if let Some(store) = store.as_ref() {
                     let _ = ch.forget_delivery(store, &b);
+                }
+                // A member returning from scratch gets a normal fresh port. A retained,
+                // poisoned receipt-only port belonged to its completed departure.
+                if self.ports.contains_key(&(cid, b)) {
+                    self.drop_port(&cid, &b);
                 }
             }
             let over = ch.ended(now_ms).is_some();
@@ -18792,9 +18816,7 @@ impl Node {
                 self.delivery_reserved
                     .retain(|(room, peer, _), _| *room != cid || peer != d);
                 self.key_waiting.remove(&(cid, *d));
-                if self.ports.contains_key(&(cid, *d)) {
-                    self.drop_port(&cid, d);
-                }
+                self.retire_departed_port(cid, *d);
             }
             // This node's own board no longer offers what the room's log says is gone (V030-14):
             // a member that left, or the whole room once it ended. A joiner reading it, or an
