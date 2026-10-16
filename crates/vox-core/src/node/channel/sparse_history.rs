@@ -630,7 +630,6 @@ impl ChannelState {
                 "pending history source header missing",
             ))?;
         if finished {
-            let author = header.skeleton.author_id;
             let refill_pending = body_expected
                 && header
                     .skeleton
@@ -638,14 +637,15 @@ impl ChannelState {
                     .as_ref()
                     .is_some_and(|v2| v2.kind == SignedEntryKind::Content)
                 && input.retention(hash)?.is_none();
-            drop(input);
-            // Feed restoration is local accepted-header maintenance. Advance at most one
-            // successor in this bounded turn, including when this exact staged body still
-            // needs to pass through the refill admission below.
-            self.advance_history_contiguous(store, &author)?;
             if refill_pending {
                 return Ok(HistoryEffectProgress::RefillPending { governance: false });
             }
+            let author = header.skeleton.author_id;
+            drop(input);
+            // Feed restoration is local accepted-header maintenance. Advance at most one
+            // successor in this bounded turn, but do not retain the source capability after
+            // this exact entry's semantic effect has already completed.
+            self.advance_history_contiguous(store, &author)?;
             return Ok(HistoryEffectProgress::Complete {
                 rendered: cursor.rendered,
             });
