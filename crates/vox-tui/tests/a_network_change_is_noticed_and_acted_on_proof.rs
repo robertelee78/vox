@@ -19,6 +19,7 @@
 //! - `flap` (Linux): active-path down/up inside one 500 ms settle interval, with identical final
 //!   addresses and gateway, is noticed and a new message is delivered;
 //! - `anchor-cache` (Linux): after losing the only configured LAN endpoint, a restarted node
+//!   publishes its current local address within 2 s of Ready without waiting for the gateway,
 //!   reaches its authenticated anchor's learned alternate and delivers a new message;
 //! - `anchor-assisted` (Linux): a real namespace packet filter blocks the established direct
 //!   path; a new message is delivered through the known anchor without operator action;

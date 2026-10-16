@@ -635,12 +635,24 @@ try:
               sh("nft", "list", "table", "inet", "vox_anchor_bootstrap"), flush=True)
         sh("nft", "delete", "table", "inet", "vox_anchor_bootstrap")
         start_daemon("d", listen["d"])
+        ready_at = time.monotonic()
+        restart_addresses = []
+        def restart_has_addresses():
+            report = status_of("d")
+            restart_addresses[:] = [(time.monotonic(), report)]
+            addresses = report.get("listening", [])
+            return (any("/ip4/10.88.0.2/udp/" in address for address in addresses)
+                    and not any("/ip4/10.77.0.2/udp/" in address for address in addresses))
+        addresses_ready = until(restart_has_addresses, 2, 0.1)
+        address_at, restart_status = restart_addresses[-1] if restart_addresses else (ready_at, {})
         anchor_reached = until(lambda: any(row.get("id") == ANCHOR_ID and row.get("reached")
                               for row in status_of("d").get("node_anchors", [])), 20, 0.1)
         ok("d", "room", "post", room, "AFTER-HOTSPOT-RESTART")
         delivered = until(lambda: "AFTER-HOTSPOT-RESTART" in run("p", "room", "read", room).stdout, 10, 0.1)
-        claim("anchor-cache", anchor_reached and delivered,
-              f"same LAN-only bootstrap {ANCHOR_SPEC}, obsolete address absent, restarted node reached anchor={anchor_reached}, new message delivered={delivered}")
+        claim("anchor-cache", addresses_ready and anchor_reached and delivered,
+              f"same LAN-only bootstrap {ANCHOR_SPEC}, obsolete address absent, restarted node reached anchor={anchor_reached}, new message delivered={delivered}; current listening addresses within 2 s of Ready={addresses_ready}, observed after {address_at - ready_at:.2f} s: {restart_status.get('listening')!r}")
+        if not addresses_ready:
+            raise Product(f"Ready node did not publish its current local address within 2 s, while gateway work is pending: {restart_status!r}")
         if not until(lambda: peer_path("d", fp["p"]) == "direct", 20, 0.1):
             raise Product("the established peer was not direct before staging its loss")
         def udp_port(w):

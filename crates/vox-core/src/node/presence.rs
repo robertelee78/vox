@@ -799,6 +799,32 @@ fn spawn_mapper(presence: std::sync::Weak<NetPresence>) -> tokio::task::AbortHan
                 )
             };
             let (leased, generation) = leased;
+            // A new presence has local addresses before any router answers. Publish those
+            // first, just as `changed` does: waiting for PCP/NAT-PMP and UPnP here left a
+            // Ready wildcard-bound node with no address in status or its room records for
+            // the entire gateway retry window. Keep unlock independent of gateway work.
+            let initial = {
+                let Some(p) = presence.upgrade() else { return };
+                let initial = p.advertised.borrow().is_none();
+                initial
+            };
+            if initial {
+                let list = crate::nat::reachability::routable_endpoints(bound, &leased).await;
+                let Some(p) = presence.upgrade() else { return };
+                // Route discovery can overlap a network event. The same lock as `changed`
+                // fences this first publication; an old path must not replace its successor.
+                let _mapping = lock(&p.mapping);
+                if *p.generation.borrow() != generation {
+                    continue;
+                }
+                p.advertised.send_if_modified(|current| {
+                    if current.is_some() {
+                        return false;
+                    }
+                    *current = Some(list);
+                    true
+                });
+            }
             let started = unix_now_ms();
             let (list, granted, asks) =
                 crate::nat::reachability::advertise_endpoints(bound, &leased, &races).await;

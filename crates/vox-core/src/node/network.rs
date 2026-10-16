@@ -784,12 +784,11 @@ impl NodeNet {
 
     /// The endpoints this node advertises.
     ///
-    /// Once the presence has run the ADR-012 ladder
+    /// Once the presence has composed its local addresses
     /// ([`NetPresence::advertised_now`](crate::node::presence::NetPresence::advertised_now)),
-    /// this is its composed set (routable address, port-mapped address, loopback). Before it — and if the
-    /// ladder found nothing — it falls back to the bound socket, which is right for a
-    /// node bound to a concrete address and merely useless for one bound to the
-    /// wildcard.
+    /// this is its composed set (routable address, any port-mapped address, loopback).
+    /// Gateway work enriches that set without delaying its first publication. Before local
+    /// discovery, a concrete bind is usable; an unspecified bind is never an endpoint.
     pub fn local_endpoints(&self) -> Result<EndpointList> {
         #[cfg(feature = "test-knobs")]
         if let Some(list) = test_advertise() {
