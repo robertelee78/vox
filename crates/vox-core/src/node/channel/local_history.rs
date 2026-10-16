@@ -86,6 +86,11 @@ impl ChannelState {
     /// remote publication already in progress must not be discovered only after encryption.
     pub(crate) fn ensure_local_append_available(&self, store: &Store) -> Result<()> {
         let read = self.entries.read(store, &self.sek, &self.channel_id)?;
+        if read.legacy_provisional().is_some() || read.legacy_required_any() {
+            return Err(Error::Profile(
+                "Legacy history required; resume explicit recovery before posting in this room",
+            ));
+        }
         if read.publication_busy()
             || (read.sparse_enabled() && read.history_obligation_capacity() < 2)
         {

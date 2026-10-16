@@ -248,35 +248,73 @@ impl ChannelState {
         wants: &[crate::log::sync::WantRange],
         now_ms: u64,
     ) -> Result<Vec<Vec<u8>>> {
+        self.session_entries_for_bounded(
+            store,
+            peer,
+            wants,
+            now_ms,
+            crate::log::sync::MAX_SERVE_ENTRIES,
+            crate::log::sync::MAX_SERVE_BYTES,
+        )
+    }
+
+    pub(super) fn session_entries_for_bounded(
+        &mut self,
+        store: &Store,
+        peer: &Digest32,
+        wants: &[crate::log::sync::WantRange],
+        now_ms: u64,
+        max_entries: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<Vec<u8>>> {
         self.now_hint = self.now_hint.max(now_ms);
         self.index_session_floors(store)?;
         let entries = self.entries.read(store, &self.sek, &self.channel_id)?;
-        crate::log::sync::entries_for_wants(&self.dag, &entries, wants)?
-            .into_iter()
-            .map(|wire| {
-                let mut entry = Entry::from_wire(&wire)?;
-                // Physical expiry is page-bounded. The saved age still withholds an
-                // expired body immediately, including while a shorter TTL drains a backlog.
-                let expired = entries.retention(&entry.entry_hash())?.is_some_and(|t| {
-                    let ttl = if t.steps {
-                        self.effective_step_retention()
-                    } else {
-                        self.effective_retention()
-                    };
-                    expired_at(t.base(), self.now_hint, ttl)
-                });
-                if expired
-                    || !self.session_body_allowed(
-                        Transaction::Snapshot(&store.snapshot()?),
-                        &entry,
-                        peer,
-                    )?
+        let accepted_wants: Vec<_> = wants
+            .iter()
+            .filter_map(|want| {
+                let mut want = *want;
+                if let Some(state) = entries
+                    .legacy_provisional()
+                    .filter(|state| state.owner.author == want.author_id)
                 {
-                    entry.payload = None;
+                    want.to_seq = want.to_seq.min(state.base_seq);
                 }
-                Ok(entry.to_wire())
+                (want.from_seq <= want.to_seq).then_some(want)
             })
-            .collect()
+            .collect();
+        crate::log::sync::entries_for_wants_bounded(
+            &self.dag,
+            &entries,
+            &accepted_wants,
+            max_entries,
+            max_bytes,
+        )?
+        .into_iter()
+        .map(|wire| {
+            let mut entry = Entry::from_wire(&wire)?;
+            // Physical expiry is page-bounded. The saved age still withholds an
+            // expired body immediately, including while a shorter TTL drains a backlog.
+            let expired = entries.retention(&entry.entry_hash())?.is_some_and(|t| {
+                let ttl = if t.steps {
+                    self.effective_step_retention()
+                } else {
+                    self.effective_retention()
+                };
+                expired_at(t.base(), self.now_hint, ttl)
+            });
+            if expired
+                || !self.session_body_allowed(
+                    Transaction::Snapshot(&store.snapshot()?),
+                    &entry,
+                    peer,
+                )?
+            {
+                entry.payload = None;
+            }
+            Ok(entry.to_wire())
+        })
+        .collect()
     }
 
     /// Learn every verified floor before publication decides which received bodies to keep.

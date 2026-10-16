@@ -980,10 +980,11 @@ async fn run_session_worker(
     channel_id: Digest32,
     peer: Digest32,
     slot: Option<crate::node::ports::Slot>,
+    buffers: crate::node::history_budget::BufferCharge,
 ) -> crate::node::channel::SessionReport {
     let joined = tokio::task::spawn_blocking(move || {
         let _slot = slot;
-        let mut t = transport;
+        let mut t = transport.charged(Arc::new(buffers));
         let on_stored = || {
             let _ = tx.blocking_send(NetEvent::RoomStored { channel_id });
         };
@@ -14163,6 +14164,18 @@ impl Node {
             Err(_) => return false,
             Ok(false) => {}
         }
+        let Some(node) = self.profile.as_ref().map(Profile::fingerprint) else {
+            return false;
+        };
+        let Some(job) = self
+            .history_budget
+            .try_start(node, crate::node::history_budget::Lane::Archive)
+        else {
+            return false;
+        };
+        let Some(buffers) = job.reserve(crate::log::sync::LEGACY_BUFFER_ENVELOPE) else {
+            return false;
+        };
         let target = SessionTarget::Channel(shared);
         let wake = self.net_tx.clone();
         let Some(slot) = crate::node::ports::Slots::take(
@@ -14264,6 +14277,7 @@ impl Node {
                 cid,
                 peer,
                 Some(slot),
+                buffers,
             )
             .await;
             report.out.admitted_authors = admitted_authors;
@@ -14300,6 +14314,18 @@ impl Node {
             return;
         };
         let Some(shared) = self.channels.get(&channel_id).map(Arc::clone) else {
+            return;
+        };
+        let Some(node) = self.profile.as_ref().map(Profile::fingerprint) else {
+            return;
+        };
+        let Some(job) = self
+            .history_budget
+            .try_start(node, crate::node::history_budget::Lane::Live)
+        else {
+            return;
+        };
+        let Some(buffers) = job.reserve(crate::log::sync::LEGACY_BUFFER_ENVELOPE) else {
             return;
         };
         let target = SessionTarget::Channel(shared);
@@ -14347,6 +14373,7 @@ impl Node {
                 channel_id,
                 peer,
                 None,
+                buffers,
             )
             .await;
             let _ = tx
@@ -14464,6 +14491,15 @@ impl Node {
             });
         }
         match &report.fail {
+            None if o.legacy_required.is_some() => {
+                // A current-only exchange does not schedule the missing legacy prefix.
+                // Future explicit requests or independent metadata wakes may retry;
+                // no partial-history progress recursively raises an archive request.
+                port.req_done = port.req_done.max(attempt.req_at_start);
+                if attempt.dir == crate::node::ports::Dir::Out {
+                    port.last_clean_out = Some(std::time::Instant::now());
+                }
+            }
             None if o.complete => {
                 // **Clean**: consume the requests this attempt saw, and credit the peer with the
                 // generation read with this side's `HAVE` — or that plus what it stored from the

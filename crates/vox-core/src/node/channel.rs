@@ -52,9 +52,12 @@ pub(crate) mod entry_store;
 pub(crate) mod governance;
 pub(crate) mod history;
 pub(crate) mod key_package_queue;
+pub(crate) mod legacy_provisional;
 mod legacy_session;
 mod legacy_session_sender;
+mod legacy_sync;
 mod local_history;
+pub(crate) use legacy_sync::LegacySync;
 mod private_session;
 pub(crate) mod session_floor;
 pub(crate) mod session_projection;
@@ -593,6 +596,17 @@ impl AuthorResolver for ChannelAuthors {
 /// What one [`ChannelState::sync_over`] session did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SyncOutcome {
+    /// A missing legacy prefix is recovered only through explicit history demand.
+    pub(crate) legacy_required: Option<crate::log::sync::LegacyGap>,
+    /// An exact explicit legacy interval reached a signed invalid/frozen feed boundary.
+    /// This cancels recovery; it never credits the missing suffix as accepted history.
+    pub(crate) legacy_invalid: bool,
+    /// Received protocol bytes including transport length prefixes.
+    pub(crate) wire_received: usize,
+    /// Next exact legacy position retained by the explicit request, including sealed staging.
+    pub(crate) legacy_next: Option<u64>,
+    /// A signed witness still needs explicit bounded publication/cleanup work.
+    pub(crate) legacy_pending: bool,
     /// Entries the ADR-008 session applied to the log.
     pub applied: usize,
     /// How many of those were governance entries accepted for the sealed projection.
@@ -703,6 +717,7 @@ impl SessionReport {
         out.refused += s.refused;
         out.gen_have = s.gen_have;
         out.gen_end = s.gen_end;
+        out.wire_received = s.wire_received;
         let fail = match fatal {
             Some(e) => Some(SyncFailure::Poisoned(e.to_string())),
             None => s.fail.map(SyncFailure::Session),
@@ -3493,6 +3508,11 @@ impl ChannelState {
         self.local_append_budget = None;
         self.local_content_header = None;
         self.key_packages.published(self.next_log_id);
+        // Explicit legacy history owns post-switch cleanup too. A large authenticated
+        // unsigned prefix must not turn this one final witness into an unbounded cleanup.
+        if self.legacy_provisional_state(store)?.is_some() {
+            return Ok(());
+        }
         let result = (|| -> Result<()> {
             loop {
                 let mut batch = store.batch()?;
@@ -4869,13 +4889,24 @@ impl ChannelState {
             &forks_bytes(&proofs),
         )?;
         let kept = proofs.len();
-        if let Err(e) =
-            store.put_segment(&self.channel_id, SegmentKind::KeyMaterial, SEG_FORKS, &seg)
-        {
+        let saved = (|| -> Result<()> {
+            let mut batch = store.batch()?;
+            batch.put_segment(&self.channel_id, SegmentKind::KeyMaterial, SEG_FORKS, &seg)?;
+            let mut index = self
+                .entries
+                .write(&mut batch, &self.sek, &self.channel_id)?;
+            for proof in &proofs {
+                index.resolve_legacy_required_invalid(&proof.author_id, proof.seq)?;
+            }
+            index.seal()?;
+            batch.commit()
+        })();
+        if let Err(e) = saved {
             self.poisoned = true;
             self.save_error = Some(e.to_string());
             return Err(e);
         }
+        self.entries.committed();
         self.forks_kept = kept;
         Ok(())
     }
@@ -6133,6 +6164,17 @@ impl ChannelState {
         now_ms: u64,
         promotion: Option<u64>,
     ) -> Result<SyncOutcome> {
+        self.absorb_batch_authorized(store, arrived, now_ms, promotion, None)
+    }
+
+    fn absorb_batch_authorized(
+        &mut self,
+        store: &Store,
+        arrived: Vec<Arrived>,
+        now_ms: u64,
+        promotion: Option<u64>,
+        authorization: Option<LegacySync>,
+    ) -> Result<SyncOutcome> {
         let mut out = SyncOutcome {
             applied: arrived.len(),
             ..SyncOutcome::default()
@@ -6161,6 +6203,9 @@ impl ChannelState {
                 return Err(e);
             }
         };
+        if let Some(request) = authorization {
+            request.check_in(self, &batch)?;
+        }
         if promotion.is_some() {
             let mut index = self
                 .entries
@@ -6368,13 +6413,43 @@ impl ChannelState {
         fence: &crate::transport::stream_transport::Fence,
         on_stored: &dyn Fn(),
     ) -> SessionReport {
+        Self::sync_over_room_mode(shared, store, peer, transport, now, fence, on_stored, None)
+    }
+
+    pub(crate) fn sync_over_room_mode<T: Transport>(
+        shared: &tokio::sync::Mutex<Self>,
+        store: &Store,
+        peer: Digest32,
+        transport: &mut T,
+        now: crate::time::Ms,
+        fence: &crate::transport::stream_transport::Fence,
+        on_stored: &dyn Fn(),
+        legacy: Option<LegacySync>,
+    ) -> SessionReport {
         let now_ms = now.get();
-        let epoch = {
-            let ch = shared.blocking_lock();
-            if ch.poisoned {
-                return SessionReport::failed(SyncFailure::Poisoned(ch.save_failure().to_string()));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let epoch = loop {
+            if fence.is_retired() || std::time::Instant::now() >= deadline {
+                return SessionReport::failed(SyncFailure::Session(
+                    crate::log::sync::SessionError::Local(crate::wire::WireError::TransportFailed),
+                ));
             }
-            ch.epoch
+            if let Ok(ch) = shared.try_lock() {
+                if ch.poisoned {
+                    return SessionReport::failed(SyncFailure::Poisoned(
+                        ch.save_failure().to_string(),
+                    ));
+                }
+                if ch.sek.key_bytes().is_err() {
+                    return SessionReport::failed(SyncFailure::Session(
+                        crate::log::sync::SessionError::Local(
+                            crate::wire::WireError::TransportFailed,
+                        ),
+                    ));
+                }
+                break ch.epoch;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
         };
         let room = ChannelSessionRoom {
             shared,
@@ -6384,6 +6459,9 @@ impl ChannelState {
             epoch,
             fence,
             on_stored,
+            legacy,
+            observe_tip: std::cell::Cell::new(None),
+            deadline,
             out: std::cell::RefCell::new(SyncOutcome::default()),
             fatal: std::cell::RefCell::new(None),
         };
@@ -6392,14 +6470,40 @@ impl ChannelState {
         // authentic; it was never persisted, and it is taken back here on every path out of the
         // session (ADR-023 decision 3).
         {
-            let mut ch = shared.blocking_lock();
-            let cleanup = ch.discard_unverified(store);
-            match cleanup {
-                Ok(_) => {}
-                Err(error) => {
-                    ch.poisoned = true;
-                    ch.save_error = Some(error.to_string());
-                    *room.fatal.borrow_mut() = Some(error);
+            // Cancellation does not skip detaching volatile provisional heads. Wait only
+            // for this bounded local cleanup; lock_now still wipes keys immediately.
+            let cleanup_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let guard = loop {
+                if let Ok(ch) = shared.try_lock() {
+                    break Some(ch);
+                }
+                if std::time::Instant::now() >= cleanup_deadline {
+                    break None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            };
+            if let Some(mut ch) = guard.filter(|ch| ch.sek.key_bytes().is_ok()) {
+                let cleanup = if let Some(request) = legacy {
+                    if let Ok(Some(state)) = ch.legacy_provisional_state(store) {
+                        room.out.borrow_mut().legacy_next = Some(state.tail_seq.saturating_add(1));
+                        room.out.borrow_mut().legacy_pending = state.pending_witness != 0
+                            || ch
+                                .legacy_publication_progress(store, request.owner)
+                                .ok()
+                                .flatten()
+                                .is_some();
+                    }
+                    ch.finish_legacy_sync(store, request).map(|()| 0)
+                } else {
+                    ch.discard_unverified(store)
+                };
+                match cleanup {
+                    Ok(_) => {}
+                    Err(error) => {
+                        ch.poisoned = true;
+                        ch.save_error = Some(error.to_string());
+                        *room.fatal.borrow_mut() = Some(error);
+                    }
                 }
             }
         }
@@ -9003,6 +9107,9 @@ struct ChannelSessionRoom<'a> {
     fence: &'a crate::transport::stream_transport::Fence,
     /// Called after a batch persisted entries (ADR-025 D1a: stores report themselves).
     on_stored: &'a dyn Fn(),
+    legacy: Option<LegacySync>,
+    observe_tip: std::cell::Cell<Option<crate::log::sync::LegacyGap>>,
+    deadline: std::time::Instant,
     out: std::cell::RefCell<SyncOutcome>,
     /// A local failure (a persist that failed) that must reach the caller as itself, not as a code.
     fatal: std::cell::RefCell<Option<Error>>,
@@ -9016,27 +9123,82 @@ impl ChannelSessionRoom<'_> {
         if self.fence.is_retired() {
             return Err(crate::wire::WireError::TransportFailed);
         }
-        let ch = self.shared.blocking_lock();
+        let ch = loop {
+            if self.fence.is_retired() || std::time::Instant::now() >= self.deadline {
+                return Err(crate::wire::WireError::TransportFailed);
+            }
+            if let Ok(ch) = self.shared.try_lock() {
+                break ch;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        };
+        if self.fence.is_retired() {
+            return Err(crate::wire::WireError::TransportFailed);
+        }
+
         if ch.poisoned {
             return Err(crate::wire::WireError::TransportFailed);
         }
         if ch.epoch != self.epoch {
             return Err(crate::wire::WireError::EpochMismatch);
         }
+        if let Some(request) = self.legacy {
+            request
+                .check(&ch, self.store)
+                .map_err(|_| crate::wire::WireError::TransportFailed)?;
+        }
         Ok(ch)
     }
 }
 
 impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
+    fn apply_entries_limit(&self) -> usize {
+        if self.legacy.is_some() {
+            crate::log::sync::LEGACY_QUANTUM_ENTRIES
+        } else {
+            1
+        }
+    }
+    fn receive_entry_bytes_limit(&self) -> usize {
+        1024 * 1024
+    }
+    fn receive_limits(&self) -> (usize, usize) {
+        (
+            crate::log::sync::LEGACY_QUANTUM_ENTRIES,
+            crate::log::sync::LEGACY_QUANTUM_BYTES,
+        )
+    }
     fn frontiers(
         &self,
     ) -> std::result::Result<(Vec<crate::log::sync::FeedFrontier>, u64), crate::wire::WireError>
     {
         let ch = self.room()?;
-        Ok((
-            crate::log::sync::frontiers_of(&ch.dag),
-            ch.gen.load(std::sync::atomic::Ordering::Relaxed),
-        ))
+        if self.legacy.is_some() {
+            return Ok((
+                Vec::new(),
+                ch.gen.load(std::sync::atomic::Ordering::Relaxed),
+            ));
+        }
+        let entries = ch
+            .entries
+            .read(self.store, &ch.sek, &ch.channel_id)
+            .map_err(|_| crate::wire::WireError::TransportFailed)?;
+        let mut frontiers = crate::log::sync::verified_frontiers_of(&ch.dag, &entries)
+            .map_err(|_| crate::wire::WireError::TransportFailed)?;
+        if let Some(state) = entries.legacy_provisional() {
+            // A signed staged witness is not a published head. The sealed accepted base
+            // remains the only automatic frontier even before final volatile detachment.
+            frontiers.retain(|head| head.author_id != state.owner.author);
+            if state.base_seq > 0 {
+                frontiers.push(crate::log::sync::FeedFrontier {
+                    author_id: state.owner.author,
+                    max_seq: state.base_seq,
+                    head_hash: state.base_hash,
+                });
+                frontiers.sort_unstable_by_key(|head| head.author_id);
+            }
+        }
+        Ok((frontiers, ch.gen.load(std::sync::atomic::Ordering::Relaxed)))
     }
 
     fn wants(
@@ -9055,40 +9217,87 @@ impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
         );
         let requested = (|| -> Result<_> {
             let entries = room.entries.read(self.store, &room.sek, &room.channel_id)?;
-            crate::log::sync::wants_for_unfrozen(&room.dag, &entries, remote)
+            if let Some(request) = self.legacy {
+                let state = entries
+                    .legacy_provisional()
+                    .filter(|state| state.owner == request.owner)
+                    .ok_or(Error::MalformedAtRest("legacy request owner changed"))?;
+                let from = state.tail_seq.saturating_add(1);
+                let through = remote
+                    .iter()
+                    .find(|f| f.author_id == request.owner.author)
+                    .map_or(0, |f| f.max_seq)
+                    .min(request.through)
+                    .min(from.saturating_add(crate::log::sync::LEGACY_QUANTUM_ENTRIES as u64 - 1));
+                let wants = if from <= through {
+                    vec![crate::log::sync::WantRange {
+                        author_id: request.owner.author,
+                        from_seq: from,
+                        to_seq: through,
+                    }]
+                } else {
+                    Vec::new()
+                };
+                Ok((wants, None))
+            } else {
+                let (mut wants, mut gap) =
+                    crate::log::sync::wants_for_current(&room.dag, &entries, remote)?;
+                if let Some(state) = entries.legacy_provisional() {
+                    gap = Some(crate::log::sync::LegacyGap {
+                        author: state.owner.author,
+                        from: state.base_seq.saturating_add(1),
+                        through: state.tail_seq.max(state.base_seq.saturating_add(1)),
+                        hash: state.tail_hash,
+                    });
+                    for want in &mut wants {
+                        let verified = if want.author_id == state.owner.author {
+                            state.base_seq
+                        } else {
+                            room.dag.verified_head(&want.author_id)
+                        };
+                        want.to_seq = want.to_seq.min(verified);
+                    }
+                    wants.retain(|want| want.from_seq <= want.to_seq);
+                }
+                if entries.legacy_required_any() {
+                    for want in &mut wants {
+                        want.to_seq = want.to_seq.min(room.dag.verified_head(&want.author_id));
+                    }
+                    wants.retain(|want| want.from_seq <= want.to_seq);
+                }
+                if let Some(tip) = gap.filter(|tip| {
+                    entries.legacy_provisional().is_none()
+                        && entries
+                            .legacy_required(&tip.author)
+                            .is_none_or(|known| known.through < tip.through)
+                }) {
+                    // Observe this signed tip alone: an older overlap may itself hold a
+                    // whole legal record and consume the legacy envelope first. Once the
+                    // scalar requirement is saved, the next metadata exchange retains the
+                    // verified-position overlap and can discover a fork without backfill.
+                    wants.clear();
+                    wants.push(crate::log::sync::WantRange {
+                        author_id: tip.author,
+                        from_seq: tip.through,
+                        to_seq: tip.through,
+                    });
+                    self.observe_tip.set(Some(tip));
+                }
+                Ok((wants, gap))
+            }
         })();
-        let mut wants = match requested {
-            Ok(wants) => wants,
+        let wants = match requested {
+            Ok((wants, gap)) => {
+                self.out.borrow_mut().legacy_required = gap;
+                wants
+            }
             Err(error) => {
                 room.poison(&error);
                 *self.fatal.borrow_mut() = Some(error);
                 return Err(crate::wire::WireError::TransportFailed);
             }
         };
-        // And every body owed here that this peer's feed reaches (V030-10).
-        // An omission means only that this peer did not supply the body in that exchange.
-        // Retry later: it may have fetched the body elsewhere without moving its feed head.
-        room.drive.expire_omissions();
-        let owed = match room.owed_wants(self.store, remote, &wants) {
-            Ok(owed) => owed,
-            Err(error) => {
-                room.poisoned = true;
-                room.save_error = Some(error.to_string());
-                *self.fatal.borrow_mut() = Some(error);
-                return Err(crate::wire::WireError::TransportFailed);
-            }
-        };
-        for range in owed {
-            for seq in range.from_seq..=range.to_seq {
-                if !room.drive.peer_omitted(&self.peer, &(range.author_id, seq)) {
-                    wants.push(crate::log::sync::WantRange {
-                        author_id: range.author_id,
-                        from_seq: seq,
-                        to_seq: seq,
-                    });
-                }
-            }
-        }
+        // Missing older bodies are explicit history demand, never a periodic refill pump.
         Ok(wants)
     }
 
@@ -9097,7 +9306,17 @@ impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
         wants: &[crate::log::sync::WantRange],
     ) -> std::result::Result<Vec<Vec<u8>>, crate::wire::WireError> {
         let mut room = self.room()?;
-        match room.session_entries_for(self.store, &self.peer, wants, self.now_ms) {
+        if self.legacy.is_some() {
+            return Ok(Vec::new());
+        }
+        match room.session_entries_for_bounded(
+            self.store,
+            &self.peer,
+            wants,
+            self.now_ms,
+            crate::log::sync::LEGACY_QUANTUM_ENTRIES,
+            1024 * 1024,
+        ) {
             Ok(entries) => Ok(entries),
             Err(error) if session_projection::floor_index::refreshing(&error) => {
                 *self.fatal.borrow_mut() = Some(error);
@@ -9112,7 +9331,7 @@ impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
         }
     }
 
-    fn apply(&self, staged: Vec<Vec<u8>>) -> crate::log::sync::ApplyReport {
+    fn apply(&self, mut staged: Vec<Vec<u8>>) -> crate::log::sync::ApplyReport {
         let mut guard = match self.room() {
             Ok(g) => g,
             Err(code) => {
@@ -9123,6 +9342,88 @@ impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
             }
         };
         let ch = &mut *guard;
+        if self.legacy.is_none() && staged.len() == 1 {
+            if let (Some(tip), Ok(mut entry)) =
+                (self.observe_tip.get(), Entry::from_wire(&staged[0]))
+            {
+                if entry.skeleton.author_id == tip.author && entry.skeleton.seq == tip.through {
+                    let verified = entry.entry_hash() == tip.hash
+                        && entry.is_signed()
+                        && ch
+                            .authors
+                            .get(&tip.author)
+                            .is_some_and(|key| entry.verify(key).is_ok());
+                    if !verified {
+                        return crate::log::sync::ApplyReport {
+                            fail: Some(crate::wire::WireError::AuthenticatorInvalid),
+                            ..crate::log::sync::ApplyReport::default()
+                        };
+                    }
+                    entry.payload = None;
+                    match ch.note_legacy_required(self.store, &entry) {
+                        Ok(_) => {
+                            return crate::log::sync::ApplyReport {
+                                classes: vec![crate::log::sync::EntryClass::Observed],
+                                ..crate::log::sync::ApplyReport::default()
+                            }
+                        }
+                        Err(
+                            Error::MalformedBundle(_)
+                            | Error::StreamRefused(_)
+                            | Error::SizeLimitExceeded(_),
+                        ) => {
+                            return crate::log::sync::ApplyReport {
+                                fail: Some(crate::wire::WireError::AuthenticatorInvalid),
+                                ..crate::log::sync::ApplyReport::default()
+                            }
+                        }
+                        Err(error) => {
+                            ch.poison(&error);
+                            *self.fatal.borrow_mut() = Some(error);
+                            return crate::log::sync::ApplyReport {
+                                fail: Some(crate::wire::WireError::TransportFailed),
+                                ..crate::log::sync::ApplyReport::default()
+                            };
+                        }
+                    }
+                }
+            }
+        }
+        let legacy_state = match ch.legacy_provisional_state(self.store) {
+            Ok(state) => state,
+            Err(error) => {
+                *self.fatal.borrow_mut() = Some(error);
+                return crate::log::sync::ApplyReport {
+                    fail: Some(crate::wire::WireError::TransportFailed),
+                    ..crate::log::sync::ApplyReport::default()
+                };
+            }
+        };
+        if self.legacy.is_some() {
+            if legacy_state.is_some_and(|state| state.pending_witness != 0) {
+                return crate::log::sync::ApplyReport {
+                    classes: vec![crate::log::sync::EntryClass::Unlinked; staged.len()],
+                    ..crate::log::sync::ApplyReport::default()
+                };
+            }
+            // A retained unsigned prefix needs its FIRST signed successor, not a bundle
+            // containing later signed bodies that a bodyless-prefix promotion could discard.
+            if let Some(at) = staged
+                .iter()
+                .position(|wire| Entry::from_wire(wire).is_ok_and(|entry| entry.is_signed()))
+            {
+                staged.truncate(at + 1);
+            }
+        } else if legacy_state.is_some() || self.out.borrow().legacy_required.is_some() {
+            // Overlap comparison needs signed headers only. It must not refill old bodies
+            // or mutate the paused request's spool as a side effect of periodic metadata.
+            for wire in &mut staged {
+                if let Ok(mut entry) = Entry::from_wire(wire) {
+                    entry.payload = None;
+                    *wire = entry.to_wire();
+                }
+            }
+        }
         let before = ch.heads();
         let gen_before = ch.gen.load(std::sync::atomic::Ordering::Relaxed);
         // The resolver as it is *now*: an author revoked while this batch was on the wire is not
@@ -9132,8 +9433,27 @@ impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
         // and stops at the first hard failure; those before it are already in the log, so they are
         // persisted, rendered and counted before the failure is reported (one joiner once read
         // nothing from the host because the order was the other way round: tworooms.sh).
+        let mut batch = match self.store.batch() {
+            Ok(batch) => batch,
+            Err(error) => {
+                ch.poison(&error);
+                *self.fatal.borrow_mut() = Some(error);
+                return crate::log::sync::ApplyReport {
+                    fail: Some(crate::wire::WireError::TransportFailed),
+                    ..crate::log::sync::ApplyReport::default()
+                };
+            }
+        };
+        if let Some(request) = self.legacy {
+            if request.check_in(ch, &batch).is_err() {
+                // Expected cancellation before any DAG/index mutation is not room corruption.
+                return crate::log::sync::ApplyReport {
+                    fail: Some(crate::wire::WireError::TransportFailed),
+                    ..crate::log::sync::ApplyReport::default()
+                };
+            }
+        }
         let staged_result = (|| -> Result<(crate::log::sync::ApplyReport, Option<Error>)> {
-            let mut batch = self.store.batch()?;
             let mut index = ch.entries.write(&mut batch, &ch.sek, &ch.channel_id)?;
             let result = crate::log::sync::apply_staged_classified(
                 &mut ch.dag,
@@ -9144,6 +9464,39 @@ impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
             );
             if result.1.is_some() {
                 return Ok(result);
+            }
+            if let (Some(request), Some(state)) = (self.legacy, legacy_state) {
+                if let Some(from) = ch
+                    .dag
+                    .refused_from(&request.owner.author)
+                    .filter(|from| *from <= request.through)
+                {
+                    index.resolve_legacy_required_invalid(&request.owner.author, from)?;
+                    self.out.borrow_mut().legacy_invalid = true;
+                } else if ch.dag.is_frozen(&request.owner.author) {
+                    // keep_forks persists the attributable proof before the explicit worker
+                    // cancels its demand. Do not label this invalid interval completed.
+                    self.out.borrow_mut().legacy_invalid = true;
+                }
+                if result.0.classes.last() == Some(&crate::log::sync::EntryClass::Stored) {
+                    if let Some(witness) = staged
+                        .last()
+                        .map(|wire| Entry::from_wire(wire))
+                        .transpose()?
+                    {
+                        if witness.is_signed() {
+                            index.begin_promotion(entry_store::Publication {
+                                witness: &witness,
+                                from: state.base_seq.saturating_add(1),
+                                first_log: ch.next_log_id,
+                                received_ms: self.now_ms,
+                                bodyless_prefix: true,
+                                origin: ch.genesis.body.created_ms,
+                            })?;
+                            debug_assert_eq!(request.owner, state.owner);
+                        }
+                    }
+                }
             }
             index.seal()?;
             batch.commit()?;
@@ -9165,6 +9518,34 @@ impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
                 *self.fatal.borrow_mut() = Some(error);
             }
             return report;
+        }
+        if self.legacy.is_some() {
+            if let Err(error) = ch.keep_forks(self.store) {
+                *self.fatal.borrow_mut() = Some(error);
+                report.fail = Some(crate::wire::WireError::TransportFailed);
+            }
+            // Exact staging and any witness cursor are durable. Publication/effects are
+            // separate explicitly resumed quanta; no implicit full-prefix walk here.
+            report.stored = 0;
+            return report;
+        }
+        for author in ch.dag.authors() {
+            let verified = ch.dag.verified_head(&author);
+            let tail = ch.dag.feed(&author).map_or(0, |feed| feed.max_seq());
+            if tail > verified {
+                self.out
+                    .borrow_mut()
+                    .legacy_required
+                    .get_or_insert(crate::log::sync::LegacyGap {
+                        author,
+                        from: verified.saturating_add(1),
+                        through: tail,
+                        hash: ch
+                            .dag
+                            .feed(&author)
+                            .map_or(ZERO_HASH, |feed| feed.head_hash()),
+                    });
+            }
         }
         if let Err(error) =
             ch.filter_received_session_bodies(self.store, self.peer, &staged, self.now_ms)
