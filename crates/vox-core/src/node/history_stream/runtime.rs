@@ -115,6 +115,9 @@ pub(crate) struct Flow {
     pub(crate) admitted_authors: usize,
     pub(crate) external: Option<(Digest32, u64)>,
     pub(crate) archive_status: Option<crate::node::api::HistoryDemandStatus>,
+    /// This hinted third-party source did not retain a required dependency. The controller
+    /// retires the exact hint through bounded cleanup without penalizing the peer's port.
+    pub(crate) hint_unavailable: bool,
     tasks: Vec<Task>,
     // One exact suspended foreground root. Intermediate pre-body continuations
     // are re-derived from durable receipts after the current dependency finishes.
@@ -192,6 +195,7 @@ impl Flow {
             admitted_authors: 0,
             external: None,
             archive_status: None,
+            hint_unavailable: false,
             tasks: Vec::with_capacity(MAX_TASKS),
             replay: None,
             slots,
@@ -293,6 +297,7 @@ impl Flow {
             admitted_authors: 0,
             external: None,
             archive_status: None,
+            hint_unavailable: false,
             slots,
             owners: [None, None],
             no_progress: 0,
@@ -1097,6 +1102,21 @@ impl Flow {
                         // a later fresh head waiting behind stale third-party hints. Dependency
                         // failures after a head was selected remain hard failures below.
                         self.tasks.clear();
+                        return Ok(());
+                    }
+                    if self.hint.is_some_and(|hint| hint.author != self.peer)
+                        && !self.departure_probe
+                    {
+                        // A peer may truthfully advertise an authenticated third-party head
+                        // while retaining only part of its dependencies. Missing evidence from
+                        // that peer is not a transport failure and must not back off the whole
+                        // room/peer port behind which later current hints are waiting. Retire
+                        // only this scalar hint. No missing evidence or effect is accepted:
+                        // another peer must provide every dependency before publication.
+                        // The controller owns retirement because a verifier or publication
+                        // cursor may already be durable by the time a later dependency is
+                        // refused. Normal completion would skip that bounded cleanup.
+                        self.hint_unavailable = true;
                         return Ok(());
                     }
                     return Err(Error::Unreachable(

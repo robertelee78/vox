@@ -578,6 +578,50 @@ impl Node {
                     self.bounded_sync.required.push_back(need);
                 }
             }
+            if returned.flow.hint_unavailable {
+                if let Some(hint) = returned.flow.hint {
+                    self.history_hints
+                        .finish(work.room, work.peer, hint.author, hint.head);
+                }
+                let more_for_peer = self
+                    .bounded_sync
+                    .ready
+                    .iter()
+                    .flatten()
+                    .any(|flow| flow.room == work.room && flow.peer == work.peer)
+                    || self
+                        .bounded_sync
+                        .deferred
+                        .iter()
+                        .any(|flow| flow.room == work.room && flow.peer == work.peer)
+                    || self.history_hints.pending(work.room, work.peer)
+                    || self
+                        .leave_waiters
+                        .iter()
+                        .any(|(room, _, _, _)| *room == work.room)
+                    || self
+                        .bounded_sync
+                        .required
+                        .iter()
+                        .any(|(room, peer, _, _)| *room == work.room && *peer == work.peer);
+                self.bounded_sync.dispose(returned.flow);
+                crate::node::status::SyncBook::with(
+                    &self.sync_book,
+                    work.room,
+                    work.peer,
+                    |counts| counts.partial += 1,
+                );
+                if let Some(port) = self.ports.get_mut(&(work.room, work.peer)) {
+                    // Consume only the scheduling request this attempt captured. A later raise
+                    // remains greater, and retained work receives a new raise below.
+                    port.req_done = port.req_done.max(work.request);
+                    if more_for_peer {
+                        port.raise();
+                    }
+                }
+                self.sched_rooms.insert(work.room);
+                continue;
+            }
             if let Some(error) = returned.error {
                 if let Some(request) = returned.flow.archive_request {
                     self.history_demand
