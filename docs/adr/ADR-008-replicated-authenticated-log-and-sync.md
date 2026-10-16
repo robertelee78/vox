@@ -23,6 +23,18 @@ consensus (shown for the Matrix Event Graph, arXiv 2011.06488). That result assu
 honest-but-unreliable replicas. Resistance to adversarial authors (equivocation, Sybil, withholding)
 comes from per-author signatures, membership (ADR-007) and the fork handling below, not from the DAG.
 
+## New-format amendment, 2026-10-15
+
+[ADR-036 H-6–H-8](ADR-036-live-messages-and-requested-history.md#h-6-concrete-new-format-wire-contract)
+defines the v2 implementation contract. For that format it supersedes LS-3's automatic replicate-all
+interpretation, LS-4/LS-10's v1 skeleton shape, LS-28/LS-29's continuous-prefix archive request and
+automatic continuation, and LS-11/LS-12's exact-predecessor/increase-only behavior for sparse held
+sets. Ciphertext remains eligible for replication independently of decryption, but old history is
+fetched only on explicit bounded demand. Same-held-set convergence, actual arrival cursors,
+attributable fork evidence and authority checks remain required. The v2 sparse/committed state
+must not advance the existing contiguous Feed. Old entry bytes and v1 rules remain intact;
+existing-format activation is unresolved and this amendment does not authorize a legacy scan.
+
 ## Requirements
 
 ### Decision: per-author logs merged into a Merkle-DAG
@@ -253,6 +265,10 @@ PRD-001 R5.
 ### Checkpoints and shed signatures
 
 ADR-023 decision 3 (M23.6).
+
+These shedding and pre-checkpoint refusal rules describe v1. ADR-036's v2 format retains every
+signed header and permits authenticated requested backfill below a checkpoint; its checkpoint
+still requires the exact earlier own-feed source and grants no unverified contiguous prefix.
 
 - **LS-38.** Authenticator type `0` ("dropped under a checkpoint") MUST carry an empty byte string.
 - **LS-39.** Struct tag `0x0016` is an author's checkpoint on its own feed, `[seq, entry_hash]`,

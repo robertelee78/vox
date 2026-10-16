@@ -30,6 +30,8 @@ pub struct RoomSnap {
     pub name: Option<String>,
     /// Whether it is open.
     pub open: bool,
+    /// Saved room history is still preparing locally.
+    pub preparing: bool,
 }
 
 /// An open room's detail, without its timeline.
@@ -123,6 +125,7 @@ impl NodeSnapshot {
                         channel_id: c.channel_id,
                         name: c.name.clone(),
                         open: c.open,
+                        preparing: c.preparing,
                     })
                     .collect(),
                 open: nv
@@ -176,11 +179,12 @@ impl NodeSnapshot {
         e.uint(u64::from(self.mlock_active));
         e.array(self.rooms.len());
         for r in &self.rooms {
-            e.array(4)
+            e.array(5)
                 .bytes(&r.channel_id)
                 .uint(u64::from(r.name.is_some()))
                 .text(r.name.as_deref().unwrap_or_default())
-                .uint(u64::from(r.open));
+                .uint(u64::from(r.open))
+                .uint(u64::from(r.preparing));
         }
         e.array(self.open.len());
         for o in &self.open {
@@ -277,15 +281,20 @@ impl NodeSnapshot {
         let mlock_active = d.uint().map_err(bad("ipc snapshot mlock"))? != 0;
         let mut rooms = Vec::new();
         for _ in 0..d.array().map_err(bad("ipc snapshot rooms"))? {
-            want(&mut d, 4, "ipc snapshot room")?;
+            want(&mut d, 5, "ipc snapshot room")?;
             let channel_id = digest(&mut d)?;
             let named = d.uint().map_err(bad("ipc snapshot room named"))? != 0;
             let name = d.text().map_err(bad("ipc snapshot room name"))?.to_owned();
             let open = d.uint().map_err(bad("ipc snapshot room open"))? != 0;
+            let preparing = d.uint().map_err(bad("ipc snapshot room preparing"))? != 0;
+            if open && preparing {
+                return Err(Error::MalformedIpc("ipc snapshot room availability"));
+            }
             rooms.push(RoomSnap {
                 channel_id,
                 name: named.then_some(name),
                 open,
+                preparing,
             });
         }
         let mut open = Vec::new();

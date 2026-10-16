@@ -7,7 +7,14 @@ mod channel;
 mod context;
 mod facts;
 mod fold;
+mod sparse;
 mod view;
+
+pub(crate) use sparse::{
+    sparse_control_evaluation, ControlEvaluation, PayloadValidation, SparsePayloadState,
+    SparseValidation, SparseValidationStep, TypedSparseBody, ValidatedSparseEntry,
+    VerifiedParentPrefix,
+};
 
 use super::entry_store::EntryIndex;
 use crate::atrest::sek::Sek;
@@ -18,8 +25,11 @@ use crate::node::store::Store;
 
 /// At most this many frontier coordinates or reverse edges are applied in one turn.
 const CAUSAL_WORK: usize = 64;
+const SOURCE_ROWS: usize = 64;
+const INPUT_BYTES: usize = 1024 * 1024;
 
-/// Advance one queued entry without keeping its body or any tree page between turns.
+/// Advance a bounded part of the queue without keeping bodies or tree pages
+/// between turns. Small entries share one transaction and the same work budget.
 /// A frontier includes the entry's own coordinate. Strict-past queries separately
 /// exclude that exact entry, never substitute a display clock for reachability.
 fn advance_frontiers(
@@ -28,93 +38,157 @@ fn advance_frontiers(
     sek: &Sek,
     room: &Digest32,
 ) -> Result<bool> {
+    let input = entries.read(store, sek, room)?;
     let mut batch = store.batch()?;
     let mut writer = facts::Write::open(&mut batch, sek, room)?;
-    let Some(mut work) = writer.work()?.cloned() else {
-        return Ok(true);
-    };
-    let hash = work
-        .entry
-        .ok_or(Error::MalformedAtRest("governance work entry missing"))?;
-    let input = entries.read(store, sek, room)?;
-    let entry = input
-        .get_by_hash(&hash)?
+    let mut remaining = CAUSAL_WORK;
+    let mut bytes = 0usize;
+    let mut rows = 0;
+    let mut drained = false;
+    while remaining > 0 {
+        let Some(mut work) = writer.work()?.cloned() else {
+            if rows == 0 {
+                return Ok(true);
+            }
+            drained = true;
+            break;
+        };
+        let hash = work
+            .entry
+            .ok_or(Error::MalformedAtRest("governance work entry missing"))?;
+        // Format 2 retains its individually signed header independently of the body.
+        // Causal projection never decrypts a large content body just to read that header.
+        let entry = if input.sparse_enabled() {
+            input
+                .history_object(super::entry_store::sparse::ObjectKind::Header, &hash)?
+                .map(|wire| crate::log::entry::Entry::from_wire(&wire))
+                .transpose()?
+        } else {
+            input.get_by_hash(&hash)?
+        }
         .filter(|entry| entry.entry_hash() == hash)
         .ok_or(Error::MalformedAtRest("governance causal entry missing"))?;
-    let clock = input.clock(&hash)?;
-    if clock.is_none() {
-        return Err(Error::MalformedAtRest(
-            "governance causal entry unpublished",
-        ));
-    }
-    writer.observe_clock(
-        &hash,
-        clock.ok_or(Error::MalformedAtRest("governance clock missing"))?,
-    )?;
-    work.changed |= writer.raise(&hash, &entry.skeleton.author_id, entry.skeleton.seq)?;
-    let own_parent = usize::from(entry.skeleton.seq > 1);
-    let parent_count = own_parent + entry.skeleton.seen.len();
-    let mut complete = false;
-    for _ in 0..CAUSAL_WORK {
-        let at = usize::try_from(work.parent)
-            .map_err(|_| Error::MalformedAtRest("governance parent cursor"))?;
-        if at > parent_count {
-            return Err(Error::MalformedAtRest(
-                "governance parent cursor beyond entry",
-            ));
-        }
-        if at < parent_count {
-            let parent = if at == 0 && own_parent != 0 {
-                &entry.skeleton.prev_hash
-            } else {
-                &entry.skeleton.seen[at - own_parent]
-            };
-            // A missing parent contributes no coordinate yet. Its eventual arrival
-            // queues this child through the already persisted reverse-edge index.
-            let next = if input.clock(parent)?.is_some() {
-                writer.frontier_after(parent, work.author)?
-            } else {
-                None
-            };
-            match next {
-                Some((author, seq)) => {
-                    work.changed |= writer.raise(&hash, &author, seq)?;
-                    work.author = Some(author);
-                }
-                None => {
-                    work.parent += 1;
-                    work.author = None;
-                }
-            }
-            continue;
-        }
-        if !work.changed {
-            complete = true;
+        let size = entry.to_wire().len();
+        // One oversized entry must still make progress; no body survives this turn.
+        if rows > 0 && bytes.saturating_add(size) > INPUT_BYTES {
             break;
         }
-        match input.child_after(&hash, work.child)? {
-            Some(child) => {
-                let log = input
-                    .log_id(&child)?
-                    .ok_or(Error::MalformedAtRest("governance child locator missing"))?;
-                writer.enqueue(&child, log)?;
-                work.child = Some(child);
+        bytes = bytes.saturating_add(size);
+        rows += 1;
+        let clock = input.clock(&hash)?;
+        if clock.is_none() {
+            return Err(Error::MalformedAtRest(
+                "governance causal entry unpublished",
+            ));
+        }
+        writer.observe_clock(
+            &hash,
+            clock.ok_or(Error::MalformedAtRest("governance clock missing"))?,
+        )?;
+        work.changed |= writer.raise(&hash, &entry.skeleton.author_id, entry.skeleton.seq)?;
+        remaining -= 1;
+        // A v2 source was admitted with its exact signed parent/control closure. Its
+        // authority frontier is that immutable pre-context plus itself. Inheriting a
+        // receiver's newer parent frontier would change strict-past authorization.
+        let signed_context = entry
+            .skeleton
+            .v2
+            .as_ref()
+            .map(|v2| {
+                let context = input
+                    .history_context(&v2.pre_context)?
+                    .ok_or(Error::MalformedAtRest("validated causal context missing"))?;
+                if context.hash() != v2.pre_context
+                    || context.room != *room
+                    || context.scope != v2.scope
+                {
+                    return Err(Error::MalformedAtRest("validated causal context binding"));
+                }
+                Ok(context)
+            })
+            .transpose()?;
+        let own_parent = usize::from(entry.skeleton.seq > 1);
+        let parent_count = if signed_context.is_some() {
+            1
+        } else {
+            own_parent + entry.skeleton.seen.len()
+        };
+        let mut complete = false;
+        while remaining > 0 {
+            remaining -= 1;
+            let at = usize::try_from(work.parent)
+                .map_err(|_| Error::MalformedAtRest("governance parent cursor"))?;
+            if at > parent_count {
+                return Err(Error::MalformedAtRest(
+                    "governance parent cursor beyond entry",
+                ));
             }
-            None => {
+            if at < parent_count {
+                if let Some(context) = &signed_context {
+                    let at = work.author.map_or(0, |after| {
+                        context
+                            .coordinates
+                            .partition_point(|coordinate| coordinate.author <= after)
+                    });
+                    if let Some(coordinate) = context.coordinates.get(at) {
+                        work.changed |= writer.raise(&hash, &coordinate.author, coordinate.seq)?;
+                        work.author = Some(coordinate.author);
+                    } else {
+                        work.parent += 1;
+                        work.author = None;
+                    }
+                    continue;
+                }
+                let parent = if at == 0 && own_parent != 0 {
+                    &entry.skeleton.prev_hash
+                } else {
+                    &entry.skeleton.seen[at - own_parent]
+                };
+                // A missing parent contributes no coordinate yet. Its eventual arrival
+                // queues this child through the already persisted reverse-edge index.
+                let next = if input.clock(parent)?.is_some() {
+                    writer.frontier_after(parent, work.author)?
+                } else {
+                    None
+                };
+                match next {
+                    Some((author, seq)) => {
+                        work.changed |= writer.raise(&hash, &author, seq)?;
+                        work.author = Some(author);
+                    }
+                    None => {
+                        work.parent += 1;
+                        work.author = None;
+                    }
+                }
+                continue;
+            }
+            if !work.changed {
                 complete = true;
                 break;
             }
+            match input.child_after(&hash, work.child)? {
+                Some(child) => {
+                    let log = input
+                        .log_id(&child)?
+                        .ok_or(Error::MalformedAtRest("governance child locator missing"))?;
+                    writer.enqueue(&child, log)?;
+                    work.child = Some(child);
+                }
+                None => {
+                    complete = true;
+                    break;
+                }
+            }
         }
-    }
-    writer.save_work(work)?;
-    if complete {
-        writer.finish_work()?;
+        writer.save_work(work)?;
+        if complete {
+            writer.finish_work()?;
+        }
     }
     writer.seal()?;
     batch.commit()?;
-    // A caller spends another turn checking the queue rather than draining it
-    // here and monopolizing the room lock on a large late-parent fan-out.
-    Ok(false)
+    Ok(drained)
 }
 
 /// Observe a source entry only after the existing EntryIndex has published it.
@@ -147,9 +221,18 @@ fn observe(
     let Some(payload) = entry.payload.as_deref() else {
         return Ok(());
     };
-    if !matches!(classify_payload(payload), Ok(EntryKind::Governance))
-        && !crate::governance::step_policy::is_step_policy(payload)
-    {
+    let governance = match &entry.skeleton.v2 {
+        Some(v2) => matches!(
+            v2.kind,
+            crate::log::history::SignedEntryKind::Governance
+                | crate::log::history::SignedEntryKind::StepPolicy
+        ),
+        None => {
+            matches!(classify_payload(payload), Ok(EntryKind::Governance))
+                || crate::governance::step_policy::is_step_policy(payload)
+        }
+    };
+    if !governance {
         return Ok(());
     }
     if writer
@@ -162,13 +245,19 @@ fn observe(
     let key = authors
         .get(&entry.skeleton.author_id)
         .ok_or(Error::MalformedAtRest("governance source author unknown"))?;
-    let Ok(body) = GovEntry::body_bound_to(entry) else {
-        return Ok(());
+    let body = match GovEntry::body_bound_to(entry) {
+        Ok(body) => body,
+        Err(error) if entry.skeleton.v2.is_some() => return Err(error),
+        Err(_) => return Ok(()),
     };
     // Malformed/unauthenticated nested statements confer nothing, just as in
     // the original pass-1 evaluator. Local Store/index errors above remain errors.
-    if body.verify(key).is_err() {
-        return Ok(());
+    if let Err(error) = body.verify(key) {
+        return if entry.skeleton.v2.is_some() {
+            Err(error)
+        } else {
+            Ok(())
+        };
     }
     writer.barrier(log);
     writer.verified(&hash, &entry.skeleton.author_id, entry.skeleton.seq, log)?;
@@ -184,9 +273,9 @@ fn observe(
     writer.current_input(&entry.skeleton.author_id, entry.skeleton.seq, log, &body)
 }
 
-/// Advance one authoritative source row. The cursor and every derived obligation
-/// commit together; a crash after source acceptance but before this turn merely
-/// leaves the source row beyond the cursor for the next unlock to discover.
+/// Advance a bounded batch of authoritative source rows. The cursor and every
+/// derived obligation commit together; a crash leaves uncommitted source rows
+/// beyond the cursor for the next unlock to discover.
 fn advance_source(
     store: &Store,
     entries: &EntryIndex,
@@ -200,38 +289,49 @@ fn advance_source(
     let mut batch = store.batch()?;
     let mut writer = facts::Write::open(&mut batch, sek, room)?;
     writer.discover_source()?;
-    match writer.source_after()? {
-        Some((id, entry)) => {
-            let hash = entry.entry_hash();
-            let published = input.log_id(&hash)? == Some(id) && input.clock(&hash)?.is_some();
-            let mut backfill = false;
-            if published {
-                let clock = published_clock(input.log_id(&hash)?, input.clock(&hash)?, id)?;
-                let late = input.child_after(&hash, None)?.is_some();
-                observe(&mut writer, id, clock, late, &entry, authors, root)?;
-                backfill = writer
-                    .get(facts::Table::Hashes, &facts::hash_key(&hash))?
-                    .is_some()
-                    && grants_this_reader(&entry, me);
-            }
-            writer.observed_through(id)?;
-            writer.seal()?;
-            if backfill {
-                queue_backfill(&mut batch, entries, sek, room, entry.skeleton.author_id)?;
-            }
-            batch.commit()?;
-            Ok(false)
-        }
-        None => {
-            if writer.initialized() {
-                return Ok(true);
-            }
-            writer.source_caught_up();
-            writer.seal()?;
-            batch.commit()?;
-            Ok(true)
-        }
+    if writer.initialized() {
+        return Ok(true);
     }
+    let mut bytes = 0usize;
+    let mut backfill = std::collections::BTreeSet::new();
+    let mut done = false;
+    for row in 0..SOURCE_ROWS {
+        let Some((id, entry)) = writer.source_after()? else {
+            writer.source_caught_up();
+            done = true;
+            break;
+        };
+        let size = entry.to_wire().len();
+        if row > 0 && bytes.saturating_add(size) > INPUT_BYTES {
+            break;
+        }
+        bytes = bytes.saturating_add(size);
+        let hash = entry.entry_hash();
+        let published = input.log_id(&hash)? == Some(id) && input.clock(&hash)?.is_some();
+        if published {
+            let clock = published_clock(input.log_id(&hash)?, input.clock(&hash)?, id)?;
+            let late = input.child_after(&hash, None)?.is_some();
+            observe(&mut writer, id, clock, late, &entry, authors, root)?;
+            if writer
+                .get(facts::Table::Hashes, &facts::hash_key(&hash))?
+                .is_some()
+                && grants_this_reader(&entry, me)
+            {
+                backfill.insert(entry.skeleton.author_id);
+            }
+        }
+        writer.observed_through(id)?;
+    }
+    writer.seal()?;
+    if !backfill.is_empty() {
+        let mut writer = entries.write(&mut batch, sek, room)?;
+        for author in backfill {
+            writer.queue_backfill(author, Some(1))?;
+        }
+        writer.seal()?;
+    }
+    batch.commit()?;
+    Ok(done)
 }
 
 pub(super) use channel::{remember_presence, Presence};
@@ -354,13 +454,19 @@ pub(super) fn advance(
     }
     advance_source(store, entries, sek, room, authors, root, me)?;
     advance_frontiers(store, entries, sek, room)?;
-    let input = entries.read(store, sek, room)?;
-    let mut batch = store.batch()?;
-    let mut writer = facts::Write::open(&mut batch, sek, room)?;
-    if canonical::advance(&mut writer)? {
-        fold::advance(&mut writer, &input, root, now)?;
+    {
+        let input = entries.read(store, sek, room)?;
+        let mut batch = store.batch()?;
+        let mut writer = facts::Write::open(&mut batch, sek, room)?;
+        // Canonical ordering cannot mutate anything before causal settlement.
+        // Do not rewrite its sealed header or fsync an otherwise empty turn.
+        if writer.causal_settled()? {
+            if canonical::advance(&mut writer)? {
+                fold::advance(&mut writer, &input, root, now)?;
+            }
+            writer.seal()?;
+            batch.commit()?;
+        }
     }
-    writer.seal()?;
-    batch.commit()?;
     progress(store, sek, room, now)
 }

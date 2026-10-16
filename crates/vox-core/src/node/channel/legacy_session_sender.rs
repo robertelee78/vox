@@ -83,6 +83,16 @@ impl ChannelState {
         if self.poisoned {
             return Err(self.save_failure());
         }
+        // A new-format public feed has no legacy private Session namespace. Do not
+        // scan it or emit encrypted legacy declarations disguised as ordinary content.
+        if self
+            .entries
+            .read(profile.store(), &self.sek, &self.channel_id)?
+            .sparse_enabled()
+        {
+            return Ok(0);
+        }
+        self.ensure_local_append_available(profile.store())?;
         let me = self.me();
         if !self.settled || self.has_left(&me) || !self.authors.contains_key(&me) {
             return Ok(0);
@@ -180,7 +190,7 @@ impl ChannelState {
             let prepared = if let Some(plaintext) = plaintext {
                 let signer = profile.signer()?;
                 let payload = self.sender.encrypt(&plaintext)?.to_wire();
-                let skeleton = self.next_skeleton(profile.store(), &me, &payload, now_ms)?;
+                let skeleton = self.next_skeleton(profile, &me, &payload, now_ms)?;
                 let entry = Entry::build_signed(signer, skeleton, payload)?;
                 let hash = entry.entry_hash();
                 let id = self.next_log_id;

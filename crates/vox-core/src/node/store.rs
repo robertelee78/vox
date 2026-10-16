@@ -185,6 +185,7 @@ const fn kind_code(kind: SegmentKind) -> u8 {
         SegmentKind::GovernanceIndex => 15,
         SegmentKind::SessionIngress => 13,
         SegmentKind::SessionAttention => 16,
+        SegmentKind::HistoryDemand => 17,
     }
 }
 
@@ -725,6 +726,24 @@ impl Store {
             .map(|v| v.value().to_vec()))
     }
 
+    /// Copy only a fixed metadata prefix, without allocating the rest of an at-rest value.
+    /// Used for an existing sealed record's incarnation nonce, never to authenticate its body.
+    pub(crate) fn get_meta_prefix<const N: usize>(&self, name: &str) -> Result<Option<[u8; N]>> {
+        let txn = self.begin_read()?;
+        let meta = txn.open_table(META).map_err(storage("open meta"))?;
+        let value = meta.get(name).map_err(storage("read meta"))?;
+        value
+            .map(|value| {
+                value
+                    .value()
+                    .get(..N)
+                    .ok_or(Error::MalformedAtRest("metadata prefix missing"))?
+                    .try_into()
+                    .map_err(|_| Error::MalformedAtRest("metadata prefix length"))
+            })
+            .transpose()
+    }
+
     /// Read and replace one metadata entry in **one** write transaction, so two callers cannot
     /// interleave between the read and the write (redb admits one writer at a time). `f` is
     /// given the current value and returns the new one, plus whatever it wants to hand back.
@@ -792,6 +811,53 @@ pub(crate) struct Snapshot {
 }
 
 impl Snapshot {
+    /// Bound a sealed object's serialized size before copying ciphertext out of redb.
+    /// The caller reserves its plaintext/ciphertext working set before this read.
+    pub(crate) fn get_segment_bounded(
+        &self,
+        channel: &Digest32,
+        kind: SegmentKind,
+        id: u64,
+        plaintext_limit: usize,
+    ) -> Result<Option<SealedSegment>> {
+        let table = self
+            .txn
+            .open_table(SEGMENTS)
+            .map_err(storage("open segments"))?;
+        let value = table
+            .get((*channel, kind_code(kind), id))
+            .map_err(storage("read segment"))?;
+        value
+            .map(|value| {
+                // Version, nonce, AEAD tag and canonical CBOR byte-string headers fit in 64 bytes.
+                if value.value().len() > plaintext_limit.saturating_add(64) {
+                    return Err(Error::MalformedAtRest("sealed object exceeds read bound"));
+                }
+                sealed_segment_from_slice(value.value())
+            })
+            .transpose()
+    }
+    /// Read the last segment key without opening its sealed body.
+    pub(crate) fn last_segment_id(
+        &self,
+        channel: &Digest32,
+        kind: SegmentKind,
+    ) -> Result<Option<u64>> {
+        let table = self
+            .txn
+            .open_table(SEGMENTS)
+            .map_err(storage("open segments"))?;
+        let mut rows = table
+            .range((*channel, kind_code(kind), 0)..=(*channel, kind_code(kind), u64::MAX))
+            .map_err(storage("range segments"))?;
+        let found = rows
+            .next_back()
+            .transpose()
+            .map_err(storage("iterate segments"))?
+            .map(|(key, _)| key.value().2);
+        Ok(found)
+    }
+
     /// Read only the next segment key. A readiness check never copies the sealed body.
     pub(crate) fn segment_id_after(
         &self,
@@ -872,6 +938,46 @@ pub struct Batch<'a> {
 }
 
 impl Batch<'_> {
+    /// Read a fixed metadata incarnation inside the same serialized publication transaction.
+    pub(crate) fn get_meta_prefix<const N: usize>(&self, name: &str) -> Result<Option<[u8; N]>> {
+        let meta = self.txn.open_table(META).map_err(storage("open meta"))?;
+        let value = meta.get(name).map_err(storage("read meta"))?;
+        value
+            .map(|value| {
+                value
+                    .value()
+                    .get(..N)
+                    .ok_or(Error::MalformedAtRest("metadata prefix missing"))?
+                    .try_into()
+                    .map_err(|_| Error::MalformedAtRest("metadata prefix length"))
+            })
+            .transpose()
+    }
+
+    /// Read this transaction's bounded object without first copying an unbounded value.
+    pub(crate) fn get_segment_bounded(
+        &self,
+        channel: &Digest32,
+        kind: SegmentKind,
+        id: u64,
+        plaintext_limit: usize,
+    ) -> Result<Option<SealedSegment>> {
+        let table = self
+            .txn
+            .open_table(SEGMENTS)
+            .map_err(storage("open segments"))?;
+        let value = table
+            .get((*channel, kind_code(kind), id))
+            .map_err(storage("read segment"))?;
+        value
+            .map(|value| {
+                if value.value().len() > plaintext_limit.saturating_add(64) {
+                    return Err(Error::MalformedAtRest("sealed object exceeds read bound"));
+                }
+                sealed_segment_from_slice(value.value())
+            })
+            .transpose()
+    }
     /// Read the last segment key without opening its sealed body.
     pub(crate) fn last_segment_id(
         &self,

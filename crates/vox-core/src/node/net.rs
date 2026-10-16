@@ -182,8 +182,12 @@ impl PeerPolicy {
     ///   it as a member *after* the join's final frame, and the ADR-004 responder
     ///   cannot speak first on the new session anyway. Allowing `pairwise` costs
     ///   nothing: a sealed message from a peer we hold no session with cannot be
-    ///   opened and is dropped. Never `sync` (no log authority) and never `tunnel`.
-    /// - **JoinResponder**: `pairwise` (its sender key), `rendezvous` and `coord`.
+    ///   opened and is dropped. `sync` reaches the actor's room/epoch gate: a departed
+    ///   admitted author can request only Control/Head(self), and the response serves only
+    ///   its own completed public head as a departure receipt. No room/data authority is
+    ///   granted by this transport classification. Never `tunnel`.
+    /// - **JoinResponder**: `pairwise` (its sender key), `rendezvous`, `coord`, and the
+    ///   same independently gated `sync` transport.
     /// - **Unknown**: `rendezvous`, gated further by the service's own policy (ADR-012:
     ///   reads open, member-only writes refused there), and `coord`, where its only verb is
     ///   `WHOAMI`.
@@ -205,13 +209,14 @@ impl PeerPolicy {
             ),
             PeerClass::PendingJoiner => matches!(
                 kind,
-                StreamKind::Join
+                StreamKind::Sync
+                    | StreamKind::Join
                     | StreamKind::Rendezvous
                     | StreamKind::Pairwise
                     | StreamKind::Coord
                     | StreamKind::Circuit
             ),
-            // **Its sender key, and nothing an unknown peer could not already open.** The responder
+            // Its sender key and the independently room/query-gated receipt transport. The responder
             // releases its key the moment it admits us, which is before this node holds the room
             // or knows the responder as a member. Judged as `Unknown`, that pairwise stream was
             // refused at accept — `stream refused: peer may not open this stream kind` — while
@@ -221,7 +226,10 @@ impl PeerPolicy {
             // while the second room — joined when the responder was already a member — worked.
             PeerClass::JoinResponder => matches!(
                 kind,
-                StreamKind::Pairwise | StreamKind::Rendezvous | StreamKind::Coord
+                StreamKind::Sync
+                    | StreamKind::Pairwise
+                    | StreamKind::Rendezvous
+                    | StreamKind::Coord
             ),
             // An unknown peer reaches the board — and the coord stream, where the only
             // verb open to it is `WHOAMI`, whose answer is its own address (enforced in
@@ -229,6 +237,18 @@ impl PeerPolicy {
             // any other way, and this ADR exists for that client.
             PeerClass::Unknown => matches!(kind, StreamKind::Rendezvous | StreamKind::Coord),
         }
+    }
+
+    /// Whether this exact peer may open `kind`, including narrow temporary capabilities that
+    /// overlap a broader class. A room host can also be this node's configured anchor; classifying
+    /// it as `Anchor` must not mask the explicit join-responder permission to deliver its sender
+    /// key while the join is in flight. The overlap adds only Pairwise already granted by
+    /// [`Self::expect_join_responder`]; it does not reclassify the peer or grant anchor/member
+    /// authority to any other stream kind.
+    #[must_use]
+    pub fn allows_peer(&self, peer: &Digest32, kind: StreamKind) -> bool {
+        Self::allows(self.classify(peer), kind)
+            || (kind == StreamKind::Pairwise && self.join_responders.contains(peer))
     }
 
     /// The transport admission for a node that does **not** serve rendezvous: only
@@ -1731,8 +1751,9 @@ pub async fn accept_authorized(
 ) -> Result<(StreamKind, SendStream, RecvStream)> {
     let (kind, mut send, mut recv) = accept_typed(conn).await?;
     refuse_second_exchange(conn.quinn(), kind)?;
-    let class = policy.classify(&conn.peer_id());
-    if !PeerPolicy::allows(class, kind) {
+    let peer = conn.peer_id();
+    let class = policy.classify(&peer);
+    if !policy.allows_peer(&peer, kind) {
         refuse_disallowed(class, kind, &mut send, &mut recv);
         return Err(Error::StreamRefused("peer may not open this stream kind"));
     }

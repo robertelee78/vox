@@ -304,6 +304,7 @@ fn feed_entry(author: &dyn RootSigner, room: Digest32, prev: &[Entry], payload: 
     let seq = prev.len() as u64 + 1;
     let hash_of = |s: u64| prev[(s - 1) as usize].entry_hash();
     let skeleton = EntrySkeleton {
+        v2: None,
         author_id: author.fingerprint(),
         seq,
         prev_hash: if seq == 1 {

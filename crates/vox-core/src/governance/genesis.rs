@@ -1,5 +1,8 @@
 //! The channel genesis record — the trust anchor (ADR-007 §"Trust anchor",
-//! tag `0x000D`, domain `vox/genesis/v2`).
+//! tag `0x000D`, domain `vox/genesis/v3`).
+//!
+//! Format 3 binds authenticated sparse history in the signed and hashed body (ADR-036).
+//! Existing formats 1 and 2 retain their original bytes, signatures and room identities.
 //!
 //! ## Its times are milliseconds (format 2)
 //! `created` and the policy's `ttl` are milliseconds since the Unix epoch and milliseconds. A
@@ -43,10 +46,23 @@ use crate::hash::{sha256, Digest32, COMPOSITE_PUB_LEN};
 use crate::identity::composite::{CompositePublicKey, CompositeSignature, RootSigner};
 use crate::identity::rng::fill_random;
 use crate::suite::{algo, suite_by_id, validate_algo, SuiteFloor};
-use crate::wire::{frame_at, parse_frame, signing_input_at, time_decoded, time_encoded, StructTag};
+use crate::wire::{
+    frame_at, parse_frame, signing_input_at, time_decoded, time_encoded, StructTag,
+    HISTORY_GENESIS_VERSION,
+};
 
 /// Length of the genesis nonce in bytes (128-bit, ADR-007).
 pub const GENESIS_NONCE_LEN: usize = 16;
+
+/// The authenticated history contract committed by a new room's genesis (ADR-036).
+const AUTHENTICATED_HISTORY_FORMAT: u64 = 2;
+
+fn history_format(d: &mut Decoder<'_>, format: u8) -> Result<()> {
+    if format == HISTORY_GENESIS_VERSION && d.uint()? != AUTHENTICATED_HISTORY_FORMAT {
+        return Err(Error::MalformedGovernance("genesis history format"));
+    }
+    Ok(())
+}
 
 /// Read the retired service-grant slot, accepting it only empty.
 ///
@@ -154,22 +170,28 @@ pub struct GenesisBody {
     pub policy: ChannelPolicy,
     /// The creator's composite root public key — the root admin (ADR-007).
     pub creator_pubkey: CompositePublicKey,
-    /// The format it was written in: [`StructTag::format_version`] for one this build makes,
-    /// [`crate::wire::FORMAT_VERSION`] (1) for one written when its times were seconds. It is encoded in its own
-    /// format, so its bytes, its signature and its hash (the room's id) are what its creator made.
+    /// The format it was written in: 3 binds authenticated history, 2 carries milliseconds,
+    /// and 1 carries seconds. Its original format preserves its signature and room ID.
     pub format: u8,
 }
 
 impl GenesisBody {
+    /// Whether the creator committed this room to authenticated sparse history.
+    #[must_use]
+    pub const fn authenticated_history(&self) -> bool {
+        self.format == HISTORY_GENESIS_VERSION
+    }
+
     /// Canonical-CBOR body in the ADR-007 field order:
     /// `[nonce, created, [history_mode, retired_deniability (always 0), ttl, min_suite],
     ///   [] (retired service grant, always empty), creator_pubkey, [sign_algo]]`.
+    /// Format 3 appends the authenticated history format `2` as a seventh body field.
     /// `sign_algo` is the composite signature class (the only algorithm a genesis record
     /// commits to); `min_suite` is the ADR-003 ciphersuite floor the channel is created at.
     #[must_use]
     pub fn canonical_body(&self) -> Vec<u8> {
         let mut e = Encoder::new();
-        e.array(6)
+        e.array(if self.authenticated_history() { 7 } else { 6 })
             .bytes(&self.nonce)
             .uint(time_encoded(self.created_ms, self.format))
             .array(4)
@@ -181,11 +203,14 @@ impl GenesisBody {
             .bytes(&self.creator_pubkey.to_bytes())
             .array(1)
             .uint(u64::from(algo::COMPOSITE_ED25519_ML_DSA_65));
+        if self.authenticated_history() {
+            e.uint(AUTHENTICATED_HISTORY_FORMAT);
+        }
         e.finish()
     }
 
-    /// The signing input: `vox/genesis/v2 ‖ canonical_body` (ADR-008), or `vox/genesis/v1 ‖ …`
-    /// for a format-1 genesis.
+    /// The signing input uses the original format domain: `vox/genesis/v1`, `v2`, or `v3`
+    /// followed by that format's canonical body (ADR-008, ADR-036).
     #[must_use]
     pub fn signing_input(&self) -> Vec<u8> {
         signing_input_at(
@@ -208,7 +233,12 @@ impl GenesisBody {
     /// the composite signature class).
     fn from_canonical_body(body: &[u8], format: u8) -> Result<Self> {
         let mut d = Decoder::new(body);
-        if d.array()? != 6 {
+        let arity = if format == HISTORY_GENESIS_VERSION {
+            7
+        } else {
+            6
+        };
+        if d.array()? != arity {
             return Err(Error::MalformedGovernance("genesis arity"));
         }
         let nonce: [u8; GENESIS_NONCE_LEN] = d
@@ -232,6 +262,7 @@ impl GenesisBody {
             return Err(Error::MalformedGovernance("genesis algo_ids arity"));
         }
         let sign_algo = u16_from(d.uint()?)?;
+        history_format(&mut d, format)?;
         d.finish()?;
 
         validate_algo(sign_algo)?;
@@ -317,14 +348,14 @@ impl Genesis {
         &self.body.creator_pubkey
     }
 
-    /// The 7-field wire body: the 6 signed body fields, with the composite
-    /// self-signature appended as the 7th element (ADR-008). Framed by
+    /// The signed body fields with the composite self-signature appended: eight fields
+    /// for format 3, seven for legacy formats (ADR-008, ADR-036). Framed by
     /// [`Genesis::to_wire`].
     #[must_use]
     fn wire_body(&self) -> Vec<u8> {
         let b = &self.body;
         let mut e = Encoder::new();
-        e.array(7)
+        e.array(if b.authenticated_history() { 8 } else { 7 })
             .bytes(&b.nonce)
             .uint(time_encoded(b.created_ms, b.format))
             .array(4)
@@ -336,13 +367,16 @@ impl Genesis {
             .bytes(&b.creator_pubkey.to_bytes())
             .array(1)
             .uint(u64::from(algo::COMPOSITE_ED25519_ML_DSA_65));
+        if b.authenticated_history() {
+            e.uint(AUTHENTICATED_HISTORY_FORMAT);
+        }
         e.bytes(&self.signature.to_bytes());
         e.finish()
     }
 
     /// Frame for the wire/storage per ADR-008: `tag(2 BE) ‖ version(1) ‖
-    /// canonical_cbor_6field_body` (tag [`StructTag::GenesisRecord`] = `0x000D`).
-    /// The `vox/genesis/v2` domain label is the *signing* prefix, **not** the wire
+    /// canonical_cbor_body` (tag [`StructTag::GenesisRecord`] = `0x000D`).
+    /// The `vox/genesis/v3` domain label is the *signing* prefix, **not** the wire
     /// frame (ADR-008 §Struct framing).
     #[must_use]
     pub fn to_wire(&self) -> Vec<u8> {
@@ -362,11 +396,12 @@ impl Genesis {
             return Err(Error::MalformedGovernance("genesis wrong struct tag"));
         }
         let mut d = Decoder::new(parsed.body);
-        if d.array()? != 7 {
+        let authenticated = parsed.version == HISTORY_GENESIS_VERSION;
+        if d.array()? != if authenticated { 8 } else { 7 } {
             return Err(Error::MalformedGovernance("genesis wire arity"));
         }
-        // Read all seven wire elements, then re-encode the first six into the
-        // body-only canonical buffer and decode strictly, so the reconstructed
+        // Read the exact versioned wire elements and reconstruct the body-only
+        // canonical buffer, then decode strictly, so the reconstructed
         // signing input is byte-identical to the creator's.
         let nonce = d.bytes()?.to_vec();
         let created = d.uint()?;
@@ -383,11 +418,12 @@ impl Genesis {
             return Err(Error::MalformedGovernance("genesis algo_ids arity"));
         }
         let sign_algo = d.uint()?;
+        history_format(&mut d, parsed.version)?;
         let sig_bytes = d.bytes()?.to_vec();
         d.finish()?;
 
         let mut be = Encoder::new();
-        be.array(6)
+        be.array(if authenticated { 7 } else { 6 })
             .bytes(&nonce)
             .uint(created)
             .array(4)
@@ -399,6 +435,9 @@ impl Genesis {
             .bytes(&creator_pubkey)
             .array(1)
             .uint(sign_algo);
+        if authenticated {
+            be.uint(AUTHENTICATED_HISTORY_FORMAT);
+        }
         let body = GenesisBody::from_canonical_body(&be.finish(), parsed.version)?;
 
         let sig_arr: [u8; crate::hash::COMPOSITE_SIG_LEN] = sig_bytes

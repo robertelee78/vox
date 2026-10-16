@@ -354,7 +354,8 @@ impl ChannelState {
         author: &Digest32,
     ) -> Result<Option<Entry>> {
         Ok(self.entry_at(transaction, hash)?.filter(|entry| {
-            entry.skeleton.channel_id == self.channel_id
+            entry.skeleton.v2.is_none()
+                && entry.skeleton.channel_id == self.channel_id
                 && entry.skeleton.author_id == *author
                 && entry.skeleton.seq <= self.dag.verified_head(author)
         }))
@@ -362,6 +363,10 @@ impl ChannelState {
 
     /// Inspect an authenticated available body without consuming the live receiver chain.
     fn available_legacy_kind(&self, entry: &Entry) -> Option<bool> {
+        // Format-2 public entries cannot carry the legacy private Session namespace.
+        if entry.skeleton.v2.is_some() {
+            return Some(false);
+        }
         let payload = entry.payload.as_deref()?;
         if !matches!(classify_payload(payload), Ok(EntryKind::Content)) {
             return Some(false);
@@ -542,6 +547,9 @@ impl ChannelState {
         batch: &mut crate::node::store::Batch<'_>,
         entry: &Entry,
     ) -> Result<()> {
+        if entry.skeleton.v2.is_some() {
+            return Ok(());
+        }
         if let Some(session) = self.available_legacy_kind(entry) {
             self.remember_legacy_kind(
                 batch,

@@ -175,8 +175,7 @@ impl ChannelState {
                 first_seq,
                 membership,
             };
-            self.append_control_kind(profile, &floor.wire(), now, EntryKind::Content)?;
-            self.drive.clear_omissions();
+            self.append_control_kind(profile, &floor.wire(), now, EntryKind::Content, false)?;
         }
         Ok(())
     }
@@ -240,43 +239,63 @@ impl ChannelState {
                 .is_some_and(|chain| chain.can_open_iteration(msg.header.iteration)))
     }
 
-    /// Keep signed skeletons while withholding bodies older than the recipient's authorization.
-    pub(super) fn session_entries_for(
+    pub(super) fn session_entries_for_bounded(
         &mut self,
         store: &Store,
         peer: &Digest32,
         wants: &[crate::log::sync::WantRange],
         now_ms: u64,
+        max_entries: usize,
+        max_bytes: usize,
     ) -> Result<Vec<Vec<u8>>> {
         self.now_hint = self.now_hint.max(now_ms);
         self.index_session_floors(store)?;
         let entries = self.entries.read(store, &self.sek, &self.channel_id)?;
-        crate::log::sync::entries_for_wants(&self.dag, &entries, wants)?
-            .into_iter()
-            .map(|wire| {
-                let mut entry = Entry::from_wire(&wire)?;
-                // Physical expiry is page-bounded. The saved age still withholds an
-                // expired body immediately, including while a shorter TTL drains a backlog.
-                let expired = entries.retention(&entry.entry_hash())?.is_some_and(|t| {
-                    let ttl = if t.steps {
-                        self.effective_step_retention()
-                    } else {
-                        self.effective_retention()
-                    };
-                    expired_at(t.base(), self.now_hint, ttl)
-                });
-                if expired
-                    || !self.session_body_allowed(
-                        Transaction::Snapshot(&store.snapshot()?),
-                        &entry,
-                        peer,
-                    )?
+        let accepted_wants: Vec<_> = wants
+            .iter()
+            .filter_map(|want| {
+                let mut want = *want;
+                if let Some(state) = entries
+                    .legacy_provisional()
+                    .filter(|state| state.owner.author == want.author_id)
                 {
-                    entry.payload = None;
+                    want.to_seq = want.to_seq.min(state.base_seq);
                 }
-                Ok(entry.to_wire())
+                (want.from_seq <= want.to_seq).then_some(want)
             })
-            .collect()
+            .collect();
+        crate::log::sync::entries_for_wants_bounded(
+            &self.dag,
+            &entries,
+            &accepted_wants,
+            max_entries,
+            max_bytes,
+        )?
+        .into_iter()
+        .map(|wire| {
+            let mut entry = Entry::from_wire(&wire)?;
+            // Physical expiry is page-bounded. The saved age still withholds an
+            // expired body immediately, including while a shorter TTL drains a backlog.
+            let expired = entries.retention(&entry.entry_hash())?.is_some_and(|t| {
+                let ttl = if t.steps {
+                    self.effective_step_retention()
+                } else {
+                    self.effective_retention()
+                };
+                expired_at(t.base(), self.now_hint, ttl)
+            });
+            if expired
+                || !self.session_body_allowed(
+                    Transaction::Snapshot(&store.snapshot()?),
+                    &entry,
+                    peer,
+                )?
+            {
+                entry.payload = None;
+            }
+            Ok(entry.to_wire())
+        })
+        .collect()
     }
 
     /// Learn every verified floor before publication decides which received bodies to keep.
@@ -285,7 +304,6 @@ impl ChannelState {
     pub(super) fn filter_received_session_bodies(
         &mut self,
         store: &Store,
-        peer: Digest32,
         staged: &[Vec<u8>],
         now_ms: u64,
     ) -> Result<()> {
@@ -320,11 +338,9 @@ impl ChannelState {
                     )?;
                     batch.commit()?;
                 }
-                self.drive.clear_omissions();
             }
             self.observe_legacy_drive_generation(&entry)?;
         }
-        let me = self.me();
         for wire in staged {
             let Ok(incoming) = Entry::from_wire(wire) else {
                 continue;
@@ -335,13 +351,6 @@ impl ChannelState {
             if entry.skeleton.seq > self.dag.verified_head(&entry.skeleton.author_id) {
                 continue;
             }
-            let missing = entry.payload.is_none()
-                || !self.session_body_allowed(
-                    Transaction::Snapshot(&store.snapshot()?),
-                    &entry,
-                    &me,
-                )?;
-            let position = (entry.skeleton.author_id, entry.skeleton.seq);
             // No body of a newly verified entry is removed before its publication can save
             // the exact subtype beside its assigned LogDb id. This closes the old volatile
             // observation gap between pre-filtering and absorb_batch.
@@ -358,11 +367,6 @@ impl ChannelState {
                     self.entries.committed();
                     self.legacy_sessions.committed();
                 }
-            }
-            if missing {
-                self.drive.note_omission(peer, position);
-            } else {
-                self.drive.note_body_from(&peer, &position);
             }
         }
         Ok(())

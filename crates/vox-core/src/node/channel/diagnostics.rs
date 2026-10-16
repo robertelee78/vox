@@ -13,6 +13,14 @@ const SAMPLE_LIMIT: usize = 64;
 const ENTRY_BYTES: usize = 1024;
 
 impl SetAside {
+    pub(super) fn restored(entries: Vec<String>, omitted: u64) -> crate::error::Result<Self> {
+        if entries.len() > SAMPLE_LIMIT || entries.iter().any(|entry| entry.len() > ENTRY_BYTES) {
+            return Err(crate::error::Error::MalformedAtRest(
+                "restart diagnostic bound",
+            ));
+        }
+        Ok(Self { entries, omitted })
+    }
     pub(super) fn push(&mut self, mut entry: String) {
         if self.entries.len() == SAMPLE_LIMIT {
             self.omitted = self.omitted.saturating_add(1);

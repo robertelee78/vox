@@ -184,6 +184,8 @@ pub struct Room {
     pub name: String,
     /// Whether it is open (its key unlocked) now.
     pub open: bool,
+    /// Saved room history is preparing locally.
+    pub preparing: bool,
 }
 
 /// One rendered message.
@@ -378,6 +380,7 @@ impl VoxNode {
                 id: b32_encode(&c.channel_id),
                 name: c.name.unwrap_or_default(),
                 open: c.open,
+                preparing: c.preparing,
             })
             .collect()
     }

@@ -2,7 +2,8 @@
 //! locators, updated in the same transaction as the authenticated wire and ratchet state.
 
 use crate::atrest::sek::Sek;
-use crate::cbor::Encoder;
+use crate::atrest::store::{open_segment, seal_segment, SegmentKind};
+use crate::cbor::{Decoder, Encoder};
 use crate::error::{Error, Result};
 use crate::hash::Digest32;
 use crate::node::store::{Batch, Snapshot};
@@ -10,6 +11,161 @@ use crate::node::store::{Batch, Snapshot};
 use super::super::private_session::Stored;
 use super::record::{Key, Position, Source};
 use super::storage::{Read, Tree, Write};
+
+// This small checkpoint certifies the existing private locator roots. It is committed
+// with each verified row/index write, never ahead of the effects it acknowledges.
+const RESTART: u64 = 22;
+
+#[derive(Clone, Default)]
+pub(in crate::node::channel) struct Restart {
+    pub complete: bool,
+    pub after: Option<u64>,
+    pub next: u64,
+    pub pending: bool,
+    pub pending_after: Option<u64>,
+    pub pending_through: u64,
+}
+
+impl Restart {
+    fn read(sek: &Sek, segment: &crate::atrest::store::SealedSegment) -> Result<Self> {
+        if segment.ciphertext.len() > 256 {
+            return Err(Error::MalformedAtRest("private restart size"));
+        }
+        let bytes = open_segment(sek, SegmentKind::KeyMaterial, RESTART, segment)?;
+        let mut d = Decoder::new(&bytes);
+        if d.array()? != 7 || d.uint()? != 1 {
+            return Err(Error::MalformedAtRest("private restart version"));
+        }
+        let complete = flag(&mut d)?;
+        let after = optional(&mut d)?;
+        let next = d.uint()?;
+        let pending = flag(&mut d)?;
+        let pending_after = optional(&mut d)?;
+        let pending_through = d.uint()?;
+        d.finish()?;
+        if next == 0
+            || after.is_some_and(|id| id >= next)
+            || pending_through > next
+            || pending_after.is_some_and(|id| id >= pending_through)
+        {
+            return Err(Error::MalformedAtRest("private restart cursor"));
+        }
+        Ok(Self {
+            complete,
+            after,
+            next,
+            pending,
+            pending_after,
+            pending_through,
+        })
+    }
+    pub fn queue(&self, batch: &mut Batch<'_>, sek: &Sek, room: &Digest32) -> Result<()> {
+        if self.complete && !super::storage::exists_in(batch, room)? {
+            // Empty new rooms have no locator writes yet. Publish their empty index with
+            // this checkpoint; saved bodies without an index are never certified complete.
+            if batch
+                .last_segment_id(room, SegmentKind::PrivateSession)?
+                .is_some()
+            {
+                return Err(Error::MalformedAtRest("private restart index missing"));
+            }
+            Write::open(batch, sek, room)?.seal()?;
+        }
+        let mut e = Encoder::new();
+        e.array(7).uint(1).uint(u64::from(self.complete));
+        put_optional(&mut e, self.after);
+        e.uint(self.next.max(1)).uint(u64::from(self.pending));
+        put_optional(&mut e, self.pending_after);
+        e.uint(self.pending_through);
+        let segment = seal_segment(sek, SegmentKind::KeyMaterial, RESTART, &e.finish())?;
+        batch.put_segment(room, SegmentKind::KeyMaterial, RESTART, &segment)
+    }
+}
+fn flag(d: &mut Decoder<'_>) -> Result<bool> {
+    match d.uint()? {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(Error::MalformedAtRest("private restart flag")),
+    }
+}
+fn optional(d: &mut Decoder<'_>) -> Result<Option<u64>> {
+    match d.array()? {
+        0 => Ok(None),
+        1 => Ok(Some(d.uint()?)),
+        _ => Err(Error::MalformedAtRest("private restart optional cursor")),
+    }
+}
+fn put_optional(e: &mut Encoder, value: Option<u64>) {
+    e.array(usize::from(value.is_some()));
+    if let Some(value) = value {
+        e.uint(value);
+    }
+}
+pub(in crate::node::channel) fn restart(
+    snapshot: &Snapshot,
+    sek: &Sek,
+    room: &Digest32,
+) -> Result<Restart> {
+    let state = snapshot
+        .get_segment(room, SegmentKind::KeyMaterial, RESTART)?
+        .map(|s| Restart::read(sek, &s))
+        .transpose()?
+        .unwrap_or_else(|| Restart {
+            next: 1,
+            ..Default::default()
+        });
+    if state.complete && Read::existing(snapshot, sek, room)?.is_none() {
+        return Err(Error::MalformedAtRest("private restart index missing"));
+    }
+    Ok(state)
+}
+
+/// Fresh create/join already has an empty room transaction; certify that exact empty index.
+pub(in crate::node::channel) fn initialize(
+    batch: &mut Batch<'_>,
+    sek: &Sek,
+    room: &Digest32,
+) -> Result<()> {
+    if batch
+        .last_segment_id(room, SegmentKind::PrivateSession)?
+        .is_some()
+    {
+        return Err(Error::MalformedAtRest(
+            "private initialization is not empty",
+        ));
+    }
+    Restart {
+        complete: true,
+        next: 1,
+        ..Default::default()
+    }
+    .queue(batch, sek, room)
+}
+
+fn restart_in(batch: &Batch<'_>, sek: &Sek, room: &Digest32) -> Result<Restart> {
+    batch
+        .get_segment(room, SegmentKind::KeyMaterial, RESTART)?
+        .map(|s| Restart::read(sek, &s))
+        .transpose()
+        .map(|s| {
+            s.unwrap_or_else(|| Restart {
+                next: 1,
+                ..Default::default()
+            })
+        })
+}
+pub(in crate::node::channel) fn unread_after(
+    snapshot: &Snapshot,
+    sek: &Sek,
+    room: &Digest32,
+    after: Option<u64>,
+) -> Result<Option<u64>> {
+    let Some(read) = Read::existing(snapshot, sek, room)? else {
+        return Ok(None);
+    };
+    read.next(Tree::PrivateUnread, after.map(arrival_key))
+        .map(|v| v.map(|(_, id)| id))
+}
 
 fn hash_key(hash: &Digest32) -> Key {
     let mut key = [0; 64];
@@ -389,6 +545,11 @@ pub(in crate::node::channel) fn put(
     index.set(tree, key, Some(id))?;
     index.set(Tree::PrivateHash, hash_key(&hash), Some(id))?;
     index.set(Tree::PrivateArrival, arrival_key(id), Some(id))?;
+    index.set(
+        Tree::PrivateUnread,
+        arrival_key(id),
+        saved.row.is_none().then_some(id),
+    )?;
     if let Some(row) = saved
         .row
         .as_ref()
@@ -433,7 +594,18 @@ pub(in crate::node::channel) fn put(
     if let Some(row) = &saved.row {
         super::activity_index::put(&mut index, id, row)?;
     }
-    index.seal()
+    index.seal()?;
+    let mut state = restart_in(batch, sek, room)?;
+    state.next = state.next.max(
+        id.checked_add(1)
+            .ok_or(Error::MalformedAtRest("private Session id exhausted"))?,
+    );
+    if saved.row.is_none() {
+        state.pending = true;
+        state.pending_after = None;
+        state.pending_through = state.next;
+    }
+    state.queue(batch, sek, room)
 }
 
 pub(in crate::node::channel) fn remove(
@@ -457,6 +629,7 @@ pub(in crate::node::channel) fn remove(
     index.set(tree, key, None)?;
     index.set(Tree::PrivateHash, hash_key(&saved.record.hash()), None)?;
     index.set(Tree::PrivateArrival, arrival_key(id), None)?;
+    index.set(Tree::PrivateUnread, arrival_key(id), None)?;
     index.set(Tree::Files, arrival_key(id), None)?;
     if let Some(row) = saved
         .row
@@ -484,4 +657,18 @@ pub(in crate::node::channel) fn remove(
         }
     }
     index.seal()
+}
+
+/// Arrival locators are sealed index data; callers bound body reads separately.
+pub(in crate::node::channel) fn arrival_before(
+    snapshot: &Snapshot,
+    sek: &Sek,
+    room: &Digest32,
+    before: Option<u64>,
+) -> Result<Option<u64>> {
+    let Some(read) = Read::existing(snapshot, sek, room)? else {
+        return Ok(None);
+    };
+    read.previous(Tree::PrivateArrival, before.map(arrival_key))
+        .map(|p| p.map(|(_, id)| id))
 }

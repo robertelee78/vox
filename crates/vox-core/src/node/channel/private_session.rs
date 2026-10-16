@@ -5,12 +5,18 @@ use std::time::{Duration, Instant};
 
 use super::session_projection::{floor_index, private_index};
 use super::*;
-use crate::node::sessionstream::{Ask, Cursor, Page, Record, PAGE_RECORDS};
+use crate::node::sessionstream::{
+    Ask, Cursor, Locator, Page, Query as PrivateQuery, Record, MAX_PAGE, MAX_RECORD, PAGE_OVERHEAD,
+    PAGE_RECORDS,
+};
 
 const SUPPORT: &str = "vox/private-session-stream/v1";
 const SEG_LEGACY_DRIVE_GENERATIONS: u64 = 19;
+const SEG_PRIVATE_PULLS: u64 = 23;
 const WORK_ROWS: usize = 32;
 const WORK_BYTES: usize = 1024 * 1024;
+const TRUST_CHANGED: &str = "private trust incarnation changed";
+type TrustNonce = Option<[u8; crate::atrest::sek::NONCE_LEN]>;
 
 /// Callers only signal that committed public steps need inspection. The actual work is a
 /// disk cursor, not one resident hash for every historical step.
@@ -97,6 +103,7 @@ pub(super) struct PrivateSessions {
     next: u64,
     incarnation: Option<Digest32>,
     cursors: BTreeMap<Digest32, Cursor>,
+    observed_tips: BTreeMap<Digest32, Cursor>,
     pulling: BTreeSet<Digest32>,
     attempted: BTreeMap<Digest32, Instant>,
     revision: u64,
@@ -207,7 +214,13 @@ impl ChannelState {
 
     fn private_at(&self, store: &Store, id: u64) -> Result<Option<Stored>> {
         store
-            .get_segment(&self.channel_id, SegmentKind::PrivateSession, id)?
+            .snapshot()?
+            .get_segment_bounded(
+                &self.channel_id,
+                SegmentKind::PrivateSession,
+                id,
+                2 * MAX_RECORD,
+            )?
             .map(|segment| self.read_private(id, &segment))
             .transpose()
     }
@@ -684,6 +697,17 @@ impl ChannelState {
                 self.private_sessions.pending_active = true;
                 self.private_sessions.pending_after = None;
                 self.private_sessions.pending_through = self.private_sessions.next;
+                let mut batch = store.batch()?;
+                {
+                    let mut index = self
+                        .entries
+                        .write(&mut batch, &self.sek, &self.channel_id)?;
+                    index.clear_retained_step_marker()?;
+                    index.seal()?;
+                }
+                self.queue_private_progress(&mut batch)?;
+                batch.commit()?;
+                self.entries.committed();
                 return Ok(true);
             };
             let size = entry.payload.as_ref().map_or(0, Vec::len);
@@ -850,6 +874,7 @@ impl ChannelState {
         self.private_sessions.pending_active = true;
         self.private_sessions.pending_after = None;
         self.private_sessions.pending_through = self.private_sessions.next;
+        self.save_private_progress(store)?;
         if self.private_policy_ready(store, now)?
             && !self.private_sessions.upgrading
             && !self.private_sessions.restoring
@@ -876,14 +901,21 @@ impl ChannelState {
         }
         let mut bytes = 0usize;
         for _ in 0..WORK_ROWS {
-            let next = self.private_after(store, self.private_sessions.pending_after)?;
-            let Some((id, saved)) =
-                next.filter(|(id, _)| *id < self.private_sessions.pending_through)
-            else {
+            let next = private_index::unread_after(
+                &store.snapshot()?,
+                &self.sek,
+                &self.channel_id,
+                self.private_sessions.pending_after,
+            )?;
+            let Some(id) = next.filter(|id| *id < self.private_sessions.pending_through) else {
                 self.private_sessions.pending_active = false;
                 self.private_sessions.pending_after = None;
+                self.save_private_progress(store)?;
                 return Ok(true);
             };
+            let saved = self
+                .private_at(store, id)?
+                .ok_or(Error::MalformedAtRest("unread Session locator missing"))?;
             let size = saved.record.message.ciphertext.len();
             if bytes != 0 && bytes.saturating_add(size) > WORK_BYTES {
                 break;
@@ -899,7 +931,8 @@ impl ChannelState {
                     saved.record.message.header.chain_id,
                 ))
             {
-                if let Err(error) = self.take_private_record(store, &saved.record.wire(), now) {
+                if let Err(error) = self.take_private_record(store, &saved.record.wire(), now, None)
+                {
                     // A policy replay is not a verdict on the saved wire. Keep both the
                     // record and the last completed cursor so the same row can be retried.
                     if super::governance::refreshing(&error) || floor_index::refreshing(&error) {
@@ -941,6 +974,7 @@ impl ChannelState {
             }
             self.private_sessions.pending_after = Some(id);
         }
+        self.save_private_progress(store)?;
         Ok(false)
     }
 
@@ -1038,17 +1072,181 @@ impl ChannelState {
             &support_body(&self.channel_id, &me),
             now,
             EntryKind::Content,
+            false,
         )?;
         Ok(())
     }
     pub(super) fn restore_private_sessions(&mut self, store: &Store) -> Result<()> {
-        let _ = store;
-        self.private_sessions.controls_import = true;
+        let snapshot = store.snapshot()?;
+        let state = private_index::restart(&snapshot, &self.sek, &self.channel_id)?;
+        self.private_sessions.controls_import = snapshot
+            .get_segment(
+                &self.channel_id,
+                SegmentKind::KeyMaterial,
+                SEG_LEGACY_DRIVE_GENERATIONS,
+            )?
+            .is_some();
         self.private_sessions.controls_import_after = None;
         self.private_sessions.controls_after = None;
-        self.private_sessions.restoring = true;
-        self.private_sessions.restore_after = None;
+        self.private_sessions.restoring = !state.complete;
+        self.private_sessions.restore_after = state.after;
+        self.private_sessions.next = state.next;
+        self.private_sessions.pending_active = state.pending;
+        self.private_sessions.pending_after = state.pending_after;
+        self.private_sessions.pending_through = state.pending_through;
+        self.restore_private_pulls(store)?;
         Ok(())
+    }
+
+    // Cursor scope follows held grant generations, not ratchet iterations. A grant saved
+    // immediately before a crash invalidates the old cursor even if its reset was not saved.
+    fn private_pull_binding(&self) -> Digest32 {
+        let mut e = Encoder::new();
+        e.array(3)
+            .bytes(&self.channel_id)
+            .uint(self.epoch)
+            .array(self.drive.receivers.len());
+        for (author, generation) in self.drive.receivers.keys() {
+            e.array(2).bytes(author).uint(*generation);
+        }
+        crate::hash::sha256(&e.finish())
+    }
+
+    fn restore_private_pulls(&mut self, store: &Store) -> Result<()> {
+        let Some(segment) = store.get_segment(
+            &self.channel_id,
+            SegmentKind::KeyMaterial,
+            SEG_PRIVATE_PULLS,
+        )?
+        else {
+            return Ok(());
+        };
+        if segment.ciphertext.len() > AUTHORS_HARD_LIMIT * 96 + 256 {
+            return Err(Error::MalformedAtRest("private pull cursor bound"));
+        }
+        let bytes = open_segment(
+            &self.sek,
+            SegmentKind::KeyMaterial,
+            SEG_PRIVATE_PULLS,
+            &segment,
+        )?;
+        let mut d = Decoder::new(&bytes);
+        if d.array()? != 4 || d.uint()? != 1 {
+            return Err(Error::MalformedAtRest("private pull cursor version"));
+        }
+        self.private_sessions.incarnation = match d.bytes()? {
+            [] => None,
+            b => Some(
+                b.try_into()
+                    .map_err(|_| Error::MalformedAtRest("private stream incarnation"))?,
+            ),
+        };
+        let binding: Digest32 = d
+            .bytes()?
+            .try_into()
+            .map_err(|_| Error::MalformedAtRest("private pull grant binding"))?;
+        let count = d.array()?;
+        if count > AUTHORS_HARD_LIMIT {
+            return Err(Error::MalformedAtRest("private pull peer bound"));
+        }
+        let mut cursors = BTreeMap::new();
+        for _ in 0..count {
+            if d.array()? != 3 {
+                return Err(Error::MalformedAtRest("private pull peer cursor"));
+            }
+            let peer = d
+                .bytes()?
+                .try_into()
+                .map_err(|_| Error::MalformedAtRest("private pull peer"))?;
+            let incarnation = d
+                .bytes()?
+                .try_into()
+                .map_err(|_| Error::MalformedAtRest("private pull incarnation"))?;
+            let after = d.uint()?;
+            if cursors
+                .insert(peer, Cursor { incarnation, after })
+                .is_some()
+            {
+                return Err(Error::MalformedAtRest("duplicate private pull peer"));
+            }
+        }
+        d.finish()?;
+        if binding == self.private_pull_binding() {
+            self.private_sessions.cursors = cursors;
+        }
+        Ok(())
+    }
+
+    fn save_private_pulls(&self, store: &Store) -> Result<()> {
+        self.save_private_pull_candidate(store, &self.private_sessions.cursors, None)
+    }
+
+    fn save_private_pull_candidate(
+        &self,
+        store: &Store,
+        cursors: &BTreeMap<Digest32, Cursor>,
+        authority: Option<TrustNonce>,
+    ) -> Result<()> {
+        if cursors.len() > AUTHORS_HARD_LIMIT {
+            return Err(Error::MalformedAtRest("private pull peer bound"));
+        }
+        let mut e = Encoder::new();
+        e.array(4)
+            .uint(1)
+            .bytes(
+                self.private_sessions
+                    .incarnation
+                    .as_ref()
+                    .map_or(&[][..], |v| &v[..]),
+            )
+            .bytes(&self.private_pull_binding())
+            .array(cursors.len());
+        for (peer, cursor) in cursors {
+            e.array(3)
+                .bytes(peer)
+                .bytes(&cursor.incarnation)
+                .uint(cursor.after);
+        }
+        let segment = seal_segment(
+            &self.sek,
+            SegmentKind::KeyMaterial,
+            SEG_PRIVATE_PULLS,
+            &e.finish(),
+        )?;
+        let mut batch = store.batch()?;
+        if let Some(expected) = authority {
+            if batch.get_meta_prefix::<{ crate::atrest::sek::NONCE_LEN }>(
+                crate::node::trust::TRUST_META_KEY,
+            )? != expected
+            {
+                return Err(Error::StreamRefused(TRUST_CHANGED));
+            }
+        }
+        batch.put_segment(
+            &self.channel_id,
+            SegmentKind::KeyMaterial,
+            SEG_PRIVATE_PULLS,
+            &segment,
+        )?;
+        batch.commit()
+    }
+
+    fn queue_private_progress(&self, batch: &mut crate::node::store::Batch<'_>) -> Result<()> {
+        private_index::Restart {
+            complete: !self.private_sessions.restoring,
+            after: self.private_sessions.restore_after,
+            next: self.private_sessions.next.max(1),
+            pending: self.private_sessions.pending_active,
+            pending_after: self.private_sessions.pending_after,
+            pending_through: self.private_sessions.pending_through,
+        }
+        .queue(batch, &self.sek, &self.channel_id)
+    }
+
+    fn save_private_progress(&self, store: &Store) -> Result<()> {
+        let mut batch = store.batch()?;
+        self.queue_private_progress(&mut batch)?;
+        batch.commit()
     }
 
     fn restore_private_chunk(&mut self, store: &Store) -> Result<bool> {
@@ -1061,6 +1259,7 @@ impl ChannelState {
                 self.private_sessions.pending_active = true;
                 self.private_sessions.pending_after = None;
                 self.private_sessions.pending_through = self.private_sessions.next;
+                self.save_private_progress(store)?;
                 return Ok(false);
             };
             let size = saved.record.message.ciphertext.len();
@@ -1078,9 +1277,15 @@ impl ChannelState {
                 .ok_or(Error::MalformedAtRest("private Session id exhausted"))?;
             let mut batch = store.batch()?;
             private_index::put(&mut batch, &self.sek, &self.channel_id, id, &saved)?;
-            batch.commit()?;
             self.private_sessions.next = self.private_sessions.next.max(next);
             self.private_sessions.restore_after = Some(id);
+            if saved.row.is_none() {
+                self.private_sessions.pending_active = true;
+                self.private_sessions.pending_after = None;
+                self.private_sessions.pending_through = self.private_sessions.next;
+            }
+            self.queue_private_progress(&mut batch)?;
+            batch.commit()?;
         }
         Ok(false)
     }
@@ -1192,6 +1397,17 @@ impl ChannelState {
         saved: Stored,
         completion: Option<&crate::node::session_ingress::Completion>,
     ) -> Result<Digest32> {
+        self.keep_private_candidate(store, saved, completion, None, None)
+    }
+
+    fn keep_private_candidate(
+        &mut self,
+        store: &Store,
+        saved: Stored,
+        completion: Option<&crate::node::session_ingress::Completion>,
+        candidate: Option<((Digest32, u64), &ReceiverChain)>,
+        authority: Option<TrustNonce>,
+    ) -> Result<Digest32> {
         let hash = saved.record.hash();
         let id = self
             .private_id(store, &hash)?
@@ -1204,6 +1420,14 @@ impl ChannelState {
         let result = (|| {
             let segment = seal_segment(&self.sek, SegmentKind::PrivateSession, id, &saved.bytes())?;
             let mut batch = store.batch()?;
+            if let Some(expected) = authority {
+                if batch.get_meta_prefix::<{ crate::atrest::sek::NONCE_LEN }>(
+                    crate::node::trust::TRUST_META_KEY,
+                )? != expected
+                {
+                    return Err(Error::StreamRefused(TRUST_CHANGED));
+                }
+            }
             if let Some(old) =
                 batch.get_segment(&self.channel_id, SegmentKind::PrivateSession, id)?
             {
@@ -1211,7 +1435,18 @@ impl ChannelState {
                 private_index::remove(&mut batch, &self.sek, &self.channel_id, id, &old)?;
             }
             batch.put_segment(&self.channel_id, SegmentKind::PrivateSession, id, &segment)?;
-            self.queue_drive(&mut batch)?;
+            let drive = seal_segment(
+                &self.sek,
+                SegmentKind::KeyMaterial,
+                SEG_DRIVE,
+                &self.drive.state_with_receiver(candidate),
+            )?;
+            batch.put_segment(
+                &self.channel_id,
+                SegmentKind::KeyMaterial,
+                SEG_DRIVE,
+                &drive,
+            )?;
             private_index::put(&mut batch, &self.sek, &self.channel_id, id, &saved)?;
             if let Some(completion) = completion {
                 completion.queue(&mut batch)?;
@@ -1219,7 +1454,9 @@ impl ChannelState {
             batch.commit()
         })();
         if let Err(e) = result {
-            self.private_save_failed(&e);
+            if !matches!(&e, Error::StreamRefused(reason) if *reason == TRUST_CHANGED) {
+                self.private_save_failed(&e);
+            }
             return Err(e);
         }
         if let Some(row) = &saved.row {
@@ -1683,6 +1920,7 @@ impl ChannelState {
         ask: &Ask,
         peer: &Digest32,
         holders: &BTreeSet<Digest32>,
+        charge: crate::node::history_budget::BufferCharge,
     ) -> Result<Page> {
         self.require_governance_ready(store, crate::time::Ms(self.now_hint))?;
         if self.poisoned
@@ -1700,41 +1938,157 @@ impl ChannelState {
                 let mut i = [0; 32];
                 getrandom::fill(&mut i).map_err(|_| Error::Rng)?;
                 self.private_sessions.incarnation = Some(i);
+                if let Err(error) = self.save_private_pulls(store) {
+                    self.private_save_failed(&error);
+                    return Err(error);
+                }
                 i
             }
         };
-        let mut after = if ask.cursor.incarnation == incarnation {
-            ask.cursor.after
-        } else {
-            0
+        let mut page = Page {
+            revision: 0,
+            query: ask.query.clone(),
+            cursor: Cursor {
+                incarnation,
+                after: 0,
+            },
+            more: false,
+            records: Vec::new(),
+            positions: Vec::new(),
+            hints: Vec::new(),
+            charge,
         };
-        let mut records = Vec::new();
-        // Bound CPU and bytes even when most retained records belong to other audiences.
-        for _ in 0..256 {
-            if records.len() == PAGE_RECORDS {
-                break;
+        let mut wire_bytes = PAGE_OVERHEAD;
+        let permitted = |saved: &Stored| -> Result<bool> {
+            Ok(!self.private_expired(saved, self.now_hint)
+                && (saved.record.message.header.author_id != self.me() || holders.contains(peer))
+                && self.private_permitted(store, &saved.record, peer)?)
+        };
+        match &ask.query {
+            PrivateQuery::LiveTail => {
+                let tip = self.private_sessions.next.saturating_sub(1);
+                page.cursor.after = tip;
+                let lower = tip.saturating_sub(PAGE_RECORDS as u64 - 1).max(1);
+                let seen = if ask.cursor.incarnation == incarnation {
+                    ask.cursor.after
+                } else {
+                    0
+                };
+                let mut before = tip.checked_add(1);
+                for _ in 0..PAGE_RECORDS {
+                    let Some(id) = private_index::arrival_before(
+                        &store.snapshot()?,
+                        &self.sek,
+                        &self.channel_id,
+                        before,
+                    )?
+                    else {
+                        break;
+                    };
+                    if id < lower || id <= seen {
+                        break;
+                    }
+                    before = Some(id);
+                    let saved = self
+                        .private_at(store, id)?
+                        .ok_or(Error::MalformedAtRest("private live locator missing"))?;
+                    if !permitted(&saved)? {
+                        continue;
+                    }
+                    let wire = saved.record.wire();
+                    if wire.len() > MAX_RECORD {
+                        return Err(Error::SizeLimitExceeded("private Session record"));
+                    }
+                    if wire_bytes + wire.len() + 16 > MAX_PAGE {
+                        page.more = true;
+                        break;
+                    }
+                    wire_bytes += wire.len() + 16;
+                    page.positions.push(id);
+                    page.records.push(wire);
+                }
+                // Delivery order keeps ratchet advancement and lifecycle ordering monotone.
+                page.positions.reverse();
+                page.records.reverse();
+                page.more |= lower > seen.saturating_add(1);
             }
-            let Some((id, saved)) = self.private_after(store, Some(after))? else {
-                break;
-            };
-            after = id;
-            if self.private_expired(&saved, self.now_hint) {
-                continue;
+            PrivateQuery::ArchiveInventory { lo, hi, before } => {
+                if ask.cursor.incarnation != incarnation {
+                    return Err(Error::StreamRefused(
+                        "private history donor incarnation changed",
+                    ));
+                }
+                let mut before = *before;
+                for _ in 0..PAGE_RECORDS {
+                    let Some(id) = private_index::arrival_before(
+                        &store.snapshot()?,
+                        &self.sek,
+                        &self.channel_id,
+                        Some(before),
+                    )?
+                    else {
+                        break;
+                    };
+                    if id < *lo {
+                        break;
+                    }
+                    if id > *hi {
+                        return Err(Error::MalformedBundle("private history interval widened"));
+                    }
+                    before = id;
+                    let saved = self
+                        .private_at(store, id)?
+                        .ok_or(Error::MalformedAtRest("private history locator missing"))?;
+                    if permitted(&saved)? {
+                        page.hints.push(Locator {
+                            id,
+                            hash: saved.record.hash(),
+                        });
+                    }
+                }
+                page.hints.reverse();
+                page.cursor.after = before.max(*lo);
+                page.more = private_index::arrival_before(
+                    &store.snapshot()?,
+                    &self.sek,
+                    &self.channel_id,
+                    Some(before),
+                )?
+                .is_some_and(|id| id >= *lo && id <= *hi);
             }
-            if saved.record.message.header.author_id == self.me() && !holders.contains(peer) {
-                continue;
-            }
-            if self.private_permitted(store, &saved.record, peer)? {
-                records.push(saved.record.wire());
+            PrivateQuery::ArchiveRecords { positions, .. } => {
+                if ask.cursor.incarnation != incarnation {
+                    return Err(Error::StreamRefused(
+                        "private history donor incarnation changed",
+                    ));
+                }
+                for position in positions {
+                    let saved =
+                        self.private_at(store, position.id)?
+                            .ok_or(Error::StreamRefused(
+                                "requested private history is no longer retained",
+                            ))?;
+                    if saved.record.hash() != position.hash || !permitted(&saved)? {
+                        return Err(Error::StreamRefused(
+                            "requested private history is not authorized",
+                        ));
+                    }
+                    let wire = saved.record.wire();
+                    if wire.len() > MAX_RECORD {
+                        return Err(Error::SizeLimitExceeded("private Session record"));
+                    }
+                    if wire_bytes + wire.len() + 16 > MAX_PAGE {
+                        page.more = true;
+                        break;
+                    }
+                    wire_bytes += wire.len() + 16;
+                    page.cursor.after = position.id;
+                    page.positions.push(position.id);
+                    page.records.push(wire);
+                }
             }
         }
-        let more = self.private_after(store, Some(after))?.is_some();
-        Ok(Page {
-            revision: 0,
-            cursor: Cursor { incarnation, after },
-            more,
-            records,
-        })
+        Ok(page)
     }
 
     pub(crate) fn start_private_pull(
@@ -1749,7 +2103,12 @@ impl ChannelState {
             || self.drive.receivers.is_empty()
             || !self.supports_private(store, &peer)?
             || !self.drive_members().contains(&peer)
-            || self.private_sessions.pulling.contains(&peer)
+            || (self.private_sessions.pulling.contains(&peer)
+                && self
+                    .private_sessions
+                    .attempted
+                    .get(&peer)
+                    .is_some_and(|at| at.elapsed() < Duration::from_secs(30)))
             || self
                 .private_sessions
                 .attempted
@@ -1764,6 +2123,7 @@ impl ChannelState {
             revision: self.private_sessions.revision,
             room: self.channel_id,
             epoch: self.epoch,
+            query: PrivateQuery::LiveTail,
             cursor: self
                 .private_sessions
                 .cursors
@@ -1779,29 +2139,303 @@ impl ChannelState {
         peer: Digest32,
         page: Result<Page>,
         now: u64,
+        trust_nonce: TrustNonce,
     ) -> Result<bool> {
         self.private_sessions.pulling.remove(&peer);
         let page = page?;
         self.require_governance_ready(store, crate::time::Ms(now))?;
-        if self.poisoned || !self.drive_members().contains(&peer) {
-            return Err(Error::StreamRefused("private Session room unavailable"));
+        if self.poisoned
+            || !self.drive_members().contains(&peer)
+            || page.revision != self.private_sessions.revision
+            || page.query != PrivateQuery::LiveTail
+        {
+            return Err(Error::StreamRefused(
+                "private live request or authority changed",
+            ));
         }
         self.index_session_floors(store)?;
+        // This is a donor-local locator hint, not a completeness statement or a watermark.
+        // Authenticate the whole advertised page before retaining even that bounded hint.
         for wire in &page.records {
-            self.take_private_record(store, wire, now)?;
+            let record = Record::read(wire)?;
+            let author = record.message.header.author_id;
+            let key = self
+                .authors
+                .get(&author)
+                .ok_or(Error::StreamRefused("private Session author unknown"))?;
+            record.verify(&self.channel_id, key)?;
+            if !self.private_permitted(store, &record, &self.me())? {
+                return Err(Error::StreamRefused(
+                    "private Session has no current Drive grant",
+                ));
+            }
         }
-        // A grant arriving while the request was in flight resets recovery to the beginning.
-        // Do not overwrite that reset with a cursor sampled before the grant.
-        if page.revision == self.private_sessions.revision {
-            self.private_sessions.cursors.insert(peer, page.cursor);
+        if page.records.is_empty()
+            && page.cursor.after > self.private_recovery_after(&peer, page.cursor.incarnation)
+        {
+            return Err(Error::StreamRefused(
+                "private donor advertised a gap without authenticated records",
+            ));
         }
-        if page.more {
-            self.private_sessions.attempted.remove(&peer);
+        self.private_sessions
+            .observed_tips
+            .insert(peer, page.cursor.clone());
+        for wire in &page.records {
+            let record = Record::read(wire)?;
+            let header = &record.message.header;
+            if !self.private_cached(store, &record.hash())? && header.author_id != self.me() {
+                let receiver = self
+                    .drive
+                    .receivers
+                    .get(&(header.author_id, header.chain_id))
+                    .ok_or(Error::StreamRefused(
+                        "private lifecycle/history unavailable; explicit recovery required",
+                    ))?;
+                if receiver.has_skipped_iterations()
+                    || header.iteration != receiver.next_iteration()
+                {
+                    return Err(Error::StreamRefused(
+                        "private lifecycle/history gap; explicit recovery required",
+                    ));
+                }
+            }
+            let row = self
+                .preview_private_record(store, wire)?
+                .ok_or(Error::StreamRefused(
+                    "private lifecycle/history unavailable; explicit recovery required",
+                ))?;
+            if !crate::node::sessions::is_record(&row.body)
+                && row.session_id != crate::node::drive::KEY_CHANGED
+            {
+                use super::session_projection::{Query, Reply};
+                if !matches!(
+                    self.session_query(
+                        store,
+                        Query::Lookup {
+                            node: row.author,
+                            id: row.session_id.clone()
+                        },
+                        1,
+                        now
+                    ),
+                    Ok(Reply::Lookup(Some(_)))
+                ) {
+                    return Err(Error::StreamRefused(
+                        "private lifecycle unavailable; explicit recovery required",
+                    ));
+                }
+            }
+            self.take_private_record(store, wire, now, Some(trust_nonce))?;
         }
-        Ok(page.more)
+        if self.private_sessions.cursors.get(&peer) != Some(&page.cursor) {
+            let mut next = self.private_sessions.cursors.clone();
+            next.insert(peer, page.cursor);
+            if let Err(error) = self.save_private_pull_candidate(store, &next, Some(trust_nonce)) {
+                if !matches!(&error, Error::StreamRefused(reason) if *reason == TRUST_CHANGED) {
+                    self.private_save_failed(&error);
+                }
+                return Err(error);
+            }
+            self.private_sessions.cursors = next;
+        }
+        Ok(false) // No private archive is scheduled automatically, even when a gap remains.
     }
 
-    fn take_private_record(&mut self, store: &Store, wire: &[u8], now: u64) -> Result<()> {
+    fn preview_private_record(&self, store: &Store, wire: &[u8]) -> Result<Option<SessionRow>> {
+        let record = Record::read(wire)?;
+        let author = record.message.header.author_id;
+        let key = self
+            .authors
+            .get(&author)
+            .ok_or(Error::StreamRefused("private Session author unknown"))?;
+        record.verify(&self.channel_id, key)?;
+        if !self.private_permitted(store, &record, &self.me())? {
+            return Err(Error::StreamRefused(
+                "private Session has no current drive grant",
+            ));
+        }
+        if let Some(id) = self.private_id(store, &record.hash())? {
+            if let Some(saved) = self.private_at(store, id)? {
+                if saved.row.is_some() {
+                    return Ok(saved.row);
+                }
+            }
+        }
+        if author == self.me() {
+            return Ok(None);
+        }
+        let receiver = self
+            .drive
+            .receivers
+            .get(&(author, record.message.header.chain_id))
+            .ok_or(Error::StreamRefused(
+                "private Session drive key not received",
+            ))?;
+        if !receiver.can_open_iteration(record.message.header.iteration) {
+            return Ok(None);
+        }
+        let mut next = ReceiverChain::from_state(&receiver.to_state())?;
+        let plain = Zeroizing::new(next.decrypt(&record.message)?);
+        let Decoded::Session(content) = crate::node::content::decode(&plain)? else {
+            return Err(Error::MalformedBundle("private Session content kind"));
+        };
+        Ok(Some(SessionRow {
+            entry_hash: record.hash(),
+            author,
+            created_millis: content.created_millis,
+            session_id: content.session_id,
+            body: content.body,
+        }))
+    }
+
+    /// Stable generation scope for explicit private history. Ratchet iteration advances do
+    /// not change it; a durable receiver generation or membership change does.
+    pub(crate) fn private_history_scope(
+        &self,
+        store: &Store,
+        peer: &Digest32,
+    ) -> Result<(Cursor, Digest32)> {
+        self.require_governance_ready(store, crate::time::Ms(self.now_hint))?;
+        if self.poisoned
+            || !self.drive_members().contains(peer)
+            || !self.private_controls_ready(store)?
+        {
+            return Err(Error::StreamRefused(
+                "private history authority is unavailable",
+            ));
+        }
+        let boundary = self
+            .private_sessions
+            .observed_tips
+            .get(peer)
+            .or_else(|| self.private_sessions.cursors.get(peer))
+            .cloned()
+            .ok_or(Error::StreamRefused(
+                "current private donor boundary is not available yet",
+            ))?;
+        Ok((boundary, self.private_pull_binding()))
+    }
+
+    pub(crate) fn private_history_ask(
+        &self,
+        store: &Store,
+        bounds: crate::node::history_demand::Bounds,
+        plan: &crate::node::history_demand::PrivatePlan,
+    ) -> Result<Ask> {
+        let (boundary, grant) = self.private_history_scope(store, &plan.donor)?;
+        if boundary.incarnation != bounds.head || grant != plan.grant || bounds.hi > boundary.after
+        {
+            return Err(Error::StreamRefused(
+                "private history donor or Drive generation changed",
+            ));
+        }
+        let query = if !plan.inventory_done {
+            PrivateQuery::ArchiveInventory {
+                lo: bounds.lo,
+                hi: bounds.hi,
+                before: bounds
+                    .hi
+                    .checked_add(1)
+                    .ok_or(Error::SizeLimitExceeded("private history boundary"))?,
+            }
+        } else {
+            PrivateQuery::ArchiveRecords {
+                lo: bounds.lo,
+                hi: bounds.hi,
+                positions: plan.positions.clone(),
+            }
+        };
+        Ok(Ask {
+            revision: self.private_sessions.revision,
+            room: self.channel_id,
+            epoch: self.epoch,
+            cursor: Cursor {
+                incarnation: bounds.head,
+                after: bounds.hi,
+            },
+            query,
+        })
+    }
+
+    /// One explicit quantum only. The caller persists this exact updated plan after these
+    /// idempotent record effects commit and before reporting progress to the person.
+    pub(crate) fn finish_private_history(
+        &mut self,
+        store: &Store,
+        bounds: crate::node::history_demand::Bounds,
+        plan: &mut crate::node::history_demand::PrivatePlan,
+        page: Page,
+        now: u64,
+        trust_nonce: TrustNonce,
+    ) -> Result<()> {
+        let ask = self.private_history_ask(store, bounds, plan)?;
+        if page.revision != ask.revision || page.query != ask.query {
+            return Err(Error::StreamRefused(
+                "private history request changed during transfer",
+            ));
+        }
+        self.index_session_floors(store)?;
+        match &page.query {
+            PrivateQuery::ArchiveInventory { .. } => {
+                if page.more {
+                    return Err(Error::StreamRefused(
+                        "private inventory did not finish its fixed interval",
+                    ));
+                }
+                let mut missing = Vec::new();
+                for position in page.hints {
+                    if !self.private_cached(store, &position.hash)? {
+                        missing.push(position);
+                    }
+                }
+                plan.positions = missing;
+                plan.inventory_done = true;
+            }
+            PrivateQuery::ArchiveRecords { .. } => {
+                for wire in &page.records {
+                    self.preview_private_record(store, wire)?
+                        .ok_or(Error::StreamRefused(
+                            "requested private history key is no longer retained",
+                        ))?;
+                    self.take_private_record(store, wire, now, Some(trust_nonce))?;
+                }
+                plan.positions.drain(..page.records.len());
+            }
+            PrivateQuery::LiveTail => {
+                return Err(Error::StreamRefused(
+                    "live delivery is not an archive quantum",
+                ))
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn private_recovery_after(&self, peer: &Digest32, incarnation: Digest32) -> u64 {
+        self.private_sessions
+            .cursors
+            .get(peer)
+            .filter(|c| c.incarnation == incarnation)
+            .map_or(0, |c| c.after)
+    }
+    pub(crate) fn private_cached(&self, store: &Store, hash: &Digest32) -> Result<bool> {
+        let Some(id) = self.private_id(store, hash)? else {
+            return Ok(false);
+        };
+        let Some(saved) = self.private_at(store, id)? else {
+            return Ok(false);
+        };
+        Ok(saved.row.is_some()
+            && !self.private_expired(&saved, self.now_hint)
+            && self.private_permitted(store, &saved.record, &self.me())?)
+    }
+
+    fn take_private_record(
+        &mut self,
+        store: &Store,
+        wire: &[u8],
+        now: u64,
+        authority: Option<TrustNonce>,
+    ) -> Result<()> {
         if let Err(error) = self.require_governance_ready(store, crate::time::Ms(now)) {
             self.private_save_failed(&error);
             return Err(error);
@@ -1864,8 +2498,7 @@ impl ChannelState {
             session_id: content.session_id,
             body: content.body,
         };
-        self.drive.receivers.insert(slot, next);
-        self.keep_private(
+        self.keep_private_candidate(
             store,
             Stored {
                 record,
@@ -1874,7 +2507,10 @@ impl ChannelState {
                 attention_after: None,
             },
             None,
+            Some((slot, &next)),
+            authority,
         )?;
+        self.drive.receivers.insert(slot, next);
         self.sweep_private_sessions(store, now)?;
         Ok(())
     }
@@ -1882,6 +2518,7 @@ impl ChannelState {
     pub(super) fn reset_private_pulls(&mut self) {
         self.private_sessions.revision = self.private_sessions.revision.wrapping_add(1);
         self.private_sessions.cursors.clear();
+        self.private_sessions.observed_tips.clear();
         self.private_sessions.attempted.clear();
     }
 

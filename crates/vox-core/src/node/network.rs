@@ -886,8 +886,23 @@ impl NodeNet {
         (kind, mut send, mut recv): (StreamKind, SendStream, RecvStream),
     ) -> Result<(StreamKind, SendStream, RecvStream)> {
         crate::node::net::refuse_second_exchange(conn, kind)?;
-        let class = self.classify(&peer);
+        let policy = self.policy.snapshot();
+        // Keep the class and the exact join-responder capability on one policy snapshot. A policy
+        // replacement between two reads must not let an older Member class authorize a stream
+        // after the actor has retired it. The board remains the fallback only when this snapshot
+        // has no actor-owned answer, exactly as in `classify`.
+        let policy_class = policy.classify(&peer);
+        let class = if policy_class != PeerClass::Unknown {
+            policy_class
+        } else if self.peer_is_member_on_board(&peer) {
+            PeerClass::Member
+        } else if self.peer_has_prejoin(&peer) {
+            PeerClass::PendingJoiner
+        } else {
+            PeerClass::Unknown
+        };
         if !(PeerPolicy::allows(class, kind)
+            || policy.allows_peer(&peer, kind)
             || kind == StreamKind::Circuit && self.service.computer_transport_peer(&peer))
         {
             crate::node::net::refuse_disallowed(class, kind, &mut send, &mut recv);
@@ -967,6 +982,26 @@ impl NodeNet {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .forget_prejoin(channel_id, peer);
+    }
+
+    /// The verified pre-join bundle `peer` presented for `channel_id`, while it is still live.
+    ///
+    /// This remains candidate key material only. The caller must separately establish room
+    /// authority before using it; a pre-join record alone never makes its presenter a member.
+    #[must_use]
+    pub fn board_prejoin_bundle(
+        &self,
+        channel_id: &Digest32,
+        peer: &Digest32,
+    ) -> Option<crate::identity::keyagreement::PrekeyBundlePublic> {
+        let now = self.now_ms();
+        let store = self.service.store();
+        let guard = store.lock().unwrap_or_else(PoisonError::into_inner);
+        guard
+            .current_prejoins(channel_id, now)
+            .into_iter()
+            .find(|record| record.asserted_id() == *peer)
+            .map(|record| record.prekey_bundle.clone())
     }
 
     /// Whether the board knows `peer` as a member of some channel it anchors: the

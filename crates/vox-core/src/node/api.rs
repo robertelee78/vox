@@ -41,6 +41,8 @@ pub struct ChannelSummary {
     pub name: Option<String>,
     /// Whether the channel is open (SEK unlocked) in this session.
     pub open: bool,
+    /// The room is recovering locally; its history is not yet available.
+    pub preparing: bool,
     /// Number of accepted log entries (0 while closed).
     pub entries: u64,
     /// Whether the room is over for this node, in plain words (V030-08): this identity left it,
@@ -610,6 +612,8 @@ pub struct ChannelDetail {
     pub history_instance: [u8; 16],
     /// Local reuse stamp for the already-built display; never serialized or sent to peers.
     pub(crate) display_stamp: crate::node::channel::DisplayStamp,
+    /// Local indicator reuse token; never serialized or sent to peers.
+    pub(crate) read_summary_stamp: crate::node::channel::ReadSummaryStamp,
     /// Node-local change token for the published timeline, unchanged on projection reuse.
     /// Scoped to this node actor; clients discard it when their node connection changes.
     pub display_revision: u64,
@@ -806,9 +810,113 @@ pub struct AnchoredChannel {
     pub holding: Vec<(Digest32, Vec<String>)>,
 }
 
+/// An explicit local request for bounded peer history. Cache queries never construct this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum HistoryDemandAction {
+    /// Select a bounded missing interval near the newest accepted head.
+    Newest,
+    /// Select an older interval before this exact cached message.
+    Older {
+        /// Exact cached message before which the bounded interval is selected.
+        before: Digest32,
+    },
+    /// Recover the next bounded sequential private interval from this exact donor.
+    PrivateRecover {
+        /// Exact donor whose next private interval is recovered.
+        peer: Digest32,
+    },
+    /// Resume this exact retained operation, preserving its original bounds.
+    Resume {
+        /// Exact retained operation to resume.
+        request: [u8; 16],
+    },
+    /// Cancel this exact retained operation, including provisional body storage.
+    Cancel {
+        /// Exact retained operation to cancel.
+        request: [u8; 16],
+    },
+    /// Inspect saved progress; never starts or resumes traffic.
+    Status,
+}
+
+/// Public progress for one explicit archive operation; partial progress is not synchronization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryDemandPhase {
+    /// No retained request exists.
+    Idle,
+    /// This bounded selection is already available locally.
+    Cached,
+    /// Local bounded selection or durable request preparation is running.
+    Preparing,
+    /// The explicit request is queued or running.
+    Pending,
+    /// This quantum ended with more within the original selection; explicit resume is required.
+    More,
+    /// Retained work is inactive, including after restart.
+    Paused,
+    /// The requested evidence or a suitable peer is presently unavailable.
+    Unavailable,
+    /// This bounded logical selection completed; older history may still exist.
+    Complete,
+    /// The request is cancelled; bounded provisional cleanup may remain.
+    Cancelled,
+    /// Another bounded operation owns the available reservation.
+    Busy,
+}
+
+/// Redaction-safe, bounded progress returned to the CLI and app.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HistoryDemandStatus {
+    /// Private Drive scope; absent for public room history.
+    #[serde(default)]
+    pub private_peer: Option<Digest32>,
+    /// Original donor-local private interval; unchanged by continuation.
+    #[serde(default)]
+    pub private_lo: Option<u64>,
+    /// Inclusive high bound of the original donor-local private interval.
+    #[serde(default)]
+    pub private_hi: Option<u64>,
+    /// Selected room.
+    pub room: Digest32,
+    /// Exact saved room incarnation.
+    pub instance: [u8; 16],
+    /// Current operation, when one was durably created.
+    pub request: Option<[u8; 16]>,
+    /// Public operation state.
+    pub phase: HistoryDemandPhase,
+    /// Author selected for this exact-head page.
+    pub author: Option<Digest32>,
+    /// Original accepted head, never widened by a peer continuation.
+    pub head: Option<Digest32>,
+    /// Remaining entries in the original authorized interval; this may exceed one quantum.
+    pub remaining: usize,
+    /// Persisted partial-body offset; ACK never precedes it.
+    pub offset: u64,
+    /// Maximum headers authorized for the logical page.
+    pub headers: usize,
+    /// Maximum total wire bytes per response quantum, including protocol traffic.
+    pub wire_bytes: usize,
+    /// Short operational explanation, never a body or secret.
+    pub detail: String,
+}
+
 /// A command from a client to the node.
 #[derive(Debug)]
 pub enum NodeCommand {
+    /// Explicit local archive demand, distinct from all cache/page/watch APIs.
+    HistoryDemand {
+        /// Selected room.
+        channel_id: Digest32,
+        /// Exact saved room incarnation from the caller's displayed selection.
+        instance: [u8; 16],
+        /// One explicit start, continuation, cancellation or status operation.
+        action: HistoryDemandAction,
+        /// Answer after bounded local preparation; no peer round trip blocks the actor.
+        reply: tokio::sync::oneshot::Sender<Result<HistoryDemandStatus, String>>,
+    },
     /// One private bounded attention operation, authenticated by the receiving transport.
     Attention {
         /// Exact room.
@@ -949,6 +1057,14 @@ pub enum NodeCommand {
         text: String,
         /// The saved room incarnation observed before sending.
         instance: [u8; 16],
+    },
+    /// Capture the exact open room incarnation before a plain post may wait. Internal to node
+    /// clients; the result crosses its own typed reply and is never accepted from IPC.
+    PreparePost {
+        /// The channel to post to.
+        channel_id: Digest32,
+        /// The incarnation observed under the room lock, or the exact refusal.
+        reply: tokio::sync::oneshot::Sender<Result<[u8; 16], Fault>>,
     },
     /// Note that these entries of an open channel were shown to this node's person, or drained
     /// into its agent's turn (ADR-028 RR-1). Done means their local read marks are durably
@@ -1247,6 +1363,10 @@ pub enum Fault {
     UnknownChannel,
     /// The channel is not open.
     ChannelNotOpen,
+    /// Identity is Ready; this room is still preparing its saved state.
+    RoomPreparing,
+    /// Explicit legacy recovery must resume before this room accepts a new post.
+    LegacyHistoryRequired,
     /// An input exceeded its bound (name or text length).
     TooLong,
     /// A trust add or remove needs the identity passphrase: it was not entered for a keyring
@@ -1281,6 +1401,8 @@ pub enum Fault {
     PostSelectionChanged,
     /// A prior local room change/open still owes its checked publication; no new write began.
     RoomChangePending,
+    /// This node already has its bounded number of posts waiting to enter the actor.
+    PostBusy,
     /// One admin removal is already being applied over bounded actor turns.
     AdminChangePending,
     /// A previous hosted room deletion is still awaiting its bounded daemon handoff.
@@ -1482,6 +1604,12 @@ impl Fault {
             Fault::UnknownChannel => {
                 "no such room on this node\n       `vox room list` shows the rooms it holds"
             }
+            Fault::RoomPreparing => {
+                "that room is preparing its saved history; the node is Ready, and the room will become available when preparation finishes — no passphrase is needed"
+            }
+            Fault::LegacyHistoryRequired => {
+                "Legacy history required; resume explicit recovery before posting in this room"
+            }
             Fault::ChannelNotOpen => {
                 "that room is not open on this node\n       open it with its passphrase: a line holding the room's id and its passphrase to `vox daemon`, or in `vox tui`"
             }
@@ -1529,6 +1657,9 @@ impl Fault {
             }
             Fault::RoomChangePending => {
                 "a previous change to this room is still being applied; this request made no change\n       wait for its answer before changing the room again"
+            }
+            Fault::PostBusy => {
+                "this node already has too many posts waiting; this message was not posted\n       wait for those posts to finish, then try again"
             }
             Fault::AdminChangePending => {
                 "an admin change is already being applied on this node\n       wait for its answer before making another admin change"
@@ -1749,6 +1880,8 @@ fault_names!(
     PassphraseEmpty,
     UnknownChannel,
     ChannelNotOpen,
+    RoomPreparing,
+    LegacyHistoryRequired,
     TooLong,
     KeyringFull,
     ServiceOffersFull,
@@ -1759,6 +1892,7 @@ fault_names!(
     ReadSelectionChanged,
     PostSelectionChanged,
     RoomChangePending,
+    PostBusy,
     AdminChangePending,
     SessionCleanupBusy,
     SessionCleanupUnavailable,

@@ -83,6 +83,8 @@ pub struct Router {
 }
 
 struct Inner {
+    /// Archive and live/control reservations span every node this daemon hosts.
+    history_budget: Arc<vox_core::node::history_budget::Budget>,
     account: Account,
     rt: Handle,
     defaults: Defaults,
@@ -346,6 +348,7 @@ impl Router {
                 let codex = crate::codex_mirror::CodexMirror::new(Arc::clone(&sink));
                 let opencode = crate::opencode_mirror::OpenCodeMirror::new(Arc::clone(&sink));
                 Inner {
+                    history_budget: vox_core::node::history_budget::Budget::new(),
                     codex,
                     opencode,
                     account,
@@ -3387,6 +3390,7 @@ impl Router {
             let mut cfg = NodeConfig::new()
                 .anchors(set.clone())
                 .on_profile_wait(crate::tunnel_cli::say_waiting);
+            cfg.history_budget = Arc::clone(&self.inner.history_budget);
             cfg.computer = Some(Arc::clone(&self.inner.defaults.computer.computer));
             cfg.session_room_removed = Some(room_removed.clone());
             if let Some(bind) = &bind {

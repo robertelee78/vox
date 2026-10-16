@@ -178,6 +178,18 @@ pub enum Rejected {
     PreCheckpoint,
 }
 
+/// Compact state for one already authenticated, durably published feed prefix.
+/// Never serialize a staging DAG head: it can be ahead of the committed root switch.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PublishedFeed {
+    pub seq: u64,
+    pub hash: Digest32,
+    pub first_claimed_ms: u64,
+    pub ended: bool,
+    pub checkpoint: Option<(u64, Digest32)>,
+    pub swept_to: u64,
+}
+
 /// The replicated log store: per-author feeds, a hash index, and frozen authors.
 /// One [`Dag`] per channel.
 #[derive(Debug, Default)]
@@ -234,6 +246,172 @@ impl Dag {
     #[must_use]
     pub fn for_room(_origin_ms: u64) -> Self {
         Self::default()
+    }
+
+    /// Bootstrap only after the complete historical acceptance pass has discarded all
+    /// unverified tails. Live publication derives each changed author from its own witness.
+    pub(crate) fn published_feeds(&self) -> Result<BTreeMap<Digest32, PublishedFeed>> {
+        if !self.unverified_from.is_empty() {
+            return Err(Error::MalformedAtRest("unverified feed in restart state"));
+        }
+        Ok(self
+            .feeds
+            .iter()
+            .filter(|(_, feed)| !feed.is_empty())
+            .map(|(author, feed)| {
+                (
+                    *author,
+                    PublishedFeed {
+                        seq: feed.max_seq(),
+                        hash: feed.head_hash(),
+                        first_claimed_ms: feed.first_claimed_ms().unwrap_or(0),
+                        ended: feed.ended(),
+                        checkpoint: self.checkpoints.get(author).copied(),
+                        swept_to: self.swept_to.get(author).copied().unwrap_or(0),
+                    },
+                )
+            })
+            .collect())
+    }
+
+    /// Restore sealed accepted metadata. Head/source authentication is checked by the room
+    /// loader; incoming entries still pass the unchanged acceptance predicate.
+    pub(crate) fn restore_published(feeds: &BTreeMap<Digest32, PublishedFeed>) -> Result<Self> {
+        let mut dag = Self::new();
+        for (author, state) in feeds {
+            dag.feeds.insert(
+                *author,
+                Feed::restore_published(
+                    *author,
+                    state.seq,
+                    state.hash,
+                    state.first_claimed_ms,
+                    state.ended,
+                )?,
+            );
+            if let Some(checkpoint) = state.checkpoint {
+                if checkpoint.0 == 0 || checkpoint.0 >= state.seq || state.swept_to > checkpoint.0 {
+                    return Err(Error::MalformedAtRest("published checkpoint bound"));
+                }
+                dag.checkpoints.insert(*author, checkpoint);
+            } else if state.swept_to != 0 {
+                return Err(Error::MalformedAtRest("sweep without checkpoint"));
+            }
+            dag.swept_to.insert(*author, state.swept_to);
+        }
+        Ok(dag)
+    }
+
+    /// Apply one compact state only after the matching header-only Feed validation and
+    /// sealed restart update commit. This never invents a prefix from a sparse tip.
+    pub(crate) fn restore_contiguous_author(
+        &mut self,
+        author: Digest32,
+        state: &PublishedFeed,
+    ) -> Result<()> {
+        let feed = Feed::restore_published(
+            author,
+            state.seq,
+            state.hash,
+            state.first_claimed_ms,
+            state.ended,
+        )?;
+        if self
+            .feeds
+            .get(&author)
+            .is_some_and(|old| old.max_seq() > state.seq)
+        {
+            return Err(Error::MalformedAtRest(
+                "contiguous author state moved backwards",
+            ));
+        }
+        self.feeds.insert(author, feed);
+        Ok(())
+    }
+
+    /// Restore only sealed local staging metadata for one explicit legacy request. Every
+    /// staged row already passed admission and contiguous/skip linkage when it was written;
+    /// this avoids replaying that unsigned suffix on each explicit Resume. It is not accepted
+    /// history: `verified_head` remains at `base`, and ordinary frontiers must use that boundary.
+    // The exact sealed base and tail scalars are checked together; no history is loaded.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn restore_legacy_provisional(
+        &mut self,
+        author: Digest32,
+        base: u64,
+        base_hash: Digest32,
+        tail: u64,
+        tail_hash: Digest32,
+        first_claimed_ms: u64,
+        ended: bool,
+    ) -> Result<()> {
+        let current = self.feeds.get(&author);
+        if self.unverified_from.contains_key(&author)
+            || current.map_or(0, Feed::max_seq) != base
+            || current.map_or(crate::log::entry::ZERO_HASH, Feed::head_hash) != base_hash
+            || tail < base
+            || tail > crate::log::feed::MAX_SEQ
+        {
+            return Err(Error::MalformedAtRest("legacy provisional base differs"));
+        }
+        if tail > base {
+            self.feeds.insert(
+                author,
+                Feed::restore_published(author, tail, tail_hash, first_claimed_ms, ended)?,
+            );
+            self.unverified_from.insert(author, base + 1);
+        }
+        Ok(())
+    }
+
+    /// Detach an exact request's volatile suffix without deleting its sealed spool. The
+    /// caller obtains `base` from the current accepted restart root, never a peer's claim.
+    pub(crate) fn detach_legacy_provisional(
+        &mut self,
+        author: Digest32,
+        base: u64,
+        base_hash: Digest32,
+        first_claimed_ms: u64,
+        ended: bool,
+    ) -> Result<()> {
+        if base == 0 {
+            self.feeds.remove(&author);
+        } else {
+            self.feeds.insert(
+                author,
+                Feed::restore_published(author, base, base_hash, first_claimed_ms, ended)?,
+            );
+        }
+        self.unverified_from.remove(&author);
+        Ok(())
+    }
+
+    pub(crate) fn restore_legacy_accepted(
+        &mut self,
+        author: Digest32,
+        state: &PublishedFeed,
+    ) -> Result<()> {
+        self.detach_legacy_provisional(
+            author,
+            state.seq,
+            state.hash,
+            state.first_claimed_ms,
+            state.ended,
+        )?;
+        match state.checkpoint {
+            Some(checkpoint) => {
+                self.checkpoints.insert(author, checkpoint);
+            }
+            None => {
+                self.checkpoints.remove(&author);
+            }
+        }
+        self.swept_to.insert(author, state.swept_to);
+        Ok(())
+    }
+
+    pub(crate) fn swept_positions(&self) -> impl Iterator<Item = (&Digest32, &u64)> {
+        self.swept_to.iter()
     }
 
     /// The number of entries stored across all authors.
@@ -353,6 +531,11 @@ impl Dag {
 
     /// Look up a stored entry by its 32-byte hash (the Negentropy key).
     pub fn get_by_hash(&self, entries: &impl EntryRead, hash: &Digest32) -> Result<Option<Entry>> {
+        // A sparse source is separately evidence-validated and atomically published. It
+        // does not become a contiguous Feed merely to be available to local consumers.
+        if let Some(entry) = entries.get_sparse_published(hash)? {
+            return Ok(Some(entry));
+        }
         let Some((author, seq)) = entries.locate(hash)? else {
             return Ok(None);
         };
@@ -511,10 +694,11 @@ impl Dag {
         // Below its author's checkpoint, nothing new is taken: every position there is
         // already held (the feed is contiguous), so a different entry for one is refused as
         // pre-checkpoint — not raised as a fork.
-        if self
-            .checkpoints
-            .get(&author)
-            .is_some_and(|(below, _)| seq <= *below)
+        if entry.skeleton.v2.is_none()
+            && self
+                .checkpoints
+                .get(&author)
+                .is_some_and(|(below, _)| seq <= *below)
         {
             self.refused_below_checkpoint = self.refused_below_checkpoint.saturating_add(1);
             return Err(Rejected::PreCheckpoint);
@@ -598,7 +782,7 @@ impl Dag {
         } else {
             self.unverified_from.entry(author).or_insert(seq);
         }
-        if let Some(cp) = checkpoint {
+        if let Some(cp) = checkpoint.filter(|_| entry.skeleton.v2.is_none()) {
             let held = self.checkpoints.entry(author).or_insert((0, cp.entry_hash));
             if cp.seq > held.0 {
                 *held = (cp.seq, cp.entry_hash);

@@ -56,6 +56,13 @@ million-message room holds about 3.5 GB of skeletons after every body has expire
   the room's order (`Request::Read.after`), never as an arrival cursor, so a late row is shown once
   and in its place. `vox room read --hashes` (hidden) MUST print `<hash> <clock-ms>` for every held
   entry, in order.
+- **RL-1.4a. Sparse new-format history (2026-10-15).** ADR-036 H-8 specifies the v2
+  held-set ordering amendment: nearest held same-author predecessor while a gap remains, verified
+  control-context dependencies, atomic gap splice and recomputation in both clock directions.
+  Receipts do not certify a full-history HLC. Fresh rows remain visible through bounded arrival
+  state even when their provisional position is above the current page; rows are never forced to
+  the bottom. No ordinary ancestry fetch is required merely to sort a new row. The same-held-set
+  convergence, first-seen/late rules and distinct arrival/order cursors above still apply.
 - **RL-1.5. Claims.** Claims stay in Vox: agent comms tracks who does what (ADR-020). `seen` gives
   claims a happens-before (`Dag::happened_before`, ADR-008 LS-13): a claim that saw another claim
   follows it, and only truly concurrent claims fall back to the tie-break. Vox MUST NOT hard-lock a
@@ -98,6 +105,12 @@ million-message room holds about 3.5 GB of skeletons after every body has expire
   progress is recorded in GitHub through the accountability skill (ADR-020 §5).
 
 ### Decision 3. Skeleton growth: checkpoints (R1)
+
+ADR-036 amends this decision for v2: all signed headers remain available as sparse parent
+evidence. A v2 checkpoint retains its authenticated own-feed source check but does not shed
+signatures or refuse authenticated requested backfill merely because it is older. Retention
+still governs bodies; no checkpoint manufactures a verified contiguous prefix. The v1 rules
+below remain unchanged.
 
 - **RL-3.1. Only the author checkpoints, and only its own feed.** A checkpoint MUST be the payload of
   an ordinary signed entry in the author's own feed (struct tag `0x0016`, `vox/checkpoint/v1`, body

@@ -249,6 +249,96 @@ struct View<'a> {
 }
 
 impl View<'_> {
+    fn accepted_cache_answer(&self, query: Query, bytes: usize) -> Answer<Reply> {
+        use super::legacy_provisional::LEGACY_HISTORY_REQUIRED;
+        // Counts, agreement and operation/attention authority require the completed current
+        // projection. Cached row selection and its stable cursors remain usable.
+        if !matches!(
+            &query,
+            Query::ViewPage { .. }
+                | Query::ViewRows { .. }
+                | Query::ViewRevision { .. }
+                | Query::DisplayRevision
+                | Query::ArrivalHead
+                | Query::NoticeState
+                | Query::NoticeExact { .. }
+                | Query::NoticePage { .. }
+                | Query::CursorPage { .. }
+                | Query::Arrival { .. }
+                | Query::Filtered { .. }
+                | Query::Read { .. }
+                | Query::Older { .. }
+                | Query::Exact { .. }
+        ) {
+            return Err(Failure::Request(LEGACY_HISTORY_REQUIRED));
+        }
+        let authority = self.ch.checked_governance(self.store, self.ch.now_hint)?;
+        let me = self.ch.me();
+        let answer = self.answer(query, bytes)?;
+        let check = |row: &MessageRow| -> Answer<()> {
+            // Owed placeholders are not accepted bodies. Do not expose unpublished
+            // projection work or label it as an empty historical message.
+            if row.owed {
+                return Err(Failure::Request(LEGACY_HISTORY_REQUIRED));
+            }
+            if row.author != me
+                && !self
+                    .ch
+                    .legacy_cache_trusted
+                    .as_ref()
+                    .is_some_and(|trusted| trusted.contains(&row.author))
+            {
+                return Err(Failure::Request(LEGACY_HISTORY_REQUIRED));
+            }
+            if row.author != me && !authority.can_read(&me, &row.author)? {
+                return Err(Failure::Request(LEGACY_HISTORY_REQUIRED));
+            }
+            let tracked = self
+                .rendered
+                .retention(&row.entry_hash)?
+                .ok_or(Error::MalformedAtRest("cached row retention missing"))?;
+            let entry = self
+                .rendered
+                .order()
+                .entry(&row.entry_hash)?
+                .ok_or(Error::MalformedAtRest("cached row source missing"))?;
+            if expired_at(
+                tracked.base(),
+                self.ch.now_hint,
+                self.ch
+                    .entry_retention(self.rendered.transaction(), &entry)?,
+            ) {
+                return Err(Failure::Request(LEGACY_HISTORY_REQUIRED));
+            }
+            Ok(())
+        };
+        match &answer {
+            Reply::Rows(rows) | Reply::Older { rows, .. } | Reply::Page { rows, .. } => {
+                for row in rows {
+                    check(row)?;
+                }
+            }
+            Reply::CursorPage(page) => {
+                for row in &page.rows {
+                    check(row)?;
+                }
+            }
+            Reply::NoticeExact(Some(row)) => check(&row.row)?,
+            Reply::NoticePage(page) => {
+                for row in &page.rows {
+                    check(&row.row)?;
+                }
+            }
+            Reply::Exact(row) => check(row)?,
+            Reply::DisplayRevision(_)
+            | Reply::ArrivalHead(_)
+            | Reply::NoticeState(_)
+            | Reply::NoticeExact(None) => {}
+            _ => return Err(Failure::Request(LEGACY_HISTORY_REQUIRED)),
+        }
+        Ok(answer)
+    }
+
     fn row(&self, hash: &Digest32) -> Result<Option<MessageRow>> {
         let order = self.rendered.order();
         if let Some(row) = self.rendered.row(hash)? {
@@ -1469,6 +1559,11 @@ impl View<'_> {
 impl ChannelState {
     /// One bounded turn of derived view-index catch-up: (more work, just became ready).
     pub(crate) fn advance_room_views(&self, store: &Store) -> Result<(bool, bool)> {
+        // A paused v1 request is not a scheduled view-rebuild job. Its accepted selector
+        // remains readable; an absent selector reports pending on that selected read.
+        if self.legacy_cache_only(store)? {
+            return Ok((false, false));
+        }
         let was_ready = self
             .entries
             .render_view(store, &self.sek, &self.channel_id)?
@@ -1515,6 +1610,18 @@ impl ChannelState {
                 }
                 query => query,
             };
+            if self.legacy_cache_only(store)? {
+                // The currently accepted fold, never the unpublished witness, authorizes
+                // this bounded cache selection. It performs no EntryIndex mutation.
+                let view = View {
+                    rendered: self
+                        .entries
+                        .render_view(store, &self.sek, &self.channel_id)?,
+                    ch: self,
+                    store,
+                };
+                return view.accepted_cache_answer(query, max_bytes);
+            }
             self.require_governance_ready(store, crate::time::Ms(now_ms))
                 .map_err(|e| match e {
                     Error::Profile(why) => Failure::Request(why),
@@ -1577,6 +1684,72 @@ impl Default for State {
     }
 }
 impl State {
+    /// Persist only bounded progress; incarnation remains new for every live room.
+    pub(super) fn to_bytes(&self) -> Vec<u8> {
+        let mut e = crate::cbor::Encoder::new();
+        e.array(6).uint(1);
+        match self.policy {
+            Some(policy) => {
+                e.array(3);
+                for part in policy {
+                    e.uint(part);
+                }
+            }
+            None => {
+                e.array(0);
+            }
+        }
+        e.uint(u64::from(self.pending));
+        for position in [self.cursor, self.through, self.cleanup_cursor] {
+            match position {
+                Some((author, seq)) => {
+                    e.array(2).bytes(&author).uint(seq);
+                }
+                None => {
+                    e.array(0);
+                }
+            }
+        }
+        e.finish()
+    }
+    pub(super) fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let mut d = crate::cbor::Decoder::new(bytes);
+        if d.array()? != 6 || d.uint()? != 1 {
+            return Err(Error::MalformedAtRest("projection restart format"));
+        }
+        let policy = match d.array()? {
+            0 => None,
+            3 => Some([d.uint()?, d.uint()?, d.uint()?]),
+            _ => return Err(Error::MalformedAtRest("projection restart policy")),
+        };
+        let pending = match d.uint()? {
+            0 => false,
+            1 => true,
+            _ => return Err(Error::MalformedAtRest("projection restart pending")),
+        };
+        let mut positions = [None; 3];
+        for position in &mut positions {
+            *position = match d.array()? {
+                0 => None,
+                2 => Some((
+                    d.bytes()?
+                        .try_into()
+                        .map_err(|_| Error::MalformedAtRest("projection restart author"))?,
+                    d.uint()?,
+                )),
+                _ => return Err(Error::MalformedAtRest("projection restart position")),
+            };
+        }
+        d.finish()?;
+        Ok(Self {
+            policy,
+            pending,
+            cursor: positions[0],
+            through: positions[1],
+            cleanup_cursor: positions[2],
+            ..Self::default()
+        })
+    }
     pub(super) fn owed_range(&mut self, author: Digest32, from: u64, through: u64) {
         let before = Some((author, from.saturating_sub(1)));
         let end = Some((author, through));
@@ -1622,6 +1795,7 @@ impl ChannelState {
     /// Exact counts never decrypt/scan the remaining history while a client waits.
     pub(crate) fn refresh_projection(&mut self, store: &Store) -> Result<bool> {
         let result = (|| -> Result<bool> {
+            let before = self.projection_state.to_bytes();
             let policy = [
                 self.effective_retention(),
                 self.effective_step_retention(),
@@ -1673,11 +1847,15 @@ impl ChannelState {
                 changed = true;
             }
             let expired_remain = writer.first_expired_owed(self.now_hint)?.is_some();
-            if changed {
+            let progress = self.projection_state.to_bytes();
+            if changed || before != progress {
+                writer.note_projection(progress)?;
                 writer.seal()?;
                 batch.commit()?;
                 self.entries.committed();
-                self.invalidate_display();
+                if changed {
+                    self.invalidate_display();
+                }
             }
             Ok(!self.projection_state.pending && !expired_remain)
         })();

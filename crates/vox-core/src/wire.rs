@@ -25,6 +25,9 @@ pub const FORMAT_VERSION: u8 = 1;
 /// them in seconds.
 pub const MS_FORMAT_VERSION: u8 = 2;
 
+/// A room genesis whose signed body binds authenticated sparse history (ADR-036).
+pub const HISTORY_GENESIS_VERSION: u8 = 3;
+
 /// The ADR-008 struct-type tag registry. The 2-byte tag identifies the
 /// structure so identical canonical bytes are never cross-interpreted (the
 /// serialization analogue of ADR-003's algorithm prefixes).
@@ -123,11 +126,15 @@ pub enum StructTag {
     AdmissionNotice = 0x0020,
     /// The room's complete signed anchor set (ADR-032 AN-5).
     RoomAnchors = 0x0021,
+    /// An author's signed augmented append-only log head (ADR-036).
+    LogHead = 0x0022,
+    /// A canonical content-addressed control frontier (ADR-036).
+    ControlContext = 0x0023,
 }
 
 impl StructTag {
     /// All registered tags, in ascending order.
-    pub const ALL: [StructTag; 29] = [
+    pub const ALL: [StructTag; 31] = [
         StructTag::LogEntry,
         StructTag::Skdm,
         StructTag::AdminCert,
@@ -157,6 +164,8 @@ impl StructTag {
         StructTag::RoomName,
         StructTag::AdmissionNotice,
         StructTag::RoomAnchors,
+        StructTag::LogHead,
+        StructTag::ControlContext,
     ];
 
     /// The 2-byte tag value.
@@ -175,17 +184,17 @@ impl StructTag {
             .ok_or(Error::UnknownStructTag(v))
     }
 
-    /// The format version this build writes the struct at: [`MS_FORMAT_VERSION`] for a struct
-    /// that carries a time, [`FORMAT_VERSION`] otherwise.
+    /// The format version this build writes: authenticated-history genesis at version 3,
+    /// other timed structs at version 2, and the remaining structs at version 1.
     #[must_use]
     pub const fn format_version(self) -> u8 {
         match self {
+            StructTag::GenesisRecord => HISTORY_GENESIS_VERSION,
             StructTag::RendezvousRecord
             | StructTag::PreJoinRecord
             | StructTag::MemberBundleRecord
             | StructTag::JoinWitness
             | StructTag::BoardWithdraw
-            | StructTag::GenesisRecord
             | StructTag::AdminCert
             | StructTag::PolicyRotation
             | StructTag::RoomLifecycle
@@ -233,6 +242,12 @@ impl StructTag {
     /// from a log is verified over exactly what its signer signed.
     #[must_use]
     pub const fn domain_sep_at(self, version: u8) -> &'static str {
+        if matches!(self, StructTag::LogEntry) && version == 2 {
+            return "vox/log-entry/v2";
+        }
+        if matches!(self, StructTag::GenesisRecord) && version == MS_FORMAT_VERSION {
+            return "vox/genesis/v2";
+        }
         if version == self.format_version() {
             return self.domain_sep();
         }
@@ -251,7 +266,7 @@ impl StructTag {
             StructTag::MemberBundleRecord => "vox/member-bundle-record/v2",
             StructTag::JoinWitness => "vox/join-witness/v2",
             StructTag::BoardWithdraw => "vox/board-withdraw/v2",
-            StructTag::GenesisRecord => "vox/genesis/v2",
+            StructTag::GenesisRecord => "vox/genesis/v3",
             StructTag::AdminCert => "vox/admin-cert/v2",
             StructTag::PolicyRotation => "vox/policy-rotation/v2",
             StructTag::RoomLifecycle => "vox/room-lifecycle/v2",
@@ -295,6 +310,8 @@ impl StructTag {
             StructTag::RoomName => "vox/room-name/v1",
             StructTag::RoomAnchors => "vox/room-anchors/v1",
             StructTag::AdmissionNotice => "vox/admission-notice/v1",
+            StructTag::LogHead => "vox/log-head/v1",
+            StructTag::ControlContext => "vox/log-context/v1",
         }
     }
 }
@@ -338,7 +355,12 @@ pub fn parse_frame(bytes: &[u8]) -> Result<Frame<'_>> {
         tag: tag_val,
         version: 0,
     })?;
-    if version != tag.format_version() {
+    let legacy_genesis =
+        tag == StructTag::GenesisRecord && matches!(version, FORMAT_VERSION | MS_FORMAT_VERSION);
+    if version != tag.format_version()
+        && !(tag == StructTag::LogEntry && version == 2)
+        && !legacy_genesis
+    {
         if version == FORMAT_VERSION && tag.format_version() == MS_FORMAT_VERSION {
             if !tag.reads_seconds_format() {
                 return Err(Error::OlderFormat {
@@ -417,6 +439,16 @@ pub enum FrameId {
     Entry = 0x04,
     /// `0x05` — Negentropy range-reconciliation payload.
     Neg = 0x05,
+    /// `0x06` — bounded signed head, context, proof or header (ADR-036).
+    Meta = 0x06,
+    /// `0x07` — one credited payload chunk (ADR-036).
+    Chunk = 0x07,
+    /// `0x08` — the bounded response's explicit outcome and continuation hint.
+    Done = 0x08,
+    /// `0x09` — cancellation of one exact bounded request.
+    Cancel = 0x09,
+    /// `0x0A` — acknowledgement of one exact persisted payload offset.
+    Ack = 0x0A,
 }
 
 impl FrameId {
@@ -436,6 +468,11 @@ impl FrameId {
             0x03 => Some(FrameId::Want),
             0x04 => Some(FrameId::Entry),
             0x05 => Some(FrameId::Neg),
+            0x06 => Some(FrameId::Meta),
+            0x07 => Some(FrameId::Chunk),
+            0x08 => Some(FrameId::Done),
+            0x09 => Some(FrameId::Cancel),
+            0x0A => Some(FrameId::Ack),
             _ => None,
         }
     }
@@ -445,6 +482,9 @@ impl FrameId {
 pub const SYNC_MODE_FRONTIER: u8 = 0b0000_0001;
 /// `HELLO` mode bitmap bit: Negentropy range-reconciliation (required at scale).
 pub const SYNC_MODE_RANGE_RECONCILIATION: u8 = 0b0000_0010;
+/// `HELLO` mode bitmap bit: authenticated live/control and explicit bounded history.
+/// This mode never falls back to an archive-draining reconciliation mode.
+pub const SYNC_MODE_BOUNDED_HISTORY: u8 = 0b0000_0100;
 
 /// The single wire application-error contract (ADR-008). A hard fail closes the
 /// QUIC stream/connection with one of these codes — never a silent downgrade.
@@ -534,6 +574,9 @@ pub enum WireError {
     /// node it named does not answer here.
     #[error("not available")]
     NotAvailable = 0x0F,
+    /// `0x10` — malformed or oversized protocol input, not ordinary resource exhaustion.
+    #[error("protocol limits exceeded")]
+    ProtocolLimits = 0x10,
 }
 
 impl WireError {
@@ -560,6 +603,7 @@ impl WireError {
             0x0D => Some(WireError::ShuttingDown),
             0x0E => Some(WireError::Superseded),
             0x0F => Some(WireError::NotAvailable),
+            0x10 => Some(WireError::ProtocolLimits),
             _ => None,
         }
     }

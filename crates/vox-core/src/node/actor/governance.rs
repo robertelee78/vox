@@ -7,6 +7,7 @@ pub(super) struct Maintenance {
     pub pending: bool,
     after: Option<Digest32>,
     again: bool,
+    consent_after: BTreeMap<Digest32, Digest32>,
     pub(super) removal: Option<Removal>,
 }
 
@@ -133,6 +134,44 @@ impl Node {
         }
     }
 
+    /// An already open room examines one consent page and commits at most one narrowing
+    /// append per turn. Progress advances only after that append succeeds.
+    async fn revoke_untrusted_consents(&mut self, room: &Digest32) -> crate::error::Result<bool> {
+        let shared = self
+            .channels
+            .get(room)
+            .map(Arc::clone)
+            .ok_or(Error::Profile("room is not open"))?;
+        let page = {
+            let profile = self.profile.as_ref().ok_or(Error::AtRestLocked)?;
+            let Ok(channel) = shared.try_lock() else {
+                return Ok(true);
+            };
+            channel.consent_page(
+                profile.store(),
+                &channel.me(),
+                self.governance_work.consent_after.get(room).copied(),
+                64,
+            )?
+        };
+        if let Some(member) = page
+            .targets
+            .iter()
+            .find(|member| !self.trust.is_trusted(member))
+            .copied()
+        {
+            self.withdraw_for_untrust_result(room, member).await?;
+            self.governance_work.consent_after.insert(*room, member);
+            Ok(true)
+        } else if let Some(next) = page.next {
+            self.governance_work.consent_after.insert(*room, next);
+            Ok(true)
+        } else {
+            self.governance_work.consent_after.remove(room);
+            Ok(false)
+        }
+    }
+
     /// One room's fixed-size disk work per selection. A cycle retains only its cursor and a
     /// retry bit; ordinary commands and network events remain eligible between turns.
     pub(super) async fn advance_governance_turn(&mut self) {
@@ -150,6 +189,9 @@ impl Node {
         .map(|(room, shared)| (*room, Arc::clone(shared)));
         let Some((room, shared)) = next else {
             self.governance_work.after = None;
+            self.governance_work
+                .consent_after
+                .retain(|room, _| self.channels.contains_key(room));
             self.governance_work.pending = std::mem::take(&mut self.governance_work.again);
             return;
         };
@@ -165,6 +207,25 @@ impl Node {
             }
         };
         self.governance_work.again |= progress.pending;
+        match channel.legacy_cache_only(&store) {
+            Ok(true) => {
+                // Current trust narrowing is still immediate; all publication-dependent
+                // writes await explicit recovery. Never busy-loop on a parked cursor.
+                if let Err(error) = channel.forget_keys_except(&store, &self.trust.trusted()) {
+                    channel.poison(&error);
+                }
+                drop(channel);
+                if progress.changed {
+                    self.publish().await;
+                }
+                return;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                channel.poison(&error);
+                return;
+            }
+        }
         let backfilled = match channel.advance_governance_backfill(&store, self.now_ms()) {
             Ok(count) => count,
             Err(error) => {
@@ -207,12 +268,21 @@ impl Node {
                 Err(error) => channel.poison(&error),
             }
         }
+        let settle_pending = channel.sparse_settlement_pending();
         drop(channel);
+        if progress.ready && settle_pending {
+            self.settle_sparse_room(&room).await;
+        }
         if progress.ready {
             // Discover stale consent from disk a page at a time. A quiet room must finish
             // this work too; it cannot depend on another join or trust command arriving.
-            let more_consents = self.revoke_untrusted_consents(&room).await;
-            self.governance_work.again |= more_consents;
+            match self.revoke_untrusted_consents(&room).await {
+                Ok(more) => self.governance_work.again |= more,
+                Err(error) => {
+                    shared.lock().await.poison(&error);
+                    return;
+                }
+            }
         }
         if progress.ready && progress.changed {
             self.adopt_channel_anchors(&room).await;

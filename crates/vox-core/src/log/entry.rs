@@ -1,4 +1,5 @@
-//! The Vox log entry (ADR-008, tag `0x0001`, domain `vox/log-entry/v1`).
+//! The Vox log entry (ADR-008/ADR-036, tag `0x0001`, versioned signature domain).
+//! Format 1 retains its exact bytes. Format 2 adds signed kind, scope, context and parent coordinates.
 //!
 //! Every identity owns a single-writer, append-only, hash-linked log; a log
 //! entry is its unit. The entry is a *signed skeleton* over a payload **hash**,
@@ -36,12 +37,13 @@
 //! authenticator commits to `payload_hash`, the skeleton verifies whether or not the
 //! payload is retained.
 
+use super::history::{EntryReference, EntryV2, LogScope, SignedEntryKind, MAX_HEADER_BYTES};
 use crate::cbor::{Decoder, Encoder};
 use crate::error::{Error, Result};
 use crate::hash::{sha256, Digest32, COMPOSITE_SIG_LEN, DIGEST_LEN};
 use crate::identity::composite::{CompositePublicKey, CompositeSignature, RootSigner};
 use crate::suite::{algo, validate_algo};
-use crate::wire::{frame, parse_frame, signing_input, StructTag};
+use crate::wire::{frame_at, parse_frame, signing_input_at, StructTag};
 
 /// A 32-byte all-zero hash, used for the genesis entry's `prev_hash` and
 /// `lipmaa_backlink` (there is no predecessor to hash).
@@ -66,6 +68,7 @@ pub const MAX_SEEN: usize = 16;
 
 /// The number of elements in the canonical skeleton array.
 const SKELETON_ARITY: usize = 12;
+const V2_SKELETON_ARITY: usize = 16;
 
 /// Wire discriminant for [`Authenticator::Composite`] (attributable).
 const AUTH_TYPE_COMPOSITE: u64 = 1;
@@ -181,6 +184,9 @@ pub struct EntrySkeleton {
     /// encoding). May name entries a receiving node does not hold yet; that never
     /// blocks acceptance (ADR-023 decision 1).
     pub seen: Vec<Digest32>,
+    /// Authenticated control metadata of format 2. `None` preserves format-1 bytes.
+    /// In format 2, `seen` is the exact hash projection of these author-sorted references.
+    pub v2: Option<EntryV2>,
 }
 
 impl core::fmt::Debug for EntrySkeleton {
@@ -208,7 +214,7 @@ impl EntrySkeleton {
     #[must_use]
     pub fn canonical_body(&self) -> Vec<u8> {
         let mut e = Encoder::new();
-        e.array(SKELETON_ARITY);
+        e.array(self.skeleton_arity());
         self.encode_fields(&mut e);
         e.finish()
     }
@@ -233,16 +239,93 @@ impl EntrySkeleton {
             .uint(u64::from(self.end_of_feed))
             .uint(self.claimed_ms)
             .array(self.seen.len());
-        for h in &self.seen {
-            e.bytes(h);
+        if let Some(v2) = &self.v2 {
+            for reference in &v2.seen {
+                reference.encode(e);
+            }
+            e.uint(v2.kind as u64)
+                .uint(v2.scope as u64)
+                .bytes(&v2.pre_context);
+            e.array(usize::from(v2.recipient.is_some()));
+            if let Some(recipient) = v2.recipient {
+                e.bytes(&recipient);
+            }
+        } else {
+            for h in &self.seen {
+                e.bytes(h);
+            }
         }
+    }
+
+    /// The immutable encoding version of this entry, never inferred from current room state.
+    pub const fn format_version(&self) -> u8 {
+        if self.v2.is_some() {
+            2
+        } else {
+            1
+        }
+    }
+
+    fn skeleton_arity(&self) -> usize {
+        if self.v2.is_some() {
+            V2_SKELETON_ARITY
+        } else {
+            SKELETON_ARITY
+        }
+    }
+
+    /// Check format-2 metadata even for a skeleton constructed locally rather than decoded.
+    pub fn validate_v2(&self) -> Result<()> {
+        let Some(v2) = &self.v2 else {
+            return Ok(());
+        };
+        if self.seq == 0 || self.seq > crate::log::feed::MAX_SEQ {
+            return Err(Error::MalformedBundle("v2 entry sequence"));
+        }
+        if self.payload_len > MAX_PAYLOAD_LEN as u64 || v2.seen.len() > MAX_SEEN {
+            return Err(Error::SizeLimitExceeded("v2 entry payload or seen"));
+        }
+        if self.seen.len() != v2.seen.len() {
+            return Err(Error::MalformedBundle("v2 seen projection length"));
+        }
+        let mut previous = None;
+        for (reference, hash) in v2.seen.iter().zip(&self.seen) {
+            reference.validate()?;
+            if reference.author == self.author_id
+                || previous.is_some_and(|author| author >= reference.author)
+                || reference.hash != *hash
+            {
+                return Err(Error::MalformedBundle("v2 seen projection or order"));
+            }
+            previous = Some(reference.author);
+        }
+        if self.end_of_feed != (v2.kind == SignedEntryKind::Termination)
+            || (v2.kind == SignedEntryKind::KeyPackage) != v2.recipient.is_some()
+        {
+            return Err(Error::MalformedBundle("v2 kind/end/recipient mismatch"));
+        }
+        if matches!(
+            v2.kind,
+            SignedEntryKind::ContextUpdate | SignedEntryKind::Termination
+        ) && (self.payload_len != 0 || self.payload_hash != sha256(&[]))
+        {
+            return Err(Error::MalformedBundle("v2 empty control payload"));
+        }
+        if self.seq == 1 && (self.prev_hash != ZERO_HASH || self.lipmaa_backlink != ZERO_HASH) {
+            return Err(Error::MalformedBundle("v2 first-entry links"));
+        }
+        Ok(())
     }
 
     /// The signing/authentication input: `vox/log-entry/v1 ‖ canonical_body`
     /// (ADR-008 §"Canonical serialization").
     #[must_use]
     pub fn signing_input(&self) -> Vec<u8> {
-        signing_input(StructTag::LogEntry, &self.canonical_body())
+        signing_input_at(
+            StructTag::LogEntry,
+            self.format_version(),
+            &self.canonical_body(),
+        )
     }
 
     /// The SHA-256 over the canonical body — the entry's identity used by
@@ -259,7 +342,7 @@ impl EntrySkeleton {
     /// algo-id registry membership and classes, the end-of-feed flag domain (0 or 1
     /// only), and `seen` (at most [`MAX_SEEN`], strictly ascending). The one decoder of
     /// them, for the same reason [`Self::encode_fields`] is the one encoder.
-    fn decode_fields(d: &mut Decoder<'_>) -> Result<Self> {
+    fn decode_fields(d: &mut Decoder<'_>, version: u8) -> Result<Self> {
         let author_id = take_digest(d)?;
         let seq = d.uint()?;
         // Bound seq so the lipmaa power-of-three arithmetic stays overflow-free
@@ -289,16 +372,40 @@ impl EntrySkeleton {
         if n > MAX_SEEN {
             return Err(Error::SizeLimitExceeded("log-entry seen"));
         }
-        let mut seen: Vec<Digest32> = Vec::with_capacity(n);
+        let mut seen = Vec::with_capacity(n);
+        let mut references = Vec::with_capacity(if version == 2 { n } else { 0 });
         for _ in 0..n {
-            let h = take_digest(d)?;
-            // Strictly ascending: one encoding per set, so two honest authors listing
-            // the same heads sign the same bytes, and a duplicate cannot pad the list.
-            if seen.last().is_some_and(|last| *last >= h) {
-                return Err(Error::MalformedBundle("log-entry seen not canonical"));
+            if version == 2 {
+                let reference = EntryReference::decode(d)?;
+                seen.push(reference.hash);
+                references.push(reference);
+            } else {
+                let hash = take_digest(d)?;
+                if seen.last().is_some_and(|last| *last >= hash) {
+                    return Err(Error::MalformedBundle("log-entry seen not canonical"));
+                }
+                seen.push(hash);
             }
-            seen.push(h);
         }
+        let v2 = if version == 2 {
+            let kind = SignedEntryKind::decode(d.uint()?)?;
+            let scope = LogScope::decode(d.uint()?)?;
+            let pre_context = take_digest(d)?;
+            let recipient = match d.array()? {
+                0 => None,
+                1 => Some(take_digest(d)?),
+                _ => return Err(Error::MalformedBundle("v2 recipient arity")),
+            };
+            Some(EntryV2 {
+                kind,
+                scope,
+                pre_context,
+                seen: references,
+                recipient,
+            })
+        } else {
+            None
+        };
 
         // Registry + class guards (ADR-003 type-confusion): the sign slot holds a
         // signature algo and the aead slot an AEAD algo.
@@ -317,7 +424,7 @@ impl EntrySkeleton {
             });
         }
 
-        Ok(Self {
+        let skeleton = Self {
             author_id,
             seq,
             prev_hash,
@@ -330,7 +437,10 @@ impl EntrySkeleton {
             end_of_feed,
             claimed_ms,
             seen,
-        })
+            v2,
+        };
+        skeleton.validate_v2()?;
+        Ok(skeleton)
     }
 }
 
@@ -370,8 +480,8 @@ impl Entry {
     /// supplied `payload` matches, so a caller cannot retain a body inconsistent
     /// with its own skeleton. Governance and attributable-channel content entries
     /// both take this path; the [`EntryKind`] governing the fork remedy is
-    /// supplied to the DAG at acceptance ([`crate::log::dag`]), not stored in the
-    /// signed bytes (the channel context decides it, not the author).
+    /// supplied to the DAG at acceptance for format 1. Format 2 instead signs its
+    /// dispatch kind; the channel must not override it by inspecting a payload.
     pub fn build_signed(
         author_root: &dyn RootSigner,
         skeleton: EntrySkeleton,
@@ -411,6 +521,7 @@ impl Entry {
         author_root: &dyn RootSigner,
         skeleton: &EntrySkeleton,
     ) -> Result<Authenticator> {
+        skeleton.validate_v2()?;
         if author_root.fingerprint() != skeleton.author_id {
             return Err(Error::MalformedBundle("log-entry author_id != signer"));
         }
@@ -428,6 +539,7 @@ impl Entry {
     /// bytes. Any mismatch is a hard failure. Render-gating (ADR-008) is *not*
     /// here: this verifies authorship/integrity; decryption/rendering is M4/M6.
     pub fn verify(&self, author_root: &CompositePublicKey) -> Result<()> {
+        self.skeleton.validate_v2()?;
         if author_root.fingerprint() != self.skeleton.author_id {
             return Err(Error::MalformedBundle(
                 "log-entry author_id != root fingerprint",
@@ -481,6 +593,11 @@ impl Entry {
     /// this the entry is authentic only through the hash chain. Returns whether a signature
     /// was actually dropped.
     pub fn drop_signature(&mut self) -> bool {
+        // A later sparse entry may cite any earlier header as a parent receipt.
+        // Retention may remove its body, but v2 must retain its original signature.
+        if self.skeleton.v2.is_some() {
+            return false;
+        }
         let had = self.is_signed();
         self.authenticator = Authenticator::Dropped;
         had
@@ -501,14 +618,23 @@ impl Entry {
     /// carries the verifiable skeleton + typed authenticator.
     #[must_use]
     pub fn to_wire(&self) -> Vec<u8> {
+        self.encode_wire(self.payload.as_deref())
+    }
+
+    /// The exact signed header, without copying any retained body.
+    pub fn header_wire(&self) -> Vec<u8> {
+        self.encode_wire(None)
+    }
+
+    fn encode_wire(&self, payload: Option<&[u8]>) -> Vec<u8> {
         let auth = self.authenticator.to_bytes();
-        let has_payload = self.payload.is_some();
+        let has_payload = payload.is_some();
         // 12 skeleton fields (algo_ids and seen each count as one element) +
         // auth_type + authenticator + payload_present (+ payload).
         let arity = if has_payload {
-            SKELETON_ARITY + 4
+            self.skeleton.skeleton_arity() + 4
         } else {
-            SKELETON_ARITY + 3
+            self.skeleton.skeleton_arity() + 3
         };
         let mut e = Encoder::new();
         e.array(arity);
@@ -516,10 +642,14 @@ impl Entry {
         e.uint(self.authenticator.type_id())
             .bytes(&auth)
             .uint(u64::from(has_payload));
-        if let Some(p) = &self.payload {
+        if let Some(p) = payload {
             e.bytes(p);
         }
-        frame(StructTag::LogEntry, &e.finish())
+        frame_at(
+            StructTag::LogEntry,
+            self.skeleton.format_version(),
+            &e.finish(),
+        )
     }
 
     /// Parse a framed entry from the wire/storage. Rejects a wrong/unknown
@@ -541,14 +671,22 @@ impl Entry {
         }
         let mut d = Decoder::new(parsed.body);
         let arity = d.array()?;
-        if arity != SKELETON_ARITY + 3 && arity != SKELETON_ARITY + 4 {
+        let skeleton_arity = if parsed.version == 2 {
+            V2_SKELETON_ARITY
+        } else {
+            SKELETON_ARITY
+        };
+        if arity != skeleton_arity + 3 && arity != skeleton_arity + 4 {
             return Err(Error::MalformedBundle("log-entry wire arity"));
         }
-        let skeleton = EntrySkeleton::decode_fields(&mut d)?;
+        let skeleton = EntrySkeleton::decode_fields(&mut d, parsed.version)?;
         let auth_type = d.uint()?;
         let authenticator = decode_authenticator(&mut d, auth_type)?;
+        if skeleton.v2.is_some() && auth_type != AUTH_TYPE_COMPOSITE {
+            return Err(Error::MalformedBundle("v2 signature missing"));
+        }
         let present = d.uint()?;
-        let payload = match (present, arity == SKELETON_ARITY + 4) {
+        let payload = match (present, arity == skeleton_arity + 4) {
             (1, true) => {
                 // `d.bytes()` returns a BORROWED slice (length already bounded by
                 // the remaining input — no allocation yet). Check the *actual*
@@ -584,6 +722,9 @@ impl Entry {
             payload,
         };
         entry.verify_payload_binding()?;
+        if entry.skeleton.v2.is_some() && entry.header_wire().len() > MAX_HEADER_BYTES {
+            return Err(Error::SizeLimitExceeded("v2 entry header"));
+        }
         Ok(entry)
     }
 }
@@ -626,6 +767,12 @@ fn u16_from(v: u64) -> Result<u16> {
 /// Fallible access to a room's encrypted, disk-backed entries. Callers retain owned entries
 /// only for the current operation; absence is distinct from a failed local store read.
 pub trait EntryRead {
+    /// Resolve a published evidence-complete sparse source without pretending that its
+    /// position belongs to the contiguous feed. This grants no governance authority.
+    /// Unpublished staging readers retain the absent default.
+    fn get_sparse_published(&self, _hash: &Digest32) -> Result<Option<Entry>> {
+        Ok(None)
+    }
     /// The entry at an exact author position, if held.
     fn get(&self, author: &Digest32, seq: u64) -> Result<Option<Entry>>;
     /// Resolve an exact entry hash through the authenticated entry index.

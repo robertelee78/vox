@@ -80,6 +80,23 @@ impl OrderView<'_> {
             id,
         )
     }
+    /// Author and sequence from the same sealed, published locator roots as this order.
+    /// Display indicators need these facts, not the entry's encrypted body/signature.
+    pub(crate) fn author_position(&self, hash: &Digest32) -> Result<Option<(Digest32, u64)>> {
+        if self.read.clock(hash)?.is_none() {
+            return Ok(None);
+        }
+        Ok(self
+            .read
+            .source()
+            .find(
+                self.read.sek,
+                self.read.channel,
+                self.read.directory.active.hash,
+                &hashed(hash),
+            )?
+            .map(|at| (at.author, at.seq)))
+    }
     /// Read exactly one published entry, without exposing an unsigned provisional tail.
     pub fn entry(&self, hash: &Digest32) -> Result<Option<Entry>> {
         if self.read.clock(hash)?.is_none() {
@@ -113,6 +130,13 @@ impl OrderView<'_> {
 pub(super) struct Work {
     queue: u64,
     parent: Option<(Digest32, Option<Digest32>)>,
+    placing: Option<Place>,
+}
+#[derive(Clone, Debug)]
+struct Place {
+    hash: Digest32,
+    cursor: usize,
+    latest: Option<u64>,
 }
 impl Work {
     pub(super) fn valid_for(&self, next_page: u64, phase: Phase) -> bool {
@@ -120,10 +144,10 @@ impl Work {
             && (matches!(phase, Phase::Rebuilding | Phase::Building) || self.is_empty())
     }
     pub(super) fn is_empty(&self) -> bool {
-        self.queue == 0 && self.parent.is_none()
+        self.queue == 0 && self.parent.is_none() && self.placing.is_none()
     }
     pub(super) fn write(&self, e: &mut Encoder) {
-        e.array(2).uint(self.queue);
+        e.array(3).uint(self.queue);
         match self.parent {
             None => {
                 e.array(0);
@@ -140,9 +164,26 @@ impl Work {
                 }
             }
         }
+        match &self.placing {
+            None => {
+                e.array(0);
+            }
+            Some(place) => {
+                e.array(3).bytes(&place.hash).uint(place.cursor as u64);
+                match place.latest {
+                    None => {
+                        e.array(0);
+                    }
+                    Some(clock) => {
+                        e.array(1).uint(clock);
+                    }
+                }
+            }
+        }
     }
     pub(super) fn read(d: &mut Decoder<'_>) -> Result<Self> {
-        if d.array()? != 2 {
+        let arity = d.array()?;
+        if !matches!(arity, 2 | 3) {
             return Err(invalid("DAG work arity"));
         }
         let queue = d.uint()?;
@@ -166,7 +207,42 @@ impl Work {
             }
             _ => return Err(invalid("DAG work parent arity")),
         };
-        Ok(Self { queue, parent })
+        let placing = if arity == 3 {
+            match d.array()? {
+                0 => None,
+                3 => {
+                    let hash = d
+                        .bytes()?
+                        .try_into()
+                        .map_err(|_| invalid("DAG placement hash"))?;
+                    let cursor =
+                        usize::try_from(d.uint()?).map_err(|_| invalid("DAG placement cursor"))?;
+                    if cursor
+                        > crate::log::history::MAX_CONTEXT_AUTHORS + crate::log::entry::MAX_SEEN + 1
+                    {
+                        return Err(invalid("DAG placement cursor exceeds parent bound"));
+                    }
+                    let latest = match d.array()? {
+                        0 => None,
+                        1 => Some(d.uint()?),
+                        _ => return Err(invalid("DAG placement clock option")),
+                    };
+                    Some(Place {
+                        hash,
+                        cursor,
+                        latest,
+                    })
+                }
+                _ => return Err(invalid("DAG placement arity")),
+            }
+        } else {
+            None
+        };
+        Ok(Self {
+            queue,
+            parent,
+            placing,
+        })
     }
 }
 
@@ -394,66 +470,182 @@ impl Write<'_, '_> {
         }
         Ok(())
     }
-    fn place_fact(&mut self, hash: Digest32) -> Result<()> {
+    fn order_header(&self, roots: Roots, at: Locator) -> Result<Entry> {
+        let source = Source::Batch(self.batch);
+        if let Some(header) = source.sparse_position_header(
+            self.sek,
+            self.channel,
+            roots.sparse,
+            &at.author,
+            at.seq,
+        )? {
+            return Ok(header);
+        }
+        indexed_entry(&source, self.sek, self.channel, SegmentKind::LogDb, at)
+    }
+
+    /// One bounded parent-coordinate slice. A large verified context does not make one
+    /// entry an excuse for thousands of index writes in a single transaction.
+    fn place_fact(&mut self, remaining: usize) -> Result<usize> {
+        let mut place = self
+            .directory
+            .work
+            .placing
+            .clone()
+            .ok_or(invalid("DAG placement missing"))?;
+        let hash = place.hash;
         let mut roots = self.fact_roots()?;
         let source = Source::Batch(self.batch);
         let at = source
             .find(self.sek, self.channel, roots.hash, &hashed(&hash))?
             .ok_or(invalid("DAG work entry missing"))?;
-        let entry = indexed_entry(&source, self.sek, self.channel, SegmentKind::LogDb, at)?;
+        let entry = self.order_header(roots, at)?;
         if entry.entry_hash() != hash {
             return Err(invalid("DAG work hash differs"));
         }
         let sk = &entry.skeleton;
         let old = source.number(self.sek, self.channel, roots.clock, &hashed(&hash))?;
-        let mut latest = None;
-        for parent in sk.seen.iter().chain((sk.seq > 1).then_some(&sk.prev_hash)) {
+        let mut parents = sk.seen.clone();
+        if let Some(v2) = &sk.v2 {
+            let context = source
+                .sparse_context(self.sek, self.channel, roots.sparse, &v2.pre_context)?
+                .ok_or(invalid("admitted v2 ordering context missing"))?;
+            if context.scope != v2.scope {
+                return Err(invalid("ordering context scope"));
+            }
+            parents.extend(context.coordinates.iter().map(|coordinate| coordinate.hash));
+            let predecessor = if sk.seq > 1 {
+                source
+                    .last(
+                        self.sek,
+                        self.channel,
+                        roots.sequence,
+                        &position(&sk.author_id, sk.seq - 1),
+                        0,
+                    )?
+                    .map(|(_, value)| value.locator())
+                    .transpose()?
+                    .filter(|held| held.author == sk.author_id)
+            } else {
+                None
+            };
+            let predecessor_hash = predecessor
+                .map(|held| {
+                    self.order_header(roots, held)
+                        .map(|header| header.entry_hash())
+                })
+                .transpose()?;
+            if let Some(parent) = predecessor_hash {
+                parents.push(parent);
+            }
+            if old.is_none() && place.cursor == 0 {
+                // Inserting into a gap replaces the old temporary same-author edge. Keep
+                // that edge only if the successor also explicitly names it as control/seen.
+                let successor = source
+                    .first(
+                        self.sek,
+                        self.channel,
+                        roots.sequence,
+                        &position(
+                            &sk.author_id,
+                            sk.seq
+                                .checked_add(1)
+                                .ok_or(invalid("DAG successor overflow"))?,
+                        ),
+                        0,
+                    )?
+                    .map(|(_, value)| value.locator())
+                    .transpose()?
+                    .filter(|held| held.author == sk.author_id);
+                if let Some(successor) = successor {
+                    let next = self.order_header(roots, successor)?;
+                    let next_hash = next.entry_hash();
+                    if let (Some(parent), Some(next_v2)) =
+                        (predecessor_hash, next.skeleton.v2.as_ref())
+                    {
+                        let next_context = source
+                            .sparse_context(
+                                self.sek,
+                                self.channel,
+                                roots.sparse,
+                                &next_v2.pre_context,
+                            )?
+                            .ok_or(invalid("successor ordering context missing"))?;
+                        if !next.skeleton.seen.contains(&parent)
+                            && !next_context.coordinates.iter().any(|c| c.hash == parent)
+                        {
+                            roots.children =
+                                self.change_value(roots.children, pair(&parent, &next_hash), None)?;
+                        }
+                    }
+                    self.enqueue_fact(next_hash)?;
+                }
+            }
+        } else if sk.seq > 1 {
+            parents.push(sk.prev_hash);
+        }
+        parents.sort_unstable();
+        parents.dedup();
+        if place.cursor > parents.len() {
+            return Err(invalid("DAG placement parent cursor changed"));
+        }
+        let mut spent = 0;
+        while place.cursor < parents.len() && spent < remaining {
+            let parent = parents[place.cursor];
             if let Some(clock) = Source::Batch(self.batch).number(
                 self.sek,
                 self.channel,
                 roots.clock,
-                &hashed(parent),
+                &hashed(&parent),
             )? {
-                latest = Some(latest.map_or(clock, |held: u64| held.max(clock)));
+                place.latest = Some(place.latest.map_or(clock, |held| held.max(clock)));
             }
-            if old.is_none() {
+            if old.is_none() || sk.v2.is_some() {
                 roots.children =
-                    self.change_value(roots.children, pair(parent, &hash), Some(Value::Present))?;
+                    self.change_value(roots.children, pair(&parent, &hash), Some(Value::Present))?;
             }
-        }
-        // Referencing a late parent is causal even if its clock does not lift this child.
-        for parent in &sk.seen {
-            if Source::Batch(self.batch)
-                .number(self.sek, self.channel, roots.clock, &hashed(parent))?
-                .is_none()
-            {
-                continue;
-            }
-            if let Some(parent_at) = Source::Batch(self.batch).find(
-                self.sek,
-                self.channel,
-                roots.hash,
-                &hashed(parent),
-            )? {
-                let key = pair(&sk.author_id, &parent_at.author);
-                let prior = Source::Batch(self.batch)
-                    .number(self.sek, self.channel, roots.referenced, &key)?
-                    .unwrap_or(0);
-                if parent_at.seq > prior {
-                    roots.referenced = self.change_value(
-                        roots.referenced,
-                        key,
-                        Some(Value::Number(parent_at.seq)),
-                    )?;
+            if sk.seen.contains(&parent) {
+                if let Some(parent_at) = Source::Batch(self.batch).find(
+                    self.sek,
+                    self.channel,
+                    roots.hash,
+                    &hashed(&parent),
+                )? {
+                    let key = pair(&sk.author_id, &parent_at.author);
+                    let prior = Source::Batch(self.batch)
+                        .number(self.sek, self.channel, roots.referenced, &key)?
+                        .unwrap_or(0);
+                    if parent_at.seq > prior {
+                        roots.referenced = self.change_value(
+                            roots.referenced,
+                            key,
+                            Some(Value::Number(parent_at.seq)),
+                        )?;
+                    }
                 }
             }
+            place.cursor += 1;
+            spent += 1;
         }
-        let claimed = match latest.or(self.directory.origin) {
+        if place.cursor < parents.len() || spent == remaining {
+            self.directory.work.placing = Some(place);
+            self.set_fact_roots(roots)?;
+            return Ok(spent);
+        }
+        let claimed = match place.latest.or(self.directory.origin) {
             Some(anchor) => sk.claimed_ms.min(anchor.saturating_add(MAX_LEAD_MS)),
             None => sk.claimed_ms,
         };
-        let clock = latest.map_or(claimed, |parent| claimed.max(parent.saturating_add(1)));
-        if old.is_none_or(|old| clock > old) {
+        let clock = place
+            .latest
+            .map_or(claimed, |parent| claimed.max(parent.saturating_add(1)));
+        if old.is_none_or(|prior| {
+            if sk.v2.is_some() {
+                clock != prior
+            } else {
+                clock > prior
+            }
+        }) {
             if let Some(old) = old {
                 roots.order = self.change_value(roots.order, ordered((old, hash)), None)?;
                 self.move_rendered(&mut roots, hash, old, clock)?;
@@ -469,12 +661,42 @@ impl Write<'_, '_> {
                 self.change_value(roots.order, ordered((clock, hash)), Some(Value::Present))?;
             self.directory.work.parent = Some((hash, None));
         }
-        self.set_fact_roots(roots)
+        self.directory.work.placing = None;
+        self.set_fact_roots(roots)?;
+        Ok(spent + 1)
+    }
+
+    /// Cold rebuilds know their entire verified set. Wait for an included parent rather than
+    /// publishing a provisional clock and repeatedly moving its already placed descendants.
+    /// Stored rows outside that set remain missing parents, just as in live publication.
+    fn rebuild_parents_ready(&self, entry: &Entry, dag: &crate::log::dag::Dag) -> Result<bool> {
+        let roots = self.fact_roots()?;
+        let source = Source::Batch(self.batch);
+        let sk = &entry.skeleton;
+        for parent in sk.seen.iter().chain((sk.seq > 1).then_some(&sk.prev_hash)) {
+            let Some(at) = source.find(self.sek, self.channel, roots.hash, &hashed(parent))? else {
+                continue;
+            };
+            if at.seq <= dag.verified_head(&at.author)
+                && source
+                    .number(self.sek, self.channel, roots.clock, &hashed(parent))?
+                    .is_none()
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
     /// Each step visits at most one entry or one reverse edge; queued descendants stay sealed.
     /// Tree updates are COW and the active roots remain unchanged until the effects commit.
     pub(super) fn fact_chunk(&mut self) -> Result<bool> {
-        for _ in 0..PROMOTION_ENTRIES {
+        let mut remaining = PROMOTION_ENTRIES;
+        while remaining > 0 {
+            if self.directory.work.placing.is_some() {
+                let spent = self.place_fact(remaining)?;
+                remaining = remaining.saturating_sub(spent);
+                continue;
+            }
             if let Some((parent, cursor)) = self.directory.work.parent {
                 let roots = self.fact_roots()?;
                 match Source::Batch(self.batch).child_after(
@@ -490,6 +712,7 @@ impl Write<'_, '_> {
                     }
                     None => self.directory.work.parent = None,
                 }
+                remaining -= 1;
                 continue;
             }
             let row = Source::Batch(self.batch).first(
@@ -507,13 +730,82 @@ impl Write<'_, '_> {
             }
             self.directory.work.queue = self.change_value(self.directory.work.queue, key, None)?;
             let hash = key[..32].try_into().map_err(|_| invalid("DAG work hash"))?;
-            self.place_fact(hash)?;
+            self.directory.work.placing = Some(Place {
+                hash,
+                cursor: 0,
+                latest: None,
+            });
+            remaining -= 1;
         }
         Ok(self.directory.work.is_empty())
     }
 }
 
 impl EntryIndex {
+    /// Stage exactly one evidence-complete source. Subsequent work is sliced by the caller;
+    /// this entry point does not loop over its ancestry or wait while holding room state.
+    pub(crate) fn begin_sparse_publication(
+        &self,
+        store: &Store,
+        sek: &Sek,
+        channel: &Digest32,
+        publication: SparsePublication<'_>,
+    ) -> Result<()> {
+        let mut batch = store.batch()?;
+        let mut writer = self.write(&mut batch, sek, channel)?;
+        writer.begin_sparse_publication(publication)?;
+        writer.seal()?;
+        batch.commit()?;
+        self.committed();
+        Ok(())
+    }
+
+    /// One source-copy or DAG-coordinate quantum. `true` means the unpublished roots are
+    /// ready for the caller's atomic source/evaluator transaction, not semantic acceptance.
+    pub(crate) fn advance_sparse_publication(
+        &self,
+        store: &Store,
+        sek: &Sek,
+        channel: &Digest32,
+    ) -> Result<bool> {
+        let mut batch = store.batch()?;
+        let mut writer = self.write(&mut batch, sek, channel)?;
+        let promotion = writer
+            .directory
+            .promotion
+            .as_ref()
+            .ok_or(invalid("sparse publication absent"))?;
+        if writer.directory.phase != Phase::Building || promotion.sparse_head.is_none() {
+            return Err(invalid("sparse publication phase differs"));
+        }
+        let ready = if promotion.cursor <= promotion.through {
+            writer.promotion_chunk()?;
+            false
+        } else {
+            writer.fact_chunk()?
+        };
+        writer.seal()?;
+        batch.commit()?;
+        self.committed();
+        Ok(ready)
+    }
+
+    /// One cleanup quantum after the root switch. Live admission yields between calls.
+    pub(crate) fn cleanup_publication(
+        &self,
+        store: &Store,
+        sek: &Sek,
+        channel: &Digest32,
+    ) -> Result<bool> {
+        let mut batch = store.batch()?;
+        let mut writer = self.write(&mut batch, sek, channel)?;
+        let done = writer.cleanup_chunk()?;
+        writer.seal()?;
+        batch.commit()?;
+        self.committed();
+        Ok(done)
+    }
+
     pub(crate) fn prepare_publication(
         &self,
         store: &Store,
@@ -557,6 +849,11 @@ impl EntryIndex {
         if read.directory.graph_ready {
             return Ok(());
         }
+        if read.directory.active.sparse.enabled {
+            return Err(invalid(
+                "sparse order state is missing; legacy rebuild is not valid",
+            ));
+        }
         drop(read);
         {
             let mut batch = store.batch()?;
@@ -569,31 +866,67 @@ impl EntryIndex {
             writer.seal()?;
             batch.commit()?;
         }
-        let mut batch = Some(store.batch()?);
-        let mut count = 0usize;
-        for author in dag.authors() {
-            for seq in 1..=dag.verified_head(&author) {
-                let current = batch.as_mut().ok_or(invalid("DAG rebuild batch missing"))?;
-                let mut writer = self.write(current, sek, channel)?;
-                let entry = writer
-                    .get(&author, seq)?
-                    .ok_or(invalid("DAG verified prefix missing"))?;
-                writer.enqueue_fact(entry.entry_hash())?;
-                writer.seal()?;
-                count += 1;
-                if count == PROMOTION_ENTRIES {
-                    batch
-                        .take()
-                        .ok_or(invalid("DAG rebuild batch missing"))?
-                        .commit()?;
-                    batch = Some(store.batch()?);
-                    count = 0;
+        // Keep one cursor per verified author, not a queue containing every saved hash.
+        // Hash order can put descendants first. In an ordinary old room their provisional
+        // clocks all clamp to genesis + MAX_LEAD_MS, so late parents repeatedly lift them.
+        let mut heads: Vec<_> = dag
+            .authors()
+            .into_iter()
+            .filter_map(|author| {
+                let through = dag.verified_head(&author);
+                (through != 0).then_some((author, Some(1), through))
+            })
+            .collect();
+        let mut remaining = heads.len();
+        while remaining != 0 {
+            let mut batch = store.batch()?;
+            let mut writer = self.write(&mut batch, sek, channel)?;
+            let mut count = 0usize;
+            let mut bytes = 0usize;
+            'chunk: loop {
+                let mut progressed = false;
+                for (author, next, through) in &mut heads {
+                    let Some(seq) = *next else { continue };
+                    let entry = writer
+                        .get(author, seq)?
+                        .ok_or(invalid("DAG verified prefix missing"))?;
+                    if !writer.rebuild_parents_ready(&entry, dag)? {
+                        continue;
+                    }
+                    let size = entry.to_wire().len();
+                    if count != 0 && bytes.saturating_add(size) > PROMOTION_BYTES {
+                        break 'chunk;
+                    }
+                    writer.directory.work.placing = Some(Place {
+                        hash: entry.entry_hash(),
+                        cursor: 0,
+                        latest: None,
+                    });
+                    // Every included parent was placed first, so no already placed child
+                    // needs repair. Preserve the normal work-drain invariant before sealing.
+                    if !writer.fact_chunk()? {
+                        return Err(invalid("cold DAG placement left descendant work"));
+                    }
+                    if seq == *through {
+                        *next = None;
+                        remaining -= 1;
+                    } else {
+                        *next = Some(seq + 1);
+                    }
+                    count += 1;
+                    bytes = bytes.saturating_add(size);
+                    progressed = true;
+                    if count == PROMOTION_ENTRIES || remaining == 0 {
+                        break 'chunk;
+                    }
+                }
+                if !progressed {
+                    return Err(invalid("verified DAG parents cannot be ordered"));
                 }
             }
+            writer.seal()?;
+            batch.commit()?;
         }
-        batch
-            .ok_or(invalid("DAG rebuild batch missing"))?
-            .commit()?;
         self.finish_fact_work(store, sek, channel)?;
         let mut batch = store.batch()?;
         let mut writer = self.write(&mut batch, sek, channel)?;

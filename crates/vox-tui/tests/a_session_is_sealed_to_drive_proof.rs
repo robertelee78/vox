@@ -424,7 +424,7 @@ fn channel_id(rt: &tokio::runtime::Runtime, m: &Member, short: &str) -> [u8; 32]
     match rt.block_on(m.socket(rt).rooms()) {
         Ok(Frame::Rooms { rooms }) => rooms
             .iter()
-            .map(|(id, _, _, _)| *id)
+            .map(|(id, _, _, _, _)| *id)
             .find(|id| vox_core::node::link::b32_encode(id).starts_with(short))
             .unwrap_or_else(|| panic!("APPARATUS (staging): the room is not on {}'s node", m.name)),
         other => panic!("APPARATUS (staging): {}'s rooms: {other:?}", m.name),
@@ -1595,6 +1595,7 @@ fn legacy_placeholder_journey(
         let seq = feed.last_key_value().map_or(1, |(n, _)| n + 1);
         let hash_at = |n| feed.get(&n).map_or(ZERO_HASH, Entry::entry_hash);
         let skeleton = EntrySkeleton {
+            v2: None,
             author_id: author,
             seq,
             prev_hash: hash_at(seq - 1),

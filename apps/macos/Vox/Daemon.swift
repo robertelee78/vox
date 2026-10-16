@@ -233,7 +233,9 @@ enum Daemon {
             let process = Process()
             process.executableURL = vox
             process.arguments = arguments
-            process.environment = environment
+            // Leaving the environment untouched inherits the app's. Assigning nil explicitly
+            // can launch with no environment, dropping HOME and the selected Vox roots.
+            if let environment { process.environment = environment }
             process.standardInput = FileHandle.nullDevice
             process.standardOutput = file
             process.standardError = file

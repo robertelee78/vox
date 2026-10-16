@@ -1513,6 +1513,19 @@ pub struct RoomSessionsArgs {
 /// `vox room read`
 #[derive(Args, Debug, Clone)]
 pub struct RoomReadArgs {
+    /// Explicit bounded peer history: newest, older (with --before), resume, cancel or status.
+    /// Ordinary human reads request newest once; agent/watch/cursor reads remain cache-only.
+    #[arg(long, value_parser = ["newest", "older", "private-recover", "resume", "cancel", "status"], conflicts_with_all = ["since", "unread", "tag", "late", "hashes"])]
+    pub history: Option<String>,
+    /// Exact donor fingerprint for --history private-recover.
+    #[arg(long, requires = "history")]
+    pub history_peer: Option<String>,
+    /// Exact 32-hex-digit saved-room instance from history status; permits local cleanup after forgetting a room.
+    #[arg(long, requires = "history")]
+    pub history_instance: Option<String>,
+    /// Exact 32-hex-digit saved request from history status, required with a retained instance for cancel/resume.
+    #[arg(long, requires_all = ["history", "history_instance"])]
+    pub history_request: Option<String>,
     #[command(flatten)]
     pub profile: NodeArgs,
     /// The room's id, or a unique prefix of it.
@@ -2773,6 +2786,10 @@ pub fn run() -> ExitCode {
                                 a.late,
                                 a.notices,
                                 a.unread,
+                                a.history.as_deref(),
+                                a.history_instance.as_deref(),
+                                a.history_request.as_deref(),
+                                a.history_peer.as_deref(),
                                 &crate::room_cli::Tagged {
                                     tags: a.tag.clone(),
                                     from: a.from.clone(),

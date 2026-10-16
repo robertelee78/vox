@@ -6,7 +6,7 @@
 //! A writer reads its own Batch. Roots are installed only by its durable commit.
 
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use zeroize::Zeroizing;
@@ -20,6 +20,7 @@ use crate::log::entry::{Entry, EntryRead, EntryWrite};
 use crate::node::store::{Batch, Snapshot, Store};
 
 const PAGE_BYTES: usize = 16 * 1024;
+const DIRECTORY_BYTES: usize = 1024 * 1024;
 const PAGE_ITEMS: usize = 128;
 const CACHE_BYTES: usize = 4 * 1024 * 1024;
 const CACHE_ITEMS: usize = 128;
@@ -33,9 +34,13 @@ type Key = [u8; 64];
 
 mod dag_facts;
 mod missing_facts;
+mod packages;
 mod receipt_facts;
 mod render_facts;
+mod restart;
 mod retention_facts;
+pub(crate) mod sparse;
+pub(crate) use restart::RestartState;
 pub(crate) mod session_tree;
 pub use dag_facts::OrderView;
 pub(crate) use render_facts::{Filter, RenderFact, RenderView};
@@ -92,11 +97,15 @@ pub(crate) struct Roots {
     read_pairs: u64,
     missing_positions: u64,
     read_pending: u64,
+    key_packages: u64,
+    key_latest: u64,
+    key_tip: u64,
+    sparse: sparse::Roots,
 }
 
 impl Roots {
     fn write(self, e: &mut Encoder) {
-        e.array(12)
+        e.array(16)
             .uint(self.sequence)
             .uint(self.hash)
             .uint(self.clock)
@@ -108,10 +117,15 @@ impl Roots {
         e.uint(self.read_receipts)
             .uint(self.read_pairs)
             .uint(self.missing_positions)
-            .uint(self.read_pending);
+            .uint(self.read_pending)
+            .uint(self.key_packages)
+            .uint(self.key_latest)
+            .uint(self.key_tip);
+        self.sparse.write(e);
     }
     fn read(d: &mut Decoder<'_>) -> Result<Self> {
-        if d.array()? != 12 {
+        let arity = d.array()?;
+        if !matches!(arity, 12 | 15 | 16) {
             return Err(invalid("entry roots arity"));
         }
         Ok(Self {
@@ -127,6 +141,14 @@ impl Roots {
             read_pairs: d.uint()?,
             missing_positions: d.uint()?,
             read_pending: d.uint()?,
+            key_packages: if arity >= 15 { d.uint()? } else { 0 },
+            key_latest: if arity >= 15 { d.uint()? } else { 0 },
+            key_tip: if arity >= 15 { d.uint()? } else { 0 },
+            sparse: if arity >= 16 {
+                sparse::Roots::read(d)?
+            } else {
+                sparse::Roots::default()
+            },
         })
     }
 }
@@ -160,12 +182,106 @@ struct Promotion {
     retired: u64,
     bodyless_prefix: bool,
     reordered: u64,
+    accepted: Option<crate::log::dag::PublishedFeed>,
+    sparse_head: Option<Digest32>,
+    /// Exact local request owning a remote sparse publication; never an authority grant.
+    sparse_request: Option<[u8; 16]>,
+    /// Sealed local cleanup cursor over provisional hash locators, never entry bodies.
+    cleanup_hash: Option<Key>,
+}
+
+/// An authenticated current v1 tip observed from a peer. This records a missing
+/// prerequisite only; it is never an accepted feed, read grant or automatic download request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LegacyRequired {
+    pub author: Digest32,
+    pub through: u64,
+    pub hash: Digest32,
+}
+
+/// Durable ownership of one explicitly requested legacy suffix. This is local staging,
+/// never a signature, accepted Feed, or permission to restart network work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LegacyProvisionalOwner {
+    pub request: [u8; 16],
+    pub instance: [u8; 16],
+    pub author: Digest32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LegacyProvisionalState {
+    pub owner: LegacyProvisionalOwner,
+    pub base_seq: u64,
+    pub base_hash: Digest32,
+    pub tail_seq: u64,
+    pub tail_hash: Digest32,
+    pub first_claimed_ms: u64,
+    pub ended: bool,
+    // A signed witness must pass ordinary publication before this is resumable unsigned work.
+    pub pending_witness: u64,
+}
+
+impl LegacyProvisionalState {
+    fn write(self, e: &mut Encoder) {
+        e.array(10)
+            .bytes(&self.owner.request)
+            .bytes(&self.owner.instance)
+            .bytes(&self.owner.author)
+            .uint(self.base_seq)
+            .bytes(&self.base_hash)
+            .uint(self.tail_seq)
+            .bytes(&self.tail_hash)
+            .uint(self.first_claimed_ms)
+            .uint(u64::from(self.ended))
+            .uint(self.pending_witness);
+    }
+    fn read(d: &mut Decoder<'_>, arity: usize) -> Result<Self> {
+        if arity != 10 {
+            return Err(invalid("legacy provisional state arity"));
+        }
+        Ok(Self {
+            owner: LegacyProvisionalOwner {
+                request: d
+                    .bytes()?
+                    .try_into()
+                    .map_err(|_| invalid("legacy request"))?,
+                instance: d
+                    .bytes()?
+                    .try_into()
+                    .map_err(|_| invalid("legacy instance"))?,
+                author: d
+                    .bytes()?
+                    .try_into()
+                    .map_err(|_| invalid("legacy author"))?,
+            },
+            base_seq: d.uint()?,
+            base_hash: d
+                .bytes()?
+                .try_into()
+                .map_err(|_| invalid("legacy base hash"))?,
+            tail_seq: d.uint()?,
+            tail_hash: d
+                .bytes()?
+                .try_into()
+                .map_err(|_| invalid("legacy tail hash"))?,
+            first_claimed_ms: d.uint()?,
+            ended: flag(d)?,
+            pending_witness: d.uint()?,
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
 struct Directory {
     active: Roots,
     provisional: Roots,
+    // One detached garbage root, never visible through ordinary entry lookups.
+    retired_provisional: Roots,
+    legacy_provisional: Option<LegacyProvisionalState>,
+    legacy_required: BTreeMap<Digest32, LegacyRequired>,
+    // Process-local attachment is deliberately absent from the sealed encoding.
+    provisional_attached: bool,
+    provisional_hidden: bool,
     next_page: u64,
     next_provisional: u64,
     revision: u64,
@@ -182,6 +298,10 @@ struct Directory {
     retention_stage: u8,
     retention_cursor: Option<u64>,
     read_sent_ms: u64,
+    restart: Option<RestartState>,
+    next_package: u64,
+    packages_ready: bool,
+    packages_cursor: Option<u64>,
 }
 
 impl Default for Directory {
@@ -189,6 +309,11 @@ impl Default for Directory {
         Self {
             active: Roots::default(),
             provisional: Roots::default(),
+            retired_provisional: Roots::default(),
+            legacy_provisional: None,
+            legacy_required: BTreeMap::new(),
+            provisional_attached: false,
+            provisional_hidden: false,
             next_page: 1,
             next_provisional: 1,
             revision: 0,
@@ -205,6 +330,10 @@ impl Default for Directory {
             retention_stage: 0,
             retention_cursor: None,
             read_sent_ms: 0,
+            restart: None,
+            next_package: 1,
+            packages_ready: false,
+            packages_cursor: None,
         }
     }
 }
@@ -221,7 +350,7 @@ impl Directory {
     }
     fn bytes(&self) -> Zeroizing<Vec<u8>> {
         let mut e = Encoder::new();
-        e.array(19).uint(8);
+        e.array(26).uint(13);
         self.active.write(&mut e);
         self.provisional.write(&mut e);
         e.uint(self.next_page)
@@ -238,7 +367,7 @@ impl Directory {
                 e.array(0);
             }
             Some(p) => {
-                e.array(16)
+                e.array(20)
                     .bytes(&p.author)
                     .uint(p.from)
                     .uint(p.through)
@@ -255,6 +384,39 @@ impl Directory {
                     .uint(p.retired)
                     .uint(u64::from(p.bodyless_prefix))
                     .uint(p.reordered);
+                match &p.accepted {
+                    Some(state) => {
+                        e.array(1);
+                        restart::write_feed(state, &mut e);
+                    }
+                    None => {
+                        e.array(0);
+                    }
+                }
+                match p.sparse_head {
+                    Some(head) => {
+                        e.array(1).bytes(&head);
+                    }
+                    None => {
+                        e.array(0);
+                    }
+                }
+                match p.sparse_request {
+                    Some(request) => {
+                        e.array(1).bytes(&request);
+                    }
+                    None => {
+                        e.array(0);
+                    }
+                }
+                match p.cleanup_hash {
+                    Some(cursor) => {
+                        e.array(1).bytes(&cursor);
+                    }
+                    None => {
+                        e.array(0);
+                    }
+                }
             }
         }
         e.uint(u64::from(self.graph_ready));
@@ -288,11 +450,44 @@ impl Directory {
             }
         }
         e.uint(self.read_sent_ms);
+        match &self.restart {
+            Some(state) => {
+                e.array(1);
+                state.write(&mut e);
+            }
+            None => {
+                e.array(0);
+            }
+        }
+        e.uint(self.next_package)
+            .uint(u64::from(self.packages_ready));
+        match self.packages_cursor {
+            Some(cursor) => {
+                e.array(1).uint(cursor);
+            }
+            None => {
+                e.array(0);
+            }
+        }
+        match self.legacy_provisional {
+            Some(state) => state.write(&mut e),
+            None => {
+                e.array(0);
+            }
+        }
+        e.array(self.legacy_required.len());
+        for tip in self.legacy_required.values() {
+            e.array(3)
+                .bytes(&tip.author)
+                .uint(tip.through)
+                .bytes(&tip.hash);
+        }
+        self.retired_provisional.write(&mut e);
         Zeroizing::new(e.finish())
     }
     fn parse(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() > PAGE_BYTES {
-            return Err(invalid("entry directory exceeds page bound"));
+        if bytes.len() > DIRECTORY_BYTES {
+            return Err(invalid("entry directory exceeds bounded author state"));
         }
         let mut d = Decoder::new(bytes);
         let arity = d.array()?;
@@ -300,7 +495,10 @@ impl Directory {
         // This unpublished format includes durable receipts, pending local read marks,
         // canonical operation members and retained conflict witnesses. Older partial roots
         // cannot be treated as empty without silently losing accepted work.
-        if (arity, version) != (19, 8) {
+        if !matches!(
+            (arity, version),
+            (19, 8) | (23, 9) | (23, 10) | (24, 11) | (25, 12) | (26, 13)
+        ) {
             return Err(invalid("entry directory format"));
         }
         let active = Roots::read(&mut d)?;
@@ -318,7 +516,7 @@ impl Directory {
         let promotion_arity = d.array()?;
         let promotion = match promotion_arity {
             0 => None,
-            14 | 16 => Some(Promotion {
+            14 | 16 | 17 | 18 | 19 | 20 => Some(Promotion {
                 author: d
                     .bytes()?
                     .try_into()
@@ -342,12 +540,60 @@ impl Directory {
                 first_page: d.uint()?,
                 after_page: d.uint()?,
                 retired: d.uint()?,
-                bodyless_prefix: if promotion_arity == 16 {
+                bodyless_prefix: if promotion_arity >= 16 {
                     flag(&mut d)?
                 } else {
                     true
                 },
-                reordered: if promotion_arity == 16 { d.uint()? } else { 0 },
+                reordered: if promotion_arity >= 16 { d.uint()? } else { 0 },
+                accepted: if promotion_arity >= 17 {
+                    match d.array()? {
+                        0 => None,
+                        1 => Some(restart::read_feed(&mut d)?),
+                        _ => return Err(invalid("promotion accepted state")),
+                    }
+                } else {
+                    None
+                },
+                sparse_head: if promotion_arity >= 18 {
+                    match d.array()? {
+                        0 => None,
+                        1 => Some(
+                            d.bytes()?
+                                .try_into()
+                                .map_err(|_| invalid("sparse promotion head"))?,
+                        ),
+                        _ => return Err(invalid("sparse promotion head arity")),
+                    }
+                } else {
+                    None
+                },
+                sparse_request: if promotion_arity >= 19 {
+                    match d.array()? {
+                        0 => None,
+                        1 => Some(
+                            d.bytes()?
+                                .try_into()
+                                .map_err(|_| invalid("sparse publication request"))?,
+                        ),
+                        _ => return Err(invalid("sparse publication request arity")),
+                    }
+                } else {
+                    None
+                },
+                cleanup_hash: if promotion_arity >= 20 {
+                    match d.array()? {
+                        0 => None,
+                        1 => Some(
+                            d.bytes()?
+                                .try_into()
+                                .map_err(|_| invalid("promotion cleanup cursor"))?,
+                        ),
+                        _ => return Err(invalid("promotion cleanup cursor arity")),
+                    }
+                } else {
+                    None
+                },
             }),
             _ => return Err(invalid("promotion arity")),
         };
@@ -405,8 +651,118 @@ impl Directory {
             None
         };
         let read_sent_ms = d.uint()?;
+        let restart = if version >= 9 {
+            match d.array()? {
+                0 => None,
+                1 => Some(RestartState::read(&mut d)?),
+                _ => return Err(invalid("restart state option")),
+            }
+        } else {
+            None
+        };
+        let next_package = if version >= 9 { d.uint()? } else { 1 };
+        let packages_ready = version >= 9 && flag(&mut d)?;
+        let packages_cursor = if version >= 9 {
+            match d.array()? {
+                0 => None,
+                1 => Some(d.uint()?),
+                _ => return Err(invalid("package catalog cursor")),
+            }
+        } else {
+            None
+        };
+        let legacy_provisional = if version >= 11 {
+            let arity = d.array()?;
+            if arity == 0 {
+                None
+            } else {
+                Some(LegacyProvisionalState::read(&mut d, arity)?)
+            }
+        } else {
+            None
+        };
+        let mut legacy_required = BTreeMap::new();
+        if version >= 12 {
+            let count = d.array()?;
+            if count > super::AUTHORS_HARD_LIMIT {
+                return Err(invalid("legacy required author bound"));
+            }
+            let mut previous = None;
+            for _ in 0..count {
+                if d.array()? != 3 {
+                    return Err(invalid("legacy required tip arity"));
+                }
+                let author: Digest32 = d
+                    .bytes()?
+                    .try_into()
+                    .map_err(|_| invalid("legacy required author"))?;
+                let through = d.uint()?;
+                let hash = d
+                    .bytes()?
+                    .try_into()
+                    .map_err(|_| invalid("legacy required hash"))?;
+                if previous.is_some_and(|old| old >= author)
+                    || through == 0
+                    || through > crate::log::feed::MAX_SEQ
+                    || active.sparse.enabled
+                {
+                    return Err(invalid("legacy required tip binding or order"));
+                }
+                legacy_required.insert(
+                    author,
+                    LegacyRequired {
+                        author,
+                        through,
+                        hash,
+                    },
+                );
+                previous = Some(author);
+            }
+        }
+        let retired_provisional = if version >= 13 {
+            Roots::read(&mut d)?
+        } else {
+            Roots::default()
+        };
+        // Retired roots can contain only the exact two provisional locator indexes. They
+        // are disjoint from the current roots and cannot hide any accepted-history tree.
+        if retired_provisional
+            != (Roots {
+                sequence: retired_provisional.sequence,
+                hash: retired_provisional.hash,
+                ..Roots::default()
+            })
+            || (retired_provisional.sequence == 0) != (retired_provisional.hash == 0)
+            || (retired_provisional.sequence != 0
+                && (retired_provisional.sequence == provisional.sequence
+                    || retired_provisional.sequence == active.sequence))
+            || (retired_provisional.hash != 0
+                && (retired_provisional.hash == provisional.hash
+                    || retired_provisional.hash == active.hash))
+            || (phase == Phase::Rebuilding && retired_provisional != Roots::default())
+        {
+            return Err(invalid("retired provisional roots differ"));
+        }
         d.finish()?;
-        if retention_stage > 2
+        if let Some(state) = legacy_provisional {
+            if state.owner.instance != history_instance
+                || active.sparse.enabled
+                || state.base_seq > state.tail_seq
+                || state.tail_seq > crate::log::feed::MAX_SEQ
+                || (state.base_seq == 0 && state.base_hash != [0; 32])
+                || (state.tail_seq == 0 && state.tail_hash != [0; 32])
+                || (state.base_seq == state.tail_seq && state.base_hash != state.tail_hash)
+                || (state.pending_witness != 0
+                    && (state.pending_witness <= state.base_seq
+                        || state.pending_witness > state.tail_seq))
+            {
+                return Err(invalid("legacy provisional state binding"));
+            }
+        }
+        if next_package == 0
+            || active.key_tip >= next_package
+            || (packages_ready && packages_cursor.is_some())
+            || retention_stage > 2
             || (retention_stage == 2 && retention_cursor.is_some())
             || next_page == 0
             || next_provisional == 0
@@ -421,17 +777,25 @@ impl Directory {
                 active.read_pairs,
                 active.missing_positions,
                 active.read_pending,
+                active.key_packages,
+                active.key_latest,
                 provisional.sequence,
                 provisional.hash,
+                retired_provisional.sequence,
+                retired_provisional.hash,
                 provisional.read_receipts,
                 provisional.read_pairs,
                 provisional.missing_positions,
                 provisional.read_pending,
+                provisional.key_packages,
+                provisional.key_latest,
             ]
             .iter()
             .any(|id| *id >= next_page)
             || !active.rendered.valid_for(next_page)
             || !active.retained.valid_for(next_page)
+            || !active.sparse.valid_for(next_page)
+            || !provisional.sparse.valid_for(next_page)
             || !work.valid_for(next_page, phase)
             || matches!(phase, Phase::Building | Phase::Switched) != promotion.is_some()
         {
@@ -459,9 +823,16 @@ impl Directory {
                 || p.work.read_pairs >= next_page
                 || p.work.missing_positions >= next_page
                 || p.work.read_pending >= next_page
+                || p.work.key_packages >= next_page
+                || p.work.key_latest >= next_page
+                || p.work.key_tip >= next_package
                 || !p.work.rendered.valid_for(next_page)
                 || !p.work.retained.valid_for(next_page)
+                || !p.work.sparse.valid_for(next_page)
                 || p.retired >= next_page
+                || (p.sparse_request.is_some() && p.sparse_head.is_none())
+                || (p.sparse_head.is_some()
+                    && (p.accepted.is_some() || p.from != p.through || !p.work.sparse.enabled))
             {
                 return Err(invalid("promotion bounds"));
             }
@@ -469,6 +840,11 @@ impl Directory {
         Ok(Self {
             active,
             provisional,
+            retired_provisional,
+            legacy_provisional,
+            legacy_required,
+            provisional_attached: false,
+            provisional_hidden: false,
             next_page,
             next_provisional,
             revision,
@@ -485,6 +861,10 @@ impl Directory {
             retention_stage,
             retention_cursor,
             read_sent_ms,
+            restart,
+            next_package,
+            packages_ready,
+            packages_cursor,
         })
     }
 }
@@ -732,12 +1112,33 @@ impl Source<'_> {
         kind: SegmentKind,
         id: u64,
     ) -> Result<Option<Zeroizing<Vec<u8>>>> {
+        let limit = if kind == SegmentKind::EntryIndex {
+            if id == DIRECTORY {
+                DIRECTORY_BYTES
+            } else {
+                PAGE_BYTES
+            }
+        } else {
+            crate::log::history::MAX_ENTRY_WIRE
+        };
+        self.open_bounded(sek, channel, kind, id, limit)
+    }
+    fn open_bounded(
+        &self,
+        sek: &Sek,
+        channel: &Digest32,
+        kind: SegmentKind,
+        id: u64,
+        limit: usize,
+    ) -> Result<Option<Zeroizing<Vec<u8>>>> {
         let sealed = match self {
             Self::Snapshot(snapshot)
             | Self::Cached(snapshot, _)
-            | Self::OtherSnapshot(snapshot, _) => snapshot.get_segment(channel, kind, id)?,
+            | Self::OtherSnapshot(snapshot, _) => {
+                snapshot.get_segment_bounded(channel, kind, id, limit)?
+            }
             Self::Batch(batch) | Self::OtherBatch(batch, _) => {
-                batch.get_segment(channel, kind, id)?
+                batch.get_segment_bounded(channel, kind, id, limit)?
             }
         };
         sealed
@@ -755,7 +1156,7 @@ impl Source<'_> {
             _ => SegmentKind::EntryIndex,
         };
         let bytes = self
-            .open(sek, channel, kind, id)?
+            .open_bounded(sek, channel, kind, id, PAGE_BYTES)?
             .ok_or(invalid("entry index page missing"))?;
         let page = Page::parse(&bytes)?;
         if let Self::Cached(_, cache) = self {
@@ -843,6 +1244,8 @@ impl Source<'_> {
 pub(crate) struct EntryIndex {
     cache: RefCell<PageCache>,
     cache_revision: Cell<u64>,
+    legacy_attached: Cell<Option<LegacyProvisionalOwner>>,
+    provisional_hidden: Cell<bool>,
 }
 
 impl std::fmt::Debug for EntryIndex {
@@ -873,7 +1276,11 @@ impl EntryIndex {
         let bytes = source
             .open(sek, channel, SegmentKind::EntryIndex, DIRECTORY)?
             .ok_or(invalid("entry index directory missing"))?;
-        let directory = Directory::parse(&bytes)?;
+        let mut directory = Directory::parse(&bytes)?;
+        directory.provisional_attached = directory
+            .legacy_provisional
+            .is_some_and(|s| Some(s.owner) == self.legacy_attached.get());
+        directory.provisional_hidden = self.provisional_hidden.get();
         if directory.phase == Phase::Rebuilding {
             return Err(invalid("entry index publication incomplete"));
         }
@@ -891,6 +1298,9 @@ impl EntryIndex {
 }
 
 impl Read<'_> {
+    pub(crate) fn restart_state(&self) -> Option<&RestartState> {
+        self.directory.restart.as_ref()
+    }
     pub(crate) fn transaction(&self) -> Transaction<'_, '_> {
         Transaction::Snapshot(&self.snapshot)
     }
@@ -898,6 +1308,11 @@ impl Read<'_> {
         Source::Cached(&self.snapshot, self.cache)
     }
     pub(crate) fn staged(&self, author: &Digest32, seq: u64) -> Result<bool> {
+        if self.directory.provisional_hidden
+            || (self.directory.legacy_provisional.is_some() && !self.directory.provisional_attached)
+        {
+            return Ok(false);
+        }
         Ok(self
             .source()
             .find(
@@ -954,6 +1369,12 @@ fn find_position(
         (directory.provisional.sequence, SegmentKind::ProvisionalLog),
         (directory.active.sequence, SegmentKind::LogDb),
     ] {
+        if kind == SegmentKind::ProvisionalLog
+            && (directory.provisional_hidden
+                || (directory.legacy_provisional.is_some() && !directory.provisional_attached))
+        {
+            continue;
+        }
         if let Some(at) = source.find(sek, channel, root, &key)? {
             if at.author != *author || at.seq != seq {
                 return Err(invalid("sequence locator differs"));
@@ -975,6 +1396,12 @@ fn find_hash(
         (directory.provisional.hash, SegmentKind::ProvisionalLog),
         (directory.active.hash, SegmentKind::LogDb),
     ] {
+        if kind == SegmentKind::ProvisionalLog
+            && (directory.provisional_hidden
+                || (directory.legacy_provisional.is_some() && !directory.provisional_attached))
+        {
+            continue;
+        }
         if let Some(at) = source.find(sek, channel, root, &hashed(hash))? {
             if indexed_entry(source, sek, channel, kind, at)?.entry_hash() != *hash {
                 return Err(invalid("hash locator differs"));
@@ -986,6 +1413,10 @@ fn find_hash(
 }
 
 impl EntryRead for Read<'_> {
+    fn get_sparse_published(&self, hash: &Digest32) -> Result<Option<Entry>> {
+        self.source()
+            .published_sparse_entry(self.sek, self.channel, self.directory.active, hash)
+    }
     fn clock(&self, hash: &Digest32) -> Result<Option<u64>> {
         if !self.directory.graph_ready {
             return Err(invalid("DAG facts not yet rebuilt"));
@@ -1082,6 +1513,10 @@ impl EntryIndex {
                 None => Directory::default(),
             };
         directory.ensure_instance()?;
+        directory.provisional_attached = directory
+            .legacy_provisional
+            .is_some_and(|s| Some(s.owner) == self.legacy_attached.get());
+        directory.provisional_hidden = self.provisional_hidden.get();
         Ok(Write {
             kind: SegmentKind::EntryIndex,
             batch,
@@ -1279,6 +1714,17 @@ impl<'s> Write<'_, 's> {
         self.batch
             .put_segment(self.channel, SegmentKind::LogDb, log, &sealed)?;
         self.directory.active = self.index(self.directory.active, entry, log)?;
+        if entry.skeleton.v2.is_none()
+            || Source::Batch(self.batch).sparse_effect_finished(
+                self.sek,
+                self.channel,
+                self.directory.active.sparse,
+                &entry.entry_hash(),
+            )?
+        {
+            self.directory.active = self.index_package(self.directory.active, entry, log)?;
+        }
+        self.note_checkpoint_refill(entry)?;
         // A refill settles recovery atomically with its durable wire. Rewriting a body as
         // a skeleton for local retention deliberately does not create recovery work.
         if entry.payload.is_some() {
@@ -1288,8 +1734,26 @@ impl<'s> Write<'_, 's> {
         Ok(())
     }
     pub(crate) fn stage(&mut self, entry: &Entry) -> Result<u64> {
+        if self.directory.provisional_hidden {
+            return Err(invalid("legacy provisional cleanup pending"));
+        }
         if self.directory.phase != Phase::Idle {
             return Err(invalid("entry index publication in progress"));
+        }
+        if let Some(state) = self.directory.legacy_provisional {
+            if !self.directory.provisional_attached
+                || state.owner.author != entry.skeleton.author_id
+                || entry.skeleton.channel_id != *self.channel
+                || entry.skeleton.v2.is_some()
+                || entry.skeleton.seq <= state.base_seq
+                || (state.pending_witness != 0 && entry.skeleton.seq != state.pending_witness)
+                || entry.skeleton.seq > state.tail_seq.saturating_add(1)
+                || (entry.skeleton.seq == state.tail_seq + 1
+                    && entry.skeleton.prev_hash != state.tail_hash)
+                || (!entry.is_signed() && entry.payload.is_some())
+            {
+                return Err(invalid("legacy provisional stage ownership or linkage"));
+            }
         }
         let existing = Source::Batch(self.batch).find(
             self.sek,
@@ -1325,6 +1789,19 @@ impl<'s> Write<'_, 's> {
         self.batch
             .put_segment(self.channel, SegmentKind::ProvisionalLog, id, &sealed)?;
         self.directory.provisional = self.index(self.directory.provisional, entry, id)?;
+        if let Some(state) = &mut self.directory.legacy_provisional {
+            if entry.skeleton.seq == 1 {
+                state.first_claimed_ms = entry.skeleton.claimed_ms;
+            }
+            if entry.skeleton.seq >= state.tail_seq {
+                state.tail_seq = entry.skeleton.seq;
+                state.tail_hash = entry.entry_hash();
+                state.ended = entry.skeleton.end_of_feed;
+            }
+            if entry.is_signed() {
+                state.pending_witness = state.pending_witness.max(entry.skeleton.seq);
+            }
+        }
         Ok(id)
     }
     pub(crate) fn seal(&mut self) -> Result<()> {
@@ -1333,12 +1810,11 @@ impl<'s> Write<'_, 's> {
             .revision
             .checked_add(1)
             .ok_or(invalid("entry index revision exhausted"))?;
-        let sealed = seal_segment(
-            self.sek,
-            SegmentKind::EntryIndex,
-            DIRECTORY,
-            &self.directory.bytes(),
-        )?;
+        let bytes = self.directory.bytes();
+        if bytes.len() > DIRECTORY_BYTES {
+            return Err(invalid("entry directory exceeds bounded author state"));
+        }
+        let sealed = seal_segment(self.sek, SegmentKind::EntryIndex, DIRECTORY, &bytes)?;
         self.batch
             .put_segment(self.channel, SegmentKind::EntryIndex, DIRECTORY, &sealed)
     }
@@ -1352,12 +1828,127 @@ pub(crate) struct Publication<'a> {
     pub received_ms: u64,
     pub bodyless_prefix: bool,
     pub origin: u64,
+    /// Locally verified contexts needed by ordering before the atomic active-root switch.
+    pub local_contexts: Option<(
+        &'a crate::log::history::ControlContext,
+        &'a crate::log::history::ControlContext,
+    )>,
+}
+
+/// One evidence-validated v2 source entry. Control effects still pass the existing
+/// governance fold; this publication never turns a sparse tip into a contiguous feed.
+pub(crate) struct SparsePublication<'a> {
+    pub request: [u8; 16],
+    pub entry: &'a Entry,
+    pub validated: &'a super::governance::ValidatedSparseEntry,
+    pub first_log: u64,
+    pub received_ms: u64,
+    pub origin: u64,
+    pub local_id: Digest32,
 }
 
 const PROMOTION_ENTRIES: usize = 64;
 const PROMOTION_BYTES: usize = 1024 * 1024;
 
 impl Write<'_, '_> {
+    pub(crate) fn initialize_restart(&mut self, epoch: u64) -> Result<()> {
+        if self.directory.active.sequence != 0 {
+            return Err(invalid("nonempty restart initialization"));
+        }
+        self.bootstrap_restart(RestartState::empty(*self.channel, epoch))?;
+        self.directory.packages_ready = true;
+        Ok(())
+    }
+    pub(crate) fn bootstrap_restart(&mut self, state: RestartState) -> Result<()> {
+        if self.directory.phase != Phase::Idle
+            || state.room != *self.channel
+            || self.directory.restart.is_some()
+        {
+            return Err(invalid("restart bootstrap binding"));
+        }
+        self.directory.restart = Some(state);
+        Ok(())
+    }
+    pub(crate) fn note_presence(
+        &mut self,
+        author: Digest32,
+        state: super::governance::Presence,
+    ) -> Result<()> {
+        let restart = self
+            .directory
+            .restart
+            .as_ref()
+            .ok_or(invalid("presence without restart state"))?;
+        let contiguous = restart
+            .feeds
+            .get(&author)
+            .is_some_and(|f| state.last.0 <= f.seq);
+        let sparse = if restart.sparse {
+            let source = Source::Batch(self.batch);
+            match source.sparse_position_header(
+                self.sek,
+                self.channel,
+                self.directory.active.sparse,
+                &author,
+                state.last.0,
+            )? {
+                Some(header) => source.sparse_effect_finished(
+                    self.sek,
+                    self.channel,
+                    self.directory.active.sparse,
+                    &header.entry_hash(),
+                )?,
+                None => false,
+            }
+        } else {
+            false
+        };
+        if !contiguous && !sparse {
+            return Err(invalid("presence beyond a semantically published position"));
+        }
+        self.directory
+            .restart
+            .as_mut()
+            .ok_or(invalid("presence restart state vanished"))?
+            .presence
+            .insert(author, state);
+        Ok(())
+    }
+    pub(crate) fn note_swept(&mut self, dag: &crate::log::dag::Dag) -> Result<()> {
+        let restart = self
+            .directory
+            .restart
+            .as_mut()
+            .ok_or(invalid("sweep without restart state"))?;
+        for (author, seq) in dag.swept_positions() {
+            if let Some(feed) = restart.feeds.get_mut(author) {
+                if *seq > feed.checkpoint.map_or(0, |cp| cp.0) {
+                    return Err(invalid("sweep beyond published checkpoint"));
+                }
+                feed.swept_to = *seq;
+            }
+        }
+        Ok(())
+    }
+    pub(crate) fn clear_retained_step_marker(&mut self) -> Result<()> {
+        self.directory
+            .restart
+            .as_mut()
+            .ok_or(invalid("legacy completion without restart state"))?
+            .retained_step_body = None;
+        Ok(())
+    }
+    pub(crate) fn note_projection(&mut self, bytes: Vec<u8>) -> Result<()> {
+        if bytes.len() > 256 {
+            return Err(invalid("projection state bound"));
+        }
+        self.directory
+            .restart
+            .as_mut()
+            .ok_or(invalid("projection without restart state"))?
+            .projection = Some(bytes);
+        Ok(())
+    }
     /// The caller already checked the complete feed linkage and the successor's signature.
     /// The signed witness stays in the provisional store until publication and cleanup finish.
     pub(crate) fn begin_promotion(&mut self, publication: Publication<'_>) -> Result<()> {
@@ -1368,6 +1959,7 @@ impl Write<'_, '_> {
             received_ms,
             bodyless_prefix,
             origin,
+            local_contexts,
         } = publication;
         self.set_origin(origin)?;
         if self.directory.phase != Phase::Idle
@@ -1420,6 +2012,23 @@ impl Write<'_, '_> {
         first_log
             .checked_add(count)
             .ok_or(invalid("promotion log allocator exhausted"))?;
+        if self.directory.restart.is_none() && self.directory.active.sequence == 0 && from == 1 {
+            self.directory.packages_ready = true;
+            self.directory.restart =
+                Some(RestartState::empty(*self.channel, witness.skeleton.epoch));
+        }
+        let restart = self
+            .directory
+            .restart
+            .as_ref()
+            .ok_or(invalid("accepted restart state was not prepared"))?;
+        if restart.room != *self.channel || restart.epoch != witness.skeleton.epoch {
+            return Err(invalid("restart room binding"));
+        }
+        let accepted = restart.feeds.get(&author).cloned().unwrap_or_default();
+        if accepted.seq.checked_add(1) != Some(from) || accepted.hash != base_hash {
+            return Err(invalid("restart prefix differs from promotion"));
+        }
         self.directory.promotion = Some(Promotion {
             author,
             from,
@@ -1437,8 +2046,15 @@ impl Write<'_, '_> {
             retired: 0,
             bodyless_prefix,
             reordered: 0,
+            accepted: Some(accepted),
+            sparse_head: None,
+            sparse_request: None,
+            cleanup_hash: None,
         });
         self.directory.phase = Phase::Building;
+        if let Some((pre, post)) = local_contexts {
+            self.seed_local_promotion_contexts(witness, pre, post)?;
+        }
         Ok(())
     }
 
@@ -1505,6 +2121,14 @@ impl Write<'_, '_> {
             {
                 return Err(invalid("promotion predecessor or witness differs"));
             }
+            if p.sparse_head.is_none() {
+                restart::advance(
+                    p.accepted
+                        .as_mut()
+                        .ok_or(invalid("promotion restart state missing"))?,
+                    &entry,
+                )?;
+            }
             let log = p
                 .first_log
                 .checked_add(p.cursor - p.from)
@@ -1532,6 +2156,12 @@ impl Write<'_, '_> {
                     .put_segment(self.channel, SegmentKind::Index, log, &seen)?;
             }
             p.work = self.index(p.work, &entry, log)?;
+            if p.sparse_head.is_some() {
+                self.index_sparse_source(&mut p.work, &entry)?;
+            }
+            if p.sparse_head.is_none() {
+                p.work = self.index_package(p.work, &entry, log)?;
+            }
             if entry.payload.is_none() {
                 // The membership stays unpublished with this authenticated suffix until the
                 // witness's effects and root switch commit together.
@@ -1574,6 +2204,56 @@ impl Write<'_, '_> {
         if p.cursor <= p.through || !self.directory.work.is_empty() {
             return Err(invalid("promotion suffix or DAG facts incomplete"));
         }
+        if p.sparse_head.is_none() {
+            let accepted = p
+                .accepted
+                .clone()
+                .ok_or(invalid("promotion accepted state missing"))?;
+            if accepted.seq != p.through || accepted.hash != p.witness_hash {
+                return Err(invalid("promotion accepted witness differs"));
+            }
+            let restart = self
+                .directory
+                .restart
+                .as_mut()
+                .ok_or(invalid("restart state missing at publication"))?;
+            if let Some(state) = &mut self.directory.legacy_provisional {
+                if state.owner.author != p.author {
+                    return Err(invalid("legacy publication owner differs"));
+                }
+                state.base_seq = accepted.seq;
+                state.base_hash = accepted.hash;
+                state.first_claimed_ms = accepted.first_claimed_ms;
+                if state.tail_seq <= state.base_seq {
+                    state.tail_seq = state.base_seq;
+                    state.tail_hash = state.base_hash;
+                    state.ended = accepted.ended;
+                }
+                if state.pending_witness <= state.base_seq {
+                    state.pending_witness = 0;
+                }
+            }
+            if let Some(required) = self.directory.legacy_required.get(&p.author).copied() {
+                if accepted.ended && accepted.seq < required.through {
+                    tracing::warn!(author = ?p.author, accepted_end = accepted.seq,
+                        refused_tip = required.through,
+                        "discarding legacy history requirement beyond accepted end of feed");
+                    self.directory.legacy_required.remove(&p.author);
+                } else if accepted.seq >= required.through
+                    && Source::Batch(self.batch)
+                        .find(self.sek, self.channel, p.work.hash, &hashed(&required.hash))?
+                        .is_some_and(|at| {
+                            at.author == required.author && at.seq == required.through
+                        })
+                {
+                    self.directory.legacy_required.remove(&p.author);
+                }
+            }
+            restart.feeds.insert(p.author, accepted);
+            if restart.feeds.len() > super::AUTHORS_HARD_LIMIT {
+                return Err(invalid("restart author bound"));
+            }
+        }
         let result = (p.through - p.from + 1, p.after_log);
         let from = p.from;
         self.directory.active = p.work;
@@ -1593,16 +2273,23 @@ impl Write<'_, '_> {
         let Some(mut p) = self.directory.promotion.clone() else {
             return Ok(true);
         };
+        let mut budget = ProvisionalCleanupBudget::new(&self.directory)?;
         match self.directory.phase {
             Phase::Building => {
-                for _ in 0..PROMOTION_ENTRIES {
+                for _ in 0..CLEANUP_ROWS {
                     if p.after_log > p.first_log {
+                        if !budget.reserve_deletes(2) {
+                            break;
+                        }
                         p.after_log -= 1;
                         self.batch
                             .delete_segment(self.channel, SegmentKind::LogDb, p.after_log)?;
                         self.batch
                             .delete_segment(self.channel, SegmentKind::Index, p.after_log)?;
                     } else if p.after_page > p.first_page {
+                        if !budget.reserve_deletes(1) {
+                            break;
+                        }
                         p.after_page -= 1;
                         self.batch.delete_segment(
                             self.channel,
@@ -1618,19 +2305,68 @@ impl Write<'_, '_> {
                 }
             }
             Phase::Switched => {
-                for _ in 0..PROMOTION_ENTRIES {
+                let mut scanned = 0;
+                for _ in 0..CLEANUP_ROWS {
                     if p.retired == 0 {
-                        if p.cursor <= p.through {
-                            self.remove_staged(&p.author, p.cursor)?;
-                            p.cursor = p
-                                .cursor
-                                .checked_add(1)
-                                .ok_or(invalid("promotion cleanup overflow"))?;
-                            continue;
+                        if scanned >= PROVISIONAL_CLEANUP_ENTRIES {
+                            break;
                         }
-                        self.directory.phase = Phase::Idle;
-                        self.directory.promotion = None;
-                        return Ok(true);
+                        let roots = self.directory.provisional;
+                        let Some((key, value)) = Source::Batch(self.batch).first(
+                            self.sek,
+                            self.channel,
+                            roots.hash,
+                            &p.cleanup_hash.unwrap_or([0; 64]),
+                            0,
+                        )?
+                        else {
+                            self.directory.phase = Phase::Idle;
+                            self.directory.promotion = None;
+                            return Ok(true);
+                        };
+                        scanned += 1;
+                        let at = value.locator()?;
+                        if key[32..] != [0; 32]
+                            || at.log == 0
+                            || at.log >= self.directory.next_provisional
+                        {
+                            return Err(invalid("promotion cleanup hash locator"));
+                        }
+                        if at.author == p.author && (p.from..=p.through).contains(&at.seq) {
+                            let sequence_key = position(&at.author, at.seq);
+                            let pages = self.provisional_delete_pages(roots.hash, &key, at)?
+                                + self.provisional_delete_pages(
+                                    roots.sequence,
+                                    &sequence_key,
+                                    at,
+                                )?;
+                            if !budget.reserve_pair(pages) {
+                                if budget.rows == 1 {
+                                    return Err(Error::SizeLimitExceeded(
+                                        "promotion cleanup storage quantum",
+                                    ));
+                                }
+                                break;
+                            }
+                            self.directory.provisional.hash = self.change(roots.hash, key, None)?;
+                            self.directory.provisional.sequence =
+                                self.change(roots.sequence, sequence_key, None)?;
+                            self.batch.delete_segment(
+                                self.channel,
+                                SegmentKind::ProvisionalLog,
+                                at.log,
+                            )?;
+                            p.cursor = p.cursor.saturating_add(1).min(p.through.saturating_add(1));
+                        }
+                        // Every hash key has a zero suffix, so this strictly greater key
+                        // exists even for an all-ones hash. Skipped unrelated rows stay intact.
+                        let mut next = key;
+                        next[63] = 1;
+                        p.cleanup_hash = Some(next);
+                        continue;
+                    }
+                    if !budget.reserve_deletes(2) {
+                        break;
                     }
                     let ledger = p.retired;
                     let bytes = Source::Batch(self.batch)
@@ -1663,29 +2399,111 @@ impl Write<'_, '_> {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use = "unfinished cleanup must be scheduled as bounded maintenance, never looped at startup"]
+pub(crate) enum Preparation {
+    Ready,
+    /// Current reads/staging are usable; one detached retired root still needs maintenance.
+    ReadyWithCleanup,
+    /// Current unpublished roots are still awaiting one bounded cleanup/quarantine step.
+    CleanupPending,
+}
+
 impl EntryIndex {
-    /// Complete crash cleanup before a caller scans authoritative LogDb. An absent derived
-    /// index is rebuilt from sealed wire entries; no saved entry, key or first-seen fact is reset.
-    pub(crate) fn prepare(
+    pub(crate) fn prepare_owned(
         &self,
         store: &Store,
         sek: &Sek,
         channel: &Digest32,
         origin: u64,
-    ) -> Result<()> {
+        mut paused_owner: impl FnMut(LegacyProvisionalOwner) -> Result<bool>,
+    ) -> Result<Preparation> {
+        self.legacy_attached.set(None);
+        self.provisional_hidden.set(true);
+        // Never hold a read or write transaction while the verifier opens node-owned demand.
+        let candidate = {
+            let snapshot = store.snapshot()?;
+            Source::Snapshot(&snapshot)
+                .open(sek, channel, SegmentKind::EntryIndex, DIRECTORY)?
+                .map(|bytes| Directory::parse(&bytes))
+                .transpose()?
+                .and_then(|d| d.legacy_provisional.map(|s| s.owner))
+        };
+        let verified_owner = match candidate {
+            Some(owner) => match paused_owner(owner) {
+                Ok(true) => Some(owner),
+                Ok(false) => None,
+                Err(
+                    Error::MalformedAtRest(_)
+                    | Error::AtRestUnlockFailed
+                    | Error::SizeLimitExceeded(_),
+                ) => None,
+                Err(error) => return Err(error),
+            },
+            None => None,
+        };
+        let mut preserved = false;
+        {
+            let read = self.read(store, sek, channel);
+            if let Ok(read) = &read {
+                if let Some(state) = read.directory.legacy_provisional {
+                    let owned_phase = read.directory.phase == Phase::Idle
+                        || (matches!(read.directory.phase, Phase::Building | Phase::Switched)
+                            && read.directory.promotion.as_ref().is_some_and(|p| {
+                                p.sparse_head.is_none() && p.author == state.owner.author
+                            }));
+                    preserved = Some(state.owner) == verified_owner && owned_phase;
+                }
+            }
+            // An absent/Rebuilding directory follows the existing bounded-index initialization
+            // below; malformed present directories are not silently treated as empty.
+            if let Err(error) = read {
+                if candidate.is_some() {
+                    return Err(error);
+                }
+            }
+        }
+        if preserved {
+            self.provisional_hidden.set(false); // owned roots remain detached by owner check
+        } else {
+            // This is the only orphan cleanup quantum performed by open, including when a
+            // publication needs many later rollback/retirement transactions.
+            let snapshot = store.snapshot()?;
+            let existing = Source::Snapshot(&snapshot)
+                .open(sek, channel, SegmentKind::EntryIndex, DIRECTORY)?
+                .map(|v| Directory::parse(&v))
+                .transpose()?;
+            drop(snapshot);
+            if existing
+                .as_ref()
+                .is_some_and(|d| d.phase != Phase::Rebuilding)
+                && self.cleanup_orphan_provisional(store, sek, channel)?
+                    == Preparation::CleanupPending
+            {
+                return Ok(Preparation::CleanupPending);
+            }
+        }
+        // No request remains active across reopen. Recover only the capped verifier-work
+        // index, in small transactions, after the existing publication crash cleanup.
+        // Retained entries/receipts and authority/key-body obligations are untouched; saved
+        // explicit history demand has its own sealed body/cursor and requires Resume.
+        let mut after = None;
         loop {
             let mut batch = store.batch()?;
             let mut writer = self.write(&mut batch, sek, channel)?;
-            if matches!(writer.directory.phase, Phase::Building | Phase::Switched) {
-                let done = writer.cleanup_chunk()?;
+            if !writer.directory.active.sparse.enabled {
+                break;
+            }
+            let (done, next, changed) = writer.cleanup_abandoned_history_verifiers(after)?;
+            if changed {
                 writer.seal()?;
                 batch.commit()?;
                 self.committed();
-                if !done {
-                    continue;
-                }
             }
-            break;
+            if done {
+                break;
+            }
+            after = next;
         }
         let snapshot = store.snapshot()?;
         let directory = Source::Snapshot(&snapshot)
@@ -1695,11 +2513,20 @@ impl EntryIndex {
         let rebuilding = directory
             .as_ref()
             .is_none_or(|d| d.phase == Phase::Rebuilding);
+        if rebuilding && directory.as_ref().is_some_and(|d| d.active.sparse.enabled) {
+            return Err(invalid(
+                "authenticated history cannot use the legacy archive rebuild",
+            ));
+        }
         drop(snapshot);
         if rebuilding {
             let mut fresh = Directory {
                 origin: Some(origin),
                 history_instance: directory.as_ref().map_or([0; 16], |d| d.history_instance),
+                legacy_required: directory
+                    .as_ref()
+                    .map(|d| d.legacy_required.clone())
+                    .unwrap_or_default(),
                 ..Directory::default()
             };
             fresh.ensure_instance()?;
@@ -1724,34 +2551,45 @@ impl EntryIndex {
                     break;
                 }
             }
-            let mut batch = Some(store.batch()?);
-            let mut count = 0usize;
-            store.visit_segments(channel, SegmentKind::LogDb, |id, sealed| {
-                let wire = open_segment(sek, SegmentKind::LogDb, id, &sealed)?;
-                let entry = Entry::from_wire(&wire)?;
-                if entry.skeleton.channel_id != *channel {
-                    return Err(invalid("saved entry belongs to another room"));
+            // Read the immutable log through each write transaction. A read snapshot spanning
+            // the whole rebuild pins every retired redb page until the last entry, preventing
+            // reuse across these commits. Only the stable LogDb id crosses a batch boundary;
+            // index writes cannot move or replace any of the log rows being visited.
+            let mut after = None;
+            loop {
+                let mut batch = store.batch()?;
+                let mut writer = self.write(&mut batch, sek, channel)?;
+                let mut bytes = 0usize;
+                let mut complete = false;
+                for _ in 0..PROMOTION_ENTRIES {
+                    let Some((id, sealed)) =
+                        writer
+                            .batch
+                            .segment_after(channel, SegmentKind::LogDb, after)?
+                    else {
+                        complete = true;
+                        break;
+                    };
+                    let wire = open_segment(sek, SegmentKind::LogDb, id, &sealed)?;
+                    if bytes != 0 && bytes.saturating_add(wire.len()) > PROMOTION_BYTES {
+                        break;
+                    }
+                    let entry = Entry::from_wire(&wire)?;
+                    if entry.skeleton.channel_id != *channel {
+                        return Err(invalid("saved entry belongs to another room"));
+                    }
+                    writer.index_existing(&entry, id)?;
+                    bytes = bytes.saturating_add(wire.len());
+                    after = Some(id);
                 }
-                let current = batch
-                    .as_mut()
-                    .ok_or(invalid("entry rebuild batch missing"))?;
-                let mut writer = self.write(current, sek, channel)?;
-                writer.index_existing(&entry, id)?;
+                // All changed roots and their directory become durable together. Keep one
+                // writer for the batch instead of decrypting and resealing it for every row.
                 writer.seal()?;
-                count += 1;
-                if count == PROMOTION_ENTRIES {
-                    batch
-                        .take()
-                        .ok_or(invalid("entry rebuild batch missing"))?
-                        .commit()?;
-                    batch = Some(store.batch()?);
-                    count = 0;
+                batch.commit()?;
+                if complete {
+                    break;
                 }
-                Ok(())
-            })?;
-            batch
-                .ok_or(invalid("entry rebuild batch missing"))?
-                .commit()?;
+            }
             let mut batch = store.batch()?;
             let mut writer = self.write(&mut batch, sek, channel)?;
             writer.finish_rebuild()?;
@@ -1759,57 +2597,667 @@ impl EntryIndex {
             batch.commit()?;
             self.committed();
         }
-        // An unfinished unsigned run is never recovered as an authentic feed. Reclaim its
-        // sealed wire and both locator rows atomically, in bounded batches.
-        // Provisional trees share no pages with active trees; ordinary COW updates have already
-        // retired their superseded versions. Walk deletion by key so no whole-tree Vec is held.
-        self.discard_provisional(store, sek, channel)
+        self.provisional_hidden.set(false);
+        let read = self.read(store, sek, channel)?;
+        Ok(if read.directory.retired_provisional == Roots::default() {
+            Preparation::Ready
+        } else {
+            Preparation::ReadyWithCleanup
+        })
     }
 
-    pub(crate) fn discard_provisional(
+    /// One orphan cleanup quantum. A preserved paused owner is never eligible for this path.
+    pub(crate) fn cleanup_orphan_provisional(
         &self,
         store: &Store,
         sek: &Sek,
         channel: &Digest32,
-    ) -> Result<()> {
-        loop {
-            let mut batch = store.batch()?;
-            let mut writer = self.write(&mut batch, sek, channel)?;
-            if writer.directory.phase != Phase::Idle {
-                return Err(invalid("provisional cleanup before publication cleanup"));
+    ) -> Result<Preparation> {
+        let hidden = self.provisional_hidden.get();
+        let mut batch = store.batch()?;
+        let mut writer = self.write(&mut batch, sek, channel)?;
+        let (current_ready, changed) = if hidden {
+            match writer.directory.phase {
+                Phase::Building | Phase::Switched => {
+                    let cleaned = writer.cleanup_chunk()?;
+                    let empty = writer.directory.provisional == Roots::default();
+                    if cleaned && empty {
+                        writer.directory.legacy_provisional = None;
+                    }
+                    // Never add an unbounded second phase to this publication quantum.
+                    (cleaned && empty, true)
+                }
+                Phase::Idle => writer.quarantine_provisional()?,
+                Phase::Rebuilding => return Err(invalid("orphan cleanup during index rebuild")),
             }
-            let mut removed = 0;
-            for _ in 0..PROMOTION_ENTRIES {
-                let roots = writer.directory.provisional;
-                let first =
-                    Source::Batch(writer.batch).first(sek, channel, roots.sequence, &[0; 64], 0)?;
-                let Some((key, value)) = first else {
-                    break;
-                };
-                let at = value.locator()?;
-                let wire = Source::Batch(writer.batch)
-                    .open(sek, channel, SegmentKind::ProvisionalLog, at.log)?
-                    .ok_or(invalid("provisional entry missing"))?;
-                let entry = Entry::from_wire(&wire)?;
-                writer.directory.provisional.sequence = writer.change(roots.sequence, key, None)?;
-                writer.directory.provisional.hash =
-                    writer.change(roots.hash, hashed(&entry.entry_hash()), None)?;
-                writer
-                    .batch
-                    .delete_segment(channel, SegmentKind::ProvisionalLog, at.log)?;
-                removed += 1;
-            }
+        } else if writer.directory.phase == Phase::Idle {
+            // A live or paused current owner is unrelated to these retired locators.
+            let (_, changed) = writer.reclaim_retired_provisional()?;
+            (true, changed)
+        } else {
+            // Page allocation/retirement belongs to the current publication until Idle.
+            (true, false)
+        };
+        let retired = writer.directory.retired_provisional != Roots::default();
+        if changed {
             writer.seal()?;
             batch.commit()?;
             self.committed();
-            if removed < PROMOTION_ENTRIES {
-                return Ok(());
-            }
+        }
+        if current_ready {
+            self.provisional_hidden.set(false);
+            Ok(if retired {
+                Preparation::ReadyWithCleanup
+            } else {
+                Preparation::Ready
+            })
+        } else {
+            Ok(Preparation::CleanupPending)
         }
     }
 }
 
+// Cleanup counts actual segment puts/deletes, not just logical entries. Each deletion
+// rewrites at most one page per existing path level (deletion cannot split a page), and
+// removes its old page. Reserve the final Directory write and conservative encoding/key
+// overhead before touching either index. Store engine/WAL pages are not segment rows.
+const PROVISIONAL_CLEANUP_ENTRIES: usize = 4;
+const CLEANUP_ROWS: usize = 64;
+const CLEANUP_BYTES: usize = 1024 * 1024;
+const CLEANUP_SEAL_OVERHEAD: usize = 64; // AES-GCM nonce/tag plus sealed CBOR framing
+const CLEANUP_KEY_BYTES: usize = 64; // (room, kind, id), conservatively encoded
+const CLEANUP_DIRECTORY_GROWTH: usize = 128; // root/allocator/revision integer growth
+
+struct ProvisionalCleanupBudget {
+    rows: usize,
+    bytes: usize,
+}
+
+impl ProvisionalCleanupBudget {
+    fn new(directory: &Directory) -> Result<Self> {
+        let bytes = directory.bytes().len()
+            + CLEANUP_DIRECTORY_GROWTH
+            + CLEANUP_SEAL_OVERHEAD
+            + CLEANUP_KEY_BYTES;
+        if bytes > CLEANUP_BYTES {
+            return Err(Error::SizeLimitExceeded(
+                "provisional cleanup directory quantum",
+            ));
+        }
+        Ok(Self { rows: 1, bytes })
+    }
+    fn reserve_deletes(&mut self, count: usize) -> bool {
+        // Deletion writes only keys/tombstones; no old ciphertext is loaded or copied.
+        let bytes = count.saturating_mul(CLEANUP_KEY_BYTES);
+        if self.rows.saturating_add(count) > CLEANUP_ROWS
+            || self.bytes.saturating_add(bytes) > CLEANUP_BYTES
+        {
+            return false;
+        }
+        self.rows += count;
+        self.bytes += bytes;
+        true
+    }
+    fn reserve_pair(&mut self, path_pages: usize) -> bool {
+        // Two operations per page: replacement put + old-page delete. A path that
+        // collapses to empty uses fewer. One further operation deletes the spool record.
+        let rows = path_pages * 2 + 1;
+        let bytes = path_pages * (PAGE_BYTES + CLEANUP_SEAL_OVERHEAD + 2 * CLEANUP_KEY_BYTES)
+            + CLEANUP_KEY_BYTES;
+        if self.rows + rows > CLEANUP_ROWS || self.bytes + bytes > CLEANUP_BYTES {
+            return false;
+        }
+        self.rows += rows;
+        self.bytes += bytes;
+        true
+    }
+}
+
+impl Write<'_, '_> {
+    /// Detach one Idle orphan in constant work. When the retirement slot is occupied,
+    /// discard only the bounded current orphan: old garbage must not delay current use.
+    fn quarantine_provisional(&mut self) -> Result<(bool, bool)> {
+        if self.directory.phase != Phase::Idle {
+            return Err(invalid("provisional quarantine requires idle publication"));
+        }
+        if self.directory.provisional == Roots::default() {
+            if self.directory.legacy_provisional.is_none() {
+                return Ok((true, false));
+            }
+            let _budget = ProvisionalCleanupBudget::new(&self.directory)?;
+            self.directory.legacy_provisional = None;
+            return Ok((true, true));
+        }
+        if self.directory.retired_provisional != Roots::default() {
+            let (roots, mut changed) =
+                self.discard_provisional_roots(self.directory.provisional)?;
+            self.directory.provisional = roots;
+            let done = roots == Roots::default();
+            if done {
+                changed |= self.directory.legacy_provisional.take().is_some();
+            }
+            return Ok((done, changed));
+        }
+        let _budget = ProvisionalCleanupBudget::new(&self.directory)?;
+        self.directory.retired_provisional = self.directory.provisional;
+        self.directory.provisional = Roots::default();
+        self.directory.legacy_provisional = None;
+        Ok((true, true))
+    }
+
+    /// Reclaim only the detached root; a new stage can hold the same hash/position with
+    /// another spool id. Deletion never looks up that position in current/active roots.
+    fn reclaim_retired_provisional(&mut self) -> Result<(bool, bool)> {
+        let (roots, changed) =
+            self.discard_provisional_roots(self.directory.retired_provisional)?;
+        self.directory.retired_provisional = roots;
+        Ok((roots == Roots::default(), changed))
+    }
+
+    /// Count the exact deletion path and verify its locator before any mutation. Ranked
+    /// trees and absent keys are storage errors, never permission to delete a nearby row.
+    fn provisional_delete_pages(&self, mut root: u64, key: &Key, at: Locator) -> Result<usize> {
+        for depth in 1..=MAX_DEPTH {
+            if root == 0 {
+                return Err(invalid("provisional cleanup locator missing"));
+            }
+            match Source::Batch(self.batch).page(self.sek, self.channel, root)? {
+                Page::Leaf(rows) => {
+                    let found = rows
+                        .binary_search_by_key(key, |r| r.0)
+                        .ok()
+                        .map(|index| rows[index].1.locator())
+                        .transpose()?;
+                    if found != Some(at) {
+                        return Err(invalid("provisional cleanup locator differs"));
+                    }
+                    return Ok(depth);
+                }
+                Page::Branch(rows) => {
+                    root = rows
+                        .iter()
+                        .find(|r| r.0 >= *key)
+                        .ok_or(invalid("provisional cleanup path missing"))?
+                        .1;
+                }
+                Page::Ranked(_) => return Err(invalid("ranked provisional cleanup path")),
+            }
+        }
+        Err(invalid("provisional cleanup cycle or depth"))
+    }
+
+    /// Return only this root's bounded cleanup result. No bodies are copied or decoded.
+    fn discard_provisional_roots(&mut self, mut roots: Roots) -> Result<(Roots, bool)> {
+        if self.directory.phase != Phase::Idle {
+            return Err(invalid("provisional cleanup requires idle publication"));
+        }
+        if roots == Roots::default() {
+            return Ok((roots, false));
+        }
+        let mut budget = ProvisionalCleanupBudget::new(&self.directory)?;
+        let mut changed = false;
+        for _ in 0..PROVISIONAL_CLEANUP_ENTRIES {
+            let Some((key, value)) =
+                Source::Batch(self.batch).first(self.sek, self.channel, roots.hash, &[0; 64], 0)?
+            else {
+                if roots.sequence != 0 {
+                    return Err(invalid("provisional cleanup locator roots disagree"));
+                }
+                return Ok((roots, changed));
+            };
+            let at = value.locator()?;
+            if at.log == 0 || at.log >= self.directory.next_provisional {
+                return Err(invalid("provisional cleanup log bounds"));
+            }
+            let sequence_key = position(&at.author, at.seq);
+            let pages = self.provisional_delete_pages(roots.hash, &key, at)?
+                + self.provisional_delete_pages(roots.sequence, &sequence_key, at)?;
+            if !budget.reserve_pair(pages) {
+                if !changed {
+                    return Err(Error::SizeLimitExceeded(
+                        "provisional cleanup storage quantum",
+                    ));
+                }
+                break; // Persist prior progress; this pair has not mutated either tree.
+            }
+            roots.hash = self.change(roots.hash, key, None)?;
+            roots.sequence = self.change(roots.sequence, sequence_key, None)?;
+            self.batch
+                .delete_segment(self.channel, SegmentKind::ProvisionalLog, at.log)?;
+            changed = true;
+        }
+        if (roots.hash == 0) != (roots.sequence == 0) {
+            return Err(invalid("provisional cleanup locator roots disagree"));
+        }
+        Ok((roots, changed))
+    }
+}
+
+/// Compact progress of an owned legacy witness.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LegacyPublicationProgress {
+    pub from: u64,
+    pub through: u64,
+    pub after_log: u64,
+    pub switched: bool,
+}
+
+impl Read<'_> {
+    pub(crate) fn legacy_required(&self, author: &Digest32) -> Option<LegacyRequired> {
+        self.directory.legacy_required.get(author).copied()
+    }
+    pub(crate) fn legacy_required_any(&self) -> bool {
+        !self.directory.legacy_required.is_empty()
+    }
+    pub(crate) fn legacy_required_page(
+        &self,
+        after: Option<Digest32>,
+        limit: usize,
+    ) -> Vec<LegacyRequired> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        self.directory
+            .legacy_required
+            .range((after.map_or(Unbounded, Excluded), Unbounded))
+            .take(limit.min(16))
+            .map(|(_, tip)| *tip)
+            .collect()
+    }
+}
+
+impl Write<'_, '_> {
+    /// Resolve an impossible requirement in the same Batch that persists its refusal.
+    /// This releases a blocker only; it never claims the advertised tip was accepted.
+    pub(crate) fn resolve_legacy_required_invalid(
+        &mut self,
+        author: &Digest32,
+        refused_from: u64,
+    ) -> bool {
+        if self
+            .directory
+            .legacy_required
+            .get(author)
+            .is_some_and(|tip| tip.through >= refused_from)
+        {
+            tracing::warn!(
+                ?author,
+                refused_from,
+                "discarding legacy history requirement in refused feed suffix"
+            );
+            self.directory.legacy_required.remove(author);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Caller verified the retained current-author signature and exact room/epoch. This
+    /// setter cannot accept history; a conflict retains the earlier obligation unchanged.
+    pub(crate) fn note_legacy_required(&mut self, tip: LegacyRequired) -> Result<bool> {
+        if self.directory.active.sparse.enabled
+            || tip.through == 0
+            || tip.through > crate::log::feed::MAX_SEQ
+        {
+            return Err(invalid("legacy required tip bounds"));
+        }
+        let accepted = self
+            .directory
+            .restart
+            .as_ref()
+            .and_then(|r| r.feeds.get(&tip.author));
+        if accepted.is_some_and(|f| f.ended && f.seq < tip.through) {
+            return Err(Error::StreamRefused(
+                "legacy tip extends accepted end of feed",
+            ));
+        }
+        if let Some(old) = self.directory.legacy_required.get(&tip.author) {
+            if old.through > tip.through {
+                return Ok(false);
+            }
+            if old.through == tip.through {
+                if old.hash != tip.hash {
+                    return Err(Error::MalformedBundle(
+                        "conflicting authenticated legacy tip",
+                    ));
+                }
+                return Ok(false);
+            }
+        }
+        if accepted.is_some_and(|f| f.seq >= tip.through) {
+            if Source::Batch(self.batch)
+                .find(
+                    self.sek,
+                    self.channel,
+                    self.directory.active.hash,
+                    &hashed(&tip.hash),
+                )?
+                .is_some_and(|at| at.author == tip.author && at.seq == tip.through)
+            {
+                return Ok(false);
+            }
+            return Err(Error::MalformedBundle(
+                "authenticated legacy tip conflicts with accepted feed",
+            ));
+        }
+        if !self.directory.legacy_required.contains_key(&tip.author)
+            && self.directory.legacy_required.len() >= super::AUTHORS_HARD_LIMIT
+        {
+            return Err(Error::SizeLimitExceeded("legacy required authors"));
+        }
+        self.directory.legacy_required.insert(tip.author, tip);
+        Ok(true)
+    }
+}
+
+impl Read<'_> {
+    pub(crate) fn legacy_provisional(&self) -> Option<LegacyProvisionalState> {
+        self.directory.legacy_provisional
+    }
+    pub(crate) fn legacy_publication(
+        &self,
+        owner: LegacyProvisionalOwner,
+    ) -> Result<Option<LegacyPublicationProgress>> {
+        if self
+            .directory
+            .legacy_provisional
+            .is_none_or(|s| s.owner != owner)
+        {
+            return Err(invalid("legacy provisional owner changed"));
+        }
+        Ok(self
+            .directory
+            .promotion
+            .as_ref()
+            .map(|p| LegacyPublicationProgress {
+                from: p.from,
+                through: p.through,
+                after_log: p.after_log,
+                switched: self.directory.phase == Phase::Switched,
+            }))
+    }
+}
+
+impl EntryIndex {
+    pub(crate) fn bind_legacy_provisional(
+        &self,
+        store: &Store,
+        sek: &Sek,
+        channel: &Digest32,
+        owner: LegacyProvisionalOwner,
+    ) -> Result<LegacyProvisionalState> {
+        if self.provisional_hidden.get() {
+            return Err(invalid("legacy provisional cleanup pending"));
+        }
+        let mut batch = store.batch()?;
+        let mut writer = self.write(&mut batch, sek, channel)?;
+        if let Some(state) = writer.directory.legacy_provisional {
+            if state.owner != owner {
+                return Err(invalid("another legacy request owns provisional state"));
+            }
+            drop(writer);
+            drop(batch);
+            return self.attach_legacy_provisional(store, sek, channel, owner);
+        }
+        // Only explicit legacy staging waits here. Normal current entries can continue
+        // using the independent active/provisional roots during local retirement.
+        if writer.directory.retired_provisional != Roots::default() {
+            return Err(Error::StreamRefused(
+                "legacy history waits for retired staging cleanup",
+            ));
+        }
+        if writer.directory.phase != Phase::Idle
+            || writer.directory.active.sparse.enabled
+            || writer.directory.history_instance != owner.instance
+            || writer.directory.provisional != Roots::default()
+        {
+            return Err(invalid(
+                "legacy provisional bind requires empty matching legacy room",
+            ));
+        }
+        let base = writer
+            .directory
+            .restart
+            .as_ref()
+            .ok_or(invalid("legacy restart state missing"))?
+            .feeds
+            .get(&owner.author)
+            .cloned()
+            .unwrap_or_default();
+        let state = LegacyProvisionalState {
+            owner,
+            base_seq: base.seq,
+            base_hash: base.hash,
+            tail_seq: base.seq,
+            tail_hash: base.hash,
+            first_claimed_ms: base.first_claimed_ms,
+            ended: base.ended,
+            pending_witness: 0,
+        };
+        writer.directory.legacy_provisional = Some(state);
+        writer.seal()?;
+        batch.commit()?;
+        self.committed();
+        self.legacy_attached.set(Some(owner));
+        Ok(state)
+    }
+    pub(crate) fn attach_legacy_provisional(
+        &self,
+        store: &Store,
+        sek: &Sek,
+        channel: &Digest32,
+        owner: LegacyProvisionalOwner,
+    ) -> Result<LegacyProvisionalState> {
+        if self.provisional_hidden.get() {
+            return Err(invalid("legacy provisional cleanup pending"));
+        }
+        let read = self.read(store, sek, channel)?;
+        let state = read
+            .directory
+            .legacy_provisional
+            .filter(|s| s.owner == owner)
+            .ok_or(invalid("legacy provisional owner changed"))?;
+        let base = read
+            .directory
+            .restart
+            .as_ref()
+            .and_then(|r| r.feeds.get(&owner.author))
+            .cloned()
+            .unwrap_or_default();
+        if base.seq != state.base_seq || base.hash != state.base_hash {
+            return Err(invalid("legacy provisional base or witness changed"));
+        }
+        self.legacy_attached.set(Some(owner));
+        Ok(state)
+    }
+    pub(crate) fn detach_legacy_provisional(&self, owner: LegacyProvisionalOwner) -> Result<()> {
+        match self.legacy_attached.get() {
+            Some(actual) if actual != owner => Err(invalid("legacy detach owner differs")),
+            _ => {
+                self.legacy_attached.set(None);
+                Ok(())
+            }
+        }
+    }
+    /// One exact-owner cleanup transaction. Foreign work is untouched; no-op paths do not seal.
+    pub(crate) fn cleanup_legacy_provisional(
+        &self,
+        store: &Store,
+        sek: &Sek,
+        channel: &Digest32,
+        owner: LegacyProvisionalOwner,
+    ) -> Result<bool> {
+        let mut batch = store.batch()?;
+        let mut writer = self.write(&mut batch, sek, channel)?;
+        if writer
+            .directory
+            .legacy_provisional
+            .is_none_or(|s| s.owner != owner)
+        {
+            return Ok(true);
+        }
+        if self.legacy_attached.get() == Some(owner) {
+            self.legacy_attached.set(None);
+        }
+        let (done, changed) = if matches!(writer.directory.phase, Phase::Building | Phase::Switched)
+        {
+            let promotion = writer
+                .directory
+                .promotion
+                .as_ref()
+                .ok_or(invalid("legacy cleanup promotion missing"))?;
+            if promotion.author != owner.author || promotion.sparse_head.is_some() {
+                return Err(invalid("legacy cleanup promotion owner differs"));
+            }
+            let cleanup_done = writer.cleanup_chunk()?;
+            let done = cleanup_done && writer.directory.provisional == Roots::default();
+            if done {
+                writer.directory.legacy_provisional = None;
+            }
+            (done, true)
+        } else if writer.directory.phase == Phase::Idle {
+            writer.quarantine_provisional()?
+        } else {
+            return Err(invalid("legacy cleanup during rebuild"));
+        };
+        if changed {
+            writer.seal()?;
+            batch.commit()?;
+            self.committed();
+        }
+        if done {
+            self.provisional_hidden.set(false);
+        }
+        Ok(done)
+    }
+    pub(crate) fn cleanup_legacy_publication(
+        &self,
+        store: &Store,
+        sek: &Sek,
+        channel: &Digest32,
+        owner: LegacyProvisionalOwner,
+    ) -> Result<bool> {
+        let mut batch = store.batch()?;
+        let mut writer = self.write(&mut batch, sek, channel)?;
+        match writer.directory.legacy_provisional {
+            None => return Ok(true),
+            Some(state) if state.owner != owner => {
+                return Err(invalid("legacy cleanup owner changed"))
+            }
+            Some(_) => {}
+        }
+        if writer.directory.phase == Phase::Idle && writer.directory.promotion.is_none() {
+            if writer.directory.provisional == Roots::default() {
+                writer.directory.legacy_provisional = None;
+                writer.seal()?;
+                batch.commit()?;
+                self.committed();
+                self.legacy_attached.set(None);
+            }
+            return Ok(true);
+        }
+        let promotion = writer
+            .directory
+            .promotion
+            .as_ref()
+            .ok_or(invalid("legacy cleanup publication absent"))?;
+        if writer.directory.phase != Phase::Switched
+            || promotion.author != owner.author
+            || promotion.sparse_head.is_some()
+        {
+            return Err(invalid("legacy cleanup publication phase differs"));
+        }
+        let done = writer.cleanup_chunk()?;
+        if done && writer.directory.provisional == Roots::default() {
+            writer.directory.legacy_provisional = None;
+            self.legacy_attached.set(None);
+        }
+        writer.seal()?;
+        batch.commit()?;
+        self.committed();
+        Ok(done)
+    }
+    pub(crate) fn begin_legacy_publication(
+        &self,
+        store: &Store,
+        sek: &Sek,
+        channel: &Digest32,
+        owner: LegacyProvisionalOwner,
+        publication: Publication<'_>,
+    ) -> Result<()> {
+        let mut batch = store.batch()?;
+        let mut writer = self.write(&mut batch, sek, channel)?;
+        let state = writer
+            .directory
+            .legacy_provisional
+            .filter(|s| s.owner == owner)
+            .ok_or(invalid("legacy publication owner changed"))?;
+        if !writer.directory.provisional_attached
+            || publication.witness.skeleton.author_id != owner.author
+            || publication.from != state.base_seq.saturating_add(1)
+            || publication.witness.skeleton.seq != state.pending_witness
+        {
+            return Err(invalid("legacy publication binding"));
+        }
+        writer.begin_promotion(publication)?;
+        writer.seal()?;
+        batch.commit()?;
+        self.committed();
+        Ok(())
+    }
+    pub(crate) fn advance_legacy_publication(
+        &self,
+        store: &Store,
+        sek: &Sek,
+        channel: &Digest32,
+        owner: LegacyProvisionalOwner,
+    ) -> Result<bool> {
+        let mut batch = store.batch()?;
+        let mut writer = self.write(&mut batch, sek, channel)?;
+        if writer
+            .directory
+            .legacy_provisional
+            .is_none_or(|s| s.owner != owner)
+            || !writer.directory.provisional_attached
+            || writer.directory.phase != Phase::Building
+        {
+            return Err(invalid("legacy publication owner or phase changed"));
+        }
+        let promotion = writer
+            .directory
+            .promotion
+            .as_ref()
+            .ok_or(invalid("legacy publication absent"))?;
+        if promotion.sparse_head.is_some() || promotion.author != owner.author {
+            return Err(invalid("legacy publication author differs"));
+        }
+        let ready = if promotion.cursor <= promotion.through {
+            writer.promotion_chunk()?;
+            writer
+                .directory
+                .promotion
+                .as_ref()
+                .is_some_and(|p| p.cursor > p.through)
+                && writer.directory.work.is_empty()
+        } else if writer.directory.work.is_empty() {
+            return Ok(true);
+        } else {
+            writer.fact_chunk()?
+        };
+        writer.seal()?;
+        batch.commit()?;
+        self.committed();
+        Ok(ready)
+    }
+}
+
 impl EntryRead for Write<'_, '_> {
+    fn get_sparse_published(&self, hash: &Digest32) -> Result<Option<Entry>> {
+        Source::Batch(self.batch).published_sparse_entry(
+            self.sek,
+            self.channel,
+            self.directory.active,
+            hash,
+        )
+    }
     fn clock(&self, hash: &Digest32) -> Result<Option<u64>> {
         if !self.directory.graph_ready {
             return Err(invalid("DAG facts not yet rebuilt"));
@@ -1890,16 +3338,25 @@ impl Write<'_, '_> {
         else {
             return Ok(());
         };
-        let entry = indexed_entry(
-            &Source::Batch(self.batch),
-            self.sek,
-            self.channel,
-            SegmentKind::ProvisionalLog,
-            at,
-        )?;
+        let hash = if let Some(p) = self
+            .directory
+            .promotion
+            .as_ref()
+            .filter(|p| p.author == *author && p.through == seq)
+        {
+            p.witness_hash
+        } else {
+            indexed_entry(
+                &Source::Batch(self.batch),
+                self.sek,
+                self.channel,
+                SegmentKind::ProvisionalLog,
+                at,
+            )?
+            .entry_hash()
+        };
         self.directory.provisional.sequence = self.change(roots.sequence, key, None)?;
-        self.directory.provisional.hash =
-            self.change(roots.hash, hashed(&entry.entry_hash()), None)?;
+        self.directory.provisional.hash = self.change(roots.hash, hashed(&hash), None)?;
         self.batch
             .delete_segment(self.channel, SegmentKind::ProvisionalLog, at.log)?;
         Ok(())
@@ -1990,11 +3447,16 @@ impl EntryIndex {
             .source()
             .open(sek, channel, SegmentKind::EntryIndex, DIRECTORY)?
             .ok_or(invalid("entry index directory missing"))?;
+        let mut directory = Directory::parse(&bytes)?;
+        directory.provisional_attached = directory
+            .legacy_provisional
+            .is_some_and(|s| Some(s.owner) == self.legacy_attached.get());
+        directory.provisional_hidden = self.provisional_hidden.get();
         Ok(View {
             transaction,
             sek,
             channel,
-            directory: Directory::parse(&bytes)?,
+            directory,
         })
     }
     pub(crate) fn in_batch<'a, 's>(
@@ -2021,6 +3483,14 @@ impl View<'_, '_> {
     }
 }
 impl EntryRead for View<'_, '_> {
+    fn get_sparse_published(&self, hash: &Digest32) -> Result<Option<Entry>> {
+        self.transaction.source().published_sparse_entry(
+            self.sek,
+            self.channel,
+            self.directory.active,
+            hash,
+        )
+    }
     fn clock(&self, hash: &Digest32) -> Result<Option<u64>> {
         if !self.directory.graph_ready {
             return Err(invalid("DAG facts not yet rebuilt"));

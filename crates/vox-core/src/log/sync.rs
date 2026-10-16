@@ -103,6 +103,43 @@ pub const SERVE_BUDGET: std::time::Duration = std::time::Duration::from_secs(30)
 /// generous fixed overhead for the skeleton/CBOR framing.
 pub const MAX_ENTRY_WIRE: usize = MAX_PAYLOAD_LEN + MAX_AUTHENTICATOR_LEN + 4096;
 
+/// One explicit legacy exchange. Legacy ENTRY has no chunk framing: its byte quantum must
+/// accommodate one legal whole entry, while the separate count bound limits tiny skeletons.
+pub(crate) const LEGACY_QUANTUM_ENTRIES: usize = 64;
+pub(crate) const LEGACY_CONTROL_BYTES: usize = 512 * 1024;
+pub(crate) const LEGACY_QUANTUM_BYTES: usize = MAX_ENTRY_WIRE + LEGACY_CONTROL_BYTES;
+/// Duplex serving wire plus one receive/decode/stage/seal record and bounded index scratch.
+/// The charge stays with the worker and its serving task until their actual buffers are gone.
+pub(crate) const LEGACY_BUFFER_ENVELOPE: usize = 5 * MAX_ENTRY_WIRE + 4 * 1024 * 1024;
+const LEGACY_MAX_AUTHORS: usize = 2048;
+const LEGACY_MAX_WANTS: usize = 64;
+// Both directions: frame id + CBOR array headers + tuples + four-byte length prefix.
+// HAVE tuple = array(3), two bytes32 and uint64; WANT = bytes32 and two uint64.
+const LEGACY_METADATA_BOUND: usize = 2
+    * (6 + (4 + 1 + 3 + LEGACY_MAX_AUTHORS * (1 + 34 + 9 + 34))
+        + (4 + 1 + 2 + LEGACY_MAX_WANTS * (1 + 34 + 9 + 9)));
+const _: () = assert!(LEGACY_METADATA_BOUND <= LEGACY_CONTROL_BYTES);
+
+fn entry_frame_bytes(wire_len: usize) -> usize {
+    // Canonical CBOR byte-string header, frame discriminator and transport length prefix.
+    let header = match wire_len {
+        0..=23 => 1,
+        24..=255 => 2,
+        256..=65535 => 3,
+        _ => 5,
+    };
+    wire_len.saturating_add(header + 1 + 4)
+}
+
+/// A contiguous legacy prefix cannot reach the peer's current tip without requested history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LegacyGap {
+    pub(crate) author: Digest32,
+    pub(crate) from: u64,
+    pub(crate) through: u64,
+    pub(crate) hash: Digest32,
+}
+
 /// An abstract bidirectional, reliable, ordered byte-frame transport.
 ///
 /// M5 defines this trait so the sync logic is transport-agnostic; the real QUIC
@@ -353,6 +390,9 @@ pub fn decode_frame(bytes: &[u8]) -> Result<SyncFrame> {
         FrameId::Have => {
             let mut d = Decoder::new(body);
             let n = d.array()?;
+            if n > LEGACY_MAX_AUTHORS {
+                return Err(Error::SizeLimitExceeded("legacy HAVE authors"));
+            }
             let mut v = Vec::with_capacity(n.min(1024));
             for _ in 0..n {
                 if d.array()? != 3 {
@@ -373,6 +413,9 @@ pub fn decode_frame(bytes: &[u8]) -> Result<SyncFrame> {
         FrameId::Want => {
             let mut d = Decoder::new(body);
             let n = d.array()?;
+            if n > LEGACY_MAX_WANTS {
+                return Err(Error::SizeLimitExceeded("legacy WANT ranges"));
+            }
             let mut v = Vec::with_capacity(n.min(1024));
             for _ in 0..n {
                 if d.array()? != 3 {
@@ -411,6 +454,9 @@ pub fn decode_frame(bytes: &[u8]) -> Result<SyncFrame> {
             let msg = slice.to_vec();
             d.finish()?;
             Ok(SyncFrame::Neg(msg))
+        }
+        FrameId::Meta | FrameId::Chunk | FrameId::Done | FrameId::Cancel | FrameId::Ack => {
+            Err(Error::MalformedBundle("bounded frame in legacy sync mode"))
         }
     }
 }
@@ -481,6 +527,97 @@ pub fn frontiers_of(dag: &Dag) -> Vec<FeedFrontier> {
             })
         })
         .collect()
+}
+
+/// Advertise only authenticated positions. An explicitly paused unsigned legacy suffix is
+/// local staging, never a peer's HAVE evidence or a reason to advance another node's feed.
+pub(crate) fn verified_frontiers_of(
+    dag: &Dag,
+    entries: &impl EntryRead,
+) -> Result<Vec<FeedFrontier>> {
+    dag.authors()
+        .into_iter()
+        .filter_map(|author| {
+            let seq = dag.verified_head(&author);
+            (seq != 0).then(|| {
+                let feed = dag
+                    .feed(&author)
+                    .ok_or(Error::MalformedAtRest("verified feed missing"))?;
+                let hash = if feed.max_seq() == seq {
+                    feed.head_hash()
+                } else {
+                    entries
+                        .get(&author, seq)?
+                        .ok_or(Error::MalformedAtRest("verified frontier missing"))?
+                        .entry_hash()
+                };
+                Ok(FeedFrontier {
+                    author_id: author,
+                    max_seq: seq,
+                    head_hash: hash,
+                })
+            })
+        })
+        .collect()
+}
+
+/// Automatic legacy reconciliation never asks for a missing historical interval. It can
+/// compare held positions for fork evidence, or accept a current directly linked successor.
+/// The old-head overlap is retained, so a divergent longer feed still produces fork evidence.
+pub(crate) fn wants_for_current(
+    dag: &Dag,
+    entries: &impl EntryRead,
+    remote: &[FeedFrontier],
+) -> Result<(Vec<WantRange>, Option<LegacyGap>)> {
+    let mut wants = Vec::new();
+    let mut gap = None;
+    let mut positions = 0usize;
+    for frontier in remote {
+        let author = frontier.author_id;
+        if dag.is_frozen(&author) {
+            continue;
+        }
+        let verified = dag.verified_head(&author);
+        let provisional = dag
+            .feed(&author)
+            .is_some_and(|feed| feed.max_seq() > verified);
+        if frontier.max_seq > verified
+            && (provisional || frontier.max_seq > verified.saturating_add(1))
+        {
+            gap.get_or_insert(LegacyGap {
+                author,
+                from: verified.saturating_add(1),
+                through: frontier.max_seq,
+                hash: frontier.head_hash,
+            });
+            if verified > 0 && positions < LEGACY_QUANTUM_ENTRIES {
+                wants.push(WantRange {
+                    author_id: author,
+                    from_seq: verified,
+                    to_seq: verified,
+                });
+                positions += 1;
+            }
+            continue;
+        }
+        for want in wants_for_unfrozen(dag, entries, std::slice::from_ref(frontier))? {
+            let count = usize::try_from(want.to_seq - want.from_seq + 1).unwrap_or(usize::MAX);
+            if positions.saturating_add(count) > LEGACY_QUANTUM_ENTRIES {
+                break;
+            }
+            positions += count;
+            wants.push(want);
+        }
+    }
+    if gap.is_some() {
+        // A missing v1 prefix may hide a room-wide revocation/End. Keep only overlap
+        // evidence until explicit recovery resolves it; other authors cannot bypass it.
+        for want in &mut wants {
+            want.to_seq = want.to_seq.min(dag.verified_head(&want.author_id));
+        }
+        wants.retain(|want| want.from_seq <= want.to_seq);
+    }
+    Ok((wants, gap))
 }
 
 /// Given the *remote* peer's `HAVE` frontiers and the local [`Dag`], compute the
@@ -565,6 +702,16 @@ pub fn entries_for_wants(
     entries: &impl EntryRead,
     wants: &[WantRange],
 ) -> Result<Vec<Vec<u8>>> {
+    entries_for_wants_bounded(dag, entries, wants, MAX_SERVE_ENTRIES, MAX_SERVE_BYTES)
+}
+
+pub(crate) fn entries_for_wants_bounded(
+    dag: &Dag,
+    entries: &impl EntryRead,
+    wants: &[WantRange],
+    max_entries: usize,
+    max_bytes: usize,
+) -> Result<Vec<Vec<u8>>> {
     let mut out = Vec::new();
     let mut bytes = 0usize;
     for (author, ranges) in merged_wants(wants) {
@@ -573,15 +720,22 @@ pub fn entries_for_wants(
         };
         for (from, to) in ranges {
             for entry in feed.range(entries, from, to) {
-                let wire = entry?.to_wire();
+                let entry = entry?;
+                let signed = entry.is_signed();
+                let wire = entry.to_wire();
+                let framed = entry_frame_bytes(wire.len());
                 if !out.is_empty()
-                    && (out.len() >= MAX_SERVE_ENTRIES
-                        || bytes.saturating_add(wire.len()) > MAX_SERVE_BYTES)
+                    && (out.len() >= max_entries || bytes.saturating_add(framed) > max_bytes)
                 {
                     return Ok(out);
                 }
-                bytes = bytes.saturating_add(wire.len());
+                bytes = bytes.saturating_add(framed);
                 out.push(wire);
+                if max_entries == LEGACY_QUANTUM_ENTRIES && signed {
+                    // One signed successor closes this legacy prefix quantum. Its receiver
+                    // may need explicit local publication quanta before another network run.
+                    break;
+                }
             }
         }
     }
@@ -955,6 +1109,21 @@ where
 /// task that started the session, not a worker already running it, so the worker stops at its next
 /// room step instead.
 pub trait SessionRoom {
+    /// Cumulative received ENTRY limits for this exchange, independent of apply-batch size.
+    fn receive_limits(&self) -> (usize, usize) {
+        (MAX_SERVE_ENTRIES, MAX_SERVE_BYTES)
+    }
+    /// Maximum entries under one room lock. Current legacy tip observations are separated
+    /// from contiguous application; explicit recovery still uses a bounded grouped prefix.
+    fn apply_entries_limit(&self) -> usize {
+        MAX_STAGED
+    }
+
+    /// Cumulative entry-wire bytes in this exchange, apart from one first legal signed
+    /// whole record. Framing and control bytes remain counted by receive_limits.
+    fn receive_entry_bytes_limit(&self) -> usize {
+        MAX_SERVE_BYTES
+    }
     /// The room's frontiers, for `HAVE`, and the room's generation read under the same lock
     /// (ADR-025 D1): everything stored up to that generation is covered by this `HAVE`.
     ///
@@ -996,6 +1165,8 @@ pub const MAX_STAGED_BYTES: usize = 1024 * 1024;
 /// What one received entry turned out to be (ADR-025 D3), from the predicates the DAG has.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryClass {
+    /// A signed current tip was retained as a prerequisite, without accepting its feed/body.
+    Observed,
     /// Accepted and stored.
     Stored,
     /// Already held.
@@ -1073,6 +1244,10 @@ impl SessionError {
 /// prefix in a structured partial outcome).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RoomSession {
+    /// Actual received protocol bytes, including each transport length prefix.
+    pub wire_received: usize,
+    /// Actual protocol bytes handed to the transport, including each length prefix.
+    pub wire_sent: usize,
     /// Entries newly persisted.
     pub applied: usize,
     /// Whether every position this side asked for was filled.
@@ -1241,8 +1416,26 @@ where
     S: SessionRoom + ?Sized,
 {
     let local = SessionError::Local;
-    let send = |t: &mut T, f: Vec<u8>| t.send(&f).map_err(|e| session_err(&e));
-    let recv = |t: &mut T| t.recv().map_err(|e| session_err(&e));
+    let (max_entries, max_bytes) = room.receive_limits();
+    let send = |t: &mut T, f: Vec<u8>, out: &mut RoomSession| {
+        out.wire_sent = out.wire_sent.saturating_add(f.len().saturating_add(4));
+        if out.wire_sent > max_bytes {
+            return Err(SessionError::ProtocolViolation);
+        }
+        t.send(&f).map_err(|e| session_err(&e))
+    };
+    let recv = |t: &mut T, out: &mut RoomSession| {
+        let frame = t.recv().map_err(|e| session_err(&e))?;
+        if let Some(frame) = &frame {
+            out.wire_received = out
+                .wire_received
+                .saturating_add(frame.len().saturating_add(4));
+            if out.wire_received > max_bytes {
+                return Err(SessionError::ProtocolViolation);
+            }
+        }
+        Ok(frame)
+    };
     let decoded = |r: Option<Vec<u8>>| -> std::result::Result<SyncFrame, SessionError> {
         match r {
             Some(frame) => decode_frame(&frame).map_err(|_| local(WireError::SyncModeUnsupported)),
@@ -1251,8 +1444,8 @@ where
         }
     };
 
-    send(t, encode_hello(SYNC_MODE_FRONTIER))?;
-    let SyncFrame::Hello(remote_hello) = decoded(recv(t)?)? else {
+    send(t, encode_hello(SYNC_MODE_FRONTIER), out)?;
+    let SyncFrame::Hello(remote_hello) = decoded(recv(t, out)?)? else {
         return Err(local(WireError::SyncModeUnsupported));
     };
     negotiate_mode(SYNC_MODE_FRONTIER, remote_hello).map_err(local)?;
@@ -1261,15 +1454,15 @@ where
     #[cfg(feature = "mutant-sender")]
     let (frontiers, unasked) = mutant::have(room, frontiers).map_err(local)?;
     out.gen_have = Some(gen);
-    send(t, encode_have(&frontiers))?;
-    let SyncFrame::Have(remote_have) = decoded(recv(t)?)? else {
+    send(t, encode_have(&frontiers), out)?;
+    let SyncFrame::Have(remote_have) = decoded(recv(t, out)?)? else {
         return Err(local(WireError::SyncModeUnsupported));
     };
 
     let my_wants = room.wants(&remote_have).map_err(local)?;
     let mut coverage = Coverage::new(&my_wants, &remote_have);
-    send(t, encode_want(&my_wants))?;
-    let SyncFrame::Want(their_wants) = decoded(recv(t)?)? else {
+    send(t, encode_want(&my_wants), out)?;
+    let SyncFrame::Want(their_wants) = decoded(recv(t, out)?)? else {
         return Err(local(WireError::SyncModeUnsupported));
     };
 
@@ -1278,7 +1471,13 @@ where
     let served = room.entries(&their_wants).map_err(local)?;
     #[cfg(feature = "mutant-sender")]
     let served = mutant::serve(served, unasked);
-    let frames: Vec<Vec<u8>> = served.iter().map(|w| encode_entry(w)).collect();
+    let frames: Vec<Vec<u8>> = served.into_iter().map(|w| encode_entry(&w)).collect();
+    out.wire_sent = frames.iter().fold(out.wire_sent, |sum, frame| {
+        sum.saturating_add(frame.len().saturating_add(4))
+    });
+    if out.wire_sent > max_bytes {
+        return Err(SessionError::ProtocolViolation);
+    }
     t.start_serving(frames, serve_deadline)
         .map_err(|e| session_err(&e))?;
 
@@ -1287,6 +1486,8 @@ where
     let mut staged: Vec<Vec<u8>> = Vec::new();
     let mut staged_bytes = 0usize;
     let mut positions: Vec<(Digest32, u64)> = Vec::new();
+    let mut received_entries = 0usize;
+    let mut received_entry_bytes = 0usize;
     let apply = |staged: Vec<Vec<u8>>,
                  positions: Vec<(Digest32, u64)>,
                  coverage: &mut Coverage,
@@ -1302,7 +1503,10 @@ where
                 EntryClass::Unlinked | EntryClass::Refused => {
                     out.refused += 1;
                 }
-                EntryClass::Stored | EntryClass::Duplicate | EntryClass::BodyArrived => {}
+                EntryClass::Stored
+                | EntryClass::Duplicate
+                | EntryClass::BodyArrived
+                | EntryClass::Observed => {}
             }
             if class.fills() {
                 coverage.fill(author, seq);
@@ -1332,7 +1536,7 @@ where
         )
     };
     loop {
-        let frame = match recv(t) {
+        let frame = match recv(t, out) {
             Ok(Some(frame)) => frame,
             Ok(None) => break,
             Err(error) => {
@@ -1358,8 +1562,21 @@ where
             )?;
             return Err(SessionError::DrainBudget(DRAIN_BUDGET.as_secs()));
         }
-        match decode_frame(&frame) {
+        let decoded_frame = decode_frame(&frame);
+        drop(frame);
+        match decoded_frame {
             Ok(SyncFrame::Entry(wire)) => {
+                received_entries = received_entries.saturating_add(1);
+                if received_entries > max_entries {
+                    flush(
+                        &mut staged,
+                        &mut positions,
+                        &mut staged_bytes,
+                        &mut coverage,
+                        out,
+                    )?;
+                    return Err(SessionError::ProtocolViolation);
+                }
                 let entry = match Entry::from_wire(&wire) {
                     Ok(entry) => entry,
                     Err(error) => {
@@ -1373,6 +1590,19 @@ where
                         return Err(local(wire_error_for(&error)));
                     }
                 };
+                received_entry_bytes = received_entry_bytes.saturating_add(wire.len());
+                if received_entry_bytes > room.receive_entry_bytes_limit()
+                    && !(received_entries == 1 && entry.is_signed())
+                {
+                    flush(
+                        &mut staged,
+                        &mut positions,
+                        &mut staged_bytes,
+                        &mut coverage,
+                        out,
+                    )?;
+                    return Err(SessionError::ProtocolViolation);
+                }
                 let (author, seq) = (entry.skeleton.author_id, entry.skeleton.seq);
                 if !coverage.admit(author, seq, &entry.entry_hash()) {
                     flush(
@@ -1399,7 +1629,7 @@ where
                 staged_bytes = staged_bytes.saturating_add(charge);
                 staged.push(wire);
                 positions.push((author, seq));
-                if staged.len() >= MAX_STAGED || staged_bytes >= MAX_STAGED_BYTES {
+                if staged.len() >= room.apply_entries_limit() || staged_bytes >= MAX_STAGED_BYTES {
                     flush(
                         &mut staged,
                         &mut positions,

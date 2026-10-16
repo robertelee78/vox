@@ -51,6 +51,7 @@ pub mod checkpoint;
 pub mod dag;
 pub mod entry;
 pub mod feed;
+pub mod history;
 pub mod negentropy;
 pub mod selfchannel;
 pub mod sync;

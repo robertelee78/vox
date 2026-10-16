@@ -100,6 +100,7 @@ pub struct QuicStreamTransport {
     peer_refused: Option<WireError>,
     /// The session's fence, if it has one (ADR-025 D1a).
     fence: Option<std::sync::Arc<Fence>>,
+    buffers: Option<std::sync::Arc<crate::node::history_budget::BufferCharge>>,
 }
 
 impl QuicStreamTransport {
@@ -127,6 +128,7 @@ impl QuicStreamTransport {
             frame_timeout,
             peer_refused: None,
             fence: None,
+            buffers: None,
         }
     }
 
@@ -134,6 +136,16 @@ impl QuicStreamTransport {
     #[must_use]
     pub fn fenced(mut self, fence: std::sync::Arc<Fence>) -> Self {
         self.fence = Some(fence);
+        self
+    }
+
+    /// Retain the admitted legacy exchange envelope until both duplex halves have dropped
+    /// their buffers, including a cancelled serving task that outlives its caller.
+    pub(crate) fn charged(
+        mut self,
+        charge: std::sync::Arc<crate::node::history_budget::BufferCharge>,
+    ) -> Self {
+        self.buffers = Some(charge);
         self
     }
 
@@ -228,8 +240,9 @@ impl Transport for QuicStreamTransport {
         self.closed = Some(code);
         // Reset the send side with the mapped QUIC code, and stop the recv side. A writer that
         // owns the send side resets it itself.
-        if let Some((_, cancel)) = self.writer.take() {
+        if let Some((task, cancel)) = self.writer.take() {
             let _ = cancel.send(close_code(code));
+            let _ = self.handle.block_on(task);
         }
         if let Some(send) = self.send.as_mut() {
             let _ = send.reset(close_code(code));
@@ -258,6 +271,14 @@ impl Transport for QuicStreamTransport {
             return Err(Error::Unreachable("quic transport: already serving"));
         };
         let bound = self.frame_timeout;
+        struct ChargedFrames {
+            frames: Vec<Vec<u8>>,
+            _charge: Option<std::sync::Arc<crate::node::history_budget::BufferCharge>>,
+        }
+        let served = ChargedFrames {
+            frames,
+            _charge: self.buffers.clone(),
+        };
         let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<quinn::VarInt>();
         let task = self.handle.spawn(async move {
             let outcome = {
@@ -266,7 +287,7 @@ impl Transport for QuicStreamTransport {
                     let pace = crate::log::sync::mutant::pace();
                     #[cfg(not(feature = "mutant-sender"))]
                     let pace: Option<std::time::Duration> = None;
-                    for f in &frames {
+                    for f in &served.frames {
                         if let Some(gap) = pace {
                             tokio::time::sleep(gap).await;
                         } else if std::time::Instant::now() >= deadline {
@@ -288,7 +309,7 @@ impl Transport for QuicStreamTransport {
                     code = &mut cancel_rx => Err(code),
                 }
             };
-            match outcome {
+            let result = match outcome {
                 Ok(r) => r,
                 // The session was closed with a code while serving: say so on the stream.
                 Err(Ok(code)) => {
@@ -302,7 +323,9 @@ impl Transport for QuicStreamTransport {
                     let _ = send.reset(close_code(WireError::TransportFailed));
                     Ok(())
                 }
-            }
+            };
+            drop(served);
+            result
         });
         self.writer = Some((task, cancel_tx));
         Ok(())
@@ -329,6 +352,9 @@ impl Transport for QuicStreamTransport {
             None => {
                 // Retired while serving: the writer resets the stream and stops.
                 let _ = cancel.send(close_code(WireError::TransportFailed));
+                // Its frames still own the caller's charged envelope. Cancellation requests
+                // an exit; it does not mean the writer has dropped those buffers already.
+                let _ = self.handle.block_on(task);
                 self.closed = Some(WireError::TransportFailed);
                 let _ = self.recv.stop(close_code(WireError::TransportFailed));
                 Err(Error::Unreachable("sync: the session was retired"))

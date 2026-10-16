@@ -90,7 +90,7 @@ async fn restart(account: &Account, helper: &Path, now: &str) -> Vec<NodeName> {
     match restart_checked(account, helper, now, false).await {
         Ok(nodes) => nodes,
         Err(e) => {
-            println!("the vox daemon was not restarted: {e}");
+            println!("the vox daemon restart did not finish: {e}");
             Vec::new()
         }
     }
@@ -226,21 +226,40 @@ async fn restart_checked(
         }
     }
     let t0 = Instant::now();
+    let mut preparing = None;
+    // Keep one authenticated connection to the replacement daemon continuously open while
+    // remembered nodes prepare. A detached daemon with no Ready node otherwise retires as idle
+    // after its startup grace, before this longer readiness bound expires.
+    let mut _held_after = None;
     let after = loop {
-        let greeting = DaemonClient::observe(&socket).await;
+        let greeting = DaemonClient::observe_held(&socket).await;
         if let Ok(d) = greeting {
-            if d.version == now
-                && d.pid != before.pid
-                && kept.iter().all(|k| {
-                    d.attached
-                        .iter()
-                        .any(|n| &n.name == k && n.state == NodeState::Attached)
-                })
-            {
-                break d;
+            if d.version == now && d.pid != before.pid {
+                let pending: Vec<_> = kept
+                    .iter()
+                    .filter(|k| {
+                        !d.attached
+                            .iter()
+                            .any(|n| &n.name == *k && n.state == NodeState::Attached)
+                    })
+                    .map(NodeName::as_str)
+                    .collect();
+                if pending.is_empty() {
+                    break d;
+                }
+                preparing = Some(pending.join(", "));
+                // The new greeting is established before assignment drops the prior one, so the
+                // daemon never observes an idle gap between readiness polls.
+                _held_after = Some(d);
             }
         }
         if t0.elapsed() >= REATTACH_WITHIN {
+            if let Some(nodes) = preparing {
+                return Err(AppError::Usage(format!(
+                    "the new daemon answered on vox {now}, but these remembered nodes did not become Ready within {} s: {nodes}; its log is {}",
+                    REATTACH_WITHIN.as_secs(), account.log_file().display(),
+                )));
+            }
             return Err(AppError::Usage(format!(
                 "the daemon did not return with its remembered nodes Ready on vox {now} within {} s; its log is {}",
                 REATTACH_WITHIN.as_secs(), account.log_file().display(),

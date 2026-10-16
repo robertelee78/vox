@@ -332,6 +332,11 @@ impl Read<'_> {
 }
 
 impl RenderView<'_> {
+    /// Only receipt membership and durable local read marks invalidate read indicators.
+    pub(crate) fn read_roots(&self) -> Result<[u64; 2]> {
+        let roots = readable_roots(&self.order.read.directory)?;
+        Ok([roots.read_pairs, roots.read_pending])
+    }
     /// Uses the rendered row's pinned snapshot for both signed and pending local reads.
     pub(crate) fn was_read(&self, message: &Digest32, reader: &Digest32) -> Result<bool> {
         self.order.read.was_read(message, reader)

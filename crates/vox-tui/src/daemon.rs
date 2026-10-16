@@ -631,7 +631,12 @@ fn attach_foreground(
     // time, as a piped line would give them; an empty one starts the daemon without them.
     if interactive {
         loop {
-            let shut = handle.view().channels.iter().filter(|c| !c.open).count();
+            let shut = handle
+                .view()
+                .channels
+                .iter()
+                .filter(|c| !c.open && !c.preparing)
+                .count();
             if shut == 0 {
                 break;
             }
@@ -658,8 +663,17 @@ fn say_held(handle: &vox_core::node::actor::NodeHandle, account: &Account, node:
     let view = handle.view();
     let (open, shut) = (
         view.channels.iter().filter(|c| c.open).count(),
-        view.channels.iter().filter(|c| !c.open).count(),
+        view.channels
+            .iter()
+            .filter(|c| !c.open && !c.preparing)
+            .count(),
     );
+    let preparing = view.channels.iter().filter(|c| c.preparing).count();
+    if preparing > 0 {
+        eprintln!(
+            "vox daemon: node {node} is Ready; {preparing} room(s) are preparing saved history"
+        );
+    }
     if shut > 0 {
         eprintln!(
             "vox daemon: node {node}: {open} room(s) open, {shut} still closed — a closed room \
@@ -939,8 +953,8 @@ async fn open_rooms_over_socket(client: &mut IpcClient, line: &str) {
         return;
     };
     let mut opened = false;
-    for (channel_id, _, open, _) in &rooms {
-        if *open {
+    for (channel_id, _, open, _, preparing) in &rooms {
+        if *open || *preparing {
             continue;
         }
         if let Ok(Frame::Ok) = client
@@ -957,7 +971,7 @@ async fn open_rooms_over_socket(client: &mut IpcClient, line: &str) {
         return;
     }
     if let Some((room, pass)) = line.split_once(' ') {
-        let ids: Vec<_> = rooms.iter().map(|(id, _, _, _)| *id).collect();
+        let ids: Vec<_> = rooms.iter().map(|(id, _, _, _, _)| *id).collect();
         if let Ok(id) = crate::tunnel_cli::resolve_prefix(room, &ids) {
             let _ = client
                 .request(&Request::OpenRoom {

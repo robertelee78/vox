@@ -291,6 +291,7 @@ pub struct Shares {
     paths: Paths,
     /// Weak, so the shares never keep a stopped node's command queue open.
     cmd: mpsc::WeakSender<(NodeCommand, oneshot::Sender<Outcome>)>,
+    post_slots: Arc<tokio::sync::Semaphore>,
     view: watch::Receiver<NodeView>,
     events: broadcast::Sender<NodeEvent>,
     /// Held across each change, so a stop and the tending of the same share never interleave.
@@ -328,6 +329,7 @@ impl Shares {
         cmd: mpsc::WeakSender<(NodeCommand, oneshot::Sender<Outcome>)>,
         view: watch::Receiver<NodeView>,
         events: broadcast::Sender<NodeEvent>,
+        post_slots: Arc<tokio::sync::Semaphore>,
         computer: Option<(
             Arc<crate::node::computer::Computer>,
             Arc<std::sync::atomic::AtomicU64>,
@@ -342,6 +344,7 @@ impl Shares {
             ))),
             paths,
             cmd,
+            post_slots,
             view,
             events,
             active: Mutex::new(BTreeMap::new()),
@@ -662,21 +665,20 @@ impl Shares {
     async fn announce(&self, channel_id: Digest32, text: &str) -> Result<(String, u64), String> {
         let me = self.view.borrow().identity.as_ref().map(|i| i.fingerprint);
         let mut events = self.events.subscribe();
-        let deadline = tokio::time::Instant::now() + POST_PATIENCE;
-        loop {
-            match self
-                .apply(NodeCommand::SendText {
-                    channel_id,
-                    text: text.to_owned(),
-                })
-                .await
-            {
-                Outcome::Done => break,
-                Outcome::Failed(Fault::RoomNotSynced) if tokio::time::Instant::now() < deadline => {
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                }
-                other => return Err(other.to_string()),
-            }
+        let Some(cmd) = self.cmd.upgrade() else {
+            return Err(Outcome::Failed(Fault::ShuttingDown).to_string());
+        };
+        match crate::node::actor::apply_post_command(
+            &cmd,
+            &self.post_slots,
+            channel_id,
+            text.to_owned(),
+            None,
+        )
+        .await
+        {
+            Outcome::Done => {}
+            other => return Err(other.to_string()),
         }
         let mut entry = String::new();
         let mut created = now_ms();

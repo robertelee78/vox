@@ -1968,6 +1968,18 @@ impl DaemonClient {
     /// Observe a local daemon without sending it anything, including across release versions.
     /// The returned value holds no connection and cannot issue a request.
     pub async fn observe(path: &std::path::Path) -> Result<DaemonGreeting> {
+        let d = Self::observe_held(path).await?;
+        Ok(DaemonGreeting {
+            version: d.version,
+            pid: d.pid,
+            attached: d.attached,
+        })
+    }
+
+    /// Observe a local daemon across release versions while retaining its connection.
+    /// The updater holds this greeting while it waits for remembered nodes, so a newly
+    /// restarted detached daemon with no Ready node cannot retire as idle underneath it.
+    pub async fn observe_held(path: &std::path::Path) -> Result<Self> {
         let d = Self::greet(path, None).await?;
         // A restart may signal this process. Bind the Hello pid to the kernel's peer identity,
         // rather than trusting a number supplied in the greeting or in a stale lock file.
@@ -1982,11 +1994,7 @@ impl DaemonClient {
                 detail: "the daemon's process id does not match its control socket".into(),
             }));
         }
-        Ok(DaemonGreeting {
-            version: d.version,
-            pid: d.pid,
-            attached: d.attached,
-        })
+        Ok(d)
     }
     /// Connect to the daemon's socket at `path`, checked as this user's own, and read its hello
     /// within [`crate::node::ipc::ANSWER_WITHIN`].
