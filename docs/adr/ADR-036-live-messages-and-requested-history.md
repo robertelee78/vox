@@ -1,8 +1,9 @@
 # ADR-036: Live Messages and Requested History
 
 - **Status**: Proposed for v0.4.6. Requirements reflect the decider's 2026-10-15
-  instructions; the remote authentication design below requires independent review before
-  implementation. No release acceptance is claimed.
+  instructions. The reviewed new-format design and concrete implementation contract below are
+  approved for implementation; existing-format activation remains unresolved. This ADR stays
+  Proposed until that separate decision and delivery are complete. No release acceptance is claimed.
 - **Date**: 2026-10-15
 - **Deciders**: Robert E. Lee
 - **Tags**: sync, history, control, authentication, startup, storage
@@ -46,7 +47,7 @@ node unlock. Other ready nodes and rooms MUST remain usable.
 ### H-2. Authenticate control independently of content history
 
 The proposed new signed skeleton explicitly distinguishes content from mandatory control and
-commits to the author's preceding control position/hash. Mandatory control includes governance,
+commits to the author's complete preceding control context by hash. Mandatory control includes governance,
 consent and revocation, key generations, retention, feed termination and authentication
 checkpoints. Content cannot carry an operative control action merely by disguising its payload.
 
@@ -55,7 +56,7 @@ dependencies learned through intervening content entries. The current strict-pas
 delegation, removal-wins and concurrent ordering rules in ADR-007 MUST be preserved. A plain
 list of the last few seen content hashes is not sufficient evidence for this purpose.
 
-A receiver follows and verifies the required control chain and its causal closure from its
+A receiver verifies the required counted control intervals and their causal closure from its
 last authenticated control position, using existing author keys and admission evidence. It MUST
 NOT authorize an action from an incomplete closure or accept another node's unsigned/evaluated
 snapshot as authority. Control work MUST itself be bounded and resumable; missing evidence
@@ -108,9 +109,8 @@ ordinary-content or addressed-key payload MUST NOT reach a room-governance handl
 
 Public readiness MUST NOT depend on private control closure. Public control may constrain private
 access, but no private key, Session identity, lifecycle record or body becomes public proof data.
-Every private page request still passes the current Drive and generation checks. The same proof
-machinery may be reused within the private scope where necessary; this does not merge its history
-or authority with the public room.
+Every private page request still passes the current Drive and generation checks. The existing signed private stream keeps its own format and authority; this decision does not
+introduce a second Merkle log for it or merge its history with the public room.
 
 The authenticated kind is public metadata for skeleton-only peers. It MUST NOT encode private
 Session activity or expose an encrypted key namespace or generation. A control count and public
@@ -120,7 +120,8 @@ coordinate commit to a typed record, not to a recipient's applied key state or a
 
 Live delivery MUST authenticate each admitted author's requested tail and its relationship to
 positions already held, without receiving every older content body or skeleton. Proofs MUST
-bind author, room, epoch, sequence, hash and format. Every overlapping held position MUST agree;
+bind author, room, scope, sequence, hash and format. Each leaf retains its signed epoch; the
+append-only tree binding spans epochs, as specified in H-6. Every overlapping held position MUST agree;
 conflicting valid author statements MUST retain the existing durable fork evidence and refusal.
 Termination and control changes cannot be hidden in a skipped content interval.
 
@@ -260,11 +261,9 @@ Session history retains ADR-031's join/drive boundary: a request for older room 
 grant earlier private Session steps or widen trust. Retention and unavailable-peer outcomes
 remain explicit. No automatic reset or deletion of existing node data is permitted.
 
-This remains a proposed protocol, not a complete byte-level specification. Before implementation,
-the implementer must pin the canonical encodings/domain tags, numeric field widths, proof and
-chunk limits, byte-accounting rules, aggregate resident-byte pool/reserves, request/continuation
-and cancellation states, and errors. The 128-entry/1 MiB and transfer-count defaults above do not
-define those remaining wire constants or approve legacy activation.
+H-6–H-8 fix the new-format implementation contract, including wire encodings, bounds and
+persistent states. Those definitions do not authorize existing-format activation.
+
 
 ### H-5. User-visible acceptance and release boundary
 
@@ -280,8 +279,323 @@ Each negative verdict MUST come from the product; apparatus failures are named s
 Run a proof once and repeat only where a change or observed failure reaches its claim. Existing
 greens and mutants remain bound to the source and claims they actually cover.
 
-H-1–H-5 are v0.4.6 obligations. A local restart optimization alone does not satisfy them. No
+H-1–H-8 are v0.4.6 obligations. A local restart optimization alone does not satisfy them. No
 requirement is to be silently deferred in order to call the release complete.
+
+### H-6. Concrete new-format wire contract
+
+This section is the implementation contract approved for new-format work. It does not claim
+that the described code exists. Reuse Vox's existing canonical CBOR `Encoder`/`Decoder`; no
+second serialization system or generic protocol framework is required. All arrays are definite,
+integers use their shortest unsigned encoding, and decoders require exact arity and end of input.
+Reject unknown kinds, scopes, flags and extra fields. Check lengths before allocation or copying.
+Hashes and fingerprints are 32-byte strings, request IDs are 16-byte strings and a composite
+signature is exactly 3,373 bytes. Sequence/count values are at most `2^48`, epochs and claimed
+milliseconds are `u64`, algorithm identifiers are `u16`, and kind/scope discriminants are `u8`.
+Arithmetic, proof indexes and offset sums use checked operations. Direct schema decoding has a
+maximum nesting depth of 32; using the low-level decoder does not waive that bound.
+
+**Entries and kinds.** Preserve tag `0x0001` version 1, its bytes, hash and signature domain
+exactly. Version 2 is an explicit supported version of that tag, signed with `vox/log-entry/v2`.
+Its canonical signed skeleton is this 16-field array:
+
+```text
+[author, seq, prev, lipmaa, room, epoch, [sign_algo, aead_algo],
+ payload_hash, payload_len, end_flag, claimed_ms, seen_refs,
+ kind, scope, pre_context_hash, recipient_option]
+```
+
+`seen_refs` is `[[author, seq, hash], ...]`, strictly sorted by author, with at most 16 distinct
+nonself authors. `recipient_option` is `[]`, except for a key package, where it is `[recipient]`.
+The entry hash remains SHA-256 of the canonical skeleton. The entry wire flattens those fields,
+then appends `auth_type`, `signature`, `payload_present` and, when present, `payload`: exactly
+19 or 20 fields. Presence and end flags are integers 0 or 1. A signed header is the body-absent
+19-field form. It is at most 8 KiB. Payload length is at most 16,777,216 bytes. Consequently
+`MAX_ENTRY_WIRE = 16 MiB + 8 KiB + 9` bounds the complete canonical record, including the
+largest CBOR byte-string length header. Signature type 1 is required for v2 controls and for
+newly admitted sparse entries. Existing legacy dropped-signature rules are unchanged; an
+unsigned sparse record cannot acquire authenticity just by arriving.
+
+| Kind | Sole dispatch |
+| --- | --- |
+| 0 | Ordinary content: text/read records; no control handler |
+| 1 | Existing `GovBody`, with its existing authority rules |
+| 2 | Authentication checkpoint |
+| 3 | Step policy |
+| 4 | Public Session floor |
+| 5 | Private-stream support declaration |
+| 6 | Addressed key package; only this kind has a recipient field |
+| 7 | Context update |
+| 8 | Feed termination |
+
+Kinds 1–8 contribute one to the control count; kind 0 contributes zero. Kinds 7 and 8 have an
+empty payload and SHA-256 of empty bytes as their payload hash. `end_flag == 1` if and only if
+kind is 8. Decrypted ordinary-content envelopes that encode Session lifecycle, legacy Session
+indexes or another control effect are refused, not dispatched by payload inspection. In the
+public feed, ordinary content also refuses drive-channel encrypted payload classes. Legacy
+private headers/indexes remain original-byte conversion evidence, not newly relabeled records.
+Scope 0 is the public room feed. Scope 1 is reserved and refused by this public format; existing
+private stream 13 retains its signed, Drive-protected format. A v2 public context cannot name a
+private context or require its plaintext. Key-package namespace and generation remain encrypted;
+its public coordinate is sufficient to compute the syntactic frontier.
+
+**Contexts, descriptors and heads.** Reserve struct tags `0x0022` for `LogHead` and `0x0023`
+for `ControlContext`, both version 1. A tree binding is `B = [2, room, scope, author]`.
+It deliberately excludes epoch. A context object is:
+
+```text
+C = [2, room, scope, [[author, seq, entry_hash], ...]]
+F = SHA256("vox/log-context/v1" || CBOR(C))
+D = [leaf_count, control_count, F, node_hash]
+```
+
+Coordinates are strictly sorted by author, have nonzero positions and contain at most 2,048
+authors. The 1,024-member operating bound and 2,048 hard protocol cap are not permission to
+truncate a frontier. Conflicting equal-position coordinates fail the join. The canonical empty
+context is `C` with an empty coordinate array. Descriptors are defined by these exact domains:
+
+```text
+empty: [0, 0, F_empty,
+        SHA256("vox/log-tree/empty/v1" || CBOR([B, F_empty]))]
+leaf:  [1, c, F_post,
+        SHA256("vox/log-tree/leaf/v1" || CBOR([B, entry_hash, c, F_post]))]
+node:  [n_left+n_right, c_left+c_right, F_join,
+        SHA256("vox/log-tree/node/v1" || CBOR([B, D_left, D_right, F_join]))]
+```
+
+A leaf uses the signed pre-context for content, or that context joined with its own coordinate
+for control. Internal children are nonempty and use RFC 9162's canonical largest-power-of-two
+split. Both count sums and the context join must be recomputed. A collapsed descriptor is a
+commitment, not a claim that all its omitted leaf semantics were independently checked.
+
+The head body is `H = [2, author, room, scope, tail_epoch, D]`. Its signature domain is
+`vox/log-head/v1`; its framed wire has these six fields followed by auth type 1 and the signature.
+`HeadID = SHA256("vox/log-head/v1" || CBOR(H))`, excluding randomized signature bytes.
+`tail_epoch` must match the authenticated terminal leaf when the head is promoted. It is not an
+epoch authority or a tree key. Leaf epochs are evaluated against their original strict past;
+the current request preamble is checked against current room admission. Epoch changes never
+reset positions, tree consistency, control obligations or termination. The present governance
+evaluator's epoch-zero behavior is preserved until separately changed; this format does not
+invent an epoch transition or legacy fence.
+
+**Proof objects.** All positions below are one-based; inclusion leaf index is `p - 1`.
+Descriptor orientation comes from indexes and canonical splits, never a peer-provided side bit.
+
+```text
+inclusion:   [p, n, [sibling_descriptor, ...]]
+consistency: [m, n, [proof_descriptor, ...]]
+receipt:     [HeadID, signed_parent_header_bytes, inclusion,
+              prefix_descriptor_of_size_p, consistency_p_to_n]
+control:     [HeadID, lo, hi, [token, ...]]
+```
+
+Inclusion siblings are in bottom-up RFC 9162 order, at most 48. Consistency uses RFC 9162 order,
+at most 49 descriptors, with `0 <= m <= n <= 2^48`. For `m == n`, the descriptors must be
+identical and the proof empty. An empty-prefix proof never bypasses an existing accepted root
+or unresolved legacy boundary. A receipt refers to separately supplied, verified head/context
+objects and the exact parent hash; required control coverage through `p` is still a separate
+obligation. Cache it by those exact bindings.
+
+Control tokens use canonical preorder traversal of the target root: `[0, D]` collapses a
+subtree, `[1, signed_entry_header_bytes]` expands a leaf, and `[2]` expands a branch followed
+by left and right children. Outside `[lo, hi]`, any subtree may be collapsed. Within that
+interval, only a zero-control subtree may be collapsed. The proof must consume the exact root,
+range and token list; missing/extra tokens, wrong splits, counts or joins reject it. A proof
+object has at most eight expanded control headers, 1,024 tokens and 256 KiB. Larger coverage
+uses successive proved position intervals under the same exact HeadID; it does not pretend the
+unproved remainder has zero controls. Frontier preimages travel as separate content-addressed
+objects, never as a repeated full map inside every sibling descriptor. Missing preimages or
+control bodies leave verification pending. A context object is at most 160 KiB.
+
+**Sync requests and frames.** Reuse stream kind Sync (1), its existing four-byte frame-length
+prefix and HELLO. Mode bit `0x04` selects this format; failure cannot fall back to archive-drain
+mode. The new preamble is `[2, room, current_epoch, scope, purpose, request_id]`, at most
+128 bytes. Purpose 0 is required control, 1 is live, and 2 is explicit history. The identifiable
+old two-field preamble does not authorize legacy conversion. A v2 stream serves one request
+direction; duplex streams still count against the daemon's shared budgets. HAVE is a sorted
+list of at most 2,048 `[author, size, HeadID]` hints, not verified state.
+
+WANT (`0x03`) is `[request_id, query]`, where query is exactly one of:
+
+```text
+[0, author]                                      # head
+[1, context_hash]                                # context object
+[2, HeadID, proof_kind, from, to]                 # proof
+[3, HeadID, seq, offset]                          # one entry/body continuation
+[4, HeadID, lo, hi, entry_limit, wire_limit]       # bounded page
+```
+
+Proof kinds 0/1/2 mean inclusion/consistency/control range. Inclusion requires `from == to == p`;
+consistency uses old/new sizes. Requests are bound to the authenticated author/scope and the
+original local operation; a peer cannot widen demand through a returned continuation.
+
+| Frame | Exact payload |
+| --- | --- |
+| `0x06 META` | `[request_id, object_type, body]`; types 0/1 are framed head/context bytes, 2 is `[proof_kind, proof]`, 3 is signed entry-header bytes |
+| `0x07 CHUNK` | `[request_id, entry_hash, offset, bytes]` |
+| `0x08 DONE` | `[request_id, status, continuation]` |
+| `0x09 CANCEL` | `[request_id]` |
+| `0x0A ACK` | `[request_id, entry_hash, next_persisted_offset]` |
+
+CHUNK bytes are raw payload bytes, with offsets relative to the signed `payload_len`; the
+signed header must arrive first. For encrypted content these are the existing ciphertext bytes.
+Only the complete payload hash plus signature/admission checks permit assembly into the existing
+canonical full entry record. Partial chunks are not individually authenticated by the final hash.
+Each direction permits at most one outstanding chunk of at most 64 KiB. The receiver sends ACK
+only after persisting that exact next offset. A duplicate ACK adds no credit; a wrong hash,
+request or offset rejects the response. An ACK grants only another chunk within this already
+authorized response's remaining byte credit. It does not authorize a new quantum or page.
+Check cancellation and deadlines around credit waits. Withheld credit cannot hold an actor lock.
+
+DONE status 0/1/2/3/4/5/6 means complete/more/required-evidence-unavailable/body-not-held/busy/
+cancelled/control-pending. Body-not-held is not an authenticated expiry claim; local retention
+and first-seen rules still decide that. Continuation is `[]` or
+`[query_kind, HeadID, lo, hi, next_seq, entry_hash_option, offset, entries_remaining]`, where
+`entry_hash_option` is `[]` or `[hash]`. The receiver recomputes its limits from its persisted
+original operation. Duplicate chunk bytes are idempotent only if they match. Completion of a
+large entry does not authorize the next page. Existing hard errors retain their meaning; new
+WireError `0x10 ProtocolLimits` reports malformed/oversize input, not ordinary budget exhaustion.
+Reserved error `0x06` stays reserved.
+
+**Hard work and memory bounds.** A response quantum is at most 1 MiB, counting every frame's
+four-byte prefix, CBOR, request ID, proof/context/signature and chunk bytes, but excluding QUIC/
+UDP headers. Reserve 512 bytes of that quantum for DONE. One logical page authorizes at most
+128 new entry headers; continuations carry the remaining count, not a reset count. A frame or
+proof object is at most 256 KiB. Work yields after the first of four composite verifications,
+32 descriptor reconstructions or 65,536 frontier-coordinate visits. One indivisible signature
+operation may finish; join/proof cursors must resume rather than restart their completed work.
+Persist through existing at-most-64-row/1-MiB commit slices. Missing essential control may require
+multiple such slices, but cannot monopolize the node actor or turn into ordinary archive demand.
+
+The transient application-buffer contract is **288 MiB across the daemon**: 192 MiB archive
+(two jobs of at most 96 MiB each, at most one per node, serving and receiving combined), plus
+96 MiB reserved for live/control. Within the reserve, 8 MiB guarantees small control progress
+and at most 88 MiB supports a large live/control record, with control-priority admission. A legal
+16-MiB control body is not restricted to the small 8-MiB pool; it must acquire that large-record
+envelope rather than deadlock or consume archive capacity. Archive jobs use at most one full
+entry at a time; the enforceable buffer envelope is `5 * MAX_ENTRY_WIRE + 4 MiB < 88 MiB`.
+Every real allocation/copy must fit an acquired permit, including ciphertext reads, plaintext,
+parsed payload, serialization and sealing copies. Drop obsolete copies between phases. This
+is a transient-buffer budget, not a measured RSS claim: bounded store/page caches and transport
+windows/queues remain separate. Acquire before allocation outside actor/room locks, and release
+only when the actual worker and buffers are gone. Archive transport credit must respect the
+single-chunk rule, not queue full windows behind the application permits.
+
+The fair archive wait queue holds at most 64 node requests, one coalesced pending request per
+node; excess work returns busy. Per node, only one unfinished archive operation, including
+paused staging, is retained; a new one must reuse it or require explicit cancellation. At most
+one incomplete 16-MiB entry body is staged for that operation. Private stream 13 retains its
+96-KiB record bound but caps each serialized page at 1 MiB, uses the shared admission budget,
+and requires explicit further demand instead of `more`/periodic draining. Its current Drive,
+grant generation and audience checks run on every request.
+
+### H-7. Durable state, publication and bounded demand
+
+A per-`(room, scope, author)` record must distinguish these states; they are not synonyms:
+
+1. **Observed:** a valid author-signed head is a hint. It establishes no continuity or authority.
+2. **Committed:** valid consistency advances a previously accepted descriptor. This establishes
+   append-only commitment, not semantic validity of all omitted leaves.
+3. **Control pending/ready:** exact-head interval coverage, parent receipts and control dependencies
+   are accumulated durably. Ready requires complete applicable evidence and existing deterministic
+   governance checks. Exhausted budgets and missing bodies never count as completed denial.
+4. **Individually admitted:** exact inclusion, required control closure and existing entry/body
+   checks pass. Such an entry may occupy a sparse position without changing the contiguous head.
+5. **Contiguous:** the existing feed's actually validated gap-free prefix. Never set it to an
+   observed, committed or sparse tip.
+
+A failed relay proof rejects that response, not the alleged author's identity. Attributable
+contradictions retain raw signed evidence and apply existing fork restrictions to the implicated
+author/branch. Reuse immutable proof results only under their exact authenticated bindings;
+recheck current local trust, fork restrictions, Drive generation and authority at action/use.
+Publish entry admission, derived control/render/order roots and obligation progress atomically.
+Unfinished work uses unpublished roots. A cancellation leaves already accepted cached rows intact.
+
+Use existing sealed segments and EntryIndex B-trees, adding only the roots/values needed for:
+
+- content-addressed head, context and proof objects, plus `(author, tree range) -> descriptor`;
+- `(author, seq) -> header/locator/admission flags`, independently of the contiguous feed;
+- accepted commitments, exact-head verified control intervals, receipt/dependency obligations
+  and missing position/body intervals;
+- explicit local demand and provisional chunk records keyed to request/entry/offset.
+
+The existing LogDb remains canonical complete entry bytes. A partial chunk's sealed provisional
+segment is not a canonical locator. Context objects up to 160 KiB reuse the existing sealed
+segment allocator; they are not forced into a 16-KiB index page or a new database. Root-swap
+publication uses the existing transaction/Directory boundary. Full signed heads and frontier
+maps must not be embedded in the at-most-1-MiB Directory or restart capsule: retain compact IDs,
+flags and root references, then read objects lazily. `PublishedFeed` continues to mean the
+actual contiguous prefix. Warm restart reads compact accepted state, reevaluates current local
+trust and starts only required control/live work; it does not scan all message bodies or resume
+an unfinished archive operation automatically.
+
+Bound unverified/pending state as well as accepted pages. At most one current observed-head
+reference per admitted author (2,048 author cap) is resident; additional signed evidence is
+stored lazily with its exact attributable bindings. At most 4,096 unresolved dependency keys per
+room are admitted at once; additional work remains pending before allocation. A process-wide
+lazy object cache is at most 64 objects and 4 MiB, subject to the shared buffer permits. Neither
+an unlimited pending-head map nor a restart-time load of all proof/context objects is permitted.
+Discarding an unaccepted relay hint to stay within a bound does not discard accepted evidence.
+
+An archive operation progresses through explicit local demand, cache lookup, bounded missing
+interval selection, fair permit wait, a single quantum and complete/more/pending/unavailable/
+cancelled. Persist its node/room instance, audience/grant generation, HeadID, interval/count
+limits, current entry/hash/length and persisted offset. Explicit resume rechecks authority and
+cannot widen that operation. ACK only grants within-quantum persisted-offset credit. Expiration
+or cancellation releases actual worker resources; retained state cannot secretly restart traffic.
+
+Keep existing cache-only APIs cache-only: `RoomPage`/`RoomViewPage`, watch refresh, retained row
+selection and notices must not acquire remote history as a side effect. CLI explicit newest/
+older operations and app Load older initiate the separately identified bounded demand; their
+cache read remains usable while fetch state is pending. IPC's existing frame and row-byte caps
+still apply, even where tighter than the network quantum. Large cached bodies must not be copied
+into every row/window merely because their wire transfer completed.
+
+### H-8. Sparse order and implementation boundaries
+
+Sparse delivery must not silently place a new tail behind the visible window because its own
+immediate predecessor is absent. It also must not fetch all old ancestry just to calculate an
+order. An authenticated receipt proves identity and control context, not a recursively evaluated
+HLC; do not add a signed claimed HLC and describe it as a verified full-history clock.
+
+For the v2 held set, derive ordering from held explicit `seen` parents, verified control-context
+coordinates and the nearest held lower position of the same author. The latter is a temporary
+transitive order edge when the exact own predecessor is absent, not proof that the gap is held
+or individually valid. An immutable context's maximum held clock may be cached only with the
+sealed order revision; it is a local display aggregate, never authenticated authority.
+
+When a gap fills, atomically splice the held same-author predecessor/new-entry/successor edges,
+removing the superseded temporary predecessor-to-successor edge. Recompute affected clocks in
+**both directions**, not only increases, using bounded durable work and atomic root publication.
+The no-held-parent genesis fallback can exceed a later supplied parent's capped clock, so an
+increase-only implementation is not a function of the final held set. Preserve first-seen times,
+retention, arrival cursors and late-row rules during reordering. Every node with the same held
+entry set and required authenticated context must converge to the same `(clock, hash)` order.
+
+Fresh delivery remains visible through the existing arrival cursor even when its provisional
+chronological position is above the current page. Retain a bounded arrival-visible view of at
+most 128 row references/summaries and at most 1 MiB serialized row data, subject to the existing
+tighter IPC limits; do not retain duplicate large bodies. On overflow, preserve the unconsumed
+arrival cursor and show the remaining unread/older count. Never silently advance past unseen
+rows, force late entries to the bottom or fabricate a contiguous position. Missing ordering
+ancestry and pending mandatory control are distinct UI states. Ordinary order gaps initiate no
+network request. The app's explicit page/window retention follows the same bounds.
+
+The smallest implementation packages and their handoff are:
+
+| Package | Existing seams and owned result |
+| --- | --- |
+| Codec and proof foundation | `wire.rs`, `cbor.rs`, `log/entry.rs`, and focused log context/tree/proof code integrated with those types. Versioned entry codec, typed dispatch, head/context/descriptor formats and bounded pure proof verification; no network or authority side effects. Return missing-object obligations explicitly. |
+| Admission and durable state | `log/feed.rs`, channel admission/governance, `entry_store.rs`, `entry_store/restart.rs` and DAG/order facts. Preserve contiguous Feed; add durable sparse/committed/control state and atomic publication/gap splice. No whole-body restart scan. |
+| Transport and shared scheduling | `log/sync.rs`, `node/syncstream.rs`, `transport/framing.rs`, `transport/stream_transport.rs`, actor/ports and host defaults. Lazy frame production, allocation permits, ACK credit, explicit demand and removal of public/private automatic archive continuation. The host shares one budget across its nodes. |
+| User demand and display | Existing IPC, `room_cli.rs`, FFI page calls and `NodeModel.readOlderTimeline`. Separate explicit fetch from cache queries, preserve instance/request stale-result guards, and bound the arrival-visible window. |
+
+The foundation API must take exact bindings and bounded borrowed input: decode header/context/
+head; compute leaf/join descriptor; verify inclusion/consistency/control interval; verify a
+parent receipt; and return verified values or explicit missing-object/invalid/limit outcomes.
+It must not retrieve data, advance a feed, apply governance or publish rows. The integration
+owner performs those transitions in the existing store transaction. Do not create an unused
+parallel log implementation while leaving the actual EntrySkeleton/sync path on v1 assumptions.
 
 ## Review questions
 
@@ -315,6 +629,12 @@ signer-specific blame, bounded frontier overflow, invalid-versus-missing control
 wire/resident-memory budgets. Their approvals do not establish implemented behavior or resolve
 the legacy decision.
 
+The integration owner accepted the concrete new-format contract after that adjudication, including
+explicit persisted-offset ACK credit, the 288-MiB transient-buffer contract and sparse clock
+recomputation in both directions. No additional whole-plan review cycle is required before
+new-format implementation; changed code still requires its scoped review and user-facing proof.
+Legacy activation remains a separate unresolved operator decision.
+
 The adjudication rejected the claimed root self-hash circularity, an extra independently signed
 receipt, guaranteed fork extraction from a withheld/invalid proof, replacement of signed causal
 context with a receiver's newer state, a key-package frontier dependent on private key
@@ -333,8 +653,10 @@ The operator has been asked whether the upgrade may perform a one-time bounded, 
 verification of missing legacy history, while preserving data and keeping other ready work
 responsive. This is a proposed exception for existing-format conversion, not permission already
 received, not an automatic archive drain on normal startup, and not a requirement deferred to
-another release. Until that decision and the exact protocol are resolved, H-1–H-5 remain in
-design and MUST NOT be described as implementation-ready.
+another release. The new-format contract in H-6–H-8 may be implemented independently. Existing-format activation
+remains blocked on that decision and MUST NOT be silently enabled by implementing the new codec,
+by an upgrade, or by opening a node. All H-1–H-8 obligations remain in v0.4.6; this separation is
+not permission to ship a known defect or defer the legacy decision.
 
 ## Consequences
 
@@ -360,6 +682,7 @@ partition limit: an unseen remote action cannot be known before communication.
 - [ADR-007: membership and governance](ADR-007-membership-consent-and-admin-governance.md)
 - [ADR-008: authenticated log and sync](ADR-008-replicated-authenticated-log-and-sync.md)
 - [ADR-018: product proofs](ADR-018-quality-bar-and-product-proof.md)
+- [ADR-023: room lifecycle and ordering](ADR-023-room-lifecycle.md)
 - [ADR-025: sync scheduling](ADR-025-sync-scheduling-switch-not-hub.md)
 - [ADR-026: daemon and nodes](ADR-026-daemon-and-nodes.md)
 - [ADR-031: agent setup and private Session history](ADR-031-agent-nodes-join-a-repo-room-by-themselves.md)
