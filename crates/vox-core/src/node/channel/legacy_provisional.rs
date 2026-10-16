@@ -2,11 +2,32 @@
 //! confer acceptance. The caller owns current authorization, budgets and the local request.
 
 use super::*;
+
+pub(crate) const LEGACY_HISTORY_REQUIRED: &str =
+    "Legacy history required; cached accepted messages are available; Resume or Cancel recovery";
 pub(crate) use entry_store::{
     LegacyProvisionalOwner, LegacyProvisionalState, LegacyPublicationProgress, LegacyRequired,
 };
 
 impl ChannelState {
+    /// Accepted history stays readable while a legacy gap or its exact publication is
+    /// paused. The missing prefix can contain control, so it cannot authorize current work.
+    /// This is a read-only check; it never resumes publication or network traffic.
+    pub(crate) fn legacy_cache_only(&self, store: &Store) -> Result<bool> {
+        let read = self.entries.read(store, &self.sek, &self.channel_id)?;
+        Ok(!read.sparse_enabled()
+            && (read.legacy_provisional().is_some() || read.legacy_required_any()))
+    }
+
+    pub(crate) fn require_legacy_current(&self, store: &Store) -> Result<()> {
+        if self.poisoned {
+            return Err(self.save_failure());
+        }
+        if self.legacy_cache_only(store)? {
+            return Err(Error::Profile(LEGACY_HISTORY_REQUIRED));
+        }
+        Ok(())
+    }
     pub(crate) fn legacy_startup_cleanup_pending(&self) -> bool {
         self.legacy_preparation != entry_store::Preparation::Ready
     }

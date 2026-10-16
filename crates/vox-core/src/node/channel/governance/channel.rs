@@ -306,6 +306,9 @@ impl ChannelState {
         store: &Store,
         now: crate::time::Ms,
     ) -> Result<usize> {
+        if self.legacy_cache_only(store)? {
+            return Ok(0);
+        }
         if self.poisoned {
             return Err(self.save_failure());
         }
@@ -315,6 +318,9 @@ impl ChannelState {
 
     /// Whether a bounded render turn still has work under current consent facts.
     pub fn governance_backfill_pending(&self, store: &Store) -> Result<bool> {
+        if self.legacy_cache_only(store)? {
+            return Ok(false);
+        }
         match self.current_governance(store) {
             Ok(view) => drop(view),
             Err(error) if super::refreshing(&error) => return Ok(false),
@@ -328,6 +334,7 @@ impl ChannelState {
 
     /// Projection callers retain their last good view while this returns refreshing.
     pub fn require_governance_ready(&self, store: &Store, now: crate::time::Ms) -> Result<()> {
+        self.require_legacy_current(store)?;
         self.checked_governance(store, now.get()).map(|_| ())
     }
 

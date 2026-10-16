@@ -249,6 +249,96 @@ struct View<'a> {
 }
 
 impl View<'_> {
+    fn accepted_cache_answer(&self, query: Query, bytes: usize) -> Answer<Reply> {
+        use super::legacy_provisional::LEGACY_HISTORY_REQUIRED;
+        // Counts, agreement and operation/attention authority require the completed current
+        // projection. Cached row selection and its stable cursors remain usable.
+        if !matches!(
+            &query,
+            Query::ViewPage { .. }
+                | Query::ViewRows { .. }
+                | Query::ViewRevision { .. }
+                | Query::DisplayRevision
+                | Query::ArrivalHead
+                | Query::NoticeState
+                | Query::NoticeExact { .. }
+                | Query::NoticePage { .. }
+                | Query::CursorPage { .. }
+                | Query::Arrival { .. }
+                | Query::Filtered { .. }
+                | Query::Read { .. }
+                | Query::Older { .. }
+                | Query::Exact { .. }
+        ) {
+            return Err(Failure::Request(LEGACY_HISTORY_REQUIRED));
+        }
+        let authority = self.ch.checked_governance(self.store, self.ch.now_hint)?;
+        let me = self.ch.me();
+        let answer = self.answer(query, bytes)?;
+        let check = |row: &MessageRow| -> Answer<()> {
+            // Owed placeholders are not accepted bodies. Do not expose unpublished
+            // projection work or label it as an empty historical message.
+            if row.owed {
+                return Err(Failure::Request(LEGACY_HISTORY_REQUIRED));
+            }
+            if row.author != me
+                && !self
+                    .ch
+                    .legacy_cache_trusted
+                    .as_ref()
+                    .is_some_and(|trusted| trusted.contains(&row.author))
+            {
+                return Err(Failure::Request(LEGACY_HISTORY_REQUIRED));
+            }
+            if row.author != me && !authority.can_read(&me, &row.author)? {
+                return Err(Failure::Request(LEGACY_HISTORY_REQUIRED));
+            }
+            let tracked = self
+                .rendered
+                .retention(&row.entry_hash)?
+                .ok_or(Error::MalformedAtRest("cached row retention missing"))?;
+            let entry = self
+                .rendered
+                .order()
+                .entry(&row.entry_hash)?
+                .ok_or(Error::MalformedAtRest("cached row source missing"))?;
+            if expired_at(
+                tracked.base(),
+                self.ch.now_hint,
+                self.ch
+                    .entry_retention(self.rendered.transaction(), &entry)?,
+            ) {
+                return Err(Failure::Request(LEGACY_HISTORY_REQUIRED));
+            }
+            Ok(())
+        };
+        match &answer {
+            Reply::Rows(rows) | Reply::Older { rows, .. } | Reply::Page { rows, .. } => {
+                for row in rows {
+                    check(row)?;
+                }
+            }
+            Reply::CursorPage(page) => {
+                for row in &page.rows {
+                    check(row)?;
+                }
+            }
+            Reply::NoticeExact(Some(row)) => check(&row.row)?,
+            Reply::NoticePage(page) => {
+                for row in &page.rows {
+                    check(&row.row)?;
+                }
+            }
+            Reply::Exact(row) => check(row)?,
+            Reply::DisplayRevision(_)
+            | Reply::ArrivalHead(_)
+            | Reply::NoticeState(_)
+            | Reply::NoticeExact(None) => {}
+            _ => return Err(Failure::Request(LEGACY_HISTORY_REQUIRED)),
+        }
+        Ok(answer)
+    }
+
     fn row(&self, hash: &Digest32) -> Result<Option<MessageRow>> {
         let order = self.rendered.order();
         if let Some(row) = self.rendered.row(hash)? {
@@ -1469,6 +1559,11 @@ impl View<'_> {
 impl ChannelState {
     /// One bounded turn of derived view-index catch-up: (more work, just became ready).
     pub(crate) fn advance_room_views(&self, store: &Store) -> Result<(bool, bool)> {
+        // A paused v1 request is not a scheduled view-rebuild job. Its accepted selector
+        // remains readable; an absent selector reports pending on that selected read.
+        if self.legacy_cache_only(store)? {
+            return Ok((false, false));
+        }
         let was_ready = self
             .entries
             .render_view(store, &self.sek, &self.channel_id)?
@@ -1515,6 +1610,18 @@ impl ChannelState {
                 }
                 query => query,
             };
+            if self.legacy_cache_only(store)? {
+                // The currently accepted fold, never the unpublished witness, authorizes
+                // this bounded cache selection. It performs no EntryIndex mutation.
+                let view = View {
+                    rendered: self
+                        .entries
+                        .render_view(store, &self.sek, &self.channel_id)?,
+                    ch: self,
+                    store,
+                };
+                return view.accepted_cache_answer(query, max_bytes);
+            }
             self.require_governance_ready(store, crate::time::Ms(now_ms))
                 .map_err(|e| match e {
                     Error::Profile(why) => Failure::Request(why),

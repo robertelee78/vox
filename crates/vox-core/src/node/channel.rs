@@ -999,6 +999,8 @@ pub struct ChannelState {
     /// Startup cleanup is local bounded maintenance. `CleanupPending` keeps the room private;
     /// `ReadyWithCleanup` permits current traffic while detached retired roots are reclaimed.
     legacy_preparation: entry_store::Preparation,
+    /// Current local trust used only to filter accepted-cache recovery reads.
+    legacy_cache_trusted: Option<BTreeSet<Digest32>>,
     /// Bounded cursors over retained key-package log rows and admitted-author drive hints.
     /// The actor opens one returned package at a time using its prekey ring.
     key_packages: key_package_queue::Queue,
@@ -1870,6 +1872,7 @@ impl ChannelState {
             display_rewrite: 0,
             entries,
             legacy_preparation: entry_store::Preparation::Ready,
+            legacy_cache_trusted: None,
             key_packages: key_package_queue::Queue::new(1),
             receivers: BTreeMap::new(),
             services: BTreeMap::new(),
@@ -2533,6 +2536,7 @@ impl ChannelState {
             display_rewrite: 0,
             entries,
             legacy_preparation,
+            legacy_cache_trusted: None,
             key_packages,
             receivers,
             services,
@@ -2786,6 +2790,7 @@ impl ChannelState {
             display_rewrite: 0,
             entries,
             legacy_preparation: entry_store::Preparation::Ready,
+            legacy_cache_trusted: None,
             key_packages: key_package_queue::Queue::new(1),
             receivers: BTreeMap::new(),
             services: BTreeMap::new(),
@@ -3742,6 +3747,7 @@ impl ChannelState {
     /// record the consent with [`ChannelState::issue_consent`], passing the same
     /// SKDM so the grant carries its `skdm_ref`.
     pub fn skdm_for_consent(&self, profile: &Profile) -> Result<Skdm> {
+        self.require_legacy_current(profile.store())?;
         if self.poisoned {
             return Err(self.save_failure());
         }
@@ -3761,6 +3767,7 @@ impl ChannelState {
     /// only be released from its current position, as [`Self::skdm_for_consent`] does;
     /// that is the honest limit of "full", not a silent narrowing.
     pub fn skdms_for_full_history(&self, profile: &Profile) -> Result<Vec<Skdm>> {
+        self.require_legacy_current(profile.store())?;
         if self.poisoned {
             return Err(self.save_failure());
         }
@@ -4095,6 +4102,7 @@ impl ChannelState {
         now_ms: u64,
         narrowing: bool,
     ) -> Result<u64> {
+        self.require_legacy_current(profile.store())?;
         if self.poisoned {
             return Err(self.save_failure());
         }
@@ -4211,6 +4219,7 @@ impl ChannelState {
     /// unrecoverable and the only honest release is the current position, exactly as
     /// [`ChannelState::skdm_for_consent`] does.
     pub fn rekey_skdm(&self, profile: &Profile) -> Result<Skdm> {
+        self.require_legacy_current(profile.store())?;
         if self.poisoned {
             return Err(self.save_failure());
         }
@@ -4575,7 +4584,10 @@ impl ChannelState {
     /// Mark this room poisoned after a real storage or consistency failure.
     /// Pending governance or subtype replay is retryable and keeps the last good display.
     pub fn poison(&mut self, e: &Error) {
-        if governance::refreshing(e)
+        if matches!(
+            e,
+            Error::Profile(legacy_provisional::LEGACY_HISTORY_REQUIRED)
+        ) || governance::refreshing(e)
             || Self::legacy_classification_refreshing(e)
             || Self::authorization_refreshing(e)
         {
@@ -4709,6 +4721,7 @@ impl ChannelState {
         chain_id: u64,
         iteration: u64,
     ) -> Result<Skdm> {
+        self.require_legacy_current(profile.store())?;
         if self.poisoned {
             return Err(self.save_failure());
         }
@@ -4748,6 +4761,7 @@ impl ChannelState {
     /// # Errors
     /// No signer, or a generation that cannot be released.
     pub fn rekey_skdm_for(&self, profile: &Profile, target: &Digest32) -> Result<Skdm> {
+        self.require_legacy_current(profile.store())?;
         if self.poisoned {
             return Err(self.save_failure());
         }
@@ -4834,6 +4848,7 @@ impl ChannelState {
         target: &Digest32,
         floor: u64,
     ) -> Result<Vec<Skdm>> {
+        self.require_legacy_current(profile.store())?;
         if self.poisoned {
             return Err(self.save_failure());
         }
@@ -5033,6 +5048,9 @@ impl ChannelState {
     /// Apply the node's Session rule before its next sync or sweep.
     pub fn set_node_step_retention(&mut self, store: &Store, seconds: u64) -> Result<()> {
         self.node_step_retention = seconds;
+        if self.legacy_cache_only(store)? {
+            return Ok(());
+        }
         self.forget_settled_owed(store)
     }
 
@@ -5101,6 +5119,9 @@ impl ChannelState {
     /// Takes effect at the next [`ChannelState::sweep_retention`].
     pub fn set_node_retention(&mut self, store: &Store, secs: u64) -> Result<()> {
         self.node_retention = secs;
+        if self.legacy_cache_only(store)? {
+            return Ok(());
+        }
         self.forget_settled_owed(store)
     }
 
@@ -5336,6 +5357,9 @@ impl ChannelState {
     pub fn sweep_retention(&mut self, store: &Store, now: crate::time::Ms) -> Result<usize> {
         let now_ms = now.get();
         self.now_hint = self.now_hint.max(now_ms);
+        if self.legacy_cache_only(store)? {
+            return Ok(0);
+        }
         match self.require_governance_ready(store, now) {
             Ok(()) => {}
             Err(error) if governance::refreshing(&error) => return Ok(0),
@@ -5463,6 +5487,9 @@ impl ChannelState {
     /// retention here is not forever: a room that keeps everything keeps its evidence too.
     /// Returns how many signatures were dropped.
     pub fn drop_checkpointed_signatures(&mut self, store: &Store) -> Result<usize> {
+        if self.legacy_cache_only(store)? {
+            return Ok(0);
+        }
         match self.require_governance_ready(store, crate::time::Ms(self.now_hint)) {
             Ok(()) if self.governance_display_current(self.now_hint) => {}
             Ok(()) => return Ok(0),
@@ -6547,6 +6574,7 @@ impl ChannelState {
         skdm: &Skdm,
         now: crate::time::Ms,
     ) -> Result<usize> {
+        self.require_legacy_current(store)?;
         let now_ms = now.get();
         if self.poisoned {
             return Err(self.save_failure());
@@ -6597,6 +6625,7 @@ impl ChannelState {
         store: &Store,
         trusted: &BTreeSet<Digest32>,
     ) -> Result<usize> {
+        self.legacy_cache_trusted = Some(trusted.clone());
         let before = self.receivers.len();
         self.receivers.retain(|(a, _), _| trusted.contains(a));
         let dropped = before - self.receivers.len();
@@ -6843,6 +6872,7 @@ impl ChannelState {
     /// The SKDM releasing this node's live drive key to `member` from its mark, and its
     /// generation, for [`Self::note_drive_delivered`] once sent.
     pub fn drive_skdm_for(&self, profile: &Profile, member: &Digest32) -> Result<(Skdm, u64)> {
+        self.require_legacy_current(profile.store())?;
         if self.poisoned {
             return Err(self.save_failure());
         }
@@ -8201,6 +8231,7 @@ impl ChannelState {
         shown: &[Digest32],
         now_ms: u64,
     ) -> Result<()> {
+        self.require_legacy_current(profile.store())?;
         if shown.len() > crate::node::content::MAX_READ_HASHES {
             return Err(Error::SizeLimitExceeded("read marks"));
         }
@@ -8289,6 +8320,9 @@ impl ChannelState {
         now_ms: u64,
         interval_ms: u64,
     ) -> Result<bool> {
+        if self.legacy_cache_only(profile.store())? {
+            return Ok(false);
+        }
         if self.poisoned {
             return Err(self.save_failure());
         }
@@ -9596,6 +9630,25 @@ impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
             // separate explicitly resumed quanta; no implicit full-prefix walk here.
             report.stored = 0;
             return report;
+        }
+        match ch.legacy_cache_only(self.store) {
+            Ok(true) => {
+                // Current overlap may discover a fork, but cannot refill or maintain the
+                // mutable roots owned by an explicit legacy publication.
+                if let Err(error) = ch.keep_forks(self.store) {
+                    *self.fatal.borrow_mut() = Some(error);
+                    report.fail = Some(crate::wire::WireError::TransportFailed);
+                }
+                report.stored = 0;
+                return report;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                ch.poison(&error);
+                *self.fatal.borrow_mut() = Some(error);
+                report.fail = Some(crate::wire::WireError::TransportFailed);
+                return report;
+            }
         }
         for author in ch.dag.authors() {
             let verified = ch.dag.verified_head(&author);

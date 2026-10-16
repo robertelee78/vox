@@ -10243,12 +10243,19 @@ impl Node {
                     (Some(shared), Some(profile)) => {
                         use crate::node::channel::history::Reply;
                         let mut room = shared.lock().await;
-                        match room.history_query(
-                            profile.store(),
-                            query,
-                            crate::node::ipc::rows_budget(),
-                            (self.clock)(),
-                        ) {
+                        let trusted = self.trust.trusted();
+                        let result = room
+                            .forget_keys_except(profile.store(), &trusted)
+                            .map_err(|error| error.to_string())
+                            .and_then(|_| {
+                                room.history_query(
+                                    profile.store(),
+                                    query,
+                                    crate::node::ipc::rows_budget(),
+                                    (self.clock)(),
+                                )
+                            });
+                        match result {
                             Ok(Reply::DisplayRevision(revision)) => {
                                 use sha2::{Digest, Sha256};
                                 let mut hash = Sha256::new();
@@ -17854,6 +17861,26 @@ impl Node {
             if !ch.advance_governance(profile.store(), now)?.ready {
                 return Ok(false);
             }
+            if ch.legacy_cache_only(profile.store())? {
+                // A paused exact v1 publication owns the mutable indexes. Publish only its
+                // accepted cache so Resume/Cancel remain reachable. Key release and mutation
+                // remain fenced; no private/projection/retention write enters the work roots.
+                ch.forget_keys_except(profile.store(), &self.trust.trusted())?;
+                ch.set_node_retention(
+                    profile.store(),
+                    self.node_retention.for_room(&ch.channel_id()),
+                )?;
+                ch.set_node_step_retention(
+                    profile.store(),
+                    self.node_step_retention.for_room(&ch.channel_id()),
+                )?;
+                let order = crate::node::consent_order::ConsentOrder::load(
+                    profile.store(),
+                    profile.signer()?,
+                )?;
+                ch.mark_decisions_on_open(profile.store(), &order)?;
+                return Ok(true);
+            }
             ch.require_governance_ready(profile.store(), now)?;
         }
         if ch.needs_session_upgrade() && ch.key_packages_pending() {
@@ -19937,6 +19964,7 @@ impl Node {
                     error,
                     Error::Profile(
                         "read selection changed; refresh and retry"
+                            | crate::node::channel::legacy_provisional::LEGACY_HISTORY_REQUIRED
                             | "this identity has left the room"
                             | "this room has ended"
                     ) | Error::SizeLimitExceeded(_)
