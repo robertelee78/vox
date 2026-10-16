@@ -5056,6 +5056,11 @@ pub struct Node {
     /// `(room, board)` pairs whose last publish round **failed**, with how many times in a row. A
     /// retry for each is scheduled on a backoff; see [`publish_retry_after`].
     publish_failures: std::collections::BTreeMap<(Digest32, Digest32), u32>,
+    /// `(room, board)` pairs with one [`NetEvent::PublishRetry`] timer already on its way. The
+    /// timer owns this token until it dequeues, including when another round cures the failure;
+    /// that lets the old event observe the cleared failure and become a no-op without colliding
+    /// with a newer timer for the same pair.
+    publish_retry_pending: BTreeSet<(Digest32, Digest32)>,
     /// One completion per room, after current detail is published and any required
     /// initial anchor round ends. Neither room keys nor a snapshot survive a wait.
     publish_waiters: BTreeMap<Digest32, RoomPublication>,
@@ -5656,6 +5661,7 @@ impl Node {
             republish_pending: std::collections::BTreeSet::new(),
             stale_held: std::collections::BTreeSet::new(),
             publish_failures: std::collections::BTreeMap::new(),
+            publish_retry_pending: BTreeSet::new(),
             publish_waiters: BTreeMap::new(),
             publication_after: None,
             publication_pending: false,
@@ -7773,6 +7779,9 @@ impl Node {
         let failures = self.publish_failures.entry(key).or_insert(0);
         *failures = failures.saturating_add(1);
         let wait = publish_retry_after(*failures);
+        if !self.publish_retry_pending.insert(key) {
+            return;
+        }
         let tx = self.net_tx.clone();
         tokio::spawn(async move {
             tokio::time::sleep(wait).await;
@@ -9992,18 +10001,25 @@ impl Node {
                 self.say_anchors_that_never_took(channel_id, serial);
             }
             NetEvent::PublishRetry { channel_id, board } => {
+                let key = (channel_id, board);
+                // The timer, not a later success or lifecycle turn, owns this token. Removing it
+                // sooner lets its old event erase a newer timer for the same pair. A success clears
+                // `publish_failures`, so a cured timer dequeues here and deliberately does nothing.
+                self.publish_retry_pending.remove(&key);
                 // **Cancelled if the room or the board has gone.** A room closed since, or a board
                 // this node no longer holds a connection to, is not retried: the board is published
                 // to again by `AnchorConnected` when it comes back, and a closed room has nothing to
                 // publish. Its failure count goes with it.
-                let conn = self.net.as_ref().and_then(|n| n.manager().existing(&board));
-                match conn {
-                    Some(conn) if self.channels.contains_key(&channel_id) => {
-                        self.publish_channel_to_anchor(&channel_id, &conn, PublishCause::Retry)
-                            .await;
-                    }
-                    _ => {
-                        self.publish_failures.remove(&(channel_id, board));
+                if self.publish_failures.contains_key(&key) {
+                    let conn = self.net.as_ref().and_then(|n| n.manager().existing(&board));
+                    match conn {
+                        Some(conn) if self.channels.contains_key(&channel_id) => {
+                            self.publish_channel_to_anchor(&channel_id, &conn, PublishCause::Retry)
+                                .await;
+                        }
+                        _ => {
+                            self.publish_failures.remove(&key);
+                        }
                     }
                 }
             }
@@ -17477,6 +17493,10 @@ impl Node {
         // asked for meanwhile is not handed out by a locked node (V210-96).
         self.on_board.clear();
         self.publish_trouble.clear();
+        // Retry timers may still deliver their public, key-free pair after this actor is locked.
+        // Clear the retry authority now; each timer keeps its pending token until dequeue, then
+        // sees no failure and becomes a no-op rather than racing a later unlock's timer.
+        self.publish_failures.clear();
         self.anchor_owed.clear();
         for (_, reply, _) in std::mem::take(&mut self.address_waiters) {
             let _ = reply.send(Outcome::Failed(Fault::Locked));
@@ -19053,6 +19073,11 @@ impl Node {
         }
         self.winding.remove(channel_id);
         self.records_renew_at.remove(channel_id);
+        // A timer already spawned for this room keeps its token until dequeue, where the missing
+        // failure makes it a no-op. Removing the token here would let that old event collide with
+        // a later rejoin of this room and consume a newer timer's token.
+        self.publish_failures
+            .retain(|(room, _), _| room != channel_id);
         self.departed_seen.remove(channel_id);
         self.fresh_details.remove(channel_id);
         // Kept: an anchor away now is still told when it connects. A join of the room again
