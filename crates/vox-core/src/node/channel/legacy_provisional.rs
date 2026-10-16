@@ -7,6 +7,30 @@ pub(crate) use entry_store::{
 };
 
 impl ChannelState {
+    pub(crate) fn legacy_startup_cleanup_pending(&self) -> bool {
+        self.legacy_preparation != entry_store::Preparation::Ready
+    }
+
+    pub(crate) fn legacy_startup_cleanup_blocks_current(&self) -> bool {
+        self.legacy_preparation == entry_store::Preparation::CleanupPending
+    }
+
+    pub(crate) fn schedule_legacy_startup_cleanup(&mut self) {
+        if self.legacy_preparation == entry_store::Preparation::Ready {
+            self.legacy_preparation = entry_store::Preparation::ReadyWithCleanup;
+        }
+    }
+
+    /// Advance one local startup-cleanup quantum. `true` means accepted current room state is
+    /// usable; detached retired roots may still require later background turns.
+    pub(crate) fn advance_legacy_startup_cleanup(&mut self, store: &Store) -> Result<bool> {
+        if self.legacy_preparation == entry_store::Preparation::Ready {
+            return Ok(true);
+        }
+        self.legacy_preparation = self.cleanup_legacy_orphan(store)?;
+        Ok(self.legacy_preparation != entry_store::Preparation::CleanupPending)
+    }
+
     /// Record only the exact authenticated current v1 header, never its body or peer HAVE.
     pub(crate) fn note_legacy_required(&self, store: &Store, tip: &Entry) -> Result<bool> {
         if self.poisoned {

@@ -459,6 +459,44 @@ pub(crate) fn legacy_owner(
         && state.cleanup.is_none()
         && state.legacy.is_some_and(|plan| plan.author == author))
 }
+
+/// The exact paused legacy owner retained in the one archive slot, if there is one.
+/// Reopen uses this bounded header read before touching provisional room roots. It does not
+/// create an active handle or authorize network work; an explicit Resume is still required.
+pub(crate) fn retained_legacy_owner(
+    profile: &Profile,
+) -> Result<Option<(Digest32, RequestId, [u8; 16], Digest32)>> {
+    let key = crate::atrest::seal::sek(profile.signer()?, b"vox/history-demand-sek/v1")?;
+    let scope = node_scope(profile.fingerprint(), Slot::Archive);
+    let Some(segment) =
+        profile
+            .store()
+            .snapshot()?
+            .get_segment_bounded(&scope, KIND, HEADER, STATE_BYTES)?
+    else {
+        return Ok(None);
+    };
+    let state = match decode(&key, &scope, &segment) {
+        Ok(state) => state,
+        Err(
+            Error::MalformedAtRest(_) | Error::AtRestUnlockFailed | Error::SizeLimitExceeded(_),
+        ) => {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let Some(plan) = state.legacy else {
+        return Ok(None);
+    };
+    Ok(
+        (!state.progress.terminal() && state.cleanup.is_none()).then_some((
+            state.binding.room,
+            state.request,
+            state.binding.instance,
+            plan.author,
+        )),
+    )
+}
 fn decode(
     key: &Sek,
     scope: &Digest32,

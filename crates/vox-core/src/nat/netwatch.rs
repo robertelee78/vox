@@ -416,11 +416,11 @@ impl NetWatch {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
             };
-            return tokio::select! {
+            tokio::select! {
                 r = self.settled_os() => r,
                 () = staged => Ok(NetworkEvents::default()),
                 () = unavailable => Err(std::io::Error::other("network observer read failed (proof apparatus)")),
-            };
+            }
         }
         #[cfg(not(feature = "test-knobs"))]
         self.settled_os().await

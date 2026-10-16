@@ -11,9 +11,9 @@ mod sparse;
 mod view;
 
 pub(crate) use sparse::{
-    sparse_control_evaluation, ControlEvaluation, PayloadValidation, SettledGovernanceControl,
-    SparsePayloadState, SparseValidation, SparseValidationStep, TypedSparseBody,
-    ValidatedSparseEntry, VerifiedParentPrefix,
+    sparse_control_evaluation, ControlEvaluation, PayloadValidation, SparsePayloadState,
+    SparseValidation, SparseValidationStep, TypedSparseBody, ValidatedSparseEntry,
+    VerifiedParentPrefix,
 };
 
 use super::entry_store::EntryIndex;

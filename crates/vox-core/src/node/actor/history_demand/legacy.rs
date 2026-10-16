@@ -251,7 +251,7 @@ impl Node {
                     if report.out.legacy_invalid {
                         demand::cancel(&context, request, &job).map_err(|e|e.to_string())?;
                         let _ = demand::reclaim(&context, request, &job).map_err(|e|e.to_string())?;
-                        { let mut room=lock_room(&shared,&dispatch.fence,deadline)?;
+                        { let room=lock_room(&shared,&dispatch.fence,deadline)?;
                           let _ = room.cleanup_legacy_provisional(&store, sync.owner).map_err(|e|e.to_string())?; }
                         let saved=demand::inspect(&context,&job).map_err(|e|e.to_string())?.ok_or("Legacy request disappeared.")?;
                         let mut status=saved_status(saved.state(),Some(dispatch.plan.author),None);

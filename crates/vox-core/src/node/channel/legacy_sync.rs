@@ -2,6 +2,7 @@
 //! existing signed-witness publication switches it into the room's authenticated roots.
 use super::legacy_provisional::{LegacyProvisionalOwner, LegacyProvisionalState};
 use super::*;
+use crate::node::store::Batch;
 
 #[derive(Clone, Copy)]
 pub(crate) struct LegacySync {

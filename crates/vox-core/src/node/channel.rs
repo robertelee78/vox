@@ -63,8 +63,7 @@ pub(crate) mod session_floor;
 pub(crate) mod session_projection;
 mod sparse_history;
 pub(crate) use sparse_history::{
-    HistoryEffectCursor, HistoryEffectProgress, HistoryHeadHint, HistoryHeadPage, HistoryHeader,
-    HistoryPayload, HistorySourceStart,
+    HistoryEffectCursor, HistoryEffectProgress, HistoryPayload, HistorySourceStart,
 };
 
 pub use diagnostics::SetAside;
@@ -997,6 +996,9 @@ pub struct ChannelState {
     /// entry hash -> the `LogDb` page it is stored in, so a signature dropped under a
     /// checkpoint (ADR-023 decision 3) can be rewritten in place.
     entries: entry_store::EntryIndex,
+    /// Startup cleanup is local bounded maintenance. `CleanupPending` keeps the room private;
+    /// `ReadyWithCleanup` permits current traffic while detached retired roots are reclaimed.
+    legacy_preparation: entry_store::Preparation,
     /// Bounded cursors over retained key-package log rows and admitted-author drive hints.
     /// The actor opens one returned package at a time using its prekey ring.
     key_packages: key_package_queue::Queue,
@@ -1867,6 +1869,7 @@ impl ChannelState {
             display_shown_at: 0,
             display_rewrite: 0,
             entries,
+            legacy_preparation: entry_store::Preparation::Ready,
             key_packages: key_package_queue::Queue::new(1),
             receivers: BTreeMap::new(),
             services: BTreeMap::new(),
@@ -1927,23 +1930,28 @@ impl ChannelState {
         let factor = SignatureIdentityFactor::new(signer);
         let sek = wrap.unwrap_sek(&factor, channel_id, channel_passphrase)?;
         let me = signer.fingerprint();
-        Self::open_with_sek(store, channel_id, sek, channel_passphrase, me, now)
+        let paused = crate::node::history_demand::retained_legacy_owner(profile)?
+            .filter(|(room, _, _, _)| room == channel_id)
+            .map(
+                |(_, request, instance, author)| legacy_provisional::LegacyProvisionalOwner {
+                    request,
+                    instance,
+                    author,
+                },
+            );
+        Self::open_with_sek_owned(store, channel_id, sek, channel_passphrase, me, now, paused)
     }
 
-    /// Open a channel from the store with its SEK already in hand: the half of [`Self::open`]
-    /// after the double-lock unwrap. A daemon reopening the rooms it held uses it (#208), with the
-    /// SEK and passphrase kept sealed under its identity in [`crate::node::open_rooms`]. The
-    /// passphrase is still needed: the room retains it to answer joins (ADR-005).
-    ///
-    /// It takes the store and not the profile, so that the reopening can run on a blocking task
-    /// with a [`Profile::store_handle`] rather than on the actor.
-    pub fn open_with_sek(
+    /// The post-unlock half of [`Self::open`]. The actor verifies paused legacy ownership before
+    /// moving keys to its blocking opener, so restart cannot mistake retained work for an orphan.
+    pub(crate) fn open_with_sek_owned(
         store: &Store,
         channel_id: &Digest32,
         sek: Sek,
         channel_passphrase: &[u8],
         me: Digest32,
         now: crate::time::Ms,
+        paused_legacy_owner: Option<legacy_provisional::LegacyProvisionalOwner>,
     ) -> Result<Self> {
         let now_ms = now.get();
         let manifest_seg = store
@@ -1993,7 +2001,10 @@ impl ChannelState {
         let entries = entry_store::EntryIndex::default();
         // Recover unpublished work before reading authoritative LogDb; rebuild only derived
         // locators when absent. No unsigned suffix is replayed after a crash.
-        entries.prepare(store, &sek, channel_id, genesis.body.created_ms)?;
+        let legacy_preparation =
+            entries.prepare_owned(store, &sek, channel_id, genesis.body.created_ms, |owner| {
+                Ok(Some(owner) == paused_legacy_owner)
+            })?;
         let mut entry_read = entries.read(store, &sek, channel_id)?;
 
         let mut next_log_id = 1u64;
@@ -2521,6 +2532,7 @@ impl ChannelState {
             display_shown_at: 0,
             display_rewrite: 0,
             entries,
+            legacy_preparation,
             key_packages,
             receivers,
             services,
@@ -2773,6 +2785,7 @@ impl ChannelState {
             display_shown_at: 0,
             display_rewrite: 0,
             entries,
+            legacy_preparation: entry_store::Preparation::Ready,
             key_packages: key_package_queue::Queue::new(1),
             receivers: BTreeMap::new(),
             services: BTreeMap::new(),
@@ -4897,7 +4910,7 @@ impl ChannelState {
                 .entries
                 .write(&mut batch, &self.sek, &self.channel_id)?;
             for proof in &proofs {
-                index.resolve_legacy_required_invalid(&proof.author_id, proof.seq)?;
+                index.resolve_legacy_required_invalid(&proof.author_id, proof.seq);
             }
             index.seal()?;
             batch.commit()

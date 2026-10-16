@@ -18,6 +18,10 @@ impl Node {
         };
         let Ok(signer) = profile.signer() else { return };
         let me = signer.fingerprint();
+        let Ok(retained_legacy) = crate::node::history_demand::retained_legacy_owner(profile)
+        else {
+            return;
+        };
         let now_ms = self.now_ms();
         self.store_recovery
             .retain(|id, _| self.channels.contains_key(id));
@@ -49,6 +53,7 @@ impl Node {
             retry.attempts = retry.attempts.saturating_add(1);
             let id = *id;
             let store = profile.store_handle();
+            let paused_legacy_owner = retained_legacy_owner_for(retained_legacy, id);
             let original = Arc::downgrade(shared);
             let tx = self.net_tx.clone();
             let secret_work = Arc::clone(&self.secret_work);
@@ -64,13 +69,14 @@ impl Node {
             tokio::spawn(async move {
                 let opened = secret_blocking(&secret_work, move || {
                     store.reopen_after_write_failure(&id)?;
-                    ChannelState::open_with_sek(
+                    ChannelState::open_with_sek_owned(
                         &store,
                         &id,
                         crate::atrest::sek::Sek::from_bytes(keys.sek),
                         &keys.passphrase,
                         me,
                         now_ms,
+                        paused_legacy_owner,
                     )
                 })
                 .await;
@@ -115,6 +121,9 @@ impl Node {
                 self.preparing_rooms.insert(
                     id,
                     RoomPreparation {
+                        legacy_cleanup_due: channel
+                            .legacy_startup_cleanup_blocks_current()
+                            .then_some(std::time::Instant::now()),
                         channel: tokio::sync::Mutex::new(channel),
                         reply: None,
                         reopening: false,
