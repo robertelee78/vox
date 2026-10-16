@@ -238,6 +238,7 @@ impl ChannelState {
     pub(crate) fn begin_history_source(
         &mut self,
         store: &Store,
+        request: [u8; 16],
         entry: &Entry,
         validated: &governance::ValidatedSparseEntry,
         now: crate::time::Ms,
@@ -307,6 +308,7 @@ impl ChannelState {
             &self.sek,
             &self.channel_id,
             entry_store::SparsePublication {
+                request,
                 entry,
                 validated,
                 first_log: self.next_log_id,
@@ -398,6 +400,35 @@ impl ChannelState {
             );
         }
         Ok(done)
+    }
+
+    /// A retired request may roll back only its own unpublished roots, or finish only its
+    /// own post-switch cleanup. The room lock covers this ownership check and transaction.
+    pub(crate) fn cleanup_history_source_owned(
+        &mut self,
+        store: &Store,
+        request: [u8; 16],
+    ) -> Result<bool> {
+        if self.history_read(store)?.sparse_publication_request() != Some(request) {
+            return Ok(true);
+        }
+        self.cleanup_history_source(store)
+    }
+
+    /// One local retirement slice. Another request's publication must finish first; it is
+    /// never rolled back merely to reclaim this request's verifier checkpoints.
+    pub(crate) fn cleanup_history_verifiers(
+        &self,
+        store: &Store,
+        request: [u8; 16],
+        after: Option<[u8; 64]>,
+    ) -> Result<(bool, Option<[u8; 64]>)> {
+        if self.history_publication_busy(store)? {
+            return Ok((false, after));
+        }
+        self.history_write(store, |index| {
+            index.cleanup_history_verifiers(request, after)
+        })
     }
 }
 

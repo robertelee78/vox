@@ -184,6 +184,8 @@ struct Promotion {
     reordered: u64,
     accepted: Option<crate::log::dag::PublishedFeed>,
     sparse_head: Option<Digest32>,
+    /// Exact local request owning a remote sparse publication; never an authority grant.
+    sparse_request: Option<[u8; 16]>,
 }
 
 #[derive(Clone, Debug)]
@@ -270,7 +272,7 @@ impl Directory {
                 e.array(0);
             }
             Some(p) => {
-                e.array(18)
+                e.array(19)
                     .bytes(&p.author)
                     .uint(p.from)
                     .uint(p.through)
@@ -299,6 +301,14 @@ impl Directory {
                 match p.sparse_head {
                     Some(head) => {
                         e.array(1).bytes(&head);
+                    }
+                    None => {
+                        e.array(0);
+                    }
+                }
+                match p.sparse_request {
+                    Some(request) => {
+                        e.array(1).bytes(&request);
                     }
                     None => {
                         e.array(0);
@@ -386,7 +396,7 @@ impl Directory {
         let promotion_arity = d.array()?;
         let promotion = match promotion_arity {
             0 => None,
-            14 | 16 | 17 | 18 => Some(Promotion {
+            14 | 16 | 17 | 18 | 19 => Some(Promotion {
                 author: d
                     .bytes()?
                     .try_into()
@@ -434,6 +444,19 @@ impl Directory {
                                 .map_err(|_| invalid("sparse promotion head"))?,
                         ),
                         _ => return Err(invalid("sparse promotion head arity")),
+                    }
+                } else {
+                    None
+                },
+                sparse_request: if promotion_arity >= 19 {
+                    match d.array()? {
+                        0 => None,
+                        1 => Some(
+                            d.bytes()?
+                                .try_into()
+                                .map_err(|_| invalid("sparse publication request"))?,
+                        ),
+                        _ => return Err(invalid("sparse publication request arity")),
                     }
                 } else {
                     None
@@ -585,6 +608,7 @@ impl Directory {
                 || !p.work.retained.valid_for(next_page)
                 || !p.work.sparse.valid_for(next_page)
                 || p.retired >= next_page
+                || (p.sparse_request.is_some() && p.sparse_head.is_none())
                 || (p.sparse_head.is_some()
                     && (p.accepted.is_some() || p.from != p.through || !p.work.sparse.enabled))
             {
@@ -1525,6 +1549,7 @@ pub(crate) struct Publication<'a> {
 /// One evidence-validated v2 source entry. Control effects still pass the existing
 /// governance fold; this publication never turns a sparse tip into a contiguous feed.
 pub(crate) struct SparsePublication<'a> {
+    pub request: [u8; 16],
     pub entry: &'a Entry,
     pub validated: &'a super::governance::ValidatedSparseEntry,
     pub first_log: u64,
@@ -1733,6 +1758,7 @@ impl Write<'_, '_> {
             reordered: 0,
             accepted: Some(accepted),
             sparse_head: None,
+            sparse_request: None,
         });
         self.directory.phase = Phase::Building;
         Ok(())
@@ -2014,6 +2040,28 @@ impl EntryIndex {
                 }
             }
             break;
+        }
+        // No request remains active across reopen. Recover only the capped verifier-work
+        // index, in small transactions, after the existing publication crash cleanup.
+        // Retained entries/receipts and authority/key-body obligations are untouched; saved
+        // explicit history demand has its own sealed body/cursor and requires Resume.
+        let mut after = None;
+        loop {
+            let mut batch = store.batch()?;
+            let mut writer = self.write(&mut batch, sek, channel)?;
+            if !writer.directory.active.sparse.enabled {
+                break;
+            }
+            let (done, next, changed) = writer.cleanup_abandoned_history_verifiers(after)?;
+            if changed {
+                writer.seal()?;
+                batch.commit()?;
+                self.committed();
+            }
+            if done {
+                break;
+            }
+            after = next;
         }
         let snapshot = store.snapshot()?;
         let directory = Source::Snapshot(&snapshot)

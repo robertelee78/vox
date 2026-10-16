@@ -652,6 +652,12 @@ impl Read<'_> {
         }
         Ok(Some((promotion.witness_hash, promotion.first_log)))
     }
+    pub(crate) fn sparse_publication_request(&self) -> Option<[u8; 16]> {
+        self.directory
+            .promotion
+            .as_ref()
+            .and_then(|promotion| promotion.sparse_request)
+    }
     /// A consistency-accepted exact head, including an older accepted head for which a
     /// verification cursor is still finishing. Observed hints do not satisfy this lookup.
     pub(crate) fn history_head_committed(
@@ -1182,6 +1188,7 @@ impl Write<'_, '_> {
     ) -> Result<()> {
         self.require_sparse_idle()?;
         let SparsePublication {
+            request,
             entry,
             validated,
             first_log,
@@ -1329,6 +1336,7 @@ impl Write<'_, '_> {
             reordered: 0,
             accepted: None,
             sparse_head: Some(included.head_id()),
+            sparse_request: Some(request),
         });
         self.directory.phase = Phase::Building;
         Ok(())
@@ -2235,6 +2243,45 @@ pub(crate) struct CursorBinding {
     pub generation: Digest32,
 }
 impl CursorBinding {
+    fn parse(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() > STATE_BYTES {
+            return Err(invalid("verifier binding size"));
+        }
+        let mut d = Decoder::new(bytes);
+        if d.array()? != 9 || d.uint()? != 1 {
+            return Err(invalid("verifier binding format"));
+        }
+        let binding = Self {
+            request: d
+                .bytes()?
+                .try_into()
+                .map_err(|_| invalid("verifier request"))?,
+            room: d
+                .bytes()?
+                .try_into()
+                .map_err(|_| invalid("verifier room"))?,
+            head: d
+                .bytes()?
+                .try_into()
+                .map_err(|_| invalid("verifier head"))?,
+            author: d
+                .bytes()?
+                .try_into()
+                .map_err(|_| invalid("verifier author"))?,
+            proof_kind: u8::try_from(d.uint()?).map_err(|_| invalid("verifier kind"))?,
+            from: d.uint()?,
+            through: d.uint()?,
+            generation: d
+                .bytes()?
+                .try_into()
+                .map_err(|_| invalid("verifier generation"))?,
+        };
+        d.finish()?;
+        if binding.bytes()? != bytes {
+            return Err(invalid("verifier binding encoding"));
+        }
+        Ok(binding)
+    }
     fn bytes(self) -> Result<Vec<u8>> {
         if self.proof_kind > 3
             || self.from > self.through
@@ -2373,6 +2420,113 @@ impl Read<'_> {
     }
 }
 impl Write<'_, '_> {
+    /// Retire only this request's unfinished verifier checkpoints. Accepted receipts and
+    /// authority/key-body obligations have independent lifetimes and are never removed here.
+    pub(crate) fn cleanup_history_verifiers(
+        &mut self,
+        request: [u8; 16],
+        after: Option<Key>,
+    ) -> Result<(bool, Option<Key>)> {
+        self.cleanup_verifiers(Some(request), after)
+    }
+
+    /// Reopen has no live verifier owner. Explicit history keeps its separate body/cursor;
+    /// a later Resume reacquires proofs rather than restoring an abandoned live operation.
+    pub(super) fn cleanup_abandoned_history_verifiers(
+        &mut self,
+        after: Option<Key>,
+    ) -> Result<(bool, Option<Key>, bool)> {
+        let before = self.directory.active.sparse.obligation_count;
+        let (done, next) = self.cleanup_verifiers(None, after)?;
+        Ok((
+            done,
+            next,
+            self.directory.active.sparse.obligation_count != before,
+        ))
+    }
+
+    fn cleanup_verifiers(
+        &mut self,
+        request: Option<[u8; 16]>,
+        mut after: Option<Key>,
+    ) -> Result<(bool, Option<Key>)> {
+        if self.directory.phase != Phase::Idle {
+            return Ok((false, after));
+        }
+        if !self.directory.active.sparse.enabled {
+            return Ok((true, None));
+        }
+        // Scan only the capped pending-work index, sixteen scalar rows per transaction.
+        // At most one sealed checkpoint is opened at a time; its proof is never restored.
+        for _ in 0..16 {
+            let seek = match after {
+                Some(key) => match dag_facts::successor(key) {
+                    Some(next) => next,
+                    None => return Ok((true, None)),
+                },
+                None => [0; 64],
+            };
+            let source = Source::Batch(self.batch);
+            let Some((key, value)) = source.first(
+                self.sek,
+                self.channel,
+                self.directory.active.sparse.obligations,
+                &seek,
+                0,
+            )?
+            else {
+                return Ok((true, None));
+            };
+            let Value::Number(id) = value else {
+                return Err(invalid("cleanup obligation locator"));
+            };
+            let obligation = Obligation::parse(&source.sparse_record(
+                self.sek,
+                self.channel,
+                id,
+                STATE_BYTES,
+            )?)?;
+            if obligation.key()? != key {
+                return Err(invalid("cleanup obligation binding"));
+            }
+            after = Some(key);
+            if obligation.kind != ObligationKind::Verifier {
+                continue;
+            }
+            let object = source
+                .number(
+                    self.sek,
+                    self.channel,
+                    self.directory.active.sparse.objects,
+                    &object_key(ObjectKind::Verifier, &obligation.object),
+                )?
+                .ok_or(invalid("cleanup verifier object missing"))?;
+            let binding = {
+                let bytes = source.sparse_record(
+                    self.sek,
+                    self.channel,
+                    object,
+                    ObjectKind::Verifier.limit(),
+                )?;
+                let mut d = Decoder::new(&bytes);
+                if d.array()? != 3 || d.uint()? != 1 {
+                    return Err(invalid("cleanup verifier format"));
+                }
+                let binding = CursorBinding::parse(d.bytes()?)?;
+                let _checkpoint = d.bytes()?;
+                d.finish()?;
+                if binding.room != *self.channel || binding.obligation()?.key()? != key {
+                    return Err(invalid("cleanup verifier ownership"));
+                }
+                binding
+            };
+            if request.is_none_or(|request| binding.request == request) {
+                self.finish_history_verifier_cursor(binding)?;
+            }
+        }
+        Ok((false, after))
+    }
+
     /// Replace one operation's cursor atomically with its exact pending-work pointer.
     /// Returns false before storing when the existing bounded work queue is full.
     pub(crate) fn keep_history_verifier_cursor(
