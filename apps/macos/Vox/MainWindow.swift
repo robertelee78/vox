@@ -217,6 +217,7 @@ private struct Sidebar: View {
             .frame(maxHeight: available.size.height * 0.4)
         }
         }
+        .background(PanelFill().ignoresSafeArea())
     }
 }
 

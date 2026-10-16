@@ -1181,6 +1181,23 @@ final class NodeModel: ObservableObject {
         return newest ? Array(kept.reversed()) : kept
     }
 
+    /// A current room page can lose its authority while retention or projection work crosses the
+    /// read. These refusals keep the visible snapshot and retry; lifecycle and access refusals do
+    /// not become transient merely because they are also `Failed`.
+    private static func transientRoomReadRefusal(_ reason: String) -> Bool {
+        switch reason {
+        case "The room changed while reading. Refresh and try again.",
+             "the room changed while reading; refresh and retry",
+             "the room is preparing selected history; retry",
+             "room governance is refreshing; try again when it is ready",
+             "the room is removing expired saved history; retry",
+             "the room is refreshing saved history; retry":
+            return true
+        default:
+            return false
+        }
+    }
+
     private func retainedRoomEntries(room: String, view: RoomView? = nil, instance: Data, ids: [String],
                                      current: () -> Bool) async throws -> [RoomMessage] {
         guard current(), !Task.isCancelled else { throw CancellationError() }
@@ -1255,11 +1272,8 @@ final class NodeModel: ObservableObject {
             // Reload that same room's authoritative newest page and roster while leaving the
             // displayed snapshot in place. Transport and other read failures keep the explicit
             // recovery path below.
-            if follows, case let VoxError.Failed(reason) = error {
-                if reason == "The room changed while reading. Refresh and try again." {
-                    await show(.room(id))
-                    return
-                }
+            if follows, case let VoxError.Failed(reason) = error,
+               Self.transientRoomReadRefusal(reason) {
                 if reason == "the room is preparing selected history; retry" {
                     let refreshed = await refresh(restartObservation: false)
                     guard refreshed, current() else { return }
@@ -1268,6 +1282,8 @@ final class NodeModel: ObservableObject {
                     }
                     return
                 }
+                await show(.room(id))
+                return
             }
             retireRefusedRoomRead(error)
             reportBackground(error)
