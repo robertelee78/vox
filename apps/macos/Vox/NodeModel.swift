@@ -3684,10 +3684,11 @@ final class NodeModel: ObservableObject {
         roomReadGeneration = UUID()
         invalidateRoomAnchorState(preservingSnapshot: true)
         rejectedRoomMark = nil
-        roomNeedsPage = false
-        // An ended stream does not establish whether a protected node is Locked or a
-        // passphraseless node is already Ready again. Display only the fresh snapshot.
-        releaseHistoryViews()
+        // A transport end invalidates the authority of the selected room, but not the bounded
+        // snapshot the person was already reading. Keep that timeline in place until the
+        // reconnect path replaces its page and inspector together. A confirmed detach/lock is
+        // handled by readFacts below and releases history only after the node state is known.
+        if case .room = selection { roomNeedsPage = true }
         ended = "Node \(node) is unavailable."
         machineStateKnown = false
         daemonReachable = text.localizedCaseInsensitiveContains("detached")
