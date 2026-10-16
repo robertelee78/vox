@@ -102,8 +102,10 @@ network presence from the start: there is no interim design with one socket per 
   when their node is not attached, saying how to attach it.
 
   Attaching MUST: take the node's directory lock, open its files, start its actor as its own task,
-  take its passphrase, reopen its saved rooms (ADR-010 AR-25), and start its tasks (wake loop,
-  notifier, anchor follow). Attaching an attached node MUST be idempotent. A second concurrent attach
+  authenticate its passphrase, restore current identity, trust and key-agreement state, and
+  start its tasks (wake loop, notifier, anchor follow). Saved room readiness is separate from
+  node readiness, as L-9 requires; archive reconstruction MUST NOT delay the attach reply.
+  Attaching an attached node MUST be idempotent. A second concurrent attach
   of one node MUST wait for the first and then succeed.
 - **L-3. Holders and detach.** A node attached implicitly MUST count its holders: the open held
   connections (L-7) and the registered agent sessions that act as it. When the count reaches zero, it
@@ -132,6 +134,28 @@ network presence from the start: there is no interim design with one socket per 
   connection, after a 1 s linger. It MUST NOT take that exit within 10 s of serving, so the client
   that started it, slow to connect on a loaded machine, finds it there. A daemon started by hand
   MUST run until stopped.
+
+- **L-9. Ready independently of archived messages** (decider requirements, 2026-10-15;
+  v0.4.6 implementation under review). A node MUST become Ready after its credentials and
+  current local security state have been authenticated, independently of its rooms' archive
+  sizes. A room needing essential control-state repair MUST say Preparing and refuse actions
+  whose authority it cannot establish; it MUST NOT pretend to be empty, ready or locked.
+  Other ready rooms and daemon control MUST remain usable. Normal restart MUST restore sealed,
+  bounded accepted-state and index roots, without scanning, decrypting or rewriting archived
+  message bodies. Authentication, fork evidence, current trust narrowing and pending durable
+  revocations MUST remain effective before the affected room is exposed.
+- **L-10. Repair and history are separate.** A missing or obsolete derived index MAY require
+  bounded, resumable local repair. Such repair MUST use parent-first reconstruction, bounded
+  transactions and short-lived read snapshots; it MUST NOT repeatedly rewrite descendants,
+  commit empty work or monopolize node control. Completion MUST survive restart. Normal
+  startup and becoming Ready MUST NOT enqueue a whole remote archive, including delayed
+  backfill. The distinct live/control and requested-history protocol is specified by ADR-036.
+  Local accepted restart state MUST NOT be treated as a transferable peer authority proof.
+- **L-11. Recovery evidence.** Extend the existing on-demand binary journeys to cover a normal
+  warm restart, the observed missing-index repair, fresh message exchange during requested
+  history work, and multiple kept nodes. Assert what the person can read and send and whether
+  control remains responsive. A failure MUST name PRODUCT or APPARATUS. Reuse unaffected
+  passing evidence; a new candidate alone does not require repeating a passed journey.
 
 ### 4. Control plane
 
@@ -244,6 +268,19 @@ network presence from the start: there is no interim design with one socket per 
     acceptance requirement. No new previous-release fixture or proof is required.
   - One node is one identity: a node holding a vault runs its anchor (`vox node`) as node
     `<name>-anchor`.
+
+- **F-4. v0.4.6 recovery installation** (2026-10-15; not yet delivered). Opening the existing
+  v0.4.5 node data MUST preserve identities, trust, rooms, messages, repository bindings and
+  supported Session records. Before writing an index representation v0.4.5 cannot read, the
+  daemon MUST advance `.daemon/format` under the account lock to a value v0.4.5 refuses.
+  Interrupted preparation MUST resume without resetting data. This is the observed recovery
+  path, not a requirement to support every historical release.
+  The update MUST install matching app, CLI and daemon helpers before restarting from the
+  actual managed executable path, then verify the replacement daemon's reported version and
+  kept-node outcomes. A successful binary replacement with an incomplete restart MUST be
+  reported as that partial outcome. Replacing only a binary MUST NOT be described as a safe
+  rollback after newer-format data has been written. App helper processes MUST inherit the
+  actual user environment unless an explicit complete override is supplied.
 
 ### 8. Process-wide state
 
