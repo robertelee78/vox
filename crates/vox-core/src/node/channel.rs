@@ -954,6 +954,8 @@ pub struct ChannelState {
     /// Last published scalar display only. Live authority is read from sealed facts.
     governance_display: governance::Display,
     governance_ready: bool,
+    /// A completed authenticated current-head flow may settle after bounded maintenance.
+    sparse_settle_pending: bool,
     /// Current presence per admitted author, bounded by AUTHORS_HARD_LIMIT; no event history.
     presence: BTreeMap<Digest32, governance::Presence>,
     sender: SenderChain,
@@ -1852,6 +1854,7 @@ impl ChannelState {
             forks_kept: 0,
             governance_display,
             governance_ready: false,
+            sparse_settle_pending: false,
             presence: BTreeMap::new(),
             sender,
             next_log_id: 1,
@@ -2510,6 +2513,7 @@ impl ChannelState {
             forks_kept,
             governance_display,
             governance_ready: false,
+            sparse_settle_pending: false,
             presence,
             sender,
             next_log_id,
@@ -2770,6 +2774,7 @@ impl ChannelState {
             forks_kept: 0,
             governance_display,
             governance_ready: false,
+            sparse_settle_pending: false,
             presence: BTreeMap::new(),
             sender,
             next_log_id: 1,
@@ -4051,6 +4056,21 @@ impl ChannelState {
         let Some(feed) = self.dag.feed(&me).filter(|f| !f.is_empty()) else {
             return Ok(false);
         };
+        // Each local generation change authors an entry. Once our own contiguous prefix
+        // has been recovered, its scalar sequence bounds every prior generation; v2 must
+        // not decrypt the archive merely to settle. Legacy keeps its existing scan below.
+        if self.uses_sparse_history(profile.store())? {
+            let used = feed.max_seq();
+            if self.sender.chain_id() > used {
+                return Ok(false);
+            }
+            let next_id = used
+                .checked_add(1)
+                .ok_or(Error::MalformedBundle("chain_id overflow"))?;
+            let next = SenderChain::new(&self.channel_id, self.epoch, &me, next_id, now_ms)?;
+            self.rotate_sender_to(profile, next, now_ms)?;
+            return Ok(true);
+        }
         // Generation 0 was this identity's first here whatever its feed shows.
         let mut used = 0u64;
         let entries = self

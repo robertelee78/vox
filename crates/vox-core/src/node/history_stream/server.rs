@@ -40,6 +40,15 @@ pub(super) async fn answer(
     inbox_generation: u64,
     inventory_added: &mut bool,
 ) -> Result<Status> {
+    let receipt_source;
+    let source = if preamble.purpose == Purpose::Control
+        && matches!(query, Query::Head(author) if author == source.peer)
+    {
+        receipt_source = source.for_own_head_receipt();
+        &receipt_source
+    } else {
+        source
+    };
     let request = preamble.request;
     if matches!(query, Query::Inventory) && preamble.purpose != Purpose::Control {
         return Err(Error::MalformedBundle("inventory requires control purpose"));
@@ -139,9 +148,31 @@ async fn respond(
             Ok((status, None))
         }
         Query::Head(author) => {
+            let receipt = author == source.peer;
             let found = source
                 .read(&job, 128 * 1024, move |room, store| {
-                    room.history_head(store, &author)
+                    let Some(head) = room.history_head(store, &author)? else {
+                        return Ok(None);
+                    };
+                    if receipt {
+                        // Delivery acknowledgement cannot precede the required body/effect.
+                        // Merely verifying a signed head or inclusion never proves receipt.
+                        let read = room.history_read(store)?;
+                        let Some(tip) = read.history_settled_tip(&author)? else {
+                            return Ok(None);
+                        };
+                        let Some(included) =
+                            read.history_inclusion_receipt(&head.id(), &author, head.root.leaves)?
+                        else {
+                            return Ok(None);
+                        };
+                        if tip.skeleton.seq != head.root.leaves
+                            || tip.entry_hash() != included.header().entry().entry_hash()
+                        {
+                            return Ok(None);
+                        }
+                    }
+                    Ok(Some(head))
                 })
                 .await?;
             let held = match found {

@@ -40,6 +40,128 @@ impl ChannelState {
             .sparse_enabled())
     }
 
+    /// An exact echo of our already applied, contiguous departure is delivery evidence.
+    /// It grants no authority, admits no source and needs no earlier body/proof fetch.
+    pub(crate) fn history_departure_matches(
+        &self,
+        store: &Store,
+        hint: crate::node::history_stream::HeadHint,
+    ) -> Result<bool> {
+        let own = self.me();
+        if hint.author != own || !self.has_left(&own) {
+            return Ok(false);
+        }
+        let read = self.history_read(store)?;
+        if read.publication_busy() {
+            return Ok(false);
+        }
+        let Some(head) = read.history_head(&hint.head)? else {
+            return Ok(false);
+        };
+        if head.binding.author != own
+            || head.root.leaves != hint.size
+            || !read.history_head_committed(&hint.head, head.binding)?
+            || read
+                .sparse_author(&own, LogScope::Public)?
+                .is_none_or(|s| s.committed != Some(hint.head))
+        {
+            return Ok(false);
+        }
+        let Some(included) = read.history_inclusion_receipt(&hint.head, &own, hint.size)? else {
+            return Ok(false);
+        };
+        let entry = included.header().entry();
+        Ok(read
+            .restart_state()
+            .and_then(|state| state.feeds.get(&own))
+            .is_some_and(|feed| feed.seq == hint.size && feed.hash == entry.entry_hash())
+            && self
+                .presence
+                .get(&own)
+                .is_some_and(|p| p.last == (hint.size, false)))
+    }
+
+    /// Only the actor's completed authenticated hinted flow may arm this transition.
+    /// Inventory and intermediate source/effect publication never establish settlement.
+    pub(crate) fn note_history_head_complete(
+        &mut self,
+        store: &Store,
+        hint: crate::node::history_stream::HeadHint,
+    ) -> Result<Option<u64>> {
+        if self.history_departure_matches(store, hint)? {
+            return Ok(Some(
+                self.generation().load(std::sync::atomic::Ordering::Relaxed),
+            ));
+        }
+        let read = self.history_read(store)?;
+        let Some(head) = read.history_head(&hint.head)? else {
+            return Ok(None);
+        };
+        if head.binding.author != hint.author
+            || head.root.leaves != hint.size
+            || !read.history_head_committed(&hint.head, head.binding)?
+        {
+            return Ok(None);
+        }
+        let Some(included) = read.history_inclusion_receipt(&hint.head, &hint.author, hint.size)?
+        else {
+            return Ok(None);
+        };
+        if !read.history_effect_finished(&included.header().entry().entry_hash())? {
+            return Ok(None);
+        }
+        drop(read);
+        self.sparse_settle_pending |= !self.settled;
+        Ok(None)
+    }
+
+    pub(crate) fn sparse_settlement_pending(&self) -> bool {
+        self.sparse_settle_pending
+    }
+
+    pub(crate) fn sparse_settlement_ready(
+        &self,
+        store: &Store,
+        now: crate::time::Ms,
+    ) -> Result<bool> {
+        if !self.sparse_settle_pending || self.settled {
+            return Ok(false);
+        }
+        let read = self.history_read(store)?;
+        if read.publication_busy() {
+            return Ok(false);
+        }
+        // Sparse settlement must not pretend an authenticated own tail is a contiguous
+        // own feed. Missing own ancestry/Lipmaa evidence remains truthfully unsettled;
+        // local authoring still uses the existing contiguous, fork-checked append path.
+        let own = self.me();
+        let contiguous = self.dag.verified_head(&own);
+        if read
+            .history_settled_tip(&own)?
+            .is_some_and(|tip| tip.skeleton.seq > contiguous)
+        {
+            return Ok(false);
+        }
+        if let Some(state) = read.sparse_author(&own, LogScope::Public)? {
+            // A failed proof fetch must not erase knowledge of a signed higher own head.
+            // Both slots are bounded scalars; neither requires an ancestry/body scan.
+            for id in [state.observed, state.committed].into_iter().flatten() {
+                if read
+                    .history_head(&id)?
+                    .is_none_or(|head| head.root.leaves > contiguous)
+                {
+                    return Ok(false);
+                }
+            }
+        }
+        drop(read);
+        match self.require_governance_ready(store, now) {
+            Ok(()) => Ok(true),
+            Err(error) if Self::governance_refreshing(&error) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     fn require_history_source_boundary(&self, entry: &Entry) -> Result<()> {
         if entry.skeleton.channel_id != self.channel_id
             || !self.admission.is_admitted(

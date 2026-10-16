@@ -353,6 +353,25 @@ impl Node {
                 continue;
             }
             if returned.flow.done() {
+                if !returned.flow.archive && !returned.flow.inventory {
+                    if let Some(head) = returned.flow.authenticated_head {
+                        let event = NetEvent::BoundedHeadCompleted {
+                            channel_id: work.room,
+                            instance: Arc::downgrade(&returned.flow.shared),
+                            head,
+                            epoch: returned.flow.epoch,
+                            room_instance: returned.flow.instance,
+                            generation: returned.flow.generation,
+                        };
+                        if self.net_tx.try_send(event).is_err() {
+                            // Retain the charged completed flow and its in-flight hint until
+                            // the actor can receive the exact completion; never lose this edge.
+                            self.bounded_sync.ready[index] = Some(returned.flow);
+                            self.sched_rooms.insert(work.room);
+                            continue;
+                        }
+                    }
+                }
                 if let Some(status) = returned.flow.archive_status.take() {
                     if let Some(request) = status.request {
                         self.history_demand
@@ -374,6 +393,10 @@ impl Node {
                         .flatten()
                         .any(|flow| flow.room == work.room && flow.peer == work.peer)
                         || self.history_hints.pending(work.room, work.peer)
+                        || self
+                            .leave_waiters
+                            .iter()
+                            .any(|(r, _, _, _)| *r == work.room)
                         || self
                             .bounded_sync
                             .required
@@ -486,6 +509,40 @@ impl Node {
                     return false;
                 };
 
+                // Inventory must first advertise the new local departure. Once that fixed
+                // exchange completes, probe only our own exact head; no archive is followed.
+                let departure_hint = if self.leave_waiters.iter().any(|(r, generation, _, _)| {
+                    *r == room
+                        && self
+                            .ports
+                            .get(&(room, peer))
+                            .is_some_and(|p| p.done_gen >= *generation)
+                }) {
+                    let Some(_read_charge) = state_job.reserve(4 * 1024 * 1024) else {
+                        return false;
+                    };
+                    let Ok(channel) = shared.try_lock() else {
+                        return false;
+                    };
+                    match channel.history_head(&store, &node) {
+                        Ok(Some(head)) => {
+                            let hint = stream::HeadHint {
+                                author: node,
+                                head: head.id(),
+                                size: head.root.leaves,
+                            };
+                            channel
+                                .history_departure_matches(&store, hint)
+                                .ok()
+                                .filter(|yes| *yes)
+                                .map(|_| hint)
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+
                 let control = match crate::node::history_demand::Context::current_unlocked(
                     profile,
                     Purpose::Control,
@@ -536,7 +593,7 @@ impl Node {
                             .and_then(|at| self.bounded_sync.required.remove(at))
                             .map(|(_, _, head, seq)| (head, seq));
                         let hint = if required.is_none() {
-                            self.history_hints.take(room, peer)
+                            departure_hint.or_else(|| self.history_hints.take(room, peer))
                         } else {
                             None
                         };
@@ -549,6 +606,7 @@ impl Node {
                             live,
                             control,
                             hint,
+                            departure_hint.is_some() && required.is_none(),
                             required,
                             state_charge,
                             self.bounded_sync.body_slots.clone(),
@@ -586,7 +644,7 @@ impl Node {
                         .and_then(|at| self.bounded_sync.required.remove(at))
                         .map(|(_, _, head, seq)| (head, seq));
                     let hint = if required.is_none() {
-                        self.history_hints.take(room, peer)
+                        departure_hint.or_else(|| self.history_hints.take(room, peer))
                     } else {
                         None
                     };
@@ -599,6 +657,7 @@ impl Node {
                         live,
                         control,
                         hint,
+                        departure_hint.is_some() && required.is_none(),
                         required,
                         state_charge,
                         self.bounded_sync.body_slots.clone(),

@@ -46,6 +46,7 @@ pub(crate) struct Received {
     pub(crate) body_progress: bool,
     pub(crate) inventory: Option<Inventory>,
     pub(crate) heads: Vec<super::HeadHint>,
+    pub(crate) departure_receipt: Option<super::HeadHint>,
 }
 impl Received {
     fn pending(status: Status) -> Self {
@@ -58,6 +59,7 @@ impl Received {
             body_progress: false,
             inventory: None,
             heads: Vec::new(),
+            departure_receipt: None,
         }
     }
     fn need(&mut self, query: Query) -> Result<()> {
@@ -189,7 +191,12 @@ impl Receiver {
                             result.status = Status::Busy;
                             return Ok(result);
                         }
-                        Staged::Head { head, tail, author } => {
+                        Staged::Head {
+                            head,
+                            tail,
+                            author,
+                            departure_receipt,
+                        } => {
                             if result.heads.len() >= MAX_NEEDS {
                                 return Err(Error::SizeLimitExceeded("history head result bound"));
                             }
@@ -198,7 +205,13 @@ impl Receiver {
                                 head: *head,
                                 size: *tail,
                             });
-                            if *tail > 0 {
+                            if *departure_receipt {
+                                result.departure_receipt = Some(super::HeadHint {
+                                    author: *author,
+                                    head: *head,
+                                    size: *tail,
+                                });
+                            } else if *tail > 0 {
                                 result.need(Query::Header {
                                     head: *head,
                                     seq: *tail,

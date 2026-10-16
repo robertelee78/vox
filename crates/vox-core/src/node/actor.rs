@@ -575,6 +575,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::NetworkChanged(_) => "acting on a change of the machine's network",
         NetEvent::Stranded { .. } => "dialling again peers a network change stranded",
         NetEvent::SyncDone { .. } => "filing a sync that finished",
+        NetEvent::BoundedHeadCompleted { .. } => "finishing an authenticated current head",
         NetEvent::BoundedRoomAdvanced { .. } => "publishing accepted current room work",
         NetEvent::BoundedSyncProgress { .. } => "advancing bounded current/history work",
         NetEvent::BoundedSyncDone { .. } => "filing a bounded history response",
@@ -1246,6 +1247,14 @@ enum NetEvent {
         channel_id: Digest32,
         rendered: bool,
         governance: bool,
+    },
+    BoundedHeadCompleted {
+        channel_id: Digest32,
+        instance: std::sync::Weak<tokio::sync::Mutex<ChannelState>>,
+        head: crate::node::history_stream::HeadHint,
+        epoch: u64,
+        room_instance: [u8; 16],
+        generation: Digest32,
     },
     BoundedSyncProgress {
         token: u64,
@@ -9967,6 +9976,49 @@ impl Node {
                     }
                 }
             }
+            NetEvent::BoundedHeadCompleted {
+                channel_id,
+                instance,
+                head,
+                epoch,
+                room_instance,
+                generation,
+            } => {
+                let current = self.channels.get(&channel_id).cloned();
+                if let (Some(shared), Some(old), Some(profile)) =
+                    (current, instance.upgrade(), self.profile.as_ref())
+                {
+                    if Arc::ptr_eq(&shared, &old) {
+                        let acknowledged = {
+                            let mut room = shared.lock().await;
+                            let current = room.epoch() == epoch
+                                && room.history_instance(profile.store()).ok()
+                                    == Some(room_instance)
+                                && crate::node::history_stream::authorization_generation(
+                                    profile.store(),
+                                    room.me(),
+                                    channel_id,
+                                    room_instance,
+                                    epoch,
+                                )
+                                .ok()
+                                    == Some(generation);
+                            if current {
+                                room.note_history_head_complete(profile.store(), head)
+                                    .ok()
+                                    .flatten()
+                            } else {
+                                None
+                            }
+                        };
+                        self.governance_work.pending = true;
+                        self.settle_sparse_room(&channel_id).await;
+                        if let Some(sent) = acknowledged {
+                            self.finish_leave_if_heard(channel_id, sent).await;
+                        }
+                    }
+                }
+            }
             NetEvent::BoundedSyncProgress { token } => {
                 let _ = token;
                 self.accept_bounded_sync();
@@ -14976,7 +15028,23 @@ impl Node {
             }
             return;
         }
-        if !self.may_sync(&channel_id, &peer, epoch).await {
+        let departure_receipt = if history
+            .as_ref()
+            .is_some_and(|p| p.purpose == crate::node::history_stream::Purpose::Control)
+        {
+            match self.channels.get(&channel_id) {
+                Some(shared) => {
+                    let room = shared.lock().await;
+                    room.is_author(&peer) && room.has_left(&peer)
+                }
+                None => false,
+            }
+        } else {
+            false
+        };
+        // The server still permits ONLY Head(peer) in this case; purpose alone never
+        // permits inventory, another author's head, proofs, contexts or bodies.
+        if !departure_receipt && !self.may_sync(&channel_id, &peer, epoch).await {
             // Refused explicitly, with the same coded reset as a stream kind the peer may not
             // open, rather than left to read for a frame that never comes.
             let (mut send, mut recv) = (send, recv);
@@ -14998,6 +15066,13 @@ impl Node {
         }
         // Admitted: the port exists for the room instance held now (it may not have been
         // discovered yet, since the peer spoke first).
+        if departure_receipt {
+            if let Some((room, gen)) = self.room_ref(&channel_id).await {
+                self.ports
+                    .entry((channel_id, peer))
+                    .or_insert_with(|| crate::node::ports::Port::new(room, gen));
+            }
+        }
         if !self.ensure_port(&channel_id, &peer).await {
             let (mut send, mut recv) = (send, recv);
             crate::node::net::refuse_stream(&mut send, &mut recv);
@@ -18785,6 +18860,25 @@ impl Node {
     /// entries means this identity was in the room before: it moves to a sender generation the
     /// others do not hold yet, and, if its feed ends in its departure, says it is back, so the
     /// other members list it again before it says anything else.
+    async fn settle_sparse_room(&mut self, channel_id: &Digest32) {
+        let Some(shared) = self.channels.get(channel_id).cloned() else {
+            return;
+        };
+        let ready = {
+            let Some(profile) = self.profile.as_ref() else {
+                return;
+            };
+            let room = shared.lock().await;
+            !self.history_hints.pending_author(*channel_id, room.me())
+                && room
+                    .sparse_settlement_ready(profile.store(), self.now_ms())
+                    .unwrap_or(false)
+        };
+        if ready {
+            self.settle_room(channel_id).await;
+        }
+    }
+
     async fn settle_room(&mut self, channel_id: &Digest32) {
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return;
@@ -18795,6 +18889,14 @@ impl Node {
                 return;
             };
             let mut ch = shared.lock().await;
+            if ch.uses_sparse_history(profile.store()).unwrap_or(true)
+                && (self.history_hints.pending_author(*channel_id, ch.me())
+                    || !ch
+                        .sparse_settlement_ready(profile.store(), now_ms)
+                        .unwrap_or(false))
+            {
+                return;
+            }
             if !matches!(ch.settle(profile.store()), Ok(true)) {
                 return;
             }

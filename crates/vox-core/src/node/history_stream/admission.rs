@@ -20,6 +20,7 @@ pub(super) enum Staged {
         head: Digest32,
         author: Digest32,
         tail: u64,
+        departure_receipt: bool,
     },
     Header {
         entry: Entry,
@@ -64,10 +65,19 @@ pub(super) fn stage(
             };
             let id = head.id();
             room.history_write(store, |index| index.observe_history_head(&verified))?;
+            let departure_receipt = room.history_departure_matches(
+                store,
+                super::HeadHint {
+                    author: *author,
+                    head: id,
+                    size: head.root.leaves,
+                },
+            )?;
             Ok(Staged::Head {
                 head: id,
                 author: *author,
                 tail: head.root.leaves,
+                departure_receipt,
             })
         }
         (Query::Context(expected), Object::Context(bytes)) => {

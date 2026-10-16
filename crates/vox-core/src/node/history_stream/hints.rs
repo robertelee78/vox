@@ -135,6 +135,15 @@ impl HintInbox {
         state.pending.retain(|p| p.room != room);
         Self::release_empty(&mut state);
     }
+    /// Includes in-flight hints: settlement must not outrun recovery of our own feed.
+    pub(crate) fn pending_author(&self, room: Digest32, author: Digest32) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pending
+            .iter()
+            .any(|p| p.room == room && p.hint.author == author)
+    }
     pub(crate) fn clear(&self) {
         let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         state.generation = state

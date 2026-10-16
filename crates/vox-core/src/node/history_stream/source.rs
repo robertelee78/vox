@@ -45,6 +45,8 @@ pub(super) struct Source {
     pub(super) peer: Digest32,
     pub(super) fence: Arc<Fence>,
     pub(super) deadline: Instant,
+    // Only a server clone bound to Control/Head(peer) may return a departed peer receipt.
+    own_head_receipt: bool,
 }
 
 impl Source {
@@ -63,7 +65,14 @@ impl Source {
             peer,
             fence,
             deadline,
+            own_head_receipt: false,
         }
+    }
+
+    pub(super) fn for_own_head_receipt(&self) -> Self {
+        let mut source = self.clone();
+        source.own_head_receipt = true;
+        source
     }
 
     fn current(&self) -> Result<()> {
@@ -162,9 +171,10 @@ impl Source {
         // async waiter detaches it; credit cannot be reused while the disk read still runs.
         let task = tokio::task::spawn_blocking(move || {
             source.current()?;
-            if room.epoch() != source.epoch
-                || !room.is_member(&source.peer)
-                || room.has_left(&source.peer)
+            let departed_receipt = source.own_head_receipt
+                && room.is_author(&source.peer)
+                && room.has_left(&source.peer);
+            if room.epoch() != source.epoch || (!room.is_member(&source.peer) && !departed_receipt)
             {
                 return Err(Error::Unreachable("history room access changed"));
             }
@@ -488,7 +498,12 @@ impl Source {
                         } else {
                             false
                         };
-                        if !held {
+                        if !held
+                            || (hint.author == room.me()
+                                && room.history_departure_matches(store, hint)?)
+                        {
+                            // Keep this hint as a bounded signed-head receipt probe. It is not
+                            // itself acknowledgement and grants no source or authority.
                             missing.push(hint);
                         }
                     }

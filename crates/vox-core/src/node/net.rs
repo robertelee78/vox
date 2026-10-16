@@ -182,8 +182,12 @@ impl PeerPolicy {
     ///   it as a member *after* the join's final frame, and the ADR-004 responder
     ///   cannot speak first on the new session anyway. Allowing `pairwise` costs
     ///   nothing: a sealed message from a peer we hold no session with cannot be
-    ///   opened and is dropped. Never `sync` (no log authority) and never `tunnel`.
-    /// - **JoinResponder**: `pairwise` (its sender key), `rendezvous` and `coord`.
+    ///   opened and is dropped. `sync` reaches the actor's room/epoch gate: a departed
+    ///   admitted author can request only Control/Head(self), and the response serves only
+    ///   its own completed public head as a departure receipt. No room/data authority is
+    ///   granted by this transport classification. Never `tunnel`.
+    /// - **JoinResponder**: `pairwise` (its sender key), `rendezvous`, `coord`, and the
+    ///   same independently gated `sync` transport.
     /// - **Unknown**: `rendezvous`, gated further by the service's own policy (ADR-012:
     ///   reads open, member-only writes refused there), and `coord`, where its only verb is
     ///   `WHOAMI`.
@@ -205,13 +209,14 @@ impl PeerPolicy {
             ),
             PeerClass::PendingJoiner => matches!(
                 kind,
-                StreamKind::Join
+                StreamKind::Sync
+                    | StreamKind::Join
                     | StreamKind::Rendezvous
                     | StreamKind::Pairwise
                     | StreamKind::Coord
                     | StreamKind::Circuit
             ),
-            // **Its sender key, and nothing an unknown peer could not already open.** The responder
+            // Its sender key and the independently room/query-gated receipt transport. The responder
             // releases its key the moment it admits us, which is before this node holds the room
             // or knows the responder as a member. Judged as `Unknown`, that pairwise stream was
             // refused at accept — `stream refused: peer may not open this stream kind` — while
@@ -221,7 +226,10 @@ impl PeerPolicy {
             // while the second room — joined when the responder was already a member — worked.
             PeerClass::JoinResponder => matches!(
                 kind,
-                StreamKind::Pairwise | StreamKind::Rendezvous | StreamKind::Coord
+                StreamKind::Sync
+                    | StreamKind::Pairwise
+                    | StreamKind::Rendezvous
+                    | StreamKind::Coord
             ),
             // An unknown peer reaches the board — and the coord stream, where the only
             // verb open to it is `WHOAMI`, whose answer is its own address (enforced in

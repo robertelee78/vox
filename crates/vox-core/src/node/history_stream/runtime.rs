@@ -83,8 +83,11 @@ pub(crate) struct Flow {
     pub(crate) shared: Arc<Mutex<ChannelState>>,
     pub(crate) archive: bool,
     pub(crate) inventory: bool,
+    departure_probe: bool,
     pub(crate) archive_request: Option<RequestId>,
     pub(crate) hint: Option<super::HeadHint>,
+    /// Exact signed head selected for this hinted flow, not the inventory claim.
+    pub(crate) authenticated_head: Option<super::HeadHint>,
     pub(crate) waiting: bool,
     pub(crate) published: bool,
     pub(crate) rendered: bool,
@@ -135,6 +138,7 @@ impl Flow {
         live: Arc<Context>,
         control: Arc<Context>,
         hint: Option<super::HeadHint>,
+        departure_probe: bool,
         required: Option<(Digest32, u64)>,
         state_charge: crate::node::history_budget::FlowStateCharge,
         slots: Arc<BodySlots>,
@@ -152,9 +156,11 @@ impl Flow {
             shared,
             archive: false,
             inventory: hint.is_none() && required.is_none(),
+            departure_probe,
             archive_request: None,
             _state_charge: state_charge,
             hint,
+            authenticated_head: None,
             waiting: false,
             published: false,
             rendered: false,
@@ -196,14 +202,16 @@ impl Flow {
                 }),
             })?;
         } else if let Some(hint) = flow.hint {
-            flow.push(Task {
-                request,
-                purpose: Purpose::Control,
-                operation: Operation::Tail {
-                    head: hint.head,
-                    seq: hint.size,
-                },
-            })?;
+            if !departure_probe {
+                flow.push(Task {
+                    request,
+                    purpose: Purpose::Control,
+                    operation: Operation::Tail {
+                        head: hint.head,
+                        seq: hint.size,
+                    },
+                })?;
+            }
             flow.push(Task {
                 request,
                 purpose: Purpose::Control,
@@ -247,9 +255,11 @@ impl Flow {
             shared,
             archive: true,
             inventory: false,
+            departure_probe: false,
             archive_request: Some(request),
             _state_charge: state_charge,
             hint: None,
+            authenticated_head: None,
             waiting: false,
             published: false,
             rendered: false,
@@ -611,6 +621,17 @@ impl Flow {
                 )
                 .await?;
                 self.body_progress |= result.body_progress;
+                if self.departure_probe {
+                    // A stale/absent echo is not receipt. Keep the room and retry only this
+                    // bounded head request through the existing port backoff.
+                    if result.status != Status::Complete || result.departure_receipt != self.hint {
+                        return Err(Error::Unreachable(
+                            "peer has not acknowledged the current departure head",
+                        ));
+                    }
+                    self.authenticated_head = result.departure_receipt;
+                    return Ok(());
+                }
                 // Inventory is a hint. The first signed Head(author) response selects the
                 // exact live tail before any entry/body work; a concurrent post may replace
                 // the hinted head. Never retarget an already selected dependency or proof.
@@ -633,13 +654,22 @@ impl Flow {
                         if head.author == author
                             && self.hint.is_some_and(|hint| hint.author == author)
                         {
+                            let receipt = result.departure_receipt == Some(*head);
                             for pending in &mut self.tasks {
                                 if matches!(pending.operation, Operation::Tail { .. }) {
+                                    self.authenticated_head = Some(*head);
                                     pending.operation = Operation::Tail {
                                         head: head.head,
                                         seq: head.size,
                                     };
                                 }
+                            }
+                            if receipt {
+                                // Only a verified echo matching our already accepted departure.
+                                // It must not request Header/Proof/Body from a peer we have left.
+                                self.tasks.retain(|pending| {
+                                    !matches!(pending.operation, Operation::Tail { .. })
+                                });
                             }
                         }
                     }

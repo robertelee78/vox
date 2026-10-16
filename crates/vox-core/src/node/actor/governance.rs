@@ -268,7 +268,11 @@ impl Node {
                 Err(error) => channel.poison(&error),
             }
         }
+        let settle_pending = channel.sparse_settlement_pending();
         drop(channel);
+        if progress.ready && settle_pending {
+            self.settle_sparse_room(&room).await;
+        }
         if progress.ready {
             // Discover stale consent from disk a page at a time. A quiet room must finish
             // this work too; it cannot depend on another join or trust command arriving.
