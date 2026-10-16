@@ -886,8 +886,23 @@ impl NodeNet {
         (kind, mut send, mut recv): (StreamKind, SendStream, RecvStream),
     ) -> Result<(StreamKind, SendStream, RecvStream)> {
         crate::node::net::refuse_second_exchange(conn, kind)?;
-        let class = self.classify(&peer);
+        let policy = self.policy.snapshot();
+        // Keep the class and the exact join-responder capability on one policy snapshot. A policy
+        // replacement between two reads must not let an older Member class authorize a stream
+        // after the actor has retired it. The board remains the fallback only when this snapshot
+        // has no actor-owned answer, exactly as in `classify`.
+        let policy_class = policy.classify(&peer);
+        let class = if policy_class != PeerClass::Unknown {
+            policy_class
+        } else if self.peer_is_member_on_board(&peer) {
+            PeerClass::Member
+        } else if self.peer_has_prejoin(&peer) {
+            PeerClass::PendingJoiner
+        } else {
+            PeerClass::Unknown
+        };
         if !(PeerPolicy::allows(class, kind)
+            || policy.allows_peer(&peer, kind)
             || kind == StreamKind::Circuit && self.service.computer_transport_peer(&peer))
         {
             crate::node::net::refuse_disallowed(class, kind, &mut send, &mut recv);

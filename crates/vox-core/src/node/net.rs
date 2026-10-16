@@ -239,6 +239,18 @@ impl PeerPolicy {
         }
     }
 
+    /// Whether this exact peer may open `kind`, including narrow temporary capabilities that
+    /// overlap a broader class. A room host can also be this node's configured anchor; classifying
+    /// it as `Anchor` must not mask the explicit join-responder permission to deliver its sender
+    /// key while the join is in flight. The overlap adds only Pairwise already granted by
+    /// [`Self::expect_join_responder`]; it does not reclassify the peer or grant anchor/member
+    /// authority to any other stream kind.
+    #[must_use]
+    pub fn allows_peer(&self, peer: &Digest32, kind: StreamKind) -> bool {
+        Self::allows(self.classify(peer), kind)
+            || (kind == StreamKind::Pairwise && self.join_responders.contains(peer))
+    }
+
     /// The transport admission for a node that does **not** serve rendezvous: only
     /// identities this policy knows may connect at all. A node that serves
     /// rendezvous must use [`Admission::AcceptAnyAuthenticated`] instead (see the
@@ -1739,8 +1751,9 @@ pub async fn accept_authorized(
 ) -> Result<(StreamKind, SendStream, RecvStream)> {
     let (kind, mut send, mut recv) = accept_typed(conn).await?;
     refuse_second_exchange(conn.quinn(), kind)?;
-    let class = policy.classify(&conn.peer_id());
-    if !PeerPolicy::allows(class, kind) {
+    let peer = conn.peer_id();
+    let class = policy.classify(&peer);
+    if !policy.allows_peer(&peer, kind) {
         refuse_disallowed(class, kind, &mut send, &mut recv);
         return Err(Error::StreamRefused("peer may not open this stream kind"));
     }

@@ -7108,18 +7108,21 @@ impl Node {
         // A connection to one room's anchor is not permission to publish every room
         // this node holds there (ADR-032 AN-2). Check here as well as in the caller:
         // reconnect publication invokes this path directly.
-        if !self.anchor_serves_room(channel_id, &conn.peer_id()) {
+        let serves_room = self.anchor_serves_room(channel_id, &conn.peer_id());
+        if !serves_room {
             // The authenticated member that answered a join also needs the newcomer's
             // board record. It remains a member, never a machine or room anchor.
-            let member_join = if matches!(cause, PublishCause::Join) {
-                match self.channels.get(channel_id) {
-                    Some(room) => room.lock().await.is_known_member(&conn.peer_id()),
-                    None => false,
+            let member_publish = match (cause, self.channels.get(channel_id)) {
+                (PublishCause::Join, Some(room)) => {
+                    room.lock().await.is_known_member(&conn.peer_id())
                 }
-            } else {
-                false
+                (
+                    PublishCause::Renewal | PublishCause::AskedAgain | PublishCause::Retry,
+                    Some(room),
+                ) => room.lock().await.is_member(&conn.peer_id()),
+                _ => false,
             };
-            if !member_join {
+            if !member_publish {
                 return;
             }
         }
@@ -7130,6 +7133,21 @@ impl Node {
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
             return;
         };
+        let board_id = conn.peer_id();
+        // Coalesce before signing or materializing the room's mirrored board. The actor owns this
+        // set, so it cannot change between this check and the insertion below; doing the work
+        // first multiplied a changed-prekey fan-out by every connected member.
+        if self.publishing.contains(&(*channel_id, board_id)) {
+            match self.publish_again.entry((*channel_id, board_id)) {
+                std::collections::btree_map::Entry::Vacant(waiting) => {
+                    waiting.insert(cause);
+                }
+                std::collections::btree_map::Entry::Occupied(_) => {
+                    crate::node::status::SyncBook::note_publish_merged(&self.sync_book, cause);
+                }
+            }
+            return;
+        }
         let seq = self.next_record_seq(channel_id);
         let base = self.record_timestamp(channel_id);
         // The admission goes out with the bundle: a node that cannot say how it became
@@ -7176,7 +7194,20 @@ impl Node {
         if test_hold_address(&conn.local_id(), channel_id) {
             own.pop();
         }
-        let mirrored = net.board_records(channel_id, epoch);
+        // A direct prekey renewal gives an active member only this node's refreshed records. Full
+        // board mirroring is for an anchor or the initial join round; repeating the whole board to
+        // every connected member would turn one consumed prekey into O(members × room records)
+        // retained bytes and signing work.
+        let direct_member_refresh = !serves_room
+            && matches!(
+                cause,
+                PublishCause::Renewal | PublishCause::AskedAgain | PublishCause::Retry
+            );
+        let mirrored = if direct_member_refresh {
+            Vec::new()
+        } else {
+            net.board_records(channel_id, epoch)
+        };
         // **Off the actor, and still in order.** The round awaits a board's answers, which on a
         // connection that died without saying so is `ANCHOR_PUBLISH_PATIENCE` of waiting, and that
         // was on the actor: `busy 5.0s — filing a sync that finished`, a person's post held behind
@@ -7185,7 +7216,6 @@ impl Node {
         // explicitly instead: while a round to a board is in flight, that board's port for the room
         // (ADR-025) waits rather than starting a session (`publishing`). One round per
         // (room, board) at a time; a publish asked for meanwhile runs once the round ends.
-        let board_id = conn.peer_id();
         if !self.publishing.insert((*channel_id, board_id)) {
             match self.publish_again.entry((*channel_id, board_id)) {
                 std::collections::btree_map::Entry::Vacant(waiting) => {
@@ -13935,6 +13965,30 @@ impl Node {
             self.publish_channel_to_anchors(&room, PublishCause::Renewal)
                 .await;
             if push {
+                // A consumed one-time prekey must reach members who already hold the old bundle,
+                // including a room with no anchor. Raising the room ports below eventually mirrors
+                // board records, but the join-time refusal this path repairs can leave the sender
+                // waiting on that very bundle before useful room traffic starts. Put the changed,
+                // root-signed member record directly on every connected member's board now. The
+                // receiving board still applies its normal membership, admission, sequence and
+                // timestamp checks; this is the same member-board path used when a join finishes.
+                let member_connections = match self.channels.get(&room).map(Arc::clone) {
+                    Some(shared) => {
+                        let me = self.profile.as_ref().map(Profile::fingerprint);
+                        let members = shared.lock().await.members();
+                        members
+                            .into_iter()
+                            .filter(|member| Some(*member) != me)
+                            .filter(|member| !self.anchor_serves_room(&room, member))
+                            .filter_map(|member| self.net.as_ref()?.manager().existing(&member))
+                            .collect::<Vec<_>>()
+                    }
+                    None => Vec::new(),
+                };
+                for conn in member_connections {
+                    self.publish_channel_to_anchor(&room, &conn, PublishCause::Renewal)
+                        .await;
+                }
                 for ((port_room, _), port) in &mut self.ports {
                     if *port_room == room {
                         port.raise();
