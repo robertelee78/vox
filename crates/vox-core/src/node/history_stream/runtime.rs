@@ -97,6 +97,7 @@ pub(crate) struct Flow {
     owners: [Option<RequestId>; 2],
     no_progress: u8,
     body_progress: bool,
+    last_head: Option<(super::HeadHint, u8)>,
     request: RequestId,
     cleanup_store: Arc<Store>,
     cleanup_job: Job,
@@ -156,6 +157,7 @@ impl Flow {
             owners: [None, None],
             no_progress: 0,
             body_progress: false,
+            last_head: None,
             request,
             cleanup_store,
             cleanup_job,
@@ -248,6 +250,7 @@ impl Flow {
             owners: [None, None],
             no_progress: 0,
             body_progress: false,
+            last_head: None,
             request,
             cleanup_store,
             cleanup_job,
@@ -591,6 +594,20 @@ impl Flow {
                 // the hinted head. Never retarget an already selected dependency or proof.
                 if let Query::Head(author) = query {
                     for head in &result.heads {
+                        if head.author == author {
+                            let repeats = self
+                                .last_head
+                                .filter(|(prior, _)| {
+                                    prior.author == head.author
+                                        && prior.head == head.head
+                                        && prior.size == head.size
+                                })
+                                .map_or(0, |(_, repeats)| repeats.saturating_add(1));
+                            self.last_head = Some((*head, repeats));
+                            if repeats >= 2 {
+                                return Err(Error::Unreachable("peer repeats a head that cannot satisfy the current dependency"));
+                            }
+                        }
                         if head.author == author
                             && self.hint.is_some_and(|hint| hint.author == author)
                         {
