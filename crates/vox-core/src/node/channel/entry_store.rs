@@ -1828,6 +1828,11 @@ pub(crate) struct Publication<'a> {
     pub received_ms: u64,
     pub bodyless_prefix: bool,
     pub origin: u64,
+    /// Locally verified contexts needed by ordering before the atomic active-root switch.
+    pub local_contexts: Option<(
+        &'a crate::log::history::ControlContext,
+        &'a crate::log::history::ControlContext,
+    )>,
 }
 
 /// One evidence-validated v2 source entry. Control effects still pass the existing
@@ -1954,6 +1959,7 @@ impl Write<'_, '_> {
             received_ms,
             bodyless_prefix,
             origin,
+            local_contexts,
         } = publication;
         self.set_origin(origin)?;
         if self.directory.phase != Phase::Idle
@@ -2046,6 +2052,9 @@ impl Write<'_, '_> {
             cleanup_hash: None,
         });
         self.directory.phase = Phase::Building;
+        if let Some((pre, post)) = local_contexts {
+            self.seed_local_promotion_contexts(witness, pre, post)?;
+        }
         Ok(())
     }
 

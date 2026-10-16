@@ -270,6 +270,7 @@ impl ChannelState {
                 received_ms,
                 bodyless_prefix: true,
                 origin: self.genesis.body.created_ms,
+                local_contexts: None,
             },
         )
     }

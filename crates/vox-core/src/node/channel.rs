@@ -3483,6 +3483,10 @@ impl ChannelState {
                     received_ms: now_ms,
                     bodyless_prefix: false,
                     origin: self.genesis.body.created_ms,
+                    local_contexts: self
+                        .local_history
+                        .as_ref()
+                        .map(|prepared| (&prepared.pre, &prepared.post)),
                 },
             )
         })();
@@ -6085,6 +6089,7 @@ impl ChannelState {
                                 received_ms: now_ms,
                                 bodyless_prefix: false,
                                 origin: self.genesis.body.created_ms,
+                                local_contexts: None,
                             },
                         )?;
                         let count = arrived.len() as u64;
@@ -6136,6 +6141,7 @@ impl ChannelState {
                             received_ms: now_ms,
                             bodyless_prefix: true,
                             origin: self.genesis.body.created_ms,
+                            local_contexts: None,
                         },
                     )?;
                     // Reserve all log ids before rendering the witness can allocate a cache id.
@@ -9594,6 +9600,7 @@ impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
                                 received_ms: self.now_ms,
                                 bodyless_prefix: true,
                                 origin: ch.genesis.body.created_ms,
+                                local_contexts: None,
                             })?;
                             debug_assert_eq!(request.owner, state.owner);
                         }

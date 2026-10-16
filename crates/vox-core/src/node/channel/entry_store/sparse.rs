@@ -1458,22 +1458,82 @@ impl Write<'_, '_> {
         bytes: &[u8],
     ) -> Result<()> {
         self.require_sparse_idle()?;
+        self.directory.active.sparse.objects =
+            self.save_history_object_at(self.directory.active.sparse.objects, kind, hash, bytes)?;
+        Ok(())
+    }
+
+    /// Return one updated object root without choosing which publication owns it.
+    /// allocate/retire retain the existing Building rollback and retirement accounting.
+    fn save_history_object_at(
+        &mut self,
+        root: u64,
+        kind: ObjectKind,
+        hash: Digest32,
+        bytes: &[u8],
+    ) -> Result<u64> {
         if bytes.len() > kind.limit() {
             return Err(invalid("sparse object size"));
         }
         let key = object_key(kind, &hash);
-        let root = self.directory.active.sparse.objects;
         if Source::Batch(self.batch)
             .number(self.sek, self.channel, root, &key)?
             .is_some()
         {
             // The typed caller has checked this content identity. A different randomized
             // valid signature of the same head/header does not replace the retained witness.
-            return Ok(());
+            return Ok(root);
         }
         let id = self.save_sparse_record(None, bytes, kind.limit())?;
-        self.directory.active.sparse.objects =
-            self.change_value(root, key, Some(Value::Number(id)))?;
+        self.change_value(root, key, Some(Value::Number(id)))
+    }
+
+    /// Local header verification and tree construction have already completed. Keep their
+    /// contexts only in this unpublished promotion, before DAG placement consumes them.
+    pub(super) fn seed_local_promotion_contexts(
+        &mut self,
+        witness: &Entry,
+        pre: &ControlContext,
+        post: &ControlContext,
+    ) -> Result<()> {
+        let v2 = witness
+            .skeleton
+            .v2
+            .as_ref()
+            .ok_or(invalid("legacy promotion supplied local v2 contexts"))?;
+        let promotion = self
+            .directory
+            .promotion
+            .as_ref()
+            .ok_or(invalid("local promotion context owner missing"))?;
+        if self.directory.phase != Phase::Building
+            || promotion.sparse_head.is_some()
+            || promotion.witness_hash != witness.entry_hash()
+            || !promotion.work.sparse.enabled
+            || pre.room != *self.channel
+            || post.room != *self.channel
+            || pre.scope != v2.scope
+            || post.scope != v2.scope
+            || pre.hash() != v2.pre_context
+        {
+            return Err(invalid("local promotion context binding"));
+        }
+        let mut root = promotion.work.sparse.objects;
+        for context in [pre, post] {
+            root = self.save_history_object_at(
+                root,
+                ObjectKind::Context,
+                context.hash(),
+                &context.to_wire()?,
+            )?;
+        }
+        self.directory
+            .promotion
+            .as_mut()
+            .ok_or(invalid("local promotion context owner missing"))?
+            .work
+            .sparse
+            .objects = root;
         Ok(())
     }
     pub(crate) fn keep_history_context(&mut self, context: &ControlContext) -> Result<Digest32> {
