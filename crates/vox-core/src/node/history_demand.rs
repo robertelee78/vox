@@ -99,16 +99,9 @@ impl Context {
     ) -> Result<Self> {
         let key = crate::atrest::seal::sek(profile.signer()?, b"vox/history-demand-sek/v1")?;
         let node = profile.fingerprint();
-        let mut bytes = b"vox/history-demand-scope/v1".to_vec();
-        bytes.extend_from_slice(&node);
-        bytes.push(match slot {
-            Slot::Archive => 0,
-            Slot::Live => 1,
-            Slot::Control => 2,
-        });
         Ok(Self {
             node,
-            scope: sha256(&bytes),
+            scope: node_scope(node, slot),
             slot,
             store: profile.store_handle(),
             key,
@@ -244,6 +237,29 @@ impl PrivatePlan {
     }
 }
 
+/// One explicitly selected legacy prefix. The provisional spool owns its exact tail and
+/// publication cursor; this record only preserves the original local authorization.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LegacyPlan {
+    pub author: Digest32,
+    pub from: u64,
+    pub through: u64,
+    pub expected_base: u64,
+}
+impl LegacyPlan {
+    fn validate(&self, bounds: Bounds) -> Result<()> {
+        if self.from != bounds.lo
+            || self.through != bounds.hi
+            || self.expected_base.checked_add(1) != Some(self.from)
+            || bounds.entries > 64
+        {
+            return Err(bad());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct State {
@@ -258,6 +274,8 @@ pub struct State {
     pub cursor: Option<Cursor>,
     #[serde(default)]
     pub(crate) private: Option<PrivatePlan>,
+    #[serde(default)]
+    pub(crate) legacy: Option<LegacyPlan>,
     progress: Progress,
     serial: u64,
     cleanup: Option<Cleanup>,
@@ -281,6 +299,12 @@ impl State {
         self.bounds.validate()?;
         if let Some(private) = &self.private {
             private.validate(self.bounds)?;
+            if self.body.is_some() || self.cursor.is_some() || self.legacy.is_some() {
+                return Err(bad());
+            }
+        }
+        if let Some(legacy) = &self.legacy {
+            legacy.validate(self.bounds)?;
             if self.body.is_some() || self.cursor.is_some() {
                 return Err(bad());
             }
@@ -390,6 +414,45 @@ fn key(context: &Context) -> Result<&Sek> {
 fn scope(context: &Context) -> Digest32 {
     context.scope
 }
+fn node_scope(node: Digest32, slot: Slot) -> Digest32 {
+    let mut bytes = b"vox/history-demand-scope/v1".to_vec();
+    bytes.extend_from_slice(&node);
+    bytes.push(match slot {
+        Slot::Archive => 0,
+        Slot::Live => 1,
+        Slot::Control => 2,
+    });
+    sha256(&bytes)
+}
+
+/// Read only the bounded sealed demand header during room reopen. This recognizes retained
+/// provisional ownership; it does not create an Active handle or authorize network work.
+/// The caller holds the unlocked profile and its existing startup-work reservation.
+pub(crate) fn legacy_owner(
+    profile: &Profile,
+    room: Digest32,
+    instance: [u8; 16],
+    request: RequestId,
+    author: Digest32,
+) -> Result<bool> {
+    let key = crate::atrest::seal::sek(profile.signer()?, b"vox/history-demand-sek/v1")?;
+    let scope = node_scope(profile.fingerprint(), Slot::Archive);
+    let Some(segment) =
+        profile
+            .store()
+            .snapshot()?
+            .get_segment_bounded(&scope, KIND, HEADER, STATE_BYTES)?
+    else {
+        return Ok(false);
+    };
+    let state = decode(&key, &scope, &segment)?;
+    Ok(state.request == request
+        && state.binding.room == room
+        && state.binding.instance == instance
+        && !state.progress.terminal()
+        && state.cleanup.is_none()
+        && state.legacy.is_some_and(|plan| plan.author == author))
+}
 fn decode(
     key: &Sek,
     scope: &Digest32,
@@ -498,7 +561,7 @@ pub fn start(
     bounds: Bounds,
     job: &Job,
 ) -> Result<Active> {
-    start_plan(context, request, binding, bounds, None, job)
+    start_plan(context, request, binding, bounds, None, None, job)
 }
 
 pub(crate) fn start_private(
@@ -509,8 +572,25 @@ pub(crate) fn start_private(
     plan: PrivatePlan,
     job: &Job,
 ) -> Result<Active> {
+    bounds.validate()?;
     plan.validate(bounds)?;
-    start_plan(context, request, binding, bounds, Some(plan), job)
+    start_plan(context, request, binding, bounds, Some(plan), None, job)
+}
+
+pub(crate) fn start_legacy(
+    context: &Context,
+    request: RequestId,
+    binding: Binding,
+    bounds: Bounds,
+    plan: LegacyPlan,
+    job: &Job,
+) -> Result<Active> {
+    bounds.validate()?;
+    plan.validate(bounds)?;
+    if context.slot != Slot::Archive {
+        return Err(invalid("legacy recovery requires explicit archive demand"));
+    }
+    start_plan(context, request, binding, bounds, None, Some(plan), job)
 }
 fn start_plan(
     context: &Context,
@@ -518,6 +598,7 @@ fn start_plan(
     binding: Binding,
     bounds: Bounds,
     private: Option<PrivatePlan>,
+    legacy: Option<LegacyPlan>,
     job: &Job,
 ) -> Result<Active> {
     let _charge = charge(job, STATE_WORK)?;
@@ -549,6 +630,7 @@ fn start_plan(
         body: None,
         cursor: None,
         private,
+        legacy,
         progress: Progress::Pending,
         serial,
         cleanup: None,
@@ -589,6 +671,11 @@ pub fn resume(
     }
     state.serial = next_serial(state.serial)?;
     state.progress = Progress::Pending;
+    if state.legacy.is_some() {
+        // One explicit Resume authorizes one new legacy quantum, within the original
+        // immutable interval. The spool supplies its next position; restart never does this.
+        state.remaining = state.bounds.entries;
+    }
     put(&mut batch, key, &scope, &state)?;
     commit_context(batch, context)?;
     Ok(Active {
@@ -955,6 +1042,40 @@ pub(crate) fn checkpoint_private(
         return Err(invalid("private history checkpoint binding"));
     }
     state.private = Some(next);
+    state.remaining = remaining;
+    state.progress = progress;
+    put(&mut batch, key, &scope, &state)?;
+    commit(batch, active, context)?;
+    if progress.terminal() {
+        active.valid = false;
+    }
+    Ok(())
+}
+
+/// A legacy worker acknowledges only the bounded quantum whose exact spool effects are
+/// already durable. It cannot change the original author, interval or accepted base.
+pub(crate) fn checkpoint_legacy(
+    context: &Context,
+    active: &mut Active,
+    expected: &LegacyPlan,
+    remaining: usize,
+    progress: Progress,
+    job: &Job,
+) -> Result<()> {
+    let _charge = charge(job, STATE_WORK)?;
+    let key = key(context)?;
+    let scope = scope(context);
+    let mut batch = context.store().batch()?;
+    let mut state = live(&batch, key, &scope, context, active)?;
+    if state.legacy.as_ref() != Some(expected)
+        || remaining > state.remaining
+        || !matches!(
+            progress,
+            Progress::More | Progress::Complete | Progress::Unavailable
+        )
+    {
+        return Err(invalid("legacy history checkpoint binding"));
+    }
     state.remaining = remaining;
     state.progress = progress;
     put(&mut batch, key, &scope, &state)?;
