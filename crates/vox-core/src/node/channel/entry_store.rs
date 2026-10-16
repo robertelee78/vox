@@ -2410,18 +2410,6 @@ pub(crate) enum Preparation {
 }
 
 impl EntryIndex {
-    /// Complete crash cleanup before a caller scans authoritative LogDb. An absent derived
-    /// index is rebuilt from sealed wire entries; no saved entry, key or first-seen fact is reset.
-    pub(crate) fn prepare(
-        &self,
-        store: &Store,
-        sek: &Sek,
-        channel: &Digest32,
-        origin: u64,
-    ) -> Result<Preparation> {
-        self.prepare_owned(store, sek, channel, origin, |_| Ok(false))
-    }
-
     pub(crate) fn prepare_owned(
         &self,
         store: &Store,
@@ -2847,16 +2835,12 @@ impl Write<'_, '_> {
     }
 }
 
-/// Compact progress of an owned legacy witness. `ready` is unpublished copy/order work,
-/// not a semantic acceptance verdict; the existing effects transaction still owns the switch.
+/// Compact progress of an owned legacy witness.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct LegacyPublicationProgress {
     pub from: u64,
     pub through: u64,
-    pub next: u64,
-    pub first_log: u64,
     pub after_log: u64,
-    pub ready: bool,
     pub switched: bool,
 }
 
@@ -2988,73 +2972,9 @@ impl Read<'_> {
             .map(|p| LegacyPublicationProgress {
                 from: p.from,
                 through: p.through,
-                next: p.cursor,
-                first_log: p.first_log,
                 after_log: p.after_log,
-                ready: p.cursor > p.through && self.directory.work.is_empty(),
                 switched: self.directory.phase == Phase::Switched,
             }))
-    }
-    /// At most sixteen scalar locators. No wire/body bytes or accepted-history traversal.
-    pub(crate) fn legacy_provisional_slice(
-        &self,
-        owner: LegacyProvisionalOwner,
-        after: Option<u64>,
-        reverse: bool,
-    ) -> Result<Vec<Locator>> {
-        let state = self
-            .directory
-            .legacy_provisional
-            .filter(|s| s.owner == owner)
-            .ok_or(invalid("legacy provisional owner changed"))?;
-        let mut seq = if reverse {
-            after
-                .unwrap_or(state.tail_seq.saturating_add(1))
-                .saturating_sub(1)
-        } else {
-            after.unwrap_or(state.base_seq).saturating_add(1)
-        };
-        let mut rows = Vec::with_capacity(16);
-        for _ in 0..16 {
-            if seq <= state.base_seq || seq > state.tail_seq {
-                break;
-            }
-            let found = if reverse {
-                self.source().last(
-                    self.sek,
-                    self.channel,
-                    self.directory.provisional.sequence,
-                    &position(&owner.author, seq),
-                    0,
-                )?
-            } else {
-                self.source().first(
-                    self.sek,
-                    self.channel,
-                    self.directory.provisional.sequence,
-                    &position(&owner.author, seq),
-                    0,
-                )?
-            };
-            let Some((_, value)) = found else {
-                return Err(invalid("legacy provisional position missing"));
-            };
-            let at = value.locator()?;
-            if at.seq != seq
-                || at.author != owner.author
-                || at.seq <= state.base_seq
-                || at.seq > state.tail_seq
-            {
-                return Err(invalid("legacy provisional locator bound"));
-            }
-            rows.push(at);
-            seq = if reverse {
-                at.seq.saturating_sub(1)
-            } else {
-                at.seq.saturating_add(1)
-            };
-        }
-        Ok(rows)
     }
 }
 

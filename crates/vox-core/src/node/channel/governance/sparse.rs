@@ -110,7 +110,7 @@ pub(crate) enum SparsePayloadState {
 
 pub(crate) enum PayloadValidation {
     Complete(TypedSparseBody),
-    BodyRequired(Digest32),
+    BodyRequired,
     Yielded,
 }
 
@@ -168,7 +168,7 @@ impl TypedSparseBody {
                         .ok_or(Error::MalformedBundle("key recipient missing"))?,
                 },
                 ContextUpdate | Termination => SparsePayloadState::Held,
-                _ => return Ok(PayloadValidation::BodyRequired(hash)),
+                _ => return Ok(PayloadValidation::BodyRequired),
             };
             return Ok(PayloadValidation::Complete(Self { hash, state }));
         };
@@ -619,18 +619,10 @@ fn validate_control_coordinate(
 /// a claim that the control was Applied: the unchanged evaluator may have found it inert.
 pub(crate) struct SettledGovernanceControl {
     entry_hash: Digest32,
-    revision: u64,
-    authority_generation: u64,
 }
 impl SettledGovernanceControl {
     pub(crate) fn entry_hash(&self) -> Digest32 {
         self.entry_hash
-    }
-    pub(crate) fn revision(&self) -> u64 {
-        self.revision
-    }
-    pub(crate) fn authority_generation(&self) -> u64 {
-        self.authority_generation
     }
 }
 
@@ -675,7 +667,5 @@ pub(crate) fn sparse_control_evaluation(
     }
     Ok(ControlEvaluation::Settled(SettledGovernanceControl {
         entry_hash: hash,
-        revision: facts.revision(),
-        authority_generation: facts.authority_generation(),
     }))
 }

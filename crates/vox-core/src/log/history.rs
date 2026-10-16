@@ -528,8 +528,8 @@ pub(crate) enum LocalTreeStep {
         context: ControlContext,
     },
     Complete(Descriptor),
-    MissingContext(Digest32),
-    MissingRange(TreeRange),
+    MissingContext,
+    MissingRange,
     Yielded,
 }
 
@@ -586,7 +586,7 @@ impl LocalTreeAppend {
                         context,
                     })
                 }
-                HistoryStep::MissingContext(hash) => Ok(LocalTreeStep::MissingContext(hash)),
+                HistoryStep::MissingContext(_) => Ok(LocalTreeStep::MissingContext),
                 _ => Ok(LocalTreeStep::Yielded),
             };
         };
@@ -597,7 +597,7 @@ impl LocalTreeAppend {
             return Ok(LocalTreeStep::Yielded);
         }
         let Some(descriptor) = source.range(self.binding, left)? else {
-            return Ok(LocalTreeStep::MissingRange(left));
+            return Ok(LocalTreeStep::MissingRange);
         };
         if descriptor.leaves != left.leaves
             || left.start.checked_add(left.leaves) != Some(self.start)
@@ -615,7 +615,7 @@ impl LocalTreeAppend {
                     context,
                 })
             }
-            HistoryStep::MissingContext(hash) => Ok(LocalTreeStep::MissingContext(hash)),
+            HistoryStep::MissingContext(_) => Ok(LocalTreeStep::MissingContext),
             _ => Ok(LocalTreeStep::Yielded),
         }
     }

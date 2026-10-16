@@ -382,9 +382,7 @@ fn prepare(
                 }
             }
             LocalTreeStep::Complete(root) => break root,
-            LocalTreeStep::MissingContext(_) | LocalTreeStep::MissingRange(_) => {
-                return Err(missing())
-            }
+            LocalTreeStep::MissingContext | LocalTreeStep::MissingRange => return Err(missing()),
             LocalTreeStep::Yielded => {
                 return Err(Error::SizeLimitExceeded("local append work quota"))
             }

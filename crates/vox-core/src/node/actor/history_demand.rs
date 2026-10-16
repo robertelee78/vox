@@ -24,7 +24,6 @@ pub(super) struct Dispatch {
     pub request: RequestId,
     pub generation: Digest32,
     pub query: Query,
-    pub bounds: Bounds,
     pub staging: Staging,
     pub fence: Arc<Fence>,
 }
@@ -1158,7 +1157,6 @@ fn prepare(
         request,
         generation,
         query,
-        bounds,
         staging: Staging {
             context,
             active: Arc::new(StdMutex::new(active)),

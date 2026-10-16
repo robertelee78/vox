@@ -546,7 +546,7 @@ pub(super) fn start_entry(
     }
     let body = match governance::TypedSparseBody::verify(entry, &key, &mut WorkBudget::default())? {
         governance::PayloadValidation::Complete(body) => body,
-        governance::PayloadValidation::BodyRequired(_) => {
+        governance::PayloadValidation::BodyRequired => {
             return Ok(EntryStart::Need(Query::Entry {
                 head,
                 seq,

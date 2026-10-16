@@ -109,9 +109,6 @@ impl Context {
             _secret_work: secret_work,
         })
     }
-    pub fn slot(&self) -> Slot {
-        self.slot
-    }
     pub fn cancellation(&self) -> Cancellation {
         self.cancellation.clone()
     }
@@ -429,35 +426,6 @@ fn node_scope(node: Digest32, slot: Slot) -> Digest32 {
         Slot::Control => 2,
     });
     sha256(&bytes)
-}
-
-/// Read only the bounded sealed demand header during room reopen. This recognizes retained
-/// provisional ownership; it does not create an Active handle or authorize network work.
-/// The caller holds the unlocked profile and its existing startup-work reservation.
-pub(crate) fn legacy_owner(
-    profile: &Profile,
-    room: Digest32,
-    instance: [u8; 16],
-    request: RequestId,
-    author: Digest32,
-) -> Result<bool> {
-    let key = crate::atrest::seal::sek(profile.signer()?, b"vox/history-demand-sek/v1")?;
-    let scope = node_scope(profile.fingerprint(), Slot::Archive);
-    let Some(segment) =
-        profile
-            .store()
-            .snapshot()?
-            .get_segment_bounded(&scope, KIND, HEADER, STATE_BYTES)?
-    else {
-        return Ok(false);
-    };
-    let state = decode(&key, &scope, &segment)?;
-    Ok(state.request == request
-        && state.binding.room == room
-        && state.binding.instance == instance
-        && !state.progress.terminal()
-        && state.cleanup.is_none()
-        && state.legacy.is_some_and(|plan| plan.author == author))
 }
 
 /// The exact paused legacy owner retained in the one archive slot, if there is one.

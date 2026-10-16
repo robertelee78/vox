@@ -3108,6 +3108,7 @@ pub struct SharedService {
 pub enum Frame {
     /// Durable progress of the explicitly selected bounded history operation.
     HistoryDemand {
+        /// Current redaction-safe progress for the bounded operation.
         status: crate::node::api::HistoryDemandStatus,
     },
     /// One daemon-owned work-board projection, never a client-side fold.

@@ -811,21 +811,6 @@ impl Receiver {
         })))
     }
 
-    pub(super) async fn begin_source(
-        &self,
-        request: RequestId,
-        record: Arc<Record>,
-        validated: crate::node::channel::governance::ValidatedSparseEntry,
-        now: crate::time::Ms,
-    ) -> Result<Lookup<(Arc<Record>, crate::node::channel::HistorySourceStart)>> {
-        let job = record.job.clone();
-        self.read_precharged(&job, 64 * 1024, record, move |room, store, record| {
-            room.begin_history_source(store, request, &record.entry, &validated, now)
-                .map(Some)
-        })
-        .await
-    }
-
     /// One preparation quantum. It never loops through an archive or through a fresh budget.
     pub(super) async fn advance_source(
         &self,
@@ -1205,11 +1190,7 @@ impl Receiver {
                     },
                 ),
                 Effect::GovernancePending => LocalResult::wait(step, LocalNeed::Governance),
-                Effect::CheckpointPending {
-                    author,
-                    seq,
-                    hash: _,
-                } => {
+                Effect::CheckpointPending { author, seq } => {
                     // Existing Checkpoint payloads contain only seq/hash: their target is
                     // necessarily in this entry's own author feed, covered by this head.
                     if author != record_author {
@@ -1500,11 +1481,29 @@ impl Receiver {
                     to: through,
                 }),
             ),
+            (SourceProgress::MissingSource { seq }, _) => {
+                LocalResult::wait(step, LocalNeed::Entry { head, seq })
+            }
             (
-                SourceProgress::MissingSource { seq, .. }
-                | SourceProgress::ConflictingSource { seq, .. },
+                SourceProgress::ConflictingSource {
+                    author,
+                    seq,
+                    expected,
+                    actual,
+                },
                 _,
-            ) => LocalResult::wait(step, LocalNeed::Entry { head, seq }),
+            ) => {
+                tracing::warn!(
+                    ?author,
+                    seq,
+                    ?expected,
+                    ?actual,
+                    "conflicting sparse control source"
+                );
+                return Err(Error::MalformedBundle(
+                    "held sparse control source conflicts with authenticated head",
+                ));
+            }
             (SourceProgress::PendingEffect { .. }, Some(seq)) => {
                 LocalResult::wait(step, LocalNeed::Entry { head, seq })
             }

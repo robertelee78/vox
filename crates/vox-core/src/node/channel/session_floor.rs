@@ -176,7 +176,6 @@ impl ChannelState {
                 membership,
             };
             self.append_control_kind(profile, &floor.wire(), now, EntryKind::Content, false)?;
-            self.drive.clear_omissions();
         }
         Ok(())
     }
@@ -238,24 +237,6 @@ impl ChannelState {
                 .receivers
                 .get(&(entry.skeleton.author_id, msg.header.chain_id))
                 .is_some_and(|chain| chain.can_open_iteration(msg.header.iteration)))
-    }
-
-    /// Keep signed skeletons while withholding bodies older than the recipient's authorization.
-    pub(super) fn session_entries_for(
-        &mut self,
-        store: &Store,
-        peer: &Digest32,
-        wants: &[crate::log::sync::WantRange],
-        now_ms: u64,
-    ) -> Result<Vec<Vec<u8>>> {
-        self.session_entries_for_bounded(
-            store,
-            peer,
-            wants,
-            now_ms,
-            crate::log::sync::MAX_SERVE_ENTRIES,
-            crate::log::sync::MAX_SERVE_BYTES,
-        )
     }
 
     pub(super) fn session_entries_for_bounded(
@@ -323,7 +304,6 @@ impl ChannelState {
     pub(super) fn filter_received_session_bodies(
         &mut self,
         store: &Store,
-        peer: Digest32,
         staged: &[Vec<u8>],
         now_ms: u64,
     ) -> Result<()> {
@@ -358,11 +338,9 @@ impl ChannelState {
                     )?;
                     batch.commit()?;
                 }
-                self.drive.clear_omissions();
             }
             self.observe_legacy_drive_generation(&entry)?;
         }
-        let me = self.me();
         for wire in staged {
             let Ok(incoming) = Entry::from_wire(wire) else {
                 continue;
@@ -373,13 +351,6 @@ impl ChannelState {
             if entry.skeleton.seq > self.dag.verified_head(&entry.skeleton.author_id) {
                 continue;
             }
-            let missing = entry.payload.is_none()
-                || !self.session_body_allowed(
-                    Transaction::Snapshot(&store.snapshot()?),
-                    &entry,
-                    &me,
-                )?;
-            let position = (entry.skeleton.author_id, entry.skeleton.seq);
             // No body of a newly verified entry is removed before its publication can save
             // the exact subtype beside its assigned LogDb id. This closes the old volatile
             // observation gap between pre-filtering and absorb_batch.
@@ -396,11 +367,6 @@ impl ChannelState {
                     self.entries.committed();
                     self.legacy_sessions.committed();
                 }
-            }
-            if missing {
-                self.drive.note_omission(peer, position);
-            } else {
-                self.drive.note_body_from(&peer, &position);
             }
         }
         Ok(())

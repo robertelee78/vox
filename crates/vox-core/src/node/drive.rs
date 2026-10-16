@@ -28,7 +28,6 @@
 //! ledger only says who has been given which generation.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::{Duration, Instant};
 
 use zeroize::Zeroizing;
 
@@ -48,12 +47,6 @@ const DRIVE_VERSION: u64 = 2;
 
 /// The most drive keys a room holds from other members, across generations.
 pub const MAX_DRIVE_CHAINS: usize = 4096;
-
-// Advisory retry bounds, not authorization or missing-body limits. Dropping a hint
-// permits another fetch; it never acknowledges receipt or changes sealed membership.
-const OMISSION_PEERS: usize = 32;
-const OMISSION_POSITIONS_PER_PEER: usize = 128;
-const OMISSION_RETRY_AFTER: Duration = Duration::from_secs(30);
 
 /// The id a room's drive keys are bound to in place of the room's own: `SHA-256(domain ‖ room)`.
 #[must_use]
@@ -104,9 +97,6 @@ pub struct DriveState {
     /// Member → `(generation, iteration)` from which it is owed this node's drive key: where the
     /// live generation stood when it became owed it.
     marks: BTreeMap<Digest32, (u64, u64)>,
-    /// Short-lived advisory retry hints, bounded independently of accumulated history.
-    /// Authorization and missing-body membership remain in the sealed indexes.
-    omitted: BTreeMap<Digest32, (Instant, BTreeSet<(Digest32, u64)>)>,
     /// Drive keys released to this node, by `(author, generation)`.
     pub(crate) receivers: BTreeMap<(Digest32, u64), ReceiverChain>,
     /// Member → the generation of this node's drive key last released to it.
@@ -182,53 +172,6 @@ pub fn is_file_out(row: &SessionRow) -> bool {
 }
 
 impl DriveState {
-    pub(crate) fn clear_omissions(&mut self) {
-        self.omitted.clear();
-    }
-
-    pub(crate) fn expire_omissions(&mut self) {
-        self.omitted
-            .retain(|_, (at, _)| at.elapsed() < OMISSION_RETRY_AFTER);
-    }
-
-    /// Cache an omitted position when space permits. A duplicate does not extend its
-    /// retry delay, and a full bucket leaves additional positions eligible for retry.
-    pub(crate) fn note_omission(&mut self, peer: Digest32, position: (Digest32, u64)) {
-        self.expire_omissions();
-        if !self.omitted.contains_key(&peer) && self.omitted.len() >= OMISSION_PEERS {
-            let oldest = self
-                .omitted
-                .iter()
-                .min_by_key(|(_, (at, _))| *at)
-                .map(|(peer, _)| *peer);
-            if let Some(oldest) = oldest {
-                self.omitted.remove(&oldest);
-            }
-        }
-        let (_, positions) = self
-            .omitted
-            .entry(peer)
-            .or_insert_with(|| (Instant::now(), BTreeSet::new()));
-        if positions.len() < OMISSION_POSITIONS_PER_PEER {
-            positions.insert(position);
-        }
-    }
-
-    pub(crate) fn note_body_from(&mut self, peer: &Digest32, position: &(Digest32, u64)) {
-        if let Some((_, positions)) = self.omitted.get_mut(peer) {
-            positions.remove(position);
-            if positions.is_empty() {
-                self.omitted.remove(peer);
-            }
-        }
-    }
-
-    pub(crate) fn peer_omitted(&self, peer: &Digest32, position: &(Digest32, u64)) -> bool {
-        self.omitted.get(peer).is_some_and(|(at, positions)| {
-            at.elapsed() < OMISSION_RETRY_AFTER && positions.contains(position)
-        })
-    }
-
     pub(crate) fn floor_mark(&self, member: &Digest32) -> Option<(u64, u64)> {
         self.marks.get(member).copied()
     }
@@ -416,7 +359,6 @@ impl DriveState {
             chain,
             origin,
             marks,
-            omitted: BTreeMap::new(),
             receivers,
             delivered,
             pending: Vec::new(),

@@ -2410,10 +2410,6 @@ impl ChannelState {
         Ok(())
     }
 
-    /// Fixed metadata for an explicit private history request; never starts transfer.
-    pub(crate) fn private_live_boundary(&self, peer: &Digest32) -> Option<Cursor> {
-        self.private_sessions.cursors.get(peer).cloned()
-    }
     pub(crate) fn private_recovery_after(&self, peer: &Digest32, incarnation: Digest32) -> u64 {
         self.private_sessions
             .cursors

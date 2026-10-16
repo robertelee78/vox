@@ -8,7 +8,6 @@ use crate::node::store::Batch;
 /// Exact signed header and the length bound governing payload continuations.
 pub(crate) struct HistoryHeader {
     pub wire: Vec<u8>,
-    pub payload_len: u64,
 }
 
 pub(crate) struct HistoryHeadHint {
@@ -298,7 +297,6 @@ impl ChannelState {
             .map(|entry| {
                 Ok(HistoryHeader {
                     wire: entry.header_wire(),
-                    payload_len: entry.skeleton.payload_len,
                 })
             })
             .transpose()
@@ -580,28 +578,24 @@ impl FinishedHistoryEffect {
 pub(crate) struct HistoryEffectCursor {
     hash: Digest32,
     next: usize,
+    rendered: bool,
 }
 impl HistoryEffectCursor {
     pub(crate) fn new(hash: Digest32) -> Self {
-        Self { hash, next: 0 }
+        Self {
+            hash,
+            next: 0,
+            rendered: false,
+        }
     }
 }
 
 pub(crate) enum HistoryEffectProgress {
     Progress,
-    ControlPending {
-        head: Digest32,
-        through: u64,
-    },
+    ControlPending { head: Digest32, through: u64 },
     GovernancePending,
-    CheckpointPending {
-        author: Digest32,
-        seq: u64,
-        hash: Digest32,
-    },
-    Complete {
-        rendered: bool,
-    },
+    CheckpointPending { author: Digest32, seq: u64 },
+    Complete { rendered: bool },
     Busy,
 }
 
@@ -625,9 +619,7 @@ impl ChannelState {
         if input.publication_busy() {
             return Ok(HistoryEffectProgress::Busy);
         }
-        if input.history_effect_finished(hash)? {
-            return Ok(HistoryEffectProgress::Complete { rendered: false });
-        }
+        let finished = input.history_effect_finished(hash)?;
         let header = input
             .history_object(entry_store::sparse::ObjectKind::Header, hash)?
             .map(|wire| Entry::from_wire(&wire))
@@ -635,6 +627,17 @@ impl ChannelState {
             .ok_or(Error::MalformedAtRest(
                 "pending history source header missing",
             ))?;
+        if finished {
+            let author = header.skeleton.author_id;
+            drop(input);
+            return if self.advance_history_contiguous(store, &author)? {
+                Ok(HistoryEffectProgress::Progress)
+            } else {
+                Ok(HistoryEffectProgress::Complete {
+                    rendered: cursor.rendered,
+                })
+            };
+        }
         self.require_history_source_boundary(&header)?;
         let v2 = header
             .skeleton
@@ -694,7 +697,6 @@ impl ChannelState {
                 return Ok(HistoryEffectProgress::CheckpointPending {
                     author: entry.skeleton.author_id,
                     seq: checkpoint.seq,
-                    hash: checkpoint.entry_hash,
                 });
             }
         }
@@ -728,7 +730,7 @@ impl ChannelState {
         // A changed grant is an ordinary cancellation before projection/index mutation.
         // The held Batch serializes trust writes through the final publication.
         check_binding(&batch)?;
-        let applied = (|| -> Result<HistoryEffectProgress> {
+        let applied = (|| -> Result<bool> {
             let finished = FinishedHistoryEffect { hash: *hash };
             let mut index = self
                 .entries
@@ -789,12 +791,26 @@ impl ChannelState {
             let rendered = !rows.is_empty();
             self.place_committed(store, rows, &expired)?;
             self.settle_display_order(store)?;
-            Ok(HistoryEffectProgress::Complete { rendered })
+            Ok(rendered)
         })();
-        if let Err(error) = &applied {
-            self.poison(error);
+        let rendered = match applied {
+            Ok(rendered) => rendered,
+            Err(error) => {
+                self.poison(&error);
+                return Err(error);
+            }
+        };
+        cursor.rendered |= rendered;
+        match self.advance_history_contiguous(store, &entry.skeleton.author_id) {
+            Ok(true) => Ok(HistoryEffectProgress::Progress),
+            Ok(false) => Ok(HistoryEffectProgress::Complete {
+                rendered: cursor.rendered,
+            }),
+            Err(error) => {
+                self.poison(&error);
+                Err(error)
+            }
         }
-        applied
     }
 }
 

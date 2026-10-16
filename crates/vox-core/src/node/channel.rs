@@ -7088,9 +7088,6 @@ impl ChannelState {
         }
         self.drive.receivers.insert(slot, chain);
         self.reset_private_pulls();
-        // An older author may have served a skeleton before its authenticated release arrived.
-        // Its newly available local key makes eligible bodies worth asking for again now.
-        self.drive.clear_omissions();
         self.persist_drive(store)?;
         self.drive.told_unheld.remove(&skdm.body.author_id);
         let before = self.drive.news.len();
@@ -9904,9 +9901,7 @@ impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
                     });
             }
         }
-        if let Err(error) =
-            ch.filter_received_session_bodies(self.store, self.peer, &staged, self.now_ms)
-        {
+        if let Err(error) = ch.filter_received_session_bodies(self.store, &staged, self.now_ms) {
             ch.poisoned = true;
             ch.save_error = Some(error.to_string());
             *self.fatal.borrow_mut() = Some(error);

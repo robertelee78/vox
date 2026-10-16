@@ -105,28 +105,6 @@ impl ChannelState {
         }
         Ok(changed)
     }
-    pub(crate) fn legacy_required(
-        &self,
-        store: &Store,
-        author: &Digest32,
-    ) -> Result<Option<LegacyRequired>> {
-        if self.poisoned {
-            return Err(self.save_failure());
-        }
-        Ok(self
-            .entries
-            .read(store, &self.sek, &self.channel_id)?
-            .legacy_required(author))
-    }
-    pub(crate) fn legacy_required_any(&self, store: &Store) -> Result<bool> {
-        if self.poisoned {
-            return Err(self.save_failure());
-        }
-        Ok(self
-            .entries
-            .read(store, &self.sek, &self.channel_id)?
-            .legacy_required_any())
-    }
     pub(crate) fn legacy_required_page(
         &self,
         store: &Store,
@@ -174,17 +152,6 @@ impl ChannelState {
         self.entries
             .bind_legacy_provisional(store, &self.sek, &self.channel_id, owner)
     }
-    pub(crate) fn attach_legacy_provisional(
-        &self,
-        store: &Store,
-        owner: LegacyProvisionalOwner,
-    ) -> Result<LegacyProvisionalState> {
-        if self.poisoned {
-            return Err(self.save_failure());
-        }
-        self.entries
-            .attach_legacy_provisional(store, &self.sek, &self.channel_id, owner)
-    }
     pub(crate) fn detach_legacy_provisional(&self, owner: LegacyProvisionalOwner) -> Result<()> {
         self.entries.detach_legacy_provisional(owner)
     }
@@ -200,20 +167,6 @@ impl ChannelState {
         }
         self.entries
             .cleanup_legacy_provisional(store, &self.sek, &self.channel_id, owner)
-    }
-    pub(crate) fn legacy_provisional_slice(
-        &self,
-        store: &Store,
-        owner: LegacyProvisionalOwner,
-        after: Option<u64>,
-        reverse: bool,
-    ) -> Result<Vec<entry_store::Locator>> {
-        if self.poisoned {
-            return Err(self.save_failure());
-        }
-        self.entries
-            .read(store, &self.sek, &self.channel_id)?
-            .legacy_provisional_slice(owner, after, reverse)
     }
     pub(crate) fn legacy_publication_progress(
         &self,

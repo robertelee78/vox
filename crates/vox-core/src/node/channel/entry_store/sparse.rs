@@ -158,7 +158,6 @@ pub(crate) enum ObjectKind {
     Context = 0,
     Head = 1,
     Header = 2,
-    Proof = 3,
     Verifier = 4,
     ParentReceipt = 5,
     InclusionReceipt = 6,
@@ -170,7 +169,6 @@ impl ObjectKind {
         match self {
             Self::Context => MAX_CONTEXT_BYTES,
             Self::Head | Self::Header | Self::PendingHeader => MAX_HEADER_BYTES,
-            Self::Proof => MAX_FRAME_BYTES,
             Self::Verifier => MAX_FRAME_BYTES + 12 * MAX_HEADER_BYTES + 512,
             Self::ParentReceipt | Self::InclusionReceipt | Self::PrefixReceipt => {
                 4 * MAX_HEADER_BYTES
@@ -655,15 +653,6 @@ impl Read<'_> {
             .unwrap_or(0)
             >= through)
     }
-    pub(crate) fn history_termination(&self, author: &Digest32) -> Result<Option<u64>> {
-        self.source().number(
-            self.sek,
-            self.channel,
-            self.directory.active.sparse.terminations,
-            &hashed(author),
-        )
-    }
-
     pub(crate) fn history_author_after(
         &self,
         after: Option<Digest32>,
@@ -917,94 +906,6 @@ impl Read<'_> {
             })
             .transpose()
     }
-    /// One interval in exact-head order. The admission driver's durable cursor folds
-    /// overlapping ranges in bounded slices; absence is never itself a readiness verdict.
-    pub(crate) fn control_interval_after(
-        &self,
-        head: &Digest32,
-        after: Option<u64>,
-    ) -> Result<Option<(u64, u64)>> {
-        let lo = match after {
-            Some(value) => value
-                .checked_add(1)
-                .ok_or(invalid("control interval cursor overflow"))?,
-            None => 1,
-        };
-        let source = self.source();
-        let Some((key, value)) = source.first(
-            self.sek,
-            self.channel,
-            self.directory.active.sparse.control_intervals,
-            &position(head, lo),
-            0,
-        )?
-        else {
-            return Ok(None);
-        };
-        if key[..32] != head[..] {
-            return Ok(None);
-        }
-        let start = u64::from_be_bytes(
-            key[32..40]
-                .try_into()
-                .map_err(|_| invalid("control interval key"))?,
-        );
-        let Value::Number(through) = value else {
-            return Err(invalid("control interval value"));
-        };
-        if start == 0
-            || through < start
-            || through > crate::log::feed::MAX_SEQ
-            || key[40..].iter().any(|byte| *byte != 0)
-        {
-            return Err(invalid("stored control interval bounds"));
-        }
-        Ok(Some((start, through)))
-    }
-    /// One exact-head dependency, without materializing the rest of the work queue.
-    pub(crate) fn history_obligation_after(
-        &self,
-        head: &Digest32,
-        after: Option<Digest32>,
-    ) -> Result<Option<(Digest32, Obligation)>> {
-        let mut key = [0; 64];
-        key[..32].copy_from_slice(head);
-        if let Some(after) = after {
-            key[32..].copy_from_slice(&after);
-            let Some(next) = dag_facts::successor(key) else {
-                return Ok(None);
-            };
-            key = next;
-        }
-        let source = self.source();
-        let Some((key, value)) = source.first(
-            self.sek,
-            self.channel,
-            self.directory.active.sparse.obligations,
-            &key,
-            0,
-        )?
-        else {
-            return Ok(None);
-        };
-        if key[..32] != head[..] {
-            return Ok(None);
-        }
-        let Value::Number(id) = value else {
-            return Err(invalid("sparse obligation locator"));
-        };
-        let item =
-            Obligation::parse(&source.sparse_record(self.sek, self.channel, id, STATE_BYTES)?)?;
-        if item.key()? != key {
-            return Err(invalid("sparse obligation binding"));
-        }
-        Ok(Some((
-            key[32..]
-                .try_into()
-                .map_err(|_| invalid("sparse obligation key"))?,
-            item,
-        )))
-    }
 }
 
 /// One bounded source-closure step; neither Complete nor Progress grants authority.
@@ -1029,9 +930,7 @@ pub(crate) enum SourceProgress {
         actual: Digest32,
     },
     MissingSource {
-        author: Digest32,
         seq: u64,
-        hash: Digest32,
     },
 }
 
@@ -1161,7 +1060,7 @@ impl Write<'_, '_> {
     /// The token can only be constructed by the channel's typed effect dispatcher after
     /// its exact signed context and current checks finish. This method grants nothing by
     /// source-completeness alone; all changes share the effect transaction.
-    pub(crate) fn finish_history_effect(
+    pub(in crate::node::channel) fn finish_history_effect(
         &mut self,
         entry: &Entry,
         finished: &super::super::sparse_history::FinishedHistoryEffect,
@@ -1651,12 +1550,6 @@ impl Write<'_, '_> {
         }
         let hash = entry.entry_hash();
         self.save_history_object(ObjectKind::Header, hash, &entry.header_wire())?;
-        Ok(hash)
-    }
-    /// A proof object's byte identity confers no verification or publication authority.
-    pub(crate) fn keep_history_proof(&mut self, bytes: &[u8]) -> Result<Digest32> {
-        let hash = sha256(bytes);
-        self.save_history_object(ObjectKind::Proof, hash, bytes)?;
         Ok(hash)
     }
     /// A previously reconstructed tree node, retained for bounded proof serving. The
@@ -2201,13 +2094,7 @@ impl Write<'_, '_> {
                         seq,
                     )?;
                     match actual {
-                        None => {
-                            return Ok(SourceProgress::MissingSource {
-                                author: head.binding.author,
-                                seq,
-                                hash: expected.entry_hash(),
-                            })
-                        }
+                        None => return Ok(SourceProgress::MissingSource { seq }),
                         Some(actual) if actual.entry_hash() != expected.entry_hash() => {
                             return Ok(SourceProgress::ConflictingSource {
                                 author: head.binding.author,

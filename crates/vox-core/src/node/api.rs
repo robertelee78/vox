@@ -817,13 +817,25 @@ pub enum HistoryDemandAction {
     /// Select a bounded missing interval near the newest accepted head.
     Newest,
     /// Select an older interval before this exact cached message.
-    Older { before: Digest32 },
+    Older {
+        /// Exact cached message before which the bounded interval is selected.
+        before: Digest32,
+    },
     /// Recover the next bounded sequential private interval from this exact donor.
-    PrivateRecover { peer: Digest32 },
+    PrivateRecover {
+        /// Exact donor whose next private interval is recovered.
+        peer: Digest32,
+    },
     /// Resume this exact retained operation, preserving its original bounds.
-    Resume { request: [u8; 16] },
+    Resume {
+        /// Exact retained operation to resume.
+        request: [u8; 16],
+    },
     /// Cancel this exact retained operation, including provisional body storage.
-    Cancel { request: [u8; 16] },
+    Cancel {
+        /// Exact retained operation to cancel.
+        request: [u8; 16],
+    },
     /// Inspect saved progress; never starts or resumes traffic.
     Status,
 }
@@ -864,6 +876,7 @@ pub struct HistoryDemandStatus {
     /// Original donor-local private interval; unchanged by continuation.
     #[serde(default)]
     pub private_lo: Option<u64>,
+    /// Inclusive high bound of the original donor-local private interval.
     #[serde(default)]
     pub private_hi: Option<u64>,
     /// Selected room.
