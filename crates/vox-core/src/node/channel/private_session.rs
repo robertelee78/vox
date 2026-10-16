@@ -107,6 +107,10 @@ pub(super) struct PrivateSessions {
     pulling: BTreeSet<Digest32>,
     attempted: BTreeMap<Digest32, Instant>,
     revision: u64,
+    // A capability record is live traffic, not history: a member admitted after the previous
+    // record cannot learn it. Set on every admission and open, and clear only after the current
+    // node has appended a fresh authenticated announcement.
+    support_owed: bool,
 }
 
 impl Stored {
@@ -1060,11 +1064,10 @@ impl ChannelState {
     /// content body. Only an author who advertised support is ever probed with stream 13.
     pub(crate) fn announce_private_support(&mut self, profile: &Profile, now: u64) -> Result<()> {
         let me = self.me();
-        if !self.settled
-            || self.poisoned
-            || self.has_left(&me)
-            || self.supports_private(profile.store(), &me)?
-        {
+        if !self.settled || self.poisoned || self.has_left(&me) {
+            return Ok(());
+        }
+        if !self.private_sessions.support_owed && self.supports_private(profile.store(), &me)? {
             return Ok(());
         }
         self.append_control_kind(
@@ -1074,6 +1077,7 @@ impl ChannelState {
             EntryKind::Content,
             false,
         )?;
+        self.private_sessions.support_owed = false;
         Ok(())
     }
     pub(super) fn restore_private_sessions(&mut self, store: &Store) -> Result<()> {
@@ -1094,8 +1098,15 @@ impl ChannelState {
         self.private_sessions.pending_active = state.pending;
         self.private_sessions.pending_after = state.pending_after;
         self.private_sessions.pending_through = state.pending_through;
+        // A restart may follow an admission that committed just before its capability
+        // announcement. Repeating this one small signed fact is bounded to one per open.
+        self.private_sessions.support_owed = true;
         self.restore_private_pulls(store)?;
         Ok(())
+    }
+
+    pub(crate) fn owe_private_support(&mut self) {
+        self.private_sessions.support_owed = true;
     }
 
     // Cursor scope follows held grant generations, not ratchet iterations. A grant saved

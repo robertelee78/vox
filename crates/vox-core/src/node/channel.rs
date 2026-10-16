@@ -3258,6 +3258,10 @@ impl ChannelState {
             self.save_error = Some(e.to_string());
             return Err(e);
         }
+        // Capability announcements are live room traffic. A newly admitted member cannot read
+        // the announcement that predates its admission, so the next bounded maintenance turn
+        // republishes it. The obligation is recreated on open if the process stops here.
+        self.owe_private_support();
         self.governance_ready = false;
         Ok(true)
     }

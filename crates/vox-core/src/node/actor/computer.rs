@@ -111,6 +111,10 @@ impl Node {
                 floor = floor.max(room.lock().await.newest_mint_seq());
             }
             let changes = self.apply_computer_keyring_at(floor)?;
+            // A policy revision can grant an already admitted member read or drive. That member
+            // may not have received the live capability record before this boundary, so publish
+            // discovery again. It carries no authority; rooms coalesce it to one signed record.
+            self.owe_private_support_in_open_rooms().await;
             for (id, stamp) in changes {
                 self.mark_trust_decision(id, stamp).await;
             }

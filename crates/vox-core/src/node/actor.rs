@@ -13033,6 +13033,12 @@ impl Node {
             // the member will read and never widens it, so it does not undo the trust.
             self.mark_trust_decision(fingerprint, decision).await;
         }
+        // A member may have been admitted while it was not trusted and missed the earlier live
+        // capability record. Publish a fresh signed record when local trust starts or widens the
+        // private relationship. This grants no Session key or drive permission by itself.
+        if newly || self.trust.has_drive(&fingerprint) != had_drive {
+            self.owe_private_support_in_open_rooms().await;
+        }
         // The reacher sets are a join of the ring with each room's author set, so both
         // inputs must push. Immediately, not on the tick: a stream parked open across
         // this instant is judged by the set as it stands when its request lands (M17.11).
@@ -20579,6 +20585,15 @@ impl Node {
         }
     }
 
+    /// Reannounce this node's private-stream capability after a local authorization boundary.
+    /// Each room coalesces repeated changes into one authenticated public control record.
+    async fn owe_private_support_in_open_rooms(&mut self) {
+        let rooms: Vec<_> = self.channels.values().map(Arc::clone).collect();
+        for room in rooms {
+            room.lock().await.owe_private_support();
+        }
+    }
+
     /// Pull through the separate typed stream. No network wait holds the actor or room lock.
     /// It shares the ordinary outbound slot budget, and retries only while a connection exists.
     async fn pull_private_sessions(&mut self, channel_id: Digest32, peer: Digest32) {
@@ -21630,6 +21645,7 @@ impl Node {
         }
         self.trust = next;
         self.note_capability(fingerprint, had_drive);
+        self.owe_private_support_in_open_rooms().await;
         self.publish().await;
         Outcome::Done
     }
