@@ -2685,6 +2685,8 @@ impl Write<'_, '_> {
             &included.binding().author,
             included.header().entry().skeleton.seq,
         );
+        let prefix = receipt.prefix();
+        self.keep_history_range(prefix.binding(), 1, prefix.prefix())?;
         self.save_history_object(ObjectKind::ParentReceipt, key, &receipt.checkpoint()?)
     }
 }
