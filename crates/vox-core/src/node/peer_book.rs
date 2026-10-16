@@ -112,6 +112,11 @@ pub fn load_anchor_hints(
     let Some(blob) = store.get_meta("anchor-endpoint-hints")? else {
         return Ok(crate::nat::bootstrap::BootstrapSet::new());
     };
+    // 64 identities × 8 fixed-size endpoints fit well below this conservative cap. Reject
+    // corrupt oversized cache bytes before cloning ciphertext or allocating decrypted plaintext.
+    if blob.len() > 64 * 1024 {
+        return Err(Error::SizeLimitExceeded("anchor hint cache"));
+    }
     if blob.len() < NONCE_LEN {
         return Err(Error::MalformedAtRest("anchor hint blob too short"));
     }

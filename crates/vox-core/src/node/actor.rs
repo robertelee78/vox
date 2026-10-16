@@ -4672,6 +4672,7 @@ pub struct Node {
     /// The BootstrapSet codec supplies bounds, never authority; old hints require a fresh dial.
     anchor_hints: BootstrapSet,
     anchor_hints_load_error: bool,
+    anchor_hints_dirty: bool,
     /// Connection, network generation and next refresh time; a new connection is asked at once.
     anchor_hints_due: BTreeMap<Digest32, (u64, u64, u64)>,
     /// When each anchor's current connection was made (unix milliseconds), with that connection's
@@ -5375,6 +5376,7 @@ impl Node {
             anchor_window: BTreeMap::new(),
             anchor_hints: BootstrapSet::new(),
             anchor_hints_load_error: false,
+            anchor_hints_dirty: false,
             anchor_hints_due: BTreeMap::new(),
             anchor_connected_at: BTreeMap::new(),
             anchors_up: BTreeMap::new(),
@@ -7994,19 +7996,23 @@ impl Node {
             let _ = next.add(node);
         }
         self.anchor_hints = next;
+        self.anchor_hints_dirty = true;
         true
     }
 
-    fn save_anchor_hints(&self) {
+    fn save_anchor_hints(&mut self) {
         if !self.anchor_hints_load_error {
             if let Some(profile) = self.profile.as_ref() {
                 if let Ok(signer) = profile.signer() {
-                    if let Err(error) = crate::node::peer_book::save_anchor_hints(
+                    match crate::node::peer_book::save_anchor_hints(
                         profile.store(),
                         signer,
                         &self.anchor_hints,
                     ) {
-                        eprintln!("vox: anchor endpoint cache could not be saved: {error}");
+                        Ok(()) => self.anchor_hints_dirty = false,
+                        Err(error) => eprintln!(
+                            "vox: anchor endpoint cache could not be saved; will retry: {error}"
+                        ),
                     }
                 }
             }
@@ -9081,7 +9087,8 @@ impl Node {
                 if net
                     .manager()
                     .on_current_network(generation, || self.keep_anchor_hints(peer, endpoints))
-                    == Some(true)
+                    .is_some()
+                    && self.anchor_hints_dirty
                 {
                     // Disk sealing is outside the generation read guard; it must not delay a
                     // new network event. The actor alone serializes writes to this hint cache.
@@ -16407,6 +16414,7 @@ impl Node {
         self.peer_book =
             crate::node::peer_book::PeerBook::load(profile.store(), signer).unwrap_or_default();
         self.anchor_hints_load_error = false;
+        self.anchor_hints_dirty = false;
         self.anchor_hints = match crate::node::peer_book::load_anchor_hints(profile.store(), signer)
         {
             Ok(hints) => hints,
@@ -16600,6 +16608,7 @@ impl Node {
         self.dismissed_offers = crate::node::offers::DismissedOffers::default();
         self.peer_book = crate::node::peer_book::PeerBook::new();
         self.anchor_hints = BootstrapSet::new();
+        self.anchor_hints_dirty = false;
         self.anchor_hints_due.clear();
         // The sender keys held for consents not yet delivered are room secrets: dropped, and
         // zeroized as they go (V210-76). They are reloaded, sealed, at the next unlock.
