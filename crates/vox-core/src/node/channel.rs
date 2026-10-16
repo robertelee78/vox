@@ -3572,10 +3572,25 @@ impl ChannelState {
                 self.entries.committed();
                 if done {
                     let read = self.entries.read(store, &self.sek, &self.channel_id)?;
+                    let own_applied = read
+                        .restart_state()
+                        .and_then(|state| state.feeds.get(&self.me()))
+                        .map(|feed| feed.seq);
                     self.dag.set_order_revision(
                         read.order_revision(),
                         read.order_previous(None)?.map(|(clock, _)| clock),
                     );
+                    // A sparse local append applies its effects in the same Batch that
+                    // publishes its signed head. Remote effects advance this cache in
+                    // `advance_history_effect`; keep the local path equally current so
+                    // membership decisions (especially an immediate leave) see the durable
+                    // presence statement without requiring a reopen first.
+                    if let Some(seq) = own_applied {
+                        self.sparse_applied_tips
+                            .entry(self.me())
+                            .and_modify(|tip| *tip = (*tip).max(seq))
+                            .or_insert(seq);
+                    }
                     return Ok(());
                 }
             }
