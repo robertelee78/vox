@@ -97,7 +97,7 @@ fn is_link_local(ip: Ipv6Addr) -> bool {
 ///
 /// On Linux, parses `/proc/net/ipv6_route` for the `::/0` route with the lowest
 /// metric and returns its next hop; a link-local next hop is paired with the
-/// kernel interface index read from `/sys/class/net/<iface>/ifindex`, because a
+/// kernel interface index read through a socket in the current network namespace, because a
 /// link-local address cannot be sent to without one. On other platforms the routing
 /// table has no portable file interface and this returns
 /// [`Error::PortMappingFailed`] — [`server_candidates_v6`] then relies on the RFC
@@ -196,21 +196,24 @@ fn hex_to_ipv6(hex: &str) -> Option<Ipv6Addr> {
     Some(Ipv6Addr::from(octets))
 }
 
-/// The kernel interface index for `iface`, read from sysfs.
+/// The kernel interface index for `iface` in this process's network namespace.
 ///
-/// The name comes from the routing table, but it is still interpolated into a path,
-/// so anything but a plain interface name is refused rather than escaped.
+/// `/sys/class/net` belongs to its mount's namespace, which can differ after a network-only
+/// `unshare` or `setns`. Mixing that host index with this namespace's routes either loses the
+/// route or assigns another interface's scope. A socket ioctl asks the same kernel network
+/// namespace as `/proc/net/route` and the route watcher, without requiring a sysfs mount.
 #[cfg(target_os = "linux")]
 fn interface_index(iface: &str) -> Option<u32> {
-    let plain = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':');
-    if iface.is_empty() || iface.len() > 16 || !iface.bytes().all(plain) {
-        return None;
-    }
-    std::fs::read_to_string(format!("/sys/class/net/{iface}/ifindex"))
-        .ok()?
-        .trim()
-        .parse()
+    let socket = rustix::net::socket_with(
+        rustix::net::AddressFamily::INET,
+        rustix::net::SocketType::DGRAM,
+        rustix::net::SocketFlags::CLOEXEC,
+        None,
+    )
+    .ok()?;
+    rustix::net::netdevice::name_to_index(&socket, iface)
         .ok()
+        .filter(|index| *index != 0)
 }
 
 /// Discover the IPv4 default gateway from the OS routing table.

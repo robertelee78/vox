@@ -394,7 +394,7 @@ def log(w):
 def status_of(w):
     result = run(w, "status", "--json", secs=10)
     if result.returncode != 0:
-        return {}
+        raise Product(f"{w}'s public status observation failed (exit {result.returncode}): stdout={result.stdout!r}; stderr={result.stderr!r}")
     try:
         return json.loads(result.stdout)
     except ValueError as error:
@@ -517,7 +517,7 @@ try:
                 raise Apparatus(f"{w}'s anchor inputs do not stage only a manual LAN bootstrap: {inventory!r}")
             print(f"{TAG} {w}'s public anchor inventory confirms only the LAN bootstrap and manual source: {item}", flush=True)
     time.sleep(2)
-    SAID = "vox: the network changed:"
+    SAID = "vox: node default: the network changed:"
     def said_lines():
         return [l for l in log("d").splitlines() if l.startswith(SAID)]
     if LINUX:
@@ -644,11 +644,12 @@ try:
         if not until(lambda: peer_path("d", fp["p"]) == "direct", 20, 0.1):
             raise Product("the established peer was not direct before staging its loss")
         def udp_port(w):
-            for address in status_of(w).get("listening", []):
+            report = status_of(w)
+            for address in report.get("listening", []):
                 match = re.search(r"(?:/udp/|:)([0-9]+)$", address)
                 if match:
                     return int(match.group(1))
-            raise Product(f"{w}'s status did not name its listening port")
+            raise Apparatus(f"cannot stage the direct-path filter: {w}'s public status did not name its listening port: {report!r}")
         d_port, p_port = udp_port("d"), udp_port("p")
         rules = f"{S}/direct-path-loss.nft"
         open(rules, "w").write(
