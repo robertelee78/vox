@@ -289,30 +289,44 @@ pub fn merge_anchors_file(
     set: &mut crate::nat::bootstrap::BootstrapSet,
     path: &std::path::Path,
 ) -> Result<Vec<String>> {
+    let (inputs, mut skipped) = anchor_file_inputs(path);
+    for (label, spec) in inputs {
+        if let Err(error) = merge_anchor_spec(set, &spec) {
+            skipped.push(format!("{label} is skipped: {error}"));
+        }
+    }
+    Ok(skipped)
+}
+
+fn anchor_file_inputs(path: &std::path::Path) -> (Vec<(String, String)>, Vec<String>) {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Vec::new(), Vec::new()),
         Err(e) => {
             let why = if e.kind() == std::io::ErrorKind::InvalidData {
                 "it is not text (UTF-8)".to_owned()
             } else {
                 format!("it cannot be read: {e}")
             };
-            return Ok(vec![format!("{} is skipped whole: {why}", path.display())]);
+            return (
+                Vec::new(),
+                vec![format!("{} is skipped whole: {why}", path.display())],
+            );
         }
     };
-    let mut skipped = Vec::new();
+    let mut inputs = Vec::new();
     for (i, line) in text.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
         // The line number is the whole point: a person edits this file by hand.
-        if let Err(e) = merge_anchor_spec(set, line) {
-            skipped.push(format!("{} line {} is skipped: {e}", path.display(), i + 1));
-        }
+        inputs.push((
+            format!("{} line {}", path.display(), i + 1),
+            line.to_owned(),
+        ));
     }
-    Ok(skipped)
+    (inputs, Vec::new())
 }
 
 /// Read this data root's manual anchors, independently of the node requesting them.
@@ -325,6 +339,22 @@ pub fn merge_machine_anchors(
     set: &mut crate::nat::bootstrap::BootstrapSet,
     account: &crate::node::paths::Account,
 ) -> Result<Vec<String>> {
+    let (inputs, mut skipped) = machine_anchor_inputs(account);
+    for (label, spec) in inputs {
+        if let Err(error) = merge_anchor_spec(set, &spec) {
+            skipped.push(format!("{label} is skipped: {error}"));
+        }
+    }
+    Ok(skipped)
+}
+
+/// Read manual inputs without resolving hostnames. The daemon can publish numeric candidates
+/// immediately and resolve names separately, keeping a slow resolver off its writer lock.
+/// Each input retains its diagnostic source label; unreadable files are named and skipped.
+pub fn machine_anchor_inputs(
+    account: &crate::node::paths::Account,
+) -> (Vec<(String, String)>, Vec<String>) {
+    let mut inputs = Vec::new();
     let mut skipped = Vec::new();
     for file in account.anchor_input_files() {
         if file == account.anchors_file()
@@ -337,9 +367,11 @@ pub fn merge_machine_anchors(
             ));
             continue;
         }
-        skipped.extend(merge_anchors_file(set, &file)?);
+        let (file_inputs, file_skipped) = anchor_file_inputs(&file);
+        inputs.extend(file_inputs);
+        skipped.extend(file_skipped);
     }
-    Ok(skipped)
+    (inputs, skipped)
 }
 
 /// Write one manual change without discarding any other input, including comments or lines

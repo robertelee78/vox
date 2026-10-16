@@ -11,6 +11,8 @@
 //! |---|---|---|
 //! | `WHOAMI` | asker → peer | "what source address do you see for me?" |
 //! | `OBSERVED <multiaddr>` | peer → asker | the address the peer observes for the connection the stream is on |
+//! | `ENDPOINTS` | asker → anchor | "which endpoints do you advertise for yourself?" |
+//! | `ADVERTISED <endpoints>` | anchor → asker | bounded dial hints for this authenticated identity only |
 //! | `RELAY <peer>` | initiator → coordinator | "carry a punch session to this peer" |
 //! | `FROM <peer>` | coordinator → responder | "this relayed session is from that peer" |
 //! | `RELAYING` | either → its counterpart | the session is up; `COORD` frames follow |
@@ -31,8 +33,8 @@
 //! A joiner is included deliberately: without it, a newcomer could only join a swarm
 //! that has a publicly reachable member, which is the dependency this ADR exists to
 //! remove — and a joiner already holds a far more expensive capability, the PoW-gated
-//! join stream. An *unknown* peer, which has published nothing, gets `WHOAMI` and
-//! nothing else.
+//! join stream. An *unknown* peer gets `WHOAMI` and, from an explicitly served anchor only,
+//! its own `ENDPOINTS`. Neither grants relay or room access.
 //!
 //! One more rule, for the joining case: a session relayed **by this node's own
 //! anchor** is accepted whoever the far peer is. The anchor already applied its own
@@ -92,6 +94,8 @@ const OP_FROM: u64 = 3;
 const OP_RELAYING: u64 = 4;
 const OP_REFUSED: u64 = 5;
 const OP_COORD: u64 = 6;
+const OP_ENDPOINTS: u64 = 7;
+const OP_ADVERTISED: u64 = 8;
 
 /// Why a coordinator or a responder would not take part.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -129,6 +133,13 @@ impl CoordRefusal {
 pub enum CoordFrame {
     /// "What source address do you see for me?"
     WhoAmI,
+    /// Ask an explicitly served anchor for its own current endpoints.
+    Endpoints,
+    /// Self-advertised hints; the authenticated connection supplies their identity.
+    Advertised {
+        /// Bounded hints, never identity, trust, membership or relay authority.
+        endpoints: EndpointList,
+    },
     /// The address the peer observes for this connection.
     Observed {
         /// The observed (reflexive) address.
@@ -167,6 +178,13 @@ impl CoordFrame {
             CoordFrame::WhoAmI => {
                 e.array(1).uint(OP_WHOAMI);
             }
+            CoordFrame::Endpoints => {
+                e.array(1).uint(OP_ENDPOINTS);
+            }
+            CoordFrame::Advertised { endpoints } => {
+                e.array(2).uint(OP_ADVERTISED);
+                endpoints.encode_into(&mut e);
+            }
             CoordFrame::Observed { addr } => {
                 e.array(2).uint(OP_OBSERVED);
                 addr.encode_into(&mut e);
@@ -198,6 +216,10 @@ impl CoordFrame {
         let op = d.uint()?;
         let frame = match (op, arity) {
             (OP_WHOAMI, 1) => CoordFrame::WhoAmI,
+            (OP_ENDPOINTS, 1) => CoordFrame::Endpoints,
+            (OP_ADVERTISED, 2) => CoordFrame::Advertised {
+                endpoints: EndpointList::decode_from(&mut d)?,
+            },
             (OP_OBSERVED, 2) => CoordFrame::Observed {
                 addr: Multiaddr::decode_from(&mut d)?,
             },
@@ -214,7 +236,9 @@ impl CoordFrame {
             (OP_COORD, 2) => CoordFrame::Coord {
                 payload: d.bytes()?.to_vec(),
             },
-            (OP_WHOAMI..=OP_COORD, _) => return Err(Error::HolePunchFailed("coord: frame arity")),
+            (OP_WHOAMI..=OP_ADVERTISED, _) => {
+                return Err(Error::HolePunchFailed("coord: frame arity"))
+            }
             _ => return Err(Error::HolePunchFailed("coord: unknown op")),
         };
         d.finish()
@@ -240,6 +264,26 @@ async fn next_frame(recv: &mut RecvStream) -> Result<CoordFrame> {
 
 async fn send_frame(send: &mut SendStream, frame: &CoordFrame) -> Result<()> {
     write_frame(send, &frame.to_bytes()).await
+}
+
+/// Learn the authenticated anchor's own endpoints before the current path is lost. They are
+/// only dial hints: every later connection must prove the same identity again. The whole request
+/// is bounded, including opening and writing the stream, and never delays a usable connection.
+pub async fn ask_endpoints(conn: &VoxConnection) -> Result<EndpointList> {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let (mut send, mut recv) = open_typed(conn, StreamKind::Coord).await?;
+        send_frame(&mut send, &CoordFrame::Endpoints).await?;
+        let answer = next_frame(&mut recv).await?;
+        let _ = send.finish();
+        match answer {
+            CoordFrame::Advertised { endpoints } => Ok(endpoints),
+            _ => Err(Error::HolePunchFailed(
+                "coord: anchor endpoints not available",
+            )),
+        }
+    })
+    .await
+    .map_err(|_| Error::HolePunchFailed("coord: anchor endpoint request timed out"))?
 }
 
 /// Ask `conn`'s peer for the source address it sees for this connection — this node's
@@ -308,6 +352,7 @@ pub enum CoordInbound {
 pub async fn serve_coord<F>(
     peer: Digest32,
     observed: Option<Multiaddr>,
+    advertised: Option<EndpointList>,
     classify: &(dyn Fn(&Digest32) -> PeerClass + Sync),
     shares_room: &(dyn Fn(&Digest32, &Digest32) -> bool + Sync),
     transport: &(dyn Fn(&Digest32, &Digest32) -> Option<ComputerTransportPermit> + Sync),
@@ -320,6 +365,17 @@ where
     F: FnOnce(&Digest32) -> Option<Arc<VoxConnection>>,
 {
     match next_frame(&mut recv).await? {
+        CoordFrame::Endpoints => {
+            let Some(endpoints) = advertised else {
+                refuse(&mut send, CoordRefusal::NotAuthorized).await;
+                return Err(Error::StreamRefused(
+                    "coord: this node is not a served anchor",
+                ));
+            };
+            send_frame(&mut send, &CoordFrame::Advertised { endpoints }).await?;
+            let _ = send.finish();
+            Ok(CoordInbound::Answered)
+        }
         // Open to anyone: the answer is the asker's own address — when this node can
         // actually observe it. Over a relayed path it cannot (see the caller), and a
         // circuit address handed back as "your address" is a destination nobody can dial

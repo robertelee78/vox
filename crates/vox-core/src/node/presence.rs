@@ -163,7 +163,7 @@ pub struct NetPresence {
     /// How many real changes of the machine's network this presence has seen, counted under the
     /// mapping lock: a discovery that spans one is of the network before it, and its result is
     /// not published (N-51).
-    generation: std::sync::atomic::AtomicU64,
+    generation: watch::Sender<u64>,
     /// Why this machine's network changes are not heard, if they are not (N-49).
     unwatched: Mutex<Option<String>>,
     /// The task that hears the operating system's network events.
@@ -383,19 +383,14 @@ impl NetPresence {
             nearby: Mutex::new(None),
             changes: broadcast::channel(16).0,
             last_change: Mutex::new(None),
-            generation: std::sync::atomic::AtomicU64::new(0),
+            generation: watch::channel(0).0,
             unwatched: Mutex::new(None),
             watcher: Mutex::new(None),
         });
         let mapper = spawn_mapper(Arc::downgrade(&presence));
         *lock(&presence.mapper) = Some(mapper);
-        match NetWatch::open() {
-            Ok(watch) => {
-                let watcher = spawn_watcher(Arc::downgrade(&presence), watch);
-                *lock(&presence.watcher) = Some(watcher);
-            }
-            Err(why) => *lock(&presence.unwatched) = Some(why),
-        }
+        let watcher = spawn_watcher(Arc::downgrade(&presence));
+        *lock(&presence.watcher) = Some(watcher);
         presence
     }
 
@@ -497,6 +492,13 @@ impl NetPresence {
         self.changes.subscribe()
     }
 
+    /// The shared path generation. A publication holds its read guard through its synchronous
+    /// state change, so a network transition cannot interleave an old result into a newer path.
+    #[must_use]
+    pub fn network_generation(&self) -> watch::Receiver<u64> {
+        self.generation.subscribe()
+    }
+
     /// The last real change of the machine's network, if there was one (N-52).
     #[must_use]
     pub fn last_change(&self) -> Option<NetChange> {
@@ -513,16 +515,16 @@ impl NetPresence {
     /// of a mapping whose internal address is gone, advertise the new routable addresses at once,
     /// say the change to every node, and run the full publish side, with its gateway work, after.
     async fn changed(&self, change: NetChange) {
-        self.refresh_observed();
         let leased = {
             let mut m = lock(&self.mapping);
             // Any discovery running now read the network before this change.
             self.generation
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if change.went.iter().any(|ip| ip.is_ipv4()) {
+                .send_modify(|generation| *generation = generation.wrapping_add(1));
+            self.refresh_observed();
+            if change.affected.0 {
                 m.forget(false);
             }
-            if change.went.iter().any(|ip| ip.is_ipv6()) {
+            if change.affected.1 {
                 m.forget(true);
             }
             m.leased(unix_now_ms())
@@ -540,6 +542,20 @@ impl NetPresence {
     /// address is.
     pub fn note_observed(&self, local: Digest32, reporter: Digest32, addr: Multiaddr) {
         lock(&self.observed).insert((local, reporter), addr);
+    }
+
+    /// Record a response only on the path where its request began.
+    pub fn note_observed_at(
+        &self,
+        generation: u64,
+        local: Digest32,
+        reporter: Digest32,
+        addr: Multiaddr,
+    ) {
+        let current = self.generation.borrow();
+        if *current == generation {
+            self.note_observed(local, reporter, addr);
+        }
     }
 
     /// Forget what `reporter` told `local` (its connection is gone).
@@ -773,10 +789,7 @@ fn spawn_mapper(presence: std::sync::Weak<NetPresence>) -> tokio::task::AbortHan
                 };
                 let (leased, generation) = {
                     let m = lock(&p.mapping);
-                    (
-                        m.leased(unix_now_ms()),
-                        p.generation.load(std::sync::atomic::Ordering::SeqCst),
-                    )
+                    (m.leased(unix_now_ms()), *p.generation.borrow())
                 };
                 (
                     bound,
@@ -786,6 +799,32 @@ fn spawn_mapper(presence: std::sync::Weak<NetPresence>) -> tokio::task::AbortHan
                 )
             };
             let (leased, generation) = leased;
+            // A new presence has local addresses before any router answers. Publish those
+            // first, just as `changed` does: waiting for PCP/NAT-PMP and UPnP here left a
+            // Ready wildcard-bound node with no address in status or its room records for
+            // the entire gateway retry window. Keep unlock independent of gateway work.
+            let initial = {
+                let Some(p) = presence.upgrade() else { return };
+                let initial = p.advertised.borrow().is_none();
+                initial
+            };
+            if initial {
+                let list = crate::nat::reachability::routable_endpoints(bound, &leased).await;
+                let Some(p) = presence.upgrade() else { return };
+                // Route discovery can overlap a network event. The same lock as `changed`
+                // fences this first publication; an old path must not replace its successor.
+                let _mapping = lock(&p.mapping);
+                if *p.generation.borrow() != generation {
+                    continue;
+                }
+                p.advertised.send_if_modified(|current| {
+                    if current.is_some() {
+                        return false;
+                    }
+                    *current = Some(list);
+                    true
+                });
+            }
             let started = unix_now_ms();
             let (list, granted, asks) =
                 crate::nat::reachability::advertise_endpoints(bound, &leased, &races).await;
@@ -797,7 +836,7 @@ fn spawn_mapper(presence: std::sync::Weak<NetPresence>) -> tokio::task::AbortHan
                 // addresses are the old ones, and publishing them would undo what the change
                 // advertised (N-51). Its grants are for the old network too: deleted, and the
                 // discovery runs again at once (the change asked for one).
-                if p.generation.load(std::sync::atomic::Ordering::SeqCst) != generation {
+                if *p.generation.borrow() != generation {
                     // A renewal of a mapping still held is that mapping: kept, not deleted.
                     let fresh: Vec<PortMapping> = granted
                         .into_iter()
@@ -848,32 +887,77 @@ fn spawn_mapper(presence: std::sync::Weak<NetPresence>) -> tokio::task::AbortHan
 
 /// **Hear the machine's network change** (ADR-012 N-49, N-50): coalesce each burst of the
 /// operating system's events, read the machine's shape, and act only on a real change.
-fn spawn_watcher(
-    presence: std::sync::Weak<NetPresence>,
-    mut watch: NetWatch,
-) -> tokio::task::AbortHandle {
+fn spawn_watcher(presence: std::sync::Weak<NetPresence>) -> tokio::task::AbortHandle {
     tokio::spawn(async move {
         let mut before = NetShape::now().await;
+        let mut retry = Duration::from_secs(1);
+        let mut missed_events = false;
         loop {
-            if let Err(e) = watch.settled().await {
-                // Said once, as a failure to open is said at start: from here a move to another
-                // network is noticed only when a peer is lost.
-                let why = format!("the network event socket failed: {e}");
-                eprintln!(
-                    "vox: {why}; a move to another network is noticed only when a peer is lost"
-                );
-                if let Some(p) = presence.upgrade() {
-                    *lock(&p.unwatched) = Some(why);
-                }
+            if presence.upgrade().is_none() {
                 return;
             }
-            let after = NetShape::now().await;
-            let Some(change) = NetChange::between(&before, &after, unix_now_ms()) else {
-                continue;
+            let mut watch = match NetWatch::open() {
+                Ok(watch) => watch,
+                Err(why) => {
+                    missed_events = true;
+                    if let Some(p) = presence.upgrade() {
+                        let mut previous = lock(&p.unwatched);
+                        if previous.as_ref() != Some(&why) {
+                            eprintln!("vox: {why}; retrying network observation");
+                        }
+                        *previous = Some(why);
+                    }
+                    if !cfg!(any(target_os = "macos", target_os = "linux")) {
+                        return;
+                    }
+                    tokio::time::sleep(retry).await;
+                    retry = (retry * 2).min(Duration::from_secs(30));
+                    continue;
+                }
             };
+            // Opening precedes this snapshot, so events concurrent with recovery stay queued.
+            let after = NetShape::now().await;
+            let events = if missed_events {
+                crate::nat::netwatch::NetworkEvents::missed_interval()
+            } else {
+                Default::default()
+            };
+            let change = NetChange::between(&before, &after, &events, unix_now_ms());
             before = after.knowing(&before);
             let Some(p) = presence.upgrade() else { return };
-            p.changed(change).await;
+            if lock(&p.unwatched).take().is_some() {
+                eprintln!("vox: network observation recovered");
+            }
+            if let Some(change) = change {
+                p.changed(change).await;
+            }
+            drop(p);
+            loop {
+                let events = match watch.settled().await {
+                    Ok(events) => events,
+                    Err(error) => {
+                        missed_events = true;
+                        let why = format!("the network event socket failed: {error}");
+                        eprintln!("vox: {why}; reopening network observation");
+                        if let Some(p) = presence.upgrade() {
+                            *lock(&p.unwatched) = Some(why);
+                        }
+                        break;
+                    }
+                };
+                retry = Duration::from_secs(1);
+                let after = NetShape::now().await;
+                let change = NetChange::between(&before, &after, &events, unix_now_ms());
+                // Learning a previously unknown route matters even if this sample cannot
+                // establish a change. Otherwise every later route-only move stays invisible.
+                before = after.knowing(&before);
+                let Some(p) = presence.upgrade() else { return };
+                if let Some(change) = change {
+                    p.changed(change).await;
+                }
+            }
+            tokio::time::sleep(retry).await;
+            retry = (retry * 2).min(Duration::from_secs(30));
         }
     })
     .abort_handle()
