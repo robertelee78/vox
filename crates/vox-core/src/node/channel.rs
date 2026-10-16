@@ -2297,6 +2297,18 @@ impl ChannelState {
                     sparse_applied_tips.insert(*author, tip.skeleton.seq);
                 }
             }
+            // This node applied its own authored operation in the same Batch that advanced
+            // the restart feed. It needs no later source/effect settlement to be current.
+            if let Some(seq) = entry_read
+                .restart_state()
+                .and_then(|state| state.feeds.get(&me))
+                .map(|feed| feed.seq)
+            {
+                sparse_applied_tips
+                    .entry(me)
+                    .and_modify(|tip| *tip = (*tip).max(seq))
+                    .or_insert(seq);
+            }
         }
 
         // How far each member's node holds this identity's feed (ADR-028 R-6).
@@ -3550,11 +3562,25 @@ impl ChannelState {
     }
 
     fn finish_entry_publication(&mut self, store: &Store) -> Result<()> {
+        let local_applied = self.local_history.as_ref().map(|prepared| {
+            let entry = prepared.header.entry();
+            (entry.skeleton.author_id, entry.skeleton.seq)
+        });
         self.local_history = None;
         self.local_pre_context = None;
         self.local_append_budget = None;
         self.local_content_header = None;
         self.key_packages.published(self.next_log_id);
+        // The caller committed the local append and all of its effects before entering here.
+        // Remote effects advance this cache in `advance_history_effect`; advance the authored
+        // path from the exact verified header too, before optional cleanup can return early.
+        if let Some((author, seq)) = local_applied {
+            debug_assert_eq!(author, self.me());
+            self.sparse_applied_tips
+                .entry(author)
+                .and_modify(|tip| *tip = (*tip).max(seq))
+                .or_insert(seq);
+        }
         // Explicit legacy history owns post-switch cleanup too. A large authenticated
         // unsigned prefix must not turn this one final witness into an unbounded cleanup.
         if self.legacy_provisional_state(store)?.is_some() {
@@ -3572,25 +3598,10 @@ impl ChannelState {
                 self.entries.committed();
                 if done {
                     let read = self.entries.read(store, &self.sek, &self.channel_id)?;
-                    let own_applied = read
-                        .restart_state()
-                        .and_then(|state| state.feeds.get(&self.me()))
-                        .map(|feed| feed.seq);
                     self.dag.set_order_revision(
                         read.order_revision(),
                         read.order_previous(None)?.map(|(clock, _)| clock),
                     );
-                    // A sparse local append applies its effects in the same Batch that
-                    // publishes its signed head. Remote effects advance this cache in
-                    // `advance_history_effect`; keep the local path equally current so
-                    // membership decisions (especially an immediate leave) see the durable
-                    // presence statement without requiring a reopen first.
-                    if let Some(seq) = own_applied {
-                        self.sparse_applied_tips
-                            .entry(self.me())
-                            .and_modify(|tip| *tip = (*tip).max(seq))
-                            .or_insert(seq);
-                    }
                     return Ok(());
                 }
             }
