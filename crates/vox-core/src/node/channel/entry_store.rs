@@ -2883,6 +2883,13 @@ impl EntryIndex {
             drop(batch);
             return self.attach_legacy_provisional(store, sek, channel, owner);
         }
+        // Only explicit legacy staging waits here. Normal current entries can continue
+        // using the independent active/provisional roots during local retirement.
+        if writer.directory.retired_provisional != Roots::default() {
+            return Err(Error::StreamRefused(
+                "legacy history waits for retired staging cleanup",
+            ));
+        }
         if writer.directory.phase != Phase::Idle
             || writer.directory.active.sparse.enabled
             || writer.directory.history_instance != owner.instance
