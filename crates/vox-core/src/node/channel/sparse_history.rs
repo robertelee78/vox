@@ -630,13 +630,13 @@ impl ChannelState {
         if finished {
             let author = header.skeleton.author_id;
             drop(input);
-            return if self.advance_history_contiguous(store, &author)? {
-                Ok(HistoryEffectProgress::Progress)
-            } else {
-                Ok(HistoryEffectProgress::Complete {
-                    rendered: cursor.rendered,
-                })
-            };
+            // Feed restoration is local accepted-header maintenance. Advance at most one
+            // successor in this bounded turn, but do not retain the source capability after
+            // this exact entry's semantic effect has already completed.
+            self.advance_history_contiguous(store, &author)?;
+            return Ok(HistoryEffectProgress::Complete {
+                rendered: cursor.rendered,
+            });
         }
         self.require_history_source_boundary(&header)?;
         let v2 = header
@@ -802,8 +802,7 @@ impl ChannelState {
         };
         cursor.rendered |= rendered;
         match self.advance_history_contiguous(store, &entry.skeleton.author_id) {
-            Ok(true) => Ok(HistoryEffectProgress::Progress),
-            Ok(false) => Ok(HistoryEffectProgress::Complete {
+            Ok(_) => Ok(HistoryEffectProgress::Complete {
                 rendered: cursor.rendered,
             }),
             Err(error) => {
