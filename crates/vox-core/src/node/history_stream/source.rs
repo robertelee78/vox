@@ -430,7 +430,10 @@ impl Source {
     }
 
     /// Filter at most 64 already decoded hints using exact accepted/settled local facts.
-    /// Missing terminal bodies remain eligible; a control-ready head is not body receipt.
+    /// A completed terminal control is not receipt of the content before it. Keep hints
+    /// eligible until their selected newest window is visited and has no missing positions.
+    /// A peer's BodyNotHeld is not a global absence verdict: a later hint may retry those
+    /// positions from another peer without rewinding the main cursor or draining older history.
     /// The caller holds the original HAVE's decode charge and preserves this inbox generation.
     pub(super) async fn offer_inventory(
         &self,
@@ -463,42 +466,34 @@ impl Source {
                     let read = room.history_read(store)?;
                     let mut missing = Vec::with_capacity(slice.len());
                     for hint in slice {
-                        let ready = read
-                            .sparse_author(&hint.author, crate::log::history::LogScope::Public)?
-                            .is_some_and(|state| {
-                                state.committed == Some(hint.head)
-                                    && state.control_ready == Some(hint.head)
-                            });
-                        let held = if ready {
-                            let head = read.history_head(&hint.head)?;
-                            if head
-                                .as_ref()
-                                .is_none_or(|head| head.root.leaves != hint.size)
-                            {
-                                false
-                            } else if hint.size == 0 {
-                                true
-                            } else if let Some(header) =
-                                read.history_position_header(&hint.author, hint.size)?
-                            {
-                                let hash = header.entry_hash();
-                                read.history_effect_finished(&hash)? && match header.skeleton.v2 {
-                                    Some(v2)
-                                        if v2.kind
-                                            == crate::log::history::SignedEntryKind::Content =>
-                                    {
-                                        read.retention(&hash)?.is_some()
-                                    }
-                                    Some(_) => true,
-                                    None => false,
-                                }
-                            } else {
-                                false
-                            }
+                        let state = read
+                            .sparse_author(&hint.author, crate::log::history::LogScope::Public)?;
+                        let held = state.is_some_and(|state| {
+                            state.committed == Some(hint.head)
+                                && state.control_ready == Some(hint.head)
+                                && state.live.is_some_and(|window| {
+                                    window.head == hint.head
+                                        && window.through == hint.size
+                                        && window.complete()
+                                })
+                        });
+                        // One indexed successor lookup, not a scan of older missing bodies.
+                        // Normal retention cleanup removes expired missing positions.
+                        let retry_missing = if held && hint.size != 0 {
+                            let floor = hint
+                                .size
+                                .saturating_sub(crate::log::history::MAX_PAGE_ENTRIES as u64 - 1)
+                                .max(1);
+                            let (positions, _) =
+                                read.missing_page(Some((hint.author, floor - 1)), 1)?;
+                            positions.first().is_some_and(|(author, seq)| {
+                                *author == hint.author && *seq <= hint.size
+                            })
                         } else {
                             false
                         };
                         if !held
+                            || retry_missing
                             || (hint.author == room.me()
                                 && room.history_departure_matches(store, hint)?)
                         {

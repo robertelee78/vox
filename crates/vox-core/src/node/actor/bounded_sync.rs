@@ -585,7 +585,8 @@ impl Node {
                 }
 
                 if let Some(hint) = returned.flow.hint {
-                    self.history_hints.finish(work.room, hint.author, hint.head);
+                    self.history_hints
+                        .finish(work.room, work.peer, hint.author, hint.head);
                 }
                 self.bounded_sync.dispose(returned.flow);
                 crate::node::status::SyncBook::with(
@@ -631,7 +632,8 @@ impl Node {
                     }
                 }
                 if let Some(hint) = returned.flow.hint {
-                    self.history_hints.finish(work.room, hint.author, hint.head);
+                    self.history_hints
+                        .finish(work.room, work.peer, hint.author, hint.head);
                 }
                 let mut raised = false;
                 if let Some(port) = self.ports.get_mut(&(work.room, work.peer)) {
@@ -679,7 +681,12 @@ impl Node {
                     if self.bounded_sync.deferred.len() == 8 {
                         if let Some(old) = self.bounded_sync.deferred.pop_front() {
                             if let Some(hint) = old.hint {
-                                self.history_hints.finish(old.room, hint.author, hint.head);
+                                self.history_hints.finish(
+                                    old.room,
+                                    old.peer,
+                                    hint.author,
+                                    hint.head,
+                                );
                             }
                             self.bounded_sync.dispose(old);
                         }
@@ -934,7 +941,8 @@ impl Node {
                             Ok(flow) => flow,
                             Err(_) => {
                                 if let Some(hint) = hint {
-                                    self.history_hints.finish(room, hint.author, hint.head);
+                                    self.history_hints
+                                        .finish(room, peer, hint.author, hint.head);
                                 }
                                 return false;
                             }
@@ -985,7 +993,8 @@ impl Node {
                         Ok(flow) => flow,
                         Err(_) => {
                             if let Some(hint) = hint {
-                                self.history_hints.finish(room, hint.author, hint.head);
+                                self.history_hints
+                                    .finish(room, peer, hint.author, hint.head);
                             }
                             return false;
                         }

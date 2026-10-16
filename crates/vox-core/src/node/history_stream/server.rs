@@ -416,14 +416,24 @@ async fn entry(
         ));
     }
     let live = if preamble.purpose == Purpose::Live {
+        let through = head.value.root.leaves;
         let latest = source
             .read(&job, 128 * 1024, move |room, store| {
                 Ok(Some(room.history_head(store, &author)?.is_some_and(
-                    |head| head.id() == head_id && head.root.leaves == seq,
+                    |current| {
+                        let bound = crate::log::history::MAX_PAGE_ENTRIES as u64;
+                        // An exact committed head may select only its newest 128 positions,
+                        // and only while that head is itself within 128 of the current head.
+                        // Arbitrarily old signed heads cannot turn Live into archive demand.
+                        current.root.leaves >= through
+                            && current.root.leaves - through < bound
+                            && (current.root.leaves != through || current.id() == head_id)
+                            && seq >= through.saturating_sub(bound - 1).max(1)
+                    },
                 )))
             })
             .await?;
-        let current_tail = match latest {
+        let in_live_window = match latest {
             Lookup::Found(held) => held.value,
             Lookup::Busy => {
                 result.status = Status::Busy;
@@ -441,7 +451,7 @@ async fn entry(
             entry: hash,
             length,
         };
-        if !job.live_entry(bound, offset, current_tail)? {
+        if !job.live_entry(bound, offset, in_live_window)? {
             result.status = Status::Busy;
             return Ok(result);
         }

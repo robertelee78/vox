@@ -6775,16 +6775,37 @@ impl ChannelState {
         let chain = ReceiverChain::from_skdm(skdm, &key, &self.channel_id, self.epoch)?;
         let slot = (author, chain.chain_id());
         // A second SKDM for a generation we already hold would rewind the chain
-        // head and re-enable consumed iterations; keep the live one.
+        // head and re-enable consumed iterations; keep the live one. Still renew the bounded
+        // rendering obligation: a prior process may have committed the key immediately before
+        // it could commit that cursor.
         if self.receivers.contains_key(&slot) {
-            return Ok(0);
+            return self.backfill(store, &author, now_ms);
         }
         if self.receivers.len() >= MAX_RECEIVER_CHAINS {
             return Err(Error::SizeLimitExceeded("room receiver chains"));
         }
         self.receivers.insert(slot, chain);
-        self.persist_receivers(store)?;
-        self.backfill(store, &author, now_ms)
+        // The key and the durable rendering cursor are one crash boundary. Startup already
+        // drains this bounded cursor; it must never reopen with a held key and no obligation to
+        // retry ciphertext accepted before the key arrived.
+        let queued = (|| -> Result<()> {
+            let mut batch = store.batch()?;
+            self.queue_receivers(&mut batch)?;
+            {
+                let mut writer = self
+                    .entries
+                    .write(&mut batch, &self.sek, &self.channel_id)?;
+                writer.queue_backfill(author, Some(1))?;
+                writer.seal()?;
+            }
+            batch.commit()
+        })();
+        if let Err(error) = queued {
+            self.poison(&error);
+            return Err(error);
+        }
+        self.entries.committed();
+        self.drain_backfill(store, now_ms)
     }
 
     /// Whether this node holds a sender key for `author`.
@@ -7411,20 +7432,62 @@ impl ChannelState {
             let Some((author, seq)) = writer.next_backfill()? else {
                 break;
             };
-            let head = self.dag.verified_head(&author);
-            if seq > head {
-                writer.queue_backfill(author, None)?;
-                writer.seal()?;
-                continue;
-            }
-            let entry = writer
-                .get(&author, seq)?
-                .ok_or(Error::MalformedAtRest("backfill entry missing"))?;
-            let hash = entry.entry_hash();
-            let cost = entry.payload.as_ref().map_or(0, Vec::len);
+            let sparse = writer.sparse_enabled();
+            let (entry_seq, entry) = if sparse {
+                let Some((accepted_seq, entry)) = writer.next_sparse_backfill(&author, seq)? else {
+                    writer.queue_backfill(author, None)?;
+                    writer.seal()?;
+                    continue;
+                };
+                (accepted_seq, entry)
+            } else {
+                let head = self.dag.verified_head(&author);
+                if seq > head {
+                    writer.queue_backfill(author, None)?;
+                    writer.seal()?;
+                    continue;
+                }
+                (
+                    seq,
+                    Some(
+                        writer
+                            .get(&author, seq)?
+                            .ok_or(Error::MalformedAtRest("backfill entry missing"))?,
+                    ),
+                )
+            };
+            let cost = entry
+                .as_ref()
+                .and_then(|entry| entry.payload.as_ref())
+                .map_or(0, Vec::len);
             if bytes != 0 && bytes.saturating_add(cost) > 1024 * 1024 {
                 break;
             }
+            writer.queue_backfill(
+                author,
+                if sparse {
+                    Some(
+                        entry_seq
+                            .checked_add(1)
+                            .ok_or(Error::MalformedAtRest("backfill sequence exhausted"))?,
+                    )
+                } else if entry_seq == self.dag.verified_head(&author) {
+                    None
+                } else {
+                    Some(
+                        entry_seq
+                            .checked_add(1)
+                            .ok_or(Error::MalformedAtRest("backfill sequence exhausted"))?,
+                    )
+                },
+            )?;
+            writer.seal()?;
+            let Some(entry) = entry else {
+                // Its sparse effect has not settled yet. Once it does, that path renders with
+                // the key now held; continue to the next actually accepted sparse position.
+                continue;
+            };
+            let hash = entry.entry_hash();
             bytes = bytes.saturating_add(cost);
             let already = writer.has_rendered(&hash)?
                 || writer.read_receipt_cache(&hash)?.is_some()
@@ -7438,18 +7501,6 @@ impl ChannelState {
                     .iter()
                     .any(|(row, _)| row.entry_hash == hash)
                 || skip.contains(&hash);
-            writer.queue_backfill(
-                author,
-                if seq == head {
-                    None
-                } else {
-                    Some(
-                        seq.checked_add(1)
-                            .ok_or(Error::MalformedAtRest("backfill sequence exhausted"))?,
-                    )
-                },
-            )?;
-            writer.seal()?;
             // The Batch owns all tree changes; release its short writer before decryption.
             let payload = entry.payload;
             if already {

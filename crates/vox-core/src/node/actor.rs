@@ -22463,6 +22463,9 @@ pub fn fault_of(e: &Error) -> Fault {
         Error::Profile("identity already exists on this node") => Fault::IdentityExists,
         Error::Profile("locked") => Fault::Locked,
         Error::Profile("no such room on this node") => Fault::UnknownChannel,
+        Error::Profile(
+            "Legacy history required; resume explicit recovery before posting in this room",
+        ) => Fault::LegacyHistoryRequired,
         Error::Profile("room publication is busy; retry this operation") => {
             Fault::RoomChangePending
         }

@@ -23,7 +23,7 @@ const LIVE_GRANTS: usize = 64;
 const LIVE_GRANT_LIFETIME: std::time::Duration = std::time::Duration::from_secs(300);
 const LIVE_GRANT_IDLE: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Exact body selected while it was the current live tail. A later tip cannot widen it.
+/// Exact body selected within a bounded newest window. A later tip cannot widen it.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LiveRequest {
     pub(crate) room: Digest32,
@@ -302,14 +302,15 @@ impl Job {
         })
     }
 
-    /// Start only at the presently held tail. Later quanta may finish that exact body at the
-    /// last durable ACK, even if another message arrived meanwhile. The fixed volatile map
-    /// is not history storage; restart or expiration removes the grant, without auto-resume.
+    /// Start only within a currently eligible bounded newest window. Later quanta may finish
+    /// that exact body at the last durable ACK even after the window ages out. If a volatile
+    /// grant expired or the server restarted, a saved offset may resume only if the exact
+    /// body still passes the newest-window predicate; no grant authorizes an older archive.
     pub(crate) fn live_entry(
         &self,
         request: LiveRequest,
         offset: u64,
-        current_tail: bool,
+        in_live_window: bool,
     ) -> crate::error::Result<bool> {
         use crate::error::Error;
         if self.0.lane != Lane::Live {
@@ -340,9 +341,9 @@ impl Job {
             grant.pending = None;
             return Ok(true);
         }
-        if !current_tail || offset != 0 {
+        if !in_live_window || offset > request.length {
             return Err(Error::MalformedBundle(
-                "live request is not the current tail",
+                "live request is outside the bounded newest window",
             ));
         }
         if state.live_grants.len() >= LIVE_GRANTS {
@@ -352,7 +353,7 @@ impl Job {
             key,
             LiveGrant {
                 request,
-                persisted: 0,
+                persisted: offset,
                 pending: None,
                 expires: now + LIVE_GRANT_LIFETIME,
                 idle: now + LIVE_GRANT_IDLE,

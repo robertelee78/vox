@@ -8,6 +8,7 @@ use super::{
 };
 use crate::error::{Error, Result};
 use crate::hash::Digest32;
+use crate::node::channel::entry_store::sparse::LiveWindow;
 use crate::node::channel::ChannelState;
 use crate::node::history_budget::Job;
 use crate::node::history_demand::{self as demand, Binding, Bounds, Context};
@@ -20,11 +21,29 @@ use tokio::sync::Mutex;
 const MAX_TASKS: usize = 128;
 #[derive(Clone)]
 enum Operation {
-    Tail { head: Digest32, seq: u64 },
+    LiveWindow {
+        author: Digest32,
+        head: Digest32,
+    },
+    LiveAdvance {
+        author: Digest32,
+        target: Digest32,
+        window: LiveWindow,
+        retry: bool,
+    },
+    LiveRetry {
+        author: Digest32,
+        window: LiveWindow,
+    },
+    Tail {
+        head: Digest32,
+        seq: u64,
+    },
     Wire(Query),
     LocalProof(Query),
     Local(LocalStep),
     Reclaim(Purpose),
+    ReclaimUnavailable,
     Governance,
 }
 #[derive(Clone)]
@@ -118,6 +137,10 @@ pub(crate) struct Flow {
     archive_next: Option<u64>,
     pub(crate) request_fence: Option<Arc<Fence>>,
     initialized: bool,
+    live_unavailable: Option<(Digest32, u64)>,
+    // One hinted flow either advances the main window or retries missing newest positions.
+    // A peer's BodyNotHeld never rewinds the main cursor or suppresses another peer's retry.
+    live_visited: bool,
     // Declared last: actual state/capabilities die before the shared admission is returned.
     _state_charge: crate::node::history_budget::FlowStateCharge,
 }
@@ -189,6 +212,8 @@ impl Flow {
             archive_next: None,
             request_fence: None,
             initialized: false,
+            live_unavailable: None,
+            live_visited: false,
         };
         if let Some((head, seq)) = required {
             flow.push(Task {
@@ -207,9 +232,9 @@ impl Flow {
                 flow.push(Task {
                     request,
                     purpose: Purpose::Control,
-                    operation: Operation::Tail {
+                    operation: Operation::LiveWindow {
+                        author: hint.author,
                         head: hint.head,
-                        seq: hint.size,
                     },
                 })?;
             }
@@ -296,6 +321,8 @@ impl Flow {
             archive_next: None,
             request_fence: Some(fence),
             initialized: true,
+            live_unavailable: None,
+            live_visited: false,
         }
     }
     fn push(&mut self, task: Task) -> Result<()> {
@@ -365,10 +392,12 @@ impl Flow {
         // A published current body queues only local exact-request reclamation. If its peer
         // departs before the next network turn, finish that bounded cleanup here; membership is
         // never restored and no archive, wire request or new effect is run.
-        let reclaim_live = self
-            .tasks
-            .iter()
-            .any(|task| matches!(task.operation, Operation::Reclaim(Purpose::Live)));
+        let reclaim_live = self.tasks.iter().any(|task| {
+            matches!(
+                task.operation,
+                Operation::Reclaim(Purpose::Live) | Operation::ReclaimUnavailable
+            )
+        });
         let reclaim_control = self
             .tasks
             .iter()
@@ -561,17 +590,301 @@ impl Flow {
         };
         let receiver = self.receiver(store.clone(), task.purpose, fence.clone(), deadline);
         match task.operation.clone() {
+            Operation::LiveWindow { author, head } => {
+                let instance = self.instance;
+                let generation = self.generation;
+                let node = self.node;
+                let room = self.room;
+                let epoch = self.epoch;
+                let found = source
+                    .read(job, 256, move |channel, store| {
+                        if channel.history_instance(store)? != instance
+                            || super::authorization_generation(store, node, room, instance, epoch)?
+                                != generation
+                        {
+                            return Err(Error::Profile("live window authorization changed"));
+                        }
+                        if channel.history_publication_busy(store)? {
+                            return Ok(None);
+                        }
+                        let input = channel.history_read(store)?;
+                        let target = input
+                            .history_head(&head)?
+                            .ok_or(Error::MalformedAtRest("live window head missing"))?;
+                        if target.binding.author != author
+                            || target.binding.scope != crate::log::history::LogScope::Public
+                        {
+                            return Err(Error::MalformedAtRest("live window head binding differs"));
+                        }
+                        let state = input
+                            .sparse_author(&author, crate::log::history::LogScope::Public)?
+                            .ok_or(Error::MalformedAtRest("live window author missing"))?;
+                        if state.observed_conflict.is_some() {
+                            return Err(Error::MalformedBundle(
+                                "live window author has conflicting heads",
+                            ));
+                        }
+                        if let Some(window) = state.live {
+                            if window.through >= target.root.leaves
+                                || (!window.complete()
+                                    && target.root.leaves - window.through
+                                        < crate::log::history::MAX_PAGE_ENTRIES as u64)
+                            {
+                                return Ok(Some((window, target.root.leaves)));
+                            }
+                        }
+                        let through = target.root.leaves;
+                        drop(input);
+                        channel
+                            .history_write(store, |index| {
+                                index.select_history_live_window(&author, head)
+                            })
+                            .map(|window| Some((window, through)))
+                    })
+                    .await?;
+                let Lookup::Found(found) = found else {
+                    self.push(task)?;
+                    self.waiting = true;
+                    return Ok(());
+                };
+                let (window, target_through) = found.value;
+                self.authenticated_head = Some(super::HeadHint {
+                    author,
+                    head: window.head,
+                    size: window.through,
+                });
+                if !window.complete() {
+                    self.live_visited = true;
+                    // Each staged body needs a fresh demand ID, even though its enclosing
+                    // live window is unchanged. The previous position has released both
+                    // body slots and finished its verifier work before this operation runs.
+                    let request = request_id()?;
+                    self.request = request;
+                    self.push(Task {
+                        request,
+                        operation: Operation::LiveAdvance {
+                            author,
+                            target: head,
+                            window,
+                            retry: false,
+                        },
+                        ..task.clone()
+                    })?;
+                    self.push(Task {
+                        request,
+                        operation: Operation::Tail {
+                            head: window.head,
+                            seq: window.next,
+                        },
+                        ..task
+                    })?;
+                } else if !self.live_visited {
+                    self.live_visited = true;
+                    // This is a peer-local retry pass over only the authenticated peer's
+                    // newest window. It changes neither the durable main cursor nor the
+                    // missing-position fact until normal body admission fills that fact.
+                    self.push(Task {
+                        operation: Operation::LiveRetry {
+                            author,
+                            window: LiveWindow {
+                                head,
+                                from: target_through
+                                    .saturating_sub(
+                                        crate::log::history::MAX_PAGE_ENTRIES as u64 - 1,
+                                    )
+                                    .max(1),
+                                next: target_through,
+                                through: target_through,
+                            },
+                        },
+                        ..task
+                    })?;
+                }
+            }
+            Operation::LiveRetry { author, window } => {
+                if window.complete() {
+                    return Ok(());
+                }
+                let instance = self.instance;
+                let generation = self.generation;
+                let node = self.node;
+                let room = self.room;
+                let epoch = self.epoch;
+                let found = source
+                    .read(job, 128, move |channel, store| {
+                        if channel.history_instance(store)? != instance
+                            || super::authorization_generation(store, node, room, instance, epoch)?
+                                != generation
+                        {
+                            return Err(Error::Profile("live retry authorization changed"));
+                        }
+                        let input = channel.history_read(store)?;
+                        if input.publication_busy() {
+                            return Ok(None);
+                        }
+                        Ok(Some(input.missing_contains(&author, window.next)?))
+                    })
+                    .await?;
+                let Lookup::Found(found) = found else {
+                    self.push(task)?;
+                    self.waiting = true;
+                    return Ok(());
+                };
+                if found.value {
+                    let request = request_id()?;
+                    self.request = request;
+                    self.push(Task {
+                        request,
+                        operation: Operation::LiveAdvance {
+                            author,
+                            target: window.head,
+                            window,
+                            retry: true,
+                        },
+                        ..task.clone()
+                    })?;
+                    self.push(Task {
+                        request,
+                        operation: Operation::Tail {
+                            head: window.head,
+                            seq: window.next,
+                        },
+                        ..task
+                    })?;
+                } else {
+                    self.push(Task {
+                        operation: Operation::LiveRetry {
+                            author,
+                            window: LiveWindow {
+                                next: window.next - 1,
+                                ..window
+                            },
+                        },
+                        ..task
+                    })?;
+                }
+            }
+            Operation::LiveAdvance {
+                author,
+                target,
+                window,
+                retry,
+            } => {
+                // A compacted root still owns its entry. Proof completion alone must not
+                // move the window past a body whose admission has not finished.
+                if let Some(root) = self.replay.take() {
+                    self.push(task)?;
+                    self.push(root)?;
+                    return Ok(());
+                }
+                let instance = self.instance;
+                let generation = self.generation;
+                let node = self.node;
+                let room = self.room;
+                let epoch = self.epoch;
+                let unavailable = self.live_unavailable == Some((window.head, window.next));
+                let advanced = source
+                    .read(job, 128, move |channel, store| {
+                        if channel.history_instance(store)? != instance
+                            || super::authorization_generation(store, node, room, instance, epoch)?
+                                != generation
+                        {
+                            return Err(Error::Profile("live window authorization changed"));
+                        }
+                        let input = channel.history_read(store)?;
+                        if input.publication_busy() {
+                            return Ok(None);
+                        }
+                        let Some(header) = input.history_position_header(&author, window.next)?
+                        else {
+                            return Err(Error::MalformedAtRest(
+                                "live window position was not published",
+                            ));
+                        };
+                        let hash = header.entry_hash();
+                        let content = header.skeleton.v2.as_ref().is_some_and(|v| {
+                            v.kind == crate::log::history::SignedEntryKind::Content
+                        });
+                        let missing = unavailable
+                            && content
+                            && input.missing_contains(&author, window.next)?;
+                        let finished = input.history_effect_finished(&hash)?;
+                        let body = !content
+                            || input.retention(&hash)?.is_some()
+                            || channel
+                                .body_expired(header.skeleton.claimed_ms, crate::time::Ms(now));
+                        if !(missing || finished && body) {
+                            return Err(Error::MalformedAtRest(
+                                "live window position is not complete or explicitly missing",
+                            ));
+                        }
+                        if retry {
+                            return Ok(Some(true));
+                        }
+                        drop(input);
+                        channel
+                            .history_write(store, |index| {
+                                index.advance_history_live_window(&author, window)
+                            })
+                            .map(Some)
+                    })
+                    .await?;
+                if !matches!(advanced, Lookup::Found(_)) {
+                    self.push(task)?;
+                    self.waiting = true;
+                    return Ok(());
+                }
+                self.live_unavailable = None;
+                self.push(Task {
+                    operation: if retry {
+                        Operation::LiveRetry {
+                            author,
+                            window: LiveWindow {
+                                next: window.next - 1,
+                                ..window
+                            },
+                        }
+                    } else {
+                        Operation::LiveWindow {
+                            author,
+                            head: target,
+                        }
+                    },
+                    ..task
+                })?;
+            }
             Operation::Tail { head, seq } => {
                 let found = source
                     .read(job, 128, move |room, store| {
                         let input = room.history_read(store)?;
-                        let entry = input.history_pending_header(&head, seq)?;
-                        Ok(entry.and_then(|entry| entry.skeleton.v2.map(|v2| v2.kind)))
+                        let Some(signed) = input.history_head(&head)? else {
+                            return Ok(None);
+                        };
+                        let entry = input
+                            .history_position_header(&signed.binding.author, seq)?
+                            .or(input.history_pending_header(&head, seq)?);
+                        let Some(entry) = entry else {
+                            return Ok(None);
+                        };
+                        let Some(v2) = entry.skeleton.v2.as_ref() else {
+                            return Ok(None);
+                        };
+                        let content = v2.kind == crate::log::history::SignedEntryKind::Content;
+                        let expired = content
+                            && room.body_expired(entry.skeleton.claimed_ms, crate::time::Ms(now));
+                        let held = input.history_effect_finished(&entry.entry_hash())?
+                            && (!content
+                                || input.retention(&entry.entry_hash())?.is_some()
+                                || expired);
+                        Ok(Some((content, held, expired)))
                     })
                     .await?;
                 match found {
                     Lookup::Found(value) => {
-                        let content = value.value == crate::log::history::SignedEntryKind::Content;
+                        let (content, held, expired) = value.value;
+                        if held {
+                            return Ok(());
+                        }
                         self.push(Task {
                             request: task.request,
                             purpose: if content {
@@ -583,7 +896,7 @@ impl Flow {
                                 request: task.request,
                                 head,
                                 seq,
-                                body: content,
+                                body: content && !expired,
                                 phase: EntryPhase::Start,
                             }),
                         })?;
@@ -674,8 +987,9 @@ impl Flow {
                     return Ok(());
                 }
                 // Inventory is a hint. The first signed Head(author) response selects the
-                // exact live tail before any entry/body work; a concurrent post may replace
-                // the hinted head. Never retarget an already selected dependency or proof.
+                // newest window before any entry/body work. The durable selector resumes an
+                // unfinished window while live-eligible; aging retires demand, never saved
+                // evidence. No hint retargets an in-progress entry dependency or proof.
                 if let Query::Head(author) = query {
                     for head in &result.heads {
                         if head.author == author {
@@ -697,19 +1011,19 @@ impl Flow {
                         {
                             let receipt = result.departure_receipt == Some(*head);
                             for pending in &mut self.tasks {
-                                if matches!(pending.operation, Operation::Tail { .. }) {
-                                    self.authenticated_head = Some(*head);
-                                    pending.operation = Operation::Tail {
+                                if matches!(pending.operation, Operation::LiveWindow { .. }) {
+                                    pending.operation = Operation::LiveWindow {
+                                        author,
                                         head: head.head,
-                                        seq: head.size,
                                     };
                                 }
                             }
                             if receipt {
+                                self.authenticated_head = Some(*head);
                                 // Only a verified echo matching our already accepted departure.
                                 // It must not request Header/Proof/Body from a peer we have left.
                                 self.tasks.retain(|pending| {
-                                    !matches!(pending.operation, Operation::Tail { .. })
+                                    !matches!(pending.operation, Operation::LiveWindow { .. })
                                 });
                             }
                         }
@@ -721,6 +1035,45 @@ impl Flow {
                             .offer_inventory(job, inbox, inbox_generation, self.room, page)
                             .await?;
                     }
+                }
+                if result.status == Status::BodyNotHeld && task.purpose == Purpose::Live {
+                    let Query::Entry { head, seq, .. } = query else {
+                        return Err(Error::MalformedBundle(
+                            "live body refusal has no exact entry",
+                        ));
+                    };
+                    if !self.tasks.iter().any(|pending| matches!(pending.operation,
+                        Operation::LiveAdvance { window, .. } if window.head == head && window.next == seq)) {
+                        return Err(Error::MalformedBundle("live body refusal is outside the selected window"));
+                    }
+                    // Keep the authenticated header as a missing position, without applying
+                    // a content effect or treating the peer's refusal as authenticated expiry.
+                    // Busy, cancellation and transport failure never enter this path.
+                    self.live_unavailable = Some((head, seq));
+                    let is_entry = |pending: &Task| {
+                        matches!(pending.operation,
+                        Operation::Local(LocalStep::Entry { head: at, seq: position, .. }) if at == head && position == seq)
+                    };
+                    self.tasks.retain(|pending| !is_entry(pending));
+                    if self.replay.as_ref().is_some_and(is_entry) {
+                        self.replay = None;
+                    }
+                    self.push(Task {
+                        operation: Operation::ReclaimUnavailable,
+                        ..task.clone()
+                    })?;
+                    self.push(Task {
+                        purpose: Purpose::Control,
+                        operation: Operation::Local(LocalStep::Entry {
+                            request: task.request,
+                            head,
+                            seq,
+                            body: false,
+                            phase: EntryPhase::Start,
+                        }),
+                        ..task
+                    })?;
+                    return Ok(());
                 }
                 if matches!(result.status, Status::BodyNotHeld | Status::Cancelled) {
                     if self.archive && body {
@@ -816,6 +1169,14 @@ impl Flow {
             Operation::Local(step) => {
                 let result = receiver.local_step(job, step, crate::time::Ms(now)).await?;
                 if let Some(next) = result.next {
+                    if matches!(next, LocalStep::Entry { head, seq, phase: EntryPhase::Effect(_), .. }
+                        if self.live_unavailable == Some((head, seq)))
+                    {
+                        // Header publication and its missing-body index are durable. Do not
+                        // manufacture a completed effect for a body this peer did not supply.
+                        self.published = true;
+                        return Ok(());
+                    }
                     let continuation = Task {
                         operation: Operation::Local(next),
                         ..task.clone()
@@ -946,6 +1307,16 @@ impl Flow {
                     self.push(task)?;
                 } else if self.archive && self.tasks.is_empty() {
                     self.finish_archive(job).await?;
+                }
+            }
+            Operation::ReclaimUnavailable => {
+                if let Some(root) = self.replay.take() {
+                    self.push(task)?;
+                    self.push(root)?;
+                    return Ok(());
+                }
+                if !self.reclaim_stage(Purpose::Live, job, true).await? {
+                    self.push(task)?;
                 }
             }
             Operation::Governance => {

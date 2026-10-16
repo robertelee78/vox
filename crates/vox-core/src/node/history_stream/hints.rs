@@ -60,11 +60,12 @@ impl HintInbox {
         }
         let mut outcome = Offer::default();
         for hint in hints {
-            if state
-                .pending
-                .iter()
-                .any(|p| p.room == room && p.hint.author == hint.author && p.hint.head == hint.head)
-            {
+            if state.pending.iter().any(|p| {
+                p.room == room
+                    && p.peer == peer
+                    && p.hint.author == hint.author
+                    && p.hint.head == hint.head
+            }) {
                 continue;
             }
             if state.pending.len() == MAX_CONTEXT_AUTHORS {
@@ -108,11 +109,11 @@ impl HintInbox {
         pending.in_flight = true;
         Some(pending.hint)
     }
-    pub(crate) fn finish(&self, room: Digest32, author: Digest32, head: Digest32) {
+    pub(crate) fn finish(&self, room: Digest32, peer: Digest32, author: Digest32, head: Digest32) {
         let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        state
-            .pending
-            .retain(|p| p.room != room || p.hint.author != author || p.hint.head != head);
+        state.pending.retain(|p| {
+            p.room != room || p.peer != peer || p.hint.author != author || p.hint.head != head
+        });
         Self::release_empty(&mut state);
     }
     pub(crate) fn retire_peer(&self, room: Digest32, peer: Digest32) {

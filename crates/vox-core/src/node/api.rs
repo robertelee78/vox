@@ -1365,6 +1365,8 @@ pub enum Fault {
     ChannelNotOpen,
     /// Identity is Ready; this room is still preparing its saved state.
     RoomPreparing,
+    /// Explicit legacy recovery must resume before this room accepts a new post.
+    LegacyHistoryRequired,
     /// An input exceeded its bound (name or text length).
     TooLong,
     /// A trust add or remove needs the identity passphrase: it was not entered for a keyring
@@ -1604,6 +1606,9 @@ impl Fault {
             }
             Fault::RoomPreparing => {
                 "that room is preparing its saved history; the node is Ready, and the room will become available when preparation finishes — no passphrase is needed"
+            }
+            Fault::LegacyHistoryRequired => {
+                "Legacy history required; resume explicit recovery before posting in this room"
             }
             Fault::ChannelNotOpen => {
                 "that room is not open on this node\n       open it with its passphrase: a line holding the room's id and its passphrase to `vox daemon`, or in `vox tui`"
@@ -1876,6 +1881,7 @@ fault_names!(
     UnknownChannel,
     ChannelNotOpen,
     RoomPreparing,
+    LegacyHistoryRequired,
     TooLong,
     KeyringFull,
     ServiceOffersFull,

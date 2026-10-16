@@ -229,17 +229,61 @@ pub(crate) struct AuthorState {
     pub control_ready: Option<Digest32>,
     /// One attributable same-size contradiction, retaining both exact signed heads.
     pub observed_conflict: Option<(Digest32, Digest32)>,
+    /// A selected newest window, immutable while live-eligible and independent of
+    /// commitment/control progress. Aging may retire demand without deleting evidence.
+    pub live: Option<LiveWindow>,
+}
+
+/// At most 128 positions, visited newest first. A cursor is local demand, never authority
+/// or a claim that the author's older archive is held. It survives retired network workers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LiveWindow {
+    pub head: Digest32,
+    pub from: u64,
+    pub next: u64,
+    pub through: u64,
+}
+impl LiveWindow {
+    pub(crate) fn complete(self) -> bool {
+        self.next < self.from
+    }
+    fn validate(self) -> Result<()> {
+        if self.from == 0
+            || self.through > crate::log::feed::MAX_SEQ
+            || self.from > self.through.saturating_add(1)
+            || self.through.saturating_sub(self.from)
+                >= crate::log::history::MAX_PAGE_ENTRIES as u64
+            || self.next > self.through
+            || self.next.saturating_add(1) < self.from
+        {
+            return Err(invalid("live history window bounds"));
+        }
+        Ok(())
+    }
 }
 impl AuthorState {
     fn bytes(self) -> Vec<u8> {
         let mut e = Encoder::new();
-        e.array(5).uint(2);
+        e.array(6).uint(3);
         hash_option(&mut e, self.observed);
         hash_option(&mut e, self.committed);
         hash_option(&mut e, self.control_ready);
         match self.observed_conflict {
             Some((first, second)) => {
                 e.array(2).bytes(&first).bytes(&second);
+            }
+            None => {
+                e.array(0);
+            }
+        }
+        match self.live {
+            Some(window) => {
+                e.array(1)
+                    .array(4)
+                    .bytes(&window.head)
+                    .uint(window.from)
+                    .uint(window.next)
+                    .uint(window.through);
             }
             None => {
                 e.array(0);
@@ -254,7 +298,7 @@ impl AuthorState {
         let mut d = Decoder::new(bytes);
         let arity = d.array()?;
         let version = d.uint()?;
-        if !matches!((arity, version), (4, 1) | (5, 2)) {
+        if !matches!((arity, version), (4, 1) | (5, 2) | (6, 3)) {
             return Err(invalid("sparse author state format"));
         }
         let state = Self {
@@ -272,6 +316,27 @@ impl AuthorState {
                         Some(pair)
                     }
                     _ => return Err(invalid("observed conflict arity")),
+                }
+            } else {
+                None
+            },
+            live: if version >= 3 {
+                match d.array()? {
+                    0 => None,
+                    1 => {
+                        if d.array()? != 4 {
+                            return Err(invalid("live history window arity"));
+                        }
+                        let window = LiveWindow {
+                            head: read_hash(&mut d)?,
+                            from: d.uint()?,
+                            next: d.uint()?,
+                            through: d.uint()?,
+                        };
+                        window.validate()?;
+                        Some(window)
+                    }
+                    _ => return Err(invalid("live history window option")),
                 }
             } else {
                 None
@@ -1604,6 +1669,93 @@ impl Write<'_, '_> {
         }
         Ok(())
     }
+
+    /// Resume an unfinished window while it remains live-eligible. A head at least 128
+    /// positions newer retires only that obsolete live demand and selects its newest suffix;
+    /// accepted headers, bodies and missing facts stay intact for explicit History recovery.
+    /// No selection turns the intervening disconnected archive gap into live demand.
+    pub(crate) fn select_history_live_window(
+        &mut self,
+        author: &Digest32,
+        head_id: Digest32,
+    ) -> Result<LiveWindow> {
+        self.require_sparse_idle()?;
+        let source = Source::Batch(self.batch);
+        let roots = self.directory.active.sparse;
+        let head = source
+            .sparse_head(self.sek, self.channel, roots, &head_id)?
+            .ok_or(invalid("live window head missing"))?;
+        if head.binding.author != *author || head.binding.scope != LogScope::Public {
+            return Err(invalid("live window author or scope differs"));
+        }
+        let mut state = source
+            .sparse_author(self.sek, self.channel, roots, author, LogScope::Public)?
+            .ok_or(invalid("live window author missing"))?;
+        if state.observed_conflict.is_some() {
+            return Err(invalid("live window author has conflicting heads"));
+        }
+        if let Some(window) = state.live {
+            if window.through >= head.root.leaves
+                || (!window.complete()
+                    && head.root.leaves - window.through
+                        < crate::log::history::MAX_PAGE_ENTRIES as u64)
+            {
+                return Ok(window);
+            }
+        }
+        let through = head.root.leaves;
+        let floor = through
+            .saturating_sub(crate::log::history::MAX_PAGE_ENTRIES as u64 - 1)
+            .max(1);
+        let from = state.live.map_or(floor, |old| floor.max(old.through + 1));
+        let window = LiveWindow {
+            head: head_id,
+            from,
+            next: through,
+            through,
+        };
+        window.validate()?;
+        state.live = Some(window);
+        self.save_sparse_author(head.binding, state)?;
+        Ok(window)
+    }
+
+    /// CAS the selected position, not the committed head. The caller has completed normal
+    /// admission or retained a verified missing-body position; this changes no effect flag.
+    pub(crate) fn advance_history_live_window(
+        &mut self,
+        author: &Digest32,
+        expected: LiveWindow,
+    ) -> Result<bool> {
+        self.require_sparse_idle()?;
+        expected.validate()?;
+        if expected.complete() {
+            return Ok(false);
+        }
+        let source = Source::Batch(self.batch);
+        let roots = self.directory.active.sparse;
+        let mut state = source
+            .sparse_author(self.sek, self.channel, roots, author, LogScope::Public)?
+            .ok_or(invalid("live window author missing"))?;
+        if state.live != Some(expected) {
+            return Ok(false);
+        }
+        let head = source
+            .sparse_head(self.sek, self.channel, roots, &expected.head)?
+            .ok_or(invalid("live window head missing"))?;
+        if head.binding.author != *author
+            || head.binding.scope != LogScope::Public
+            || head.root.leaves != expected.through
+        {
+            return Err(invalid("live window binding differs"));
+        }
+        state.live = Some(LiveWindow {
+            next: expected.next - 1,
+            ..expected
+        });
+        self.save_sparse_author(head.binding, state)?;
+        Ok(true)
+    }
     /// Both observation and commitment preserve the highest authenticated observation.
     /// Commitment is a separate proof-gated position and cannot lower this requirement.
     fn merge_observed_head(&self, head: &SignedHead, state: &mut AuthorState) -> Result<()> {
@@ -2517,6 +2669,72 @@ impl Read<'_> {
     }
 }
 impl Write<'_, '_> {
+    /// The first sparse position at or after `from` that this node has accepted for `author`.
+    ///
+    /// The outer option distinguishes the end of this author's accepted positions. The inner
+    /// option is present only once that exact entry's semantic effect is settled. A key-arrival
+    /// backfill advances past an unsettled position because its effect path will render it with
+    /// the now-current key; it must not mistake a hole in the sparse feed for the end of the
+    /// accepted positions that follow it.
+    pub(crate) fn next_sparse_backfill(
+        &self,
+        author: &Digest32,
+        from: u64,
+    ) -> Result<Option<(u64, Option<Entry>)>> {
+        if !self.directory.active.sparse.enabled {
+            return Ok(None);
+        }
+        let source = Source::Batch(self.batch);
+        let Some((key, value)) = source.first(
+            self.sek,
+            self.channel,
+            self.directory.active.sparse.validated_positions,
+            &position(author, from),
+            0,
+        )?
+        else {
+            return Ok(None);
+        };
+        if key[..32] != author[..] {
+            return Ok(None);
+        }
+        if key[40..].iter().any(|byte| *byte != 0) || !matches!(value, Value::Number(_)) {
+            return Err(invalid("sparse validated position key"));
+        }
+        let seq = u64::from_be_bytes(
+            key[32..40]
+                .try_into()
+                .map_err(|_| invalid("sparse validated position sequence"))?,
+        );
+        let header = source
+            .sparse_position_header(
+                self.sek,
+                self.channel,
+                self.directory.active.sparse,
+                author,
+                seq,
+            )?
+            .ok_or(invalid("sparse validated position vanished"))?;
+        let hash = header.entry_hash();
+        if source.find_value(
+            self.sek,
+            self.channel,
+            self.directory.active.sparse.settled_entries,
+            &hashed(&hash),
+        )? != Some(Value::Present)
+        {
+            return Ok(Some((seq, None)));
+        }
+        let entry = source
+            .published_sparse_entry(self.sek, self.channel, self.directory.active, &hash)?
+            .ok_or(invalid("settled sparse backfill entry missing"))?;
+        Ok(Some((seq, Some(entry))))
+    }
+
+    pub(crate) fn sparse_enabled(&self) -> bool {
+        self.directory.active.sparse.enabled
+    }
+
     /// Retire only this request's unfinished verifier checkpoints. Accepted receipts and
     /// authority/key-body obligations have independent lifetimes and are never removed here.
     pub(crate) fn cleanup_history_verifiers(
