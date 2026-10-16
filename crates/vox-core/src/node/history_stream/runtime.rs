@@ -461,7 +461,35 @@ impl Flow {
         .await
         .map_err(|_| Error::Profile("history retirement worker stopped"))??;
         self.cleanup_after = step.1;
-        Ok(step.0)
+        if !step.0 {
+            return Ok(false);
+        }
+
+        // A foreground flow may suspend an older root while a freshly identified entry uses
+        // another request ID. Retirement must clean both exact owners, without weakening the
+        // demand replay guard or retaining another collection. The bounded task stack and scalar
+        // replay root already hold every suspended continuation; the current scalar covers the
+        // operation that was popped when an error interrupted it.
+        self.cleanup_after = None;
+        self.tasks.retain(|task| task.request != request);
+        if self
+            .replay
+            .as_ref()
+            .is_some_and(|task| task.request == request)
+        {
+            self.replay = None;
+        }
+        let next = self
+            .tasks
+            .last()
+            .map(|task| task.request)
+            .or_else(|| self.replay.as_ref().map(|task| task.request));
+        if let Some(next) = next {
+            self.request = next;
+            Ok(false)
+        } else {
+            Ok(true)
+        }
     }
 
     fn stage(&self, purpose: Purpose) -> Option<Staging> {
@@ -593,6 +621,11 @@ impl Flow {
         let Some(task) = self.tasks.pop() else {
             return Ok(());
         };
+        // Retirement's scalar always names the operation that can disappear from the bounded
+        // stack while this fallible turn executes. Suspended owners remain in tasks/replay.
+        if !self.archive {
+            self.request = task.request;
+        }
         let receiver = self.receiver(store.clone(), task.purpose, fence.clone(), deadline);
         match task.operation.clone() {
             Operation::LiveWindow { author, head } => {
@@ -1298,7 +1331,13 @@ impl Flow {
                         self.waiting = true;
                     }
                     Some(LocalNeed::Entry { head, seq }) => {
-                        let request = task.request;
+                        // A distinct dependency starts a distinct staging activation. Reusing
+                        // the parent request after an earlier dependency reached Complete would
+                        // correctly trip history_demand's replay guard and strand the remaining
+                        // current work. Keep this ID as the source-owned cleanup boundary, just
+                        // as each new live-window position does above.
+                        let request = request_id()?;
+                        self.request = request;
                         self.push(Task {
                             request,
                             purpose: Purpose::Control,
