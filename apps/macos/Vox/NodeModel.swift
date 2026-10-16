@@ -2518,8 +2518,13 @@ final class NodeModel: ObservableObject {
             guard current(origin) else { return false }
             report(operation: operation, done: "Created the room.")
             // Publish the successful navigation before yielding to observation recovery.
+            // Keep the room inventory coherent with that navigation at the same boundary: room
+            // commands may run while the authoritative refresh is still reading the sidebar.
             // Neither a cancelled sheet nor a later navigation may be taken over on return.
             let destination = Selection.room(room)
+            if !rooms.contains(where: { $0.id == room }) {
+                rooms.append(Room(id: room, name: name, open: true, preparing: false))
+            }
             select(destination)
             await refresh()
             guard current(destination) else { return false }
