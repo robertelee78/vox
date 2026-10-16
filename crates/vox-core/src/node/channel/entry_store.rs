@@ -6,7 +6,7 @@
 //! A writer reads its own Batch. Roots are installed only by its durable commit.
 
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use zeroize::Zeroizing;
@@ -188,6 +188,15 @@ struct Promotion {
     sparse_request: Option<[u8; 16]>,
 }
 
+/// An authenticated current v1 tip observed from a peer. This records a missing
+/// prerequisite only; it is never an accepted feed, read grant or automatic download request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LegacyRequired {
+    pub author: Digest32,
+    pub through: u64,
+    pub hash: Digest32,
+}
+
 /// Durable ownership of one explicitly requested legacy suffix. This is local staging,
 /// never a signature, accepted Feed, or permission to restart network work.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -265,6 +274,7 @@ struct Directory {
     active: Roots,
     provisional: Roots,
     legacy_provisional: Option<LegacyProvisionalState>,
+    legacy_required: BTreeMap<Digest32, LegacyRequired>,
     // Process-local attachment is deliberately absent from the sealed encoding.
     provisional_attached: bool,
     provisional_hidden: bool,
@@ -296,6 +306,7 @@ impl Default for Directory {
             active: Roots::default(),
             provisional: Roots::default(),
             legacy_provisional: None,
+            legacy_required: BTreeMap::new(),
             provisional_attached: false,
             provisional_hidden: false,
             next_page: 1,
@@ -334,7 +345,7 @@ impl Directory {
     }
     fn bytes(&self) -> Zeroizing<Vec<u8>> {
         let mut e = Encoder::new();
-        e.array(24).uint(11);
+        e.array(25).uint(12);
         self.active.write(&mut e);
         self.provisional.write(&mut e);
         e.uint(self.next_page)
@@ -451,6 +462,13 @@ impl Directory {
                 e.array(0);
             }
         }
+        e.array(self.legacy_required.len());
+        for tip in self.legacy_required.values() {
+            e.array(3)
+                .bytes(&tip.author)
+                .uint(tip.through)
+                .bytes(&tip.hash);
+        }
         Zeroizing::new(e.finish())
     }
     fn parse(bytes: &[u8]) -> Result<Self> {
@@ -463,7 +481,10 @@ impl Directory {
         // This unpublished format includes durable receipts, pending local read marks,
         // canonical operation members and retained conflict witnesses. Older partial roots
         // cannot be treated as empty without silently losing accepted work.
-        if !matches!((arity, version), (19, 8) | (23, 9) | (23, 10) | (24, 11)) {
+        if !matches!(
+            (arity, version),
+            (19, 8) | (23, 9) | (23, 10) | (24, 11) | (25, 12)
+        ) {
             return Err(invalid("entry directory format"));
         }
         let active = Roots::read(&mut d)?;
@@ -633,6 +654,44 @@ impl Directory {
         } else {
             None
         };
+        let mut legacy_required = BTreeMap::new();
+        if version >= 12 {
+            let count = d.array()?;
+            if count > super::AUTHORS_HARD_LIMIT {
+                return Err(invalid("legacy required author bound"));
+            }
+            let mut previous = None;
+            for _ in 0..count {
+                if d.array()? != 3 {
+                    return Err(invalid("legacy required tip arity"));
+                }
+                let author: Digest32 = d
+                    .bytes()?
+                    .try_into()
+                    .map_err(|_| invalid("legacy required author"))?;
+                let through = d.uint()?;
+                let hash = d
+                    .bytes()?
+                    .try_into()
+                    .map_err(|_| invalid("legacy required hash"))?;
+                if previous.is_some_and(|old| old >= author)
+                    || through == 0
+                    || through > crate::log::feed::MAX_SEQ
+                    || active.sparse.enabled
+                {
+                    return Err(invalid("legacy required tip binding or order"));
+                }
+                legacy_required.insert(
+                    author,
+                    LegacyRequired {
+                        author,
+                        through,
+                        hash,
+                    },
+                );
+                previous = Some(author);
+            }
+        }
         d.finish()?;
         if let Some(state) = legacy_provisional {
             if state.owner.instance != history_instance
@@ -729,6 +788,7 @@ impl Directory {
             active,
             provisional,
             legacy_provisional,
+            legacy_required,
             provisional_attached: false,
             provisional_hidden: false,
             next_page,
@@ -1696,12 +1756,11 @@ impl<'s> Write<'_, 's> {
             .revision
             .checked_add(1)
             .ok_or(invalid("entry index revision exhausted"))?;
-        let sealed = seal_segment(
-            self.sek,
-            SegmentKind::EntryIndex,
-            DIRECTORY,
-            &self.directory.bytes(),
-        )?;
+        let bytes = self.directory.bytes();
+        if bytes.len() > DIRECTORY_BYTES {
+            return Err(invalid("entry directory exceeds bounded author state"));
+        }
+        let sealed = seal_segment(self.sek, SegmentKind::EntryIndex, DIRECTORY, &bytes)?;
         self.batch
             .put_segment(self.channel, SegmentKind::EntryIndex, DIRECTORY, &sealed)
     }
@@ -2110,6 +2169,17 @@ impl Write<'_, '_> {
                     state.pending_witness = 0;
                 }
             }
+            if let Some(required) = self.directory.legacy_required.get(&p.author).copied() {
+                if accepted.seq >= required.through
+                    && Source::Batch(self.batch)
+                        .find(self.sek, self.channel, p.work.hash, &hashed(&required.hash))?
+                        .is_some_and(|at| {
+                            at.author == required.author && at.seq == required.through
+                        })
+                {
+                    self.directory.legacy_required.remove(&p.author);
+                }
+            }
             restart.feeds.insert(p.author, accepted);
             if restart.feeds.len() > super::AUTHORS_HARD_LIMIT {
                 return Err(invalid("restart author bound"));
@@ -2339,6 +2409,10 @@ impl EntryIndex {
             let mut fresh = Directory {
                 origin: Some(origin),
                 history_instance: directory.as_ref().map_or([0; 16], |d| d.history_instance),
+                legacy_required: directory
+                    .as_ref()
+                    .map(|d| d.legacy_required.clone())
+                    .unwrap_or_default(),
                 ..Directory::default()
             };
             fresh.ensure_instance()?;
@@ -2504,6 +2578,82 @@ pub(crate) struct LegacyPublicationProgress {
     pub after_log: u64,
     pub ready: bool,
     pub switched: bool,
+}
+
+impl Read<'_> {
+    pub(crate) fn legacy_required(&self, author: &Digest32) -> Option<LegacyRequired> {
+        self.directory.legacy_required.get(author).copied()
+    }
+    pub(crate) fn legacy_required_any(&self) -> bool {
+        !self.directory.legacy_required.is_empty()
+    }
+    pub(crate) fn legacy_required_page(
+        &self,
+        after: Option<Digest32>,
+        limit: usize,
+    ) -> Vec<LegacyRequired> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        self.directory
+            .legacy_required
+            .range((after.map_or(Unbounded, Excluded), Unbounded))
+            .take(limit.min(16))
+            .map(|(_, tip)| *tip)
+            .collect()
+    }
+}
+
+impl Write<'_, '_> {
+    /// Caller verified the retained current-author signature and exact room/epoch. This
+    /// setter cannot accept history; a conflict retains the earlier obligation unchanged.
+    pub(crate) fn note_legacy_required(&mut self, tip: LegacyRequired) -> Result<bool> {
+        if self.directory.active.sparse.enabled
+            || tip.through == 0
+            || tip.through > crate::log::feed::MAX_SEQ
+        {
+            return Err(invalid("legacy required tip bounds"));
+        }
+        if let Some(old) = self.directory.legacy_required.get(&tip.author) {
+            if old.through > tip.through {
+                return Ok(false);
+            }
+            if old.through == tip.through {
+                if old.hash != tip.hash {
+                    return Err(Error::MalformedBundle(
+                        "conflicting authenticated legacy tip",
+                    ));
+                }
+                return Ok(false);
+            }
+        }
+        let accepted = self
+            .directory
+            .restart
+            .as_ref()
+            .and_then(|r| r.feeds.get(&tip.author));
+        if accepted.is_some_and(|f| f.seq >= tip.through) {
+            if Source::Batch(self.batch)
+                .find(
+                    self.sek,
+                    self.channel,
+                    self.directory.active.hash,
+                    &hashed(&tip.hash),
+                )?
+                .is_some_and(|at| at.author == tip.author && at.seq == tip.through)
+            {
+                return Ok(false);
+            }
+            return Err(Error::MalformedBundle(
+                "authenticated legacy tip conflicts with accepted feed",
+            ));
+        }
+        if !self.directory.legacy_required.contains_key(&tip.author)
+            && self.directory.legacy_required.len() >= super::AUTHORS_HARD_LIMIT
+        {
+            return Err(Error::SizeLimitExceeded("legacy required authors"));
+        }
+        self.directory.legacy_required.insert(tip.author, tip);
+        Ok(true)
+    }
 }
 
 impl Read<'_> {

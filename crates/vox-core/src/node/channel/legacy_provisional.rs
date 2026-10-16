@@ -3,10 +3,88 @@
 
 use super::*;
 pub(crate) use entry_store::{
-    LegacyProvisionalOwner, LegacyProvisionalState, LegacyPublicationProgress,
+    LegacyProvisionalOwner, LegacyProvisionalState, LegacyPublicationProgress, LegacyRequired,
 };
 
 impl ChannelState {
+    /// Record only the exact authenticated current v1 header, never its body or peer HAVE.
+    pub(crate) fn note_legacy_required(&self, store: &Store, tip: &Entry) -> Result<bool> {
+        if self.poisoned {
+            return Err(self.save_failure());
+        }
+        let sk = &tip.skeleton;
+        if sk.v2.is_some()
+            || !tip.is_signed()
+            || tip.payload.is_some()
+            || sk.channel_id != self.channel_id
+            || sk.epoch != self.epoch
+            || !self
+                .admission
+                .is_admitted(&self.channel_id, self.epoch, &sk.author_id)
+            || self.dag.is_frozen(&sk.author_id)
+        {
+            return Err(Error::StreamRefused(
+                "legacy tip room, epoch or author differs",
+            ));
+        }
+        let key = self
+            .authors
+            .get(&sk.author_id)
+            .ok_or(Error::StreamRefused("legacy tip author unknown"))?;
+        tip.verify(key)?;
+        let required = LegacyRequired {
+            author: sk.author_id,
+            through: sk.seq,
+            hash: tip.entry_hash(),
+        };
+        let mut batch = store.batch()?;
+        let mut writer = self
+            .entries
+            .write(&mut batch, &self.sek, &self.channel_id)?;
+        let changed = writer.note_legacy_required(required)?;
+        if changed {
+            writer.seal()?;
+            batch.commit()?;
+            self.entries.committed();
+        }
+        Ok(changed)
+    }
+    pub(crate) fn legacy_required(
+        &self,
+        store: &Store,
+        author: &Digest32,
+    ) -> Result<Option<LegacyRequired>> {
+        if self.poisoned {
+            return Err(self.save_failure());
+        }
+        Ok(self
+            .entries
+            .read(store, &self.sek, &self.channel_id)?
+            .legacy_required(author))
+    }
+    pub(crate) fn legacy_required_any(&self, store: &Store) -> Result<bool> {
+        if self.poisoned {
+            return Err(self.save_failure());
+        }
+        Ok(self
+            .entries
+            .read(store, &self.sek, &self.channel_id)?
+            .legacy_required_any())
+    }
+    pub(crate) fn legacy_required_page(
+        &self,
+        store: &Store,
+        after: Option<Digest32>,
+        limit: usize,
+    ) -> Result<Vec<LegacyRequired>> {
+        if self.poisoned {
+            return Err(self.save_failure());
+        }
+        Ok(self
+            .entries
+            .read(store, &self.sek, &self.channel_id)?
+            .legacy_required_page(after, limit))
+    }
     /// Background maintenance only advances a previously identified orphan, never a paused
     /// owner's publication. The caller schedules another turn if CleanupPending remains.
     pub(crate) fn cleanup_legacy_orphan(&self, store: &Store) -> Result<entry_store::Preparation> {
