@@ -3,8 +3,8 @@
 
 use super::source::{Lookup, Source};
 use super::{
-    EntryPhase, LocalNeed, LocalStep, Preamble, Purpose, Query, Receiver, RequestId, Staging,
-    Status,
+    EntryPhase, LocalNeed, LocalProof, LocalStep, Preamble, Purpose, Query, Receiver, RequestId,
+    Staging, Status,
 };
 use crate::error::{Error, Result};
 use crate::hash::Digest32;
@@ -22,6 +22,7 @@ const MAX_TASKS: usize = 128;
 enum Operation {
     Tail { head: Digest32, seq: u64 },
     Wire(Query),
+    LocalProof(Query),
     Local(LocalStep),
     Reclaim(Purpose),
     Governance,
@@ -789,6 +790,27 @@ impl Flow {
                     })?;
                 }
             }
+            Operation::LocalProof(query) => {
+                match receiver
+                    .local_proof(job, task.request, query.clone())
+                    .await?
+                {
+                    LocalProof::Verified(binding) => self.push(Task {
+                        request: binding.request,
+                        purpose: Purpose::Control,
+                        operation: Operation::Local(LocalStep::Verify(binding)),
+                    })?,
+                    LocalProof::Missing => self.push(Task {
+                        request: task.request,
+                        purpose: Purpose::Control,
+                        operation: Operation::Wire(query),
+                    })?,
+                    LocalProof::Busy => {
+                        self.push(task)?;
+                        self.waiting = true;
+                    }
+                }
+            }
             Operation::Local(step) => {
                 let result = receiver.local_step(job, step, crate::time::Ms(now)).await?;
                 if let Some(next) = result.next {
@@ -842,7 +864,17 @@ impl Flow {
                         self.push(Task {
                             request: task.request,
                             purpose,
-                            operation: Operation::Wire(query),
+                            operation: if matches!(
+                                query,
+                                Query::Proof {
+                                    kind: super::ProofKind::Control,
+                                    ..
+                                }
+                            ) {
+                                Operation::LocalProof(query)
+                            } else {
+                                Operation::Wire(query)
+                            },
                         })?;
                     }
                     Some(LocalNeed::StagedBody) => {

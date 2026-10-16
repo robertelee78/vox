@@ -36,6 +36,12 @@ pub(crate) struct Receiver {
     staging: Option<Staging>,
 }
 
+pub(crate) enum LocalProof {
+    Verified(CursorBinding),
+    Busy,
+    Missing,
+}
+
 /// All results are bounded scheduling information, not permission to fetch another page.
 pub(crate) struct Received {
     pub(crate) status: Status,
@@ -98,6 +104,80 @@ impl Receiver {
         job: &crate::node::history_budget::Job,
     ) -> Result<Lookup<Vec<super::HeadHint>>> {
         self.source.inventory(job).await
+    }
+
+    /// Build an exact control proof from this node's own canonical history and admit it through
+    /// the same verifier path as a wire proof. A peer need not archive proof material for a head
+    /// authored here, and its inability to serve that proof says nothing about the local head.
+    pub(crate) async fn local_proof(
+        &self,
+        job: &crate::node::history_budget::Job,
+        request: RequestId,
+        query: Query,
+    ) -> Result<LocalProof> {
+        let Query::Proof {
+            head,
+            kind,
+            from,
+            to,
+        } = query
+        else {
+            return Ok(LocalProof::Missing);
+        };
+        let local = self.node;
+        let signed = self
+            .read(
+                job,
+                crate::log::history::MAX_HEADER_BYTES,
+                move |room, store| {
+                    let input = room.history_read(store)?;
+                    Ok(input
+                        .history_head(&head)?
+                        .filter(|signed| signed.binding.author == local))
+                },
+            )
+            .await?;
+        let signed = match signed {
+            Lookup::Found(signed) => signed,
+            Lookup::Busy => return Ok(LocalProof::Busy),
+            Lookup::Missing => return Ok(LocalProof::Missing),
+        };
+        let proof = match self
+            .source
+            .proof(job, &signed.value, kind, from, to)
+            .await?
+        {
+            Lookup::Found(proof) => proof,
+            Lookup::Busy => return Ok(LocalProof::Busy),
+            Lookup::Missing => return Ok(LocalProof::Missing),
+        };
+        let generation = self.generation;
+        let staged = self
+            .read(job, VERIFY_ENVELOPE, move |room, store| {
+                admission::stage(
+                    room,
+                    store,
+                    request,
+                    generation,
+                    &query,
+                    super::Object::Proof(proof.value),
+                )
+                .map(Some)
+            })
+            .await?;
+        Ok(match staged {
+            Lookup::Found(staged) => match staged.value {
+                Staged::Verifier(binding) => LocalProof::Verified(binding),
+                Staged::Busy => LocalProof::Busy,
+                _ => {
+                    return Err(Error::MalformedAtRest(
+                        "local control proof produced unrelated staging",
+                    ))
+                }
+            },
+            Lookup::Busy => LocalProof::Busy,
+            Lookup::Missing => LocalProof::Missing,
+        })
     }
 
     /// The caller opens/handshakes the stream and owns its tracked cancellation fence.

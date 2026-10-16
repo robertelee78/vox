@@ -464,6 +464,7 @@ impl Node {
                 if let Some(hint) = returned.flow.hint {
                     self.history_hints.finish(work.room, hint.author, hint.head);
                 }
+                let mut raised = false;
                 if let Some(port) = self.ports.get_mut(&(work.room, work.peer)) {
                     if returned.flow.inventory {
                         port.done_gen = port.done_gen.max(work.generation);
@@ -487,7 +488,15 @@ impl Node {
                             .any(|(r, p, _, _)| *r == work.room && *p == work.peer)
                     {
                         port.raise();
+                        raised = true;
                     }
+                }
+                // A completed inventory can reveal the next exact departure/receipt work.
+                // Raising the port changes its need, but `schedule` only examines touched
+                // rooms. Wake this room now instead of leaving the raised port asleep until
+                // the periodic all-ports tick consumes most of the leave deadline.
+                if raised {
+                    self.sched_rooms.insert(work.room);
                 }
                 crate::node::status::SyncBook::with(
                     &self.sync_book,

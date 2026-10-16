@@ -14,7 +14,7 @@ mod server;
 mod source;
 mod transport;
 
-pub(crate) use client::{EntryPhase, LocalNeed, LocalStep, Receiver, Staging};
+pub(crate) use client::{EntryPhase, LocalNeed, LocalProof, LocalStep, Receiver, Staging};
 pub(crate) use driver::exchange;
 pub(crate) use hints::HintInbox;
 
