@@ -920,7 +920,8 @@ final class NodeModel: ObservableObject {
     }
     var observationToken: UUID { nodeObservationEpoch }
     func acceptsObservation(_ token: UUID, actor: String) -> Bool {
-        token == nodeObservationEpoch && actor == me && ended == nil && !Task.isCancelled
+        token == nodeObservationEpoch && actor == me
+            && (ended == nil || observationNeedsRestart) && !Task.isCancelled
     }
     fileprivate func acceptsArrivalInstance(_ instance: Data, room: String) -> Bool {
         roomOnScreen != room || roomInstance == nil || roomInstance == instance
