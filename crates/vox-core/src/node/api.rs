@@ -612,6 +612,8 @@ pub struct ChannelDetail {
     pub history_instance: [u8; 16],
     /// Local reuse stamp for the already-built display; never serialized or sent to peers.
     pub(crate) display_stamp: crate::node::channel::DisplayStamp,
+    /// Local indicator reuse token; never serialized or sent to peers.
+    pub(crate) read_summary_stamp: crate::node::channel::ReadSummaryStamp,
     /// Node-local change token for the published timeline, unchanged on projection reuse.
     /// Scoped to this node actor; clients discard it when their node connection changes.
     pub display_revision: u64,

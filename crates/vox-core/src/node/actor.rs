@@ -320,6 +320,18 @@ fn detail_of(
             Some(p) => p.display_revision,
             None => sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         };
+    let read_summary_stamp = ch.read_summary_stamp(store)?;
+    let (read_by, held, unread) = match prev.filter(|p| {
+        ch.display_is_current(&p.display_stamp, &display_stamp)
+            && p.read_summary_stamp == read_summary_stamp
+    }) {
+        Some(p) => (p.read_by.clone(), p.held.clone(), p.unread.clone()),
+        None => (
+            ch.read_by_own(store)?,
+            ch.held_own(store)?,
+            ch.unread(store)?,
+        ),
+    };
     // Who trusts each member (ADR-028 K-7), once: this identity's own entry is `consenting`.
     let trusted_by = ch.trusted_by(store)?;
     let member_consent = ch
@@ -342,6 +354,7 @@ fn detail_of(
         last_arrival: ch.last_arrival(store)?,
         history_instance: ch.history_instance(store)?,
         display_stamp,
+        read_summary_stamp,
         display_revision,
         services: ch
             .services()
@@ -369,9 +382,9 @@ fn detail_of(
         received_key_generations: ch.received_key_generations(),
         frozen,
         refused_below_checkpoint,
-        read_by: ch.read_by_own(store)?,
-        held: ch.held_own(store)?,
-        unread: ch.unread(store)?,
+        read_by,
+        held,
+        unread,
         drive_from: ch.drive_from(store)?,
         session_revision: ch.sessions_revision(store)?,
     })

@@ -779,6 +779,14 @@ impl PartialEq for DisplayStamp {
 
 impl Eq for DisplayStamp {}
 
+/// Inputs of the bounded read/held indicators, independent of unrelated actor events.
+/// The timeline's DisplayStamp separately binds the open room and selected messages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReadSummaryStamp {
+    reads: [u64; 2],
+    members_held: Vec<(Digest32, Option<u64>)>,
+}
+
 /// A rendered (decrypted, render-gated) message in the timeline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rendered {
@@ -2521,8 +2529,9 @@ impl ChannelState {
             room.private_sessions.legacy_pending.insert(hash);
         }
         room.private_sessions.upgrading = !room.private_sessions.legacy_pending.is_empty();
-        room.sweep_retention(store, now)?;
-        let _ = room.refresh_projection(store)?;
+        // The actor establishes current governance and this node's retention settings
+        // before sweeping or refreshing. The constructor's placeholder policies must
+        // never reset an already completed durable projection on an ordinary restart.
         Ok(room)
     }
 
@@ -7920,17 +7929,13 @@ impl ChannelState {
                 break;
             };
             cursor = Some(key);
-            let entry = rendered
+            let (_, seq) = rendered
                 .order()
-                .entry(&key.1)?
+                .author_position(&key.1)?
                 .ok_or(Error::MalformedAtRest("rendered entry missing"))?;
             let n = others
                 .iter()
-                .filter(|m| {
-                    self.held
-                        .get(*m)
-                        .is_some_and(|head| *head >= entry.skeleton.seq)
-                })
+                .filter(|m| self.held.get(*m).is_some_and(|head| *head >= seq))
                 .count();
             out.push((key.1, n as u64));
         }
@@ -7961,16 +7966,35 @@ impl ChannelState {
             if rendered.was_read(&key.1, &me)? {
                 break;
             }
-            let entry = rendered
+            let (author, _) = rendered
                 .order()
-                .entry(&key.1)?
+                .author_position(&key.1)?
                 .ok_or(Error::MalformedAtRest("rendered entry missing"))?;
-            if entry.skeleton.author_id != me {
+            if author != me {
                 out.push(key.1);
             }
         }
         out.reverse();
         Ok(out)
+    }
+
+    /// Exact sealed read roots and current members' held positions, without opening
+    /// any message bodies. Reusing indicators requires an unchanged timeline too.
+    pub(crate) fn read_summary_stamp(&self, store: &Store) -> Result<ReadSummaryStamp> {
+        if self.poisoned {
+            return Err(self.save_failure());
+        }
+        let rendered = self
+            .entries
+            .render_view(store, &self.sek, &self.channel_id)?;
+        Ok(ReadSummaryStamp {
+            reads: rendered.read_roots()?,
+            members_held: self
+                .members()
+                .into_iter()
+                .map(|member| (member, self.held.get(&member).copied()))
+                .collect(),
+        })
     }
 
     /// [`Self::read_by`] for this identity's own newest [`READ_BY_SHOWN`] messages here, those

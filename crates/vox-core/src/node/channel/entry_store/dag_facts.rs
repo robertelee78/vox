@@ -80,6 +80,23 @@ impl OrderView<'_> {
             id,
         )
     }
+    /// Author and sequence from the same sealed, published locator roots as this order.
+    /// Display indicators need these facts, not the entry's encrypted body/signature.
+    pub(crate) fn author_position(&self, hash: &Digest32) -> Result<Option<(Digest32, u64)>> {
+        if self.read.clock(hash)?.is_none() {
+            return Ok(None);
+        }
+        Ok(self
+            .read
+            .source()
+            .find(
+                self.read.sek,
+                self.read.channel,
+                self.read.directory.active.hash,
+                &hashed(hash),
+            )?
+            .map(|at| (at.author, at.seq)))
+    }
     /// Read exactly one published entry, without exposing an unsigned provisional tail.
     pub fn entry(&self, hash: &Digest32) -> Result<Option<Entry>> {
         if self.read.clock(hash)?.is_none() {
