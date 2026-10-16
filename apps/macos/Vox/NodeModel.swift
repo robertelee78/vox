@@ -1251,6 +1251,24 @@ final class NodeModel: ObservableObject {
             }
         } catch {
             guard current() else { return }
+            // A room mutation can invalidate the fresh page between its two authority fences.
+            // Reload that same room's authoritative newest page and roster while leaving the
+            // displayed snapshot in place. Transport and other read failures keep the explicit
+            // recovery path below.
+            if follows, case let VoxError.Failed(reason) = error {
+                if reason == "The room changed while reading. Refresh and try again." {
+                    await show(.room(id))
+                    return
+                }
+                if reason == "the room is preparing selected history; retry" {
+                    let refreshed = await refresh(restartObservation: false)
+                    guard refreshed, current() else { return }
+                    if rooms.first(where: { $0.id == id })?.preparing != true {
+                        await show(.room(id))
+                    }
+                    return
+                }
+            }
             retireRefusedRoomRead(error)
             reportBackground(error)
         }

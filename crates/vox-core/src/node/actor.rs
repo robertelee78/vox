@@ -5174,6 +5174,10 @@ pub struct Node {
     /// Rooms whose records are to be renewed because the prekeys this node offers changed: their
     /// renewal pushes them to the members connected now, not only to its own board and the anchors.
     prekeys_changed: BTreeSet<Digest32>,
+    /// Members that still need the current bundle after `prekeys_changed` caused a renewal.
+    /// A missing connection must not turn that one renewal into the last attempt: the member's
+    /// next connection republishes, and only a board answer retires the obligation.
+    prekey_publish_owed: BTreeSet<(Digest32, Digest32)>,
     /// Per room: the `timestamp_ms` of the last records this node signed there, on any board, and
     /// the prekeys their bundle named. See [`spaced_stamp`].
     records_stamped: BTreeMap<Digest32, (u64, (u64, Option<u64>))>,
@@ -5693,6 +5697,7 @@ impl Node {
             signed_said: BTreeSet::new(),
             packages_posted: BTreeSet::new(),
             prekeys_changed: BTreeSet::new(),
+            prekey_publish_owed: BTreeSet::new(),
             records_stamped: BTreeMap::new(),
             history_in_flight: BTreeMap::new(),
             delivery_epoch: 0,
@@ -9593,12 +9598,12 @@ impl Node {
                 }
             }
             NetEvent::Connected { peer } => {
-                if let Some(conn) = self
+                let conn = self
                     .net
                     .as_ref()
-                    .and_then(|net| net.manager().existing(&peer))
-                {
-                    self.note_peer_endpoint(&conn);
+                    .and_then(|net| net.manager().existing(&peer));
+                if let Some(conn) = &conn {
+                    self.note_peer_endpoint(conn);
                     self.pull_presentation(peer);
                 }
                 // A fresh connection syncs at once (ADR-016): a request on every port it shares,
@@ -9606,6 +9611,17 @@ impl Node {
                 self.connected.insert(peer);
                 self.discover_peers.insert(peer);
                 self.probe_older(peer);
+                if let Some(conn) = conn {
+                    let rooms: Vec<_> = self
+                        .prekey_publish_owed
+                        .iter()
+                        .filter_map(|(room, member)| (*member == peer).then_some(*room))
+                        .collect();
+                    for room in rooms {
+                        self.publish_channel_to_anchor(&room, &conn, PublishCause::Renewal)
+                            .await;
+                    }
+                }
             }
             NetEvent::SkdmRefused {
                 channel_id,
@@ -9905,6 +9921,20 @@ impl Node {
                 }
                 self.report_publish(&channel_id, board, outcomes);
                 self.note_publish_round(channel_id, board, failed);
+                // If this renewal was folded behind an older round, only the following round can
+                // acknowledge the new bundle. The round finishing now did not necessarily carry it.
+                let current_bundle_answered =
+                    holds_room && !self.publish_again.contains_key(&(channel_id, board));
+                if current_bundle_answered && self.prekey_publish_owed.remove(&(channel_id, board))
+                {
+                    if !self
+                        .prekey_publish_owed
+                        .iter()
+                        .any(|(room, _)| *room == channel_id)
+                    {
+                        self.prekeys_changed.remove(&channel_id);
+                    }
+                }
                 self.answer_addresses(channel_id).await;
                 if holds_room && self.anchor_owed.remove(&(channel_id, board)).is_some() {
                     let short = crate::node::network::short_id;
@@ -13958,7 +13988,12 @@ impl Node {
         // The room's ports are raised, as for a newcomer (`note_new_members`): the outbound setup
         // offers each peer's board the records it lacks.
         for room in due {
-            let push = self.prekeys_changed.remove(&room);
+            let changed = self.prekeys_changed.remove(&room);
+            let retry = self
+                .prekey_publish_owed
+                .iter()
+                .any(|(owed_room, _)| *owed_room == room);
+            let push = changed || retry;
             self.records_renew_at.remove(&room);
             crate::node::status::SyncBook::note_renewal(&self.sync_book);
             self.publish_channel_locally(&room).await;
@@ -13972,22 +14007,43 @@ impl Node {
                 // root-signed member record directly on every connected member's board now. The
                 // receiving board still applies its normal membership, admission, sequence and
                 // timestamp checks; this is the same member-board path used when a join finishes.
-                let member_connections = match self.channels.get(&room).map(Arc::clone) {
+                let members = match self.channels.get(&room).map(Arc::clone) {
                     Some(shared) => {
                         let me = self.profile.as_ref().map(Profile::fingerprint);
-                        let members = shared.lock().await.members();
-                        members
+                        shared
+                            .lock()
+                            .await
+                            .members()
                             .into_iter()
                             .filter(|member| Some(*member) != me)
-                            .filter(|member| !self.anchor_serves_room(&room, member))
-                            .filter_map(|member| self.net.as_ref()?.manager().existing(&member))
                             .collect::<Vec<_>>()
                     }
                     None => Vec::new(),
                 };
-                for conn in member_connections {
-                    self.publish_channel_to_anchor(&room, &conn, PublishCause::Renewal)
-                        .await;
+                let current: BTreeSet<_> = members.iter().copied().collect();
+                self.prekey_publish_owed
+                    .retain(|(owed_room, member)| *owed_room != room || current.contains(member));
+                if changed {
+                    self.prekey_publish_owed
+                        .extend(members.iter().map(|member| (room, *member)));
+                }
+                let owed: Vec<_> = self
+                    .prekey_publish_owed
+                    .iter()
+                    .filter_map(|(owed_room, member)| (*owed_room == room).then_some(*member))
+                    .collect();
+                for member in owed {
+                    if self.anchor_serves_room(&room, &member) {
+                        continue;
+                    }
+                    if let Some(conn) = self
+                        .net
+                        .as_ref()
+                        .and_then(|net| net.manager().existing(&member))
+                    {
+                        self.publish_channel_to_anchor(&room, &conn, PublishCause::Renewal)
+                            .await;
+                    }
                 }
                 for ((port_room, _), port) in &mut self.ports {
                     if *port_room == room {
@@ -14002,6 +14058,8 @@ impl Node {
         self.records_renew_at
             .retain(|room, _| open.contains_key(room));
         self.prekeys_changed.retain(|room| open.contains_key(room));
+        self.prekey_publish_owed
+            .retain(|(room, _)| open.contains_key(room));
     }
 
     /// Arm `room`'s next renewal at half its records' lifetime from now.
@@ -17289,6 +17347,10 @@ impl Node {
             for (room, at) in &mut self.records_renew_at {
                 *at = now;
                 self.prekeys_changed.insert(*room);
+                // A newer bundle supersedes every delivery obligation for the older one. The
+                // renewal seeds the current room members again from this generation.
+                self.prekey_publish_owed
+                    .retain(|(owed_room, _)| owed_room != room);
             }
         }
     }

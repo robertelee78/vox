@@ -2042,15 +2042,6 @@ pub async fn read(
         Some(s) => Some(parse_cursor(s)?),
     };
     let before = before.map(parse_cursor).transpose()?;
-    let history = history.or_else(|| {
-        (!crate::coord::agent_marked()
-            && since.is_none()
-            && !unread
-            && !only_late
-            && !with_notices
-            && tagged.tags.is_empty())
-        .then_some(if before.is_some() { "older" } else { "newest" })
-    });
     if let Some(action) = history {
         match request_history(
             &mut client,

@@ -2017,9 +2017,9 @@ mod journey {
                 },
             );
             let read_next = format!(
-                "Next: send \"{}\" this node's fingerprint (`vox id`), so it trusts you too and \
-                 you read what it writes",
-                h.key
+                "Next: send \"{}\" this node's fingerprint (`vox id --node {PERSON}`), so it \
+                 trusts you too and you read what it writes",
+                h.key,
             );
             l.claim(
                 &format!("J8.{}.trust-add", h.key),
@@ -2576,7 +2576,11 @@ mod journey {
             };
             (took, text.trim().to_owned())
         };
-        let mut paths: Vec<(&str, String, &str)> = Vec::new();
+        let locked_pass = w.root.join("hook-locked.pass");
+        std::fs::write(&locked_pass, b"hook locked identity\n")
+            .unwrap_or_else(|e| panic!("APPARATUS: cannot stage the locked hook passphrase: {e}"));
+        let locked_pass = locked_pass.display().to_string();
+        let mut paths: Vec<(&str, String, String)> = Vec::new();
         for (key, cmd) in &wirings {
             match cmd {
                 Some(c) => {
@@ -2585,9 +2589,22 @@ mod journey {
                         .find(|h| h.0 == *key)
                         .map(|h| h.2)
                         .unwrap_or_default();
-                    paths.push(("detached", c.clone(), node));
-                    paths.push(("no-daemon", c.clone(), node));
-                    paths.push(("no-node", c.replace(node, &format!("{node}-gone")), node));
+                    let locked = format!("{node}-locked");
+                    let made =
+                        w.run(&["node", "create", &locked, "--passphrase-file", &locked_pass]);
+                    if !made.ok {
+                        l.apparatus(
+                            &format!("J9.{key}.detached.staged"),
+                            &format!("the protected node could not be made: {}", made.said),
+                        );
+                    }
+                    paths.push(("detached", c.replace(node, &locked), locked));
+                    paths.push(("no-daemon", c.clone(), node.to_owned()));
+                    paths.push((
+                        "no-node",
+                        c.replace(node, &format!("{node}-gone")),
+                        node.to_owned(),
+                    ));
                 }
                 None => {
                     for p in ["detached", "no-daemon", "no-node"] {
@@ -2607,9 +2624,20 @@ mod journey {
             };
             match *path {
                 "detached" => {
-                    // A daemon running, holding the person's node, and this one detached.
+                    // A daemon running, holding the person's node, and this protected one Locked.
                     let _ = w.person(&["node", "attach", PERSON], PERSON);
-                    let _ = w.run(&["node", "detach", node]);
+                    let unlocked =
+                        w.run(&["node", "unlock", node, "--passphrase-file", &locked_pass]);
+                    let locked = w.run(&["node", "lock", node]);
+                    if !unlocked.ok || !locked.ok {
+                        l.apparatus(
+                            &format!("J9.{key}.detached.staged"),
+                            &format!(
+                                "the protected node was not unlocked then locked: {}; {}",
+                                unlocked.said, locked.said
+                            ),
+                        );
+                    }
                 }
                 "no-daemon" => {
                     // The node attached and remembered (typed, as a person attaches it), then no
