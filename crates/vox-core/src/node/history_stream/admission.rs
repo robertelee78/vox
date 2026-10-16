@@ -406,7 +406,11 @@ pub(super) fn promote_head(room: &ChannelState, store: &Store, id: Digest32) -> 
         return Ok(Advanced::Busy);
     };
     drop(input);
-    room.history_write(store, |index| index.commit_history_head(&verified, &prefix))?;
+    let conflict =
+        room.history_write(store, |index| index.commit_history_head(&verified, &prefix))?;
+    if conflict {
+        return Err(invalid("conflicting authenticated heads retained"));
+    }
     Ok(Advanced::Complete)
 }
 

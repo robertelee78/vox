@@ -1079,7 +1079,13 @@ impl Write<'_, '_> {
             self.keep_history_context(post_context)?;
             self.keep_history_header(header)?;
             self.keep_history_inclusion_receipt(included)?;
-            self.commit_history_head(head, consistency)?;
+            if self.commit_history_head(head, consistency)? {
+                // This head is still local, unpublished material. Refuse the whole local
+                // append; previously received signed conflict evidence stays on disk.
+                return Err(invalid(
+                    "local head conflicts with authenticated observation",
+                ));
+            }
             for (start, range) in ranges {
                 self.keep_history_range(signed.binding, *start, *range)?;
             }
@@ -1651,6 +1657,36 @@ impl Write<'_, '_> {
         }
         Ok(())
     }
+    /// Both observation and commitment preserve the highest authenticated observation.
+    /// Commitment is a separate proof-gated position and cannot lower this requirement.
+    fn merge_observed_head(&self, head: &SignedHead, state: &mut AuthorState) -> Result<()> {
+        let hash = head.id();
+        if state.observed == Some(hash) {
+            return Ok(());
+        }
+        let held = state
+            .observed
+            .map(|id| {
+                let prior = Source::Batch(self.batch)
+                    .sparse_head(self.sek, self.channel, self.directory.active.sparse, &id)?
+                    .ok_or(invalid("observed head missing"))?;
+                if prior.binding != head.binding {
+                    return Err(invalid("observed head author or scope differs"));
+                }
+                Ok(prior)
+            })
+            .transpose()?;
+        match held {
+            Some(old) if old.root.leaves > head.root.leaves => {}
+            Some(old) if old.root.leaves == head.root.leaves => {
+                if state.observed_conflict.is_none() {
+                    state.observed_conflict = Some((old.id(), hash));
+                }
+            }
+            _ => state.observed = Some(hash),
+        }
+        Ok(())
+    }
     /// Retain authenticated head evidence only. Return true for an attributable conflict;
     /// the caller refuses it AFTER this Batch commits, so neither witness is rolled back.
     pub(crate) fn observe_history_head(&mut self, verified: &VerifiedHead) -> Result<bool> {
@@ -1670,42 +1706,21 @@ impl Write<'_, '_> {
                 head.binding.scope,
             )?
             .unwrap_or_default();
-        if state.observed != Some(hash) {
-            let held = state
-                .observed
-                .map(|id| {
-                    let prior = Source::Batch(self.batch)
-                        .sparse_head(self.sek, self.channel, self.directory.active.sparse, &id)?
-                        .ok_or(invalid("observed head missing"))?;
-                    if prior.binding != head.binding {
-                        return Err(invalid("observed head author or scope differs"));
-                    }
-                    Ok(prior)
-                })
-                .transpose()?;
-            match held {
-                Some(old) if old.root.leaves > head.root.leaves => {}
-                Some(old) if old.root.leaves == head.root.leaves => {
-                    if state.observed_conflict.is_none() {
-                        state.observed_conflict = Some((old.id(), hash));
-                        self.save_sparse_author(head.binding, state)?;
-                    }
-                }
-                _ => {
-                    state.observed = Some(hash);
-                    self.save_sparse_author(head.binding, state)?;
-                }
-            }
+        let before = state;
+        self.merge_observed_head(head, &mut state)?;
+        if state != before {
+            self.save_sparse_author(head.binding, state)?;
         }
         Ok(state.observed_conflict.is_some())
     }
     /// Publish only the exact consistency result against the root still accepted in this
     /// Batch. A stale result cannot replace a newer commitment. No contiguous head changes.
+    /// Return true when retained observed conflict evidence must be reported after commit.
     pub(crate) fn commit_history_head(
         &mut self,
         verified: &VerifiedHead,
         proof: &ConsistentPrefix,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         self.require_sparse_idle()?;
         let head = verified.head();
         if proof.head_id() != head.id()
@@ -1759,7 +1774,7 @@ impl Write<'_, '_> {
         {
             // Reusing an older accepted target finishes its outstanding work; it must not
             // roll back the current head or create a cycle in prior-head receipts.
-            return Ok(());
+            return Ok(state.observed_conflict.is_some());
         }
         let prior_id = state.committed;
         let prior = if let Some(id) = state.committed {
@@ -1812,7 +1827,7 @@ impl Write<'_, '_> {
                 Some(Value::Number(record)),
             )?;
         }
-        state.observed = Some(head.id());
+        self.merge_observed_head(head, &mut state)?;
         state.committed = Some(head.id());
         if head.root.leaves != 0 {
             self.keep_history_range(head.binding, 1, head.root)?;
@@ -1824,7 +1839,8 @@ impl Write<'_, '_> {
         )?;
         // Previously ready evidence remains exact to its older head; it is not upgraded by
         // commitment alone. Readers must compare that ID with their requested target.
-        self.save_sparse_author(head.binding, state)
+        self.save_sparse_author(head.binding, state)?;
+        Ok(state.observed_conflict.is_some())
     }
     /// Remember cryptographically complete coverage, not semantic control readiness. Bodies,
     /// parent receipts and authority evaluation remain durable obligations owned by admission.
