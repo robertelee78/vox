@@ -124,7 +124,9 @@ struct MainWindow: View {
                 .raisedSurface()
                 .textSelection(.enabled)
         }
-        .contentSurface()
+        // Detail owns bg.base above; leave the root transparent so WindowBackground supplies
+        // bg.panel in the narrow gutter outside the sidebar's rounded split-view pane.
+        .foregroundStyle(VoxTokens.Colors.textPrimary)
         // The window's own background, which shows around the floating sidebar's rounded pane,
         // from the tokens too (L-6: never the system background).
         .background(WindowBackground())
