@@ -958,6 +958,9 @@ pub struct ChannelState {
     sparse_settle_pending: bool,
     /// Current presence per admitted author, bounded by AUTHORS_HARD_LIMIT; no event history.
     presence: BTreeMap<Digest32, governance::Presence>,
+    /// Highest semantically applied sparse entry per admitted author. Rebuilt from the
+    /// sealed settled-tip index on open; signed/source-only heads never enter this map.
+    sparse_applied_tips: BTreeMap<Digest32, u64>,
     sender: SenderChain,
     /// The next `LogDb` / `PlaintextCache` segment id.
     next_log_id: u64,
@@ -1856,6 +1859,7 @@ impl ChannelState {
             governance_ready: false,
             sparse_settle_pending: false,
             presence: BTreeMap::new(),
+            sparse_applied_tips: BTreeMap::new(),
             sender,
             next_log_id: 1,
             read_mark_scan: None,
@@ -2282,6 +2286,19 @@ impl ChannelState {
             entry_read.order_previous(None)?.map(|(clock, _)| clock),
         );
 
+        // Sparse membership follows completed semantic effects, not a contiguous archive
+        // prefix. Read at most one persistent, effect-checked tip per admitted author;
+        // reopening never enumerates retained entries or promotes an observed/source head.
+        let mut sparse_applied_tips = BTreeMap::new();
+        if entry_read.sparse_enabled() {
+            for (author, key) in &authors {
+                if let Some(tip) = entry_read.history_settled_tip(author)? {
+                    tip.verify(key)?;
+                    sparse_applied_tips.insert(*author, tip.skeleton.seq);
+                }
+            }
+        }
+
         // How far each member's node holds this identity's feed (ADR-028 R-6).
         let held = match store.get_segment(channel_id, SegmentKind::KeyMaterial, SEG_HELD)? {
             Some(seg) => parse_held(&open_segment(
@@ -2515,6 +2532,7 @@ impl ChannelState {
             governance_ready: false,
             sparse_settle_pending: false,
             presence,
+            sparse_applied_tips,
             sender,
             next_log_id,
             read_mark_scan: None,
@@ -2776,6 +2794,7 @@ impl ChannelState {
             governance_ready: false,
             sparse_settle_pending: false,
             presence: BTreeMap::new(),
+            sparse_applied_tips: BTreeMap::new(),
             sender,
             next_log_id: 1,
             read_mark_scan: None,
@@ -8841,7 +8860,11 @@ impl ChannelState {
     /// Where in `author`'s feed, as this node holds it, its statement that it left stands, when
     /// that statement is the feed's last entry.
     fn left_at(&self, author: &Digest32) -> Option<u64> {
-        let head = self.dag.feed(author).map(|f| f.max_seq())?;
+        let head = self
+            .dag
+            .feed(author)
+            .map_or(0, |feed| feed.max_seq())
+            .max(self.sparse_applied_tips.get(author).copied().unwrap_or(0));
         self.presence
             .get(author)
             .filter(|presence| presence.last.0 == head && !presence.last.1)

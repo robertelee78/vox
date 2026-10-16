@@ -767,6 +767,13 @@ impl ChannelState {
             on_admitted(&mut batch, *hash)?;
             batch.commit()?;
             self.entries.committed();
+            // The settled-tip index and presence update are now durable in the same Batch.
+            // A source-only entry cannot change membership, and a late earlier effect must
+            // not move the applied tail backward past a later return/content statement.
+            self.sparse_applied_tips
+                .entry(entry.skeleton.author_id)
+                .and_modify(|seq| *seq = (*seq).max(entry.skeleton.seq))
+                .or_insert(entry.skeleton.seq);
             self.key_packages.published(self.next_log_id);
             if kind == SignedEntryKind::KeyPackage
                 && entry.payload.is_some()
