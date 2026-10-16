@@ -29,14 +29,21 @@ struct EntryResult {
     offset: u64,
 }
 
+#[allow(clippy::too_many_arguments)] // One bound stream and its node-owned scalar hint sink.
 pub(super) async fn answer(
     source: &Source,
     io: &mut Transport,
     preamble: Preamble,
     query: Query,
     handshake_bytes: usize,
+    inbox: &super::HintInbox,
+    inbox_generation: u64,
+    inventory_added: &mut bool,
 ) -> Result<Status> {
     let request = preamble.request;
+    if matches!(query, Query::Inventory) && preamble.purpose != Purpose::Control {
+        return Err(Error::MalformedBundle("inventory requires control purpose"));
+    }
     if preamble.purpose != Purpose::History && matches!(query, Query::Page { .. }) {
         return Err(Error::MalformedBundle(
             "archive page requires history reservation",
@@ -44,6 +51,31 @@ pub(super) async fn answer(
     }
     let mut credit = Response::new(request, query.clone())?;
     credit.charge_handshake(handshake_bytes)?;
+    if matches!(query, Query::Inventory) {
+        // Inventory is symmetric: the requester sends its one HAVE before receiving ours.
+        // Its exact encoded bytes share this request's wire credit, and the decoded Vec stays
+        // inside the charged input frame until all bounded insertion slices have completed.
+        let incoming = match io.read(credit.remaining_wire()).await? {
+            Read::Frame(frame) => frame,
+            Read::Busy => return Err(Error::Unreachable("inventory reader busy")),
+            Read::End => return Err(Error::MalformedBundle("inventory closed before HAVE")),
+        };
+        credit.charge_overhead(incoming.wire_len())?;
+        let Frame::Have(hints) = incoming.frame()? else {
+            return Err(Error::MalformedBundle("inventory expected one HAVE"));
+        };
+        for slice in hints.chunks(64) {
+            let offered = source
+                .offer_inventory(io.job(), inbox, inbox_generation, preamble.room, slice)
+                .await?;
+            *inventory_added |= offered.added != 0;
+            if offered.full {
+                return Err(Error::Unreachable("inventory pending capacity busy"));
+            }
+        }
+        drop(hints);
+        drop(incoming);
+    }
     let (status, continuation) = if credit.remaining_wire() < super::DONE_RESERVE {
         (Status::Busy, None)
     } else {
@@ -96,6 +128,16 @@ async fn respond(
     let job = io.job().clone();
     let request = preamble.request;
     match *query {
+        Query::Inventory => {
+            let Lookup::Found(inventory) = source.inventory(&job).await? else {
+                return Ok((Status::Busy, None));
+            };
+            let status = match send(source, io, credit, Frame::Have(inventory.value), 0).await? {
+                Sent::Yes => Status::Complete,
+                Sent::Busy | Sent::Full => Status::Busy,
+            };
+            Ok((status, None))
+        }
         Query::Head(author) => {
             let found = source
                 .read(&job, 128 * 1024, move |room, store| {

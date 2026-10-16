@@ -179,14 +179,12 @@ impl Source {
                 None => Lookup::Missing,
             })
         });
-        let result = tokio::select! {
-            biased;
-            () = self.fence.retired() => return Err(Error::Unreachable("history request cancelled")),
-            result = tokio::time::timeout_at(self.deadline, task) => {
-                result.map_err(|_| Error::Unreachable("history disk read deadline elapsed"))?
-                    .map_err(|_| Error::Unreachable("history disk reader stopped"))?
-            }
-        };
+        // Once dispatched, await actual worker exit even after cancellation. The caller may
+        // own an outbound slot in addition to the charges held by this closure; returning early
+        // would free that slot while its blocking disk work still ran. No actor waits here.
+        let result = task
+            .await
+            .map_err(|_| Error::Unreachable("history disk reader stopped"))?;
         self.current()?;
         result
     }
@@ -375,5 +373,138 @@ impl Source {
             }),
             _charge: charge,
         }))
+    }
+}
+
+impl Source {
+    /// One bounded, charged scalar inventory. Every page rechecks current room access;
+    /// the compact index is read without touching content bodies or walking the archive.
+    pub(super) async fn inventory(&self, job: &Job) -> Result<Lookup<Vec<super::HeadHint>>> {
+        let Some(charge) = job.reserve(
+            crate::log::history::MAX_CONTEXT_AUTHORS * std::mem::size_of::<super::HeadHint>(),
+        ) else {
+            return Ok(Lookup::Busy);
+        };
+        let mut hints = Vec::with_capacity(crate::log::history::MAX_CONTEXT_AUTHORS);
+        let mut after = None;
+        for _ in 0..=crate::log::history::MAX_CONTEXT_AUTHORS / 64 {
+            self.current()?;
+            let page = self
+                .read(job, 64 * 1024, move |room, store| {
+                    room.history_head_hints(store, after).map(Some)
+                })
+                .await?;
+            let Lookup::Found(page) = page else {
+                return Ok(Lookup::Busy);
+            };
+            if hints.len() + page.value.heads.len() > crate::log::history::MAX_CONTEXT_AUTHORS {
+                return Err(Error::SizeLimitExceeded("inventory author bound"));
+            }
+            hints.extend(page.value.heads.iter().map(|hint| super::HeadHint {
+                author: hint.author,
+                size: hint.leaves,
+                head: hint.head,
+            }));
+            match page.value.next {
+                Some(next) if after.is_none_or(|previous| next > previous) => after = Some(next),
+                None => {
+                    return Ok(Lookup::Found(Held {
+                        value: hints,
+                        _charge: charge,
+                    }))
+                }
+                _ => return Err(Error::MalformedAtRest("inventory cursor did not advance")),
+            }
+        }
+        Err(Error::SizeLimitExceeded("inventory index slice bound"))
+    }
+
+    /// Filter at most 64 already decoded hints using exact accepted/settled local facts.
+    /// Missing terminal bodies remain eligible; a control-ready head is not body receipt.
+    /// The caller holds the original HAVE's decode charge and preserves this inbox generation.
+    pub(super) async fn offer_inventory(
+        &self,
+        job: &Job,
+        inbox: &super::HintInbox,
+        generation: u64,
+        room_id: Digest32,
+        hints: &[super::HeadHint],
+    ) -> Result<super::hints::Offer> {
+        if hints.len() > 64 {
+            return Err(Error::SizeLimitExceeded("inventory filter slice"));
+        }
+        // Input copy and returned vector coexist inside this small prepaid envelope.
+        let Some(input_charge) = job.reserve(64 * std::mem::size_of::<super::HeadHint>()) else {
+            return Ok(super::hints::Offer {
+                added: 0,
+                full: true,
+            });
+        };
+        let slice = hints.to_vec();
+        let filtered = self
+            .read(
+                job,
+                64 * std::mem::size_of::<super::HeadHint>(),
+                move |room, store| {
+                    let _input_charge = input_charge;
+                    if room.channel_id() != room_id {
+                        return Err(Error::MalformedBundle("inventory room binding"));
+                    }
+                    let read = room.history_read(store)?;
+                    let mut missing = Vec::with_capacity(slice.len());
+                    for hint in slice {
+                        let ready = read
+                            .sparse_author(&hint.author, crate::log::history::LogScope::Public)?
+                            .is_some_and(|state| {
+                                state.committed == Some(hint.head)
+                                    && state.control_ready == Some(hint.head)
+                            });
+                        let held = if ready {
+                            let head = read.history_head(&hint.head)?;
+                            if head
+                                .as_ref()
+                                .is_none_or(|head| head.root.leaves != hint.size)
+                            {
+                                false
+                            } else if hint.size == 0 {
+                                true
+                            } else if let Some(header) =
+                                read.history_position_header(&hint.author, hint.size)?
+                            {
+                                let hash = header.entry_hash();
+                                read.history_effect_finished(&hash)? && match header.skeleton.v2 {
+                                    Some(v2)
+                                        if v2.kind
+                                            == crate::log::history::SignedEntryKind::Content =>
+                                    {
+                                        read.retention(&hash)?.is_some()
+                                    }
+                                    Some(_) => true,
+                                    None => false,
+                                }
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
+                        if !held {
+                            missing.push(hint);
+                        }
+                    }
+                    Ok(Some(missing))
+                },
+            )
+            .await?;
+        match filtered {
+            Lookup::Found(filtered) => {
+                self.current()?;
+                inbox.offer(job, generation, room_id, self.peer, &filtered.value)
+            }
+            Lookup::Busy | Lookup::Missing => Ok(super::hints::Offer {
+                added: 0,
+                full: true,
+            }),
+        }
     }
 }
