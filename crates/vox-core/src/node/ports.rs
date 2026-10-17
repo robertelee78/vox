@@ -306,6 +306,22 @@ impl Port {
             .is_some_and(|until| now < until)
     }
 
+    /// Whether new published entries bypass a Busy backoff at `now`. The Busy backoff spaces
+    /// owed-work retries while nothing new arrived; a peer's newly published entries are new
+    /// demand, and holding the round that carries them behind a transient-refusal backoff
+    /// delayed a fresh member's join and floor visibility past the person-facing bounds. A
+    /// transport (Unreachable) backoff still holds: a peer that cannot be reached gains
+    /// nothing from an immediate retry.
+    #[must_use]
+    pub fn busy_bypass(&self, now: Instant) -> bool {
+        self.backoff.is_some_and(|b| {
+            b.kind == BackoffKind::Busy
+                && !self.poisoned
+                && self.gen.load(Ordering::Relaxed)
+                    > self.done_gen.max(self.legacy_checked_gen.unwrap_or(0))
+        }) && self.backing_off(now)
+    }
+
     /// Clear the backoff: a new connection, a new epoch, or a person's `vox room sync`.
     pub fn clear_backoff(&mut self) {
         self.backoff = None;

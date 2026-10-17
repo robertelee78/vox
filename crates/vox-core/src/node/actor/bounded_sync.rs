@@ -707,6 +707,19 @@ impl Node {
                 continue;
             }
             if let Some(error) = returned.error {
+                // A peer that does not yet hold a selected current body or a required current
+                // evidence, and a room whose Session-readiness facts are still refreshing, are
+                // bounded waiting conditions, not peer failures: this same port's next round
+                // re-selects the work and advances it. Failing the round would put this healthy
+                // port in Unreachable backoff — growing past one retry per half minute — and
+                // strand the pair's live window and control closure behind it. Dispose the flow
+                // so its next selection is fresh, and retry at the Busy cadence without
+                // counting a failure or arming the persistent-failure escalation.
+                let transient = matches!(
+                    error.as_str(),
+                    "peer unreachable: selected current body is unavailable or cancelled"
+                        | "peer unreachable: required current evidence is unavailable"
+                ) || crate::node::sessions::opening_refreshing(&error);
                 if let Some(request) = returned.flow.archive_request {
                     self.history_demand
                         .failed(request, returned.flow.generation, &error);
@@ -721,6 +734,15 @@ impl Node {
                     );
                 }
                 self.bounded_sync.dispose(returned.flow);
+                if transient {
+                    self.enter_backoff(
+                        work.room,
+                        work.peer,
+                        crate::node::status::BackoffKind::Busy,
+                    );
+                    self.sched_rooms.insert(work.room);
+                    continue;
+                }
                 crate::node::status::SyncBook::with(
                     &self.sync_book,
                     work.room,

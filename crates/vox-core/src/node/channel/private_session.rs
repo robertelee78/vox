@@ -2232,7 +2232,10 @@ impl ChannelState {
                 "private live request or authority changed",
             ));
         }
-        self.index_session_floors(store)?;
+        // No whole-room projection gate here: each record is placed by its own per-record
+        // Drive, generation, floor and receiver-chain checks below. Gating this apply on
+        // every author's still-building receipt made a member's own apply wait on the very
+        // receipts only this apply's rounds could advance.
         // This is a donor-local locator hint, not a completeness statement or a watermark.
         // Authenticate the whole advertised page before retaining even that bounded hint.
         for wire in &page.records {
@@ -2263,19 +2266,31 @@ impl ChannelState {
             let record = Record::read(wire)?;
             let header = &record.message.header;
             if !self.private_cached(store, &record.hash())? && header.author_id != self.me() {
-                let receiver = self
+                let behind = match self
                     .drive
                     .receivers
                     .get(&(header.author_id, header.chain_id))
-                    .ok_or(Error::StreamRefused(
-                        "private lifecycle/history unavailable; explicit recovery required",
-                    ))?;
-                if receiver.has_skipped_iterations()
-                    || header.iteration != receiver.next_iteration()
                 {
-                    return Err(Error::StreamRefused(
-                        "private lifecycle/history gap; explicit recovery required",
-                    ));
+                    Some(receiver) => {
+                        receiver.has_skipped_iterations()
+                            || header.iteration != receiver.next_iteration()
+                    }
+                    None => true,
+                };
+                if behind {
+                    // A sealed record beyond this receiver chain's keys is not applicable
+                    // here at this chain state. The covering key package is either still
+                    // in flight for this member — this pull retries after its install, at
+                    // its own pacing — or is not addressed to this member at all: a
+                    // Session is read from a grant onward, and this member holds no grant
+                    // for this generation, so the record is not this member's to apply and
+                    // the pull moves past it. Refusing the whole page here made the pull a
+                    // dead end: the retry re-requested the same tail while the named
+                    // explicit recovery was armed by nothing.
+                    if self.key_packages.pending_from(&header.author_id) {
+                        return Ok(false);
+                    }
+                    continue;
                 }
             }
             let row = self

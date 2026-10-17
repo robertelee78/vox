@@ -7014,8 +7014,15 @@ impl ChannelState {
         holders: &BTreeSet<Digest32>,
         now_ms: u64,
     ) -> Result<()> {
-        self.index_session_floors(store)?;
         let me = self.me();
+        // This author's own floor boundary waits only on this author's own control effects
+        // through its committed head; another author's still-building receipt is not this
+        // author's publication's to wait on.
+        if !self.current_session_control_ready(store, &me)? {
+            return Err(Error::StreamRefused(
+                session_projection::floor_index::REFRESHING,
+            ));
+        }
         let published = self
             .floor_author(Transaction::Snapshot(&store.snapshot()?), &me)?
             .announced;

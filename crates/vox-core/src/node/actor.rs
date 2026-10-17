@@ -14383,7 +14383,7 @@ impl Node {
                     && (port.needs()
                         || self.bounded_sync.needs_port(key.0, key.1)
                         || self.history_hints.pending(key.0, key.1))
-                    && !port.backing_off(now)
+                    && (!port.backing_off(now) || port.busy_bypass(now))
                     && !self.publishing.contains(*key)
                     && self
                         .net
@@ -14437,7 +14437,7 @@ impl Node {
             && (port.needs()
                 || self.bounded_sync.needs_port(key.0, key.1)
                 || self.history_hints.pending(key.0, key.1))
-            && !port.backing_off(now)
+            && (!port.backing_off(now) || port.busy_bypass(now))
             && !self.publishing.contains(key)
             && self
                 .net

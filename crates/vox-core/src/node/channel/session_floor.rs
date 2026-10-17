@@ -93,6 +93,17 @@ impl ChannelState {
         Ok(())
     }
 
+    /// Whether this author's own floor boundary is publishable: this author's control effects
+    /// are complete through its committed head. Another author's still-building receipt never
+    /// blocks this author's own boundary; readiness of the whole room is an answer the
+    /// projection gives, not a gate on one author's own publication.
+    fn own_floor_ready(&self, store: &Store, author: &Digest32) -> Result<()> {
+        if !self.current_session_control_ready(store, author)? {
+            return Err(Error::StreamRefused(floor_index::REFRESHING));
+        }
+        Ok(())
+    }
+
     /// Publish the boundary before releasing the matching key or writing a Session step.
     pub(super) fn ensure_session_floors(
         &mut self,
@@ -100,8 +111,8 @@ impl ChannelState {
         holders: &BTreeSet<Digest32>,
         now: u64,
     ) -> Result<()> {
-        self.index_session_floors(profile.store())?;
         let me = self.me();
+        self.own_floor_ready(profile.store(), &me)?;
         let members = self.drive_members();
         let Some(generation) = self.drive.chain.as_ref().map(SenderChain::chain_id) else {
             return Ok(());
@@ -249,7 +260,11 @@ impl ChannelState {
         max_bytes: usize,
     ) -> Result<Vec<Vec<u8>>> {
         self.now_hint = self.now_hint.max(now_ms);
-        self.index_session_floors(store)?;
+        // No whole-room projection gate here: the stored entries are authenticated, and each
+        // served entry passes its own verified closure; the receiver places each record with
+        // its own per-record Drive, generation and floor checks. Gating this serve on every
+        // author's still-building receipt made a fresh member's own serve wait on peers whose
+        // receipts only its serve could advance.
         let entries = self.entries.read(store, &self.sek, &self.channel_id)?;
         let accepted_wants: Vec<_> = wants
             .iter()
