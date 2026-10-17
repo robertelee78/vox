@@ -5,7 +5,10 @@ use std::sync::Arc;
 use quinn::{RecvStream, SendStream};
 use tokio::time::Instant;
 
-use super::{Encoded, Frame, MAX_FRAME_BYTES, MAX_HELLO_FRAME_BYTES, MAX_WANT_FRAME_BYTES};
+use super::{
+    Encoded, Frame, ACK_FRAME_MAX_BYTES, MAX_FRAME_BYTES, MAX_HELLO_FRAME_BYTES,
+    MAX_WANT_FRAME_BYTES,
+};
 use crate::error::{Error, Result};
 use crate::node::history_budget::{BufferCharge, Job};
 use crate::transport::framing::write_frame;
@@ -90,6 +93,17 @@ impl Transport {
             .await
     }
 
+    /// ACK and CANCEL are fixed scalar frames. They need no variable-frame decode envelope;
+    /// reserve their structural bound before the prefix and reject every other tag there.
+    pub(super) async fn read_ack_or_cancel(&mut self, remaining_wire: usize) -> Result<Read> {
+        self.read_bounded(
+            remaining_wire.min(ACK_FRAME_MAX_BYTES + 4),
+            0,
+            Some(&[0x0A, 0x09]),
+        )
+        .await
+    }
+
     async fn read_bounded(
         &mut self,
         remaining_wire: usize,
@@ -100,7 +114,13 @@ impl Transport {
         if maximum == 0 {
             return Err(Error::SizeLimitExceeded("history response credit"));
         }
-        let Some(charge) = self.job.reserve(maximum + decode_envelope) else {
+        let envelope = maximum
+            .checked_add(decode_envelope)
+            .ok_or(Error::SizeLimitExceeded("history frame envelope"))?;
+        let Some(work_job) = self.job.record_job(envelope) else {
+            return Ok(Read::Busy);
+        };
+        let Some(charge) = work_job.reserve(envelope) else {
             return Ok(Read::Busy);
         };
         let until = self.until();

@@ -514,6 +514,17 @@ impl Node {
         result
     }
 
+    /// Abandoning a flow retires its local capabilities, not the unauthoritative scalar hint it
+    /// selected. Re-arm that exact hint while its inbox scope is still live; room/peer retirement
+    /// removes it first, making this a no-op for teardown rather than leaving an in-flight orphan.
+    fn dispose_rearming_hint(&mut self, mut flow: Flow) {
+        if let Some(hint) = flow.hint.take() {
+            self.history_hints
+                .retry(flow.room, flow.hint_peer, hint.author, hint.head);
+        }
+        self.bounded_sync.dispose(flow);
+    }
+
     pub(super) fn accept_bounded_sync(&mut self) {
         self.bounded_sync.poll_cleanup();
         for index in 0..2 {
@@ -528,7 +539,7 @@ impl Node {
                 continue;
             };
             let Some(work) = self.bounded_sync.running[index].take() else {
-                self.bounded_sync.dispose(returned.flow);
+                self.dispose_rearming_hint(returned.flow);
                 continue;
             };
             let current = self
@@ -543,7 +554,7 @@ impl Node {
                     .get(&work.room)
                     .is_some_and(|room| Arc::ptr_eq(room, &returned.flow.shared));
             if !valid {
-                self.bounded_sync.dispose(returned.flow);
+                self.dispose_rearming_hint(returned.flow);
                 continue;
             }
             if returned.flow.admitted_authors > 0 {
@@ -578,11 +589,10 @@ impl Node {
                     self.bounded_sync.required.push_back(need);
                 }
             }
-            if returned.flow.hint_unavailable {
-                if let Some(hint) = returned.flow.hint {
-                    self.history_hints
-                        .finish(work.room, work.peer, hint.author, hint.head);
-                }
+            if let Some(target) = returned.flow.reroute.take() {
+                // EvidenceUnavailable named the author of the exact missing signed dependency.
+                // Keep this flow, its in-flight hint owner and its exact query/continuation
+                // intact; only the next wire turn moves to the authoritative port.
                 let more_for_peer = self
                     .bounded_sync
                     .ready
@@ -604,7 +614,15 @@ impl Node {
                         .required
                         .iter()
                         .any(|(room, peer, _, _)| *room == work.room && *peer == work.peer);
-                self.bounded_sync.dispose(returned.flow);
+                returned.flow.peer = target;
+                returned.flow.route_origin = Some(work.peer);
+                returned.flow.route_complete = false;
+                debug_assert!(self.bounded_sync.ready[0].is_none());
+                if self.bounded_sync.ready[0].is_some() {
+                    self.dispose_rearming_hint(returned.flow);
+                    continue;
+                }
+                self.bounded_sync.ready[0] = Some(returned.flow);
                 crate::node::status::SyncBook::with(
                     &self.sync_book,
                     work.room,
@@ -619,6 +637,45 @@ impl Node {
                         port.raise();
                     }
                 }
+                if let Some(port) = self.ports.get_mut(&(work.room, target)) {
+                    port.raise();
+                    port.clear_backoff();
+                } else {
+                    self.discover_rooms.insert(work.room);
+                }
+                crate::node::status::SyncBook::with(&self.sync_book, work.room, target, |counts| {
+                    counts.backoff = None
+                });
+                self.sched_rooms.insert(work.room);
+                continue;
+            }
+            if returned.flow.authorization_changed {
+                let retry_peer = returned
+                    .flow
+                    .route_origin
+                    .unwrap_or(returned.flow.hint_peer);
+                if let Some(hint) = returned.flow.hint {
+                    self.history_hints.retry(
+                        work.room,
+                        returned.flow.hint_peer,
+                        hint.author,
+                        hint.head,
+                    );
+                }
+                self.bounded_sync.dispose(returned.flow);
+                crate::node::status::SyncBook::with(
+                    &self.sync_book,
+                    work.room,
+                    work.peer,
+                    |counts| {
+                        counts.stale += 1;
+                        counts.backoff = None;
+                    },
+                );
+                if let Some(port) = self.ports.get_mut(&(work.room, retry_peer)) {
+                    port.raise();
+                    port.clear_backoff();
+                }
                 self.sched_rooms.insert(work.room);
                 continue;
             }
@@ -629,8 +686,12 @@ impl Node {
                 }
 
                 if let Some(hint) = returned.flow.hint {
-                    self.history_hints
-                        .finish(work.room, work.peer, hint.author, hint.head);
+                    self.history_hints.finish(
+                        work.room,
+                        returned.flow.hint_peer,
+                        hint.author,
+                        hint.head,
+                    );
                 }
                 self.bounded_sync.dispose(returned.flow);
                 crate::node::status::SyncBook::with(
@@ -647,6 +708,66 @@ impl Node {
                     work.peer,
                     crate::node::status::BackoffKind::Unreachable,
                 );
+                continue;
+            }
+            if returned.flow.route_complete {
+                let Some(origin) = returned.flow.route_origin.take() else {
+                    self.dispose_rearming_hint(returned.flow);
+                    continue;
+                };
+                returned.flow.route_complete = false;
+                let more_for_target = self.history_hints.pending(work.room, work.peer)
+                    || self
+                        .bounded_sync
+                        .required
+                        .iter()
+                        .any(|(room, peer, _, _)| *room == work.room && *peer == work.peer);
+                if let Some(port) = self.ports.get_mut(&(work.room, work.peer)) {
+                    port.req_done = port.req_done.max(work.request);
+                    if more_for_target {
+                        port.raise();
+                    }
+                    port.clear_backoff();
+                }
+                crate::node::status::SyncBook::with(
+                    &self.sync_book,
+                    work.room,
+                    work.peer,
+                    |counts| {
+                        counts.completed += 1;
+                        counts.backoff = None;
+                    },
+                );
+                let origin_room =
+                    crate::node::ports::RoomRef::Channel(Arc::downgrade(&returned.flow.shared));
+                let origin_live = self
+                    .ports
+                    .get(&(work.room, origin))
+                    .is_some_and(|port| !port.poisoned && port.room.is(&origin_room));
+                if !origin_live {
+                    // The advertising peer departed or its room instance was poisoned while the
+                    // exact author turn was in flight. Its inbox scope has already retired (or
+                    // this hint is safely re-armed for a later reopen); never strand the sole
+                    // foreground lane on an absent/unschedulable origin port.
+                    self.dispose_rearming_hint(returned.flow);
+                    self.sched_rooms.insert(work.room);
+                    continue;
+                }
+                returned.flow.peer = origin;
+                debug_assert!(self.bounded_sync.ready[0].is_none());
+                if self.bounded_sync.ready[0].is_some() {
+                    self.dispose_rearming_hint(returned.flow);
+                    continue;
+                }
+                self.bounded_sync.ready[0] = Some(returned.flow);
+                if let Some(port) = self.ports.get_mut(&(work.room, origin)) {
+                    port.raise();
+                    port.clear_backoff();
+                }
+                crate::node::status::SyncBook::with(&self.sync_book, work.room, origin, |counts| {
+                    counts.backoff = None
+                });
+                self.sched_rooms.insert(work.room);
                 continue;
             }
             // A successful local slice disproves only an earlier capacity yield. Do this for a
@@ -704,13 +825,22 @@ impl Node {
                     }
                 }
                 if let Some(hint) = returned.flow.hint {
-                    self.history_hints
-                        .finish(work.room, work.peer, hint.author, hint.head);
+                    self.history_hints.finish(
+                        work.room,
+                        returned.flow.hint_peer,
+                        hint.author,
+                        hint.head,
+                    );
                 }
                 let mut raised = false;
                 if let Some(port) = self.ports.get_mut(&(work.room, work.peer)) {
                     if returned.flow.inventory {
                         port.done_gen = port.done_gen.max(work.generation);
+                    }
+                    if returned.flow.inventory || returned.flow.hint.is_some() {
+                        // This attempt consumed the request that selected its inventory or
+                        // scalar hint. Leaving it outstanding immediately schedules another
+                        // inventory and recreates the feedback churn the bounded inbox removed.
                         port.req_done = port.req_done.max(work.request);
                     }
                     if self
@@ -755,7 +885,7 @@ impl Node {
                             if let Some(hint) = old.hint {
                                 self.history_hints.finish(
                                     old.room,
-                                    old.peer,
+                                    old.hint_peer,
                                     hint.author,
                                     hint.head,
                                 );
@@ -964,7 +1094,7 @@ impl Node {
                             .and_then(|at| self.bounded_sync.required.remove(at))
                             .map(|(_, _, head, seq)| (head, seq));
                         let hint = if required.is_none() {
-                            departure_hint.or_else(|| self.history_hints.take(room, peer))
+                            departure_hint.or_else(|| self.history_hints.take(room, peer, node))
                         } else {
                             None
                         };
@@ -1016,7 +1146,7 @@ impl Node {
                         .and_then(|at| self.bounded_sync.required.remove(at))
                         .map(|(_, _, head, seq)| (head, seq));
                     let hint = if required.is_none() {
-                        departure_hint.or_else(|| self.history_hints.take(room, peer))
+                        departure_hint.or_else(|| self.history_hints.take(room, peer, node))
                     } else {
                         None
                     };
@@ -1104,7 +1234,7 @@ impl Node {
             return false;
         };
         let Some(port) = self.ports.get_mut(&(room, peer)) else {
-            self.bounded_sync.dispose(flow);
+            self.dispose_rearming_hint(flow);
             return false;
         };
         let token = self.next_token;

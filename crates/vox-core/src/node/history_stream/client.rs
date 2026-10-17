@@ -302,7 +302,17 @@ impl Receiver {
                                     head: *head,
                                     size: *tail,
                                 });
-                            } else if *tail > 0 {
+                            } else if *tail == 0 {
+                                // The canonical empty head has no position-zero header. Its
+                                // ordinary empty consistency proof is the complete promotion
+                                // path and makes the exact head available for peer echo.
+                                result.need(Query::Proof {
+                                    head: *head,
+                                    kind: ProofKind::Consistency,
+                                    from: 0,
+                                    to: 0,
+                                })?;
+                            } else {
                                 result.need(Query::Header {
                                     head: *head,
                                     seq: *tail,

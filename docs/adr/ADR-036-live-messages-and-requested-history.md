@@ -438,6 +438,15 @@ reset positions, tree consistency, control obligations or termination. The prese
 evaluator's epoch-zero behavior is preserved until separately changed; this format does not
 invent an epoch transition or legacy fence.
 
+A new sparse room MUST sign and commit the local author's canonical zero-leaf public head in the
+same transaction that initializes the room. An empty feed has no terminal entry or inclusion
+receipt: a member that holds and returns that exact committed zero-leaf head has acknowledged the
+empty feed. Its promotion uses the empty consistency proof and MUST NOT request a nonexistent
+position-zero header. The first local entry advances from this ordinary committed empty prefix.
+Absence of a head is not an acknowledgement and MUST NOT make a joined room writable. Promoting a
+new remote head changes the room's advertised inventory: it MUST advance that room generation and
+wake its ports so the exact head can be echoed to its author without a periodic-tick dependency.
+
 **Proof objects.** All positions below are one-based; inclusion leaf index is `p - 1`.
 Descriptor orientation comes from indexes and canonical splits, never a peer-provided side bit.
 
@@ -463,9 +472,12 @@ interval, only a zero-control subtree may be collapsed. The proof must consume t
 range and token list; missing/extra tokens, wrong splits, counts or joins reject it. A proof
 object has at most eight expanded control headers, 1,024 tokens and 256 KiB. Larger coverage
 uses successive proved position intervals under the same exact HeadID; it does not pretend the
-unproved remainder has zero controls. Frontier preimages travel as separate content-addressed
-objects, never as a repeated full map inside every sibling descriptor. Missing preimages or
-control bodies leave verification pending. A context object is at most 160 KiB.
+unproved remainder has zero controls. If the producer narrows `hi` to enforce the header cap, it
+MUST rebuild the token traversal against that final interval; branches emitted for the former
+wider interval are invalid outside the final range and MUST NOT be retained. Frontier preimages
+travel as separate content-addressed objects, never as a repeated full map inside every sibling
+descriptor. Missing preimages or control bodies leave verification pending. A context object is
+at most 160 KiB.
 
 **Sync requests and frames.** Reuse stream kind Sync (1), its existing four-byte frame-length
 prefix and HELLO. Mode bit `0x04` selects this format; failure cannot fall back to archive-drain
@@ -489,14 +501,53 @@ WANT (`0x03`) is `[request_id, query]`, where query is exactly one of:
 
 Inventory is `WANT -> client HAVE -> server HAVE -> DONE`, with the full bidirectional
 exchange charged to the same 1 MiB wire quantum. Hints convey no body permission or authority.
-Only newly queued, bounded exact head hints wake metadata verification; accepted/in-flight
-hints are deduplicated, and neither an inventory nor its completion requests archive bodies.
+Only newly eligible, bounded exact head hints wake metadata verification; accepted/in-flight
+hints are deduplicated, and neither an inventory nor its completion requests archive bodies. A
+hint is redundant and MUST NOT enter the volatile inbox only when its exact head is already in
+that author's accepted consistency chain, the selected window for the current committed head is
+complete, and no selected-live missing position is eligible for retry. Size alone never makes a
+hint redundant: an unknown head, a newer head and a different same-size head remain eligible, as
+do exact departure receipts. Control-ready state is not part of this filter; ordinary content
+tails do not require control effects through their full size.
+Every in-flight hint MUST have one live flow owner. A normal result retires it; authorization
+change or controller abandonment while the room/peer scope remains live re-arms the exact hint;
+room/peer retirement removes it with that scope. An invalidated worker MUST NOT leave an
+in-flight hint that is skipped by selection, suppresses re-offer through deduplication or blocks
+settlement until daemon restart.
+
+Hints are scalar successor state, not an ordered work log. Selection MUST NOT mutate an in-flight
+owner. Behind it, strictly older heads from the same `(room, advertising peer, author)` collapse
+into the newest successor; equal-size different heads remain separate fork evidence. Author-owned
+heads are selected from that author's port before third-party gossip. If an advertising peer
+cannot serve a dependency whose authenticated head names another author, that refusal is not a
+transport failure and MUST NOT be requested repeatedly from the same relay. Route the dependency
+to its author by moving the same flow, exact refused query and continuation to the author's direct
+room port for one wire response. The in-flight owner remains immutable; no second root, surrogate
+whole-head request or volatile copy is created. A successful response returns that flow to the
+advertising peer before its continuation runs. Busy remains pending on the author's port, and a
+hard author failure neither accepts missing evidence nor blames the healthy advertising relay.
+If the advertising port departs, is poisoned or belongs to a replaced room instance before that
+response returns, the controller retires the flow instead of occupying the foreground lane with
+work no live port can schedule.
+The author route authenticates ordinary proof/header/body responses; it does not grant authority,
+accept missing evidence or make a relay an archive source. An absent author may remain pending,
+but an available author cannot be starved by obsolete relay work. An initial own-head echo that a
+peer has not completed is likewise pending progress, not an unreachable peer. Completing a hinted
+exchange consumes its captured port request so it cannot immediately regenerate the same inventory
+work.
 
 Proof kinds 0/1/2 mean inclusion/consistency/control range. Inclusion requires `from == to == p`;
 consistency uses old/new sizes. Requests are bound to the authenticated author/scope and the
 original local operation; a peer cannot widen demand through a returned continuation.
 Header-only requests consume one header credit and never permit CHUNK. Required proof/parent
 headers therefore do not implicitly request their older content bodies.
+
+A head already verified as an exact prefix of the current committed head is accepted but does not
+roll back that current head. Its retained prefix descriptor must equal the signed older root. If
+that descriptor is not yet retained, request consistency from the older size to the current head;
+never construct a reverse interval from the current size to an older target. Persist the verified
+prefix range with its authenticated receipt so restart preserves the same decision. A same-size
+different descriptor remains a conflict candidate rather than being suppressed by size.
 
 The purpose also constrains the server before any body read: pages require the history
 reservation, and a control-body request requires a signed mandatory-control kind. A live body
@@ -613,6 +664,14 @@ author/branch. Reuse immutable proof results only under their exact authenticate
 recheck current local trust, fork restrictions, Drive generation and authority at action/use.
 Publish entry admission, derived control/render/order roots and obligation progress atomically.
 Unfinished work uses unpublished roots. A cancellation leaves already accepted cached rows intact.
+
+Join settlement is a function only of durable exact facts, never volatile hint-inbox occupancy or
+a completion flag. A joined sparse room becomes writable only after a member's authenticated
+`Head(local_author)` answer has selected a complete live window naming the exact current committed
+local head, no higher observed own head or own-head conflict remains, the contiguous own feed is
+not behind that head, and governance is ready. Completion of another author's head is not local
+acknowledgement. Restart may discard scheduling state, but it neither creates nor erases this
+settlement evidence.
 
 Use existing sealed segments and EntryIndex B-trees, adding only the roots/values needed for:
 

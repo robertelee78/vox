@@ -430,11 +430,12 @@ impl Job {
         }
     }
 
-    /// A large control work envelope uses the foreground reservation, preserving the small
-    /// control pool for wire metadata. This admits a separately accounted worker; it never
-    /// widens a charge on the existing worker. The caller drops it with the last actual buffer.
+    /// A control work envelope larger than one MiB uses the foreground reservation, preserving
+    /// the small control pool for fixed wire metadata and staging state. This admits a separately
+    /// accounted worker; it never widens a charge on the existing worker. The caller drops it
+    /// with the last actual buffer.
     pub(crate) fn record_job(&self, envelope: usize) -> Option<Self> {
-        if self.0.lane == Lane::Control && envelope >= 4 * MIB {
+        if self.0.lane == Lane::Control && envelope > MIB {
             self.0.budget.try_start(self.0.node, Lane::LargeControl)
         } else {
             Some(self.clone())

@@ -323,62 +323,64 @@ impl Source {
         if lo == 0 || lo > hi || hi > head.root.leaves {
             return Err(Error::MalformedBundle("control interval differs from head"));
         }
-        let mut pending = vec![(1u64, head.root.leaves)];
-        let mut tokens = Vec::new();
-        let mut headers = 0;
-        while let Some((start, leaves)) = pending.pop() {
-            self.current()?;
-            if pending.len() > MAX_TREE_DEPTH || tokens.len() >= MAX_PROOF_TOKENS {
-                return Err(Error::SizeLimitExceeded("served control proof"));
-            }
-            let descriptor = match self.range(job, head.binding, start, leaves).await? {
-                Lookup::Found(found) => found.value,
-                Lookup::Busy => return Ok(Lookup::Busy),
-                Lookup::Missing => return Ok(Lookup::Missing),
-            };
-            if descriptor.leaves != leaves {
-                return Err(Error::MalformedAtRest("history range size differs"));
-            }
-            let end = start
-                .checked_add(leaves - 1)
-                .ok_or(Error::MalformedAtRest("history range overflow"))?;
-            if end < lo || start > hi || descriptor.controls == 0 {
-                tokens.push(ControlToken::Collapse(descriptor));
-            } else if leaves == 1 {
-                if headers == MAX_CONTROL_HEADERS {
-                    // The next control belongs to a separate locally requested quantum. The
-                    // completed proof still reconstructs the whole exact head, with the suffix
-                    // now outside its smaller covered interval rather than silently omitted.
-                    hi = start - 1;
-                    tokens.push(ControlToken::Collapse(descriptor));
-                    self.current()?;
-                    tokio::task::yield_now().await;
-                    continue;
+        let tokens = 'interval: loop {
+            let mut pending = vec![(1u64, head.root.leaves)];
+            let mut tokens = Vec::new();
+            let mut headers = 0;
+            while let Some((start, leaves)) = pending.pop() {
+                self.current()?;
+                if pending.len() > MAX_TREE_DEPTH || tokens.len() >= MAX_PROOF_TOKENS {
+                    return Err(Error::SizeLimitExceeded("served control proof"));
                 }
-                let author = head.binding.author;
-                let found = self
-                    .read(job, 128 * 1024, move |room, store| {
-                        room.history_header(store, &author, start)?
-                            .map(|header| Entry::from_wire(&header.wire))
-                            .transpose()
-                    })
-                    .await?;
-                match found {
-                    Lookup::Found(found) => {
-                        tokens.push(ControlToken::Leaf(Box::new(found.value)));
-                        headers += 1;
-                    }
+                let descriptor = match self.range(job, head.binding, start, leaves).await? {
+                    Lookup::Found(found) => found.value,
                     Lookup::Busy => return Ok(Lookup::Busy),
                     Lookup::Missing => return Ok(Lookup::Missing),
+                };
+                if descriptor.leaves != leaves {
+                    return Err(Error::MalformedAtRest("history range size differs"));
                 }
-            } else {
-                let left = split(leaves)?;
-                tokens.push(ControlToken::Branch);
-                pending.push((start + left, leaves - left));
-                pending.push((start, left));
+                let end = start
+                    .checked_add(leaves - 1)
+                    .ok_or(Error::MalformedAtRest("history range overflow"))?;
+                if end < lo || start > hi || descriptor.controls == 0 {
+                    tokens.push(ControlToken::Collapse(descriptor));
+                } else if leaves == 1 {
+                    if headers == MAX_CONTROL_HEADERS {
+                        // Branch tokens already emitted for the larger interval are not valid
+                        // after narrowing it. Rebuild once from the final interval so every
+                        // range outside it is represented canonically by one collapse token.
+                        hi = start - 1;
+                        self.current()?;
+                        tokio::task::yield_now().await;
+                        continue 'interval;
+                    }
+                    let author = head.binding.author;
+                    let found = self
+                        .read(job, 128 * 1024, move |room, store| {
+                            room.history_header(store, &author, start)?
+                                .map(|header| Entry::from_wire(&header.wire))
+                                .transpose()
+                        })
+                        .await?;
+                    match found {
+                        Lookup::Found(found) => {
+                            tokens.push(ControlToken::Leaf(Box::new(found.value)));
+                            headers += 1;
+                        }
+                        Lookup::Busy => return Ok(Lookup::Busy),
+                        Lookup::Missing => return Ok(Lookup::Missing),
+                    }
+                } else {
+                    let left = split(leaves)?;
+                    tokens.push(ControlToken::Branch);
+                    pending.push((start + left, leaves - left));
+                    pending.push((start, left));
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
+            break tokens;
+        };
         self.current()?;
         Ok(Lookup::Found(Held {
             value: Proof::Control(ControlRangeProof {
@@ -474,15 +476,37 @@ impl Source {
                     for hint in slice {
                         let state = read
                             .sparse_author(&hint.author, crate::log::history::LogScope::Public)?;
-                        let held = state.is_some_and(|state| {
-                            state.committed == Some(hint.head)
-                                && state.control_ready == Some(hint.head)
-                                && state.live.is_some_and(|window| {
-                                    window.head == hint.head
-                                        && window.through == hint.size
-                                        && window.complete()
-                                })
-                        });
+                        // An inventory scalar is redundant only when its exact signed head is
+                        // already in this author's accepted consistency chain and the selected
+                        // current live window is complete. Size alone never suppresses an
+                        // unknown or same-size conflicting head. Requiring control_ready here
+                        // was a permanent re-offer loop: ordinary content tails and local heads
+                        // do not need control effects through their full size.
+                        let held = match (state, read.history_head(&hint.head)?) {
+                            (Some(state), Some(advertised))
+                                if advertised.binding.author == hint.author
+                                    && advertised.binding.scope
+                                        == crate::log::history::LogScope::Public
+                                    && advertised.root.leaves == hint.size
+                                    && read.history_head_accepted(
+                                        &hint.head,
+                                        advertised.binding,
+                                    )? =>
+                            {
+                                match (state.committed, state.live) {
+                                    (Some(current_id), Some(window))
+                                        if window.head == current_id && window.complete() =>
+                                    {
+                                        read.history_head(&current_id)?.is_some_and(|current| {
+                                            current.binding == advertised.binding
+                                                && window.through == current.root.leaves
+                                        })
+                                    }
+                                    _ => false,
+                                }
+                            }
+                            _ => false,
+                        };
                         // One indexed successor lookup, not a scan of older missing bodies.
                         // Normal retention cleanup removes expired missing positions.
                         let retry_missing = if held && hint.size != 0 {

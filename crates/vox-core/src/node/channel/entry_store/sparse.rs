@@ -796,6 +796,42 @@ impl Read<'_> {
             .history_head(head)?
             .is_some_and(|h| h.binding == binding))
     }
+    /// Whether this exact signed head is in the accepted consistency chain. The current head and
+    /// every cryptographically retained prefix are accepted; a same-size different descriptor is
+    /// not. This never promotes or rolls back the author's current head.
+    pub(crate) fn history_head_accepted(
+        &self,
+        head: &Digest32,
+        binding: TreeBinding,
+    ) -> Result<bool> {
+        if self.history_head_committed(head, binding)? {
+            return Ok(true);
+        }
+        let Some(target) = self.history_head(head)? else {
+            return Ok(false);
+        };
+        if target.binding != binding {
+            return Ok(false);
+        }
+        let Some(current_id) = self
+            .sparse_author(&binding.author, binding.scope)?
+            .and_then(|state| state.committed)
+        else {
+            return Ok(false);
+        };
+        let Some(current) = self.history_head(&current_id)? else {
+            return Err(invalid("accepted head missing"));
+        };
+        if current.binding != binding || target.root.leaves >= current.root.leaves {
+            return Ok(false);
+        }
+        let prefix = if target.root.leaves == 0 {
+            Some(Descriptor::empty(binding))
+        } else {
+            self.history_range(binding, 1, target.root.leaves)?
+        };
+        Ok(prefix == Some(target.root))
+    }
     /// An individually evidence-complete published source and its exact inclusion target.
     /// This does not claim that the governance evaluator has applied the source's effect.
     pub(crate) fn history_validated_header(
@@ -2979,6 +3015,9 @@ impl Write<'_, '_> {
             &receipt.binding().author,
             receipt.prefix().leaves,
         );
+        if receipt.prefix().leaves != 0 {
+            self.keep_history_range(receipt.binding(), 1, receipt.prefix())?;
+        }
         self.save_history_object(ObjectKind::PrefixReceipt, key, &receipt.local_receipt()?)
     }
 }

@@ -364,21 +364,44 @@ pub(super) fn promote_head(room: &ChannelState, store: &Store, id: Digest32) -> 
     let signed = input
         .history_head(&id)?
         .ok_or(invalid("promotion head missing"))?;
-    if input.history_head_committed(&id, signed.binding)? {
+    if input.history_head_accepted(&id, signed.binding)? {
         return Ok(Advanced::Complete);
     }
-    let baseline = match input
+    let (baseline_id, baseline) = match input
         .sparse_author(&signed.binding.author, signed.binding.scope)?
         .and_then(|state| state.committed)
     {
         Some(old) => {
-            input
+            let root = input
                 .history_head(&old)?
                 .ok_or(invalid("accepted baseline missing"))?
-                .root
+                .root;
+            (Some(old), root)
         }
-        None => Descriptor::empty(signed.binding),
+        None => (None, Descriptor::empty(signed.binding)),
     };
+    if signed.root.leaves < baseline.leaves {
+        let baseline_id = baseline_id.ok_or(invalid("nonempty baseline has no head"))?;
+        let Some(prefix) = input.history_prefix_receipt(
+            &baseline_id,
+            &signed.binding.author,
+            signed.root.leaves,
+        )?
+        else {
+            return Ok(Advanced::Need(Query::Proof {
+                head: baseline_id,
+                kind: ProofKind::Consistency,
+                from: signed.root.leaves,
+                to: baseline.leaves,
+            }));
+        };
+        if prefix.prefix() != signed.root || prefix.root() != baseline {
+            return Err(invalid(
+                "stale head differs from accepted consistency chain",
+            ));
+        }
+        return Ok(Advanced::Complete);
+    }
     let Some(prefix) =
         input.history_prefix_receipt(&id, &signed.binding.author, baseline.leaves)?
     else {
@@ -394,9 +417,10 @@ pub(super) fn promote_head(room: &ChannelState, store: &Store, id: Digest32) -> 
             "consistency differs from current accepted baseline",
         ));
     }
-    if input
-        .history_inclusion_receipt(&id, &signed.binding.author, signed.root.leaves)?
-        .is_none()
+    if signed.root.leaves != 0
+        && input
+            .history_inclusion_receipt(&id, &signed.binding.author, signed.root.leaves)?
+            .is_none()
     {
         return Ok(Advanced::Need(Query::Header {
             head: id,
@@ -415,6 +439,11 @@ pub(super) fn promote_head(room: &ChannelState, store: &Store, id: Digest32) -> 
     if conflict {
         return Err(invalid("conflicting authenticated heads retained"));
     }
+    // A newly accepted remote head changes what this room must advertise. The actor touches
+    // the room on completion so every port observes this generation immediately and can echo
+    // the exact head back to its author.
+    room.generation()
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Ok(Advanced::Complete)
 }
 
@@ -457,12 +486,27 @@ pub(super) fn start_entry(
     if included.header().entry().header_wire() != entry.header_wire() {
         return Err(invalid("entry differs from exact inclusion"));
     }
-    if !input.history_head_committed(&head, included.binding())? {
+    if !input.history_head_accepted(&head, included.binding())? {
         drop(input);
         return match promote_head(room, store, head)? {
             Advanced::Need(query) => Ok(EntryStart::Need(query)),
             _ => Ok(EntryStart::Busy),
         };
+    }
+    let target = input
+        .history_head(&head)?
+        .ok_or(invalid("entry target head missing"))?;
+    if input.history_range(target.binding, 1, seq)?.is_none() {
+        // A settled entry is eligible to become an explicit parent of the next local append.
+        // Retain its exact authenticated prefix before effects can mark it settled; inclusion
+        // in a newer head alone does not construct that prefix. The actual author retains each
+        // historical local root and can serve this ordinary consistency proof.
+        return Ok(EntryStart::Need(Query::Proof {
+            head,
+            kind: ProofKind::Consistency,
+            from: seq,
+            to: target.root.leaves,
+        }));
     }
     let key = room
         .history_author_key(&author)

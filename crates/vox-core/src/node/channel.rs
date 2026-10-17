@@ -97,6 +97,9 @@ use crate::identity::composite::{CompositePublicKey, RootSigner};
 use crate::log::dag::{AdmissionPolicy, Dag, ForkProof};
 use crate::log::entry::{Entry, EntryKind, EntryRead, EntrySkeleton, ZERO_HASH};
 use crate::log::feed::lipmaa;
+use crate::log::history::{
+    ConsistentPrefix, Descriptor, LocalAppendBudget, LogScope, SignedHead, TreeBinding,
+};
 use crate::log::sync::{frontier_session_peer, AuthorResolver, Transport};
 use crate::nat::bootstrap::BootstrapSet;
 use crate::nat::record::Admission;
@@ -135,6 +138,28 @@ const SEG_ORIGINS: u64 = 6;
 /// (M18.1): target → the highest generation this identity has delivered to it. What
 /// is *owed* is derived from this and the consent set, so it cannot go stale.
 const SEG_DELIVERED: u64 = 7;
+
+/// Persist the canonical signed empty public head before a new sparse room becomes visible.
+/// A joiner has no entry yet, but another member still needs an exact object to acknowledge
+/// before this node may leave the unsettled state and author its first entry.
+fn initialize_sparse_identity(
+    index: &mut entry_store::Write<'_, '_>,
+    signer: &dyn RootSigner,
+    room: Digest32,
+    epoch: u64,
+) -> Result<()> {
+    let binding = TreeBinding {
+        author: signer.fingerprint(),
+        room,
+        scope: LogScope::Public,
+    };
+    let signed = SignedHead::sign(binding, epoch, Descriptor::empty(binding), signer)?;
+    let mut budget = LocalAppendBudget::new();
+    let verified = budget.verify_head(&signed, &signer.public_key())?;
+    let prefix = ConsistentPrefix::empty(&verified)?;
+    index.commit_history_head(&verified, &prefix)?;
+    Ok(())
+}
 
 /// This node's **own admission** to the channel, within [`SegmentKind::KeyMaterial`]
 /// (M17.6): whether it created the channel, or the [`crate::nat::record::JoinWitness`] a member signed
@@ -975,7 +1000,6 @@ pub struct ChannelState {
     governance_display: governance::Display,
     governance_ready: bool,
     /// A completed authenticated current-head flow may settle after bounded maintenance.
-    sparse_settle_pending: bool,
     /// Current presence per admitted author, bounded by AUTHORS_HARD_LIMIT; no event history.
     presence: BTreeMap<Digest32, governance::Presence>,
     /// Highest semantically applied sparse entry per admitted author. Rebuilt from the
@@ -1852,6 +1876,7 @@ impl ChannelState {
         index.initialize_restart(epoch)?;
         if genesis.body.authenticated_history() {
             index.initialize_sparse_history()?;
+            initialize_sparse_identity(&mut index, signer, channel_id, epoch)?;
         }
         index.empty_rendered()?;
         index.seal()?;
@@ -1877,7 +1902,6 @@ impl ChannelState {
             forks_kept: 0,
             governance_display,
             governance_ready: false,
-            sparse_settle_pending: false,
             presence: BTreeMap::new(),
             sparse_applied_tips: BTreeMap::new(),
             sender,
@@ -2562,7 +2586,6 @@ impl ChannelState {
             forks_kept,
             governance_display,
             governance_ready: false,
-            sparse_settle_pending: false,
             presence,
             sparse_applied_tips,
             sender,
@@ -2798,6 +2821,7 @@ impl ChannelState {
         index.initialize_restart(epoch)?;
         if genesis.body.authenticated_history() {
             index.initialize_sparse_history()?;
+            initialize_sparse_identity(&mut index, signer, *channel_id, epoch)?;
         }
         index.empty_rendered()?;
         index.seal()?;
@@ -2824,7 +2848,6 @@ impl ChannelState {
             forks_kept: 0,
             governance_display,
             governance_ready: false,
-            sparse_settle_pending: false,
             presence: BTreeMap::new(),
             sparse_applied_tips: BTreeMap::new(),
             sender,
@@ -6108,7 +6131,6 @@ impl ChannelState {
         }
         if settle_sparse {
             self.settled = true;
-            self.sparse_settle_pending = false;
         }
         self.entries.committed();
         self.next_log_id = id.saturating_add(1);

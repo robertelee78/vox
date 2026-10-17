@@ -10263,6 +10263,10 @@ impl Node {
                         };
                         self.governance_work.pending = true;
                         self.settle_sparse_room(&channel_id).await;
+                        // Head promotion advances the shared room generation inside the disk
+                        // worker. Touch the room here so schedule observes it immediately and
+                        // advertises the newly committed head back to its author.
+                        self.sched_rooms.insert(channel_id);
                         if let Some(sent) = acknowledged {
                             self.finish_leave_if_heard(channel_id, sent).await;
                         }
@@ -19272,11 +19276,10 @@ impl Node {
         changed
     }
 
-    /// A sync of `channel_id` with another member ended cleanly: a room joined here now holds its
-    /// own feed as the room does, and may be written to (V210-164). A feed that already holds
-    /// entries means this identity was in the room before: it moves to a sender generation the
-    /// others do not hold yet, and, if its feed ends in its departure, says it is back, so the
-    /// other members list it again before it says anything else.
+    /// A member has acknowledged this room's exact current own head: the joined room may now
+    /// be written to (V210-164). A feed that already holds entries means this identity was in
+    /// the room before: it moves to a sender generation the others do not hold yet, and, if its
+    /// feed ends in its departure, says it is back before it says anything else.
     async fn settle_sparse_room(&mut self, channel_id: &Digest32) {
         let Some(shared) = self.channels.get(channel_id).cloned() else {
             return;
@@ -19286,10 +19289,8 @@ impl Node {
                 return;
             };
             let room = shared.lock().await;
-            !self.history_hints.pending_author(*channel_id, room.me())
-                && room
-                    .sparse_settlement_ready(profile.store(), self.now_ms())
-                    .unwrap_or(false)
+            room.sparse_settlement_ready(profile.store(), self.now_ms())
+                .unwrap_or(false)
         };
         if ready {
             self.settle_room(channel_id).await;
@@ -19307,10 +19308,9 @@ impl Node {
             };
             let mut ch = shared.lock().await;
             if ch.uses_sparse_history(profile.store()).unwrap_or(true)
-                && (self.history_hints.pending_author(*channel_id, ch.me())
-                    || !ch
-                        .sparse_settlement_ready(profile.store(), now_ms)
-                        .unwrap_or(false))
+                && !ch
+                    .sparse_settlement_ready(profile.store(), now_ms)
+                    .unwrap_or(false)
             {
                 return;
             }

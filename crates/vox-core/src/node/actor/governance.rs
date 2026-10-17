@@ -268,7 +268,10 @@ impl Node {
                 Err(error) => channel.poison(&error),
             }
         }
-        let settle_pending = channel.sparse_settlement_pending();
+        // An unsettled sparse room rechecks its durable exact own-head acknowledgement on
+        // every ready governance turn. Volatile hint-queue occupancy is not settlement state.
+        let settle_pending =
+            !channel.is_settled() && channel.uses_sparse_history(&store).unwrap_or(false);
         drop(channel);
         if progress.ready && settle_pending {
             self.settle_sparse_room(&room).await;
