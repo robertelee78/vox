@@ -664,6 +664,13 @@ author/branch. Reuse immutable proof results only under their exact authenticate
 recheck current local trust, fork restrictions, Drive generation and authority at action/use.
 Publish entry admission, derived control/render/order roots and obligation progress atomically.
 Unfinished work uses unpublished roots. A cancellation leaves already accepted cached rows intact.
+Finishing a content effect without a visible row is valid only for a final, dependency-free reason
+or when the same transaction persists the bounded author reprojection cursor. If the author's
+consent control or sender-key generation can still arrive, that cursor is mandatory before effect
+completion. Consent observation and sender-key installation wake and drain it; a wake that raced
+ahead of effect completion is not the sole copy of the obligation. The live flow releases rather
+than waiting on a possibly permanent denial. Historical cursor draining does not requeue a
+permanently unreadable entry into a hot loop; a later consent/key event starts it again.
 
 Join settlement is a function only of durable exact facts, never volatile hint-inbox occupancy or
 a completion flag. A joined sparse room becomes writable only after a member's authenticated

@@ -7720,7 +7720,18 @@ impl ChannelState {
             };
             match allowed {
                 Some(true) => {}
-                Some(false) => return Ok(ContentProjection::Applied),
+                Some(false) => {
+                    if !historical {
+                        // The author's consent control can be causally ahead of this content but
+                        // still in flight locally. Persist the reprojection cursor in the same
+                        // Batch as this effect: if the consent wake raced ahead of effect finish,
+                        // the completed turn still leaves bounded work for the next local wake.
+                        let mut writer = self.entries.write(batch, &self.sek, &self.channel_id)?;
+                        writer.queue_backfill(author, Some(1))?;
+                        writer.seal()?;
+                    }
+                    return Ok(ContentProjection::Applied);
+                }
                 None => {
                     let mut writer = self.entries.write(batch, &self.sek, &self.channel_id)?;
                     writer.queue_backfill(author, Some(1))?;
@@ -7758,7 +7769,15 @@ impl ChannelState {
             }
         }
         let Some(chain) = self.receivers.get_mut(&slot) else {
-            return Ok(ContentProjection::Deferred);
+            if !historical {
+                // SKDM installation normally queues this author, but it may commit and drain
+                // before the concurrently admitted content effect finishes. Queue again at the
+                // effect's own crash boundary so that ordering cannot lose the reprojection.
+                let mut writer = self.entries.write(batch, &self.sek, &self.channel_id)?;
+                writer.queue_backfill(author, Some(1))?;
+                writer.seal()?;
+            }
+            return Ok(ContentProjection::Applied);
         };
         let plaintext = match if historical {
             chain.decrypt_history(&msg)
