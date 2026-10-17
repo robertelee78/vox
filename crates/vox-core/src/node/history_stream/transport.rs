@@ -80,13 +80,13 @@ impl Transport {
     /// HELLO has a fixed three-byte maximum and no decoded collection. Keep its reservation
     /// ahead of the prefix while leaving the attacker-sized envelope on every variable frame.
     pub(super) async fn read_hello(&mut self) -> Result<Read> {
-        self.read_bounded(MAX_HELLO_FRAME_BYTES + 4, 0, Some(0x01))
+        self.read_bounded(MAX_HELLO_FRAME_BYTES + 4, 0, Some(&[0x01]))
             .await
     }
 
-    /// WANT carries only a request ID and one of the bounded scalar Query shapes.
-    pub(super) async fn read_want(&mut self) -> Result<Read> {
-        self.read_bounded(MAX_WANT_FRAME_BYTES + 4, 0, Some(0x03))
+    /// This handshake position accepts WANT's bounded scalar Query or a smaller CANCEL.
+    pub(super) async fn read_want_or_cancel(&mut self) -> Result<Read> {
+        self.read_bounded(MAX_WANT_FRAME_BYTES + 4, 0, Some(&[0x03, 0x09]))
             .await
     }
 
@@ -94,7 +94,7 @@ impl Transport {
         &mut self,
         remaining_wire: usize,
         decode_envelope: usize,
-        expected_tag: Option<u8>,
+        expected_tags: Option<&[u8]>,
     ) -> Result<Read> {
         let maximum = remaining_wire.saturating_sub(4).min(MAX_FRAME_BYTES);
         if maximum == 0 {
@@ -110,7 +110,7 @@ impl Transport {
             () = fence.retired() => Err(Error::Unreachable("history request cancelled")),
             result = tokio::time::timeout_at(
                 until,
-                read_charged(&mut self.recv, maximum, charge, expected_tag),
+                read_charged(&mut self.recv, maximum, charge, expected_tags),
             ) => {
                 result.unwrap_or(Err(Error::Unreachable("history frame deadline elapsed")))
             }
@@ -181,7 +181,7 @@ async fn read_charged(
     recv: &mut RecvStream,
     maximum: usize,
     charge: BufferCharge,
-    expected_tag: Option<u8>,
+    expected_tags: Option<&[u8]>,
 ) -> Result<Read> {
     let mut prefix = [0; 4];
     match recv.read_exact(&mut prefix).await {
@@ -195,7 +195,7 @@ async fn read_charged(
     }
     let mut bytes = vec![0; len];
     recv.read_exact(&mut bytes).await.map_err(read_error)?;
-    if expected_tag.is_some_and(|expected| bytes.first() != Some(&expected)) {
+    if expected_tags.is_some_and(|expected| !expected.contains(&bytes[0])) {
         return Err(Error::MalformedBundle("history unexpected fixed frame"));
     }
     Ok(Read::Frame(Incoming {

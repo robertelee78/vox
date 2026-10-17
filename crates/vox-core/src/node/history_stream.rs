@@ -159,7 +159,7 @@ async fn serve_request(
     overhead += encoded.as_slice().len() + 4;
     io.write_encoded(&encoded).await?;
     drop(encoded);
-    let next = match io.read_want().await? {
+    let next = match io.read_want_or_cancel().await? {
         transport::Read::Frame(frame) => frame,
         transport::Read::End => return Err(invalid("history closed before WANT")),
         transport::Read::Busy => return Err(Error::Unreachable("history WANT reader busy")),
