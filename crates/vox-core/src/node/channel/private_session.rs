@@ -11,6 +11,7 @@ use crate::node::sessionstream::{
 };
 
 const SUPPORT: &str = "vox/private-session-stream/v1";
+const CONTROL_REFRESHING: &str = "Session control facts are refreshing";
 const SEG_LEGACY_DRIVE_GENERATIONS: u64 = 19;
 const SEG_PRIVATE_PULLS: u64 = 23;
 const WORK_ROWS: usize = 32;
@@ -107,6 +108,10 @@ pub(super) struct PrivateSessions {
     pulling: BTreeSet<Digest32>,
     attempted: BTreeMap<Digest32, Instant>,
     revision: u64,
+    // A capability record is live traffic, not history: a member admitted after the previous
+    // record cannot learn it. Set on every admission and open, and clear only after the current
+    // node has appended a fresh authenticated announcement.
+    support_owed: bool,
 }
 
 impl Stored {
@@ -372,7 +377,10 @@ impl ChannelState {
         result
     }
 
-    pub(super) fn private_controls_ready(&self, store: &Store) -> Result<bool> {
+    /// Whether the legacy indexes have scanned every public position. Encrypted legacy drive
+    /// generations can live in ordinary Content, so only explicit legacy recovery may satisfy
+    /// this predicate when a sparse room omitted those bodies.
+    fn legacy_private_controls_ready(&self, store: &Store) -> Result<bool> {
         if self.private_sessions.controls_import || self.private_sessions.restoring {
             return Ok(false);
         }
@@ -385,6 +393,63 @@ impl ChannelState {
                     .through
                     < self.dag.verified_head(author)
             {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Whether the current Session control effects are complete at one author's exact head.
+    /// Sparse control proofs deliberately omit ordinary/archive bodies, so their durable receipt
+    /// replaces sequence contiguity only for signed Session floors and support declarations.
+    pub(super) fn current_session_control_ready(
+        &self,
+        store: &Store,
+        author: &Digest32,
+    ) -> Result<bool> {
+        if self.private_sessions.controls_import || self.private_sessions.restoring {
+            return Ok(false);
+        }
+        let read = self.entries.read(store, &self.sek, &self.channel_id)?;
+        let contiguous_target = if read.sparse_enabled() {
+            let state = read.sparse_author(author, crate::log::history::LogScope::Public)?;
+            if state.as_ref().is_some_and(|state| {
+                state.committed.is_some() && state.control_ready == state.committed
+            }) {
+                return Ok(true);
+            }
+            match state.and_then(|state| state.committed) {
+                Some(head) => {
+                    read.history_head(&head)?
+                        .ok_or(Error::MalformedAtRest("committed history head missing"))?
+                        .root
+                        .leaves
+                }
+                None => self.dag.verified_head(author),
+            }
+        } else {
+            self.dag.verified_head(author)
+        };
+        drop(read);
+        // Join/import may have applied every position before sparse receipt bookkeeping runs.
+        // A genuinely complete contiguous scan is equally authoritative; unlike the old sole
+        // predicate, it is now an alternative and cannot make an omitted archive body necessary.
+        let snapshot = store.snapshot()?;
+        let control =
+            private_index::control(&snapshot, &self.sek, &self.channel_id, author)?.through;
+        let floor = self
+            .floor_author(Transaction::Snapshot(&snapshot), author)?
+            .through;
+        let verified = self.dag.verified_head(author);
+        let ready = verified >= contiguous_target
+            && control >= contiguous_target
+            && floor >= contiguous_target;
+        Ok(ready)
+    }
+
+    pub(super) fn current_session_controls_ready(&self, store: &Store) -> Result<bool> {
+        for author in self.authors.keys() {
+            if !self.current_session_control_ready(store, author)? {
                 return Ok(false);
             }
         }
@@ -423,7 +488,7 @@ impl ChannelState {
             };
             let Some(author) = author else {
                 self.private_sessions.controls_after = None;
-                return self.private_controls_ready(store);
+                return self.legacy_private_controls_ready(store);
             };
             let fact =
                 private_index::control(&store.snapshot()?, &self.sek, &self.channel_id, &author)?;
@@ -657,7 +722,7 @@ impl ChannelState {
     pub(super) fn migrate_legacy_steps(&mut self, store: &Store, now: u64) -> Result<()> {
         if self.private_sessions.upgrading
             || self.private_sessions.restoring
-            || !self.private_controls_ready(store)?
+            || !self.legacy_private_controls_ready(store)?
         {
             return Ok(());
         }
@@ -880,7 +945,7 @@ impl ChannelState {
             && !self.private_sessions.restoring
             && self.private_sessions.legacy_work.is_none()
             && self.private_sessions.legacy_pending.is_empty()
-            && self.private_controls_ready(store)?
+            && self.current_session_controls_ready(store)?
         {
             let result = self.advance_pending_private(store, now).map(|_| ());
             if let Err(error) = &result {
@@ -922,10 +987,6 @@ impl ChannelState {
             }
             bytes = bytes.saturating_add(size);
             if saved.row.is_none()
-                && self.legacy_current_drive(
-                    Transaction::Snapshot(&store.snapshot()?),
-                    &saved.record.message.header.author_id,
-                )?
                 && self.drive.receivers.contains_key(&(
                     saved.record.message.header.author_id,
                     saved.record.message.header.chain_id,
@@ -935,7 +996,10 @@ impl ChannelState {
                 {
                     // A policy replay is not a verdict on the saved wire. Keep both the
                     // record and the last completed cursor so the same row can be retried.
-                    if super::governance::refreshing(&error) || floor_index::refreshing(&error) {
+                    if super::governance::refreshing(&error)
+                        || floor_index::refreshing(&error)
+                        || matches!(&error, Error::StreamRefused(reason) if *reason == CONTROL_REFRESHING)
+                    {
                         return Ok(false);
                     }
                     if self.poisoned {
@@ -1023,13 +1087,23 @@ impl ChannelState {
             if self.private_sessions.restoring {
                 return self.restore_private_chunk(store);
             }
-            if !self.private_controls_ready(store)? {
-                self.advance_private_controls(store)?;
+            if !self.current_session_controls_ready(store)? {
+                // Old sealed author maps and an actually contiguous legacy/current feed still
+                // need their bounded importer. Once that scan is complete it is not repeated;
+                // a sparse head beyond the contiguous frontier remains pending on its exact
+                // control receipt instead of spinning this legacy reader.
+                if !self.legacy_private_controls_ready(store)? {
+                    self.advance_private_controls(store)?;
+                }
                 return Ok(false);
             }
             if self.private_sessions.legacy_work.is_some()
                 || !self.private_sessions.legacy_pending.is_empty()
             {
+                if !self.legacy_private_controls_ready(store)? {
+                    self.advance_private_controls(store)?;
+                    return Ok(false);
+                }
                 self.migrate_legacy_steps_inner(store, now)?;
                 return Ok(false);
             }
@@ -1046,8 +1120,8 @@ impl ChannelState {
     }
 
     pub(super) fn supports_private(&mut self, store: &Store, peer: &Digest32) -> Result<bool> {
-        if !self.private_controls_ready(store)? {
-            return Err(Error::StreamRefused("Session control facts are refreshing"));
+        if !self.current_session_control_ready(store, peer)? {
+            return Err(Error::StreamRefused(CONTROL_REFRESHING));
         }
         Ok(
             private_index::control(&store.snapshot()?, &self.sek, &self.channel_id, peer)?
@@ -1060,11 +1134,10 @@ impl ChannelState {
     /// content body. Only an author who advertised support is ever probed with stream 13.
     pub(crate) fn announce_private_support(&mut self, profile: &Profile, now: u64) -> Result<()> {
         let me = self.me();
-        if !self.settled
-            || self.poisoned
-            || self.has_left(&me)
-            || self.supports_private(profile.store(), &me)?
-        {
+        if !self.settled || self.poisoned || self.has_left(&me) {
+            return Ok(());
+        }
+        if !self.private_sessions.support_owed && self.supports_private(profile.store(), &me)? {
             return Ok(());
         }
         self.append_control_kind(
@@ -1074,6 +1147,7 @@ impl ChannelState {
             EntryKind::Content,
             false,
         )?;
+        self.private_sessions.support_owed = false;
         Ok(())
     }
     pub(super) fn restore_private_sessions(&mut self, store: &Store) -> Result<()> {
@@ -1094,8 +1168,15 @@ impl ChannelState {
         self.private_sessions.pending_active = state.pending;
         self.private_sessions.pending_after = state.pending_after;
         self.private_sessions.pending_through = state.pending_through;
+        // A restart may follow an admission that committed just before its capability
+        // announcement. Repeating this one small signed fact is bounded to one per open.
+        self.private_sessions.support_owed = true;
         self.restore_private_pulls(store)?;
         Ok(())
+    }
+
+    pub(crate) fn owe_private_support(&mut self) {
+        self.private_sessions.support_owed = true;
     }
 
     // Cursor scope follows held grant generations, not ratchet iterations. A grant saved
@@ -1886,9 +1967,7 @@ impl ChannelState {
         {
             let snapshot = store.snapshot()?;
             let transaction = Transaction::Snapshot(&snapshot);
-            if self.floor_author(transaction, &h.author_id)?.through
-                < self.dag.verified_head(&h.author_id)
-            {
+            if !self.current_session_control_ready(store, &h.author_id)? {
                 return Err(Error::StreamRefused(floor_index::REFRESHING));
             }
             let Some((m, iteration, _)) =
@@ -2153,7 +2232,10 @@ impl ChannelState {
                 "private live request or authority changed",
             ));
         }
-        self.index_session_floors(store)?;
+        // No whole-room projection gate here: each record is placed by its own per-record
+        // Drive, generation, floor and receiver-chain checks below. Gating this apply on
+        // every author's still-building receipt made a member's own apply wait on the very
+        // receipts only this apply's rounds could advance.
         // This is a donor-local locator hint, not a completeness statement or a watermark.
         // Authenticate the whole advertised page before retaining even that bounded hint.
         for wire in &page.records {
@@ -2184,19 +2266,31 @@ impl ChannelState {
             let record = Record::read(wire)?;
             let header = &record.message.header;
             if !self.private_cached(store, &record.hash())? && header.author_id != self.me() {
-                let receiver = self
+                let behind = match self
                     .drive
                     .receivers
                     .get(&(header.author_id, header.chain_id))
-                    .ok_or(Error::StreamRefused(
-                        "private lifecycle/history unavailable; explicit recovery required",
-                    ))?;
-                if receiver.has_skipped_iterations()
-                    || header.iteration != receiver.next_iteration()
                 {
-                    return Err(Error::StreamRefused(
-                        "private lifecycle/history gap; explicit recovery required",
-                    ));
+                    Some(receiver) => {
+                        receiver.has_skipped_iterations()
+                            || header.iteration != receiver.next_iteration()
+                    }
+                    None => true,
+                };
+                if behind {
+                    // A sealed record beyond this receiver chain's keys is not applicable
+                    // here at this chain state. The covering key package is either still
+                    // in flight for this member — this pull retries after its install, at
+                    // its own pacing — or is not addressed to this member at all: a
+                    // Session is read from a grant onward, and this member holds no grant
+                    // for this generation, so the record is not this member's to apply and
+                    // the pull moves past it. Refusing the whole page here made the pull a
+                    // dead end: the retry re-requested the same tail while the named
+                    // explicit recovery was armed by nothing.
+                    if self.key_packages.pending_from(&header.author_id) {
+                        return Ok(false);
+                    }
+                    continue;
                 }
             }
             let row = self
@@ -2298,7 +2392,7 @@ impl ChannelState {
         self.require_governance_ready(store, crate::time::Ms(self.now_hint))?;
         if self.poisoned
             || !self.drive_members().contains(peer)
-            || !self.private_controls_ready(store)?
+            || !self.current_session_controls_ready(store)?
         {
             return Err(Error::StreamRefused(
                 "private history authority is unavailable",

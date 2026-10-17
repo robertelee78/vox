@@ -85,13 +85,27 @@ const calls = []
 let callWaiting = null
 // The session's title as OpenCode holds it (`title`), or none.
 let title = null
+const encoder = new TextEncoder()
+function jsonStream(value) {
+  const bytes = encoder.encode(JSON.stringify(value))
+  return new ReadableStream({
+    start(controller) {
+      controller.enqueue(bytes)
+      controller.close()
+    },
+  })
+}
 const client = {
   _client: {
+    getConfig() {
+      return { fetch: globalThis.fetch }
+    },
     async request({ method, url, body }) {
       // A read of the session: its info, as OpenCode answers it. Not a call the plugin made on
       // the session's behalf, so not among `calls`.
       if (method === "GET" && url === `/session/${session}`) {
-        return { response: { status: 200 }, data: { id: session, ...(title ? { title } : {}) } }
+        return { response: { status: 200 },
+          data: jsonStream({ id: session, ...(title ? { title } : {}) }) }
       }
       calls.push({ method, url, body: body ?? null })
       if (callWaiting) callWaiting()
@@ -109,8 +123,15 @@ const client = {
   },
 }
 
+let turnSequence = 0
 async function turn(hooks, text) {
-  const output = { message: { sessionID: session }, parts: [{ type: "text", text }] }
+  turnSequence += 1
+  const messageID = `msg_vox_host_${turnSequence}`
+  const output = {
+    message: { id: messageID, sessionID: session, role: "user" },
+    parts: [{ id: `part_vox_host_${turnSequence}`, messageID, sessionID: session,
+      type: "text", text }],
+  }
   await hooks["chat.message"]({ sessionID: session }, output)
   return output.parts[0].text
 }

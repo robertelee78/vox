@@ -68,6 +68,28 @@ impl HintInbox {
             }) {
                 continue;
             }
+            // Inventory heads are scalar successors, not a work log. Keep an owner already in
+            // flight immutable, but collapse strictly older queued versions for this source and
+            // author behind the newest successor. Equal-size distinct heads remain separate so
+            // an attributable fork is still examined instead of being hidden by coalescing.
+            let same_source = |pending: &&Pending| {
+                pending.room == room && pending.peer == peer && pending.hint.author == hint.author
+            };
+            if state
+                .pending
+                .iter()
+                .filter(same_source)
+                .any(|pending| pending.hint.size > hint.size)
+            {
+                continue;
+            }
+            state.pending.retain(|pending| {
+                pending.room != room
+                    || pending.peer != peer
+                    || pending.hint.author != hint.author
+                    || pending.in_flight
+                    || pending.hint.size >= hint.size
+            });
             if state.pending.len() == MAX_CONTEXT_AUTHORS {
                 outcome.full = true;
                 break;
@@ -100,12 +122,46 @@ impl HintInbox {
             .iter()
             .any(|p| p.room == room && p.peer == peer && !p.in_flight)
     }
-    pub(crate) fn take(&self, room: Digest32, peer: Digest32) -> Option<HeadHint> {
+    /// Whether an immutable in-flight owner has a strictly newer queued successor. Equal-size
+    /// distinct heads remain fork evidence and never supersede each other by scalar ordering.
+    pub(crate) fn newer_pending(
+        &self,
+        room: Digest32,
+        peer: Digest32,
+        author: Digest32,
+        size: u64,
+    ) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pending
+            .iter()
+            .any(|pending| {
+                pending.room == room
+                    && pending.peer == peer
+                    && pending.hint.author == author
+                    && !pending.in_flight
+                    && pending.hint.size > size
+            })
+    }
+    pub(crate) fn take(&self, room: Digest32, peer: Digest32, local: Digest32) -> Option<HeadHint> {
         let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         let pending = state
             .pending
             .iter_mut()
-            .find(|p| p.room == room && p.peer == peer && !p.in_flight)?;
+            .filter(|p| p.room == room && p.peer == peer && !p.in_flight)
+            // The author is the authoritative live-body source. Prefer its own head, then our
+            // exact echo needed for settlement/departure; third-party gossip remains fallback
+            // when the author is absent or has no pending successor on this port.
+            .min_by_key(|pending| {
+                if pending.hint.author == peer {
+                    0
+                } else if pending.hint.author == local {
+                    1
+                } else {
+                    2
+                }
+            })?;
         pending.in_flight = true;
         Some(pending.hint)
     }
@@ -115,6 +171,44 @@ impl HintInbox {
             p.room != room || p.peer != peer || p.hint.author != author || p.hint.head != head
         });
         Self::release_empty(&mut state);
+    }
+    /// A local authorization edit retires the old flow, not its unauthoritative scalar hint.
+    /// Release that exact hint for a new flow bound to the current authorization generation.
+    pub(crate) fn retry(&self, room: Digest32, peer: Digest32, author: Digest32, head: Digest32) {
+        let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(owner) = state.pending.iter().find(|pending| {
+            pending.room == room
+                && pending.peer == peer
+                && pending.hint.author == author
+                && pending.hint.head == head
+        }) else {
+            return;
+        };
+        let owner_size = owner.hint.size;
+        if state.pending.iter().any(|pending| {
+            pending.room == room
+                && pending.peer == peer
+                && pending.hint.author == author
+                && pending.hint.head != head
+                && pending.hint.size > owner_size
+        }) {
+            // Authorization/port turnover abandoned this owner after a newer successor arrived.
+            // Retrying the obsolete scalar first recreates the backlog coalescing removed.
+            state.pending.retain(|pending| {
+                pending.room != room
+                    || pending.peer != peer
+                    || pending.hint.author != author
+                    || pending.hint.head != head
+            });
+            Self::release_empty(&mut state);
+        } else if let Some(pending) = state.pending.iter_mut().find(|pending| {
+            pending.room == room
+                && pending.peer == peer
+                && pending.hint.author == author
+                && pending.hint.head == head
+        }) {
+            pending.in_flight = false;
+        }
     }
     pub(crate) fn retire_peer(&self, room: Digest32, peer: Digest32) {
         let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
@@ -131,15 +225,6 @@ impl HintInbox {
         state.generation = state.generation.saturating_add(1);
         state.pending.retain(|p| p.room != room);
         Self::release_empty(&mut state);
-    }
-    /// Includes in-flight hints: settlement must not outrun recovery of our own feed.
-    pub(crate) fn pending_author(&self, room: Digest32, author: Digest32) -> bool {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .pending
-            .iter()
-            .any(|p| p.room == room && p.hint.author == author)
     }
     pub(crate) fn clear(&self) {
         let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);

@@ -106,6 +106,9 @@ pub(crate) struct Flow {
     departure_probe: bool,
     pub(crate) archive_request: Option<RequestId>,
     pub(crate) hint: Option<super::HeadHint>,
+    /// The advertising peer that owns `hint` in the inbox, even while one exact dependency is
+    /// temporarily routed over its author's port.
+    pub(crate) hint_peer: Digest32,
     /// Exact signed head selected for this hinted flow, not the inventory claim.
     pub(crate) authenticated_head: Option<super::HeadHint>,
     pub(crate) waiting: bool,
@@ -115,9 +118,16 @@ pub(crate) struct Flow {
     pub(crate) admitted_authors: usize,
     pub(crate) external: Option<(Digest32, u64)>,
     pub(crate) archive_status: Option<crate::node::api::HistoryDemandStatus>,
-    /// This hinted third-party source did not retain a required dependency. The controller
-    /// retires the exact hint through bounded cleanup without penalizing the peer's port.
-    pub(crate) hint_unavailable: bool,
+    /// A healthy advertising peer did not retain the exact current wire dependency. The actor
+    /// moves this same flow to the named author's port; no second root or volatile copy exists.
+    pub(crate) reroute: Option<Digest32>,
+    /// Original peer while the next exact wire dependency runs against its author.
+    pub(crate) route_origin: Option<Digest32>,
+    /// The routed wire response completed and the retained continuation must return to origin.
+    pub(crate) route_complete: bool,
+    /// A local trust edit invalidated this flow's grant. Retire it without blaming the peer;
+    /// the controller re-arms its exact scalar hint under the new generation.
+    pub(crate) authorization_changed: bool,
     tasks: Vec<Task>,
     // One exact suspended foreground root. Intermediate pre-body continuations
     // are re-derived from durable receipts after the current dependency finishes.
@@ -144,6 +154,9 @@ pub(crate) struct Flow {
     // One hinted flow either advances the main window or retries missing newest positions.
     // A peer's BodyNotHeld never rewinds the main cursor or suppresses another peer's retry.
     live_visited: bool,
+    // Exact head whose independent control closure is already retained by this flow. A later
+    // authenticated successor schedules its own closure without mutating the in-flight work.
+    control_head: Option<Digest32>,
     // Declared last: actual state/capabilities die before the shared admission is returned.
     _state_charge: crate::node::history_budget::FlowStateCharge,
 }
@@ -187,6 +200,7 @@ impl Flow {
             archive_request: None,
             _state_charge: state_charge,
             hint,
+            hint_peer: peer,
             authenticated_head: None,
             waiting: false,
             published: false,
@@ -195,7 +209,10 @@ impl Flow {
             admitted_authors: 0,
             external: None,
             archive_status: None,
-            hint_unavailable: false,
+            reroute: None,
+            route_origin: None,
+            route_complete: false,
+            authorization_changed: false,
             tasks: Vec::with_capacity(MAX_TASKS),
             replay: None,
             slots,
@@ -218,6 +235,7 @@ impl Flow {
             initialized: false,
             live_unavailable: None,
             live_visited: false,
+            control_head: None,
         };
         if let Some((head, seq)) = required {
             flow.push(Task {
@@ -289,6 +307,7 @@ impl Flow {
             archive_request: Some(request),
             _state_charge: state_charge,
             hint: None,
+            hint_peer: peer,
             authenticated_head: None,
             waiting: false,
             published: false,
@@ -297,7 +316,10 @@ impl Flow {
             admitted_authors: 0,
             external: None,
             archive_status: None,
-            hint_unavailable: false,
+            reroute: None,
+            route_origin: None,
+            route_complete: false,
+            authorization_changed: false,
             slots,
             owners: [None, None],
             no_progress: 0,
@@ -328,6 +350,7 @@ impl Flow {
             initialized: true,
             live_unavailable: None,
             live_visited: false,
+            control_head: None,
         }
     }
     fn push(&mut self, task: Task) -> Result<()> {
@@ -335,6 +358,34 @@ impl Flow {
             return Err(Error::SizeLimitExceeded("history dependency stack"));
         }
         self.tasks.push(task);
+        Ok(())
+    }
+    /// Retain exact control closure above any ordinary-body work already on the LIFO stack.
+    /// Source proof runs before effect application; a successor gets a distinct pair of tasks.
+    fn push_control_closure(&mut self, task: &Task, window: LiveWindow) -> Result<()> {
+        if window.through == 0 || self.control_head == Some(window.head) {
+            return Ok(());
+        }
+        if self.tasks.len() > MAX_TASKS.saturating_sub(2) {
+            return Err(Error::SizeLimitExceeded("history dependency stack"));
+        }
+        self.tasks.push(Task {
+            operation: Operation::Local(LocalStep::Control {
+                head: window.head,
+                through: window.through,
+                effects: true,
+            }),
+            ..task.clone()
+        });
+        self.tasks.push(Task {
+            operation: Operation::Local(LocalStep::Control {
+                head: window.head,
+                through: window.through,
+                effects: false,
+            }),
+            ..task.clone()
+        });
+        self.control_head = Some(window.head);
         Ok(())
     }
     pub(crate) fn needs_board(&self) -> bool {
@@ -555,6 +606,20 @@ impl Flow {
                 now,
             )
             .await;
+        if result.as_ref().is_err_and(|error| {
+            matches!(
+                error,
+                Error::Profile(
+                    "history authorization changed"
+                        | "history authorization changed before publication"
+                        | "live window authorization changed"
+                        | "live retry authorization changed"
+                )
+            )
+        }) {
+            self.authorization_changed = true;
+            return Ok(());
+        }
         if self.owners.iter().any(Option::is_some) && self.waiting && !self.body_progress {
             self.no_progress = self.no_progress.saturating_add(1);
             if self.no_progress >= 3 {
@@ -687,10 +752,14 @@ impl Flow {
                     return Ok(());
                 };
                 let (window, target_through) = found.value;
+                // Report the exact authenticated Head(author) response that selected this
+                // operation, not a newer locally retained window that may supersede it. Join
+                // settlement must never turn an older peer echo into acknowledgement of the
+                // current own head.
                 self.authenticated_head = Some(super::HeadHint {
                     author,
-                    head: window.head,
-                    size: window.through,
+                    head,
+                    size: target_through,
                 });
                 if !window.complete() {
                     self.live_visited = true;
@@ -715,30 +784,41 @@ impl Flow {
                             head: window.head,
                             seq: window.next,
                         },
-                        ..task
+                        ..task.clone()
                     })?;
-                } else if !self.live_visited {
-                    self.live_visited = true;
-                    // This is a peer-local retry pass over only the authenticated peer's
-                    // newest window. It changes neither the durable main cursor nor the
-                    // missing-position fact until normal body admission fills that fact.
-                    self.push(Task {
-                        operation: Operation::LiveRetry {
-                            author,
-                            window: LiveWindow {
-                                head,
-                                from: target_through
-                                    .saturating_sub(
-                                        crate::log::history::MAX_PAGE_ENTRIES as u64 - 1,
-                                    )
-                                    .max(1),
-                                next: target_through,
-                                through: target_through,
+                } else {
+                    if !self.live_visited {
+                        self.live_visited = true;
+                        // This is a peer-local retry pass over only the authenticated peer's
+                        // newest window. It changes neither the durable main cursor nor the
+                        // missing-position fact until normal body admission fills that fact.
+                        // Retain it below the exact-head control work on this LIFO stack: omitted
+                        // ordinary bodies are best-effort live recovery and cannot delay Session
+                        // authorization. Any addressed key-package in the same window is a
+                        // control dependency and is fetched by that work before the retry begins.
+                        self.push(Task {
+                            operation: Operation::LiveRetry {
+                                author,
+                                window: LiveWindow {
+                                    head,
+                                    from: target_through
+                                        .saturating_sub(
+                                            crate::log::history::MAX_PAGE_ENTRIES as u64 - 1,
+                                        )
+                                        .max(1),
+                                    next: target_through,
+                                    through: target_through,
+                                },
                             },
-                        },
-                        ..task
-                    })?;
+                            ..task.clone()
+                        })?;
+                    }
                 }
+                // Head commitment independently authorizes bounded control closure. Run it above
+                // the ordinary-body work just retained on this LIFO stack, so governance,
+                // Session floors/support and addressed key delivery do not wait for 128 unrelated
+                // Content bodies. Collapsed proof ranges fetch none of those omitted bodies.
+                self.push_control_closure(&task, window)?;
             }
             Operation::LiveRetry { author, window } => {
                 if window.complete() {
@@ -1014,6 +1094,11 @@ impl Flow {
                 )
                 .await?;
                 self.body_progress |= result.body_progress;
+                if self.route_origin.is_some()
+                    && !matches!(result.status, Status::Busy | Status::EvidenceUnavailable)
+                {
+                    self.route_complete = true;
+                }
                 if self.departure_probe {
                     // A stale/absent echo is not receipt. Keep the room and retry only this
                     // bounded head request through the existing port backoff.
@@ -1125,33 +1210,68 @@ impl Flow {
                     ));
                 }
                 if result.status == Status::EvidenceUnavailable && !self.archive {
-                    if matches!(query, Query::Head(author) if self.hint.is_some_and(|hint| hint.author == author))
+                    if matches!(query, Query::Head(author) if (author == self.peer || author == self.node) && self.hint.is_some_and(|hint| hint.author == author))
                         && !self.departure_probe
                         && self.last_head.is_none()
                         && self.replay.is_none()
                     {
                         // Inventory is an unauthoritative scalar hint. A peer that no longer
-                        // holds the initially named head retires only this hint; treating that
-                        // as a transport failure backs off the whole room/peer port and can leave
-                        // a later fresh head waiting behind stale third-party hints. Dependency
-                        // failures after a head was selected remain hard failures below.
+                        // holds its initially named head, or has not yet completed our echo,
+                        // retires only this hint. Neither is a transport failure, and backing off
+                        // the healthy room/peer port can strand a later fresh head behind it.
+                        // Third-party heads route to their author below; dependency failures
+                        // after a head was selected remain hard failures.
                         self.tasks.clear();
                         return Ok(());
                     }
-                    if self.hint.is_some_and(|hint| hint.author != self.peer)
-                        && !self.departure_probe
-                    {
-                        // A peer may truthfully advertise an authenticated third-party head
-                        // while retaining only part of its dependencies. Missing evidence from
-                        // that peer is not a transport failure and must not back off the whole
-                        // room/peer port behind which later current hints are waiting. Retire
-                        // only this scalar hint. No missing evidence or effect is accepted:
-                        // another peer must provide every dependency before publication.
-                        // The controller owns retirement because a verifier or publication
-                        // cursor may already be durable by the time a later dependency is
-                        // refused. Normal completion would skip that bounded cleanup.
-                        self.hint_unavailable = true;
-                        return Ok(());
+                    if !self.departure_probe {
+                        let dependency = match query {
+                            Query::Head(author) => self.hint.filter(|hint| hint.author == author),
+                            Query::Header { head, .. }
+                            | Query::Proof { head, .. }
+                            | Query::Entry { head, .. }
+                            | Query::Page { head, .. } => {
+                                match source
+                                    .read(
+                                        job,
+                                        std::mem::size_of::<Option<Digest32>>(),
+                                        move |room, store| {
+                                            Ok(Some(
+                                                room.history_read(store)?.history_head(&head)?.map(
+                                                    |signed| super::HeadHint {
+                                                        author: signed.binding.author,
+                                                        head,
+                                                        size: signed.root.leaves,
+                                                    },
+                                                ),
+                                            ))
+                                        },
+                                    )
+                                    .await?
+                                {
+                                    Lookup::Found(found) => found.value,
+                                    Lookup::Busy => {
+                                        self.push(task)?;
+                                        self.waiting = true;
+                                        return Ok(());
+                                    }
+                                    Lookup::Missing => None,
+                                }
+                            }
+                            Query::Inventory | Query::Context(_) => None,
+                        };
+                        if dependency.is_some_and(|head| {
+                            head.author != self.peer && head.author != self.node
+                        }) {
+                            // Keep the exact refused query and its full continuation owned by
+                            // this flow. The actor moves it to the dependency author's port for
+                            // one wire turn, then returns the same flow to this advertising peer.
+                            // No missing evidence is accepted and no whole-head surrogate can
+                            // complete without satisfying this exact query.
+                            self.push(task)?;
+                            self.reroute = dependency.map(|head| head.author);
+                            return Ok(());
+                        }
                     }
                     return Err(Error::Unreachable(
                         "required current evidence is unavailable",

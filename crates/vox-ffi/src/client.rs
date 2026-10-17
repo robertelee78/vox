@@ -22,7 +22,8 @@ use vox_core::error::Error;
 use vox_core::hash::Digest32;
 use vox_core::node::api::{HistoryCursor, MessageRow, NodeEvent};
 use vox_core::node::daemonipc::{
-    AttachMode, DaemonClient, DaemonFrame, DaemonRequest, KeepSource, NodeName, NodeState, UseNode,
+    AttachMode, DaemonClient, DaemonFrame, DaemonRequest, KeepSource, NodeName, NodeState, Refusal,
+    UseNode,
 };
 use vox_core::node::ipc::{Frame, IpcClient, NodeSocket, Request, SessionSummary};
 use vox_core::node::link::b32_encode;
@@ -3034,6 +3035,14 @@ impl VoxClient {
                 .await
                 .map_err(|e| said(&socket, e))?;
             match d.request(req).await {
+                Ok(DaemonFrame::Refused(r @ Refusal::WrongPassphrase { .. })) => {
+                    Err(VoxError::WrongPassphrase {
+                        reason: r.to_string(),
+                    })
+                }
+                Ok(DaemonFrame::Refused(r @ Refusal::NodeInUse { .. })) => Err(VoxError::Busy {
+                    reason: r.to_string(),
+                }),
                 Ok(DaemonFrame::Refused(r)) => Err(failed(r.to_string())),
                 Ok(f) => Ok(f),
                 Err(e) if read_only => Err(read_interrupted(e, |e| {

@@ -151,6 +151,13 @@ network presence from the start: there is no interim design with one socket per 
   startup and becoming Ready MUST NOT enqueue a whole remote archive, including delayed
   backfill. The distinct live/control and requested-history protocol is specified by ADR-036.
   Local accepted restart state MUST NOT be treated as a transferable peer authority proof.
+  Volatile recovery scheduling MUST NOT turn an abandoned worker into durable missing history:
+  work that owns an in-flight hint MUST either complete it, re-arm it while the room/peer scope
+  remains live, or retire it with that scope. Restart MAY clear volatile scheduling state, but
+  MUST NOT be required for an already durable current message to become readable.
+  Joined-room write readiness likewise MUST derive from durable exact peer acknowledgement and
+  governance facts, never from whether a volatile recovery queue happens to be empty. Restart
+  MUST NOT make an otherwise unchanged room newly writable.
 - **L-11. Recovery evidence.** Extend the existing on-demand binary journeys to cover a normal
   warm restart, the observed missing-index repair, fresh message exchange during requested
   history work, and multiple kept nodes. Assert what the person can read and send and whether

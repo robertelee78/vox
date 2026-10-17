@@ -145,6 +145,11 @@ below remain unchanged.
   fork. In a sync session the refusal MUST NOT be fatal. Above the checkpoint, fork detection is
   unaffected.
 - **RL-3.7.** A room whose effective retention is forever MUST keep every signature.
+- **RL-3.8. Bounded maintenance.** The periodic retention turn MUST NOT open, seal or commit a
+  durable batch when no held checkpoint has positions beyond that room's persisted sweep cursor.
+  A no-op sweep performs no fsync. Actual checkpoint work examines and rewrites at most 64
+  positions in one durable turn, persisting its cursor before a later turn resumes the remainder.
+  An idle room's no-op maintenance MUST NOT park the node actor or strand unrelated live delivery.
 
 ### Decision 4. Key delivery through members (R11, R14)
 

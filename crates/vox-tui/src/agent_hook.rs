@@ -1924,7 +1924,7 @@ pub async fn run(
             let words = Unregistered::NotAttached(node.clone()).said(&input, &daemon.account);
             eprintln!("vox agent hook: {words}");
             if crate::wake::first_detached_notice(paths, &input.session_id) {
-                crate::notify::needs_passphrase(paths, node.as_str(), &words);
+                crate::notify::needs_passphrase_from_hook(paths, node.as_str(), &words);
                 emit(format, &raw, &input.event, &format!("{words}\n"), "");
             }
             return Ok(());
@@ -1939,7 +1939,10 @@ pub async fn run(
             return Ok(());
         }
         Err(
-            u @ (Unregistered::NoDaemon(_) | Unregistered::Attaching(_) | Unregistered::Version(_)),
+            u @ (Unregistered::NoDaemon(_)
+            | Unregistered::Attaching(_)
+            | Unregistered::DaemonUnanswered
+            | Unregistered::Version(_)),
         ) => {
             let words = u.said(&input, &daemon.account);
             eprintln!("vox agent hook: {words}");
@@ -1977,6 +1980,8 @@ pub(crate) enum Unregistered {
     NoDaemon(String),
     /// The hook's node is being attached by the daemon's start (a kept node), not yet done.
     Attaching(vox_core::node::paths::NodeName),
+    /// A daemon owns the local socket but did not answer within the hook's short bound.
+    DaemonUnanswered,
     /// A local daemon of another release is refused before any request.
     Version(String),
     /// Anything else, in words.
@@ -2059,6 +2064,10 @@ impl Unregistered {
                 "Vox is preparing node {node}; this session joins it once it is Ready, and \
                  your rooms show from your next turn."
             ),
+            Self::DaemonUnanswered => "Vox could not read your rooms because the vox daemon here \
+                 did not answer promptly; try again next turn, and ask the operator to restart it \
+                 if this continues."
+                .into(),
             Self::NoDaemon(why) => format!(
                 "Vox could not read your rooms because no vox daemon runs and none could be \
                  started ({why}); ask the operator to {}.",
@@ -2102,16 +2111,6 @@ impl Daemon {
         if !self.account.nodes_on_disk().contains(&self.node) {
             return Err(Unregistered::NoNode(self.node.clone()));
         }
-        crate::daemon_client::ensure_daemon(&self.account, self.listen, &self.anchors)
-            .await
-            .map_err(|e| {
-                let why = one_line_reason(&e);
-                if why.contains("Vox's daemon is ") {
-                    Unregistered::Version(why)
-                } else {
-                    Unregistered::NoDaemon(why)
-                }
-            })?;
         let mut record = crate::wake::Session::from_env(&input.session_id, input.codex);
         // A native Claude hook identifies its actual child harness even inside another
         // agent's shell. Inherited OpenCode endpoints never become that child's route.
@@ -2140,6 +2139,34 @@ impl Daemon {
         let (room, join) = session_room(&self.account, input, room_arg);
         record.room = room;
         record.start = Some(input.cwd.clone()).filter(|c| !c.is_empty());
+        let daemon =
+            crate::daemon_client::ensure_daemon_for_hook(&self.account, self.listen, &self.anchors)
+                .await
+                .map_err(|e| {
+                    let why = one_line_reason(&e);
+                    if why.contains("Vox's daemon is ") {
+                        Unregistered::Version(why)
+                    } else {
+                        Unregistered::NoDaemon(why)
+                    }
+                })?;
+        if matches!(daemon, crate::daemon_client::HookDaemon::Unanswered) {
+            return Err(Unregistered::DaemonUnanswered);
+        }
+        if matches!(daemon, crate::daemon_client::HookDaemon::Starting) {
+            // The cold daemon owns its child and continues starting. Keep this turn atomically so
+            // its kept node can discover the harness and the next hook can finish opening the
+            // Session. A tmux claim is authority presented to the daemon, never persisted before
+            // the daemon proves it; the next turn presents it again.
+            let paths = self
+                .account
+                .node_paths(&self.node)
+                .map_err(|e| AppError::Usage(e.to_string()))?;
+            record.tmux_claim = None;
+            crate::wake::store_checked(&paths, &record)
+                .map_err(|why| AppError::Usage(format!("the session was not registered: {why}")))?;
+            return Err(Unregistered::Attaching(self.node.clone()));
+        }
         let record = serde_json::to_string(&record)
             .map_err(|e| AppError::Usage(format!("the session's record: {e}")))?;
         let mut d = DaemonClient::open(&self.account.socket())

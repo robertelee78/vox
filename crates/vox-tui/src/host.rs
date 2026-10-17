@@ -125,6 +125,12 @@ struct Inner {
     session_admissions: Arc<tokio::sync::Semaphore>,
     /// The Claude Code sessions whose transcript is read for a new name (ADR-029 MD-1).
     titles: Mutex<BTreeSet<(NodeName, String)>>,
+    /// Durable registrations whose idempotent room opening is in flight. Registration must
+    /// answer a hook without waiting for room history/projection readiness; one detached worker
+    /// per Session owns that later work, and a daemon restart rebuilds it from the saved records.
+    session_openings: Mutex<BTreeSet<(NodeName, String)>>,
+    /// A completed opening failure is told on the Session's next hook before that hook retries.
+    session_open_failures: Mutex<BTreeMap<(NodeName, String), String>>,
     /// Codex sessions' activity, read from Codex's app-server as a peer client (ADR-029 #541).
     codex: Arc<crate::codex_mirror::CodexMirror>,
     /// OpenCode sessions' activity, read through Vox's OpenCode plugin (ADR-029 #542).
@@ -379,6 +385,8 @@ impl Router {
                     posting: tokio::sync::Mutex::default(),
                     session_admissions: Arc::new(tokio::sync::Semaphore::new(64)),
                     titles: Mutex::default(),
+                    session_openings: Mutex::default(),
+                    session_open_failures: Mutex::default(),
                     joins: Mutex::default(),
                 }
             }),
@@ -1420,44 +1428,151 @@ impl Router {
         // session keeps the room it started with (RB-4), so a later lookup joins nothing.
         let join = join.filter(|_| asked.is_some() && asked == room);
         if let (Some(handle), Some(reg)) = (handle.as_ref(), stored.as_ref()) {
-            joining = self.open_session(node, handle, reg, join).await;
+            // The saved registration is the durable opening obligation. Projection can be
+            // refreshing for tens of seconds after a sparse join; it must not hold the hook's
+            // ten-second request open. One idempotent worker continues independently, and is
+            // reconstructed from the same registration when the daemon restarts.
+            joining = self.open_registered(node, handle, g.detached.clone(), reg);
+            if let Some(room_b32) = reg.room.as_deref() {
+                if let Ok(room_id) = vox_core::node::link::b32_decode(room_b32, "room") {
+                    let member = handle
+                        .view()
+                        .open_channels
+                        .iter()
+                        .any(|c| c.channel_id == room_id);
+                    let joins =
+                        Arc::clone(lock(&self.inner.joins).entry(node.clone()).or_default());
+                    if member {
+                        joins.set_status(room_b32, None);
+                    } else if let Some((link, passphrase)) = join {
+                        vox_core::node::room_join::join_in_background(
+                            handle, &joins, room_b32, &link, passphrase, None,
+                        );
+                        joining = joins.status(room_b32).or(joining);
+                    }
+                }
+            }
         }
         if let Some(reg) = stored.as_ref() {
             self.watch_title(node, reg);
         }
-        // **New** is new to this node: no registration before, and no Session of it in any room
-        // its log holds, so a daemon restarted mid-session still knows it (ADR-029 RB-5).
-        let seen = if let Some(handle) = &handle {
-            let rooms: Vec<_> = handle
-                .view()
-                .open_channels
-                .iter()
-                .map(|d| d.channel_id)
-                .collect();
-            let mut seen = false;
-            for room in rooms {
-                if handle
-                    .session_seen(room, &id)
-                    .await
-                    .map_err(|why| Refusal::Failed {
-                        node: node.clone(),
-                        why,
-                    })?
-                {
-                    seen = true;
-                    break;
-                }
-            }
-            seen
-        } else {
-            false
-        };
         Ok(DaemonFrame::SessionRegistered {
             info: g.info,
             room,
-            new: !known && !seen,
+            // This is new to the node's durable registrations. With a room, `new` produces no
+            // first-run note; without one there can be no room Session to discover first.
+            new: !known,
             joining,
         })
+    }
+
+    /// Continue one saved interactive Session opening without holding its hook request. The
+    /// registration file is both the cancellation check and the daemon-restart retry source.
+    /// Repeated hooks coalesce on `(node, session)` while the idempotent opening is in flight.
+    fn open_registered(
+        &self,
+        node: &NodeName,
+        handle: &vox_core::node::actor::NodeHandle,
+        mut detached: watch::Receiver<bool>,
+        reg: &crate::wake::Session,
+    ) -> Option<String> {
+        let room_b32 = reg.room.as_ref()?;
+        if reg.harness == "unknown" || !reg.interactive {
+            return None;
+        }
+        let room = vox_core::node::link::b32_decode(room_b32, "room").ok()?;
+        let key = (node.clone(), reg.session.clone());
+        let previous = lock(&self.inner.session_open_failures).remove(&key);
+        if !lock(&self.inner.session_openings).insert(key.clone()) {
+            return previous;
+        }
+        let router = self.clone();
+        let handle = handle.clone();
+        let opening = vox_core::node::sessions::Opening {
+            id: reg.session.clone(),
+            harness: reg.harness.clone(),
+            name: reg.name.clone(),
+            cwd: reg.start.clone().filter(|cwd| !cwd.is_empty()),
+        };
+        let expected_room = room_b32.clone();
+        self.inner.rt.spawn(async move {
+            let still_registered = || {
+                router
+                    .inner
+                    .account
+                    .node_paths(&key.0)
+                    .ok()
+                    .and_then(|paths| crate::wake::registration(&paths, &key.1))
+                    .is_some_and(|current| {
+                        current.interactive
+                            && current.harness != "unknown"
+                            && current.room.as_deref() == Some(expected_room.as_str())
+                    })
+            };
+            while !*detached.borrow()
+                && still_registered()
+                && !handle
+                    .view()
+                    .open_channels
+                    .iter()
+                    .any(|c| c.channel_id == room)
+            {
+                tokio::select! {
+                    _ = detached.changed() => {},
+                    () = tokio::time::sleep(Duration::from_millis(200)) => {},
+                }
+            }
+            let result = if *detached.borrow() || !still_registered() {
+                Ok(())
+            } else {
+                loop {
+                    // Recheck the durable binding while each bounded core attempt waits on
+                    // projection work; an end or room move cancels this owner instead of
+                    // reopening stale state. A readiness deadline bounds one attempt, not the
+                    // durable obligation: the exact registration remains its retry source.
+                    let future =
+                        vox_core::node::sessions::open_when_member(&handle, room, &opening);
+                    tokio::pin!(future);
+                    let attempt = loop {
+                        tokio::select! {
+                            result = &mut future => break result,
+                            _ = detached.changed() => {
+                                if *detached.borrow() { break Ok(()); }
+                            }
+                            () = tokio::time::sleep(Duration::from_millis(200)) => {
+                                if !still_registered() { break Ok(()); }
+                            }
+                        }
+                    };
+                    match attempt {
+                        Err(why)
+                            if vox_core::node::sessions::opening_refreshing(&why)
+                                && !*detached.borrow()
+                                && still_registered() =>
+                        {
+                            tokio::select! {
+                                _ = detached.changed() => {},
+                                () = tokio::time::sleep(Duration::from_millis(200)) => {},
+                            }
+                        }
+                        result => break result,
+                    }
+                }
+            };
+            lock(&router.inner.session_openings).remove(&key);
+            match result {
+                Ok(()) => {
+                    lock(&router.inner.session_open_failures).remove(&key);
+                }
+                Err(why) if still_registered() => {
+                    let said = format!("could not open this session's Session in its room: {why}");
+                    eprintln!("vox daemon: session {} of node {}: {said}", key.1, key.0);
+                    lock(&router.inner.session_open_failures).insert(key, said);
+                }
+                Err(_) => {}
+            }
+        });
+        previous
     }
 
     /// Open `reg`'s Session in its room (ADR-029 SE-1): at once when the node is a member, or once
@@ -3207,11 +3322,9 @@ impl Router {
                             }
                             let implicit = a.implicit;
                             let fingerprint = a.fingerprint;
-                            // Codex sessions registered before this daemon started are read
-                            // again from their app-server at once, not at their next turn.
-                            for s in crate::wake::registered(&a.paths) {
-                                self.watch_harness(node, &s);
-                            }
+                            let registered = crate::wake::registered(&a.paths);
+                            let opening_handle = a.handle.clone();
+                            let opening_detached = a.detached.subscribe();
                             // Drive input from members with drive (ADR-029 §3), while attached.
                             self.serve_drive(node, &a.handle, a.detached.subscribe());
                             self.serve_attention(&a.handle, a.detached.subscribe());
@@ -3231,6 +3344,20 @@ impl Router {
                                 node: node.clone(),
                                 fingerprint,
                             });
+                            // A saved registration is a durable opening obligation. Restore its
+                            // harness/title readers and its idempotent room opening after the
+                            // attached slot is visible, so a daemon crash after acknowledgment
+                            // cannot strand the Session until another hook turn.
+                            for session in registered {
+                                self.watch_harness(node, &session);
+                                self.watch_title(node, &session);
+                                self.open_registered(
+                                    node,
+                                    &opening_handle,
+                                    opening_detached.clone(),
+                                    &session,
+                                );
+                            }
                             granted
                         }
                         Err(r) => {

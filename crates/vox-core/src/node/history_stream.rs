@@ -32,6 +32,22 @@ use crate::log::history::{
 pub type RequestId = [u8; 16];
 pub const MAX_PREAMBLE: usize = 128;
 pub const DONE_RESERVE: usize = 512;
+// One frame tag plus the canonical CBOR encoding of any u8 mode bitmap.
+const MAX_HELLO_FRAME_BYTES: usize = 3;
+// Tag + outer pair + request ID + the largest canonical Query (Page). Query's bounded u64 and
+// digest fields make this an exact structural maximum, independent of peer input.
+const MAX_WANT_FRAME_BYTES: usize = 80;
+// Tag and a conservatively maximal CBOR array header. Each locally materialized HAVE hint is an
+// array header, two 32-byte byte strings (each with a maximal CBOR length header), and one u64.
+// The decoder still reserves the full attacker-sized envelope before reading any variable frame;
+// this bound sizes only an encoder whose exact local hint count is already known.
+const HAVE_FRAME_FIXED_BYTES: usize = 1 + 9;
+const HAVE_HINT_MAX_BYTES: usize = 9 + 2 * (9 + 32) + 9;
+// Conservative tag/CBOR overhead for a locally sourced byte-string frame. The peer-facing
+// decoder still reserves the full attacker-sized frame and decode envelope before its prefix.
+const LOCAL_BYTES_FRAME_FIXED_BYTES: usize = 128;
+const CANCEL_FRAME_MAX_BYTES: usize = 64;
+const ACK_FRAME_MAX_BYTES: usize = 128;
 
 /// Exact local request incarnation. The sealed keyring nonce changes on a durable trust edit,
 /// including removal followed by an otherwise identical regrant; unchanged restart preserves
@@ -132,7 +148,7 @@ async fn serve_request(
     inventory_added: &mut bool,
     departure_receipt: &std::sync::atomic::AtomicBool,
 ) -> Result<Status> {
-    let first = match io.read(MAX_FRAME_BYTES + 4).await? {
+    let first = match io.read_hello().await? {
         transport::Read::Frame(frame) => frame,
         transport::Read::End => return Err(invalid("history closed before HELLO")),
         transport::Read::Busy => return Err(Error::Unreachable("history HELLO reader busy")),
@@ -154,7 +170,7 @@ async fn serve_request(
     overhead += encoded.as_slice().len() + 4;
     io.write_encoded(&encoded).await?;
     drop(encoded);
-    let next = match io.read(MAX_FRAME_BYTES + 4).await? {
+    let next = match io.read_want_or_cancel().await? {
         transport::Read::Frame(frame) => frame,
         transport::Read::End => return Err(invalid("history closed before WANT")),
         transport::Read::Busy => return Err(Error::Unreachable("history WANT reader busy")),
@@ -604,7 +620,35 @@ impl<'a> Frame<'a> {
     /// The caller already owns the independently charged source objects. Lack of room is a
     /// local busy/yield result; it is not malformed peer input.
     pub fn encode(&self, job: &Job) -> Result<Option<Encoded>> {
-        let Some(charge) = job.reserve(4 * MAX_FRAME_BYTES) else {
+        let maximum = match self {
+            Self::Hello(_) => MAX_HELLO_FRAME_BYTES,
+            Self::Want { .. } => MAX_WANT_FRAME_BYTES,
+            Self::Have(hints) => HAVE_FRAME_FIXED_BYTES
+                .checked_add(
+                    hints
+                        .len()
+                        .checked_mul(HAVE_HINT_MAX_BYTES)
+                        .ok_or(Error::SizeLimitExceeded("history encoded frame"))?,
+                )
+                .filter(|bound| *bound <= MAX_FRAME_BYTES)
+                .ok_or(Error::SizeLimitExceeded("history encoded frame"))?,
+            Self::Meta {
+                object: Object::Head(bytes) | Object::Context(bytes) | Object::Header(bytes),
+                ..
+            }
+            | Self::Chunk { bytes, .. } => LOCAL_BYTES_FRAME_FIXED_BYTES
+                .checked_add(bytes.len())
+                .filter(|bound| *bound <= MAX_FRAME_BYTES)
+                .ok_or(Error::SizeLimitExceeded("history encoded frame"))?,
+            Self::Done { .. } => DONE_RESERVE,
+            Self::Cancel(_) => CANCEL_FRAME_MAX_BYTES,
+            Self::Ack { .. } => ACK_FRAME_MAX_BYTES,
+            Self::Meta {
+                object: Object::Proof(_),
+                ..
+            } => MAX_FRAME_BYTES,
+        };
+        let Some(charge) = job.reserve(4 * maximum) else {
             return Ok(None);
         };
         let mut e = Encoder::new();
@@ -732,7 +776,7 @@ impl<'a> Frame<'a> {
         };
         let body = e.finish();
         let len = 1 + body.len() + tail.as_ref().map_or(0, Vec::len);
-        if len > MAX_FRAME_BYTES {
+        if len > maximum {
             return Err(Error::SizeLimitExceeded("history encoded frame"));
         }
         let mut bytes = Vec::with_capacity(len);

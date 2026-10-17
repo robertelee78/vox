@@ -36,6 +36,15 @@ relies on is ADR-028 K-14.
   room, created when the daemon registers the session (ADR-020 6.10), whether or not it has posted
   a `hello`. A headless run
   (`claude -p`, `codex exec`, a non-interactive OpenCode run) MUST NOT get one.
+  Registration is accepted once its record and room binding are durable; its hook response MUST
+  NOT wait for room history, Session projection or attention readiness. The daemon MUST coalesce
+  repeated hooks into one idempotent opening attempt per registered Session, cancel an attempt
+  whose registration ends or moves, and reconstruct unfinished openings from the durable
+  registrations whenever the node becomes Ready after daemon restart. A bounded attempt that
+  finds governance, controls, floors or Session projection still refreshing MUST continue from
+  that same durable obligation; its deadline MUST NOT turn transient readiness into abandonment.
+  A permanent detached opening failure MUST be logged and told to that Session on its next hook
+  before a new attempt starts.
 - **SE-2.** A Session's identity MUST be the harness's own session id (Claude Code's
   `session_id`, Codex's thread id, OpenCode's `ses_…` id); Vox MUST NOT mint one. A sub-agent's
   activity MUST belong to its parent's Session, never a Session of its own: each of its entries
@@ -78,7 +87,10 @@ relies on is ADR-028 K-14.
   admitted to the room or gains drive, whichever is later, retrying on the tick (ADR-020 3.2). A
   member reads the Session from that release onward, as ADR-006's forward-only rule does for
   messages. *Amended by ADR-031 SA-8 (the decider, 2026-10-10):* a joining node gets a Session's
-  steps only from the later of its join and its gaining drive; no earlier step is sent to it.
+  steps only from the later of its join and its gaining drive; no earlier step is sent to it. Once
+  an addressed release body is durably cataloged by its recipient, key installation MUST become
+  runnable from that publication itself; a best-effort display/event wake is not the obligation,
+  and daemon restart MUST recover an uninstalled catalog entry from the room.
 - **SC-2b.** When a member loses drive (downgraded to read, or untrusted), the node MUST rotate the
   Session key and release the new one only to the members that still have drive, as ADR-020 3.6
   does for the sender key. The member keeps what it already read and reads nothing sealed

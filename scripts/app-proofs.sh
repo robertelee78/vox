@@ -414,13 +414,15 @@ fi
 # Every red names its side: a red the suite reports is the product's or the proof's own, said in
 # its failure message (PRODUCT: or APPARATUS:); a runner that never started is the machine's.
 status=0
+NATIVE_NODE="${VOX_PROOF_NATIVE_NODE:-$(command -v node || true)}"
+[ -n "$NATIVE_NODE" ] || NATIVE_NODE=/Users/admin/vox-app-proofs/apparatus/node
 TEST_RUNNER_VOX_PROOF_STEP="${VOX_PROOF_STEP:-}" \
 TEST_RUNNER_VOX_PROOF_APP="$APP" TEST_RUNNER_VOX_PROOF_SCRATCH="$SCRATCH" \
     TEST_RUNNER_VOX_PROOF_STAGER_PORT="$(cat "$SCRATCH/stager.port")" \
     TEST_RUNNER_VOX_PROOF_STAGER_TOKEN="$TOKEN" \
     TEST_RUNNER_VOX_PROOF_FROM="${VOX_PROOF_FROM:-}" \
     TEST_RUNNER_VOX_PROOF_KNOBS_VOX="$ROOT/target/proof-knobs/release/vox" \
-    TEST_RUNNER_VOX_PROOF_NATIVE_NODE="${VOX_PROOF_NATIVE_NODE:-/Users/admin/vox-app-proofs/apparatus/node}" \
+    TEST_RUNNER_VOX_PROOF_NATIVE_NODE="$NATIVE_NODE" \
     TEST_RUNNER_VOX_PROOF_OPENCODE_HOST="$ROOT/crates/vox-tui/tests/support/opencode_plugin_host.mjs" \
     TEST_RUNNER_VOX_PROOF_CONTINUE="${VOX_PROOF_CONTINUE:-}" \
     xcodebuild -project apps/macos/Vox.xcodeproj -scheme Vox -configuration Release \

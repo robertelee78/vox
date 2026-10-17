@@ -97,6 +97,9 @@ use crate::identity::composite::{CompositePublicKey, RootSigner};
 use crate::log::dag::{AdmissionPolicy, Dag, ForkProof};
 use crate::log::entry::{Entry, EntryKind, EntryRead, EntrySkeleton, ZERO_HASH};
 use crate::log::feed::lipmaa;
+use crate::log::history::{
+    ConsistentPrefix, Descriptor, LocalAppendBudget, LogScope, SignedHead, TreeBinding,
+};
 use crate::log::sync::{frontier_session_peer, AuthorResolver, Transport};
 use crate::nat::bootstrap::BootstrapSet;
 use crate::nat::record::Admission;
@@ -135,6 +138,28 @@ const SEG_ORIGINS: u64 = 6;
 /// (M18.1): target → the highest generation this identity has delivered to it. What
 /// is *owed* is derived from this and the consent set, so it cannot go stale.
 const SEG_DELIVERED: u64 = 7;
+
+/// Persist the canonical signed empty public head before a new sparse room becomes visible.
+/// A joiner has no entry yet, but another member still needs an exact object to acknowledge
+/// before this node may leave the unsettled state and author its first entry.
+fn initialize_sparse_identity(
+    index: &mut entry_store::Write<'_, '_>,
+    signer: &dyn RootSigner,
+    room: Digest32,
+    epoch: u64,
+) -> Result<()> {
+    let binding = TreeBinding {
+        author: signer.fingerprint(),
+        room,
+        scope: LogScope::Public,
+    };
+    let signed = SignedHead::sign(binding, epoch, Descriptor::empty(binding), signer)?;
+    let mut budget = LocalAppendBudget::new();
+    let verified = budget.verify_head(&signed, &signer.public_key())?;
+    let prefix = ConsistentPrefix::empty(&verified)?;
+    index.commit_history_head(&verified, &prefix)?;
+    Ok(())
+}
 
 /// This node's **own admission** to the channel, within [`SegmentKind::KeyMaterial`]
 /// (M17.6): whether it created the channel, or the [`crate::nat::record::JoinWitness`] a member signed
@@ -891,6 +916,9 @@ pub struct RoomNotice {
 /// size it saves on one skeleton, so one per 32 costs about 3% of what it frees, and a room
 /// that expires slowly is not filled with checkpoints.
 pub const CHECKPOINT_EVERY: usize = 32;
+/// Maximum checkpoint-covered positions rewritten in one periodic maintenance turn. A peer can
+/// arrive after many checkpoints, so the receiver must not walk that entire range on its actor.
+const SIGNATURE_SWEEP_PAGE: usize = 64;
 
 /// How many of this node's own newest messages in a room a client is told the readers of (ADR-028
 /// R-6): more than a screen holds, and a bound on what every snapshot of the node carries.
@@ -975,7 +1003,6 @@ pub struct ChannelState {
     governance_display: governance::Display,
     governance_ready: bool,
     /// A completed authenticated current-head flow may settle after bounded maintenance.
-    sparse_settle_pending: bool,
     /// Current presence per admitted author, bounded by AUTHORS_HARD_LIMIT; no event history.
     presence: BTreeMap<Digest32, governance::Presence>,
     /// Highest semantically applied sparse entry per admitted author. Rebuilt from the
@@ -1852,6 +1879,7 @@ impl ChannelState {
         index.initialize_restart(epoch)?;
         if genesis.body.authenticated_history() {
             index.initialize_sparse_history()?;
+            initialize_sparse_identity(&mut index, signer, channel_id, epoch)?;
         }
         index.empty_rendered()?;
         index.seal()?;
@@ -1877,7 +1905,6 @@ impl ChannelState {
             forks_kept: 0,
             governance_display,
             governance_ready: false,
-            sparse_settle_pending: false,
             presence: BTreeMap::new(),
             sparse_applied_tips: BTreeMap::new(),
             sender,
@@ -2562,7 +2589,6 @@ impl ChannelState {
             forks_kept,
             governance_display,
             governance_ready: false,
-            sparse_settle_pending: false,
             presence,
             sparse_applied_tips,
             sender,
@@ -2798,6 +2824,7 @@ impl ChannelState {
         index.initialize_restart(epoch)?;
         if genesis.body.authenticated_history() {
             index.initialize_sparse_history()?;
+            initialize_sparse_identity(&mut index, signer, *channel_id, epoch)?;
         }
         index.empty_rendered()?;
         index.seal()?;
@@ -2824,7 +2851,6 @@ impl ChannelState {
             forks_kept: 0,
             governance_display,
             governance_ready: false,
-            sparse_settle_pending: false,
             presence: BTreeMap::new(),
             sparse_applied_tips: BTreeMap::new(),
             sender,
@@ -3258,6 +3284,10 @@ impl ChannelState {
             self.save_error = Some(e.to_string());
             return Err(e);
         }
+        // Capability announcements are live room traffic. A newly admitted member cannot read
+        // the announcement that predates its admission, so the next bounded maintenance turn
+        // republishes it. The obligation is recreated on open if the process stops here.
+        self.owe_private_support();
         self.governance_ready = false;
         Ok(true)
     }
@@ -3469,10 +3499,11 @@ impl ChannelState {
         let read = self.entries.read(store, &self.sek, &room)?;
         self.key_packages
             .next(store, &self.sek, &room, &me, &read, trust_digest, |entry| {
-                entry.skeleton.channel_id == room
+                Ok(entry.skeleton.channel_id == room
                     && entry.skeleton.epoch == epoch
                     && entry.skeleton.seq != 0
-                    && entry.skeleton.seq <= dag.verified_head(&entry.skeleton.author_id)
+                    && (entry.skeleton.seq <= dag.verified_head(&entry.skeleton.author_id)
+                        || read.history_effect_finished(&entry.entry_hash())?))
             })
     }
 
@@ -5664,13 +5695,22 @@ impl ChannelState {
         {
             return Ok(0);
         }
+        // The actor asks every tick so a newly accepted checkpoint is handled promptly. Most
+        // ticks have no new checkpoint range. Do not turn those no-ops into a durable database
+        // commit: its synchronous fsync would park this room's actor and strand unrelated live
+        // work (including a just-received key package).
+        if !self.dag.checkpoint_signature_sweep_due() {
+            return Ok(0);
+        }
         let result = (|| -> Result<usize> {
             let mut batch = store.batch()?;
             let mut index = self
                 .entries
                 .write(&mut batch, &self.sek, &self.channel_id)?;
             index.committing(self.next_log_id);
-            let dropped = self.dag.drop_checkpointed_signatures(&mut index)?;
+            let dropped = self
+                .dag
+                .drop_checkpointed_signatures(&mut index, SIGNATURE_SWEEP_PAGE)?;
             index.note_swept(&self.dag)?;
             index.seal()?;
             batch.commit()?;
@@ -6104,7 +6144,6 @@ impl ChannelState {
         }
         if settle_sparse {
             self.settled = true;
-            self.sparse_settle_pending = false;
         }
         self.entries.committed();
         self.next_log_id = id.saturating_add(1);
@@ -6903,17 +6942,21 @@ impl ChannelState {
     /// session that brought it, when the node opens it): before that, nothing here can tell the key
     /// changed, and the session's node is the authority on whom it lets drive (DR-2).
     pub fn drive_from(&self, store: &Store) -> Result<Vec<Digest32>> {
-        if !self.private_controls_ready(store)? {
+        if !self.current_session_controls_ready(store)? {
             return Err(Error::StreamRefused("Session control facts are refreshing"));
         }
         let held: BTreeSet<Digest32> = self.drive.receivers.keys().map(|(a, _)| *a).collect();
         let mut from = BTreeSet::new();
         for author in held {
-            let legacy = self.legacy_drive_generation(store, &author)?;
             let announced = self
                 .floor_author(Transaction::Snapshot(&store.snapshot()?), &author)?
                 .announced;
-            let newest = legacy.into_iter().chain(announced).max();
+            // A signed current floor is authoritative in sparse rooms. Only an older author
+            // without floors needs the contiguous legacy encrypted-generation fallback.
+            let newest = match announced {
+                Some(generation) => Some(generation),
+                None => self.legacy_drive_generation(store, &author)?,
+            };
             if newest.is_none_or(|g| self.drive.receivers.contains_key(&(author, g)))
                 || self.key_packages.pending_from(&author)
             {
@@ -6971,8 +7014,15 @@ impl ChannelState {
         holders: &BTreeSet<Digest32>,
         now_ms: u64,
     ) -> Result<()> {
-        self.index_session_floors(store)?;
         let me = self.me();
+        // This author's own floor boundary waits only on this author's own control effects
+        // through its committed head; another author's still-building receipt is not this
+        // author's publication's to wait on.
+        if !self.current_session_control_ready(store, &me)? {
+            return Err(Error::StreamRefused(
+                session_projection::floor_index::REFRESHING,
+            ));
+        }
         let published = self
             .floor_author(Transaction::Snapshot(&store.snapshot()?), &me)?
             .announced;
@@ -7694,7 +7744,18 @@ impl ChannelState {
             };
             match allowed {
                 Some(true) => {}
-                Some(false) => return Ok(ContentProjection::Applied),
+                Some(false) => {
+                    if !historical {
+                        // The author's consent control can be causally ahead of this content but
+                        // still in flight locally. Persist the reprojection cursor in the same
+                        // Batch as this effect: if the consent wake raced ahead of effect finish,
+                        // the completed turn still leaves bounded work for the next local wake.
+                        let mut writer = self.entries.write(batch, &self.sek, &self.channel_id)?;
+                        writer.queue_backfill(author, Some(1))?;
+                        writer.seal()?;
+                    }
+                    return Ok(ContentProjection::Applied);
+                }
                 None => {
                     let mut writer = self.entries.write(batch, &self.sek, &self.channel_id)?;
                     writer.queue_backfill(author, Some(1))?;
@@ -7732,7 +7793,15 @@ impl ChannelState {
             }
         }
         let Some(chain) = self.receivers.get_mut(&slot) else {
-            return Ok(ContentProjection::Deferred);
+            if !historical {
+                // SKDM installation normally queues this author, but it may commit and drain
+                // before the concurrently admitted content effect finishes. Queue again at the
+                // effect's own crash boundary so that ordering cannot lose the reprojection.
+                let mut writer = self.entries.write(batch, &self.sek, &self.channel_id)?;
+                writer.queue_backfill(author, Some(1))?;
+                writer.seal()?;
+            }
+            return Ok(ContentProjection::Applied);
         };
         let plaintext = match if historical {
             chain.decrypt_history(&msg)

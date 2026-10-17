@@ -920,7 +920,8 @@ final class NodeModel: ObservableObject {
     }
     var observationToken: UUID { nodeObservationEpoch }
     func acceptsObservation(_ token: UUID, actor: String) -> Bool {
-        token == nodeObservationEpoch && actor == me && ended == nil && !Task.isCancelled
+        token == nodeObservationEpoch && actor == me
+            && (ended == nil || observationNeedsRestart) && !Task.isCancelled
     }
     fileprivate func acceptsArrivalInstance(_ instance: Data, room: String) -> Bool {
         roomOnScreen != room || roomInstance == nil || roomInstance == instance
@@ -1181,6 +1182,23 @@ final class NodeModel: ObservableObject {
         return newest ? Array(kept.reversed()) : kept
     }
 
+    /// A current room page can lose its authority while retention or projection work crosses the
+    /// read. These refusals keep the visible snapshot and retry; lifecycle and access refusals do
+    /// not become transient merely because they are also `Failed`.
+    private static func transientRoomReadRefusal(_ reason: String) -> Bool {
+        switch reason {
+        case "The room changed while reading. Refresh and try again.",
+             "the room changed while reading; refresh and retry",
+             "the room is preparing selected history; retry",
+             "room governance is refreshing; try again when it is ready",
+             "the room is removing expired saved history; retry",
+             "the room is refreshing saved history; retry":
+            return true
+        default:
+            return false
+        }
+    }
+
     private func retainedRoomEntries(room: String, view: RoomView? = nil, instance: Data, ids: [String],
                                      current: () -> Bool) async throws -> [RoomMessage] {
         guard current(), !Task.isCancelled else { throw CancellationError() }
@@ -1251,6 +1269,23 @@ final class NodeModel: ObservableObject {
             }
         } catch {
             guard current() else { return }
+            // A room mutation can invalidate the fresh page between its two authority fences.
+            // Reload that same room's authoritative newest page and roster while leaving the
+            // displayed snapshot in place. Transport and other read failures keep the explicit
+            // recovery path below.
+            if follows, case let VoxError.Failed(reason) = error,
+               Self.transientRoomReadRefusal(reason) {
+                if reason == "the room is preparing selected history; retry" {
+                    let refreshed = await refresh(restartObservation: false)
+                    guard refreshed, current() else { return }
+                    if rooms.first(where: { $0.id == id })?.preparing != true {
+                        await show(.room(id))
+                    }
+                    return
+                }
+                await show(.room(id))
+                return
+            }
             retireRefusedRoomRead(error)
             reportBackground(error)
         }
@@ -1479,7 +1514,7 @@ final class NodeModel: ObservableObject {
             if outcome?.operation == "", outcome?.backgroundConnectivity == true { outcome = nil }
             if Int(view.peers) != peers { peers = Int(view.peers) }
             if view.keyring != keyring { keyring = view.keyring }
-            if fresh.first(where: { $0.name == node })?.state == "attached" {
+            if fresh.first(where: { $0.name == node })?.state == "attached", !recovering {
                 ended = nil
             }
             if recovering && restartObservation {
@@ -1503,6 +1538,14 @@ final class NodeModel: ObservableObject {
                 // Reachability and installed observation do not establish a published inventory.
                 // Keep recovery owned by the follow loop until the authoritative refresh lands.
                 guard refreshed else { observationNeedsRestart = true; return }
+                if case let .room(id) = selection {
+                    guard await show(.room(id), whileRecovering: true) else {
+                        observationNeedsRestart = true
+                        return
+                    }
+                } else {
+                    ended = nil
+                }
                 observationNeedsRestart = false
                 await reconcileUnread()
                 guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
@@ -1808,13 +1851,26 @@ final class NodeModel: ObservableObject {
     /// Show `selection`. A room shown is not read by being chosen: each message is read as it is
     /// drawn in view with the window in front ([`drawn`], ADR-028 R-6).
     func show(_ selection: Selection?) async {
+        _ = await show(selection, whileRecovering: false)
+    }
+
+    /// Reload the selected room while a stopped observer is reconnecting. Its old ordinary
+    /// timeline stays visible, but `ended` keeps every action unavailable until the new page and
+    /// roster have both arrived and are published together.
+    @discardableResult
+    private func show(_ selection: Selection?, whileRecovering: Bool) async -> Bool {
         select(selection)
         if case .decisions = selection {
             decisionEvents = await decisions()
         }
-        guard case let .room(id) = selection, ended == nil else { return }
-        guard rooms.first(where: { $0.id == id })?.preparing != true else { return }
-        watchReads(id)
+        guard case let .room(id) = selection,
+              ended == nil || whileRecovering && observationNeedsRestart else { return false }
+        guard rooms.first(where: { $0.id == id })?.preparing != true else {
+            // Preparing has no authoritative page or roster yet. Keep reconnect's unavailable
+            // state and its action boundary until this room can publish both.
+            return !whileRecovering
+        }
+        if !whileRecovering { watchReads(id) }
         let view = selectedRoomView, viewGeneration = roomViewGeneration
         let generation = roomReadGeneration
         let messageRevision = roomMessageRevision
@@ -1829,7 +1885,9 @@ final class NodeModel: ObservableObject {
             let unread = try await readUnreadSummary(id)
             let page = try await client.roomViewRead(room: id, view: view)
             let read = page.messages
-            guard viewGeneration == roomViewGeneration, generation == roomReadGeneration, self.selection == .room(id), ended == nil else { return }
+            guard viewGeneration == roomViewGeneration, generation == roomReadGeneration,
+                  self.selection == .room(id),
+                  ended == nil || whileRecovering && observationNeedsRestart else { return false }
             let services = try await client.servicesPage(room: id, after: nil, revision: nil)
             let rows = try await memberRows(id)
             let kept = (try? await client.retention(room: id)) ?? ""
@@ -1837,8 +1895,10 @@ final class NodeModel: ObservableObject {
             let done = try await client.noticesPage(room: id, before: nil, revision: nil)
             let livePage = try await client.sessionsOpenPage(room: id, after: liveAfter)
             let historyPage = try await client.sessionsPage(room: id, after: historyAfter)
-            guard viewGeneration == roomViewGeneration, generation == roomReadGeneration, self.selection == .room(id), ended == nil else { return }
-            guard messageRevision == roomMessageRevision else { return }
+            guard viewGeneration == roomViewGeneration, generation == roomReadGeneration,
+                  self.selection == .room(id),
+                  ended == nil || whileRecovering && observationNeedsRestart else { return false }
+            guard messageRevision == roomMessageRevision else { return false }
             // The page and its inspector replace the prior view together, after both reads
             // have succeeded. An ordinary refresh must not publish a half-empty room.
             roomInstance = page.instance
@@ -1870,16 +1930,27 @@ final class NodeModel: ObservableObject {
                 sessionsOpenNext = livePage.next
                 sessionsHistoryNext = historyPage.next
             }
+            // Only this joint room-page/roster publication retires reconnect's unavailable state.
+            if whileRecovering { ended = nil }
             await loadStepRetention()
-            guard !Task.isCancelled, generation == roomReadGeneration, selection == .room(id), ended == nil else { return }
+            guard !Task.isCancelled, generation == roomReadGeneration,
+                  self.selection == .room(id), ended == nil else { return false }
             await loadRoomAnchorState()
-            guard viewGeneration == roomViewGeneration, generation == roomReadGeneration, self.selection == .room(id), ended == nil else { return }
+            guard viewGeneration == roomViewGeneration, generation == roomReadGeneration,
+                  self.selection == .room(id), ended == nil else { return false }
             // A Session restored as this room's last view is read once the room lists it (D12).
-            if showingSession { await readSession() }
+            if showingSession {
+                if whileRecovering { await readSelectedSessionMetadata() }
+                if showingSession { await readSession() }
+            }
             watchReads(id)
+            return true
         } catch {
-            guard viewGeneration == roomViewGeneration, generation == roomReadGeneration, self.selection == .room(id), ended == nil else { return }
+            guard viewGeneration == roomViewGeneration, generation == roomReadGeneration,
+                  self.selection == .room(id),
+                  ended == nil || whileRecovering && observationNeedsRestart else { return false }
             reportBackground(error)
+            return false
         }
     }
 
@@ -2472,8 +2543,9 @@ final class NodeModel: ObservableObject {
         let editor = sheetInstance, origin = selection
         // The mutation opens a room, so its ChannelOpened event may restart observation and
         // retire the old read epoch. That does not retire the person's creation intent.
-        // Keep the exact sheet and navigation fences; reads still use their own fresh epochs.
-        func current(_ expected: Selection?) -> Bool {
+        // Keep the exact sheet and navigation fences until creation succeeds; reads use their
+        // own fresh epochs after the successful sheet is dismissed.
+        func currentEditor(_ expected: Selection?) -> Bool {
             currentOwner() && !Task.isCancelled && sheet == .newRoom && sheetInstance == editor && selection == expected
         }
         do {
@@ -2481,18 +2553,27 @@ final class NodeModel: ObservableObject {
             defer { passphrase.wipe() }
             let room = try await client.createRoomWithAnchors(name: name, passphrase: passphrase,
                                                              anchors: anchors, node: me)
-            guard current(origin) else { return false }
+            guard currentEditor(origin) else { return false }
             report(operation: operation, done: "Created the room.")
-            // Publish the successful navigation before yielding to observation recovery.
-            // Neither a cancelled sheet nor a later navigation may be taken over on return.
+            // Publish the successful navigation and dismiss its modal editor before yielding to
+            // observation recovery. Native room commands (including Command-L) must be available
+            // as soon as creation succeeds; a full sidebar/page refresh may take much longer.
+            // Keep the room inventory coherent with that navigation at the same boundary: room
+            // commands may run while the authoritative refresh is still reading the sidebar.
             let destination = Selection.room(room)
+            if !rooms.contains(where: { $0.id == room }) {
+                rooms.append(Room(id: room, name: name, open: true, preparing: false))
+            }
             select(destination)
+            sheet = nil
             await refresh()
-            guard current(destination) else { return false }
+            // Creation is already complete. A later choice may supersede its background reads;
+            // never navigate back over it when those reads return.
+            guard currentOwner(), !Task.isCancelled, selection == destination else { return true }
             await show(destination)
-            return current(destination)
+            return true
         } catch {
-            guard current(origin) else { return false }
+            guard currentEditor(origin) else { return false }
             report(error, operation: operation)
             return false
         }
@@ -3645,10 +3726,17 @@ final class NodeModel: ObservableObject {
         roomReadGeneration = UUID()
         invalidateRoomAnchorState(preservingSnapshot: true)
         rejectedRoomMark = nil
-        roomNeedsPage = false
-        // An ended stream does not establish whether a protected node is Locked or a
-        // passphraseless node is already Ready again. Display only the fresh snapshot.
-        releaseHistoryViews()
+        // A transport end invalidates the authority of the selected room, but not the bounded
+        // ordinary-room snapshot the person was already reading. Session bodies require current
+        // drive authorization, so they are withheld until reconnect checks that exact Session.
+        // The room's actions remain unavailable until its page and inspector replace the snapshot
+        // together. A confirmed detach/lock releases the rest after the node state is known.
+        if case .room = selection {
+            let snapshot = messages
+            releaseHistoryViews()
+            messages = snapshot
+            roomNeedsPage = true
+        }
         ended = "Node \(node) is unavailable."
         machineStateKnown = false
         daemonReachable = text.localizedCaseInsensitiveContains("detached")

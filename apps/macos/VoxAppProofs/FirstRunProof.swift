@@ -573,7 +573,7 @@ final class FirstRunProof: XCTestCase {
             $0.contains(" lifecycle")
         }.split(whereSeparator: \.isWhitespace).first.map(String.init) ?? ""
         try staged(vox, ["room", "post", "--node", "alice", room, "LIFECYCLE-BODY-PRESERVED"], env: voxEnv)
-        try stager.write(Data("alice\n".utf8), to: config + "/app/node")
+        try staged(vox, ["computer", "personal", "alice"], env: voxEnv)
         // A file's words, or "" when there is none (its absence is what Return must leave).
         func read(_ name: String) -> String {
             stager.run(["/bin/sh", "-c", "cat \"$0\" 2>/dev/null", config + "/app/" + name], env: [:]).out
@@ -797,9 +797,9 @@ final class FirstRunProof: XCTestCase {
         guard ui.wait(for: .notRunning, timeout: 15) else {
             throw Product("public Quit must stop Alice's window before staging the plain-node client")
         }
-        // As in the initial fixture, select the next scratch client's saved node before launch.
+        // Select the next scratch client's saved node through the daemon authority before launch.
         // This stages the acting identity; it does not claim Forget changes a window's identity.
-        try stager.write(Data("plain\n".utf8), to: config + "/app/node")
+        try staged(vox, ["computer", "personal", "plain"], env: voxEnv)
         try launchVox(ui, appPath, env: ui.launchEnvironment, scratch: scratchPath)
         guard words(ui, Key.id("attached"), timeout: 60,
                     "the next client must actually act as the passphraseless node Ready",
@@ -886,7 +886,7 @@ final class FirstRunProof: XCTestCase {
         try staged(vox, ["node", "create", "alice", "--passphrase-file", pass], env: voxEnv)
         try staged(vox, ["node", "attach", "alice", "--keep", "--passphrase-file", pass], env: voxEnv)
         try stager.write(Data("keep\n".utf8), to: config + "/app/login-item")
-        try stager.write(Data("alice\n".utf8), to: config + "/app/node")
+        try staged(vox, ["computer", "personal", "alice"], env: voxEnv)
         try stager.write(Data("off\n".utf8), to: config + "/app/menubar")
         try stager.write(Data("registered vox-proof-service-stand-in\n".utf8),
                          to: config + "/app/proof-login-item")
@@ -1032,7 +1032,7 @@ final class FirstRunProof: XCTestCase {
         try staged(vox, ["room", "post", "--node", "alice", room, "MEASURE-THIS-MESSAGE"], env: voxEnv)
         try staged(vox, ["room", "post", "--node", "alice", room, "AND-THE-NEXT-ONE"], env: voxEnv)
         try stager.write(Data("no\n".utf8), to: config + "/app/login-item")
-        try stager.write(Data("alice\n".utf8), to: config + "/app/node")
+        try staged(vox, ["computer", "personal", "alice"], env: voxEnv)
 
         let ui = voxApp(appPath)
         ui.launchEnvironment = voxEnv.merging(["HOME": home]) { $1 }
@@ -1141,7 +1141,7 @@ final class FirstRunProof: XCTestCase {
         }.split(whereSeparator: \.isWhitespace).first.map(String.init) ?? ""
         try staged(vox, ["room", "post", "--node", "alice", room, "LOOK-AT-THIS"], env: voxEnv)
         try stager.write(Data("no\n".utf8), to: config + "/app/login-item")
-        try stager.write(Data("alice\n".utf8), to: config + "/app/node")
+        try staged(vox, ["computer", "personal", "alice"], env: voxEnv)
 
         let ui = voxApp(appPath)
         ui.launchEnvironment = voxEnv.merging(["HOME": home]) { $1 }
@@ -1491,7 +1491,7 @@ final class FirstRunProof: XCTestCase {
                        env: voxEnv.merging(["VOX_IDENTITY_PASSPHRASE": "alice identity"]) { $1 })
         }
         try stager.write(Data("no\n".utf8), to: config + "/app/login-item")
-        try stager.write(Data("alice\n".utf8), to: config + "/app/node")
+        try staged(vox, ["computer", "personal", "alice"], env: voxEnv)
         // The widths start from the standard ones: the column keys, in the bundle under proof's
         // own defaults (never the person's Vox), are removed first.
         let domain = stager.run(["/usr/bin/defaults", "read", appPath + "/Contents/Info", "CFBundleIdentifier"],
@@ -1674,8 +1674,7 @@ final class FirstRunProof: XCTestCase {
         try stager.write(Data("bob identity\n".utf8), to: pass("bob"))
         try stager.write(Data("notify room\n".utf8), to: pass("room"))
         // The first-run question is left unanswered, so the menu bar toggle is clicked as a
-        // person does (the path that once did nothing); the node is chosen before.
-        try stager.write(Data("alice\n".utf8), to: config + "/app/node")
+        // person does (the path that once did nothing).
         daemon = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"], env: voxEnv,
                            until: "vox daemon: control socket")
         for (name, words) in [("alice", "alice identity"), ("bob", "bob identity")] {
@@ -1683,6 +1682,7 @@ final class FirstRunProof: XCTestCase {
                        env: voxEnv.merging(["VOX_IDENTITY_PASSPHRASE": words]) { $1 })
             try staged(vox, ["node", "attach", name, "--passphrase-file", pass(name)], env: voxEnv)
         }
+        try staged(vox, ["computer", "personal", "alice"], env: voxEnv)
         let aliceFp = try line(staged(vox, ["id", "--node", "alice"], env: voxEnv)) { $0.count == 52 }
         let bobFp = try line(staged(vox, ["id", "--node", "bob"], env: voxEnv)) { $0.count == 52 }
         try staged(vox, ["room", "create", "--node", "alice", "--passphrase-file", pass("room"),
@@ -1699,6 +1699,14 @@ final class FirstRunProof: XCTestCase {
                          "--identity-passphrase-file", pass("alice")], env: voxEnv)
         try staged(vox, ["trust", "add", "--node", "bob", aliceFp, "--name", "alice",
                          "--identity-passphrase-file", pass("bob")], env: voxEnv)
+        // Bob's addressed post comes from an agent Session. Open it through the same first-turn
+        // hook a real Claude Code session runs; a VOX_SESSION marker alone is not registration.
+        let opened = run(vox, ["agent", "hook", "--node", "bob", "--room", room, "--format", "text"],
+                         env: voxEnv.merging(["CLAUDE_CODE_ENTRYPOINT": "cli"]) { $1 },
+                         input: "{\"session_id\":\"bob-proof\",\"hook_event_name\":\"UserPromptSubmit\",\"cwd\":\"/tmp\",\"transcript_path\":\"/tmp/t.jsonl\",\"prompt\":\"notify alice\"}")
+        guard opened.status == 0 else {
+            throw Apparatus("bob's Claude Code hook, to open the notification sender Session, exited \(opened.status): \(opened.out)")
+        }
         // Forward-only keys: bob posts until one is readable to alice.
         var readable = false
         let staging = Date().addingTimeInterval(120)
@@ -2082,7 +2090,6 @@ final class FirstRunProof: XCTestCase {
                                             stderr: computerRoot.appendingPathComponent("native-host.stderr").path)
         defer { nativeHost.terminate() }
         _ = try nativeHost.command("title Pairing native OpenCode")
-        _ = try nativeHost.command("turn NATIVE-799-INITIAL")
         func nativeEvent(_ object: [String: Any]) throws {
             let json = try JSONSerialization.data(withJSONObject: object)
             _ = try nativeHost.command("event " + String(decoding: json, as: UTF8.self))
@@ -2092,6 +2099,29 @@ final class FirstRunProof: XCTestCase {
         let initialText: [String: Any] = ["type": "message.part.updated", "properties": ["part":
             ["id": "part_799_user", "messageID": "msg_799_user", "sessionID": nativeSession,
              "type": "text", "text": "NATIVE-799-INITIAL"]]]
+        let nativeOpenUntil = Date().addingTimeInterval(20)
+        var nativeOwner = (status: Int32(-1), out: "")
+        var nativeTurnAnswers: [[String: Any]] = []
+        repeat {
+            // A bounded first turn can truthfully say that this freshly attached node is still
+            // preparing and to try again next turn. Model only that documented next turn. Events
+            // cannot establish the Session before the plugin hook has opened it, so replaying only
+            // the bus events (the old apparatus) could wait forever for a Session that did not exist.
+            let answer = try nativeHost.command("turn NATIVE-799-INITIAL")
+            nativeTurnAnswers.append(answer)
+            let observeUntil = min(nativeOpenUntil, Date().addingTimeInterval(1))
+            repeat {
+                nativeOwner = run(vox, ["room", "session", "--node", "protected", "--json", keptRoom, nativeSession], env: computerB)
+                if nativeOwner.status == 0 { break }
+                Thread.sleep(forTimeInterval: 0.1)
+            } while Date() < observeUntil
+            if nativeOwner.status == 0 { break }
+            let text = answer["text"] as? String ?? ""
+            guard text.contains("try again next turn") || text.contains("is preparing node") else { break }
+        } while Date() < nativeOpenUntil
+        guard nativeOwner.status == 0 else {
+            throw Apparatus("the native OpenCode hook did not establish its repo-bound Session on protected; native turns said \(nativeTurnAnswers); owner's `vox room session --json` exited \(nativeOwner.status) saying \(nativeOwner.out)")
+        }
         let nativeInitialUntil = Date().addingTimeInterval(60)
         var nativeInitial = ""
         while Date() < nativeInitialUntil {
@@ -2101,7 +2131,7 @@ final class FirstRunProof: XCTestCase {
             Thread.sleep(forTimeInterval: 0.3)
         }
         guard nativeInitial.contains("NATIVE-799-INITIAL") else {
-            throw Apparatus("the repo-bound native Session was not established for the personal receiver: \(nativeInitial)")
+            throw Product("the computer-trusted personal node did not receive the protected node's established native Session within 60 seconds; it said \(nativeInitial)")
         }
         tap(pairingUI, Key.id("session-\(nativeSession.prefix(8))"), "The native OpenCode Session in the joined room")
         guard present(pairingUI, Key.id("session-compose"), timeout: 30,
@@ -2741,9 +2771,8 @@ final class FirstRunProof: XCTestCase {
         try stager.write(Data("work room\n".utf8), to: pass("room"))
         try stager.write(Data("keep\n".utf8), to: work + "/.keep")
         try stager.write(Data("keep\n".utf8), to: home + "/.keep")
-        // The first run answered (Not Now) and the node chosen: the app opens as alice.
+        // The first run answered (Not Now); the daemon's public selection below opens as alice.
         try stager.write(Data("no\n".utf8), to: config + "/app/login-item")
-        try stager.write(Data("alice\n".utf8), to: config + "/app/node")
         // An ordinary empty room map is the known baseline for the wrong-passphrase check.
         try stager.write(Data(), to: data + "/rooms")
         let mapMode = stager.run(["/bin/chmod", "600", data + "/rooms"], env: [:])
@@ -2759,6 +2788,7 @@ final class FirstRunProof: XCTestCase {
                        env: voxEnv.merging(["VOX_IDENTITY_PASSPHRASE": words]) { $1 })
             try staged(vox, ["node", "attach", name, "--passphrase-file", pass(name)], env: voxEnv)
         }
+        try staged(vox, ["computer", "personal", "alice"], env: voxEnv)
         let aliceFp = try line(staged(vox, ["id", "--node", "alice"], env: voxEnv)) { $0.count == 52 }
         let agentFp = try line(staged(vox, ["id", "--node", "claude-a"], env: voxEnv)) { $0.count == 52 }
         var rooms: [String: String] = [:]
@@ -2787,6 +2817,27 @@ final class FirstRunProof: XCTestCase {
         guard closedKeyring.contains("keyring asks for the passphrase") else {
             throw Apparatus("alice's keyring window did not close before room work: \(closedKeyring)")
         }
+        // Lock/Unlock replaces Alice's actor. Establish the real peer path again before Session
+        // injection, rather than mistaking a reconnect delay for a Session UI result.
+        let readyMarker = "SESSION-STAGING-READY"
+        let readyUntil = Date().addingTimeInterval(60)
+        var readyPost: (status: Int32, out: String) = (-1, "")
+        var readyRead: (status: Int32, out: String) = (-1, "")
+        // Post one durable marker, as a person does. Posting another marker on every read poll
+        // starts fresh live-sync work while the two reopened rooms are already reconnecting; the
+        // proof itself could then keep the bounded history buffers busy and prevent its first
+        // marker from being observed.
+        while Date() < readyUntil && readyPost.status != 0 {
+            readyPost = run(vox, ["room", "post", "--node", "claude-a", room, readyMarker], env: voxEnv)
+            if readyPost.status != 0 { Thread.sleep(forTimeInterval: 0.5) }
+        }
+        while Date() < readyUntil && !readyRead.out.contains(readyMarker) {
+            readyRead = run(vox, ["room", "read", "--node", "alice", room], env: voxEnv)
+            if !readyRead.out.contains(readyMarker) { Thread.sleep(forTimeInterval: 0.5) }
+        }
+        guard readyPost.status == 0, readyRead.out.contains(readyMarker) else {
+            throw Apparatus("peer readiness was not re-established after Alice's Unlock; post exited \(readyPost.status) saying \(readyPost.out.debugDescription), read exited \(readyRead.status) saying \(readyRead.out.debugDescription)")
+        }
         // Claude Code's two sessions, opened by its hook as it runs it.
         let hookEnv = voxEnv.merging(["HOME": home, "VOX_NODE": "claude-a",
                                       "VOX_IDENTITY_PASSPHRASE": "agent identity",
@@ -2799,10 +2850,12 @@ final class FirstRunProof: XCTestCase {
             let bytes = (try? JSONSerialization.data(withJSONObject: e)) ?? Data()
             return String(decoding: bytes, as: UTF8.self)
         }
-        func hook(_ json: String) throws {
+        @discardableResult
+        func hook(_ json: String) throws -> String {
             let r = stager.run(["/bin/sh", "-c", "cd \"$1\" && exec \"$2\" agent hook --node claude-a --room \"$3\"",
                                 "hook", work, vox, room], env: hookEnv, input: json)
             guard r.status == 0 else { throw Apparatus("`vox agent hook` exited \(r.status): \(r.out)") }
+            return r.out
         }
 
         let asked = root.appendingPathComponent("asked")
@@ -2811,13 +2864,34 @@ final class FirstRunProof: XCTestCase {
         if selectedStep.isEmpty {
             for (session, words) in [(s1, "S1-WORDS"), (s2, "S2-WORDS")] {
                 try stager.write(Data(("{\"type\":\"custom-title\",\"customTitle\":\"" + words + "\"}\n").utf8), to: work + "/\(session).jsonl")
-                try hook(event(session, "UserPromptSubmit", ["prompt": words]))
+                // A bounded hook says to try again on the next turn when the daemon is still
+                // preparing or did not answer promptly. Model that next turn only for that exact
+                // answer, and first verify on the Session owner's node so peer replication cannot
+                // be mistaken for hook staging.
+                let openUntil = Date().addingTimeInterval(20)
+                var opened = (status: Int32(-1), out: "")
+                var hookAnswers: [String] = []
+                repeat {
+                    let answer = try hook(event(session, "UserPromptSubmit", ["prompt": words]))
+                    hookAnswers.append(answer)
+                    let observeUntil = min(openUntil, Date().addingTimeInterval(1))
+                    repeat {
+                        opened = run(vox, ["room", "session", "--node", "claude-a", "--json", room, session], env: voxEnv)
+                        if opened.status == 0 { break }
+                        Thread.sleep(forTimeInterval: 0.1)
+                    } while Date() < observeUntil
+                    if opened.status == 0 { break }
+                    guard answer.contains("try again next turn") || answer.contains("is preparing node") else { break }
+                } while Date() < openUntil
+                guard opened.status == 0 else {
+                    throw Apparatus("staging not achieved: Claude's \(words) hook did not open Session \(session) on claude-a; hook said \(hookAnswers.debugDescription); `vox room session --json` exited \(opened.status) saying \(opened.out.debugDescription)")
+                }
             }
             // S1 asks an approval: its hook waits for the answer, in the background, its pid kept.
             // Only the hook itself goes to the background, with its own output in a file, so nothing
             // left running holds the stager's pipe open; `&&` would background a subshell holding it.
             let touch: [String: Any] = ["command": "touch p1", "description": "Make p1"]
-            try hook(event(s1, "PreToolUse", ["tool_name": "Bash", "tool_input": touch, "tool_use_id": "toolu_P1"]))
+            let preToolAnswer = try hook(event(s1, "PreToolUse", ["tool_name": "Bash", "tool_input": touch, "tool_use_id": "toolu_P1"]))
             try stager.write(Data(event(s1, "PermissionRequest", ["tool_name": "Bash", "tool_input": touch,
                                                                    "permission_suggestions": []]).utf8),
                              to: asked.path + ".json")
@@ -2839,7 +2913,8 @@ final class FirstRunProof: XCTestCase {
                 if !s1Now.contains("\"waiting\":true") { Thread.sleep(forTimeInterval: 0.5) }
             }
             guard s1Now.contains("\"waiting\":true") else {
-                throw Apparatus("staging not achieved: S1's request is not waiting on alice within 20 s; `vox room session --json` said \(s1Now.debugDescription)")
+                let requestAnswer = stager.run(["/bin/cat", asked.path + ".out"], env: [:]).out
+                throw Apparatus("staging not achieved: S1's request is not waiting on alice within 20 s; PreToolUse hook said \(preToolAnswer.debugDescription); PermissionRequest hook said \(requestAnswer.debugDescription); `vox room session --json` said \(s1Now.debugDescription)")
             }
 
         }
@@ -3236,7 +3311,7 @@ final class FirstRunProof: XCTestCase {
         handOff(ui, "q")
         guard ui.wait(for: .notRunning, timeout: 15) else { throw Product("Quit must stop Alice's client before staging the Drive viewer") }
         // The next client's acting identity is an initial fixture, never a claim that Forget switches nodes.
-        try stager.write(Data("claude-a\n".utf8), to: config + "/app/node")
+        try staged(vox, ["computer", "personal", "claude-a"], env: voxEnv)
         try launchVox(ui, appPath, env: ui.launchEnvironment, scratch: scratchPath)
         guard words(ui, Key.id("attached"), timeout: 60, "the authorized viewer must actually act as claude-a",
                     until: { $0 == "node claude-a, Ready" }) != nil else { return }
@@ -3364,7 +3439,6 @@ final class FirstRunProof: XCTestCase {
         }
         try stager.write(Data("pending room\n".utf8), to: pass("room"))
         try stager.write(Data("no\n".utf8), to: config + "/app/login-item")
-        try stager.write(Data("alice\n".utf8), to: config + "/app/node")
         // Only owned apparatus daemons use the existing knob to target these private Keychains.
         // The app and every CLI command remain the ordinary bundled binary.
         daemon = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"], env: voxEnv,
@@ -3378,6 +3452,7 @@ final class FirstRunProof: XCTestCase {
                        env: nodeEnv.merging(["VOX_IDENTITY_PASSPHRASE": "\(name) identity"]) { $1 })
             try staged(vox, ["node", "attach", name, "--passphrase-file", pass(name)], env: nodeEnv)
         }
+        try staged(vox, ["computer", "personal", "alice"], env: voxEnv)
         let aliceFp = try line(staged(vox, ["id", "--node", "alice"], env: voxEnv)) { $0.count == 52 }
         let bobFp = try line(staged(vox, ["id", "--node", "bob"], env: carolEnv)) { $0.count == 52 }
         let carolFp = try line(staged(vox, ["id", "--node", "carol"], env: carolEnv)) { $0.count == 52 }
@@ -3410,48 +3485,80 @@ final class FirstRunProof: XCTestCase {
         defer { ui.terminate() }
         present(ui, Key.id("attached"), timeout: 60, "the app must open attached as alice")
 
-        // Carol's offer, first (v0.4.3): its words give read, with no drive; Trust opens the
+        // Carol's member action, first: its words give read, with no drive; Trust opens the
         // passphrase form, and then that form's Trust is the only one on screen; left empty, its
         // Trust says the identity's passphrase is needed (alice's has one); Cancel brings back
         // the offer's Trust and Dismiss.
-        // In the room she joined, at the top of its General (v0.4.3: a trust offer is in the room
-        // it concerns; the sidebar lists rooms only).
+        // In the room she joined, beside her member row.
         tap(ui, Key.id("room-pending"), "pending in the sidebar")
         offers = run(vox, ["trust", "offers", "--node", "alice"], env: voxEnv).out
         guard offers.contains(String(carolFp.prefix(12))) else {
             throw Apparatus("staging no longer holds after opening the app: alice is not offered carol; `vox trust offers` said \(offers)")
         }
-        tap(ui, Key.id("offer-\(carolFp.prefix(12))"), "carol's offer at the top of pending's General",
+        tap(ui, Key.id("member-trust-\(carolFp)"), "Trust beside carol's member row",
             premise: Premise("carol is offered to alice") {
                 offers = self.run(vox, ["trust", "offers", "--node", "alice"], env: voxEnv).out
                 return (offers.contains(String(carolFp.prefix(12))), "`vox trust offers` said \(offers.debugDescription)")
             })
-        let explain = words(ui, Key.id("offer-explain"), timeout: 10,
-                            "carol's offer must say what trusting her gives") ?? ""
+        let explain = words(ui, Key.id("card-trust-effect"), timeout: 10,
+                            "carol's trust card must say what trusting her gives") ?? ""
         XCTAssertFalse(explain.lowercased().contains("drive"),
-                       "PRODUCT: the offer must say trusting gives read, with no drive (the app gives none); it says \(explain.debugDescription)")
-        words(ui, Key.id("offer-presented-name"), timeout: 90,
+                       "PRODUCT: the member trust card must say trusting gives read, with no drive (the app gives none); it says \(explain.debugDescription)")
+        words(ui, Key.id("card-presented-name"), timeout: 90,
               "Carol must present her own name before Alice trusts her", until: { $0 == "Name it presents: carol" })
-        words(ui, Key.id("offer-fingerprint"), timeout: 10,
+        words(ui, Key.id("card-fingerprint"), timeout: 10,
               "the suggested name must keep Carol's whole fingerprint visible", until: {
                   $0.filter { !$0.isWhitespace }.lowercased() == carolFp
               })
-        words(ui, Key.id("offer-alias"), timeout: 10,
+        words(ui, Key.id("card-alias"), timeout: 10,
               "Carol's presented name must be the editable local alias default, without typing", until: { $0 == "carol" }, field: true)
-        tap(ui, Key.id("offer-accept"), "Trust on carol's offer")
+        tap(ui, Key.id("card-trust-confirm"), "Trust on carol's member card")
         present(ui, Key.id("keyring-passphrase-continue"), timeout: 15,
                 "Trust on carol's offer, the keyring window closed, must ask for the passphrase")
-        XCTAssertNil(locate(ui, Key.id("offer-accept")),
-                     "PRODUCT: while the passphrase form is open its Trust must be the only one; the offer's own Trust still shows")
+        XCTAssertNil(locate(ui, Key.id("card-trust-confirm")),
+                     "PRODUCT: while the passphrase form is open its Trust must be the only one; the card's own Trust still shows")
         tap(ui, Key.id("keyring-passphrase-continue"), "Trust with the passphrase field left empty")
-        words(ui, Key.id("offer-failed"), timeout: 15,
+        words(ui, Key.id("card-failed"), timeout: 15,
               "Trust with the field empty, alice's identity having a passphrase, must say it is needed",
               until: { $0.contains("This node's identity has a passphrase") })
-        tap(ui, Key.id("keyring-passphrase-cancel"), "Cancel in the passphrase form")
-        present(ui, Key.id("offer-accept"), timeout: 10, "Cancel must bring back the offer's Trust")
-        tap(ui, Key.id("offer-alias"), "Focus Carol's alias after cancelling")
-        el(ui, Key.id("offer-alias")).typeKey("a", modifierFlags: .command)
-        el(ui, Key.id("offer-alias")).typeKey(XCUIKeyboardKey.delete.rawValue, modifierFlags: [])
+        // XCTest can keep this button non-hittable after the failed submit even though it is
+        // drawn in the same row as the Trust button just clicked. Click its visible point as a
+        // person does, bounded to the attached card. A macOS sheet is allowed to extend below
+        // its parent window's AX frame, so that window is not the boundary of what the person
+        // sees or can click; the result below still decides whether Cancel worked.
+        guard present(ui, Key.id("keyring-passphrase-cancel"), timeout: 10,
+                      "the passphrase form must show Cancel") else { return }
+        let cancel = el(ui, Key.id("keyring-passphrase-cancel"))
+        let cancelFrame = cancel.frame
+        let card = el(ui, Key.id("node-card"))
+        let cardFrame = card.frame
+        func drawn(_ frame: CGRect) -> Bool {
+            frame.minX.isFinite && frame.minY.isFinite && frame.maxX.isFinite
+                && frame.maxY.isFinite && frame.width > 0 && frame.height > 0
+        }
+        guard drawn(cancelFrame), drawn(cardFrame), cardFrame.contains(cancelFrame) else {
+            keepTree(ui, "Cancel was not visibly inside the passphrase card")
+            throw Apparatus("Cancel in the passphrase form has no card-contained click point: \(cancelFrame)")
+        }
+        let cancelAt = CGPoint(x: cancelFrame.midX, y: cancelFrame.midY)
+        let clearBy = Date().addingTimeInterval(20)
+        var overlay = systemOverlayOver(cancelAt, targetHittable: cancel.isHittable)
+        while overlay != nil, Date() < clearBy {
+            Thread.sleep(forTimeInterval: 0.5)
+            overlay = systemOverlayOver(cancelAt, targetHittable: cancel.isHittable)
+        }
+        guard overlay == nil else {
+            keepTree(ui, "a system window covered Cancel in the passphrase form")
+            throw Apparatus("\(overlay!) covered Cancel in the passphrase form for 20 s")
+        }
+        card.coordinate(withNormalizedOffset: CGVector(dx: 0, dy: 0))
+            .withOffset(CGVector(dx: cancelAt.x - cardFrame.minX,
+                                 dy: cancelAt.y - cardFrame.minY)).click()
+        present(ui, Key.id("card-trust-confirm"), timeout: 10, "Cancel must bring back the card's Trust")
+        tap(ui, Key.id("card-alias"), "Focus Carol's alias after cancelling")
+        el(ui, Key.id("card-alias")).typeKey("a", modifierFlags: .command)
+        el(ui, Key.id("card-alias")).typeKey(XCUIKeyboardKey.delete.rawValue, modifierFlags: [])
+        tap(ui, Key.id("card-close"), "Close Carol's card")
         print("[proof] offer: \(explain.debugDescription); one Trust while the form was open; empty passphrase said needed; Cancel brought Trust back")
 
         // Bob's change, waiting for the passphrase, named.
@@ -3470,35 +3577,34 @@ final class FirstRunProof: XCTestCase {
               "a change waiting for the passphrase must name itself",
               until: { $0.contains("trust bob") })
 
-        // Carol's offer: no prompt there, only that bob's change waits.
-        // In the room she joined, pending: its row says what waits, and its General shows her
-        // offer at the top (the decider, v0.4.3: offers are in the room they concern).
+        // Carol's member action: no prompt there, only that bob's change waits.
         words(ui, Key.id("room-pending"), timeout: 30, "pending's row must say carol's offer waits: \"… joined — trust?\"",
               until: { $0.contains("joined — trust?") })
         tap(ui, Key.id("room-pending"), "pending in the sidebar")
-        let offer = Key.id("offer-\(carolFp.prefix(12))")
-        tap(ui, offer, "carol's offer at the top of pending's General",
+        let offer = Key.id("member-trust-" + carolFp)
+        tap(ui, offer, "Trust beside carol's member row",
             premise: Premise("carol is offered to alice") {
                 offers = self.run(vox, ["trust", "offers", "--node", "alice"], env: voxEnv).out
                 return (offers.contains(String(carolFp.prefix(12))), "`vox trust offers` said \(offers.debugDescription)")
             })
-        present(ui, Key.id("offer-alias"), timeout: 10, "carol's offer must open")
+        present(ui, Key.id("card-alias"), timeout: 10, "carol's trust card must open")
         if locate(ui, Key.id("keyring-passphrase")) != nil {
             keepTree(ui, "carol's offer showed the passphrase prompt")
-            XCTFail("PRODUCT: carol's offer must not show the passphrase prompt for bob's change")
+            XCTFail("PRODUCT: carol's trust card must not show the passphrase prompt for bob's change")
         }
         words(ui, Key.id("keyring-waiting"), timeout: 10,
-              "carol's offer must say a keyring change is waiting, and which",
+              "carol's trust card must say a keyring change is waiting, and which",
               until: { $0.contains("trust bob") })
         // Trusting carol while bob's waits: asked first; kept.
-        tap(ui, Key.id("offer-alias"), "Focus Carol's explicit alias")
-        el(ui, Key.id("offer-alias")).typeKey("a", modifierFlags: .command)
-        el(ui, Key.id("offer-alias")).typeKey(XCUIKeyboardKey.delete.rawValue, modifierFlags: [])
-        type(ui, Key.id("offer-alias"), "carol", "carol's explicit local alias field")
-        tap(ui, Key.id("offer-accept"), "Trust on carol's offer")
+        tap(ui, Key.id("card-alias"), "Focus Carol's explicit alias")
+        el(ui, Key.id("card-alias")).typeKey("a", modifierFlags: .command)
+        el(ui, Key.id("card-alias")).typeKey(XCUIKeyboardKey.delete.rawValue, modifierFlags: [])
+        type(ui, Key.id("card-alias"), "carol", "carol's explicit local alias field")
+        tap(ui, Key.id("card-trust-confirm"), "Trust on carol's member card")
         present(ui, Key.id("keyring-replace-ask"), timeout: 15,
                 "a second change waiting for the passphrase must ask before replacing the first")
         tap(ui, Key.id("keyring-replace-no"), "Keep Waiting Change")
+        tap(ui, Key.id("card-close"), "Close Carol's card")
 
         // The passphrase, typed where bob's change waits, makes bob's change only.
         ui.menuBars.menuBarItems["View"].click()
@@ -3531,16 +3637,16 @@ final class FirstRunProof: XCTestCase {
 
         // An explicit local override wins over Carol's authenticated default.
         tap(ui, Key.id("room-pending"), "pending in the sidebar")
-        tap(ui, offer, "Carol's still-waiting offer")
-        words(ui, Key.id("offer-presented-name"), timeout: 30,
+        tap(ui, offer, "Carol's still-waiting member action")
+        words(ui, Key.id("card-presented-name"), timeout: 30,
               "Carol's authenticated name stays visible beside her full fingerprint", until: { $0 == "Name it presents: carol" })
-        words(ui, Key.id("offer-explain"), timeout: 10,
+        words(ui, Key.id("card-directions"), timeout: 10,
               "a presented name must not conceal that Carol is outside the keyring", until: { $0.contains("not in your keyring") })
-        tap(ui, Key.id("offer-alias"), "Carol's editable default")
-        el(ui, Key.id("offer-alias")).typeKey("a", modifierFlags: .command)
-        el(ui, Key.id("offer-alias")).typeKey(XCUIKeyboardKey.delete.rawValue, modifierFlags: [])
-        type(ui, Key.id("offer-alias"), "local-carol", "the explicit local override")
-        tap(ui, Key.id("offer-accept"), "Trust Carol as local-carol")
+        tap(ui, Key.id("card-alias"), "Carol's editable default")
+        el(ui, Key.id("card-alias")).typeKey("a", modifierFlags: .command)
+        el(ui, Key.id("card-alias")).typeKey(XCUIKeyboardKey.delete.rawValue, modifierFlags: [])
+        type(ui, Key.id("card-alias"), "local-carol", "the explicit local override")
+        tap(ui, Key.id("card-trust-confirm"), "Trust Carol as local-carol")
         keyringPassphraseIfAsked(ui) { self.run(vox, ["trust", "list", "--node", "alice"], env: voxEnv).out.contains(carolFp) }
         ui.menuBars.menuBarItems["View"].click()
         tap(ui, Key.menuItem("Keyring"), "the keyring after accepting Carol")
@@ -3654,7 +3760,7 @@ final class FirstRunProof: XCTestCase {
                              "--identity-passphrase-file", pass], env: environment)
         }
         try stager.write(Data("no\n".utf8), to: alice["VOX_CONFIG_DIR"]! + "/app/login-item")
-        try stager.write(Data("alice\n".utf8), to: alice["VOX_CONFIG_DIR"]! + "/app/node")
+        try staged(vox, ["computer", "personal", "alice"], env: alice)
         try staged(vox, ["room", "post", "--node", "bob", room, "RECOVERY-OLD"], env: bob)
         let ui = voxApp(appPath)
         ui.launchEnvironment = alice
@@ -3891,7 +3997,7 @@ final class FirstRunProof: XCTestCase {
             try staged(vox, ["node", "create", "carol"],
                        env: voxEnv.merging(["VOX_IDENTITY_PASSPHRASE": "carol identity"]) { $1 })
             try stager.write(Data("no\n".utf8), to: config + "/app/login-item")
-            try stager.write(Data("alice\n".utf8), to: config + "/app/node")
+            try staged(vox, ["computer", "personal", "alice"], env: voxEnv)
             // Only the app holds alice from here, as after step 2: `vox node attach` is an
             // explicit attach that outlives the app (step 12 checks the app's quit detaches her).
             try staged(vox, ["node", "detach", "alice"], env: voxEnv)
@@ -3907,7 +4013,6 @@ final class FirstRunProof: XCTestCase {
             let field = Key.id("passphrase")
             present(ui, field, timeout: 30, "the app must ask for node alice's passphrase")
             type(ui, field, "alice identity", "the passphrase field")
-            noKeychain(ui)
             tap(ui, Key.id("attach"), "Attach")
             present(ui, Key.id("attached"), timeout: 60, "the app, its first run answered, must open attached as alice")
             listed = run(vox, ["node", "list"], env: voxEnv).out
@@ -3937,7 +4042,6 @@ final class FirstRunProof: XCTestCase {
         present(ui, field, timeout: 30,
                 "with one node on this Mac, the app must ask for node alice's passphrase, not which node")
         type(ui, field, "not the passphrase", "the passphrase field")
-        noKeychain(ui)
         tap(ui, Key.id("attach"), "Attach")
         words(ui, Key.id("said"), timeout: 30,
               "a wrong passphrase must show the daemon's own sentence where it was typed",
@@ -6613,25 +6717,6 @@ final class FirstRunProof: XCTestCase {
     /// that as its premise; any other target is a control of the screen the proof has just
     /// reached, which the app must show.
     @discardableResult
-    /// The attach form remembers the passphrase in the Keychain unless told not to (ADR-028 K-10
-    /// as amended, #666). Storing is the person's, never a proof's: the proof's daemon would store
-    /// it in the real login keychain. So the toggle, on by default, is turned off before Attach.
-    private func noKeychain(_ ui: XCUIApplication) {
-        let toggle = ui.descendants(matching: .any)["keep-in-keychain"]
-        guard toggle.waitForExistence(timeout: 10) else {
-            XCTFail("PRODUCT: the attach form must offer to remember the passphrase in the Keychain (keep-in-keychain): \(onScreen(ui))")
-            ui.terminate()
-            return
-        }
-        let on = { (toggle.value as? Int) == 1 || (toggle.value as? String) == "1" }
-        if on() { toggle.click() }
-        if on() {
-            // Stopped here, so the Attach that follows stores nothing in the real login keychain.
-            XCTFail("APPARATUS: the keep-in-keychain toggle did not turn off; the app is stopped before Attach")
-            ui.terminate()
-        }
-    }
-
     private func tap(_ ui: XCUIApplication, _ key: Key, _ what: String, premise: Premise? = nil,
                      file: StaticString = #filePath, line: UInt = #line) -> Bool {
         let end = Date().addingTimeInterval(10)
