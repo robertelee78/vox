@@ -5,7 +5,7 @@ use std::sync::Arc;
 use quinn::{RecvStream, SendStream};
 use tokio::time::Instant;
 
-use super::{Encoded, Frame, MAX_FRAME_BYTES};
+use super::{Encoded, Frame, MAX_FRAME_BYTES, MAX_HELLO_FRAME_BYTES, MAX_WANT_FRAME_BYTES};
 use crate::error::{Error, Result};
 use crate::node::history_budget::{BufferCharge, Job};
 use crate::transport::framing::write_frame;
@@ -73,11 +73,30 @@ impl Transport {
     /// The caller supplies its remaining response credit including the four-byte prefix.
     /// Reserve before reading even that prefix: Busy never leaves a partially consumed frame.
     pub(super) async fn read(&mut self, remaining_wire: usize) -> Result<Read> {
+        self.read_bounded(remaining_wire, DECODE_ENVELOPE).await
+    }
+
+    /// HELLO has a fixed three-byte maximum and no decoded collection. Keep its reservation
+    /// ahead of the prefix while leaving the attacker-sized envelope on every variable frame.
+    pub(super) async fn read_hello(&mut self) -> Result<Read> {
+        self.read_bounded(MAX_HELLO_FRAME_BYTES + 4, 0).await
+    }
+
+    /// WANT carries only a request ID and one of the bounded scalar Query shapes.
+    pub(super) async fn read_want(&mut self) -> Result<Read> {
+        self.read_bounded(MAX_WANT_FRAME_BYTES + 4, 0).await
+    }
+
+    async fn read_bounded(
+        &mut self,
+        remaining_wire: usize,
+        decode_envelope: usize,
+    ) -> Result<Read> {
         let maximum = remaining_wire.saturating_sub(4).min(MAX_FRAME_BYTES);
         if maximum == 0 {
             return Err(Error::SizeLimitExceeded("history response credit"));
         }
-        let Some(charge) = self.job.reserve(maximum + DECODE_ENVELOPE) else {
+        let Some(charge) = self.job.reserve(maximum + decode_envelope) else {
             return Ok(Read::Busy);
         };
         let until = self.until();
