@@ -964,7 +964,7 @@ impl Node {
                             .and_then(|at| self.bounded_sync.required.remove(at))
                             .map(|(_, _, head, seq)| (head, seq));
                         let hint = if required.is_none() {
-                            departure_hint.or_else(|| self.history_hints.take(room, peer))
+                            departure_hint.or_else(|| self.history_hints.take(room, peer, node))
                         } else {
                             None
                         };
@@ -1016,7 +1016,7 @@ impl Node {
                         .and_then(|at| self.bounded_sync.required.remove(at))
                         .map(|(_, _, head, seq)| (head, seq));
                     let hint = if required.is_none() {
-                        departure_hint.or_else(|| self.history_hints.take(room, peer))
+                        departure_hint.or_else(|| self.history_hints.take(room, peer, node))
                     } else {
                         None
                     };
