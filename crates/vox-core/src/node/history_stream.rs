@@ -43,6 +43,11 @@ const MAX_WANT_FRAME_BYTES: usize = 80;
 // this bound sizes only an encoder whose exact local hint count is already known.
 const HAVE_FRAME_FIXED_BYTES: usize = 1 + 9;
 const HAVE_HINT_MAX_BYTES: usize = 9 + 2 * (9 + 32) + 9;
+// Conservative tag/CBOR overhead for a locally sourced byte-string frame. The peer-facing
+// decoder still reserves the full attacker-sized frame and decode envelope before its prefix.
+const LOCAL_BYTES_FRAME_FIXED_BYTES: usize = 128;
+const CANCEL_FRAME_MAX_BYTES: usize = 64;
+const ACK_FRAME_MAX_BYTES: usize = 128;
 
 /// Exact local request incarnation. The sealed keyring nonce changes on a durable trust edit,
 /// including removal followed by an otherwise identical regrant; unchanged restart preserves
@@ -627,7 +632,21 @@ impl<'a> Frame<'a> {
                 )
                 .filter(|bound| *bound <= MAX_FRAME_BYTES)
                 .ok_or(Error::SizeLimitExceeded("history encoded frame"))?,
-            _ => MAX_FRAME_BYTES,
+            Self::Meta {
+                object: Object::Head(bytes) | Object::Context(bytes) | Object::Header(bytes),
+                ..
+            }
+            | Self::Chunk { bytes, .. } => LOCAL_BYTES_FRAME_FIXED_BYTES
+                .checked_add(bytes.len())
+                .filter(|bound| *bound <= MAX_FRAME_BYTES)
+                .ok_or(Error::SizeLimitExceeded("history encoded frame"))?,
+            Self::Done { .. } => DONE_RESERVE,
+            Self::Cancel(_) => CANCEL_FRAME_MAX_BYTES,
+            Self::Ack { .. } => ACK_FRAME_MAX_BYTES,
+            Self::Meta {
+                object: Object::Proof(_),
+                ..
+            } => MAX_FRAME_BYTES,
         };
         let Some(charge) = job.reserve(4 * maximum) else {
             return Ok(None);
