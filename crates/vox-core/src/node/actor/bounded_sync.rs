@@ -6,6 +6,11 @@ use crate::node::store::Store;
 use std::collections::VecDeque;
 use std::sync::Mutex as StdMutex;
 
+// The daemon admits sixteen retained flows in total. Limit one hosted identity to a quarter of
+// that reservation so a burst from one node cannot prevent the other directly reachable nodes
+// from starting the control flow that settles their rooms.
+const RETAINED_FLOWS_PER_NODE: usize = 4;
+
 struct Returned {
     flow: Flow,
     error: Option<String>,
@@ -835,7 +840,7 @@ impl Node {
                 };
                 flow
             } else {
-                if self.bounded_sync.flow_count() >= 12 {
+                if self.bounded_sync.flow_count() >= RETAINED_FLOWS_PER_NODE {
                     return false;
                 }
                 if self.bounded_sync.ready[1].is_none() && self.bounded_sync.running[1].is_none() {
