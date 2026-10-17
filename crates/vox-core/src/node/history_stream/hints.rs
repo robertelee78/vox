@@ -100,23 +100,12 @@ impl HintInbox {
             .iter()
             .any(|p| p.room == room && p.peer == peer && !p.in_flight)
     }
-    pub(crate) fn take(&self, room: Digest32, peer: Digest32, local: Digest32) -> Option<HeadHint> {
+    pub(crate) fn take(&self, room: Digest32, peer: Digest32) -> Option<HeadHint> {
         let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         let pending = state
             .pending
             .iter_mut()
-            .filter(|p| p.room == room && p.peer == peer && !p.in_flight)
-            // Establish the peer's authoritative feed before third-party context, then recover
-            // our echoed feed so sparse settlement cannot wait behind unrelated authors.
-            .min_by_key(|p| {
-                if p.hint.author == peer {
-                    0
-                } else if p.hint.author == local {
-                    1
-                } else {
-                    2
-                }
-            })?;
+            .find(|p| p.room == room && p.peer == peer && !p.in_flight)?;
         pending.in_flight = true;
         Some(pending.hint)
     }
