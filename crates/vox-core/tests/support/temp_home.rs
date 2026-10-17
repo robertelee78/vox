@@ -80,7 +80,7 @@ const UNSET: [&str; 11] = [
 
 /// The `VOX_*` a run of proofs may set on purpose, kept: each configures the proof process, never
 /// the product (`VOX_PROXY` is set below when the run gives none).
-const RUN_SETTINGS: [&str; 7] = [
+const RUN_SETTINGS: [&str; 8] = [
     "VOX_PROXY",
     "VOX_PROOF_",
     "VOX_MUTANT_",
@@ -88,6 +88,7 @@ const RUN_SETTINGS: [&str; 7] = [
     "VOX_PREVIOUS_RELEASE_DIR",
     "VOX_PERF_",
     "VOX_TEST_WATCHDOG_SECS",
+    "VOX_JOURNEY_KEEP",
 ];
 
 /// Where a `vox` daemon listens for its `.vox` proxy, and the value every proof's child gets unless

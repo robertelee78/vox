@@ -477,11 +477,12 @@ impl Source {
                         let state = read
                             .sparse_author(&hint.author, crate::log::history::LogScope::Public)?;
                         // An inventory scalar is redundant only when its exact signed head is
-                        // already in this author's accepted consistency chain and the selected
-                        // current live window is complete. Size alone never suppresses an
-                        // unknown or same-size conflicting head. Requiring control_ready here
-                        // was a permanent re-offer loop: ordinary content tails and local heads
-                        // do not need control effects through their full size.
+                        // already in this author's accepted consistency chain, its selected
+                        // current live window is complete and its exact control receipt is
+                        // durable. Size alone never suppresses an unknown or same-size conflicting
+                        // head. The live window may omit ordinary archive bodies; the separate
+                        // bounded control closure proves those omitted positions contain no
+                        // unapplied control and is what makes this state restart-complete.
                         let held = match (state, read.history_head(&hint.head)?) {
                             (Some(state), Some(advertised))
                                 if advertised.binding.author == hint.author
@@ -495,7 +496,9 @@ impl Source {
                             {
                                 match (state.committed, state.live) {
                                     (Some(current_id), Some(window))
-                                        if window.head == current_id && window.complete() =>
+                                        if state.control_ready == Some(current_id)
+                                            && window.head == current_id
+                                            && window.complete() =>
                                     {
                                         read.history_head(&current_id)?.is_some_and(|current| {
                                             current.binding == advertised.binding

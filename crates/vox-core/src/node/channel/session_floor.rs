@@ -87,7 +87,7 @@ impl ChannelState {
     }
 
     pub(super) fn index_session_floors(&self, store: &Store) -> Result<()> {
-        if !self.private_controls_ready(store)? {
+        if !self.current_session_controls_ready(store)? {
             return Err(Error::StreamRefused(floor_index::REFRESHING));
         }
         Ok(())

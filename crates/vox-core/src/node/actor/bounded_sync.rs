@@ -58,6 +58,27 @@ pub(super) struct Controller {
     cleanup_due: Option<std::time::Instant>,
 }
 impl Controller {
+    /// A retained current/archive continuation is itself demand on its exact room/peer port.
+    /// Port request generations describe external wakes; an independent clean exchange may
+    /// consume one while this continuation is between bounded slices. Do not let that scalar
+    /// acknowledgement strand work whose ownership is still here.
+    pub(super) fn needs_port(&self, room: Digest32, peer: Digest32) -> bool {
+        self.ready
+            .iter()
+            .flatten()
+            .any(|flow| flow.room == room && flow.peer == peer)
+            || self
+                .deferred
+                .iter()
+                .any(|flow| flow.room == room && flow.peer == peer)
+            || self
+                .required
+                .iter()
+                .any(|(needed_room, needed_peer, _, _)| {
+                    *needed_room == room && *needed_peer == peer
+                })
+    }
+
     fn cancel_archive_admission(&mut self) {
         if let Some(admission) = self.archive_admission.take() {
             admission.task.abort();
@@ -567,6 +588,12 @@ impl Node {
                 returned.flow.published = false;
                 self.governance_work.pending = true;
                 self.sched_rooms.insert(work.room);
+                // A bounded publication may have made an addressed key-package durable. Its
+                // catalog is authoritative even when the best-effort presentation event below
+                // cannot fit in the actor queue, so make package installation runnable here.
+                // A turn that finds no package is bounded and clears the room again; a crash
+                // between publication and this mark is recovered by the room-open scan.
+                self.key_package_rooms.entry(work.room).or_insert(false);
                 let _ = self.net_tx.try_send(NetEvent::BoundedRoomAdvanced {
                     channel_id: work.room,
                     rendered: returned.flow.rendered,
@@ -767,6 +794,38 @@ impl Node {
                 crate::node::status::SyncBook::with(&self.sync_book, work.room, origin, |counts| {
                     counts.backoff = None
                 });
+                self.sched_rooms.insert(work.room);
+                continue;
+            }
+            let superseded = returned.flow.hint.is_some_and(|hint| {
+                self.history_hints.newer_pending(
+                    work.room,
+                    returned.flow.hint_peer,
+                    hint.author,
+                    hint.size,
+                )
+            });
+            if superseded {
+                // The worker has returned from its bounded slice, so no in-flight state is
+                // mutated. Retire its transient capabilities; signed headers, receipts, cursors
+                // and missing-body facts already committed by earlier slices remain durable.
+                // `retry` drops this obsolete owner because the inbox holds a newer successor,
+                // which resumes the same live window instead of waiting behind up to 128 bodies.
+                self.dispose_rearming_hint(returned.flow);
+                if let Some(port) = self.ports.get_mut(&(work.room, work.peer)) {
+                    port.req_done = port.req_done.max(work.request);
+                    port.raise();
+                    port.clear_backoff();
+                }
+                crate::node::status::SyncBook::with(
+                    &self.sync_book,
+                    work.room,
+                    work.peer,
+                    |counts| {
+                        counts.partial += 1;
+                        counts.backoff = None;
+                    },
+                );
                 self.sched_rooms.insert(work.room);
                 continue;
             }

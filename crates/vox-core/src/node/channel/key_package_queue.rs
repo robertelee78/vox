@@ -254,7 +254,7 @@ impl Queue {
         recipient: &Digest32,
         read: &super::entry_store::Read<'_>,
         trust: Digest32,
-        verified: impl Fn(&Entry) -> bool,
+        verified: impl Fn(&Entry) -> Result<bool>,
     ) -> Result<Progress> {
         if self.attempt.is_some() {
             return Err(Error::MalformedAtRest("key-package attempt unacknowledged"));
@@ -294,7 +294,7 @@ impl Queue {
                 Some(segment) => {
                     let wire = open_segment(sek, SegmentKind::LogDb, id, &segment)?;
                     let entry = Entry::from_wire(&wire)?;
-                    verified(&entry)
+                    verified(&entry)?
                         .then_some(&entry)
                         .and_then(|e| e.payload.as_deref())
                         .filter(|p| KeyPackage::is_key_package(p))

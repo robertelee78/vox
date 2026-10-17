@@ -916,6 +916,9 @@ pub struct RoomNotice {
 /// size it saves on one skeleton, so one per 32 costs about 3% of what it frees, and a room
 /// that expires slowly is not filled with checkpoints.
 pub const CHECKPOINT_EVERY: usize = 32;
+/// Maximum checkpoint-covered positions rewritten in one periodic maintenance turn. A peer can
+/// arrive after many checkpoints, so the receiver must not walk that entire range on its actor.
+const SIGNATURE_SWEEP_PAGE: usize = 64;
 
 /// How many of this node's own newest messages in a room a client is told the readers of (ADR-028
 /// R-6): more than a screen holds, and a bound on what every snapshot of the node carries.
@@ -3496,10 +3499,11 @@ impl ChannelState {
         let read = self.entries.read(store, &self.sek, &room)?;
         self.key_packages
             .next(store, &self.sek, &room, &me, &read, trust_digest, |entry| {
-                entry.skeleton.channel_id == room
+                Ok(entry.skeleton.channel_id == room
                     && entry.skeleton.epoch == epoch
                     && entry.skeleton.seq != 0
-                    && entry.skeleton.seq <= dag.verified_head(&entry.skeleton.author_id)
+                    && (entry.skeleton.seq <= dag.verified_head(&entry.skeleton.author_id)
+                        || read.history_effect_finished(&entry.entry_hash())?))
             })
     }
 
@@ -5691,13 +5695,22 @@ impl ChannelState {
         {
             return Ok(0);
         }
+        // The actor asks every tick so a newly accepted checkpoint is handled promptly. Most
+        // ticks have no new checkpoint range. Do not turn those no-ops into a durable database
+        // commit: its synchronous fsync would park this room's actor and strand unrelated live
+        // work (including a just-received key package).
+        if !self.dag.checkpoint_signature_sweep_due() {
+            return Ok(0);
+        }
         let result = (|| -> Result<usize> {
             let mut batch = store.batch()?;
             let mut index = self
                 .entries
                 .write(&mut batch, &self.sek, &self.channel_id)?;
             index.committing(self.next_log_id);
-            let dropped = self.dag.drop_checkpointed_signatures(&mut index)?;
+            let dropped = self
+                .dag
+                .drop_checkpointed_signatures(&mut index, SIGNATURE_SWEEP_PAGE)?;
             index.note_swept(&self.dag)?;
             index.seal()?;
             batch.commit()?;
@@ -6929,17 +6942,21 @@ impl ChannelState {
     /// session that brought it, when the node opens it): before that, nothing here can tell the key
     /// changed, and the session's node is the authority on whom it lets drive (DR-2).
     pub fn drive_from(&self, store: &Store) -> Result<Vec<Digest32>> {
-        if !self.private_controls_ready(store)? {
+        if !self.current_session_controls_ready(store)? {
             return Err(Error::StreamRefused("Session control facts are refreshing"));
         }
         let held: BTreeSet<Digest32> = self.drive.receivers.keys().map(|(a, _)| *a).collect();
         let mut from = BTreeSet::new();
         for author in held {
-            let legacy = self.legacy_drive_generation(store, &author)?;
             let announced = self
                 .floor_author(Transaction::Snapshot(&store.snapshot()?), &author)?
                 .announced;
-            let newest = legacy.into_iter().chain(announced).max();
+            // A signed current floor is authoritative in sparse rooms. Only an older author
+            // without floors needs the contiguous legacy encrypted-generation fallback.
+            let newest = match announced {
+                Some(generation) => Some(generation),
+                None => self.legacy_drive_generation(store, &author)?,
+            };
             if newest.is_none_or(|g| self.drive.receivers.contains_key(&(author, g)))
                 || self.key_packages.pending_from(&author)
             {

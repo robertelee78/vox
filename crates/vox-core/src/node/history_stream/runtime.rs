@@ -154,6 +154,9 @@ pub(crate) struct Flow {
     // One hinted flow either advances the main window or retries missing newest positions.
     // A peer's BodyNotHeld never rewinds the main cursor or suppresses another peer's retry.
     live_visited: bool,
+    // Exact head whose independent control closure is already retained by this flow. A later
+    // authenticated successor schedules its own closure without mutating the in-flight work.
+    control_head: Option<Digest32>,
     // Declared last: actual state/capabilities die before the shared admission is returned.
     _state_charge: crate::node::history_budget::FlowStateCharge,
 }
@@ -232,6 +235,7 @@ impl Flow {
             initialized: false,
             live_unavailable: None,
             live_visited: false,
+            control_head: None,
         };
         if let Some((head, seq)) = required {
             flow.push(Task {
@@ -346,6 +350,7 @@ impl Flow {
             initialized: true,
             live_unavailable: None,
             live_visited: false,
+            control_head: None,
         }
     }
     fn push(&mut self, task: Task) -> Result<()> {
@@ -353,6 +358,34 @@ impl Flow {
             return Err(Error::SizeLimitExceeded("history dependency stack"));
         }
         self.tasks.push(task);
+        Ok(())
+    }
+    /// Retain exact control closure above any ordinary-body work already on the LIFO stack.
+    /// Source proof runs before effect application; a successor gets a distinct pair of tasks.
+    fn push_control_closure(&mut self, task: &Task, window: LiveWindow) -> Result<()> {
+        if window.through == 0 || self.control_head == Some(window.head) {
+            return Ok(());
+        }
+        if self.tasks.len() > MAX_TASKS.saturating_sub(2) {
+            return Err(Error::SizeLimitExceeded("history dependency stack"));
+        }
+        self.tasks.push(Task {
+            operation: Operation::Local(LocalStep::Control {
+                head: window.head,
+                through: window.through,
+                effects: true,
+            }),
+            ..task.clone()
+        });
+        self.tasks.push(Task {
+            operation: Operation::Local(LocalStep::Control {
+                head: window.head,
+                through: window.through,
+                effects: false,
+            }),
+            ..task.clone()
+        });
+        self.control_head = Some(window.head);
         Ok(())
     }
     pub(crate) fn needs_board(&self) -> bool {
@@ -751,30 +784,41 @@ impl Flow {
                             head: window.head,
                             seq: window.next,
                         },
-                        ..task
+                        ..task.clone()
                     })?;
-                } else if !self.live_visited {
-                    self.live_visited = true;
-                    // This is a peer-local retry pass over only the authenticated peer's
-                    // newest window. It changes neither the durable main cursor nor the
-                    // missing-position fact until normal body admission fills that fact.
-                    self.push(Task {
-                        operation: Operation::LiveRetry {
-                            author,
-                            window: LiveWindow {
-                                head,
-                                from: target_through
-                                    .saturating_sub(
-                                        crate::log::history::MAX_PAGE_ENTRIES as u64 - 1,
-                                    )
-                                    .max(1),
-                                next: target_through,
-                                through: target_through,
+                } else {
+                    if !self.live_visited {
+                        self.live_visited = true;
+                        // This is a peer-local retry pass over only the authenticated peer's
+                        // newest window. It changes neither the durable main cursor nor the
+                        // missing-position fact until normal body admission fills that fact.
+                        // Retain it below the exact-head control work on this LIFO stack: omitted
+                        // ordinary bodies are best-effort live recovery and cannot delay Session
+                        // authorization. Any addressed key-package in the same window is a
+                        // control dependency and is fetched by that work before the retry begins.
+                        self.push(Task {
+                            operation: Operation::LiveRetry {
+                                author,
+                                window: LiveWindow {
+                                    head,
+                                    from: target_through
+                                        .saturating_sub(
+                                            crate::log::history::MAX_PAGE_ENTRIES as u64 - 1,
+                                        )
+                                        .max(1),
+                                    next: target_through,
+                                    through: target_through,
+                                },
                             },
-                        },
-                        ..task
-                    })?;
+                            ..task.clone()
+                        })?;
+                    }
                 }
+                // Head commitment independently authorizes bounded control closure. Run it above
+                // the ordinary-body work just retained on this LIFO stack, so governance,
+                // Session floors/support and addressed key delivery do not wait for 128 unrelated
+                // Content bodies. Collapsed proof ranges fetch none of those omitted bodies.
+                self.push_control_closure(&task, window)?;
             }
             Operation::LiveRetry { author, window } => {
                 if window.complete() {

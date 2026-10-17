@@ -14380,7 +14380,9 @@ impl Node {
             .iter()
             .filter(|(key, port)| {
                 port.out.is_none()
-                    && port.needs()
+                    && (port.needs()
+                        || self.bounded_sync.needs_port(key.0, key.1)
+                        || self.history_hints.pending(key.0, key.1))
                     && !port.backing_off(now)
                     && !self.publishing.contains(*key)
                     && self
@@ -14432,7 +14434,9 @@ impl Node {
             return false;
         };
         port.out.is_none()
-            && port.needs()
+            && (port.needs()
+                || self.bounded_sync.needs_port(key.0, key.1)
+                || self.history_hints.pending(key.0, key.1))
             && !port.backing_off(now)
             && !self.publishing.contains(key)
             && self
@@ -20957,8 +20961,9 @@ impl Node {
             if has_session && ch.ensure_drive(profile.store(), holders, now_ms).is_err() {
                 return;
             }
-            let Ok(owed) = ch.owed_drive(profile, holders, now_ms) else {
-                return;
+            let owed = match ch.owed_drive(profile, holders, now_ms) {
+                Ok(owed) => owed,
+                Err(_) => return,
             };
             if !owed.is_empty()
                 && !ch

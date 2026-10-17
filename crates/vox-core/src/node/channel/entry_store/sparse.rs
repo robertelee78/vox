@@ -1279,6 +1279,12 @@ impl Write<'_, '_> {
             return Err(invalid("local settlement head differs"));
         }
         self.finish_history_obligation(&Obligation::authority(head.id(), entry))?;
+        if expected_head.is_some() {
+            // A local append extends only its already-ready predecessor, and this Batch contains
+            // the new entry's semantic effect. Publish the new exact-head receipt atomically;
+            // unlike a remote sparse effect, no separate prefix walk remains.
+            self.publish_control_ready(&head)?;
+        }
         Ok(())
     }
     pub(crate) fn begin_sparse_publication(
@@ -1964,7 +1970,12 @@ impl Write<'_, '_> {
         }
         self.merge_observed_head(head, &mut state)?;
         state.committed = Some(head.id());
-        if head.root.leaves != 0 {
+        if head.root.leaves == 0 {
+            // An empty exact head has no control positions or effects to fetch. Mark that
+            // vacuous projection complete with the commitment; no control-source request can
+            // name position zero later to advance it.
+            state.control_ready = Some(head.id());
+        } else {
             self.keep_history_range(head.binding, 1, head.root)?;
         }
         self.directory.active.sparse.commitments = self.change_value(

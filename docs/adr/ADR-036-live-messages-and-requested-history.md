@@ -542,6 +542,13 @@ original local operation; a peer cannot widen demand through a returned continua
 Header-only requests consume one header credit and never permit CHUNK. Required proof/parent
 headers therefore do not implicitly request their older content bodies.
 
+An addressed key-package is the exception only for its signed recipient: whichever current path
+first encounters that exact entry (live position, parent or control dependency) upgrades it to a
+body-bearing control operation before publishing its semantic effect or advancing the live
+window. The body is the delivered key, so a header-only effect cannot satisfy the recipient's
+durable key-body obligation. Every other member keeps only the authenticated public header and
+does not request or open the encrypted package body.
+
 A head already verified as an exact prefix of the current committed head is accepted but does not
 roll back that current head. Its retained prefix descriptor must equal the signed older root. If
 that descriptor is not yet retained, request consistency from the older size to the current head;
@@ -559,6 +566,33 @@ lost may resume only at the last acknowledged offset or the sole outstanding chu
 The binding authorizes no additional entry or page. Restart drops it; this is bounded transfer
 state, not a saved history queue or permission to resume archive work. Changing a query's purpose
 cannot borrow reserved control/live capacity for arbitrary older bodies.
+
+Sparse Session-floor and private-support readiness is proved by the durable exact-head
+control-effect receipt: an author's public `control_ready` equals its current committed head. A
+zero-entry head is vacuously control-ready in the same commit because no position-zero control
+request can exist. A join/import that has actually projected a contiguous feed through the exact
+committed sparse head may use that stronger existing proof until receipt bookkeeping catches up;
+coverage only through a lower contiguous frontier is insufficient. Current authorization MUST
+NOT require contiguity when the exact receipt is ready, so deliberately omitted ordinary/archive
+Content cannot block it. The receipt does not certify encrypted legacy drive-generation
+discovery; legacy classification and migration retain their contiguous scan or require explicit
+recovery. Exact floor, membership, generation, continuity and Drive checks still apply after
+readiness.
+
+Selecting an author's newest live window MUST immediately drive both the authenticated
+control-source receipt and the applied control-effect receipt through that exact committed head,
+independently of and before its ordinary-body walk. Control proofs collapse subtrees without
+controls, so this does not request an omitted archive Content body. The effect receipt is published
+only after every enumerated control through the head has finished its ordinary typed effect
+(including an addressed key-package body); merely completing the 128-entry live cursor is not
+Session readiness. The ordinary live walk and its optional missing-body retry remain retained and
+bounded, but cannot delay authorization; any addressed key-package in the same window is mandatory
+control work and is fetched by closure rather than left to either body pass.
+Control effects may finish while their signed head is observed but not yet the committed current
+head. That early completion MUST NOT publish readiness. After the same head commits, however, the
+exact-head continuation MUST promote the already-complete effect prefix to the durable ready
+receipt; treating prefix completion alone as a finished retry would leave that head refreshing and
+re-offered forever.
 
 The consistency META proof body is `[claimed_prefix_descriptor, consistency]`, carrying the
 prefix descriptor already required by the receipt above. Its leaf count MUST equal `from`.
@@ -664,6 +698,25 @@ author/branch. Reuse immutable proof results only under their exact authenticate
 recheck current local trust, fork restrictions, Drive generation and authority at action/use.
 Publish entry admission, derived control/render/order roots and obligation progress atomically.
 Unfinished work uses unpublished roots. A cancellation leaves already accepted cached rows intact.
+An owned bounded continuation or queued exact-head hint is itself port demand until it completes,
+is superseded under the hint coalescing rule, or is explicitly retired. A clean exchange may
+acknowledge the request generation it observed, but that scalar acknowledgement MUST NOT make an
+owned continuation or newer pending successor unschedulable.
+The in-flight owner is immutable while its bounded slice runs. At the slice boundary, a strictly
+newer queued head for the same room, source peer and author supersedes that owner's remaining
+transient continuation: retire its capabilities, keep every durable receipt/cursor/missing fact it
+already committed, discard the obsolete scalar and start the one retained successor. This is
+coalescing, not cancellation of durable recovery. Equal-size distinct heads never supersede one
+another because they may be attributable fork evidence.
+After restart, an inventory head already committed with a complete live window MUST remain eligible
+until its exact control receipt is durable. Re-observing that same scalar reconstructs bounded
+control closure; it MUST NOT request omitted ordinary bodies or treat live-window completion as
+control completion.
+Publishing a bounded current effect may also make durable recipient work, including an addressed
+key-package catalog entry. That publication MUST directly make the corresponding bounded worker
+runnable before any best-effort presentation event; a full actor event queue cannot strand the
+durable obligation. A turn that finds no work clears its room, and room-open recovery schedules
+the same scan after a crash between publication and the in-memory runnable mark.
 Finishing a content effect without a visible row is valid only for a final, dependency-free reason
 or when the same transaction persists the bounded author reprojection cursor. If the author's
 consent control or sender-key generation can still arrive, that cursor is mandatory before effect

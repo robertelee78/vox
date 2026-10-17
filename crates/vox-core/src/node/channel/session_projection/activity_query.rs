@@ -327,7 +327,9 @@ impl ChannelState {
             return Err(REFRESHING.into());
         }
         let result = (|| -> Result<Reply> {
-            if !self.private_controls_ready(store)? || !self.private_expiry_ready(store, now)? {
+            if !self.current_session_controls_ready(store)?
+                || !self.private_expiry_ready(store, now)?
+            {
                 return Err(Error::StreamRefused(REFRESHING));
             }
             let authors = self.drive_from(store)?;

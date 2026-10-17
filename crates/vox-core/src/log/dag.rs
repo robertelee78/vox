@@ -852,14 +852,34 @@ impl Dag {
         self.checkpoints.get(author).copied()
     }
 
+    /// Whether a held author has checkpointed positions this node has not swept yet.
+    ///
+    /// This is deliberately a read-only preflight for the durable sweep. Opening and committing
+    /// an empty store batch is not free: it fsyncs the room database and can park the node actor
+    /// even though [`Dag::drop_checkpointed_signatures`] has no position to examine.
+    #[must_use]
+    pub fn checkpoint_signature_sweep_due(&self) -> bool {
+        self.checkpoints.iter().any(|(author, (below, _))| {
+            self.feeds.contains_key(author)
+                && self.swept_to.get(author).copied().unwrap_or(0) < *below
+        })
+    }
+
     /// Drop the signatures of every entry at or below its author's checkpoint whose body is
     /// already pruned (ADR-023 decision 3), returning their hashes so the caller can rewrite
     /// what it stores. An entry with a body keeps its signature: governance is never pruned,
     /// and content keeps it until it expires here.
     ///
-    /// Walks only what no earlier call covered, so it costs nothing between checkpoints.
-    pub fn drop_checkpointed_signatures(&mut self, entries: &mut impl EntryWrite) -> Result<usize> {
+    /// Walks only what no earlier call covered and at most `limit` positions in one call. The
+    /// caller persists the cursor with the rewritten entries, then resumes any remainder in a
+    /// later maintenance turn.
+    pub fn drop_checkpointed_signatures(
+        &mut self,
+        entries: &mut impl EntryWrite,
+        limit: usize,
+    ) -> Result<usize> {
         let mut dropped = 0usize;
+        let mut examined = 0usize;
         for (author, (below, _)) in &self.checkpoints {
             let Some(feed) = self.feeds.get_mut(author) else {
                 continue;
@@ -869,6 +889,9 @@ impl Dag {
                 continue;
             }
             for seq in from..=*below {
+                if examined >= limit {
+                    return Ok(dropped);
+                }
                 if let Some(entry) = feed.get(entries, seq)? {
                     if entry.is_signed()
                         && entry.payload.is_none()
@@ -878,6 +901,7 @@ impl Dag {
                     }
                 }
                 self.swept_to.insert(*author, seq);
+                examined += 1;
             }
         }
         Ok(dropped)

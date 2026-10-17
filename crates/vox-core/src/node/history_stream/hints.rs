@@ -122,6 +122,28 @@ impl HintInbox {
             .iter()
             .any(|p| p.room == room && p.peer == peer && !p.in_flight)
     }
+    /// Whether an immutable in-flight owner has a strictly newer queued successor. Equal-size
+    /// distinct heads remain fork evidence and never supersede each other by scalar ordering.
+    pub(crate) fn newer_pending(
+        &self,
+        room: Digest32,
+        peer: Digest32,
+        author: Digest32,
+        size: u64,
+    ) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pending
+            .iter()
+            .any(|pending| {
+                pending.room == room
+                    && pending.peer == peer
+                    && pending.hint.author == author
+                    && !pending.in_flight
+                    && pending.hint.size > size
+            })
+    }
     pub(crate) fn take(&self, room: Digest32, peer: Digest32, local: Digest32) -> Option<HeadHint> {
         let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         let pending = state
