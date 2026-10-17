@@ -152,10 +152,16 @@ impl Source {
         F: FnOnce(&mut ChannelState, &Store) -> Result<Option<T>> + Send + 'static,
     {
         self.current()?;
-        let Some(charge) = job.reserve(envelope) else {
+        let work_envelope = envelope
+            .checked_add(temporary)
+            .ok_or(Error::SizeLimitExceeded("history read envelope"))?;
+        let Some(work_job) = job.record_job(work_envelope) else {
             return Ok(Lookup::Busy);
         };
-        let Some(scratch) = job.reserve(temporary) else {
+        let Some(charge) = work_job.reserve(envelope) else {
+            return Ok(Lookup::Busy);
+        };
+        let Some(scratch) = work_job.reserve(temporary) else {
             return Ok(Lookup::Busy);
         };
         let mut room = tokio::select! {
