@@ -126,7 +126,17 @@ pub fn backoff_wait(kind: BackoffKind, failures: u32) -> Duration {
         Duration::from_millis(from_ms.saturating_mul(1 << shift).min(cap_ms))
     };
     match kind {
-        BackoffKind::Unreachable | BackoffKind::Busy => doubling(200, 8_000),
+        BackoffKind::Unreachable => doubling(200, 8_000),
+        // A `Busy` refusal is not a reach failure: the peer answered, and saying it is busy
+        // costs it one lookup. The work it is busy with is usually the same convergence this
+        // port is pulling for — the peer's own bounded publication or its inbound limit — so
+        // spacing retries like an unreachable peer starved exactly that pull: a room that
+        // needed ~10 one-step rounds to converge sat through them at the 8 s cap (a measured
+        // 14-failure Busy spiral held a creator's pull to one step per 8 s for the whole
+        // minute while both sides converged without it, ending 12 entries behind). Stay
+        // polite at 200 ms, capped at 1 s: one refused probe per second cannot crowd out
+        // the peer's own work, and a transient busy clears long before the cap matters.
+        BackoffKind::Busy => doubling(200, 1_000),
         BackoffKind::NoProgress => doubling(1_000, 30_000),
         // An anchor that keeps no log for the room is asked once per interval, as before, not
         // every few seconds.
