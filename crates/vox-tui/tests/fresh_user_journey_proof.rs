@@ -1445,13 +1445,110 @@ mod journey {
             }
         }
         readable.extend(tmux_dirs.iter().map(PathBuf::as_path));
+        // The journey's own OpenCode server, on a port picked here. `opencode run`
+        // without it starts (or reaches for) the machine's background service, whose
+        // port is deterministic: the operator's running OpenCode already holds it
+        // (measured twice: "Failed to start server. Is port 49374 in use?", the
+        // desktop service's own port), and no cleared environment shifts it inside
+        // the sandbox. A server of this proof's own, with `run --server` pointed at
+        // it, collides with nothing on the machine.
+        let oc_port: u16 = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0")
+                .unwrap_or_else(|e| panic!("APPARATUS: cannot pick OpenCode's server port: {e}"));
+            l.local_addr()
+                .unwrap_or_else(|e| panic!("APPARATUS: OpenCode's server port: {e}"))
+                .port()
+        };
         let profile = w.root.join("harness.sb");
-        std::fs::write(
-            &profile,
-            oc_sandbox::offline_profile(&[&w.root], &readable, port),
-        )
-        .unwrap_or_else(|e| panic!("APPARATUS: the sandbox profile: {e}"));
+        // The three ancestor literals (`/private/tmp`, `/private`, `/`): OpenCode's server,
+        // on a session's first turn, resolves the real path of every ancestor of its
+        // working directory to discover its config, and each resolution reads the ancestor
+        // directory's own entry — denied, `/api/location` answers 500 and the session
+        // dies as APPARATUS. The literals admit reading exactly those directory entries
+        // and no file under them: names of siblings in the system temp, nothing more,
+        // and the canary stays unreadable and unlisted.
+        let profile_text = format!(
+            "{}(allow network-outbound (remote ip \"localhost:{oc_port}\"))\n\
+             (allow file-read-data file-read-metadata (literal \"/private/tmp\"))\n\
+             (allow file-read-data file-read-metadata (literal \"/private\"))\n\
+             (allow file-read-data file-read-metadata (literal \"/\"))\n",
+            oc_sandbox::offline_profile(&[&w.root], &readable, port)
+        );
+        std::fs::write(&profile, profile_text)
+            .unwrap_or_else(|e| panic!("APPARATUS: the sandbox profile: {e}"));
         oc_sandbox::probe_profile(&profile, &canary, "harnesses on the stand-in model");
+        // Start that server inside the same sandbox, with the same scratch environment
+        // the harnesses get, so its sessions, spawns and model calls touch nothing of
+        // the operator's either.
+        let oc_serve_log = w.t.join("opencode-serve.log");
+        let oc_serve = Command::new("/usr/bin/sandbox-exec")
+            .env_clear()
+            .envs(w.env())
+            .envs([
+                (
+                    "XDG_CONFIG_HOME",
+                    w.home.join(".config").display().to_string(),
+                ),
+                (
+                    "XDG_DATA_HOME",
+                    w.root.join("xdg").join("data").display().to_string(),
+                ),
+                (
+                    "XDG_STATE_HOME",
+                    w.root.join("xdg").join("state").display().to_string(),
+                ),
+                (
+                    "XDG_CACHE_HOME",
+                    w.root.join("xdg").join("cache").display().to_string(),
+                ),
+                ("OPENCODE_DISABLE_MODELS_FETCH", "1".to_owned()),
+                ("OPENCODE_DISABLE_AUTOUPDATE", "1".to_owned()),
+                ("OPENCODE_DISABLE_LSP_DOWNLOAD", "1".to_owned()),
+                ("OPENCODE_DISABLE_CLAUDE_CODE", "1".to_owned()),
+                // A server of this proof's own has no operator to authenticate against;
+                // give serve and run a shared made-up password so neither asks the other
+                // for one the harness cannot know.
+                (
+                    "OPENCODE_PASSWORD",
+                    "made-up-password-for-a-stand-in".to_owned(),
+                ),
+            ])
+            .arg("-f")
+            .arg(&profile)
+            .arg(&oc_sandbox::opencode_bin())
+            .args([
+                "serve",
+                "--port",
+                &oc_port.to_string(),
+                "--log-level",
+                "debug",
+            ])
+            .current_dir(&w.repo)
+            .stdin(Stdio::null())
+            .stdout(
+                std::fs::File::create(&oc_serve_log)
+                    .unwrap_or_else(|e| panic!("APPARATUS: OpenCode's server log: {e}")),
+            )
+            .stderr(
+                std::fs::File::create(w.t.join("opencode-serve.err"))
+                    .unwrap_or_else(|e| panic!("APPARATUS: OpenCode's server error log: {e}")),
+            )
+            .spawn()
+            .unwrap_or_else(|e| panic!("APPARATUS: cannot start OpenCode's server: {e}"));
+        stop.children.push(oc_serve);
+        let oc_url = format!("http://127.0.0.1:{oc_port}");
+        let t0 = Instant::now();
+        loop {
+            if std::net::TcpStream::connect(("127.0.0.1", oc_port)).is_ok() {
+                break;
+            }
+            assert!(
+                t0.elapsed() < Duration::from_secs(30),
+                "APPARATUS: OpenCode's server did not listen (its log: {})",
+                std::fs::read_to_string(&oc_serve_log).unwrap_or_default()
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
 
         let xdg = |d: &str| w.root.join("xdg").join(d).display().to_string();
         for d in ["data", "state", "cache"] {
@@ -1503,7 +1600,16 @@ mod journey {
                         ],
                     ),
                     _ => (
-                        vec!["run", "--model", "standin/stub-model", "hello"],
+                        // `--server`: this proof's own server, started above inside the
+                        // same sandbox, instead of the machine's background service.
+                        vec![
+                            "run",
+                            "--server",
+                            &oc_url,
+                            "--model",
+                            "standin/stub-model",
+                            "hello",
+                        ],
                         vec![
                             (
                                 "XDG_CONFIG_HOME".into(),
@@ -1516,6 +1622,10 @@ mod journey {
                             ("OPENCODE_DISABLE_AUTOUPDATE".into(), "1".into()),
                             ("OPENCODE_DISABLE_LSP_DOWNLOAD".into(), "1".into()),
                             ("OPENCODE_DISABLE_CLAUDE_CODE".into(), "1".into()),
+                            (
+                                "OPENCODE_PASSWORD".into(),
+                                "made-up-password-for-a-stand-in".into(),
+                            ),
                         ],
                     ),
                 };
@@ -1577,10 +1687,32 @@ mod journey {
             );
             if !out.status.success() || all.lines().count() == before {
                 return Err(format!(
-                    "{} did not finish a turn against the stand-in model (exit {:?}): {}",
+                    "{} did not finish a turn against the stand-in model (exit {:?}): {}{}",
                     h.name,
                     out.status.code(),
-                    last_lines(&said, 15)
+                    last_lines(&said, 15),
+                    if h.key == "opencode" {
+                        let db_log = w
+                            .root
+                            .join("xdg")
+                            .join("data")
+                            .join("opencode/log/opencode.log");
+                        format!(
+                            "\n[the proof's OpenCode server said]:\n{}\n[its errors]:\n{}\n[its db log]:\n{}",
+                            last_lines(
+                                &std::fs::read_to_string(&oc_serve_log).unwrap_or_default(),
+                                15
+                            ),
+                            last_lines(
+                                &std::fs::read_to_string(w.t.join("opencode-serve.err"))
+                                    .unwrap_or_default(),
+                                15
+                            ),
+                            last_lines(&std::fs::read_to_string(&db_log).unwrap_or_default(), 25)
+                        )
+                    } else {
+                        String::new()
+                    }
                 ));
             }
             Ok((sent, said))
