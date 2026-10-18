@@ -18,10 +18,10 @@
 //!   once it completes or fails; a completion seen alone posts its start first;
 //! - each reply (`reply`): an assistant message's text, posted before the next tool call and at
 //!   the turn's end, so replies and calls keep their order;
-//! - each turn's end (`turn-end`): `session.idle`;
-//! - each approval (`permission.asked`) and question (`question.asked`), held for the first answer
-//!   ([`Sink::request`]) and retired by OpenCode's own `permission.replied`, `question.replied`
-//!   or `question.rejected` (DR-4).
+//! - each turn's end (`turn-end`): `session.idle` (or `session.status` at rest);
+//! - each approval (`permission.asked`), held for the first answer
+//!   ([`Sink::request`]) and retired by OpenCode's own `permission.replied` (DR-4). OpenCode
+//!   2.x asks no questions: its forms reach only the client, and a reply is a client action.
 //!
 //! A sub-agent's entries carry `agent_id` and its authoritative name when available;
 //! otherwise its exact session id is also the displayed label.
@@ -122,8 +122,8 @@ impl OpenCodeMirror {
             mirror_token: token.to_owned(),
             agent: None,
             texts: Vec::new(),
+            tools: BTreeMap::new(),
             asks: BTreeMap::new(),
-            model: None,
             ended: false,
             failed: false,
             title: None,
@@ -206,14 +206,10 @@ impl OpenCodeMirror {
     }
 }
 
-/// An approval or question OpenCode asked.
+/// An approval OpenCode asked.
 struct Ask {
     of: &'static str,
-    /// The questions, in order, to put answers back in OpenCode's shape.
-    questions: Vec<Value>,
     answered: Option<Given>,
-    /// The answers sent to OpenCode, in its shape.
-    sent: Option<Value>,
     /// Exactly this request's first-answer waiter; no detached forwarding task survives it.
     receiver: Option<oneshot::Receiver<Given>>,
 }
@@ -229,15 +225,16 @@ struct Follow {
     /// Live assistant text parts not yet posted: (session, part id, text, agent label).
     texts: Vec<(String, String, String, Option<String>)>,
     asks: BTreeMap<String, Ask>,
-    /// The provider and model of the session's last assistant message, which /compact needs.
-    model: Option<(String, String)>,
+    /// Tool names of running calls: (session, assistant message, call) → the tool's name,
+    /// remembered from `session.tool.input.started`, which carries what `called` does not.
+    tools: BTreeMap<(String, String, String), String>,
     /// Whether the last thing posted was a turn's end: OpenCode reports a session idle more than
     /// once around an abort, and one turn ends once.
     ended: bool,
     /// An explicit producer failure ends this observation rather than guessing missing roles.
     failed: bool,
-    /// The session's title as last said: OpenCode sends `session.updated` for much besides a
-    /// rename, and only a new title renames the Session.
+    /// The session's title as last said: OpenCode 2.x says a rename only in
+    /// `session.renamed`, and only a new title renames the Session.
     title: Option<String>,
     next_id: u64,
     calls: BTreeMap<u64, PendingCall>,
@@ -260,11 +257,7 @@ fn given_bytes(given: &Given) -> usize {
 
 fn ask_bytes(id: &str, ask: &Ask) -> usize {
     id.len()
-        .saturating_add(serde_json::to_vec(&ask.questions).map_or(MAX_ASK_BYTES, |v| v.len()))
         .saturating_add(ask.answered.as_ref().map_or(0, given_bytes))
-        .saturating_add(ask.sent.as_ref().map_or(0, |value| {
-            serde_json::to_vec(value).map_or(MAX_ASK_BYTES, |v| v.len())
-        }))
 }
 
 fn now_ms() -> u64 {
@@ -274,8 +267,13 @@ fn now_ms() -> u64 {
 }
 
 /// Text the operator typed, without the blocks the drain put in front of it (Vox's notice, the
-/// room's fence). `None` for a wake notice Vox relayed: it is Vox's, not the operator's.
+/// room's fence). `None` for a wake notice Vox relayed: it is Vox's, not the operator's. A
+/// notice arrives as the inbox item's own text ("Vox-generated attention notice; not the
+/// operator's message:"), which the TUI receiver wrote, so it is recognized by its own words.
 fn typed(text: &str) -> Option<&str> {
+    if text.starts_with("Vox-generated attention notice; not the operator's message:") {
+        return None;
+    }
     if !text.starts_with("<vox-room-") && !text.starts_with("<vox-notice-") {
         return Some(text);
     }
@@ -495,17 +493,7 @@ impl Follow {
                     return None;
                 }
                 "compact" => {
-                    let Some((provider, model)) = self.model.clone() else {
-                        let _ = reply.send(Err(
-                            "/compact needs the session's model, and it has not answered since \
-                             Vox began following it"
-                                .into(),
-                        ));
-                        return None;
-                    };
                     m.insert("action".into(), json!("summarize"));
-                    m.insert("providerID".into(), json!(provider));
-                    m.insert("modelID".into(), json!(model));
                     "/compact started".to_owned()
                 }
                 "clear" | "new" => {
@@ -541,24 +529,6 @@ impl Follow {
                     m.insert("message".into(), json!(w));
                 }
             }
-            (Given::Answer(a), "question") => {
-                let answers: Vec<Value> = ask
-                    .questions
-                    .iter()
-                    .map(|q| {
-                        let text = q
-                            .get("question")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default();
-                        let given = a.get(text).cloned().unwrap_or_default();
-                        json!(labels(q, &given))
-                    })
-                    .collect();
-                m.insert("action".into(), json!("question"));
-                m.insert("request".into(), json!(request));
-                ask.sent = Some(json!(answers));
-                m.insert("answers".into(), json!(answers));
-            }
             _ => return None,
         }
         ask.answered = Some(given);
@@ -570,7 +540,7 @@ impl Follow {
         {
             return None;
         }
-        // Its result is OpenCode's `permission.replied` / `question.replied`, not this call's.
+        // Its result is OpenCode's `permission.replied`, not this call's.
         let (reply, _) = oneshot::channel();
         self.call(m, reply, String::new())
     }
@@ -738,53 +708,65 @@ impl Follow {
     }
 
     async fn event(&mut self, ev: &Value) {
-        let p = &ev["properties"];
-        let sid = p
+        let d = &ev["data"];
+        let sid = d
             .get("sessionID")
-            .or_else(|| p.pointer("/part/sessionID"))
-            .or_else(|| p.pointer("/info/sessionID"))
             .and_then(Value::as_str)
             .unwrap_or(&self.session)
             .to_owned();
         match ev.get("type").and_then(Value::as_str).unwrap_or_default() {
-            "message.updated" => {
-                let info = &p["info"];
-                if info.get("role").and_then(Value::as_str) == Some("assistant") {
-                    if sid != self.session {
-                        if let Some(a) = info.get("agent").and_then(Value::as_str) {
-                            self.agent = Some((sid.clone(), a.to_owned()));
-                        }
-                    } else if let (Some(pr), Some(mo)) = (
-                        info.get("providerID").and_then(Value::as_str),
-                        info.get("modelID").and_then(Value::as_str),
-                    ) {
-                        self.model = Some((pr.to_owned(), mo.to_owned()));
+            // The lineage of a sub-agent's session and its authoritative agent label (SE-2).
+            "session.created" => {
+                if sid != self.session {
+                    if let Some(agent) = d.get("agent").and_then(Value::as_str) {
+                        self.agent = Some((sid.clone(), agent.to_owned()));
                     }
                 }
             }
-            "message.part.updated" => {
-                let info = &p["voxMessage"];
-                let part = &p["part"];
-                let Some(role @ ("user" | "assistant")) = info.get("role").and_then(Value::as_str)
-                else {
-                    self.fail("a part arrived without its authoritative message role")
-                        .await;
-                    return;
-                };
-                if info.get("id").and_then(Value::as_str)
-                    != part.get("messageID").and_then(Value::as_str)
-                    || info.get("sessionID").and_then(Value::as_str) != Some(sid.as_str())
-                {
-                    self.fail("a part arrived without its authoritative message role")
-                        .await;
+            // **A rename is the Session's name at once** (ADR-029 MD-1): OpenCode's title, set by
+            // `/rename`, by Vox's own rename, or made by OpenCode itself, arrives only here.
+            "session.renamed" => {
+                if sid == self.session {
+                    if let Some(title) = d.get("title").and_then(Value::as_str) {
+                        if self.title.as_deref() != Some(title) {
+                            self.title = Some(title.to_owned());
+                            self.sink.renamed(&self.node, &self.session, title);
+                        }
+                    }
+                }
+            }
+            // The operator's prompt (`user`): the delivered inbox item's payload text. A
+            // sub-agent's prompt is its parent's tool call, already shown.
+            "session.inbox.delivered" | "session.inbox.enqueued" => {
+                if sid != self.session {
                     return;
                 }
-                if let Some(observed) = p.get("voxAttention").filter(|v| !v.is_null()) {
+                if d.pointer("/item/type").and_then(Value::as_str) != Some("user") {
+                    return;
+                }
+                let Some(text) = d.pointer("/item/payload/text").and_then(Value::as_str) else {
+                    return;
+                };
+                let Some(text) = typed(text) else {
+                    return;
+                };
+                if text.trim().is_empty() {
+                    return;
+                }
+                let mut e = self.envelope(&sid, "user", None);
+                e.insert("text".into(), json!(text));
+                let id = d.get("inboxID").and_then(Value::as_str).unwrap_or_default();
+                self.post_source(&sid, id, e, "text").await;
+            }
+            // The step a reply is made in: its agent, and an attention observation the
+            // plugin attached from the receipts its drain stamped on this turn's input.
+            "session.step.started" => {
+                if let Some(agent) = d.get("agent").and_then(Value::as_str) {
+                    self.agent = Some((sid.clone(), agent.to_owned()));
+                }
+                if let Some(observed) = d.get("voxAttention").filter(|v| !v.is_null()) {
                     let result = async {
-                        if sid != self.session
-                            || role != "assistant"
-                            || part["type"] != "step-start"
-                        {
+                        if sid != self.session {
                             return Err(
                                 "attention observation is not this Session's running step".into()
                             );
@@ -796,8 +778,10 @@ impl Follow {
                         let observation: vox_core::node::attention::InputObservation =
                             serde_json::from_slice(&bytes)
                                 .map_err(|e| format!("invalid attention observation: {e}"))?;
-                        if Some(observation.assistant.as_str()) != part["messageID"].as_str()
-                            || Some(observation.step.as_str()) != part["id"].as_str()
+                        if Some(observation.assistant.as_str())
+                            != d.get("assistantMessageID").and_then(Value::as_str)
+                            || Some(observation.step.as_str())
+                                != d.get("assistantMessageID").and_then(Value::as_str)
                         {
                             return Err(
                                 "attention observation names a different assistant step".into()
@@ -816,35 +800,86 @@ impl Follow {
                     .await;
                     if let Err(why) = result {
                         self.fail(&why).await;
-                        return;
                     }
                 }
-                self.agent = info
-                    .get("agent")
-                    .and_then(Value::as_str)
-                    .map(|agent| (sid.clone(), agent.to_owned()));
-                if sid == self.session && info["role"] == "assistant" {
-                    if let (Some(provider), Some(model)) = (
-                        info.get("providerID").and_then(Value::as_str),
-                        info.get("modelID").and_then(Value::as_str),
-                    ) {
-                        self.model = Some((provider.to_owned(), model.to_owned()));
-                    }
-                }
-                self.part(&sid, part, role).await;
             }
-            // **A rename is the Session's name at once** (ADR-029 MD-1): OpenCode's title, set by
-            // `/rename`, by Vox's own rename, or made by OpenCode itself, arrives only here.
-            "session.updated" => {
-                let info = &p["info"];
-                if info.get("id").and_then(Value::as_str) == Some(self.session.as_str()) {
-                    if let Some(title) = info.get("title").and_then(Value::as_str) {
-                        if self.title.as_deref() != Some(title) {
-                            self.title = Some(title.to_owned());
-                            self.sink.renamed(&self.node, &self.session, title);
+            "session.text.ended" => {
+                let Some(text) = d.get("text").and_then(Value::as_str) else {
+                    return;
+                };
+                let pid = format!(
+                    "{}:{}",
+                    d.get("assistantMessageID")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                    d.get("ordinal").and_then(Value::as_u64).unwrap_or_default()
+                );
+                self.assistant_text(&sid, &pid, text).await;
+            }
+            "session.tool.input.started" => {
+                let key = (
+                    sid.clone(),
+                    d.get("assistantMessageID")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    d.get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                );
+                if let Some(name) = d.get("name").and_then(Value::as_str) {
+                    self.tools.insert(key, name.to_owned());
+                    if self.tools.len() > MAX_COMMANDS {
+                        let first = self.tools.keys().next().cloned();
+                        if let Some(first) = first {
+                            self.tools.remove(&first);
                         }
                     }
                 }
+            }
+            "session.tool.called" => {
+                let id = d.get("id").and_then(Value::as_str).unwrap_or_default();
+                let key = (
+                    sid.clone(),
+                    d.get("assistantMessageID")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    id.to_owned(),
+                );
+                let tool = self
+                    .tools
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or_else(|| "tool".into());
+                // Admit earlier reply text before this call, without spawning an unbounded waiter.
+                self.flush_replies().await;
+                let input = d.get("input").cloned().unwrap_or(json!({}));
+                let text = input_text(&tool, &input);
+                let mut e = self.envelope(&sid, "tool", Some(id));
+                e.insert("tool".into(), json!(tool));
+                e.insert("summary".into(), json!(one_line(&text)));
+                e.insert("input".into(), json!(text));
+                self.post_source(&sid, id, e, "input").await;
+            }
+            "session.tool.success" | "session.tool.failed" => {
+                let id = d.get("id").and_then(Value::as_str).unwrap_or_default();
+                let key = (
+                    sid.clone(),
+                    d.get("assistantMessageID")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    id.to_owned(),
+                );
+                let tool = self
+                    .tools
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or_else(|| "tool".into());
+                let ok = ev.get("type").and_then(Value::as_str) == Some("session.tool.success");
+                self.tool_settled(&sid, id, &tool, ok, d).await;
             }
             "session.idle" if sid == self.session => {
                 self.flush_replies().await;
@@ -854,18 +889,25 @@ impl Follow {
                     self.ended = true;
                 }
             }
-            "permission.asked" => {
-                self.permission(&sid, p).await;
+            "session.status" if sid == self.session => {
+                if d.pointer("/status/type").and_then(Value::as_str) == Some("idle") {
+                    self.flush_replies().await;
+                    if !self.ended {
+                        self.post(split(self.envelope(&sid, "turn-end", None), ""))
+                            .await;
+                        self.ended = true;
+                    }
+                }
             }
-            "question.asked" => {
-                self.question(&sid, p).await;
+            "permission.asked" => {
+                self.permission(&sid, d).await;
             }
             "permission.replied" => {
-                let Some(r) = p.get("requestID").and_then(Value::as_str) else {
+                let Some(r) = d.get("requestID").and_then(Value::as_str) else {
                     return;
                 };
                 if self.asks.remove(r).is_some() {
-                    let outcome = match p.get("reply").and_then(Value::as_str) {
+                    let outcome = match d.get("reply").and_then(Value::as_str) {
                         Some("reject") => "denied",
                         _ => "allowed",
                     };
@@ -874,180 +916,97 @@ impl Follow {
                         .await;
                 }
             }
-            t @ ("question.replied" | "question.rejected") => {
-                let Some(r) = p.get("requestID").and_then(Value::as_str) else {
-                    return;
-                };
-                if let Some(ask) = self.asks.remove(r) {
-                    if t == "question.rejected" {
-                        self.sink
-                            .resolved(&self.node, &self.session, r, "cancelled", None)
-                            .await;
-                    } else {
-                        // What OpenCode took, in the shape the member gave it when it is the
-                        // member's answer, so the sink can say who answered (DR-4).
-                        let took = p.get("answers").cloned();
-                        let answers = match (&ask.answered, &ask.sent) {
-                            (Some(Given::Answer(m)), Some(sent)) if took.as_ref() == Some(sent) => {
-                                Some(json!(m))
-                            }
-                            _ => took,
-                        };
-                        self.sink
-                            .resolved(&self.node, &self.session, r, "answered", answers)
-                            .await;
-                    }
-                }
-            }
             _ => {}
         }
     }
 
-    async fn part(&mut self, sid: &str, part: &Value, role: &str) {
-        let pid = part.get("id").and_then(Value::as_str).unwrap_or_default();
-        match part.get("type").and_then(Value::as_str).unwrap_or_default() {
-            "text" => {
-                let text = part.get("text").and_then(Value::as_str).unwrap_or_default();
-                match role {
-                    "user" => {
-                        // A user message's text, once, when it is final; a sub-agent's prompt
-                        // is its parent's tool call, already shown.
-                        if sid != self.session {
-                            return;
-                        }
-                        let Some(text) = typed(text) else { return };
-                        if text.trim().is_empty() {
-                            return;
-                        }
-                        let mut e = self.envelope(sid, "user", None);
-                        e.insert("text".into(), json!(text));
-                        self.post_source(sid, pid, e, "text").await;
-                    }
-                    "assistant" => {
-                        let agent = self
-                            .agent
-                            .as_ref()
-                            .filter(|(of, _)| of == sid)
-                            .map(|(_, name)| name.clone());
-                        let slot = self
-                            .texts
-                            .iter()
-                            .position(|(of, id, _, _)| of == sid && id == pid);
-                        let used = self
-                            .texts
-                            .iter()
-                            .enumerate()
-                            .filter(|(i, _)| Some(*i) != slot)
-                            .fold(0usize, |n, (_, (s, p, t, a))| {
-                                n.saturating_add(s.len())
-                                    .saturating_add(p.len())
-                                    .saturating_add(t.len())
-                                    .saturating_add(a.as_ref().map_or(0, String::len))
-                            });
-                        let added = sid
-                            .len()
-                            .saturating_add(pid.len())
-                            .saturating_add(text.len())
-                            .saturating_add(agent.as_ref().map_or(0, String::len));
-                        if (slot.is_none() && self.texts.len() >= MAX_TEXT_PARTS)
-                            || added > MAX_TEXT_BYTES.saturating_sub(used)
-                        {
-                            self.fail("live assistant text exceeds 128 parts or 8 MiB; observation must restart").await;
-                            return;
-                        }
-                        let part = (sid.to_owned(), pid.to_owned(), text.to_owned(), agent);
-                        if let Some(slot) = slot {
-                            self.texts[slot] = part;
-                        } else {
-                            self.texts.push(part);
-                        }
-                    }
-                    _ => unreachable!("checked role"),
-                }
-            }
-            "tool" => self.tool(sid, part).await,
-            _ => {}
+    /// Accumulate one finished assistant text part of a reply, posted before the next
+    /// tool call and at the turn's end, so replies and calls keep their order.
+    async fn assistant_text(&mut self, sid: &str, pid: &str, text: &str) {
+        let agent = self
+            .agent
+            .as_ref()
+            .filter(|(of, _)| of == sid)
+            .map(|(_, name)| name.clone());
+        let slot = self
+            .texts
+            .iter()
+            .position(|(of, id, _, _)| of == sid && id == pid);
+        let used = self
+            .texts
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| Some(*i) != slot)
+            .fold(0usize, |n, (_, (s, p, t, a))| {
+                n.saturating_add(s.len())
+                    .saturating_add(p.len())
+                    .saturating_add(t.len())
+                    .saturating_add(a.as_ref().map_or(0, String::len))
+            });
+        let added = sid
+            .len()
+            .saturating_add(pid.len())
+            .saturating_add(text.len())
+            .saturating_add(agent.as_ref().map_or(0, String::len));
+        if (slot.is_none() && self.texts.len() >= MAX_TEXT_PARTS)
+            || added > MAX_TEXT_BYTES.saturating_sub(used)
+        {
+            self.fail("live assistant text exceeds 128 parts or 8 MiB; observation must restart")
+                .await;
+            return;
+        }
+        let part = (sid.to_owned(), pid.to_owned(), text.to_owned(), agent);
+        if let Some(slot) = slot {
+            self.texts[slot] = part;
+        } else {
+            self.texts.push(part);
         }
     }
 
-    async fn tool(&mut self, sid: &str, part: &Value) {
-        let call = part
-            .get("callID")
-            .or_else(|| part.get("id"))
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned();
-        let tool = part
-            .get("tool")
-            .and_then(Value::as_str)
-            .unwrap_or("tool")
-            .to_owned();
-        let state = &part["state"];
-        let status = state
-            .get("status")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let input = state.get("input").cloned().unwrap_or(json!({}));
-        if matches!(status, "running" | "completed" | "error") {
-            // Admit earlier reply text before this call, without spawning an unbounded waiter.
-            self.flush_replies().await;
-            let text = input_text(&tool, &input);
-            let mut e = self.envelope(sid, "tool", Some(&call));
-            e.insert("tool".into(), json!(tool));
-            e.insert("summary".into(), json!(one_line(&text)));
-            e.insert("input".into(), json!(text));
-            self.post_source(sid, &call, e, "input").await;
-            if self.failed {
-                return;
-            }
-        }
-        match status {
-            "running" => {}
-            "completed" | "error" => {
-                let ok = status == "completed";
-                let output = if ok {
-                    state
-                        .get("output")
+    /// A tool call's settlement: its completion or failure, in the shape every harness
+    /// shares. A completion seen alone posts its start first.
+    async fn tool_settled(&mut self, sid: &str, call: &str, tool: &str, ok: bool, d: &Value) {
+        self.flush_replies().await;
+        let output = if ok {
+            d.get("content")
+                .and_then(Value::as_array)
+                .map(|cs| {
+                    cs.iter()
+                        .filter_map(|c| c.get("text").and_then(Value::as_str))
+                        .collect::<Vec<_>>()
+                        .join("\n\n")
+                })
+                .unwrap_or_default()
+        } else {
+            d.get("error")
+                .map(|e| {
+                    e.get("message")
                         .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_owned()
-                } else {
-                    state
-                        .get("error")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_owned()
-                };
-                let summary = if ok {
-                    state
-                        .get("title")
-                        .and_then(Value::as_str)
-                        .filter(|t| !t.is_empty())
-                        .map_or_else(|| one_line(&output), one_line)
-                } else {
-                    format!("error: {}", one_line(&output))
-                };
-                let mut e = self.envelope(sid, "tool-done", Some(&call));
-                e.insert("tool".into(), json!(tool));
-                e.insert("ok".into(), json!(ok));
-                e.insert("summary".into(), json!(one_line(&summary)));
-                e.insert("output".into(), json!(output));
-                self.post_source(sid, &call, e, "output").await;
-            }
-            _ => {}
-        }
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| e.to_string())
+                })
+                .unwrap_or_default()
+        };
+        let summary = if ok {
+            one_line(&output)
+        } else {
+            format!("error: {}", one_line(&output))
+        };
+        let mut e = self.envelope(sid, "tool-done", Some(call));
+        e.insert("tool".into(), json!(tool));
+        e.insert("ok".into(), json!(ok));
+        e.insert("summary".into(), json!(one_line(&summary)));
+        e.insert("output".into(), json!(output));
+        self.post_source(sid, call, e, "output").await;
     }
 
-    async fn permission(&mut self, sid: &str, p: &Value) {
-        let Some(id) = p.get("id").and_then(Value::as_str).map(str::to_owned) else {
+    async fn permission(&mut self, sid: &str, d: &Value) {
+        let Some(id) = d.get("id").and_then(Value::as_str).map(str::to_owned) else {
             return;
         };
-        let what = p
-            .get("permission")
-            .and_then(Value::as_str)
-            .unwrap_or("tool");
-        let patterns = p
-            .get("patterns")
+        let action = d.get("action").and_then(Value::as_str).unwrap_or("tool");
+        let patterns = d
+            .get("resources")
             .and_then(Value::as_array)
             .map(|ps| {
                 ps.iter()
@@ -1056,12 +1015,12 @@ impl Follow {
                     .join(" ")
             })
             .unwrap_or_default();
-        let input = p
+        let input = d
             .get("metadata")
             .map(|m| serde_json::to_string_pretty(m).unwrap_or_default())
             .unwrap_or_default();
         let mut e = self.envelope(sid, "approval", Some(&id));
-        e.insert("tool".into(), json!(what));
+        e.insert("tool".into(), json!(action));
         e.insert(
             "summary".into(),
             json!(one_line(if patterns.is_empty() {
@@ -1071,37 +1030,10 @@ impl Follow {
             })),
         );
         e.insert("input".into(), json!(input));
-        self.ask(id, "approval", Vec::new(), Value::Object(e).to_string())
-            .await;
+        self.ask(id, "approval", Value::Object(e).to_string()).await;
     }
 
-    async fn question(&mut self, sid: &str, p: &Value) {
-        let Some(id) = p.get("id").and_then(Value::as_str).map(str::to_owned) else {
-            return;
-        };
-        let questions: Vec<Value> = p
-            .get("questions")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let shown: Vec<Value> = questions
-            .iter()
-            .map(|q| {
-                json!({
-                    "text": q.get("question").cloned().unwrap_or(Value::Null),
-                    "header": q.get("header").cloned().unwrap_or(Value::Null),
-                    "options": q.get("options").cloned().unwrap_or(json!([])),
-                    "multi": q.get("multiple").and_then(Value::as_bool).unwrap_or(false),
-                })
-            })
-            .collect();
-        let mut e = self.envelope(sid, "question", Some(&id));
-        e.insert("questions".into(), json!(shown));
-        self.ask(id, "question", questions, Value::Object(e).to_string())
-            .await;
-    }
-
-    async fn ask(&mut self, id: String, of: &'static str, questions: Vec<Value>, entry: String) {
+    async fn ask(&mut self, id: String, of: &'static str, entry: String) {
         if self.asks.contains_key(&id) {
             return;
         }
@@ -1109,9 +1041,7 @@ impl Follow {
             .asks
             .iter()
             .fold(0usize, |n, (id, ask)| n.saturating_add(ask_bytes(id, ask)));
-        let added = id
-            .len()
-            .saturating_add(serde_json::to_vec(&questions).map_or(MAX_ASK_BYTES, |v| v.len()));
+        let added = id.len();
         if self.asks.len() >= MAX_ASKS
             || added > MAX_ASK_BYTES.saturating_sub(used)
             || entry.len() > MAX_LINE
@@ -1128,9 +1058,7 @@ impl Follow {
             id,
             Ask {
                 of,
-                questions,
                 answered: None,
-                sent: None,
                 receiver: Some(rx),
             },
         );
@@ -1146,30 +1074,4 @@ fn input_text(tool: &str, input: &Value) -> String {
         _ => None,
     }
     .unwrap_or_else(|| serde_json::to_string_pretty(input).unwrap_or_default())
-}
-
-/// A member's answer to question `q` as OpenCode's list of chosen labels. A multiple-choice
-/// answer arrives joined with ", "; it is split only when every piece is one of the question's
-/// labels, so a label or a typed answer holding ", " is never cut apart.
-fn labels(q: &Value, given: &str) -> Vec<String> {
-    let options: Vec<&str> = q
-        .get("options")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|o| o.get("label").and_then(Value::as_str))
-        .collect();
-    if given.is_empty() {
-        return Vec::new();
-    }
-    if options.contains(&given) {
-        return vec![given.to_owned()];
-    }
-    let pieces: Vec<&str> = given.split(", ").collect();
-    if q.get("multiple").and_then(Value::as_bool) == Some(true)
-        && pieces.iter().all(|p| options.contains(p))
-    {
-        return pieces.into_iter().map(str::to_owned).collect();
-    }
-    vec![given.to_owned()]
 }

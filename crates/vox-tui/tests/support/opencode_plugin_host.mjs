@@ -1,33 +1,35 @@
-// The shipped OpenCode plugin, hosted the way OpenCode hosts it, with no model and no OpenCode
-// (V030-21). Used by `room_text_cannot_close_the_opencode_fence_proof.rs` and
+// The shipped OpenCode plugin, hosted the way OpenCode 2.x hosts it, with no model and no
+// OpenCode (V030-21). Used by `room_text_cannot_close_the_opencode_fence_proof.rs` and
 // `a_codex_and_an_opencode_session_are_mirrored_and_driven_proof.rs`.
 //
 //   node opencode_plugin_host.mjs <plugin.mjs> <session id>
 //
-// It loads the plugin `vox agent plugin opencode` printed and gives it what OpenCode gives a
-// plugin: Bun's `$` (here, the same calls made with `node:child_process`, so the real `vox agent
-// hook` runs) and a client whose `session.promptAsync` is how a wake arrives. Then it reads one
-// command per line on stdin and answers each with one JSON line on stdout:
+// It loads the plugin `vox agent plugin opencode` printed and gives it what OpenCode 2.x gives
+// a plugin: the plugin context (`{id, setup}` is how 2.x loads it) — its `session.hook` domains,
+// its `event.subscribe` stream, and its own session/permission domains, which is how a wake
+// arrives and how the plugin's driven calls reach OpenCode. Then it reads one command per line
+// on stdin and answers each with one JSON line on stdout:
 //
-//   turn <text>   a user message typed as <text>: the plugin's `chat.message` runs on it, and
-//                 the answer is what the model would be given, `{"kind":"turn","text":…}`
-//   wake <secs>   wait for `vox daemon` to relay a wake through the plugin's socket; OpenCode
-//                 then runs `chat.message` on the relayed prompt, and so does this:
-//                 `{"kind":"wake","relayed":…,"text":…}`, or `{"kind":"no-wake"}` past <secs>
+//   turn <text>   a user message typed as <text>: the plugin's `session` `context` hook runs
+//                 on it, and the answer is what the model would be given, `{"kind":"turn","text":…}`
+//   wake <secs>   wait for `vox daemon` to relay a wake through the plugin's socket, as a
+//                 driven `session.prompt` call; OpenCode then runs the context hook on the
+//                 relayed prompt, and so does this: `{"kind":"wake","relayed":…,"text":…}`,
+//                 or `{"kind":"no-wake"}` past <secs>
 //   notice <secs> take the same wake without starting its turn yet, as a busy OpenCode can do;
 //                 the room remains unread until a later `turn` or `wake`.
-//   event <json>  one event of OpenCode's bus, as OpenCode hands it to the plugin's `event` hook:
-//                 `{"kind":"event"}` once the hook returned
-//   title <text>  the session's title as OpenCode holds it, from now on: what the plugin reads
-//                 with `GET /session/<id>` (a read, not counted among `calls`): `{"kind":"title"}`
+//   event <json>  one event of OpenCode 2.x's bus (`{type, data}`), as the plugin's
+//                 `event.subscribe` stream delivers it: `{"kind":"event"}` once it settled
+//   title <text>  the session's title as OpenCode holds it, from now on: what the plugin
+//                 reads with `ctx.session.get` (a read, not counted among `calls`):
+//                 `{"kind":"title"}`
 //   calls <secs> <n>
-//                 wait until the plugin has made at least <n> calls to OpenCode's API through
-//                 its in-process client (`client._client.request`), and answer all of them:
-//                 `{"kind":"calls","calls":[{method,url,body}…]}`
+//                 wait until the plugin has made at least <n> calls on OpenCode's session
+//                 domain, and answer all of them: `{"kind":"calls","calls":[{method,input}…]}`
 //
 // Anything the host itself cannot do is `{"kind":"apparatus","error":…}`.
 
-import { spawn } from "node:child_process"
+import { readFileSync } from "node:fs"
 import { createInterface } from "node:readline"
 import { pathToFileURL } from "node:url"
 
@@ -40,106 +42,136 @@ function say(obj) {
   process.stdout.write(JSON.stringify(obj) + "\n")
 }
 
-// Bun's `$` as the plugin uses it: `` $`${bin} agent hook … ${flags}`.env(e).quiet().nothrow() ``,
-// awaited for `{ stdout, exitCode }`. Each interpolated value is one argument, an array is several,
-// and the literal text between them is split on whitespace, as Bun's shell does.
-function $(strings, ...values) {
-  const argv = []
-  strings.forEach((lit, i) => {
-    argv.push(...lit.split(/\s+/).filter(Boolean))
-    if (i < values.length) {
-      const v = values[i]
-      if (Array.isArray(v)) argv.push(...v.map(String))
-      else argv.push(String(v))
-    }
-  })
-  let env = process.env
-  const cmd = {
-    env(e) {
-      env = e
-      return cmd
-    },
-    quiet() {
-      return cmd
-    },
-    nothrow() {
-      return cmd
-    },
-    then(resolve, reject) {
-      const child = spawn(argv[0], argv.slice(1), { env, stdio: ["ignore", "pipe", "inherit"] })
-      const out = []
-      child.stdout.on("data", (b) => out.push(b))
-      child.on("error", (e) => resolve({ stdout: Buffer.alloc(0), exitCode: 127, error: e }))
-      child.on("close", (code) => resolve({ stdout: Buffer.concat(out), exitCode: code ?? -1 }))
-      return undefined
-    },
-  }
-  return cmd
-}
-
 const prompts = []
 let waiting = null
-// The plugin's calls to OpenCode's HTTP API, made in process; each is answered 200, as OpenCode
+// The notices a hosted client receiver submitted (`VOX_PROOF_NOTICES`): the daemon's wake
+// reaching the client, which alone submits it (ADR-020 RA7). One JSON line each:
+// {"session":…,"text":…,"metadata":{…}}. The offset tracks what this host has taken.
+let noticesPath = process.env.VOX_PROOF_NOTICES ?? null
+let noticesAt = 0
+const notices = []
+function takeNotices() {
+  if (!noticesPath) return
+  let text
+  try {
+    text = readFileSync(noticesPath, "utf8")
+  } catch {
+    return
+  }
+  const lines = text.split("\n")
+  if (lines.length && lines[lines.length - 1] === "") lines.pop()
+  for (; noticesAt < lines.length; noticesAt += 1) {
+    try {
+      const record = JSON.parse(lines[noticesAt])
+      if (record && typeof record.text === "string") notices.push(record)
+    } catch {}
+  }
+}
+function arrival() {
+  if (prompts.length) {
+    return { text: prompts.shift().text, metadata: null }
+  }
+  if (notices.length) {
+    const notice = notices.shift()
+    return { text: notice.text, metadata: notice.metadata ?? null }
+  }
+  return null
+}
+// The plugin's calls on OpenCode's own domains, made in process; each is answered as OpenCode
 // answers a call it takes.
 const calls = []
 let callWaiting = null
 // The session's title as OpenCode holds it (`title`), or none.
 let title = null
-const encoder = new TextEncoder()
-function jsonStream(value) {
-  const bytes = encoder.encode(JSON.stringify(value))
-  return new ReadableStream({
-    start(controller) {
-      controller.enqueue(bytes)
-      controller.close()
-    },
-  })
+// One registered hook per domain name, as `ctx.session.hook` installed it.
+const hooks = {}
+// The events fed to the plugin's `event.subscribe` stream, and the pump's wake.
+const events = []
+let eventPushed = null
+const register = (domain) => async (name, callback) => {
+  hooks[domain + "." + name] = callback
+  return { dispose: () => { delete hooks[domain + "." + name] } }
 }
-const client = {
-  _client: {
-    getConfig() {
-      return { fetch: globalThis.fetch }
-    },
-    async request({ method, url, body }) {
-      // A read of the session: its info, as OpenCode answers it. Not a call the plugin made on
-      // the session's behalf, so not among `calls`.
-      if (method === "GET" && url === `/session/${session}`) {
-        return { response: { status: 200 },
-          data: jsonStream({ id: session, ...(title ? { title } : {}) }) }
-      }
-      calls.push({ method, url, body: body ?? null })
-      if (callWaiting) callWaiting()
-      return { response: { status: 200 }, data: null }
-    },
-  },
+const note = (method, input) => {
+  calls.push({ method, input: JSON.parse(JSON.stringify(input ?? {})) })
+  if (callWaiting) callWaiting()
+  return Promise.resolve({})
+}
+const ctx = {
+  location: { directory: process.cwd() },
   session: {
-    // OpenCode takes the prompt and answers 2xx; the turn it starts runs afterwards.
-    async promptAsync({ path, body }) {
-      const text = body?.parts?.[0]?.text ?? ""
-      prompts.push({ session: path?.id, text })
+    hook: register("session"),
+    // A read of the session: its info, as OpenCode answers it. Not a call the plugin made on
+    // the session's behalf, so not among `calls`.
+    get: (input) =>
+      Promise.resolve({
+        data: { id: input.sessionID, parentID: null, ...(title ? { title } : {}) },
+      }),
+    // OpenCode takes the prompt and answers; the turn it starts runs the context hook after.
+    prompt: (input) => {
+      const text = input?.text?.text ?? ""
+      prompts.push({ session: input.sessionID, text })
       if (waiting) waiting()
-      return { response: { status: 200 } }
+      return note("session.prompt", input)
     },
+    interrupt: (input) => note("session.interrupt", input),
+    update: (input) => note("session.update", input),
+    compact: (input) => note("session.compact", input),
+    command: (input) => note("session.command", input),
+  },
+  permission: {
+    hook: register("permission"),
+    reply: (input) => note("permission.reply", input),
+  },
+  tool: { hook: register("tool") },
+  shell: { hook: register("shell") },
+  event: {
+    // OpenCode's event stream: each fed event is delivered once, in order.
+    subscribe: () => ({
+      async *[Symbol.asyncIterator]() {
+        for (;;) {
+          while (events.length) {
+            const event = events.shift()
+            yield event
+          }
+          await new Promise((resolve) => { eventPushed = resolve })
+          eventPushed = null
+        }
+      },
+    }),
   },
 }
 
 let turnSequence = 0
-async function turn(hooks, text) {
+async function turn(text, metadata = null) {
   turnSequence += 1
   const messageID = `msg_vox_host_${turnSequence}`
-  const output = {
-    message: { id: messageID, sessionID: session, role: "user" },
-    parts: [{ id: `part_vox_host_${turnSequence}`, messageID, sessionID: session,
-      type: "text", text }],
+  const message = {
+    id: messageID,
+    role: "user",
+    content: [{ type: "text", text }],
+    ...(metadata ? { metadata } : {}),
   }
-  await hooks["chat.message"]({ sessionID: session }, output)
-  return output.parts[0].text
+  await hooks["session.context"]({
+    sessionID: session,
+    model: { providerID: "host", modelID: "host" },
+    system: [],
+    messages: [message],
+    options: {},
+    agent: "host",
+    tools: {},
+  })
+  return message.content[0].text
 }
 
-let hooks
+let cleanup
 try {
   const mod = await import(pathToFileURL(pluginPath).href)
-  hooks = await mod.default({ $, client })
+  if (!mod?.default || typeof mod.default !== "object"
+    || typeof mod.default.id !== "string" || typeof mod.default.setup !== "function") {
+    throw new Error("the plugin does not export a 2.x {id, setup} definition")
+  }
+  cleanup = await mod.default.setup(ctx)
 } catch (e) {
   say({ kind: "apparatus", error: "loading the plugin: " + e })
   process.exit(2)
@@ -151,11 +183,16 @@ for await (const line of lines) {
   const arg = rest.join(" ")
   try {
     if (cmd === "turn") {
-      say({ kind: "turn", text: await turn(hooks, arg) })
+      say({ kind: "turn", text: await turn(arg) })
     } else if (cmd === "wake" || cmd === "notice") {
-      if (!prompts.length) {
+      let next = null
+      const deadline = Date.now() + Number(arg) * 1000
+      while (Date.now() < deadline) {
+        takeNotices()
+        next = arrival()
+        if (next) break
         await new Promise((resolve) => {
-          const timer = setTimeout(resolve, Number(arg) * 1000)
+          const timer = setTimeout(resolve, 50)
           waiting = () => {
             clearTimeout(timer)
             resolve()
@@ -163,15 +200,19 @@ for await (const line of lines) {
         })
         waiting = null
       }
-      const p = prompts.shift()
-      if (!p) say({ kind: "no-wake" })
-      else say({ kind: "wake", relayed: p.text,
-        ...(cmd === "wake" ? { text: await turn(hooks, p.text) } : {}) })
+      if (!next) say({ kind: "no-wake" })
+      else say({ kind: "wake", relayed: next.text,
+        ...(cmd === "wake" ? { text: await turn(next.text, next.metadata) } : {}) })
     } else if (cmd === "title") {
       title = arg
       say({ kind: "title" })
     } else if (cmd === "event") {
-      await hooks.event({ event: JSON.parse(arg) })
+      // The fed event is delivered by the stream the plugin pumps; the short settle holds
+      // this answer until the pump has taken the event, while the proofs that depend on
+      // its effects poll for those effects with their own deadlines.
+      events.push(JSON.parse(arg))
+      if (eventPushed) eventPushed()
+      await new Promise((resolve) => setTimeout(resolve, 100))
       say({ kind: "event" })
     } else if (cmd === "calls") {
       const [secs, n] = arg.split(" ").map(Number)
@@ -194,4 +235,5 @@ for await (const line of lines) {
     say({ kind: "apparatus", error: String(e) })
   }
 }
+try { await cleanup?.() } catch {}
 process.exit(0)

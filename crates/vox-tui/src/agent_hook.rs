@@ -1786,6 +1786,11 @@ pub async fn run(
                 .ok()
                 .filter(|s| !s.trim().is_empty())
         })
+        .or_else(|| {
+            std::env::var("OPENCODE_SESSION_ID")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        })
     {
         input.session_id = id.trim().to_owned();
         input.codex = session.is_none() && std::env::var_os("CODEX_THREAD_ID").is_some();
