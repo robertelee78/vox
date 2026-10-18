@@ -1507,7 +1507,7 @@ mod journey {
             .envs(oc_env)
             .arg("-f")
             .arg(&profile)
-            .arg(&oc_sandbox::opencode_bin())
+            .arg(oc_sandbox::opencode_bin())
             .args(["service", "set", "port", &oc_port.to_string()])
             .current_dir(&w.repo)
             .stdin(Stdio::null())
