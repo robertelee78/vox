@@ -135,7 +135,9 @@ pub(crate) struct Flow {
     slots: Arc<BodySlots>,
     owners: [Option<RequestId>; 2],
     no_progress: u8,
-    body_progress: bool,
+    /// A durable body chunk moved in this flow's last turn: the waiting slice is
+    /// progress, not a busy wait, and its port must not grow a Busy backoff.
+    pub(crate) body_progress: bool,
     last_head: Option<(super::HeadHint, u8)>,
     request: RequestId,
     cleanup_store: Arc<Store>,

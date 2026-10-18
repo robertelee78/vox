@@ -2279,25 +2279,48 @@ impl ChannelState {
                 };
                 if behind {
                     // A sealed record beyond this receiver chain's keys is not applicable
-                    // here at this chain state. The covering key package is either still
-                    // in flight for this member — this pull retries after its install, at
-                    // its own pacing — or is not addressed to this member at all: a
+                    // here at this chain state, and refusing the page here made the pull
+                    // a dead end: the retry re-requested the same tail while the named
+                    // explicit recovery was armed by nothing, and the failed round lost
+                    // the walk entirely. The chain says which it is: a receiver this
+                    // member holds names its chain, so the record is this member's and the
+                    // covering package merely has not landed yet — this pull returns no
+                    // progress and retries after the install, at its own pacing. Only a
+                    // record of a chain this member holds no receiver for at all, with no
+                    // package of its author in flight, is not this member's to apply: a
                     // Session is read from a grant onward, and this member holds no grant
-                    // for this generation, so the record is not this member's to apply and
-                    // the pull moves past it. Refusing the whole page here made the pull a
-                    // dead end: the retry re-requested the same tail while the named
-                    // explicit recovery was armed by nothing.
+                    // for this generation, so the pull moves past it.
                     if self.key_packages.pending_from(&header.author_id) {
+                        return Ok(false);
+                    }
+                    if self
+                        .drive
+                        .receivers
+                        .contains_key(&(header.author_id, header.chain_id))
+                    {
                         return Ok(false);
                     }
                     continue;
                 }
             }
-            let row = self
-                .preview_private_record(store, wire)?
-                .ok_or(Error::StreamRefused(
-                    "private lifecycle/history unavailable; explicit recovery required",
-                ))?;
+            // A record whose covering key package is still in flight cannot be previewed
+            // yet, and one whose opening Session record is still in flight cannot find its
+            // session yet. Refusing the page for either made this pull a dead end: the retry
+            // re-requested the same tail while the named explicit recovery was armed by
+            // nothing, and the failed round lost the walk that carried the pull. Each
+            // returns no progress instead and retries at its own pacing once the package or
+            // the opening record lands; the explicit refusal stays for a record whose
+            // session the projection will not hold.
+            if self.key_packages.pending_from(&header.author_id) {
+                return Ok(false);
+            }
+            let row = match self.preview_private_record(store, wire)? {
+                Some(row) => row,
+                // The receiver cannot open this iteration yet: the covering package has
+                // not landed. No progress; the install advances the chain and this pull
+                // retries the page.
+                None => return Ok(false),
+            };
             if !crate::node::sessions::is_record(&row.body)
                 && row.session_id != crate::node::drive::KEY_CHANGED
             {
@@ -2314,14 +2337,18 @@ impl ChannelState {
                     ),
                     Ok(Reply::Lookup(Some(_)))
                 ) {
-                    return Err(Error::StreamRefused(
-                        "private lifecycle unavailable; explicit recovery required",
-                    ));
+                    // The opening Session record of this lifecycle record's session is
+                    // still in flight through this same pull: refusing the page here
+                    // failed the round and lost the walk, and the retry re-requested the
+                    // same tail while the recovery it named was armed by nothing. No
+                    // progress; the opening record lands and this pull retries the page.
+                    return Ok(false);
                 }
             }
             self.take_private_record(store, wire, now, Some(trust_nonce))?;
         }
-        if self.private_sessions.cursors.get(&peer) != Some(&page.cursor) {
+        let advanced = self.private_sessions.cursors.get(&peer) != Some(&page.cursor);
+        if advanced {
             let mut next = self.private_sessions.cursors.clone();
             next.insert(peer, page.cursor);
             if let Err(error) = self.save_private_pull_candidate(store, &next, Some(trust_nonce)) {
@@ -2332,7 +2359,12 @@ impl ChannelState {
             }
             self.private_sessions.cursors = next;
         }
-        Ok(false) // No private archive is scheduled automatically, even when a gap remains.
+        // `true` is this page advanced the pull: its caller pulls the next page at once, so a
+        // member's private records converge in one run instead of one page per tick. `false`
+        // leaves the next page to the tick's own pacing: a page that applied nothing waits
+        // for whatever it waits for, and no failing page is retried in a tight loop. No
+        // private archive is scheduled automatically either way, even when a gap remains.
+        Ok(advanced)
     }
 
     fn preview_private_record(&self, store: &Store, wire: &[u8]) -> Result<Option<SessionRow>> {

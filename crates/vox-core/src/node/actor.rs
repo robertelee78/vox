@@ -1021,7 +1021,7 @@ enum NetEvent {
         channel_id: Digest32,
         peer: Digest32,
         room: std::sync::Weak<tokio::sync::Mutex<crate::node::channel::ChannelState>>,
-        result: Result<(), String>,
+        result: Result<bool, String>,
     },
     /// A program asked, through the app API, to open an app stream to `peer`: reach it
     /// through the ladder and hand the connection back (ADR-022 decision 7).
@@ -6131,6 +6131,13 @@ impl Node {
                     self.publication_pending |= !self.publish_waiters.is_empty();
                     self.publication_again |= !self.publish_waiters.is_empty();
                     if self.apply_computer_keyring().await.is_err() { continue; }
+                    // A finished bounded round reports through a `try_send` wake that a full
+                    // net queue can drop; its durable result slot stays pollable. The wake
+                    // dropped at the join burst's peak leaked its port's one attempt slot
+                    // (`out`) for the rest of the run: no round could start again, and the
+                    // room's late joiner never converged within its bounds. Poll the slots
+                    // here so a dropped wake costs at most this one second, never the port.
+                    self.accept_bounded_sync();
                     if let Some(net) = self.net.as_ref() {
                         // Connections a better path displaced are closed once their
                         // grace is up (M15.1b).
@@ -10190,6 +10197,7 @@ impl Node {
                 {
                     return;
                 }
+                let advanced = result.as_ref().copied().unwrap_or(false);
                 if let Err(reason) = result {
                     crate::node::status::SyncBook::with(
                         &self.sync_book,
@@ -10200,6 +10208,14 @@ impl Node {
                 }
                 self.say_session_news(&channel_id).await;
                 self.refresh_network_view().await;
+                // A page that advanced the pull leaves more of the same stream to fetch, and
+                // waiting for the next tick paced a member's private records at one page a
+                // second: a late joiner's Session opens arrived past the person-facing
+                // bounds while every page answered in milliseconds. Pull the next page now;
+                // a page that advanced nothing keeps the tick's pacing, so nothing spins.
+                if advanced {
+                    self.pull_private_sessions(channel_id, peer).await;
+                }
             }
             NetEvent::BoundedRoomAdvanced {
                 channel_id,
@@ -10479,6 +10495,7 @@ impl Node {
                 query,
                 reply,
             } => {
+                self.spawn_session_projection_catch_up(&channel_id);
                 let result = match (self.channels.get(&channel_id), self.profile.as_ref()) {
                     (Some(shared), Some(profile)) => {
                         let mut room = shared.lock().await;
@@ -10504,6 +10521,7 @@ impl Node {
                 query,
                 reply,
             } => {
+                self.spawn_session_projection_catch_up(&channel_id);
                 let result = match (self.channels.get(&channel_id), self.profile.as_ref()) {
                     (Some(shared), Some(profile)) => {
                         let mut room = shared.lock().await;
@@ -10530,6 +10548,7 @@ impl Node {
                 query,
                 reply,
             } => {
+                self.spawn_session_projection_catch_up(&channel_id);
                 let result = match (self.channels.get(&channel_id), self.profile.as_ref()) {
                     (Some(shared), Some(profile)) => {
                         let mut room = shared.lock().await;
@@ -14433,7 +14452,7 @@ impl Node {
         let Some(port) = self.ports.get(key) else {
             return false;
         };
-        port.out.is_none()
+        let eligible = port.out.is_none()
             && (port.needs()
                 || self.bounded_sync.needs_port(key.0, key.1)
                 || self.history_hints.pending(key.0, key.1))
@@ -14442,7 +14461,8 @@ impl Node {
             && self
                 .net
                 .as_ref()
-                .is_some_and(|n| n.manager().existing(&key.1).is_some())
+                .is_some_and(|n| n.manager().existing(&key.1).is_some());
+        eligible
     }
 
     /// The tick's part in sync (ADR-025 D1a, D7): retire attempts whose connection died, and every
@@ -20678,7 +20698,7 @@ impl Node {
                 )
                 .await?;
                 let Some(ask) = ask else {
-                    return Ok(());
+                    return Ok(false);
                 };
                 let page = tokio::time::timeout(
                     Duration::from_secs(10),
@@ -20697,7 +20717,6 @@ impl Node {
                     guard,
                     move |room, store| {
                         room.finish_private_pull(store, peer, page, now, trust_nonce)
-                            .map(|_| ())
                     },
                 )
                 .await
@@ -20859,6 +20878,38 @@ impl Node {
     /// Say [`NodeEvent::SessionEntry`] once for each session of the room `channel_id` with an
     /// entry placed since it was last said (ADR-029 CL-2): its entries are not room messages, so no
     /// other event tells a client of them.
+    /// A session query found the room's sessions projection with bounded work
+    /// outstanding. The query's own step advanced one slice and left the rest for the
+    /// next query or announcement, so a room whose records arrived through the private
+    /// pull converged its `vox sessions` view at one slice per poll — past the
+    /// person-facing bounds while every record had applied. Run the remaining bounded
+    /// steps off the actor now, one room lock at a time and yielding between steps, so
+    /// the projection catches up in one run; the query that triggered this still answers
+    /// with the projection as it stands, and its retry finds it current.
+    fn spawn_session_projection_catch_up(&mut self, channel_id: &Digest32) {
+        let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
+            return;
+        };
+        let Some(profile) = self.profile.as_ref() else {
+            return;
+        };
+        let store = profile.store_handle();
+        let now_ms = self.now_ms();
+        self.join_tasks.spawn(async move {
+            // Capped: a projection that never reports itself done must not spin here.
+            for _ in 0..64 {
+                tokio::task::yield_now().await;
+                let Ok(mut room) = shared.try_lock() else {
+                    break;
+                };
+                match room.advance_sessions(&store, now_ms.get()) {
+                    Ok(true) => {}
+                    _ => break,
+                }
+            }
+        });
+    }
+
     async fn say_session_news(&self, channel_id: &Digest32) {
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return;

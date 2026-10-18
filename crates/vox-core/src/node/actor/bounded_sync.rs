@@ -856,7 +856,8 @@ impl Node {
             // on the same port, and leaving its old Busy backoff intact spaces that real work at
             // the exponential cap even though capacity has just made progress. Transport, policy
             // and no-progress backoffs retain their distinct meaning.
-            let local_progress = returned.flow.done() || !returned.flow.waiting;
+            let local_progress =
+                returned.flow.done() || !returned.flow.waiting || returned.flow.body_progress;
             let cleared_busy = local_progress
                 && self
                     .ports
@@ -960,6 +961,7 @@ impl Node {
                 );
             } else {
                 let waiting = returned.flow.waiting;
+                let body_progress = returned.flow.body_progress;
                 if index == 0 {
                     if self.bounded_sync.deferred.len() == 8 {
                         if let Some(old) = self.bounded_sync.deferred.pop_front() {
@@ -979,11 +981,20 @@ impl Node {
                     self.bounded_sync.ready[index] = Some(returned.flow);
                 }
                 if waiting {
-                    self.enter_backoff(
-                        work.room,
-                        work.peer,
-                        crate::node::status::BackoffKind::Busy,
-                    );
+                    if body_progress {
+                        // A waiting slice that moved a durable body chunk is progress on real
+                        // remaining work, not a busy wait: the port's next round runs now at
+                        // the base cadence instead of doubling a Busy backoff against the very
+                        // backlog it is draining (an 18-slice drain was spaced past the
+                        // person-facing bounds by the exponential cap alone).
+                        self.sched_rooms.insert(work.room);
+                    } else {
+                        self.enter_backoff(
+                            work.room,
+                            work.peer,
+                            crate::node::status::BackoffKind::Busy,
+                        );
+                    }
                 } else {
                     self.sched_rooms.insert(work.room);
                 }
