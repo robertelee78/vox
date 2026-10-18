@@ -322,7 +322,18 @@ pub(super) fn advance(
         }
         ResultStep::Controls(controls) => {
             let input = room.history_read(store)?;
-            let accepted = input.history_head_committed(&controls.head_id(), controls.binding())?;
+            // Accepted, not merely committed: a control range is frequently about an
+            // earlier head of the author's chain — the head the join's control records
+            // were sealed under — and an earlier head is proven on the committed chain,
+            // never itself the committed head. Gating on `committed` alone meant such a
+            // range could never complete: the promotion below proved the head on the
+            // chain and returned Complete without committing it, this step re-ran, the
+            // gate was still false, and the verify/proof fetches looped for the whole
+            // window while every read refused. `history_head_accepted` is the same
+            // predicate for the committed head and additionally accepts an earlier head
+            // whose prefix range — persisted by the consistency receipt the promotion
+            // fetched — matches its own root.
+            let accepted = input.history_head_accepted(&controls.head_id(), controls.binding())?;
             drop(input);
             if !accepted {
                 return Ok(match promote_head(room, store, binding.head)? {

@@ -6131,6 +6131,14 @@ impl Node {
                     self.publication_pending |= !self.publish_waiters.is_empty();
                     self.publication_again |= !self.publish_waiters.is_empty();
                     if self.apply_computer_keyring().await.is_err() { continue; }
+                    // A joined sparse room that is not yet settled owes its settlement one
+                    // attempt every tick: nothing else reliably re-arms it. Sync session and
+                    // head-completion events call it too, but a room whose remaining piece
+                    // is its own feed's acknowledgement gets no further sync event until
+                    // the fetch that acknowledgement needs is itself driven — by this call.
+                    for room in self.channels.keys().copied().collect::<Vec<_>>() {
+                        self.settle_room(&room).await;
+                    }
                     // A finished bounded round reports through a `try_send` wake that a full
                     // net queue can drop; its durable result slot stays pollable. The wake
                     // dropped at the join burst's peak leaked its port's one attempt slot
@@ -19336,6 +19344,40 @@ impl Node {
                     .sparse_settlement_ready(profile.store(), now_ms)
                     .unwrap_or(false)
             {
+                // A joiner's settlement acknowledges its own feed's live window as fully
+                // visited — but only a flow visiting that feed ever selects the window, and
+                // no hint drives a flow to a joiner's own author: its entries are authored
+                // here, so nothing fetches them back until the 30-second periodic happens
+                // to. That half-minute was the whole convergence budget: a joined room sat
+                // unsettled — silently refusing every Session opening, drive-key release
+                // and private pull gated on it — until the periodic fetched a node's own
+                // head back from a peer that holds it. When the only missing piece is that
+                // acknowledgement, offer the own-author hint for the committed own head to
+                // every connected peer, so the next round fetches it now and this
+                // settlement settles on the answer.
+                if let Some((author, head, size)) =
+                    ch.sparse_settlement_pending_own_head(profile.store())
+                {
+                    drop(ch);
+                    let hint = crate::node::history_stream::HeadHint { author, size, head };
+                    let generation = self.history_hints.generation();
+                    if let Some(job) = self.history_budget.try_start(
+                        profile.fingerprint(),
+                        crate::node::history_budget::Lane::Control,
+                    ) {
+                        let peers = self.connected_peers();
+                        for peer in peers {
+                            let _ = self.history_hints.offer(
+                                &job,
+                                generation,
+                                *channel_id,
+                                peer,
+                                &[hint],
+                            );
+                        }
+                    }
+                    self.sched_rooms.insert(*channel_id);
+                }
                 return;
             }
             let settlement = if ch.uses_sparse_history(profile.store()).unwrap_or(true) {

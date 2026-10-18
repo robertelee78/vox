@@ -906,16 +906,18 @@ fn an_opencode_session_is_mirrored_and_driven() {
     let user = json!({"type": "session.inbox.delivered", "data": {"sessionID": OC, "inboxID": "msg_u1",
         "item": {"type": "user", "payload": {"text": "Paint e1 the colour I pick."}, "delivery": "queue"}}});
     let deadline = Instant::now() + within;
+    let mut err = String::new();
     loop {
         host.event(user.clone());
-        let (_, plain, _) = w.vox(PERSON, &["room", "session", &w.room, OC], None);
+        let (_, plain, e) = w.vox(PERSON, &["room", "session", &w.room, OC], None);
+        err = e;
         if plain.contains("typed at the terminal: Paint e1") {
             break;
         }
         assert!(
             Instant::now() < deadline,
             "PRODUCT: within {within:?}, the OpenCode session's prompt never reached its \
-             Session; `vox room session` said:\n{plain}"
+             Session; `vox room session` said:\n{plain}--stderr--\n{err}--end--"
         );
         std::thread::sleep(Duration::from_millis(500));
     }

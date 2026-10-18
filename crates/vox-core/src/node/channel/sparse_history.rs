@@ -95,14 +95,56 @@ impl ChannelState {
         Ok(None)
     }
 
+    /// The own-author committed head whose live-window acknowledgement is the only
+    /// missing piece of [`Self::sparse_settlement_ready`]: the room is unsettled,
+    /// the own sparse state has a committed own head with no observed conflict, the
+    /// local contiguous verified prefix covers that head, and the own live window
+    /// has not (fully) visited it. `None` when the settlement is missing something
+    /// else, or is already ready.
+    pub(crate) fn sparse_settlement_pending_own_head(
+        &self,
+        store: &Store,
+    ) -> Option<(Digest32, Digest32, u64)> {
+        if self.settled {
+            return None;
+        }
+        let read = self.history_read(store).ok()?;
+        if read.publication_busy() {
+            return None;
+        }
+        let own = self.me();
+        let contiguous = self.dag.verified_head(&own);
+        if read
+            .history_settled_tip(&own)
+            .ok()?
+            .is_some_and(|tip| tip.skeleton.seq > contiguous)
+        {
+            return None;
+        }
+        let state = read.sparse_author(&own, LogScope::Public).ok()??;
+        if state.observed_conflict.is_some() {
+            return None;
+        }
+        let committed = state.committed?;
+        let head = read.history_head(&committed).ok()??;
+        let acknowledged = state.live.is_some_and(|window| {
+            window.head == committed && window.through == head.root.leaves && window.complete()
+        });
+        if acknowledged
+            || head.binding.author != own
+            || head.binding.scope != LogScope::Public
+            || head.root.leaves > contiguous
+        {
+            return None;
+        }
+        Some((own, committed, head.root.leaves))
+    }
+
     pub(crate) fn sparse_settlement_ready(
         &self,
         store: &Store,
         now: crate::time::Ms,
     ) -> Result<bool> {
-        if self.settled {
-            return Ok(false);
-        }
         let read = self.history_read(store)?;
         if read.publication_busy() {
             return Ok(false);
