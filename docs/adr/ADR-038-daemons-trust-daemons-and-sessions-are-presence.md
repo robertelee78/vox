@@ -40,7 +40,7 @@ trust relationships between computers". What the daemon and the keyrings showed:
   "last sync 21 s ago". The sync lane records none of its completed rounds as a sync; a hint
   that arrives for a head the node already holds starts a round that makes no progress, waits on
   nothing, and is retried at once. Under that load the daemon did not answer a harness hook
-  promptly.
+  promptly, in two sessions' hooks.
 - Replying to an ask with the entry prefix `vox room read` prints was refused ("this node cannot
   read that message"); the full entry hash worked.
 - Rooms from before the v0.4.5 format showed "Legacy history required; Resume or Cancel". He
@@ -78,7 +78,9 @@ The decider then answered twelve questions, one at a time. His answers are the d
   the app (for macos) to ensure that node-1 (bound to app) from daemon-A gets drive access for
   the nodes of daemon-B that are not bound to the app from that other computer -- and vice
   versa"; "it's based on node bound to app -- not name". Agent nodes MUST NOT drive agent nodes
-  through daemon trust.
+  through daemon trust. A headless computer has no app-bound node (ADR-035 CT-13, `vox computer
+  personal --clear`): nothing on it drives the paired computer's nodes, and the paired Mac's
+  app-bound node drives the headless computer's nodes.
 - **FX-4.** Nodes of a trusted daemon MUST appear under the names their owner gave them, with
   no typing ("yes, should show names owner gave them"); a local rename stays available and is
   the exception (ADR-035 CT-5).
@@ -144,15 +146,16 @@ The decider then answered twelve questions, one at a time. His answers are the d
 > "I mean sure -- but I'm wary of foot guns -- so maybe if you find something in violation flag
 > it to me then."
 
-- **FX-15.** A quiet room MUST run no sync round without a need the status can name. A round
-  that made no progress and waits on nothing MUST retire its flow, never be retried at once; a
-  hint for a head the node already holds MUST be finished on arrival, never turned into a round;
-  the periodic request (ADR-025 D7) remains the only cadence. This is measured, not gated: no
-  threshold is added to the product; a violation is reported to the decider with its
-  measurement (ADR-037 R13).
+- **FX-15.** A quiet room MUST run no sync round without a need the status can name; the
+  periodic request (ADR-025 D7) remains the only cadence. The proof drives the shipped binary and
+  asserts rounds per peer, idle CPU and what `vox status` names, never an internal state. This
+  is measured, not gated: no threshold is added to the product; a violation is reported to the
+  decider with its measurement (ADR-037 R13). Measured cause on 2026-10-19: the settlement tick
+  offered the node's own head to every connected peer every second, and the lane never recorded
+  a peer's acknowledgement, so the hinted round that fetched nothing ran again each tick.
 - **FX-16.** `vox status` and the app MUST record each round the lane completes as the room's
   and the peer's last completed sync; "no completed sync" MUST fire only when it is true
-  (ADR-034's true health; PRD-001 R35).
+  (ADR-034 §5 "Health is true", HL-1; PRD-001 R35).
 - **FX-17.** The daemon MUST answer its control socket within a harness hook's wait while it
   syncs; a hook that reports "the vox daemon here did not answer promptly" on an idle machine
   is a product defect.
@@ -162,9 +165,11 @@ The decider then answered twelve questions, one at a time. His answers are the d
 - **FX-18.** Rooms from before the v0.4.5 format are not supported: "we're still building vox
   and have no users -- I want to continue to design freely without overengineering backwards
   compat." The legacy history recovery flow (ADR-036's "Legacy history required", resume and
-  cancel) MUST be deleted, with its prompts, states and proofs. An unsupported room MUST be
-  refused with one sentence naming what to do (leave it and create a new one). Real data MUST
-  NOT be deleted or reset by Vox.
+  cancel) MUST be deleted, with its prompts, states and proofs. The refusal and the deletion
+  apply to rooms in the pre-v0.4.5 format only; a current-format room whose requested history
+  is unavailable keeps ADR-036's live and requested-history journeys (H-1–H-8) unchanged. An
+  unsupported room MUST be refused with one sentence naming what to do (leave it and create a
+  new one). Real data MUST NOT be deleted or reset by Vox.
 
 ### 6. How this ships
 
@@ -177,10 +182,12 @@ The decider then answered twelve questions, one at a time. His answers are the d
   the known defects above turned into stories and fixed now. The walkthrough and all staging
   MUST run on the VM setup (the macOS guests of the v0.4.4 app-proof work), not on his working
   Macs ("use the VM stuffs so I'm not losing ability to use my macs").
-- **FX-21.** Every requirement above lands with a proof that drives the shipped `vox` binary as
-  a person would, with a mutant that turns it red on its own assertion (ADR-018). The two-
-  computer requirements (FX-2–FX-7) are proved by two daemons in two data roots on one machine;
-  the walkthrough is the person's proof.
+- **FX-21.** Every product requirement above (FX-1–FX-10, FX-12–FX-18) lands with a proof that
+  drives the shipped `vox` binary as a person would, with a mutant that turns it red on its own
+  assertion (ADR-018). The two-computer requirements (FX-2–FX-7) are proved by two daemons in
+  two data roots on one machine. FX-11's design, FX-19 and FX-20 are process rulings: FX-19's
+  record is each closed release milestone, FX-20's is the walkthrough's defect record, and
+  FX-11's is the amendment it produces.
 
 ## Unchanged rulings
 
@@ -197,12 +204,12 @@ Narrow successor amendments. Requirements not named here remain in force.
 |---|---|
 | ADR-031 LT-7: nothing automatic for nodes on other machines; `vox room join` tells the person to `trust add` each member | For two computers of the person, daemon trust is the path the product offers first (FX-1, FX-6); per-node trust is the exception for other people's nodes |
 | ADR-035 CT-6: the primary flow begins with Add Computer in Vox.app | Preserved; FX-6 adds that every surface where two of the person's daemons first meet names it, and FX-5 that the headless command is a first-class path |
-| ADR-029 SE-1–SE-5, ADR-031 LT-1–LT-5, ADR-033: an agent node joins the repo room by itself and is a member | Preserved; membership is not presence (FX-8–FX-10); every listing shows Sessions per node (FX-9) |
-| ADR-020 §4 and the 2026-10-01 wake decision: wakes announce urgent messages only; the text arrives through the per-turn drain | An idle harness window shows every new message as it arrives (FX-12); the drain stays the record of what the model read |
-| ADR-020 §3 ask/answer | An undirected ask is answered per Session that finds it relevant, without cross-replies; an addressed ask by its addressee (FX-13) |
+| ADR-029 SE-1–SE-5, ADR-031 HK-1–HK-6, NC-1–NC-6 and RM-1–RM-6, ADR-033: an agent node joins the repo room by itself and is a member | Preserved; membership is not presence (FX-8–FX-10); every listing shows Sessions per node (FX-9) |
+| ADR-020 6.8 (V030-15): a wake is an announce-only notice of urgent messages and replies; 6.15: ordinary conversation arrives through the per-turn drain | An idle harness window shows every new message as it arrives (FX-12); the drain stays the record of what the model read |
+| ADR-020 4.11 (the ask and answer vocabulary) | An undirected ask is answered per Session that finds it relevant, without cross-replies; an addressed ask by its addressee (FX-13) |
 | ADR-036 legacy history recovery (Legacy history required, resume, cancel, cached-only reads) | Deleted (FX-18) |
 | ADR-037 R7, R11: event-driven gates; a turn may run several chunks, never a cycle | FX-15 adds: no round without a nameable need; a no-progress, no-wait round retires; a hint for a held head finishes on arrival |
-| ADR-034 true health, PRD-001 R35 | The lane's completed rounds are completed syncs (FX-16); the control socket answers under sync load (FX-17) |
+| ADR-034 §5 "Health is true" (HL-1, HL-2), PRD-001 R35 | The lane's completed rounds are completed syncs (FX-16); the control socket answers under sync load (FX-17) |
 
 ## Implementation order and related work
 
