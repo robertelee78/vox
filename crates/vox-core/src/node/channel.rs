@@ -6957,30 +6957,65 @@ impl ChannelState {
     /// key-package from that author for this node waits to be opened (until the end of the sync
     /// session that brought it, when the node opens it): before that, nothing here can tell the key
     /// changed, and the session's node is the authority on whom it lets drive (DR-2).
+    ///
+    /// Refuses while any held author's Session control effects are still refreshing here; a
+    /// read that can answer per author uses [`Self::drive_from_known`] instead.
     pub fn drive_from(&self, store: &Store) -> Result<Vec<Digest32>> {
-        if !self.current_session_controls_ready(store)? {
+        let (known, refreshing) = self.drive_from_known(store)?;
+        if !refreshing.is_empty() {
             return Err(Error::StreamRefused("Session control facts are refreshing"));
         }
+        Ok(known)
+    }
+
+    /// [`Self::drive_from`], answered from what this node knows now (ADR-037 R4): the nodes
+    /// whose Sessions it can read inside here, sorted, and apart from them the held authors
+    /// whose Session control effects are not yet current here, sorted. The second list lets a
+    /// caller say per author that it is fetching that now instead of refusing the room; no
+    /// author is dropped silently (ADR-036 H-1). This node itself is always known: its own
+    /// Sessions are its own durable fact (R5).
+    pub fn drive_from_known(&self, store: &Store) -> Result<(Vec<Digest32>, Vec<Digest32>)> {
+        let me = self.me();
         let held: BTreeSet<Digest32> = self.drive.receivers.keys().map(|(a, _)| *a).collect();
-        let mut from = BTreeSet::new();
+        let snapshot = store.snapshot()?;
+        let mut known = BTreeSet::new();
+        let mut refreshing = BTreeSet::new();
         for author in held {
+            if author == me {
+                continue;
+            }
+            if !self.current_session_control_ready(store, &author)? {
+                refreshing.insert(author);
+                continue;
+            }
             let announced = self
-                .floor_author(Transaction::Snapshot(&store.snapshot()?), &author)?
+                .floor_author(Transaction::Snapshot(&snapshot), &author)?
                 .announced;
             // A signed current floor is authoritative in sparse rooms. Only an older author
-            // without floors needs the contiguous legacy encrypted-generation fallback.
+            // without floors needs the contiguous legacy encrypted-generation fallback, and
+            // that fallback's own refusal is this author's gap, not the room's.
             let newest = match announced {
                 Some(generation) => Some(generation),
-                None => self.legacy_drive_generation(store, &author)?,
+                None => match self.legacy_drive_generation(store, &author) {
+                    Ok(generation) => generation,
+                    Err(Error::StreamRefused("Session control facts are refreshing")) => {
+                        refreshing.insert(author);
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                },
             };
             if newest.is_none_or(|g| self.drive.receivers.contains_key(&(author, g)))
                 || self.key_packages.pending_from(&author)
             {
-                from.insert(author);
+                known.insert(author);
             }
         }
-        from.insert(self.me());
-        Ok(from.into_iter().collect())
+        known.insert(me);
+        Ok((
+            known.into_iter().collect(),
+            refreshing.into_iter().collect(),
+        ))
     }
 
     /// The members a drive key may be owed to: every member admitted here that has not left,
