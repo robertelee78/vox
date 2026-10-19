@@ -133,6 +133,10 @@ type SharedChannel = Arc<tokio::sync::Mutex<ChannelState>>;
 /// every event that can change what it needs (ADR-025 D6a); the tick retires attempts whose
 /// connection died and raises the periodic request (D7).
 const TICK: Duration = Duration::from_secs(1);
+/// A preparing room's bounded step that waited on the fold or on a peer is tried again after
+/// this, not at once: unpaced, a reopened room ran 74,000 preparation turns in 12 s at full CPU
+/// while its control socket went unanswered.
+const PREPARE_RETRY: Duration = Duration::from_millis(50);
 
 /// Test-only: while the file this names exists, the node opens none of the key-packages the log
 /// brings it; they stay queued, as between a sync session's entries and its end, so a proof can
@@ -18345,6 +18349,10 @@ impl Node {
             } else {
                 match self.retention_before_publication(&mut prepared).await {
                     Ok(false) => {
+                        if prepared.legacy_cleanup_due.is_none() {
+                            prepared.legacy_cleanup_due =
+                                Some(std::time::Instant::now() + PREPARE_RETRY);
+                        }
                         self.preparing_rooms.insert(id, prepared);
                         return;
                     }
@@ -18354,6 +18362,10 @@ impl Node {
                     {
                         // Current policy and classification are prerequisites for private
                         // retention/publication. Pending replay keeps this room unpublished.
+                        if prepared.legacy_cleanup_due.is_none() {
+                            prepared.legacy_cleanup_due =
+                                Some(std::time::Instant::now() + PREPARE_RETRY);
+                        }
                         self.preparing_rooms.insert(id, prepared);
                         return;
                     }
@@ -18492,7 +18504,9 @@ impl Node {
         let profile = self.profile.as_ref().ok_or(Error::AtRestLocked)?;
         ch.set_node_retention(profile.store(), retention)?;
         ch.set_node_step_retention(profile.store(), self.node_step_retention.for_room(&id))?;
-        if !ch.finish_session_upgrade(profile.store(), self.now_ms().get())? {
+        if !ch.finish_session_upgrade(profile.store(), self.now_ms().get())?
+            && ch.session_upgrade_local_work()
+        {
             return Ok(false);
         }
         if !ch.refresh_session_records(profile, &self.drive_holders(), &[], self.now_ms().get())? {
@@ -20968,16 +20982,20 @@ impl Node {
             let mut ch = shared.lock().await;
             // **Never sealed under a key a member that lost drive still holds** (SC-2b): the key
             // changes here, before the entry, whatever the tick has not got to yet.
-            match ch
-                .require_governance_ready(profile.store(), crate::time::Ms(now_millis))
-                .and_then(|current| {
-                    ch.rotate_drive_if_lost(
-                        profile.store(),
-                        &holders,
-                        crate::time::Ms(now_millis),
-                        current,
-                    )
-                }) {
+            // The fold is one bounded governance turn away, never a peer round trip (ADR-037 R1,
+            // R2): an append that finds it behind takes that turn here instead of refusing an
+            // entry its harness sends once. Measured: a fold released from a hold stayed behind
+            // until the one-second tick, and the harness's next append was refused meanwhile.
+            let now = crate::time::Ms(now_millis);
+            let current = match ch.require_governance_ready(profile.store(), now) {
+                Err(e) if ChannelState::governance_refreshing(&e) => ch
+                    .advance_governance(profile.store(), now)
+                    .and_then(|_| ch.require_governance_ready(profile.store(), now)),
+                other => other,
+            };
+            match current.and_then(|current| {
+                ch.rotate_drive_if_lost(profile.store(), &holders, now, current)
+            }) {
                 Ok(_) => ch.append_session(profile, session_id, body, &holders, now_millis),
                 Err(e) => Err(e),
             }
