@@ -48,6 +48,7 @@ primitive) precedes ADR-007 (consent, which is stored on the log) in build order
 | [034](ADR-034-the-app-and-daemon-never-hang-or-hide-a-failure.md) | The App and the Daemon Never Hang or Hide a Failure (updates restart the daemon, refusal only on a real incompatibility, bounded waits, paged replies, a room that cannot save recovers, true health, bounded logs, Quit always quits) — accepted for v0.4.4 | 014, 018, 026, 028 |
 | [035](ADR-035-computer-trust-and-daemon-identities.md) | Computer Trust and Daemon Identities (pair once, all managed nodes, selected personal nodes get drive, individual node trust remains) — product requirements and technical contract revision 2 accepted for v0.4.5 | 002, 003, 010, 012, 018, 026, 028, 029, 031 |
 | [037](ADR-037-a-joined-room-converges-without-waiting.md) | A Joined Room Converges Without Waiting (Ready is a constant wait; one fast fold is the gate for everything irreversible and content never holds it; reads answer known data; own-authored state is durable; proofs with mutants) — proposed for v0.4.6 | 007, 008, 018, 026, 029, 031, 036 |
+| [038](ADR-038-daemons-trust-daemons-and-sessions-are-presence.md) | Daemons Trust Daemons, and Sessions Are Presence (daemon trust is the obvious path; presence is live Sessions; idle harness windows; idle Vox costs nothing and tells the truth; no legacy; small releases) — proposed after v0.4.6 | 018, 020, 026, 029, 031, 033, 034, 035, 036, 037 |
 
 ## Tiers
 
