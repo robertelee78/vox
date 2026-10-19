@@ -47,6 +47,8 @@ primitive) precedes ADR-007 (consent, which is stored on the log) in build order
 | [033](ADR-033-the-repo-room-is-where-agents-work-together.md) | The Repo Room Is Where Agents Work Together (threads, pause, room marks, the composer, Session tabs, who does what from the room's claims only) — accepted for v0.4.4 | 020, 021, 028, 029, 031 |
 | [034](ADR-034-the-app-and-daemon-never-hang-or-hide-a-failure.md) | The App and the Daemon Never Hang or Hide a Failure (updates restart the daemon, refusal only on a real incompatibility, bounded waits, paged replies, a room that cannot save recovers, true health, bounded logs, Quit always quits) — accepted for v0.4.4 | 014, 018, 026, 028 |
 | [035](ADR-035-computer-trust-and-daemon-identities.md) | Computer Trust and Daemon Identities (pair once, all managed nodes, selected personal nodes get drive, individual node trust remains) — product requirements and technical contract revision 2 accepted for v0.4.5 | 002, 003, 010, 012, 018, 026, 028, 029, 031 |
+| [036](ADR-036-live-messages-and-requested-history.md) | Live Messages and Requested History (separate purposes and possession, control authenticated independently of content history, bounded memory without unbounded startup) — proposed for v0.4.6 | 007, 008, 010, 018, 025, 026, 031 |
+| [037](ADR-037-a-joined-room-converges-without-waiting.md) | A Joined Room Converges Without Waiting (ready is a constant wait — communication never gated on room-global convergence, the fold is the arbiter, history on demand from local cache; background gates event-driven, Busy is not Unreachable, bounded control chunks per turn) — proposed for v0.4.6 | 008, 026, 029, 031, 036 |
 
 ## Tiers
 
