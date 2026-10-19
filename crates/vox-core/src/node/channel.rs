@@ -8536,6 +8536,17 @@ impl ChannelState {
     /// Record that `member`'s node said, in a sync, it holds this identity's feed here up to `seq`
     /// (ADR-028 R-6). Its last word stands. Kept on disk best effort: a write that fails costs a
     /// restart the count until the next sync, never the room.
+    /// This identity's own feed here: the contiguous verified head, the durable own fact
+    /// (ADR-037 R5).
+    pub fn own_verified_head(&self) -> u64 {
+        self.dag.verified_head(&self.me())
+    }
+
+    /// How far `member`'s node last said it holds this identity's feed here (ADR-028 R-6).
+    pub fn held_through(&self, member: &Digest32) -> Option<u64> {
+        self.held.get(member).copied()
+    }
+
     pub fn note_held(&mut self, store: &Store, member: Digest32, seq: u64) {
         if member == self.me() || self.held.get(&member) == Some(&seq) {
             return;

@@ -29,6 +29,9 @@ pub(crate) struct HintInbox(Mutex<State>);
 pub(crate) struct Offer {
     pub(crate) added: usize,
     pub(crate) full: bool,
+    /// The largest size the peer advertised for this node's own feed with a head this node
+    /// holds and accepted: the peer's word that it holds the feed through there.
+    pub(crate) mine_held: Option<u64>,
 }
 
 impl HintInbox {

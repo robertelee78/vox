@@ -578,6 +578,12 @@ impl Node {
                 self.dispose_rearming_hint(returned.flow);
                 continue;
             }
+            if let Some(seq) = returned.flow.mine_held.take() {
+                // The peer's word on how far it holds this node's feed (ADR-028 R-6), recorded
+                // on the actor's next turn; the settlement tick then stops offering the own
+                // head to that peer (ADR-038 FX-15).
+                self.held_notes.push((work.room, work.peer, seq));
+            }
             if returned.flow.admitted_authors > 0 {
                 returned.flow.admitted_authors = 0;
                 let _ = self.net_tx.try_send(NetEvent::BoardGrew {

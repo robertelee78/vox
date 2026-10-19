@@ -121,6 +121,11 @@ pub(crate) struct Flow {
     pub(crate) hint_peer: Digest32,
     /// Exact signed head selected for this hinted flow, not the inventory claim.
     pub(crate) authenticated_head: Option<super::HeadHint>,
+    /// How far the peer said, in this round, it holds this node's own feed: its answer to
+    /// the own-author head probe, or its inventory naming an own head this node accepted
+    /// (ADR-028 R-6). The actor records it, and the settlement tick stops offering the own
+    /// head to a peer that holds it (ADR-038 FX-15).
+    pub(crate) mine_held: Option<u64>,
     pub(crate) waiting: bool,
     pub(crate) published: bool,
     pub(crate) rendered: bool,
@@ -220,6 +225,7 @@ impl Flow {
             hint,
             hint_peer: peer,
             authenticated_head: None,
+            mine_held: None,
             waiting: false,
             published: false,
             rendered: false,
@@ -329,6 +335,7 @@ impl Flow {
             hint: None,
             hint_peer: peer,
             authenticated_head: None,
+            mine_held: None,
             waiting: false,
             published: false,
             rendered: false,
@@ -1218,6 +1225,9 @@ impl Flow {
                 if let Query::Head(author) = query {
                     for head in &result.heads {
                         if head.author == author {
+                            if author == self.node {
+                                self.mine_held = Some(self.mine_held.map_or(head.size, |m| m.max(head.size)));
+                            }
                             let repeats = self
                                 .last_head
                                 .filter(|(prior, _)| {
@@ -1256,9 +1266,12 @@ impl Flow {
                 }
                 if let Some(inventory) = result.inventory {
                     for page in inventory.hints.chunks(64) {
-                        source
+                        let offered = source
                             .offer_inventory(job, inbox, inbox_generation, self.room, page)
                             .await?;
+                        if let Some(seq) = offered.mine_held {
+                            self.mine_held = Some(self.mine_held.map_or(seq, |m| m.max(seq)));
+                        }
                     }
                 }
                 if result.status == Status::BodyNotHeld && task.purpose == Purpose::Live {
