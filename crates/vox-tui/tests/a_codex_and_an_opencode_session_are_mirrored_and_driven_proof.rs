@@ -906,11 +906,9 @@ fn an_opencode_session_is_mirrored_and_driven() {
     let user = json!({"type": "session.inbox.delivered", "data": {"sessionID": OC, "inboxID": "msg_u1",
         "item": {"type": "user", "payload": {"text": "Paint e1 the colour I pick."}, "delivery": "queue"}}});
     let deadline = Instant::now() + within;
-    let mut err;
     loop {
         host.event(user.clone());
-        let (_, plain, e) = w.vox(PERSON, &["room", "session", &w.room, OC], None);
-        err = e;
+        let (_, plain, err) = w.vox(PERSON, &["room", "session", &w.room, OC], None);
         if plain.contains("typed at the terminal: Paint e1") {
             break;
         }
