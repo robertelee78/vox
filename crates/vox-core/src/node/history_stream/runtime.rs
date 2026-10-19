@@ -46,6 +46,10 @@ enum Operation {
     ReclaimUnavailable,
     Governance,
 }
+/// How long one turn keeps running local slices before it yields to the actor.
+const LOCAL_TURN_BUDGET: std::time::Duration = std::time::Duration::from_millis(20);
+/// How many local slices one turn runs at most.
+const LOCAL_SLICES_PER_TURN: u32 = 64;
 #[derive(Clone)]
 struct Task {
     request: RequestId,
@@ -396,6 +400,23 @@ impl Flow {
     pub(crate) fn done(&self) -> bool {
         self.tasks.is_empty() && self.replay.is_none()
     }
+    /// Whether the next task is a local slice, with no wire exchange, so this turn may run it.
+    fn next_slice_is_local(&self) -> bool {
+        let next = self.tasks.last().or(self.replay.as_ref());
+        matches!(
+            next.map(|task| &task.operation),
+            Some(
+                Operation::Local(_)
+                    | Operation::LiveWindow { .. }
+                    | Operation::LiveAdvance { .. }
+                    | Operation::LiveRetry { .. }
+                    | Operation::Tail { .. }
+                    | Operation::Reclaim(_)
+                    | Operation::ReclaimUnavailable
+                    | Operation::Governance
+            )
+        )
+    }
     pub(crate) fn lane(&self) -> crate::node::history_budget::Lane {
         use crate::node::history_budget::Lane;
         match self
@@ -596,18 +617,41 @@ impl Flow {
         inbox_generation: u64,
         now: u64,
     ) -> Result<()> {
-        let result = self
-            .turn_inner(
-                store,
-                conn,
-                job,
-                fence,
-                deadline,
-                inbox,
-                inbox_generation,
-                now,
-            )
-            .await;
+        self.waiting = false;
+        self.body_progress = false;
+        self.external = None;
+        // Local slices run back to back inside one turn; a slice that needs the wire, waits,
+        // errs or spends the slice budget ends it. Each slice used to be a turn of its own,
+        // and a turn costs an actor round trip (~10 ms): one body took ~30 slices, so a
+        // 128-position live window drained at three positions a second (40 s), and a creator
+        // serving three joiners at once read their first posts after 30 s (#934).
+        let started = tokio::time::Instant::now();
+        let mut slices = 0u32;
+        let result = loop {
+            let result = self
+                .turn_inner(
+                    store.clone(),
+                    conn,
+                    job,
+                    fence.clone(),
+                    deadline,
+                    inbox,
+                    inbox_generation,
+                    now,
+                )
+                .await;
+            slices += 1;
+            if result.is_err()
+                || self.waiting
+                || self.external.is_some()
+                || slices >= LOCAL_SLICES_PER_TURN
+                || started.elapsed() >= LOCAL_TURN_BUDGET
+                || tokio::time::Instant::now() >= deadline
+                || !self.next_slice_is_local()
+            {
+                break result;
+            }
+        };
         if result.as_ref().is_err_and(|error| {
             matches!(
                 error,
@@ -650,9 +694,6 @@ impl Flow {
         inbox_generation: u64,
         now: u64,
     ) -> Result<()> {
-        self.waiting = false;
-        self.body_progress = false;
-        self.external = None;
         let source = Source::new(
             self.shared.clone(),
             store.clone(),
@@ -697,6 +738,38 @@ impl Flow {
         let receiver = self.receiver(store.clone(), task.purpose, fence.clone(), deadline);
         match task.operation.clone() {
             Operation::LiveWindow { author, head } => {
+                if author == self.node {
+                    // This node's own log needs no window: every position is held, and a
+                    // peer holding more of it is the own-history conflict the detector stops
+                    // the node on (ADR-037 R5), not something to fetch. The authenticated head
+                    // still settles the join. Measured before this: a creator walked her own
+                    // 10-entry log through a joiner's port for 8 s, 103 rounds, while two
+                    // other joiners' first posts waited behind it.
+                    let found = source
+                        .read(job, 256, move |channel, store| {
+                            let input = channel.history_read(store)?;
+                            Ok(input
+                                .history_head(&head)?
+                                .filter(|signed| signed.binding.author == author)
+                                .map(|signed| signed.root.leaves))
+                        })
+                        .await?;
+                    match found {
+                        Lookup::Found(found) => {
+                            self.authenticated_head = Some(super::HeadHint {
+                                author,
+                                head,
+                                size: found.value,
+                            });
+                        }
+                        Lookup::Busy => {
+                            self.push(task)?;
+                            self.waiting = true;
+                        }
+                        Lookup::Missing => {}
+                    }
+                    return Ok(());
+                }
                 let instance = self.instance;
                 let generation = self.generation;
                 let node = self.node;
