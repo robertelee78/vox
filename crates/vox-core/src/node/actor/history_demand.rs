@@ -337,19 +337,43 @@ impl Node {
                 self.bounded_sync.cancel_archive(room, instance, request);
             }
         } else if self.history_demand.running.is_some() {
-            return Ok(self
-                .history_demand
-                .status
-                .clone()
-                .filter(|s| s.room == room && s.instance == instance)
-                .unwrap_or_else(|| {
-                    status(
-                        room,
-                        instance,
-                        Phase::Busy,
-                        "A history operation is active; cancel it before starting another.",
-                    )
-                }));
+            // An explicit new page ask is the person's newer intent: it ends the quantum still
+            // running for an earlier ask (what it published stays) and takes its place. Status
+            // and Resume answer the running one as before. Measured before this: a newcomer
+            // paging back was told "one bounded history quantum is queued" while nothing was
+            // queued, and the page below his live window was never asked for.
+            let replaceable = matches!(action, Action::Newest | Action::Older { .. })
+                && self
+                    .history_demand
+                    .running
+                    .as_ref()
+                    .zip(self.history_demand.status.as_ref())
+                    .is_some_and(|(running, current)| {
+                        current.room == room
+                            && current.instance == instance
+                            && current.request == Some(running.request)
+                    });
+            if replaceable {
+                if let Some(request) = self.history_demand.running.as_ref().map(|r| r.request) {
+                    if self.history_demand.stop_request(room, instance, request) {
+                        self.bounded_sync.cancel_archive(room, instance, request);
+                    }
+                }
+            } else {
+                return Ok(self
+                    .history_demand
+                    .status
+                    .clone()
+                    .filter(|s| s.room == room && s.instance == instance)
+                    .unwrap_or_else(|| {
+                        status(
+                            room,
+                            instance,
+                            Phase::Busy,
+                            "A history operation is active; cancel it before starting another.",
+                        )
+                    }));
+            }
         }
         let prior_private = if matches!(action, Action::Cancel { .. }) {
             self.history_demand.private_work.take()

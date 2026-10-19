@@ -369,6 +369,7 @@ impl ChannelState {
         }
         let result = (|| -> Answer<Reply> {
             let (authors, refreshing) = self.drive_from_known(store)?;
+            let me = self.me();
             let snapshot = store.snapshot()?;
             let read = Read::existing(&snapshot, &self.sek, &self.channel_id)?;
             let public = self
@@ -453,7 +454,8 @@ impl ChannelState {
                         Ok(Reply::Valid)
                     }
                     Query::Join { node } => {
-                        if self.is_member(&node)
+                        if node != me
+                            && self.is_member(&node)
                             && (authors.contains(&node) || refreshing.contains(&node))
                         {
                             return Err(Failure::Request(REFRESHING));
@@ -467,6 +469,7 @@ impl ChannelState {
                             },
                         })
                     }
+                    Query::HasOpen { node } if node == me => Ok(Reply::HasOpen(false)),
                     Query::HasOpen { node }
                     | Query::Exact { node, .. }
                     | Query::Lookup { node, .. } => {
@@ -694,9 +697,16 @@ impl ChannelState {
                     })
                 }
                 Query::HasOpen { node } => {
-                    readable(&node)?;
+                    // This node's own Sessions are its own durable facts (ADR-037 R5): they
+                    // are answered while other authors' controls refresh, and a provisional
+                    // fold does not turn its own "none" into a retry.
+                    if node != me {
+                        readable(&node)?;
+                    }
                     let open = read.find(Tree::OpenCounts, &hash_key(&node))?.unwrap_or(0) != 0;
-                    proven(open)?;
+                    if node != me {
+                        proven(open)?;
+                    }
                     Ok(Reply::HasOpen(open))
                 }
                 Query::Join { node } => {
@@ -704,12 +714,17 @@ impl ChannelState {
                     // index. Read-only members get the same empty answer as no opening; a
                     // member whose controls are refreshing, or whose opening a provisional
                     // fold does not hold yet, is told to retry rather than "none".
-                    let row = if authors.contains(&node) && self.is_member(&node) {
+                    let row = if (authors.contains(&node) || node == me) && self.is_member(&node)
+                    {
                         next(&read, &[node], 0, true)?.map(|(_, row)| row)
                     } else {
                         None
                     };
-                    if self.is_member(&node) {
+                    // The node's own opening is its own durable fact (ADR-037 R5): its harness
+                    // hook, a one-shot command, was turned away with "refreshing saved
+                    // Sessions" while another member's join folded, and no Session ever
+                    // opened; a member with drive then never read it.
+                    if self.is_member(&node) && node != me {
                         if refreshing.contains(&node) {
                             return Err(Failure::Request(REFRESHING));
                         }
