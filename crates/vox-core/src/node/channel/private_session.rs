@@ -1051,6 +1051,20 @@ impl ChannelState {
             || self.private_sessions.pending_active
     }
 
+    /// Session upgrade work this node finishes alone: restoring its index, importing its legacy
+    /// controls, migrating legacy steps. What can remain after it (an author's control receipt,
+    /// a pending private pull) needs a peer, and a peer is reached only once the room is
+    /// published (ADR-037 R1): a room's preparation must not wait on it. Measured on the shipped
+    /// candidate: a reopened sparse room waited here for a receipt no sync could bring it, and
+    /// stayed "preparing history" for as long as the daemon ran.
+    pub(crate) fn session_upgrade_local_work(&self) -> bool {
+        self.private_sessions.upgrading
+            || self.private_sessions.restoring
+            || self.private_sessions.controls_import
+            || !self.private_sessions.legacy_pending.is_empty()
+            || self.private_sessions.legacy_work.is_some()
+    }
+
     /// The actor yields between false results and keeps the room unpublished. Key packages
     /// have already been attempted when the initial gate is lifted.
     pub(crate) fn finish_session_upgrade(&mut self, store: &Store, now: u64) -> Result<bool> {
