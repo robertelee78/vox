@@ -714,8 +714,7 @@ impl ChannelState {
                     // index. Read-only members get the same empty answer as no opening; a
                     // member whose controls are refreshing, or whose opening a provisional
                     // fold does not hold yet, is told to retry rather than "none".
-                    let row = if (authors.contains(&node) || node == me) && self.is_member(&node)
-                    {
+                    let row = if (authors.contains(&node) || node == me) && self.is_member(&node) {
                         next(&read, &[node], 0, true)?.map(|(_, row)| row)
                     } else {
                         None

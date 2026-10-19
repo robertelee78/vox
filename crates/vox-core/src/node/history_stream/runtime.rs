@@ -1387,7 +1387,8 @@ impl Flow {
                         .ok_or(Error::Profile("archive state missing"))?;
                     if let Some(body) = &state.state().body {
                         self.archive_next = body.seq.checked_add(1);
-                        self.archive_wire_bytes = self.archive_wire_bytes.saturating_add(body.length);
+                        self.archive_wire_bytes =
+                            self.archive_wire_bytes.saturating_add(body.length);
                         self.push(Task {
                             request: wire_request,
                             purpose: Purpose::History,
