@@ -105,9 +105,8 @@ impl ChannelState {
         &self,
         store: &Store,
     ) -> Option<(Digest32, Digest32, u64)> {
-        if self.settled {
-            return None;
-        }
+        // Asked for whether or not the room is settled (ADR-037 R5): settlement no longer
+        // waits on it, but the own-history conflict detector reads what it fetches.
         let read = self.history_read(store).ok()?;
         if read.publication_busy() {
             return None;
@@ -140,63 +139,56 @@ impl ChannelState {
         Some((own, committed, head.root.leaves))
     }
 
-    pub(crate) fn sparse_settlement_ready(
-        &self,
-        store: &Store,
-        now: crate::time::Ms,
-    ) -> Result<bool> {
+    /// Evidence that a member holds entries of this node's own feed that this node does not
+    /// (ADR-037 R5): a settled own tip above the local contiguous own head, an observed own
+    /// conflict, or an observed signed own head above it. A restored older profile shows
+    /// exactly this; writing on would make it an equivocator (V210-63).
+    pub(crate) fn own_history_conflict(&self, store: &Store) -> Result<bool> {
         let read = self.history_read(store)?;
-        if read.publication_busy() {
-            return Ok(false);
-        }
-        // Sparse settlement must not pretend an authenticated own tail is a contiguous
-        // own feed. Missing own ancestry/Lipmaa evidence remains truthfully unsettled;
-        // local authoring still uses the existing contiguous, fork-checked append path.
         let own = self.me();
         let contiguous = self.dag.verified_head(&own);
         if read
             .history_settled_tip(&own)?
             .is_some_and(|tip| tip.skeleton.seq > contiguous)
         {
-            return Ok(false);
+            return Ok(true);
         }
         let Some(state) = read.sparse_author(&own, LogScope::Public)? else {
             return Ok(false);
         };
         if state.observed_conflict.is_some() {
-            return Ok(false);
+            return Ok(true);
         }
-        // Settlement is a durable exact acknowledgement, not a moment when a volatile
-        // scheduling queue happens to be empty. A Head(own) answer selects this window;
-        // it must name the current committed own head and be fully visited.
-        let Some(committed) = state.committed else {
-            return Ok(false);
-        };
-        let Some(head) = read.history_head(&committed)? else {
-            return Ok(false);
-        };
-        let acknowledged = state.live.is_some_and(|window| {
-            window.head == committed && window.through == head.root.leaves && window.complete()
-        });
-        if head.binding.author != own
-            || head.binding.scope != LogScope::Public
-            || head.root.leaves > contiguous
-            || !acknowledged
-        {
-            return Ok(false);
-        }
-        // A failed proof fetch must not erase knowledge of a signed higher own head.
         if let Some(observed) = state.observed {
             if read
                 .history_head(&observed)?
-                .is_none_or(|observed| observed.root.leaves > contiguous)
+                .is_some_and(|observed| observed.root.leaves > contiguous)
             {
-                return Ok(false);
+                return Ok(true);
             }
         }
-        drop(read);
+        Ok(false)
+    }
+
+    /// Settlement from this node's own durable record (ADR-037 R5): a sparse room not yet
+    /// settled, no evidence that a member holds more of the own feed, and current governance.
+    /// No peer acknowledgement is waited for; the detector above reads that when it comes.
+    pub(crate) fn sparse_settlement_local_ready(
+        &self,
+        store: &Store,
+        now: crate::time::Ms,
+    ) -> Result<bool> {
+        if self.settled || self.own_behind || !self.uses_sparse_history(store)? {
+            return Ok(false);
+        }
+        if self.history_read(store)?.publication_busy() {
+            return Ok(false);
+        }
+        if self.own_history_conflict(store)? {
+            return Ok(false);
+        }
         match self.require_governance_ready(store, now) {
-            Ok(()) => Ok(true),
+            Ok(_) => Ok(true),
             Err(error) if Self::governance_refreshing(&error) => Ok(false),
             Err(error) => Err(error),
         }

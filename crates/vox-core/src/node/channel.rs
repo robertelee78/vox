@@ -251,6 +251,9 @@ const FORKS_VERSION: u64 = 1;
 /// join until the room's first clean sync with another member, so a node that stops in between
 /// still writes nothing when it reopens the room. See `ChannelState::settled`.
 const SEG_UNSETTLED: u64 = 13;
+/// Present while a member was seen holding entries of this node's own feed that this node does
+/// not hold (ADR-037 R5): a restored older profile. The room refuses this node's writes.
+const SEG_OWN_BEHIND: u64 = 18;
 
 /// How far each member's node holds this identity's feed here, as that node last said in a sync
 /// (ADR-028 R-6, #482), within [`SegmentKind::KeyMaterial`]: what "on N of M members' nodes" is
@@ -1002,6 +1005,9 @@ pub struct ChannelState {
     /// Last published scalar display only. Live authority is read from sealed facts.
     governance_display: governance::Display,
     governance_ready: bool,
+    /// A member holds entries of this node's own feed here that this node does not (ADR-037
+    /// R5): durable in `SEG_OWN_BEHIND`; every write here refuses with `OwnHistoryBehind`.
+    own_behind: bool,
     /// A completed authenticated current-head flow may settle after bounded maintenance.
     /// Current presence per admitted author, bounded by AUTHORS_HARD_LIMIT; no event history.
     presence: BTreeMap<Digest32, governance::Presence>,
@@ -1905,6 +1911,7 @@ impl ChannelState {
             forks_kept: 0,
             governance_display,
             governance_ready: false,
+            own_behind: false,
             presence: BTreeMap::new(),
             sparse_applied_tips: BTreeMap::new(),
             sender,
@@ -2372,6 +2379,10 @@ impl ChannelState {
         let settled = store
             .get_segment(channel_id, SegmentKind::KeyMaterial, SEG_UNSETTLED)?
             .is_none();
+        // A profile seen to be behind its own history here stays so across reopen (ADR-037 R5).
+        let own_behind = store
+            .get_segment(channel_id, SegmentKind::KeyMaterial, SEG_OWN_BEHIND)?
+            .is_some();
         // The fork proofs this room kept (V210-63), each checked as a new one would be: a proof
         // that does not verify is a tampered store, as a stored entry that fails acceptance is.
         let mut forks_kept = 0usize;
@@ -2589,6 +2600,7 @@ impl ChannelState {
             forks_kept,
             governance_display,
             governance_ready: false,
+            own_behind,
             presence,
             sparse_applied_tips,
             sender,
@@ -2851,6 +2863,7 @@ impl ChannelState {
             forks_kept: 0,
             governance_display,
             governance_ready: false,
+            own_behind: false,
             presence: BTreeMap::new(),
             sparse_applied_tips: BTreeMap::new(),
             sender,
@@ -3762,6 +3775,7 @@ impl ChannelState {
         if !self.settled {
             return Err(Error::RoomNotSynced);
         }
+        self.require_own_history_current()?;
         let signer = profile.signer()?;
         let me = signer.fingerprint();
         if !self.authors.contains_key(&me) {
@@ -4002,8 +4016,8 @@ impl ChannelState {
     /// — because "no longer needed" is what R14 deletes. Returns how many were deleted.
     pub fn prune_superseded_origins(&mut self, store: &Store, keep_from: u64) -> Result<usize> {
         match self.require_governance_ready(store, crate::time::Ms(self.now_hint)) {
-            Ok(()) if self.governance_display_current(self.now_hint) => {}
-            Ok(()) => return Ok(0),
+            Ok(_) if self.governance_display_current(self.now_hint) => {}
+            Ok(_) => return Ok(0),
             Err(error) if governance::refreshing(&error) => return Ok(0),
             Err(error) => return Err(error),
         }
@@ -5555,7 +5569,7 @@ impl ChannelState {
             return Ok(0);
         }
         match self.require_governance_ready(store, now) {
-            Ok(()) => {}
+            Ok(_) => {}
             Err(error) if governance::refreshing(&error) => return Ok(0),
             Err(error) => return Err(error),
         }
@@ -5685,8 +5699,8 @@ impl ChannelState {
             return Ok(0);
         }
         match self.require_governance_ready(store, crate::time::Ms(self.now_hint)) {
-            Ok(()) if self.governance_display_current(self.now_hint) => {}
-            Ok(()) => return Ok(0),
+            Ok(_) if self.governance_display_current(self.now_hint) => {}
+            Ok(_) => return Ok(0),
             Err(error) if governance::refreshing(&error) => return Ok(0),
             Err(error) => return Err(error),
         }
@@ -5745,6 +5759,7 @@ impl ChannelState {
         if !self.settled {
             return Err(Error::RoomNotSynced);
         }
+        self.require_own_history_current()?;
         let signer = profile.signer()?;
         let me = signer.fingerprint();
         let skeleton = self.next_skeleton(profile, &me, payload, now_ms)?;
@@ -6098,6 +6113,7 @@ impl ChannelState {
         if !self.settled && !settle_sparse {
             return Err(Error::RoomNotSynced);
         }
+        self.require_own_history_current()?;
         if settle_sparse && (!self.uses_sparse_history(profile.store())? || self.settled) {
             return Err(Error::MalformedBundle("sparse settlement state differs"));
         }
@@ -7013,6 +7029,7 @@ impl ChannelState {
         store: &Store,
         holders: &BTreeSet<Digest32>,
         now_ms: u64,
+        _current: governance::GovernanceCurrent,
     ) -> Result<()> {
         let me = self.me();
         // This author's own floor boundary waits only on this author's own control effects
@@ -7109,6 +7126,7 @@ impl ChannelState {
         store: &Store,
         holders: &BTreeSet<Digest32>,
         now: crate::time::Ms,
+        current: governance::GovernanceCurrent,
     ) -> Result<bool> {
         if self.drive.chain.is_some() || self.poisoned {
             return Ok(false);
@@ -7117,7 +7135,7 @@ impl ChannelState {
         if !holders.iter().any(|h| members.contains(h)) {
             return Ok(false);
         }
-        self.begin_drive(store, holders, now.get())?;
+        self.begin_drive(store, holders, now.get(), current)?;
         self.persist_drive(store)?;
         self.drive.change_unsaid = None;
         Ok(true)
@@ -7131,6 +7149,7 @@ impl ChannelState {
         store: &Store,
         holders: &BTreeSet<Digest32>,
         now: crate::time::Ms,
+        current: governance::GovernanceCurrent,
     ) -> Result<Vec<Digest32>> {
         let now_ms = now.get();
         let lost = self.drive.lost(holders);
@@ -7138,7 +7157,7 @@ impl ChannelState {
             return Ok(lost);
         }
         self.drive.forget(&lost);
-        self.begin_drive(store, holders, now_ms)?;
+        self.begin_drive(store, holders, now_ms, current)?;
         self.persist_drive(store)?;
         self.drive.change_unsaid = Some(true);
         Ok(lost)
@@ -7164,7 +7183,12 @@ impl ChannelState {
 
     /// The SKDM releasing this node's live drive key to `member` from its mark, and its
     /// generation, for [`Self::note_drive_delivered`] once sent.
-    pub fn drive_skdm_for(&self, profile: &Profile, member: &Digest32) -> Result<(Skdm, u64)> {
+    pub fn drive_skdm_for(
+        &self,
+        profile: &Profile,
+        member: &Digest32,
+        _current: governance::GovernanceCurrent,
+    ) -> Result<(Skdm, u64)> {
         self.require_legacy_current(profile.store())?;
         if self.poisoned {
             return Err(self.save_failure());
@@ -8305,6 +8329,7 @@ impl ChannelState {
         if !self.settled {
             return Err(Error::RoomNotSynced);
         }
+        self.require_own_history_current()?;
         let signer = profile.signer()?;
         let me = signer.fingerprint();
         if !self.authors.contains_key(&me) {
@@ -8701,6 +8726,7 @@ impl ChannelState {
         if !self.settled {
             return Err(Error::RoomNotSynced);
         }
+        self.require_own_history_current()?;
         self.require_governance_ready(profile.store(), crate::time::Ms(now_ms))?;
         let me = profile.fingerprint();
         if self.has_left(&me) || self.ended(now_ms).is_some() {
@@ -8828,6 +8854,7 @@ impl ChannelState {
         if !self.settled {
             return Err(Error::RoomNotSynced);
         }
+        self.require_own_history_current()?;
         let signer = profile.signer()?;
         let me = signer.fingerprint();
         if !self.authors.contains_key(&me) || self.left().contains(&me) {
@@ -9291,6 +9318,36 @@ impl ChannelState {
     #[must_use]
     pub fn is_settled(&self) -> bool {
         self.settled
+    }
+
+    /// Whether a member was seen holding entries of this node's own feed here that this node
+    /// does not hold (ADR-037 R5): a restored older profile, which must not write here.
+    #[must_use]
+    pub fn own_history_behind(&self) -> bool {
+        self.own_behind
+    }
+
+    pub(crate) fn require_own_history_current(&self) -> Result<()> {
+        if self.own_behind {
+            return Err(Error::OwnHistoryBehind);
+        }
+        Ok(())
+    }
+
+    /// Record, durably, that a member holds more of this node's own feed than this node does
+    /// (ADR-037 R5). Nothing here writes again until the person resolves it. Whether new.
+    pub(crate) fn note_own_history_behind(&mut self, store: &Store) -> Result<bool> {
+        if self.own_behind {
+            return Ok(false);
+        }
+        store.put_segment(
+            &self.channel_id,
+            SegmentKind::KeyMaterial,
+            SEG_OWN_BEHIND,
+            &seal_segment(&self.sek, SegmentKind::KeyMaterial, SEG_OWN_BEHIND, &[1])?,
+        )?;
+        self.own_behind = true;
+        Ok(true)
     }
 
     /// A sync with another member ended cleanly: this node holds its own feed as the room does,
