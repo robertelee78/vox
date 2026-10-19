@@ -1082,7 +1082,7 @@ fn prepare(
             return Err("The history request changed.".into());
         }
         if state.body.is_none()
-            && (state.remaining == 0 || state.cursor.is_some_and(|c| c.next_seq > state.bounds.hi))
+            && (state.remaining == 0 || state.cursor.is_some_and(|c| c.next_seq < state.bounds.lo))
         {
             return Err("This history interval has no remaining entries.".into());
         }
@@ -1099,8 +1099,8 @@ fn prepare(
         } else if let Some(cursor) = state.cursor {
             Query::Page {
                 head: state.bounds.head,
-                lo: cursor.next_seq,
-                hi: state.bounds.hi,
+                lo: state.bounds.lo,
+                hi: cursor.next_seq,
                 entries: state.remaining,
                 wire_bytes: 1024 * 1024,
             }
@@ -1454,7 +1454,12 @@ fn select(
                 {
                     true
                 }
-                Some(header) => read.retention(&header.entry_hash())?.is_some(),
+                // Held means rendered: a body a cut-short page stored but never applied is
+                // fetched again, not counted.
+                Some(header) => {
+                    let hash = header.entry_hash();
+                    read.history_effect_finished(&hash)? && read.retention(&hash)?.is_some()
+                }
                 None => false,
             };
             if held {
