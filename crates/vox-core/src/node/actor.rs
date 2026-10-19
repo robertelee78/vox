@@ -10512,11 +10512,10 @@ impl Node {
                 let result = match (self.channels.get(&channel_id), self.profile.as_ref()) {
                     (Some(shared), Some(profile)) => {
                         let mut room = shared.lock().await;
-                        match room
-                            .require_governance_ready(profile.store(), self.now_ms())
-                            .and_then(|_| {
-                                room.advance_sessions(profile.store(), self.now_ms().get())
-                            }) {
+                        // A read answers from what the node knows (ADR-037 R4); the fold's
+                        // gate stays inside `advance_sessions`, which makes no progress while
+                        // governance is refreshing and fails only on a local storage fault.
+                        match room.advance_sessions(profile.store(), self.now_ms().get()) {
                             Ok(_) => room.session_activity_query(
                                 profile.store(),
                                 query,
@@ -10538,11 +10537,9 @@ impl Node {
                 let result = match (self.channels.get(&channel_id), self.profile.as_ref()) {
                     (Some(shared), Some(profile)) => {
                         let mut room = shared.lock().await;
-                        match room
-                            .require_governance_ready(profile.store(), self.now_ms())
-                            .and_then(|_| {
-                                room.advance_sessions(profile.store(), self.now_ms().get())
-                            }) {
+                        // As for SessionActivity: the read answers from the published fold,
+                        // and only a local storage fault refuses here.
+                        match room.advance_sessions(profile.store(), self.now_ms().get()) {
                             Ok(_) => room.session_query(
                                 profile.store(),
                                 query,

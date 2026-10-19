@@ -5843,8 +5843,10 @@ async fn write_session_activity(
     Ok(true)
 }
 
-/// Read an incomplete projection one bounded actor step at a time. This retains
-/// only one request and does not enqueue a waiter for every saved Session.
+/// Read a projection one bounded actor step at a time. Listings answer from the published
+/// fold at once (ADR-037 R4); only an exact selection whose absence that fold cannot yet
+/// prove is told to retry, and this waits for the fold's next steps. This retains only one
+/// request and does not enqueue a waiter for every saved Session.
 async fn session_projection(
     handle: &NodeHandle,
     room: Digest32,
