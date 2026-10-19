@@ -299,10 +299,15 @@ impl Port {
     /// Whether the port needs a session (ADR-025 D1).
     #[must_use]
     pub fn needs(&self) -> bool {
+        // An own append the peer has not been told of is a need of its own (ADR-037 R7). It
+        // used to ride along only when a hint from the peer started a round anyway; an append
+        // into a quiet room then woke nothing. Measured on the shipped binary: a Session opened
+        // after a room went quiet was never announced, and neither port ran a round for 90 s.
         !self.poisoned
             && (self.gen.load(Ordering::Relaxed)
                 > self.done_gen.max(self.legacy_checked_gen.unwrap_or(0))
-                || self.req_gen > self.req_done)
+                || self.req_gen > self.req_done
+                || self.announce_owed())
     }
 
     /// Raise a request (ADR-025 D2).
