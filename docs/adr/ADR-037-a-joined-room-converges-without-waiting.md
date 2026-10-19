@@ -59,9 +59,10 @@ History MUST rehydrate from the node's local cache; older messages MUST be fetch
 (`vox room read --history`). Neither is part of Ready.
 
 No first-use operation MUST refuse on room-global convergence state ("room governance is
-refreshing", "the room is refreshing saved Sessions", "joined and has not yet synced"). The one
-exception is the irreversible egresses of R3, which wait on the fold being current; the fold is
-one bounded turn away (R2).
+refreshing", "the room is refreshing saved Sessions", "joined and has not yet synced"). The
+exceptions are the irreversible egresses of R3, which wait on the fold being current, and a
+sparse room's first write, which waits on the room's own settlement (R5). Both are one bounded
+governance turn away (R2), never a peer round trip.
 
 ### R2. The fold is the gate, and it is fast
 
@@ -82,16 +83,18 @@ changes is its cost, and what may hold it.
 
 ### R3. The irreversible egresses are structurally gated
 
-The irreversible egresses are encryption-audience selection (the private Session append),
-drive-key release (`drive_skdm_for`) and final delivery. Each MUST wait on the fold being
-current, and the wait MUST be structural, not a check a call site can forget:
-`require_governance_ready(...) -> Result<GovernanceCurrent>` is the only constructor of the
-zero-size proof token `GovernanceCurrent`, and each egress function takes `&GovernanceCurrent`.
-No call site can reach an irreversible egress without the fold's proof.
+The irreversible egresses are three: the Session append's encryption audience (and the
+drive-generation choice inside it), the drive-key release (`drive_skdm_for`) and the consent key
+release. Each MUST wait on the fold being current, and the wait MUST be structural, not a check
+a call site can forget: `require_governance_ready(...) -> Result<GovernanceCurrent>` is the only
+constructor of the zero-size `Copy` proof token `GovernanceCurrent`, and each egress function
+takes `GovernanceCurrent` by value. No call site can reach an irreversible egress without the
+fold's proof.
 
 Live delivery while the fold is behind the receipt frontier MUST be marked provisional, never
-presented as final: `MessagePage.provisional: bool` is true when the room's fold was not
-current at read time, and `vox room read` MUST print, before the rows,
+presented as final: `HistoryPage`, `MessagePage` and the RoomPage IPC frame carry
+`provisional: bool`, true when the room's fold was not current at read time, and `vox room read`
+MUST print, before the rows,
 `note: this room is still folding its control entries; this page is provisional`.
 
 The legacy-recovery gate (`require_legacy_current`) MUST stay on every opened path, including
@@ -123,9 +126,12 @@ node already decrypted under the checks that admitted it.
 
 ### R5. Own-authored state is the author's durable fact
 
-A node's own sequence and own drive generation in a room MUST come from its local store.
-Writing MUST NOT wait for a peer to acknowledge the own head: `settle_sparse` runs at join from
-local state.
+A node's own sequence and own drive generation in a room MUST come from its local store. A
+sparse room settles from the node's own record on its first governance turn after the join;
+`RoomNotSynced` can fire only in that window and never waits on a peer. Settlement
+(`settle_sparse`) still precedes the node's first write, because it rotates the node's sender
+key past any generation shared during the join; what it no longer does is wait for a peer to
+acknowledge the own head.
 
 The acknowledgement check becomes a background conflict detector. A peer's higher own head, or
 an observed own conflict, MUST mark the room "own history behind", and every write in that room
@@ -134,9 +140,7 @@ MUST then refuse with `Error::OwnHistoryBehind` / `Fault::OwnHistoryBehind`:
 > this node's record of its own history in this room is behind what a member holds, as after
 > restoring an older backup; it writes nothing here until that is resolved
 
-The daemon MUST say so once as a NodeNote. The `RoomNotSynced` refusals on text posts, read
-records, floors, key packages, Session appends, consent release and drive membership are
-removed.
+The daemon MUST say so once as a NodeNote.
 
 The drive generation is still never chosen off an unknown own feed: it MUST be chosen off the
 local own feed, which is authoritative.
