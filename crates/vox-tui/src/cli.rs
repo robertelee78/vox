@@ -1227,6 +1227,10 @@ pub struct AgentPluginArgs {
     /// The agent's own node, which the printed hooks act as (`vox agent hook --node <name>`).
     #[arg(long, required_unless_present = "install", conflicts_with = "install")]
     pub node: Option<String>,
+    /// With `opencode`: print the TUI client plugin instead of the server plugin, the
+    /// receiver `vox agent setup opencode` installs as `tui/vox.js`.
+    #[arg(long, requires = "harness")]
+    pub tui: bool,
     /// Install a quiet, node-free hook in every harness here without a Vox hook.
     #[arg(long)]
     pub install: bool,
@@ -3534,6 +3538,14 @@ pub fn run() -> ExitCode {
                 .as_str()
             {
                 "opencode" => {
+                    if args.tui {
+                        print!("{}", crate::agent_hook::opencode_tui_plugin(&node));
+                        eprintln!(
+                            "vox: save that as ${{XDG_CONFIG_HOME:-~/.config}}/opencode/tui/vox.js, beside the \
+                             server plugin `vox agent plugin opencode` prints.",
+                        );
+                        return ExitCode::SUCCESS;
+                    }
                     print!("{}", crate::agent_hook::opencode_plugin(&node));
                     eprintln!(
                     "vox: save that as ${{XDG_CONFIG_HOME:-~/.config}}/opencode/plugin/vox.js, and install the skill \

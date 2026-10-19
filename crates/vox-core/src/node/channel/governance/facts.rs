@@ -16,6 +16,13 @@ use zeroize::Zeroizing;
 const KIND: SegmentKind = SegmentKind::GovernanceIndex;
 const HEADER: u64 = 0;
 const HEADER_BYTES: usize = 1024;
+/// The derived index's own format. 4 (v0.4.6, ADR-037 R2c): the control settlement queue.
+/// A format-3 header (every release through v0.4.5) is read as is, with the new queue empty,
+/// and `prepare` fills that queue from the pending rows and reseals the header at 4: the
+/// index is migrated in place, never rebuilt from the source log, so an upgrade does not pay a
+/// cold scan of a large store for a derived queue it can compute from the rows it already has.
+pub(super) const HEADER_VERSION: u64 = 4;
+const HEADER_VERSION_PREVIOUS: u64 = 3;
 
 fn invalid(why: &'static str) -> Error {
     Error::MalformedAtRest(why)
@@ -108,9 +115,13 @@ pub(super) enum Table {
     IssuerRoles,
     ActiveAdmins,
     CurrentAuthority,
+    /// Control rows awaiting frontier work (ADR-037 R2c): in a signed-format room the order
+    /// settles on this queue alone, so content rows never hold the fold. Every row here is
+    /// also in `PendingOrder`, the work queue; this one is worked first.
+    ControlPending,
 }
 
-const TABLES: usize = Table::CurrentAuthority as usize + 1;
+const TABLES: usize = Table::ControlPending as usize + 1;
 
 #[derive(Clone, Copy)]
 pub(super) enum Cursor {
@@ -199,10 +210,19 @@ fn read_hash(d: &mut Decoder<'_>) -> Result<Option<Digest32>> {
     }
 }
 
+/// The format a sealed header's plaintext was written at, if it reads as a header at all.
+pub(super) fn header_version(bytes: &[u8]) -> Option<u64> {
+    let mut d = Decoder::new(bytes);
+    (d.array().ok()? == 22).then(|| d.uint().ok()).flatten()
+}
+
 impl Header {
     fn bytes(&self) -> Zeroizing<Vec<u8>> {
         let mut e = Encoder::new();
-        e.array(22).uint(3).uint(self.next).array(TABLES);
+        e.array(22)
+            .uint(HEADER_VERSION)
+            .uint(self.next)
+            .array(TABLES);
         for root in self.roots {
             e.uint(root);
         }
@@ -243,15 +263,21 @@ impl Header {
             return Err(invalid("governance header size"));
         }
         let mut d = Decoder::new(bytes);
-        if d.array()? != 22 || d.uint()? != 3 {
+        if d.array()? != 22 {
+            return Err(invalid("governance header format"));
+        }
+        let version = d.uint()?;
+        if version != HEADER_VERSION && version != HEADER_VERSION_PREVIOUS {
             return Err(invalid("governance header format"));
         }
         let next = d.uint()?;
-        if d.array()? != TABLES {
+        // Format 3 had every table but the control settlement queue, which is read as empty.
+        let stored = d.array()?;
+        if stored != TABLES && !(version == HEADER_VERSION_PREVIOUS && stored == TABLES - 1) {
             return Err(invalid("governance root count"));
         }
         let mut roots = [0; TABLES];
-        for root in &mut roots {
+        for root in roots.iter_mut().take(stored) {
             *root = d.uint()?;
         }
         if d.array()? != CURSORS {
@@ -543,6 +569,9 @@ pub(super) struct Write<'a, 'store> {
     sek: &'a Sek,
     room: &'a Digest32,
     header: Header,
+    /// Whether the order settles on control rows alone (a signed-format room, ADR-037 R2c).
+    /// Set by the caller from the entry index; never persisted.
+    control_only: bool,
 }
 
 impl<'a, 'store> Write<'a, 'store> {
@@ -573,7 +602,18 @@ impl<'a, 'store> Write<'a, 'store> {
             sek,
             room,
             header,
+            control_only: false,
         })
+    }
+
+    /// In a signed-format room every control row carries its own signed control closure, so
+    /// content rows neither raise the barrier nor hold the order (ADR-037 R2c). A legacy
+    /// room's control rows can have content parents, so there everything settles as before.
+    pub(super) fn set_control_only(&mut self, on: bool) {
+        self.control_only = on;
+    }
+    pub(super) fn control_only(&self) -> bool {
+        self.control_only
     }
 
     fn tree(&self) -> session_tree::Read<'_> {
@@ -847,9 +887,14 @@ impl<'a, 'store> Write<'a, 'store> {
     }
 
     pub(super) fn causal_settled(&self) -> Result<bool> {
+        let queue = if self.control_only {
+            Table::ControlPending
+        } else {
+            Table::PendingOrder
+        };
         Ok(self.header.initialized
             && self
-                .first(Table::PendingOrder, None)?
+                .first(queue, None)?
                 .is_none_or(|(key, _)| pending_log(&key) > self.header.barrier))
     }
     pub(super) fn initialized(&self) -> bool {
@@ -1106,8 +1151,49 @@ impl<'a, 'store> Write<'a, 'store> {
         Ok(())
     }
 
-    /// Retain the obligation before acknowledging the accepted input to its caller.
-    pub(super) fn enqueue(&mut self, hash: &Digest32, log: u64) -> Result<()> {
+    /// A pending row's source id and hash, for the in-place migration of a format-3 index: the
+    /// rows after `after` in the work queue, in order.
+    pub(super) fn pending_after(
+        &self,
+        after: Option<session_tree::Key>,
+    ) -> Result<Option<(session_tree::Key, u64, Digest32)>> {
+        let Some((key, _)) = self.first(Table::PendingOrder, after)? else {
+            return Ok(None);
+        };
+        let hash: Digest32 = key[8..40]
+            .try_into()
+            .map_err(|_| invalid("governance pending entry"))?;
+        Ok(Some((key, pending_log(&key), hash)))
+    }
+
+    /// Put an already queued row on the control settlement queue too (the migration of a
+    /// format-3 index, whose queue predates that table), with the serial the work queue holds.
+    pub(super) fn mark_control_pending(&mut self, key: session_tree::Key) -> Result<()> {
+        let serial = self
+            .get(Table::PendingOrder, &key)?
+            .ok_or(invalid("governance pending row missing"))?;
+        self.put(Table::ControlPending, key, Some(serial))
+    }
+
+    /// The source row at `log` as the log holds it, for classification only: its hash binding
+    /// is checked, its governance binding is not (a content row has none).
+    pub(super) fn source_entry(&self, log: u64) -> Result<crate::log::entry::Entry> {
+        let sealed = self
+            .batch
+            .get_segment(self.room, SegmentKind::LogDb, log)?
+            .ok_or(invalid("governance source entry missing"))?;
+        let bytes = open_segment(self.sek, SegmentKind::LogDb, log, &sealed)?;
+        let entry = crate::log::entry::Entry::from_wire(&bytes)?;
+        if entry.skeleton.channel_id != *self.room {
+            return Err(invalid("governance source binding"));
+        }
+        Ok(entry)
+    }
+
+    /// Retain the obligation before acknowledging the accepted input to its caller. A control
+    /// row is queued on the control settlement queue too (ADR-037 R2c), where it is worked
+    /// first and where a signed-format room's order settles.
+    pub(super) fn enqueue(&mut self, hash: &Digest32, log: u64, control: bool) -> Result<()> {
         if log == 0 {
             return Err(invalid("governance queue source is zero"));
         }
@@ -1126,12 +1212,25 @@ impl<'a, 'store> Write<'a, 'store> {
             pending_key(log, hash),
             Some(self.header.queue_serial),
         )?;
+        if control {
+            self.put(
+                Table::ControlPending,
+                pending_key(log, hash),
+                Some(self.header.queue_serial),
+            )?;
+        }
         Ok(())
     }
 
     pub(super) fn work(&mut self) -> Result<Option<&mut Work>> {
         if self.header.work.entry.is_none() {
-            let Some((key, serial)) = self.first(Table::PendingOrder, None)? else {
+            // Control rows first: the order settles on them, and a room converging must not
+            // wait behind its content backlog (ADR-037 R2c). Content rows follow in log order.
+            let next = match self.first(Table::ControlPending, None)? {
+                Some(control) => Some(control),
+                None => self.first(Table::PendingOrder, None)?,
+            };
+            let Some((key, serial)) = next else {
                 return Ok(None);
             };
             let log = pending_log(&key);
@@ -1175,6 +1274,9 @@ impl<'a, 'store> Write<'a, 'store> {
         }
         if queued == work.serial {
             self.put(Table::PendingOrder, order_key, None)?;
+            if self.get(Table::ControlPending, &order_key)?.is_some() {
+                self.put(Table::ControlPending, order_key, None)?;
+            }
             self.header.roots[Table::Pending as usize] =
                 self.set_root(self.header.roots[Table::Pending as usize], key, None)?;
             self.header.roots[Table::Complete as usize] = self.set_root(

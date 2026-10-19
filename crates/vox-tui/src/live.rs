@@ -1934,6 +1934,7 @@ impl DaemonCore {
                 mut sessions,
                 summaries,
                 more: false,
+                ..
             } if sessions.len() <= 1
                 && sessions.len() == summaries.len()
                 && sessions.iter().all(|s| s.node == node && s.id == id) =>
@@ -1980,6 +1981,7 @@ impl DaemonCore {
                 sessions,
                 summaries,
                 more,
+                ..
             } => {
                 if sessions.len() != summaries.len() {
                     return Err("the Session page has mismatched summaries".into());
@@ -2423,7 +2425,7 @@ impl DaemonCore {
                 .await
                 .map_err(|e| format!("the room page could not be read: {e}"))?
             {
-                Frame::RoomPage { rows, older } => (rows, older),
+                Frame::RoomPage { rows, older, .. } => (rows, older),
                 Frame::Error { reason } => return Err(reason.into()),
                 Frame::NodeDetached { .. } => return Err(PageFailure::Detached),
                 _ => return Err("the daemon did not answer the room page".into()),

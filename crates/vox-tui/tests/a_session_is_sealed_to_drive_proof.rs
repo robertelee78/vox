@@ -82,7 +82,34 @@
 //! - **Regrant treated as continuous permission** (claim 6): ignore the start of a recipient's
 //!   grant in later generations in `private_permitted`. The author returns old ciphertext to
 //!   Dave's raw request after regrant: red PRODUCT.
+//!
+//! 7. **A Session append waits for the fold; a read meanwhile says it is provisional** (ADR-037
+//!    R3, #953; optional, `test-knobs`). The private Session append chooses its audience from
+//!    the room's governance, so it is one of the irreversible egresses gated on the fold being
+//!    current. Alice's daemon runs with `VOX_TEST_FOLD_HOLD_FILE`, and while that file exists no
+//!    fold of hers advances. With it held, a control entry reaches her — carol joins through
+//!    bob's link, and alice's `vox status --json` shows a sync with bob completed after it — so
+//!    her fold is behind what she has received. Then: her `vox room read` prints
+//!    `note: this room is still folding its control entries; this page is provisional` before the
+//!    rows; her Session's next entry, written as her harness's hook writes one (through her
+//!    node's control socket, [`Request::AppendSession`], the staging every claim above uses), is
+//!    **not** read in her Session by bob, who drives it, for as long as the hold lasts
+//!    ([`HELD_FOR`]); her ordinary text post meanwhile **is** read by bob (content never waits on
+//!    the fold, R1, R2c). The file is removed: her node has answered the append (a node that
+//!    refused it while behind, saying so, takes the same entry sent again), bob reads the entry
+//!    within [`RELEASED_WITHIN`], and the note is gone from her read. Mutants: the append not
+//!    gated (`require_governance_ready` not consulted before the audience is chosen) → bob reads
+//!    the held entry during the hold, red on that assertion; the provisional marker not printed
+//!    (`MessagePage.provisional` ignored by `vox room read`) → red on the note's assertion.
+#![cfg_attr(not(feature = "optional-proofs"), allow(dead_code))]
 #![cfg(unix)]
+
+#[path = "support/optional_proof.rs"]
+mod optional_proof;
+optional_proof::not_run!(a_sessions_append_waits_for_the_fold_and_a_read_meanwhile_is_provisional);
+
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
@@ -112,6 +139,15 @@ const ROOM_PASS: &str = "channel passphrase";
 const SESSION: &str = "3f0c25bf-1d2e-4c5b-9a8f-session-proof";
 /// How many entries alice's Session writes before, and after, bob's downgrade.
 const ENTRIES: usize = 3;
+/// What `vox room read` prints before the rows while the room's fold is behind what it received
+/// (ADR-037 R3).
+const PROVISIONAL: &str =
+    "note: this room is still folding its control entries; this page is provisional";
+/// How long the hold is watched for a Session append that must not leave (claim 7). An append
+/// that is not gated lands in well under a second on loopback.
+const HELD_FOR: Duration = Duration::from_secs(8);
+/// From the hold's file being removed, how long the held append and the note's going have.
+const RELEASED_WITHIN: Duration = Duration::from_secs(60);
 
 /// `vox` with none of the environment of whatever runs this proof: above all no `TMUX*` (a staged
 /// hook inheriting the operator's tmux binds its session to the operator's own pane, and a drive is
@@ -293,6 +329,11 @@ impl Member {
 }
 
 fn member(tmp: &Path, name: &'static str, anchor: &str) -> Member {
+    member_env(tmp, name, anchor, &[])
+}
+
+/// [`member`], its daemon started with `env` set too (a proof's test-only knobs).
+fn member_env(tmp: &Path, name: &'static str, anchor: &str, env: &[(&str, &str)]) -> Member {
     let data = tmp.join(name);
     std::fs::create_dir_all(data.join("cfg")).expect("APPARATUS: create a staging dir");
     let pass = tmp.join(format!("{name}.pass"));
@@ -319,6 +360,7 @@ fn member(tmp: &Path, name: &'static str, anchor: &str) -> Member {
         .args(["daemon", "--listen", "127.0.0.1:0", "--anchor", anchor])
         .arg("--passphrase-file")
         .arg(&m.pass)
+        .envs(env.iter().copied())
         .env("VOX_DATA_DIR", &m.data)
         .env("VOX_CONFIG_DIR", m.data.join("cfg"))
         .env_remove("VOX_ROOM")
@@ -1431,13 +1473,17 @@ fn private_wire_refused(member: &mut Member, holders: &[&Member], room: [u8; 32]
                 let (mut send, mut recv) = open_typed(&connection, StreamKind::Session)
                     .await
                     .expect("APPARATUS: private wire peer opens stream");
+                // The private Session ask, version 2: the room, its epoch, the donor cursor and
+                // the query, here the live tail (`sessionstream::read_ask`).
                 let mut e = Encoder::new();
-                e.array(5)
-                    .uint(1)
+                e.array(6)
+                    .uint(2)
                     .bytes(&room)
                     .uint(0)
                     .bytes(&incarnation)
-                    .uint(after);
+                    .uint(after)
+                    .array(1)
+                    .uint(0);
                 write_frame(&mut send, &e.finish())
                     .await
                     .expect("APPARATUS: private wire peer asks");
@@ -1448,15 +1494,17 @@ fn private_wire_refused(member: &mut Member, holders: &[&Member], room: [u8; 32]
                     .expect("PRODUCT: member's private Session page exchange failed")
                     .expect("PRODUCT: member received no private Session response")
             });
+            // The answer, version 2: cursor, more, the records each with its position, and the
+            // locator hints (`sessionstream::answer`).
             let mut d = Decoder::new(&bytes);
             assert_eq!(
                 d.array().expect("PRODUCT: private Session page array"),
-                5,
+                6,
                 "PRODUCT: malformed private Session page"
             );
             assert_eq!(
                 d.uint().expect("PRODUCT: private Session page integer"),
-                1,
+                2,
                 "PRODUCT: wrong private Session page version"
             );
             incarnation = d
@@ -1468,10 +1516,26 @@ fn private_wire_refused(member: &mut Member, holders: &[&Member], room: [u8; 32]
             let more = d.uint().expect("PRODUCT: private Session page integer");
             let records = d.array().expect("PRODUCT: private Session page array");
             for _ in 0..records {
+                assert_eq!(
+                    d.array().expect("PRODUCT: private Session record pair"),
+                    2,
+                    "PRODUCT: malformed private Session record pair"
+                );
+                let _position = d.uint().expect("PRODUCT: private Session record position");
                 let wire = d.bytes().expect("PRODUCT: private Session record bytes");
                 let hash = vox_core::hash::sha256(wire);
                 assert!(allowed.contains(&hash),
                     "PRODUCT: {name} served earlier step ciphertext or an unreported lifecycle record to {} outside its current grant", member.name);
+            }
+            let hints = d.array().expect("PRODUCT: private Session hint array");
+            for _ in 0..hints {
+                assert_eq!(
+                    d.array().expect("PRODUCT: private Session hint pair"),
+                    2,
+                    "PRODUCT: malformed private Session hint"
+                );
+                let _ = d.uint().expect("PRODUCT: private Session hint position");
+                let _ = d.bytes().expect("PRODUCT: private Session hint hash");
             }
             d.finish()
                 .expect("PRODUCT: extra bytes in private Session page");
@@ -1801,4 +1865,323 @@ fn legacy_placeholder_journey(
         None,
         "PRODUCT: receiver restart restored revoked Session discovery"
     );
+}
+
+// ---- claim 7: the fold gates the Session append; a read meanwhile is provisional (ADR-037) ----
+
+/// How many sync sessions `m`'s node has completed with `peer` (a fingerprint), summed over its
+/// rooms, as the shipped `vox status --json` counts them.
+#[cfg(feature = "optional-proofs")]
+fn completed_with(m: &Member, peer: &str) -> u64 {
+    let (ok, out, err) = m.vox(&["status", "--json"], None);
+    assert!(
+        ok,
+        "PRODUCT: {}'s `vox status --json` failed: {out}{err}",
+        m.name
+    );
+    let status: serde_json::Value = serde_json::from_str(out.trim()).unwrap_or_else(|e| {
+        panic!(
+            "PRODUCT: {}'s `vox status --json` printed {out:?}: {e}",
+            m.name
+        )
+    });
+    status["sync"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|r| {
+            r["peer"]
+                .as_str()
+                .is_some_and(|p| peer.starts_with(p) || p.starts_with(peer))
+        })
+        .map(|r| r["completed"].as_u64().unwrap_or(0))
+        .sum()
+}
+
+/// Everything `m`'s `vox room read` of `room` shows a person, stdout and stderr together, and
+/// whether it answered. A refused read is reported, never read as an empty room.
+#[cfg(feature = "optional-proofs")]
+fn room_read(m: &Member, room: &str) -> (bool, String) {
+    let (ok, out, err) = m.vox(&["room", "read", room], None);
+    (ok, format!("{out}{err}"))
+}
+
+/// One Session entry of alice's, written as her harness's hook writes it (through her node's
+/// control socket, [`Request::AppendSession`]), on a runtime of this thread's own: what the node
+/// answered, or that it had not answered within `patience`.
+#[cfg(feature = "optional-proofs")]
+fn append_session(
+    alice: &Member,
+    room: [u8; 32],
+    seq: usize,
+    text: &str,
+    patience: Duration,
+) -> String {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("APPARATUS: a runtime");
+    let mut client = alice.socket(&rt);
+    let request = Request::AppendSession {
+        channel_id: room,
+        session_id: SESSION.to_owned(),
+        body: reply(seq, text),
+    };
+    // The timer is made inside the runtime: a `timeout` built outside it has no reactor.
+    match rt.block_on(async { tokio::time::timeout(patience, client.request(&request)).await }) {
+        Ok(Ok(Frame::Appended { .. })) => "appended".to_owned(),
+        Ok(Ok(Frame::Error { reason })) => format!("refused: {reason}"),
+        Ok(Ok(other)) => format!("answered {other:?}"),
+        Ok(Err(e)) => format!("the socket failed: {e}"),
+        Err(_) => format!("not answered within {patience:?}"),
+    }
+}
+
+/// Claim 7 (ADR-037 R3, #953): see the module doc.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "an anchor and three daemons with production Argon2id, and a test-only knob; optional, run in release"]
+fn a_sessions_append_waits_for_the_fold_and_a_read_meanwhile_is_provisional() {
+    test_knobs::require(&["VOX_TEST_FOLD_HOLD_FILE"]);
+    watchdog::arm();
+    let tmp = tempfile::tempdir().expect("APPARATUS: a tempdir");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("APPARATUS: a runtime");
+    let (_anchor, spec) = anchor(tmp.path());
+    let hold = tmp.path().join("fold-hold");
+    let hold_path = hold
+        .to_str()
+        .expect("APPARATUS: a UTF-8 temp path")
+        .to_owned();
+    // Alice's daemon reads the knob from its start; the file does not exist yet, so nothing is
+    // held while the room is staged.
+    let alice = member_env(
+        tmp.path(),
+        "alice",
+        &spec,
+        &[("VOX_TEST_FOLD_HOLD_FILE", hold_path.as_str())],
+    );
+    let bob = member(tmp.path(), "bob", &spec);
+    let carol = member(tmp.path(), "carol", &spec);
+
+    // ---- staging: alice's room; bob in it with drive; alice's Session open and read by bob ----
+    let (ok, _, e) = alice.vox(
+        &["room", "create", "--passphrase-file", "-", "--name", "repo"],
+        Some(&format!("{ROOM_PASS}\n")),
+    );
+    assert!(ok, "APPARATUS (staging): vox room create failed: {e}");
+    let room = room_id(&alice, "repo");
+    let (ok, link, e) = alice.vox(&["room", "link", &room], None);
+    assert!(ok, "APPARATUS (staging): vox room link failed: {e}");
+    let (ok, o, e) = bob.vox(
+        &["room", "join", "--passphrase-file", "-", link.trim()],
+        Some(&format!("{ROOM_PASS}\n")),
+    );
+    assert!(ok, "PRODUCT: `vox room join` failed for bob: {o}{e}");
+    alice.trust(&bob, true);
+    bob.trust(&alice, false);
+    assert!(
+        posts_until_read(&alice, &bob, &room, "READY-BOB"),
+        "APPARATUS (staging): bob never read alice's room messages"
+    );
+    let id = channel_id(&rt, &alice, &room);
+    // Alice is at her session: its hook opens its Session in the room, and the Session's entries
+    // are written as the hook writes them, through her node's control socket (the staging the
+    // claims above use). Bob, with drive, reads the first.
+    let (ok, o, e) = alice.vox_with(
+        &["agent", "hook", "--node", "default", "--room", &room],
+        Some(&format!(
+            r#"{{"session_id":"{SESSION}","hook_event_name":"UserPromptSubmit","cwd":"/tmp","transcript_path":"/tmp/t.jsonl","prompt":"go"}}"#
+        )),
+        &[("CLAUDE_CODE_ENTRYPOINT", "cli")],
+    );
+    assert!(ok, "APPARATUS (staging): alice's hook failed: {o}{e}");
+    let first = append_session(&alice, id, 1, "READY-SESSION", Duration::from_secs(120));
+    assert!(
+        first == "appended",
+        "PRODUCT (staging): alice's node did not take her Session's first entry: {first}"
+    );
+    assert!(
+        until(Duration::from_secs(120), || {
+            opened(&bob, &room).iter().any(|t| t == "READY-SESSION")
+        }),
+        "PRODUCT (staging): bob, whom alice trusts with drive, never read her Session's first \
+         entry within 120 s: he opened {:?}",
+        opened(&bob, &room)
+    );
+    let (ok, shown) = room_read(&alice, &room);
+    assert!(
+        ok && !shown.contains(PROVISIONAL),
+        "PRODUCT (staging): before anything is held, alice's `vox room read` must answer with no \
+         provisional note; it printed:\n{shown}"
+    );
+
+    // ---- the hold, and a control entry that reaches alice while it lasts ----
+    std::fs::write(&hold, b"held by the proof\n").expect("APPARATUS: write the hold file");
+    let synced_before = completed_with(&alice, &bob.fp);
+    // Carol joins through bob's link: bob admits her, and her admission is a control entry in the
+    // room's log that alice receives from bob and cannot fold.
+    let (ok, link, e) = bob.vox(&["room", "link", &room], None);
+    assert!(ok, "APPARATUS (staging): bob's vox room link failed: {e}");
+    let (ok, o, e) = carol.vox(
+        &["room", "join", "--passphrase-file", "-", link.trim()],
+        Some(&format!("{ROOM_PASS}\n")),
+    );
+    assert!(
+        ok,
+        "PRODUCT: carol's `vox room join` through bob's link failed: {o}{e}"
+    );
+    let joined = Instant::now();
+    assert!(
+        until(Duration::from_secs(60), || completed_with(&alice, &bob.fp)
+            > synced_before),
+        "CANNOT MEASURE: staging not achieved: within 60 s of carol's join, alice completed no \
+         sync with bob (completed with him: {synced_before} before, {} after), so no control \
+         entry is known to have reached her while her fold was held",
+        completed_with(&alice, &bob.fp)
+    );
+    println!(
+        "[proof] (7) carol joined through bob at +0; alice completed a sync with bob by +{:?} \
+         with her fold held",
+        joined.elapsed()
+    );
+
+    // ---- (a) alice's read says the page is provisional ----
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let shown = loop {
+        let (ok, shown) = room_read(&alice, &room);
+        assert!(
+            ok,
+            "PRODUCT: alice's `vox room read` was refused while her fold was held; a read answers \
+             from what the node knows (ADR-037 R1). It printed:\n{shown}"
+        );
+        if shown.contains(PROVISIONAL) {
+            break shown;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT: with a control entry received and her fold held, alice's `vox room read` \
+             must print {PROVISIONAL:?} before the rows (ADR-037 R3); 30 s after the sync it \
+             printed:\n{shown}"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    println!(
+        "[proof] (7a) alice's read while held:\n{}",
+        shown.lines().take(3).collect::<Vec<_>>().join("\n")
+    );
+
+    // ---- (b) her Session's next entry does not leave while held; (c) her text does ----
+    // The append is made on a thread of its own: a node that holds it until the fold is current
+    // answers late, and the hold is watched meanwhile.
+    let held_text = "WHILE-HELD entry that must wait for the fold";
+    let (tx, rx) = std::sync::mpsc::channel();
+    let t_append = Instant::now();
+    std::thread::scope(|scope| {
+        let alice = &alice;
+        scope.spawn(move || {
+            let answer = append_session(
+                alice,
+                id,
+                2,
+                held_text,
+                HELD_FOR + Duration::from_secs(30) + RELEASED_WITHIN,
+            );
+            let _ = tx.send((t_append.elapsed(), answer));
+        });
+        let mut answered: Option<(Duration, String)> = None;
+        while t_append.elapsed() < HELD_FOR {
+            assert!(
+                !opened(&bob, &room).iter().any(|t| t == held_text),
+                "PRODUCT: {:?} after alice's Session append with her fold held, bob read the entry: \
+                 the private Session append left her node before the fold was current (ADR-037 \
+                 R3, #953)",
+                t_append.elapsed()
+            );
+            if answered.is_none() {
+                answered = rx.try_recv().ok();
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        println!(
+            "[proof] (7b) for {HELD_FOR:?} bob read nothing of the held entry; alice's node {}",
+            answered.as_ref().map_or_else(
+                || "has not answered the append".to_owned(),
+                |(at, a)| format!("answered the append after {at:?}: {a}")
+            )
+        );
+        let flows = "FLOWS-WHILE-HELD";
+        let (ok, o, e) = alice.vox(&["room", "post", &room, flows], None);
+        assert!(
+            ok,
+            "PRODUCT: alice's text post was refused while her fold was held: a post never waits \
+             on the fold (ADR-037 R1): {o}{e}"
+        );
+        let posted = Instant::now();
+        assert!(
+            until(Duration::from_secs(30), || bob.reads(&room, flows)),
+            "PRODUCT: bob did not read alice's text post within 30 s while her fold was held: \
+             content is held hostage to the fold (ADR-037 R2c)"
+        );
+        println!(
+            "[proof] (7c) alice's text post reached bob {:?} after it was posted, fold held",
+            posted.elapsed()
+        );
+        assert!(
+            !opened(&bob, &room).iter().any(|t| t == held_text),
+            "PRODUCT: bob read alice's held Session entry before the hold was released"
+        );
+
+        // ---- the release: the entry lands, the node has answered, the note is gone ----
+        std::fs::remove_file(&hold).expect("APPARATUS: remove the hold file");
+        let released = Instant::now();
+        let answered = answered.or_else(|| rx.recv_timeout(RELEASED_WITHIN).ok());
+        let Some((at, answer)) = answered else {
+            panic!(
+                "PRODUCT: alice's node had not answered the Session append {RELEASED_WITHIN:?} \
+                 after the hold was released (it was asked {:?} before the release)",
+                t_append.elapsed() - released.elapsed()
+            );
+        };
+        println!("[proof] (7d) alice's node answered the held append after {at:?}: {answer}");
+        if answer != "appended" {
+            // A node that refused the append while its fold was behind, saying so, takes the
+            // same entry now, as a harness that retries its held activity would send it.
+            let again = append_session(alice, id, 2, held_text, RELEASED_WITHIN);
+            assert!(
+                again == "appended",
+                "PRODUCT: with the hold released, alice's node must take the Session entry it \
+                 refused while the fold was behind; it answered: {again}"
+            );
+            println!("[proof] (7d) the entry, sent again after the release: {again}");
+        }
+        assert!(
+            until(RELEASED_WITHIN, || opened(&bob, &room)
+                .iter()
+                .any(|t| t == held_text)),
+            "PRODUCT: within {RELEASED_WITHIN:?} of the hold's release, bob never read the Session \
+             entry alice's node took: the held append was lost, not deferred (ADR-037 R3). He \
+             opened {:?}",
+            opened(&bob, &room)
+        );
+        println!(
+            "[proof] (7d) bob read the held entry {:?} after the release",
+            released.elapsed()
+        );
+        assert!(
+            until(RELEASED_WITHIN, || {
+                let (ok, shown) = room_read(alice, &room);
+                ok && !shown.contains(PROVISIONAL)
+            }),
+            "PRODUCT: {RELEASED_WITHIN:?} after the hold was released, alice's `vox room read` \
+             still says the page is provisional:\n{}",
+            room_read(alice, &room).1
+        );
+        println!(
+            "[proof] (7e) the provisional note left alice's read {:?} after the release",
+            released.elapsed()
+        );
+    });
 }

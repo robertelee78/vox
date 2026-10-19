@@ -1761,7 +1761,19 @@ async fn rows_of(
                 })
                 .await?
             {
-                vox_core::node::ipc::Frame::RoomPage { rows, older } => {
+                vox_core::node::ipc::Frame::RoomPage {
+                    rows,
+                    older,
+                    provisional,
+                } => {
+                    if provisional {
+                        // The room's governance fold was behind what this node has received
+                        // (ADR-037 R3): a control entry it holds is not folded yet, so this
+                        // page may still be re-ordered or withdrawn. Said before the rows.
+                        eprintln!(
+                            "note: this room is still folding its control entries; this page is provisional"
+                        );
+                    }
                     if let Some(first) = rows.first().filter(|_| older > 0) {
                         eprintln!(
                             "{older} older messages not shown: {}",
@@ -2042,15 +2054,6 @@ pub async fn read(
         Some(s) => Some(parse_cursor(s)?),
     };
     let before = before.map(parse_cursor).transpose()?;
-    let history = history.or_else(|| {
-        (!crate::coord::agent_marked()
-            && since.is_none()
-            && !unread
-            && !only_late
-            && !with_notices
-            && tagged.tags.is_empty())
-        .then_some(if before.is_some() { "older" } else { "newest" })
-    });
     if let Some(action) = history {
         match request_history(
             &mut client,
@@ -2479,13 +2482,28 @@ pub async fn sessions(paths: &Paths, room: &str, json: bool) -> Result<(), AppEr
     };
     let mut any = false;
     let mut ended_heading = false;
+    // What the pages could not answer for (ADR-037 R4): members whose Session control
+    // effects are still refreshing on this node, and a fold still behind its inputs. Said
+    // after the rows, never left out; an empty listing with either is not "no Sessions".
+    let mut refreshing = std::collections::BTreeSet::new();
+    let mut provisional = false;
     // Preserve the terminal's open-then-ended grouping with two bounded passes,
     // rather than retaining every completed Session until the open list finishes.
     for pass in 0..if json { 1 } else { 2 } {
         let mut after = None;
         loop {
             let (rows, more) = match client.sessions_page(channel_id, after).await {
-                Ok(Frame::SessionsPage { sessions, more, .. }) => (sessions, more),
+                Ok(Frame::SessionsPage {
+                    sessions,
+                    more,
+                    refreshing: fetching,
+                    provisional: behind,
+                    ..
+                }) => {
+                    refreshing.extend(fetching);
+                    provisional |= behind;
+                    (sessions, more)
+                }
                 Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
                 Ok(other) => return Err(crate::client::unexpected(&other)),
                 Err(e) => return Err(AppError::Usage(e.to_string())),
@@ -2526,8 +2544,30 @@ pub async fn sessions(paths: &Paths, room: &str, json: bool) -> Result<(), AppEr
             after = next;
         }
     }
-    if !json && !any {
+    // With `--json` the notes go to stderr, as the pause status does, so the stream stays one
+    // object per Session and a script still never reads an omission as absence.
+    let mut notes = Vec::new();
+    for member in &refreshing {
+        notes.push(format!(
+            "fetching {}'s Sessions now",
+            crate::ident::name_of(member)
+        ));
+    }
+    if provisional {
+        notes.push(
+            "note: this room is still folding its saved Sessions; this listing is provisional"
+                .to_owned(),
+        );
+    }
+    if !json && !any && notes.is_empty() {
         println!("(no Sessions in this room)");
+    }
+    for note in notes {
+        if json {
+            eprintln!("{note}");
+        } else {
+            println!("{note}");
+        }
     }
 
     Ok(())

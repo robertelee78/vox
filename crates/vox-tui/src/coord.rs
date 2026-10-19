@@ -46,9 +46,9 @@ pub const EXIT_UNAGREED: u8 = 5;
 /// The session this process speaks for, or `None` when nothing names one.
 ///
 /// In order: `--session`; `VOX_SESSION`; then what the harness puts in every tool
-/// process's environment — Claude Code's `CLAUDE_CODE_SESSION_ID` and Codex's
-/// `CODEX_THREAD_ID`. OpenCode has no such variable, and its Vox plugin exports
-/// `VOX_SESSION` to every shell it runs instead (`shell.env`).
+/// process's environment — Claude Code's `CLAUDE_CODE_SESSION_ID`, Codex's
+/// `CODEX_THREAD_ID`, and OpenCode 2.x's own `OPENCODE_SESSION_ID` (its core exports
+/// it into every shell the model runs; the Vox plugin adds `VOX_SESSION` the same way).
 ///
 /// These are the *same* values the drain hook receives as the session id, which is
 /// what lets it recognise this session's own messages (ADR-021 §7).
@@ -72,6 +72,7 @@ fn named_session(flag: Option<&str>) -> Option<(&'static str, String)> {
     let from_env = |k: &'static str| std::env::var(k).ok().map(|v| (k, v));
     flag.map(|f| ("--session", f.to_owned()))
         .or_else(|| from_env("VOX_SESSION"))
+        .or_else(|| from_env("OPENCODE_SESSION_ID"))
         .or_else(|| from_env("CLAUDE_CODE_SESSION_ID"))
         .or_else(|| from_env("CODEX_THREAD_ID"))
         .map(|(k, s)| (k, s.trim().to_owned()))
@@ -100,8 +101,9 @@ pub(crate) fn posting_session(
 ) -> Result<Option<String>, AppError> {
     let mark = |key: &str| -> Result<Option<String>, AppError> {
         match std::env::var(key) {
-            // OpenCode shell.env merges inherited variables: an explicit empty override
-            // removes a parent's native marker without removing the actual VOX_SESSION.
+            // An explicit empty override removes a parent's native marker without removing
+            // the actual VOX_SESSION (the OpenCode plugin's shell hook empties the parent
+            // harness's marks the way its 1.x `shell.env` output did).
             Ok(value) if value.is_empty() => Ok(None),
             Ok(value) if !value.trim().is_empty() && is_valid_name(&value, MAX_NAME) => {
                 Ok(Some(value))
@@ -115,18 +117,28 @@ pub(crate) fn posting_session(
     let codex = mark("CODEX_THREAD_ID")?;
     let vox = mark("VOX_SESSION")?;
     let claude = mark("CLAUDE_CODE_SESSION_ID")?;
-    let native = codex.as_ref().or(claude.as_ref()).or(vox.as_ref());
-    if [codex.as_ref(), claude.as_ref(), vox.as_ref()]
-        .into_iter()
-        .flatten()
-        .any(|value| Some(value) != native)
+    let opencode = mark("OPENCODE_SESSION_ID")?;
+    let native = codex
+        .as_ref()
+        .or(claude.as_ref())
+        .or(opencode.as_ref())
+        .or(vox.as_ref());
+    if [
+        codex.as_ref(),
+        claude.as_ref(),
+        opencode.as_ref(),
+        vox.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|value| Some(value) != native)
     {
         return Err(AppError::Usage(
             "inherited harness session marks disagree; cannot establish the sending session, so nothing was posted. Use this harness's own tool environment without a parent's session marks".into()
         ));
     }
     let inherited = vox.or_else(|| claude.clone());
-    let Some(actual) = codex.clone().or(inherited) else {
+    let Some(actual) = codex.clone().or_else(|| opencode.clone()).or(inherited) else {
         // These markers identify a harness, not an individual Session. A caller-chosen flag
         // cannot turn them into proof of which of that harness's registrations is speaking.
         if [
@@ -153,6 +165,7 @@ pub(crate) fn posting_session(
     if registered.session != actual
         || (codex.is_some() && registered.harness != "codex")
         || (claude.is_some() && registered.harness != "claude")
+        || (opencode.is_some() && registered.harness != "opencode")
     {
         return Err(AppError::Usage(
             "the sending session's registration does not match this harness; nothing was posted"
@@ -184,9 +197,14 @@ pub(crate) fn require_posting_session(
 /// Whether the process carries a harness's session mark. A malformed mark is still an agent
 /// mark; this is not validation of a displayed session name (ADR-031 LT-8, NC-4).
 pub(crate) fn agent_marked() -> bool {
-    ["VOX_SESSION", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"]
-        .iter()
-        .any(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty()))
+    [
+        "VOX_SESSION",
+        "CLAUDE_CODE_SESSION_ID",
+        "CODEX_THREAD_ID",
+        "OPENCODE_SESSION_ID",
+    ]
+    .iter()
+    .any(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty()))
 }
 
 /// ADR-031 LT-8: an agent-marked process cannot widen trust, regardless of keyring authorization.

@@ -81,6 +81,14 @@ each of these broke.
 - **WT-5. Reopened, not detached.** When a client drops a broken connection (WT-2, FR-3) and opens
   a new one, the node it acts as MUST stay Ready (ADR-031 CW-1): reopening a connection MUST NOT
   lock, detach or let go of the node, and the person MUST NOT be asked for anything.
+- **WT-6. Durable hook registration, asynchronous projection.** An agent hook's bounded daemon
+  request MUST finish after its Session registration and room binding are durable; it MUST NOT
+  wait for history recovery, Session projection or attention preparation. Those operations
+  continue as a coalesced idempotent obligation owned by the daemon, recover from the durable
+  registration after daemon restart, retry only the named transient projection-readiness
+  refusals after each bounded attempt, and retain WT-3's permanent failure on the daemon log and
+  the Session's next hook. A client timeout or one readiness deadline MUST NOT cancel an accepted
+  Session opening.
 
 ### 3. Replies fit their frame
 

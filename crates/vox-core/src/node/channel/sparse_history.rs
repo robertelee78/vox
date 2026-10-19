@@ -80,8 +80,8 @@ impl ChannelState {
                 .is_some_and(|p| p.last == (hint.size, false)))
     }
 
-    /// Only the actor's completed authenticated hinted flow may arm this transition.
-    /// Inventory and intermediate source/effect publication never establish settlement.
+    /// Retain the existing exact departure acknowledgement. Ordinary join settlement is
+    /// derived from durable own-head/window facts, never from this completion edge.
     pub(crate) fn note_history_head_complete(
         &mut self,
         store: &Store,
@@ -92,73 +92,103 @@ impl ChannelState {
                 self.generation().load(std::sync::atomic::Ordering::Relaxed),
             ));
         }
-        let read = self.history_read(store)?;
-        let Some(head) = read.history_head(&hint.head)? else {
-            return Ok(None);
-        };
-        if head.binding.author != hint.author
-            || head.root.leaves != hint.size
-            || !read.history_head_committed(&hint.head, head.binding)?
-        {
-            return Ok(None);
-        }
-        let Some(included) = read.history_inclusion_receipt(&hint.head, &hint.author, hint.size)?
-        else {
-            return Ok(None);
-        };
-        if !read.history_effect_finished(&included.header().entry().entry_hash())? {
-            return Ok(None);
-        }
-        drop(read);
-        self.sparse_settle_pending |= !self.settled;
         Ok(None)
     }
 
-    pub(crate) fn sparse_settlement_pending(&self) -> bool {
-        self.sparse_settle_pending
-    }
-
-    pub(crate) fn sparse_settlement_ready(
+    /// The own-author committed head whose live-window acknowledgement is the only
+    /// missing piece of [`Self::sparse_settlement_ready`]: the room is unsettled,
+    /// the own sparse state has a committed own head with no observed conflict, the
+    /// local contiguous verified prefix covers that head, and the own live window
+    /// has not (fully) visited it. `None` when the settlement is missing something
+    /// else, or is already ready.
+    pub(crate) fn sparse_settlement_pending_own_head(
         &self,
         store: &Store,
-        now: crate::time::Ms,
-    ) -> Result<bool> {
-        if !self.sparse_settle_pending || self.settled {
-            return Ok(false);
-        }
-        let read = self.history_read(store)?;
+    ) -> Option<(Digest32, Digest32, u64)> {
+        // Asked for whether or not the room is settled (ADR-037 R5): settlement no longer
+        // waits on it, but the own-history conflict detector reads what it fetches.
+        let read = self.history_read(store).ok()?;
         if read.publication_busy() {
-            return Ok(false);
+            return None;
         }
-        // Sparse settlement must not pretend an authenticated own tail is a contiguous
-        // own feed. Missing own ancestry/Lipmaa evidence remains truthfully unsettled;
-        // local authoring still uses the existing contiguous, fork-checked append path.
+        let own = self.me();
+        let contiguous = self.dag.verified_head(&own);
+        if read
+            .history_settled_tip(&own)
+            .ok()?
+            .is_some_and(|tip| tip.skeleton.seq > contiguous)
+        {
+            return None;
+        }
+        let state = read.sparse_author(&own, LogScope::Public).ok()??;
+        if state.observed_conflict.is_some() {
+            return None;
+        }
+        let committed = state.committed?;
+        let head = read.history_head(&committed).ok()??;
+        let acknowledged = state.live.is_some_and(|window| {
+            window.head == committed && window.through == head.root.leaves && window.complete()
+        });
+        if acknowledged
+            || head.binding.author != own
+            || head.binding.scope != LogScope::Public
+            || head.root.leaves > contiguous
+        {
+            return None;
+        }
+        Some((own, committed, head.root.leaves))
+    }
+
+    /// Evidence that a member holds entries of this node's own feed that this node does not
+    /// (ADR-037 R5): a settled own tip above the local contiguous own head, an observed own
+    /// conflict, or an observed signed own head above it. A restored older profile shows
+    /// exactly this; writing on would make it an equivocator (V210-63).
+    pub(crate) fn own_history_conflict(&self, store: &Store) -> Result<bool> {
+        let read = self.history_read(store)?;
         let own = self.me();
         let contiguous = self.dag.verified_head(&own);
         if read
             .history_settled_tip(&own)?
             .is_some_and(|tip| tip.skeleton.seq > contiguous)
         {
+            return Ok(true);
+        }
+        let Some(state) = read.sparse_author(&own, LogScope::Public)? else {
+            return Ok(false);
+        };
+        if state.observed_conflict.is_some() {
+            return Ok(true);
+        }
+        if let Some(observed) = state.observed {
+            if read
+                .history_head(&observed)?
+                .is_some_and(|observed| observed.root.leaves > contiguous)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Settlement from this node's own durable record (ADR-037 R5): a sparse room not yet
+    /// settled, no evidence that a member holds more of the own feed, and current governance.
+    /// No peer acknowledgement is waited for; the detector above reads that when it comes.
+    pub(crate) fn sparse_settlement_local_ready(
+        &self,
+        store: &Store,
+        now: crate::time::Ms,
+    ) -> Result<bool> {
+        if self.settled || self.own_behind || !self.uses_sparse_history(store)? {
             return Ok(false);
         }
-        if let Some(state) = read.sparse_author(&own, LogScope::Public)? {
-            if state.observed_conflict.is_some() {
-                return Ok(false);
-            }
-            // A failed proof fetch must not erase knowledge of a signed higher own head.
-            // Both slots are bounded scalars; neither requires an ancestry/body scan.
-            for id in [state.observed, state.committed].into_iter().flatten() {
-                if read
-                    .history_head(&id)?
-                    .is_none_or(|head| head.root.leaves > contiguous)
-                {
-                    return Ok(false);
-                }
-            }
+        if self.history_read(store)?.publication_busy() {
+            return Ok(false);
         }
-        drop(read);
+        if self.own_history_conflict(store)? {
+            return Ok(false);
+        }
         match self.require_governance_ready(store, now) {
-            Ok(()) => Ok(true),
+            Ok(_) => Ok(true),
             Err(error) if Self::governance_refreshing(&error) => Ok(false),
             Err(error) => Err(error),
         }

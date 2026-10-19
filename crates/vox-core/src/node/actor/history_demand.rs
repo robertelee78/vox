@@ -71,6 +71,15 @@ struct Running {
     generation: Digest32,
     fence: Arc<Fence>,
     cancellation: demand::Cancellation,
+    /// The page this quantum fetches (head, lo, hi), when it is a page.
+    page: Option<(Digest32, u64, u64)>,
+}
+
+fn page_of(query: &Query) -> Option<(Digest32, u64, u64)> {
+    match query {
+        Query::Page { head, lo, hi, .. } => Some((*head, *lo, *hi)),
+        _ => None,
+    }
 }
 #[derive(Default)]
 pub(super) struct Controller {
@@ -294,6 +303,37 @@ pub(crate) fn saved_status(
 }
 
 impl Node {
+    /// Whether the running quantum's page already covers the position below `before`.
+    fn running_page_covers(&self, room: Digest32, before: &Digest32) -> bool {
+        let Some((head, lo, hi)) = self.history_demand.running.as_ref().and_then(|r| r.page) else {
+            return false;
+        };
+        let Some(profile) = self.profile.as_ref() else {
+            return false;
+        };
+        let Some(shared) = self.channels.get(&room) else {
+            return false;
+        };
+        let Ok(ch) = shared.try_lock() else {
+            return false;
+        };
+        let store = profile.store();
+        let Ok(read) = ch.history_read(store) else {
+            return false;
+        };
+        let Ok(Some(bytes)) = read.history_object(ObjectKind::Header, before) else {
+            return false;
+        };
+        let Ok(entry) = crate::log::entry::Entry::from_wire(&bytes) else {
+            return false;
+        };
+        let Ok(Some(current)) = ch.history_head(store, &entry.skeleton.author_id) else {
+            return false;
+        };
+        let wanted = entry.skeleton.seq.saturating_sub(1);
+        current.id() == head && wanted >= lo && wanted <= hi
+    }
+
     pub(super) fn begin_history_demand(
         &mut self,
         room: Digest32,
@@ -337,19 +377,52 @@ impl Node {
                 self.bounded_sync.cancel_archive(room, instance, request);
             }
         } else if self.history_demand.running.is_some() {
-            return Ok(self
-                .history_demand
-                .status
-                .clone()
-                .filter(|s| s.room == room && s.instance == instance)
-                .unwrap_or_else(|| {
-                    status(
-                        room,
-                        instance,
-                        Phase::Busy,
-                        "A history operation is active; cancel it before starting another.",
-                    )
-                }));
+            // An explicit new page ask is the person's newer intent: it ends the quantum still
+            // running for an earlier ask (what it published stays) and takes its place. Status
+            // and Resume answer the running one as before. Measured before this: a newcomer
+            // paging back was told "one bounded history quantum is queued" while nothing was
+            // queued, and the page below his live window was never asked for.
+            // An ask for the page below a row that the page in flight is already bringing is
+            // that same ask: it gets the running quantum's status and lets it finish. Measured:
+            // a reader re-asking as each row showed cancelled its own page every 500 ms and got
+            // two rows per ask.
+            let covered = match action {
+                Action::Older { before } => self.running_page_covers(room, &before),
+                _ => false,
+            };
+            let replaceable = !covered
+                && matches!(action, Action::Newest | Action::Older { .. })
+                && self
+                    .history_demand
+                    .running
+                    .as_ref()
+                    .zip(self.history_demand.status.as_ref())
+                    .is_some_and(|(running, current)| {
+                        current.room == room
+                            && current.instance == instance
+                            && current.request == Some(running.request)
+                    });
+            if replaceable {
+                if let Some(request) = self.history_demand.running.as_ref().map(|r| r.request) {
+                    if self.history_demand.stop_request(room, instance, request) {
+                        self.bounded_sync.cancel_archive(room, instance, request);
+                    }
+                }
+            } else {
+                return Ok(self
+                    .history_demand
+                    .status
+                    .clone()
+                    .filter(|s| s.room == room && s.instance == instance)
+                    .unwrap_or_else(|| {
+                        status(
+                            room,
+                            instance,
+                            Phase::Busy,
+                            "A history operation is active; cancel it before starting another.",
+                        )
+                    }));
+            }
         }
         let prior_private = if matches!(action, Action::Cancel { .. }) {
             self.history_demand.private_work.take()
@@ -682,6 +755,7 @@ impl Node {
                         generation: dispatch.generation,
                         fence: dispatch.fence.clone(),
                         cancellation: dispatch.staging.context.cancellation(),
+                        page: None,
                     });
                     self.start_legacy_history(dispatch);
                 }
@@ -691,6 +765,7 @@ impl Node {
                         generation: dispatch.generation,
                         fence: dispatch.fence.clone(),
                         cancellation: dispatch.staging.context.cancellation(),
+                        page: None,
                     });
                     self.start_private_history(dispatch);
                 }
@@ -700,6 +775,7 @@ impl Node {
                         generation: dispatch.generation,
                         fence: dispatch.fence.clone(),
                         cancellation: dispatch.staging.context.cancellation(),
+                        page: page_of(&dispatch.query),
                     });
                     if let Some(port) = self.ports.get_mut(&(dispatch.room, dispatch.peer)) {
                         port.raise();
@@ -1058,7 +1134,7 @@ fn prepare(
             return Err("The history request changed.".into());
         }
         if state.body.is_none()
-            && (state.remaining == 0 || state.cursor.is_some_and(|c| c.next_seq > state.bounds.hi))
+            && (state.remaining == 0 || state.cursor.is_some_and(|c| c.next_seq < state.bounds.lo))
         {
             return Err("This history interval has no remaining entries.".into());
         }
@@ -1075,8 +1151,8 @@ fn prepare(
         } else if let Some(cursor) = state.cursor {
             Query::Page {
                 head: state.bounds.head,
-                lo: cursor.next_seq,
-                hi: state.bounds.hi,
+                lo: state.bounds.lo,
+                hi: cursor.next_seq,
                 entries: state.remaining,
                 wire_bytes: 1024 * 1024,
             }
@@ -1098,16 +1174,22 @@ fn prepare(
             state.remaining,
         )
     } else {
-        if let Some(saved) = saved.as_ref() {
-            if !matches!(
-                saved.state().progress(None),
-                demand::Progress::Complete | demand::Progress::Cancelled
-            ) || saved.state().reclaiming()
-            {
-                answer.status.detail =
-                    "A saved request exists. Resume or cancel it explicitly.".into();
-                return Ok(answer);
-            }
+        // An explicit new ask is the person's newer intent: it ends a paused earlier quantum
+        // instead of being turned away by it; `--history resume` continues one on purpose.
+        // Measured before this: a newcomer paging back was told "A saved request exists" for
+        // 60 s after one quantum paused, and the page below his window never came.
+        let paused = saved
+            .as_ref()
+            .map(|previous| previous.state())
+            .filter(|state| {
+                !matches!(
+                    state.progress(None),
+                    demand::Progress::Complete | demand::Progress::Cancelled
+                ) || state.reclaiming()
+            })
+            .map(|state| state.request);
+        if let Some(request) = paused {
+            cancel_exact(&context, request, job, &fence, deadline)?;
         }
         let selected = select(room, store, action, &fence, deadline, selection_after)
             .map_err(|e| e.to_string())?;
@@ -1424,7 +1506,12 @@ fn select(
                 {
                     true
                 }
-                Some(header) => read.retention(&header.entry_hash())?.is_some(),
+                // Held means rendered: a body a cut-short page stored but never applied is
+                // fetched again, not counted.
+                Some(header) => {
+                    let hash = header.entry_hash();
+                    read.history_effect_finished(&hash)? && read.retention(&hash)?.is_some()
+                }
                 None => false,
             };
             if held {

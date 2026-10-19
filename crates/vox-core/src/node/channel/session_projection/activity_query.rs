@@ -10,21 +10,45 @@ use crate::error::{Error, Result};
 use crate::hash::Digest32;
 use crate::node::drive::{SessionFilter, SessionRow};
 use crate::node::store::Store;
-use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 const CHANGED: &str = "the room's Session activity changed; refresh the page";
 const REFRESHING: &str = "the room is refreshing saved Sessions; retry";
 const STEPS: usize = 256;
 
+/// What a selection was made from (ADR-037 R4). The published activity fold answers; its
+/// boundary, the drive authority answered for and the authors not yet answerable are the
+/// basis every continuation revalidates.
 #[derive(Clone)]
 pub(crate) struct Revision {
     incarnation: Arc<std::sync::atomic::AtomicU64>,
     instance: [u8; 16],
     invalidated: u64,
+    /// The known and the refreshing drive authors, as one hash.
     drive: Digest32,
     boundary: u64,
     pending: Option<(u64, u64)>,
+    refreshing: Vec<Digest32>,
+    provisional: bool,
+}
+
+// The IPC activity writer is to carry both onto the SessionPage wire (ADR-037 R4); until that
+// lands nothing in this crate reads them.
+#[allow(dead_code)]
+impl Revision {
+    /// The authors whose Session control effects are not yet current here, sorted. Their
+    /// activity is not in this answer; each is named so the caller can say it is fetching
+    /// them now (ADR-036 H-1), never dropped silently.
+    pub fn refreshing(&self) -> &[Digest32] {
+        &self.refreshing
+    }
+
+    /// Whether this answer came from an activity fold that is rebuilding, from no fold at
+    /// all, or during a saved-Session upgrade, restore or import: the rows are what was last
+    /// published, and a later page may show more.
+    pub fn provisional(&self) -> bool {
+        self.provisional
+    }
 }
 
 #[derive(Clone)]
@@ -35,9 +59,18 @@ pub(crate) struct Plan {
     pub revision: Revision,
 }
 
+#[allow(dead_code)]
 impl Plan {
     pub(crate) fn instance(&self) -> [u8; 16] {
         self.revision.instance
+    }
+    /// See [`Revision::refreshing`].
+    pub(crate) fn refreshing(&self) -> &[Digest32] {
+        self.revision.refreshing()
+    }
+    /// See [`Revision::provisional`].
+    pub(crate) fn provisional(&self) -> bool {
+        self.revision.provisional()
     }
 }
 
@@ -323,31 +356,70 @@ impl ChannelState {
         if self.poisoned {
             return Err(self.save_failure().to_string());
         }
-        if self.needs_session_upgrade() {
-            return Err(REFRESHING.into());
-        }
         let result = (|| -> Result<Reply> {
-            if !self.private_controls_ready(store)? || !self.private_expiry_ready(store, now)? {
-                return Err(Error::StreamRefused(REFRESHING));
-            }
-            let authors = self.drive_from(store)?;
+            let (authors, refreshing) = self.drive_from_known(store)?;
             let snapshot = store.snapshot()?;
-            let read = Read::existing(&snapshot, &self.sek, &self.channel_id)?
-                .ok_or(Error::StreamRefused(REFRESHING))?;
-            if !read.header.activity.ready {
-                return Err(Error::StreamRefused(REFRESHING));
-            }
-            let mut hash = Sha256::new();
-            for author in &authors {
-                hash.update(author);
-            }
+            let read = Read::existing(&snapshot, &self.sek, &self.channel_id)?;
+            // The published activity roots answer (ADR-037 R4). A rebuild in flight keeps the
+            // old generation published and is said to be provisional; publication moves the
+            // boundary, so a page under way re-reads.
+            let provisional = read.as_ref().is_none_or(|read| !read.header.activity.ready)
+                || self.needs_session_upgrade();
             let current = Revision {
                 incarnation: self.gen.clone(),
                 instance: self.history_instance(store)?,
-                invalidated: read.header.activity.invalidated,
-                drive: hash.finalize().into(),
-                boundary: read.header.activity.applied,
+                invalidated: read.as_ref().map_or(0, |r| r.header.activity.invalidated),
+                drive: super::query::drive_basis(&authors, &refreshing),
+                boundary: read.as_ref().map_or(0, |r| r.header.activity.applied),
                 pending: None,
+                refreshing: refreshing.clone(),
+                provisional,
+            };
+            let Some(read) = read else {
+                // No fold has run here yet: nothing is known, and the plan says so. An
+                // exact entry selection is not folded yet, and a continuation of an earlier
+                // basis has nothing to continue from.
+                return match query {
+                    Query::Resolve { revision: None, .. } => Ok(Reply::Resolved {
+                        candidate: None,
+                        next: None,
+                        ambiguous: false,
+                        revision: current,
+                    }),
+                    Query::Select {
+                        which: SessionFilter::Entries { .. },
+                        ..
+                    } => Err(Error::StreamRefused(REFRESHING)),
+                    Query::Select {
+                        which,
+                        before: None,
+                        revision: None,
+                        ..
+                    } => {
+                        let (_, _, visible) = selection(&which, &authors)?;
+                        Ok(Reply::Selected(Plan {
+                            origins: Vec::new(),
+                            older: 0,
+                            visible,
+                            revision: current,
+                        }))
+                    }
+                    Query::Companions { plan, .. } if plan.origins.is_empty() => {
+                        Ok(Reply::Companions {
+                            arrivals: Vec::new(),
+                            next: None,
+                        })
+                    }
+                    Query::Select {
+                        before: Some(_), ..
+                    } => Err(Error::StreamRefused(
+                        "cursor not among these Session entries",
+                    )),
+                    Query::Resolve { .. }
+                    | Query::Select { .. }
+                    | Query::Companions { .. }
+                    | Query::Row { .. } => Err(Error::StreamRefused(CHANGED)),
+                };
             };
             let check = |revision: &Revision| -> Result<()> {
                 if !Arc::ptr_eq(&current.incarnation, &revision.incarnation)
@@ -551,6 +623,9 @@ impl ChannelState {
                         if *instance != revision.instance {
                             return Err(Error::StreamRefused(CHANGED));
                         }
+                        if revision.refreshing.contains(node) {
+                            return Err(Error::StreamRefused(REFRESHING));
+                        }
                         if !authors.contains(node) {
                             return Err(Error::StreamRefused(
                                 "this node no longer has drive access to the selected Session",
@@ -578,6 +653,9 @@ impl ChannelState {
                                 ));
                             }
                             let f = fact(&read, arrival)?;
+                            if revision.refreshing.contains(&f.author) {
+                                return Err(Error::StreamRefused(REFRESHING));
+                            }
                             // The established Session view includes its owner's activity
                             // and authorized drivers' explicit drive rows naming this Session.
                             if f.hash != *hash

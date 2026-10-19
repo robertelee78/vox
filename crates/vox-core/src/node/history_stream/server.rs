@@ -156,20 +156,31 @@ async fn respond(
                     };
                     if receipt {
                         // Delivery acknowledgement cannot precede the required body/effect.
-                        // Merely verifying a signed head or inclusion never proves receipt.
+                        // Merely verifying a signed nonempty head or inclusion never proves
+                        // receipt. A canonical empty head has no terminal entry: holding that
+                        // exact committed head is the complete acknowledgement of an empty feed.
                         let read = room.history_read(store)?;
-                        let Some(tip) = read.history_settled_tip(&author)? else {
-                            return Ok(None);
-                        };
-                        let Some(included) =
-                            read.history_inclusion_receipt(&head.id(), &author, head.root.leaves)?
-                        else {
-                            return Ok(None);
-                        };
-                        if tip.skeleton.seq != head.root.leaves
-                            || tip.entry_hash() != included.header().entry().entry_hash()
-                        {
-                            return Ok(None);
+                        if head.root.leaves == 0 {
+                            if read.history_settled_tip(&author)?.is_some() {
+                                return Ok(None);
+                            }
+                        } else {
+                            let Some(tip) = read.history_settled_tip(&author)? else {
+                                return Ok(None);
+                            };
+                            let Some(included) = read.history_inclusion_receipt(
+                                &head.id(),
+                                &author,
+                                head.root.leaves,
+                            )?
+                            else {
+                                return Ok(None);
+                            };
+                            if tip.skeleton.seq != head.root.leaves
+                                || tip.entry_hash() != included.header().entry().entry_hash()
+                            {
+                                return Ok(None);
+                            }
                         }
                     }
                     Ok(Some(head))
@@ -322,7 +333,12 @@ async fn respond(
             Ok((result.status, cursor))
         }
         Query::Page { head, lo, hi, .. } => {
-            for seq in lo..=hi {
+            // Newest first (ADR-037 R1): a page is what a reader asked for below the oldest row
+            // it shows, so its rows arrive from the top down and an interrupted page leaves a
+            // contiguous top and a missing bottom, never a hole. Served oldest-first, a page the
+            // reader's next ask cut short left rendered rows below unrendered ones; nothing
+            // refilled the hole, and the ask below the bottom row found nothing to fetch.
+            for seq in (lo..=hi).rev() {
                 let result = entry(source, io, preamble, credit, head, seq, 0).await?;
                 if result.status != Status::Complete {
                     return Ok((
@@ -567,7 +583,7 @@ async fn entry(
             }
         }
         loop {
-            let incoming = match io.read(ACK_RESERVE.min(credit.remaining_wire())).await? {
+            let incoming = match io.read_ack_or_cancel(credit.remaining_wire()).await? {
                 Read::Frame(frame) => frame,
                 Read::End => return Err(Error::Unreachable("history ended before persisted ACK")),
                 Read::Busy => return Err(Error::Unreachable("history ACK reader busy")),

@@ -219,6 +219,7 @@ pub fn run(args: &NodeArgs) -> Result<(), AppError> {
     }
     println!();
     println!("vox setup: {}", crate::ident::NO_BACKUP);
+    println!("Next: run `vox status` to see your nodes and rooms");
     Ok(())
 }
 

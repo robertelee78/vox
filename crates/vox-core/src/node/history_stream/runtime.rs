@@ -46,6 +46,16 @@ enum Operation {
     ReclaimUnavailable,
     Governance,
 }
+/// How long one turn keeps running local slices before it yields to the actor.
+const LOCAL_TURN_BUDGET: std::time::Duration = std::time::Duration::from_millis(20);
+/// How many local slices one turn runs at most.
+const LOCAL_SLICES_PER_TURN: u32 = 64;
+/// Fold steps an entry slice may take in one turn before it waits for the actor's fold hook
+/// (ADR-037 R11): a hold on the fold cycled the need 32 times a turn, 77 turns a second.
+const GOVERNANCE_STEPS_PER_TURN: u8 = 4;
+/// The body bytes one explicit history quantum fetches at most; past it the request pauses and
+/// `vox room read --history resume` asks for the rest.
+const ARCHIVE_QUANTUM_BYTES: u64 = 1024 * 1024;
 #[derive(Clone)]
 struct Task {
     request: RequestId,
@@ -106,6 +116,9 @@ pub(crate) struct Flow {
     departure_probe: bool,
     pub(crate) archive_request: Option<RequestId>,
     pub(crate) hint: Option<super::HeadHint>,
+    /// The advertising peer that owns `hint` in the inbox, even while one exact dependency is
+    /// temporarily routed over its author's port.
+    pub(crate) hint_peer: Digest32,
     /// Exact signed head selected for this hinted flow, not the inventory claim.
     pub(crate) authenticated_head: Option<super::HeadHint>,
     pub(crate) waiting: bool,
@@ -115,9 +128,16 @@ pub(crate) struct Flow {
     pub(crate) admitted_authors: usize,
     pub(crate) external: Option<(Digest32, u64)>,
     pub(crate) archive_status: Option<crate::node::api::HistoryDemandStatus>,
-    /// This hinted third-party source did not retain a required dependency. The controller
-    /// retires the exact hint through bounded cleanup without penalizing the peer's port.
-    pub(crate) hint_unavailable: bool,
+    /// A healthy advertising peer did not retain the exact current wire dependency. The actor
+    /// moves this same flow to the named author's port; no second root or volatile copy exists.
+    pub(crate) reroute: Option<Digest32>,
+    /// Original peer while the next exact wire dependency runs against its author.
+    pub(crate) route_origin: Option<Digest32>,
+    /// The routed wire response completed and the retained continuation must return to origin.
+    pub(crate) route_complete: bool,
+    /// A local trust edit invalidated this flow's grant. Retire it without blaming the peer;
+    /// the controller re-arms its exact scalar hint under the new generation.
+    pub(crate) authorization_changed: bool,
     tasks: Vec<Task>,
     // One exact suspended foreground root. Intermediate pre-body continuations
     // are re-derived from durable receipts after the current dependency finishes.
@@ -125,7 +145,14 @@ pub(crate) struct Flow {
     slots: Arc<BodySlots>,
     owners: [Option<RequestId>; 2],
     no_progress: u8,
-    body_progress: bool,
+    /// A durable body chunk moved in this flow's last turn: the waiting slice is
+    /// progress, not a busy wait, and its port must not grow a Busy backoff.
+    pub(crate) body_progress: bool,
+    /// This turn's slice waits on the room's governance fold, which is not ready yet (ADR-037
+    /// R2): a local wait, not a body slot held against a busy peer, so it never retires the slot,
+    /// and the actor's fold hook is asked to drive the fold.
+    pub(crate) governance_wait: bool,
+    governance_cycles: u8,
     last_head: Option<(super::HeadHint, u8)>,
     request: RequestId,
     cleanup_store: Arc<Store>,
@@ -136,7 +163,8 @@ pub(crate) struct Flow {
     live: Option<Staging>,
     control: Option<Staging>,
     history: Option<Staging>,
-    archive_wire_used: bool,
+    /// Body bytes this explicit history quantum has fetched so far (ADR-036: one bounded ask).
+    archive_wire_bytes: u64,
     archive_next: Option<u64>,
     pub(crate) request_fence: Option<Arc<Fence>>,
     initialized: bool,
@@ -144,6 +172,9 @@ pub(crate) struct Flow {
     // One hinted flow either advances the main window or retries missing newest positions.
     // A peer's BodyNotHeld never rewinds the main cursor or suppresses another peer's retry.
     live_visited: bool,
+    // Exact head whose independent control closure is already retained by this flow. A later
+    // authenticated successor schedules its own closure without mutating the in-flight work.
+    control_head: Option<Digest32>,
     // Declared last: actual state/capabilities die before the shared admission is returned.
     _state_charge: crate::node::history_budget::FlowStateCharge,
 }
@@ -187,6 +218,7 @@ impl Flow {
             archive_request: None,
             _state_charge: state_charge,
             hint,
+            hint_peer: peer,
             authenticated_head: None,
             waiting: false,
             published: false,
@@ -195,13 +227,18 @@ impl Flow {
             admitted_authors: 0,
             external: None,
             archive_status: None,
-            hint_unavailable: false,
+            reroute: None,
+            route_origin: None,
+            route_complete: false,
+            authorization_changed: false,
             tasks: Vec::with_capacity(MAX_TASKS),
             replay: None,
             slots,
             owners: [None, None],
             no_progress: 0,
             body_progress: false,
+            governance_wait: false,
+            governance_cycles: 0,
             last_head: None,
             request,
             cleanup_store,
@@ -212,12 +249,13 @@ impl Flow {
             live: None,
             control: None,
             history: None,
-            archive_wire_used: false,
+            archive_wire_bytes: 0,
             archive_next: None,
             request_fence: None,
             initialized: false,
             live_unavailable: None,
             live_visited: false,
+            control_head: None,
         };
         if let Some((head, seq)) = required {
             flow.push(Task {
@@ -289,6 +327,7 @@ impl Flow {
             archive_request: Some(request),
             _state_charge: state_charge,
             hint: None,
+            hint_peer: peer,
             authenticated_head: None,
             waiting: false,
             published: false,
@@ -297,11 +336,16 @@ impl Flow {
             admitted_authors: 0,
             external: None,
             archive_status: None,
-            hint_unavailable: false,
+            reroute: None,
+            route_origin: None,
+            route_complete: false,
+            authorization_changed: false,
             slots,
             owners: [None, None],
             no_progress: 0,
             body_progress: false,
+            governance_wait: false,
+            governance_cycles: 0,
             last_head: None,
             request,
             cleanup_store,
@@ -322,12 +366,13 @@ impl Flow {
             live: None,
             control: None,
             history: Some(staging),
-            archive_wire_used: false,
+            archive_wire_bytes: 0,
             archive_next: None,
             request_fence: Some(fence),
             initialized: true,
             live_unavailable: None,
             live_visited: false,
+            control_head: None,
         }
     }
     fn push(&mut self, task: Task) -> Result<()> {
@@ -337,11 +382,56 @@ impl Flow {
         self.tasks.push(task);
         Ok(())
     }
+    /// Retain exact control closure above any ordinary-body work already on the LIFO stack.
+    /// Source proof runs before effect application; a successor gets a distinct pair of tasks.
+    fn push_control_closure(&mut self, task: &Task, window: LiveWindow) -> Result<()> {
+        if window.through == 0 || self.control_head == Some(window.head) {
+            return Ok(());
+        }
+        if self.tasks.len() > MAX_TASKS.saturating_sub(2) {
+            return Err(Error::SizeLimitExceeded("history dependency stack"));
+        }
+        self.tasks.push(Task {
+            operation: Operation::Local(LocalStep::Control {
+                head: window.head,
+                through: window.through,
+                effects: true,
+            }),
+            ..task.clone()
+        });
+        self.tasks.push(Task {
+            operation: Operation::Local(LocalStep::Control {
+                head: window.head,
+                through: window.through,
+                effects: false,
+            }),
+            ..task.clone()
+        });
+        self.control_head = Some(window.head);
+        Ok(())
+    }
     pub(crate) fn needs_board(&self) -> bool {
         self.inventory && !self.initialized
     }
     pub(crate) fn done(&self) -> bool {
         self.tasks.is_empty() && self.replay.is_none()
+    }
+    /// Whether the next task is a local slice, with no wire exchange, so this turn may run it.
+    fn next_slice_is_local(&self) -> bool {
+        let next = self.tasks.last().or(self.replay.as_ref());
+        matches!(
+            next.map(|task| &task.operation),
+            Some(
+                Operation::Local(_)
+                    | Operation::LiveWindow { .. }
+                    | Operation::LiveAdvance { .. }
+                    | Operation::LiveRetry { .. }
+                    | Operation::Tail { .. }
+                    | Operation::Reclaim(_)
+                    | Operation::ReclaimUnavailable
+                    | Operation::Governance
+            )
+        )
     }
     pub(crate) fn lane(&self) -> crate::node::history_budget::Lane {
         use crate::node::history_budget::Lane;
@@ -529,8 +619,9 @@ impl Flow {
         }
     }
 
-    /// Exactly one local slice or one response quantum. The caller retains its worker/port slot
-    /// through this return, including every spawned blocking worker, even after cancellation.
+    /// Local slices back to back, or one response quantum (ADR-037 R11). The caller retains its
+    /// worker/port slot through this return, including every spawned blocking worker, even after
+    /// cancellation.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn turn(
         &mut self,
@@ -543,19 +634,62 @@ impl Flow {
         inbox_generation: u64,
         now: u64,
     ) -> Result<()> {
-        let result = self
-            .turn_inner(
-                store,
-                conn,
-                job,
-                fence,
-                deadline,
-                inbox,
-                inbox_generation,
-                now,
+        self.waiting = false;
+        self.body_progress = false;
+        self.governance_wait = false;
+        self.governance_cycles = 0;
+        self.external = None;
+        // Local slices run back to back inside one turn; a slice that needs the wire, waits,
+        // errs or spends the slice budget ends it. Each slice used to be a turn of its own,
+        // and a turn costs an actor round trip (~10 ms): one body took ~30 slices, so a
+        // 128-position live window drained at three positions a second (40 s), and a creator
+        // serving three joiners at once read their first posts after 30 s (#934).
+        let started = tokio::time::Instant::now();
+        let mut slices = 0u32;
+        let result = loop {
+            let result = self
+                .turn_inner(
+                    store.clone(),
+                    conn,
+                    job,
+                    fence.clone(),
+                    deadline,
+                    inbox,
+                    inbox_generation,
+                    now,
+                )
+                .await;
+            slices += 1;
+            if result.is_err()
+                || self.waiting
+                || self.external.is_some()
+                || slices >= LOCAL_SLICES_PER_TURN
+                || started.elapsed() >= LOCAL_TURN_BUDGET
+                || tokio::time::Instant::now() >= deadline
+                || !self.next_slice_is_local()
+            {
+                break result;
+            }
+        };
+        if result.as_ref().is_err_and(|error| {
+            matches!(
+                error,
+                Error::Profile(
+                    "history authorization changed"
+                        | "history authorization changed before publication"
+                        | "live window authorization changed"
+                        | "live retry authorization changed"
+                )
             )
-            .await;
-        if self.owners.iter().any(Option::is_some) && self.waiting && !self.body_progress {
+        }) {
+            self.authorization_changed = true;
+            return Ok(());
+        }
+        if self.owners.iter().any(Option::is_some)
+            && self.waiting
+            && !self.body_progress
+            && !self.governance_wait
+        {
             self.no_progress = self.no_progress.saturating_add(1);
             if self.no_progress >= 3 {
                 return Err(Error::Unreachable(
@@ -583,9 +717,6 @@ impl Flow {
         inbox_generation: u64,
         now: u64,
     ) -> Result<()> {
-        self.waiting = false;
-        self.body_progress = false;
-        self.external = None;
         let source = Source::new(
             self.shared.clone(),
             store.clone(),
@@ -630,6 +761,38 @@ impl Flow {
         let receiver = self.receiver(store.clone(), task.purpose, fence.clone(), deadline);
         match task.operation.clone() {
             Operation::LiveWindow { author, head } => {
+                if author == self.node {
+                    // This node's own log needs no window: every position is held, and a
+                    // peer holding more of it is the own-history conflict the detector stops
+                    // the node on (ADR-037 R5), not something to fetch. The authenticated head
+                    // still settles the join. Measured before this: a creator walked her own
+                    // 10-entry log through a joiner's port for 8 s, 103 rounds, while two
+                    // other joiners' first posts waited behind it.
+                    let found = source
+                        .read(job, 256, move |channel, store| {
+                            let input = channel.history_read(store)?;
+                            Ok(input
+                                .history_head(&head)?
+                                .filter(|signed| signed.binding.author == author)
+                                .map(|signed| signed.root.leaves))
+                        })
+                        .await?;
+                    match found {
+                        Lookup::Found(found) => {
+                            self.authenticated_head = Some(super::HeadHint {
+                                author,
+                                head,
+                                size: found.value,
+                            });
+                        }
+                        Lookup::Busy => {
+                            self.push(task)?;
+                            self.waiting = true;
+                        }
+                        Lookup::Missing => {}
+                    }
+                    return Ok(());
+                }
                 let instance = self.instance;
                 let generation = self.generation;
                 let node = self.node;
@@ -663,12 +826,15 @@ impl Flow {
                                 "live window author has conflicting heads",
                             ));
                         }
+                        // A head no newer than the window's top resumes it. A newer head
+                        // selects a new window at once, even over an unfinished one: fresh
+                        // messages never wait for old bodies (ADR-036; the decider, #934), and
+                        // the selector keeps the unfinished positions inside the new window,
+                        // walked newest first after the fresh ones, held positions passing
+                        // locally. Measured before this: a joiner read the creator's next post
+                        // only when his drain of her 150-post window ended, 51–59 s on.
                         if let Some(window) = state.live {
-                            if window.through >= target.root.leaves
-                                || (!window.complete()
-                                    && target.root.leaves - window.through
-                                        < crate::log::history::MAX_PAGE_ENTRIES as u64)
-                            {
+                            if window.through >= target.root.leaves {
                                 return Ok(Some((window, target.root.leaves)));
                             }
                         }
@@ -687,10 +853,14 @@ impl Flow {
                     return Ok(());
                 };
                 let (window, target_through) = found.value;
+                // Report the exact authenticated Head(author) response that selected this
+                // operation, not a newer locally retained window that may supersede it. Join
+                // settlement must never turn an older peer echo into acknowledgement of the
+                // current own head.
                 self.authenticated_head = Some(super::HeadHint {
                     author,
-                    head: window.head,
-                    size: window.through,
+                    head,
+                    size: target_through,
                 });
                 if !window.complete() {
                     self.live_visited = true;
@@ -715,30 +885,41 @@ impl Flow {
                             head: window.head,
                             seq: window.next,
                         },
-                        ..task
+                        ..task.clone()
                     })?;
-                } else if !self.live_visited {
-                    self.live_visited = true;
-                    // This is a peer-local retry pass over only the authenticated peer's
-                    // newest window. It changes neither the durable main cursor nor the
-                    // missing-position fact until normal body admission fills that fact.
-                    self.push(Task {
-                        operation: Operation::LiveRetry {
-                            author,
-                            window: LiveWindow {
-                                head,
-                                from: target_through
-                                    .saturating_sub(
-                                        crate::log::history::MAX_PAGE_ENTRIES as u64 - 1,
-                                    )
-                                    .max(1),
-                                next: target_through,
-                                through: target_through,
+                } else {
+                    if !self.live_visited {
+                        self.live_visited = true;
+                        // This is a peer-local retry pass over only the authenticated peer's
+                        // newest window. It changes neither the durable main cursor nor the
+                        // missing-position fact until normal body admission fills that fact.
+                        // Retain it below the exact-head control work on this LIFO stack: omitted
+                        // ordinary bodies are best-effort live recovery and cannot delay Session
+                        // authorization. Any addressed key-package in the same window is a
+                        // control dependency and is fetched by that work before the retry begins.
+                        self.push(Task {
+                            operation: Operation::LiveRetry {
+                                author,
+                                window: LiveWindow {
+                                    head,
+                                    from: target_through
+                                        .saturating_sub(
+                                            crate::log::history::MAX_PAGE_ENTRIES as u64 - 1,
+                                        )
+                                        .max(1),
+                                    next: target_through,
+                                    through: target_through,
+                                },
                             },
-                        },
-                        ..task
-                    })?;
+                            ..task.clone()
+                        })?;
+                    }
                 }
+                // Head commitment independently authorizes bounded control closure. Run it above
+                // the ordinary-body work just retained on this LIFO stack, so governance,
+                // Session floors/support and addressed key delivery do not wait for 128 unrelated
+                // Content bodies. Collapsed proof ranges fetch none of those omitted bodies.
+                self.push_control_closure(&task, window)?;
             }
             Operation::LiveRetry { author, window } => {
                 if window.complete() {
@@ -956,7 +1137,10 @@ impl Flow {
             }
             Operation::Wire(mut query) => {
                 let body = matches!(query, Query::Entry { .. } | Query::Page { .. });
-                if task.purpose == Purpose::History && body && self.archive_wire_used {
+                if task.purpose == Purpose::History
+                    && body
+                    && self.archive_wire_bytes >= ARCHIVE_QUANTUM_BYTES
+                {
                     self.finish_archive(job).await?;
                     self.tasks.clear();
                     return Ok(());
@@ -995,9 +1179,6 @@ impl Flow {
                 } else {
                     task.request
                 };
-                if task.purpose == Purpose::History && body {
-                    self.archive_wire_used = true;
-                }
                 let result = super::exchange(
                     &receiver,
                     conn,
@@ -1014,6 +1195,11 @@ impl Flow {
                 )
                 .await?;
                 self.body_progress |= result.body_progress;
+                if self.route_origin.is_some()
+                    && !matches!(result.status, Status::Busy | Status::EvidenceUnavailable)
+                {
+                    self.route_complete = true;
+                }
                 if self.departure_probe {
                     // A stale/absent echo is not receipt. Keep the room and retry only this
                     // bounded head request through the existing port backoff.
@@ -1125,33 +1311,68 @@ impl Flow {
                     ));
                 }
                 if result.status == Status::EvidenceUnavailable && !self.archive {
-                    if matches!(query, Query::Head(author) if self.hint.is_some_and(|hint| hint.author == author))
+                    if matches!(query, Query::Head(author) if (author == self.peer || author == self.node) && self.hint.is_some_and(|hint| hint.author == author))
                         && !self.departure_probe
                         && self.last_head.is_none()
                         && self.replay.is_none()
                     {
                         // Inventory is an unauthoritative scalar hint. A peer that no longer
-                        // holds the initially named head retires only this hint; treating that
-                        // as a transport failure backs off the whole room/peer port and can leave
-                        // a later fresh head waiting behind stale third-party hints. Dependency
-                        // failures after a head was selected remain hard failures below.
+                        // holds its initially named head, or has not yet completed our echo,
+                        // retires only this hint. Neither is a transport failure, and backing off
+                        // the healthy room/peer port can strand a later fresh head behind it.
+                        // Third-party heads route to their author below; dependency failures
+                        // after a head was selected remain hard failures.
                         self.tasks.clear();
                         return Ok(());
                     }
-                    if self.hint.is_some_and(|hint| hint.author != self.peer)
-                        && !self.departure_probe
-                    {
-                        // A peer may truthfully advertise an authenticated third-party head
-                        // while retaining only part of its dependencies. Missing evidence from
-                        // that peer is not a transport failure and must not back off the whole
-                        // room/peer port behind which later current hints are waiting. Retire
-                        // only this scalar hint. No missing evidence or effect is accepted:
-                        // another peer must provide every dependency before publication.
-                        // The controller owns retirement because a verifier or publication
-                        // cursor may already be durable by the time a later dependency is
-                        // refused. Normal completion would skip that bounded cleanup.
-                        self.hint_unavailable = true;
-                        return Ok(());
+                    if !self.departure_probe {
+                        let dependency = match query {
+                            Query::Head(author) => self.hint.filter(|hint| hint.author == author),
+                            Query::Header { head, .. }
+                            | Query::Proof { head, .. }
+                            | Query::Entry { head, .. }
+                            | Query::Page { head, .. } => {
+                                match source
+                                    .read(
+                                        job,
+                                        std::mem::size_of::<Option<Digest32>>(),
+                                        move |room, store| {
+                                            Ok(Some(
+                                                room.history_read(store)?.history_head(&head)?.map(
+                                                    |signed| super::HeadHint {
+                                                        author: signed.binding.author,
+                                                        head,
+                                                        size: signed.root.leaves,
+                                                    },
+                                                ),
+                                            ))
+                                        },
+                                    )
+                                    .await?
+                                {
+                                    Lookup::Found(found) => found.value,
+                                    Lookup::Busy => {
+                                        self.push(task)?;
+                                        self.waiting = true;
+                                        return Ok(());
+                                    }
+                                    Lookup::Missing => None,
+                                }
+                            }
+                            Query::Inventory | Query::Context(_) => None,
+                        };
+                        if dependency.is_some_and(|head| {
+                            head.author != self.peer && head.author != self.node
+                        }) {
+                            // Keep the exact refused query and its full continuation owned by
+                            // this flow. The actor moves it to the dependency author's port for
+                            // one wire turn, then returns the same flow to this advertising peer.
+                            // No missing evidence is accepted and no whole-head surrogate can
+                            // complete without satisfying this exact query.
+                            self.push(task)?;
+                            self.reroute = dependency.map(|head| head.author);
+                            return Ok(());
+                        }
                     }
                     return Err(Error::Unreachable(
                         "required current evidence is unavailable",
@@ -1183,7 +1404,9 @@ impl Flow {
                         .await?
                         .ok_or(Error::Profile("archive state missing"))?;
                     if let Some(body) = &state.state().body {
-                        self.archive_next = body.seq.checked_add(1);
+                        self.archive_next = body.seq.checked_sub(1).filter(|next| *next >= 1);
+                        self.archive_wire_bytes =
+                            self.archive_wire_bytes.saturating_add(body.length);
                         self.push(Task {
                             request: wire_request,
                             purpose: Purpose::History,
@@ -1376,7 +1599,10 @@ impl Flow {
             Operation::Reclaim(purpose) => {
                 if !self.reclaim_stage(purpose, job, false).await? {
                     self.push(task)?;
-                } else if self.archive && self.tasks.is_empty() {
+                } else if self.archive
+                    && self.tasks.is_empty()
+                    && !self.archive_continue(job).await?
+                {
                     self.finish_archive(job).await?;
                 }
             }
@@ -1408,9 +1634,26 @@ impl Flow {
                             .map(|_| Some(()))
                     })
                     .await?;
-                if !matches!(advanced, Lookup::Found(_)) {
-                    self.push(task)?;
-                    self.waiting = true;
+                // A bounded fold step, then the entry slice is re-derived and decides for itself
+                // whether the fold now serves it. A fold that is held or slow left that cycle
+                // running against the same fold, 32 slices a turn and 77 turns a second, and
+                // because the one foreground lane went back to this flow every round, the node's
+                // other peer never got a round (a post made while the fold was held reached no
+                // one in 30 s; ADR-037 R11). After a few steps the flow waits at the port's Busy
+                // cadence and the actor's fold hook drives the fold (R2 b).
+                match advanced {
+                    Lookup::Found(_) if self.governance_cycles < GOVERNANCE_STEPS_PER_TURN => {
+                        self.governance_cycles += 1;
+                    }
+                    Lookup::Found(_) => {
+                        self.push(task)?;
+                        self.waiting = true;
+                        self.governance_wait = true;
+                    }
+                    Lookup::Busy | Lookup::Missing => {
+                        self.push(task)?;
+                        self.waiting = true;
+                    }
                 }
             }
         }
@@ -1539,6 +1782,53 @@ impl Flow {
         }
         Ok(complete)
     }
+    /// After a body of an explicit history quantum is applied: the next page of the same bounded
+    /// interval, while entries remain and the quantum's byte budget does. A page response is
+    /// consumed up to its first complete body (one body slot), so one ask fetches its page body
+    /// by body. Returns whether a page was pushed. Measured before this: `vox room read
+    /// --history older` delivered one body and paused, and the newcomer proof's page below the
+    /// live window never arrived.
+    async fn archive_continue(&mut self, job: &Job) -> Result<bool> {
+        let Some(staging) = self.history.clone() else {
+            return Ok(false);
+        };
+        let Some(next) = self.archive_next else {
+            return Ok(false);
+        };
+        if self.archive_wire_bytes >= ARCHIVE_QUANTUM_BYTES {
+            return Ok(false);
+        }
+        let snapshot = inspect(&staging.context, job)
+            .await?
+            .ok_or(Error::Profile("archive state missing"))?;
+        let state = snapshot.state();
+        if state.body.is_some()
+            || state.reclaiming()
+            || state.remaining == 0
+            || next < state.bounds.lo
+        {
+            return Ok(false);
+        }
+        let request = staging
+            .active
+            .lock()
+            .map(|active| active.request())
+            .map_err(|_| Error::Profile("history activation lock failed"))?;
+        let query = Query::Page {
+            head: state.bounds.head,
+            lo: state.bounds.lo,
+            hi: next,
+            entries: state.remaining,
+            wire_bytes: 1024 * 1024,
+        };
+        self.push(Task {
+            request,
+            purpose: Purpose::History,
+            operation: Operation::Wire(query),
+        })?;
+        Ok(true)
+    }
+
     async fn finish_archive(&mut self, job: &Job) -> Result<()> {
         let Some(staging) = self.history.clone() else {
             return Ok(());
@@ -1557,7 +1847,7 @@ impl Flow {
                     if snapshot.state().body.is_none() && !snapshot.state().reclaiming() {
                         if let Some(next) = next {
                             let state = snapshot.state();
-                            let cursor = (next <= state.bounds.hi && state.remaining > 0)
+                            let cursor = (next >= state.bounds.lo && state.remaining > 0)
                                 .then_some(super::Continuation {
                                     query_kind: 4,
                                     head: state.bounds.head,

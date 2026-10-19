@@ -71,6 +71,16 @@ pub struct GovernanceNotices {
     pub revision: u64,
 }
 
+/// Proof that this room's governance fold was current through the node's local receipt
+/// frontier when it was obtained: every control entry the node has accepted is ordered and
+/// evaluated (ADR-037 R3). The three irreversible egresses — the encryption audience of a
+/// Session append, a drive-key release, and a consent key release — take one by value, and
+/// nothing but [`ChannelState::require_governance_ready`] can make one, so no call site
+/// reaches an egress without the fold's proof. A revocation the node holds but has not folded
+/// therefore cannot let a removed member be encrypted to.
+#[derive(Clone, Copy, Debug)]
+pub struct GovernanceCurrent(());
+
 impl ChannelState {
     /// A pending replay is retryable. A malformed or unreadable stored fact is
     /// never classified as refreshing, so callers must preserve that error.
@@ -332,10 +342,16 @@ impl ChannelState {
             .has_backfill())
     }
 
-    /// Projection callers retain their last good view while this returns refreshing.
-    pub fn require_governance_ready(&self, store: &Store, now: crate::time::Ms) -> Result<()> {
+    /// Projection callers retain their last good view while this returns refreshing. The
+    /// token it returns is the only proof an irreversible egress accepts (ADR-037 R3).
+    pub fn require_governance_ready(
+        &self,
+        store: &Store,
+        now: crate::time::Ms,
+    ) -> Result<GovernanceCurrent> {
         self.require_legacy_current(store)?;
-        self.checked_governance(store, now.get()).map(|_| ())
+        self.checked_governance(store, now.get())
+            .map(|_| GovernanceCurrent(()))
     }
 
     /// A local setting is visible only after the same checked revision has reached

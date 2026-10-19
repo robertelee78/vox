@@ -126,7 +126,17 @@ pub fn backoff_wait(kind: BackoffKind, failures: u32) -> Duration {
         Duration::from_millis(from_ms.saturating_mul(1 << shift).min(cap_ms))
     };
     match kind {
-        BackoffKind::Unreachable | BackoffKind::Busy => doubling(200, 8_000),
+        BackoffKind::Unreachable => doubling(200, 8_000),
+        // A `Busy` refusal is not a reach failure: the peer answered, and saying it is busy
+        // costs it one lookup. The work it is busy with is usually the same convergence this
+        // port is pulling for — the peer's own bounded publication or its inbound limit — so
+        // spacing retries like an unreachable peer starved exactly that pull: a room that
+        // needed ~10 one-step rounds to converge sat through them at the 8 s cap (a measured
+        // 14-failure Busy spiral held a creator's pull to one step per 8 s for the whole
+        // minute while both sides converged without it, ending 12 entries behind). Stay
+        // polite at 200 ms, capped at 1 s: one refused probe per second cannot crowd out
+        // the peer's own work, and a transient busy clears long before the cap matters.
+        BackoffKind::Busy => doubling(200, 1_000),
         BackoffKind::NoProgress => doubling(1_000, 30_000),
         // An anchor that keeps no log for the room is asked once per interval, as before, not
         // every few seconds.
@@ -247,6 +257,12 @@ pub struct Port {
     /// When this node's own outbound session last completed cleanly, so the periodic request
     /// passes over a port that was just served (ADR-025 D7, V210-97).
     pub last_clean_out: Option<Instant>,
+    /// This node's own appends in the room, counted (ADR-037 R7): what the peer is told of
+    /// through an inventory exchange, the only exchange that carries this node's heads.
+    pub own_seq: u64,
+    /// `own_seq` when this port last began an inventory exchange. While `own_seq` is past it,
+    /// the port owes the peer an announcement, and a parked hinted continuation waits one round.
+    pub announced_seq: u64,
 }
 
 impl Port {
@@ -267,16 +283,31 @@ impl Port {
             legacy_checked_gen: None,
             last_progress: None,
             last_clean_out: None,
+            own_seq: 0,
+            announced_seq: 0,
         }
+    }
+
+    /// Whether this node appended in the room since this port last announced its heads to
+    /// the peer (ADR-037 R7). An inventory exchange, not a hinted fetch, is what tells the
+    /// peer; a hinted drain of the peer's backlog must not hold that announcement back.
+    #[must_use]
+    pub fn announce_owed(&self) -> bool {
+        self.own_seq > self.announced_seq
     }
 
     /// Whether the port needs a session (ADR-025 D1).
     #[must_use]
     pub fn needs(&self) -> bool {
+        // An own append the peer has not been told of is a need of its own (ADR-037 R7). It
+        // used to ride along only when a hint from the peer started a round anyway; an append
+        // into a quiet room then woke nothing. Measured on the shipped binary: a Session opened
+        // after a room went quiet was never announced, and neither port ran a round for 90 s.
         !self.poisoned
             && (self.gen.load(Ordering::Relaxed)
                 > self.done_gen.max(self.legacy_checked_gen.unwrap_or(0))
-                || self.req_gen > self.req_done)
+                || self.req_gen > self.req_done
+                || self.announce_owed())
     }
 
     /// Raise a request (ADR-025 D2).
@@ -304,6 +335,22 @@ impl Port {
         self.backoff
             .and_then(|b| b.until)
             .is_some_and(|until| now < until)
+    }
+
+    /// Whether new published entries bypass a Busy backoff at `now`. The Busy backoff spaces
+    /// owed-work retries while nothing new arrived; a peer's newly published entries are new
+    /// demand, and holding the round that carries them behind a transient-refusal backoff
+    /// delayed a fresh member's join and floor visibility past the person-facing bounds. A
+    /// transport (Unreachable) backoff still holds: a peer that cannot be reached gains
+    /// nothing from an immediate retry.
+    #[must_use]
+    pub fn busy_bypass(&self, now: Instant) -> bool {
+        self.backoff.is_some_and(|b| {
+            b.kind == BackoffKind::Busy
+                && !self.poisoned
+                && self.gen.load(Ordering::Relaxed)
+                    > self.done_gen.max(self.legacy_checked_gen.unwrap_or(0))
+        }) && self.backing_off(now)
     }
 
     /// Clear the backoff: a new connection, a new epoch, or a person's `vox room sync`.

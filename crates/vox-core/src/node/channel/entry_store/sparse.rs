@@ -796,6 +796,42 @@ impl Read<'_> {
             .history_head(head)?
             .is_some_and(|h| h.binding == binding))
     }
+    /// Whether this exact signed head is in the accepted consistency chain. The current head and
+    /// every cryptographically retained prefix are accepted; a same-size different descriptor is
+    /// not. This never promotes or rolls back the author's current head.
+    pub(crate) fn history_head_accepted(
+        &self,
+        head: &Digest32,
+        binding: TreeBinding,
+    ) -> Result<bool> {
+        if self.history_head_committed(head, binding)? {
+            return Ok(true);
+        }
+        let Some(target) = self.history_head(head)? else {
+            return Ok(false);
+        };
+        if target.binding != binding {
+            return Ok(false);
+        }
+        let Some(current_id) = self
+            .sparse_author(&binding.author, binding.scope)?
+            .and_then(|state| state.committed)
+        else {
+            return Ok(false);
+        };
+        let Some(current) = self.history_head(&current_id)? else {
+            return Err(invalid("accepted head missing"));
+        };
+        if current.binding != binding || target.root.leaves >= current.root.leaves {
+            return Ok(false);
+        }
+        let prefix = if target.root.leaves == 0 {
+            Some(Descriptor::empty(binding))
+        } else {
+            self.history_range(binding, 1, target.root.leaves)?
+        };
+        Ok(prefix == Some(target.root))
+    }
     /// An individually evidence-complete published source and its exact inclusion target.
     /// This does not claim that the governance evaluator has applied the source's effect.
     pub(crate) fn history_validated_header(
@@ -1243,6 +1279,12 @@ impl Write<'_, '_> {
             return Err(invalid("local settlement head differs"));
         }
         self.finish_history_obligation(&Obligation::authority(head.id(), entry))?;
+        if expected_head.is_some() {
+            // A local append extends only its already-ready predecessor, and this Batch contains
+            // the new entry's semantic effect. Publish the new exact-head receipt atomically;
+            // unlike a remote sparse effect, no separate prefix walk remains.
+            self.publish_control_ready(&head)?;
+        }
         Ok(())
     }
     pub(crate) fn begin_sparse_publication(
@@ -1695,11 +1737,7 @@ impl Write<'_, '_> {
             return Err(invalid("live window author has conflicting heads"));
         }
         if let Some(window) = state.live {
-            if window.through >= head.root.leaves
-                || (!window.complete()
-                    && head.root.leaves - window.through
-                        < crate::log::history::MAX_PAGE_ENTRIES as u64)
-            {
+            if window.through >= head.root.leaves {
                 return Ok(window);
             }
         }
@@ -1707,7 +1745,18 @@ impl Write<'_, '_> {
         let floor = through
             .saturating_sub(crate::log::history::MAX_PAGE_ENTRIES as u64 - 1)
             .max(1);
-        let from = state.live.map_or(floor, |old| floor.max(old.through + 1));
+        // A newer head over a finished window starts just above it: everything below was
+        // visited. Over an unfinished window it keeps that window's start, so the fresh
+        // positions above the old top are walked first and the old remainder after them,
+        // positions already held passing locally (ADR-036: live before history). The oldest
+        // positions a 128-wide window can no longer reach are older history, on demand.
+        let from = state.live.map_or(floor, |old| {
+            if old.complete() {
+                floor.max(old.through + 1)
+            } else {
+                floor.max(old.from)
+            }
+        });
         let window = LiveWindow {
             head: head_id,
             from,
@@ -1928,7 +1977,12 @@ impl Write<'_, '_> {
         }
         self.merge_observed_head(head, &mut state)?;
         state.committed = Some(head.id());
-        if head.root.leaves != 0 {
+        if head.root.leaves == 0 {
+            // An empty exact head has no control positions or effects to fetch. Mark that
+            // vacuous projection complete with the commitment; no control-source request can
+            // name position zero later to advance it.
+            state.control_ready = Some(head.id());
+        } else {
             self.keep_history_range(head.binding, 1, head.root)?;
         }
         self.directory.active.sparse.commitments = self.change_value(
@@ -2979,6 +3033,9 @@ impl Write<'_, '_> {
             &receipt.binding().author,
             receipt.prefix().leaves,
         );
+        if receipt.prefix().leaves != 0 {
+            self.keep_history_range(receipt.binding(), 1, receipt.prefix())?;
+        }
         self.save_history_object(ObjectKind::PrefixReceipt, key, &receipt.local_receipt()?)
     }
 }

@@ -1,5 +1,12 @@
 // Vox OpenCode TUI attention receiver. Installed by vox setup into tui/vox.js.
 // This module runs in the actual client, not the retained OpenCode server.
+//
+// OpenCode 2.x loads a TUI plugin as `export default {id, setup}`; the setup receives
+// the TUI plugin context and its returned cleanup runs when the plugin unloads, which
+// replaces the 1.x `api.lifecycle` disposal pair. The route is the same Solid store
+// it was (`ctx.ui.router.current()` reads it, reactive in a computation), the client
+// is `ctx.client`, and a notice is submitted with `ctx.client.session.prompt`, its
+// payload metadata marking it as Vox-generated text.
 import { createRoot, createComputed } from "solid-js"
 import { createServer } from "node:net"
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto"
@@ -16,9 +23,21 @@ const AUTH_WITHIN_MS = 5000
 const REQUEST_WITHIN_MS = 30000
 
 export const id = "vox-attention"
-export async function tui(api) {
-  if (api.lifecycle.signal.aborted) return
-  const directory = realpathSync(api.state.path.directory)
+export async function setup(ctx) {
+  const api = {
+    lifecycle: { disposed: false },
+    client: ctx.client,
+    route: {
+      get current() {
+        const route = ctx.ui.router.current()
+        if (route?.type === "session" && typeof route.sessionID === "string") {
+          return { name: "session", params: { sessionID: route.sessionID } }
+        }
+        return { name: route?.type ?? "home" }
+      },
+    },
+  }
+  const directory = realpathSync(ctx.location?.directory ?? process.cwd())
   const scope = createHash("sha256").update(JSON.stringify([VOX_NODE, directory])).digest("hex")
   const registry = join("/tmp", "vox-oc-clients-" + scope.slice(0, 32))
   try { mkdirSync(registry, { mode: 0o700 }) } catch (e) { if (e.code !== "EEXIST") throw e }
@@ -42,7 +61,7 @@ export async function tui(api) {
   let listening = false
   let registration = null
   let wanted = null
-  const live = () => !stopped && !api.lifecycle.signal.aborted
+  const live = () => !stopped && !api.lifecycle.disposed
   const currentSession = () => {
     const current = api.route.current
     const value = current.name === "session" ? current.params?.sessionID : null
@@ -162,15 +181,14 @@ export async function tui(api) {
       // is allowed to complete; close/lost ACK never authorizes a replay.
       let request
       try {
-        request = api.client.session.promptAsync({ sessionID: session, directory,
-          parts: [{ type: "text", text: "Vox-generated attention notice; not the operator's message:\n" + msg.text, synthetic: true,
-            metadata: { vox_attention: { source: "vox", client, route, id: msg.id } } }],
-        }, { signal: controller.signal, responseStyle: "fields" })
+        request = ctx.client.session.prompt(
+          { sessionID: session,
+            text: { text: "Vox-generated attention notice; not the operator's message:\n" + msg.text,
+              metadata: { vox_attention: { source: "vox", client, route, id: msg.id } } } },
+          { signal: controller.signal })
       } catch (error) { request = Promise.reject(error) }
-      Promise.resolve(request).then((result) => {
-        const status = result?.response?.status ?? 0
-        record.outcome = status >= 200 && status < 300 ? "accepted" : "unknown"
-        if (record.outcome === "unknown") record.error = "OpenCode did not acknowledge acceptance; do not retry"
+      Promise.resolve(request).then(() => {
+        record.outcome = "accepted"
       }, () => {
         record.outcome = "unknown"
         record.error = "OpenCode acceptance is unknown; do not retry"
@@ -195,6 +213,7 @@ export async function tui(api) {
   const dispose = () => {
     if (stopped) return
     stopped = true
+    api.lifecycle.disposed = true
     session = null
     route = randomBytes(32).toString("hex")
     receipts.clear()
@@ -208,8 +227,6 @@ export async function tui(api) {
     try { rmdirSync(dir) } catch {}
     try { rmdirSync(registry) } catch {}
   }
-  api.lifecycle.signal.addEventListener("abort", dispose, { once: true })
-  api.lifecycle.onDispose(dispose)
   server.on("error", dispose)
   server.listen(socket, () => {
     if (!live()) { dispose(); return }
@@ -226,5 +243,6 @@ export async function tui(api) {
     { detached: true, stdio: ["pipe", "ignore", "ignore"] })
   helper.on("error", () => {})
   helper.unref()
+  return dispose
 }
-export default { id, tui }
+export default { id, setup }

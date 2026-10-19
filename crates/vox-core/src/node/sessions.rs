@@ -119,7 +119,11 @@ pub(crate) async fn lookup(
 // and the Session projection. Every other refusal, including unreadable facts, is permanent
 // for this attempt and must reach the caller. These are Error::Display strings where the
 // actor returns a storage-layer readiness error before reaching the Session query.
-fn opening_refreshing(reason: &str) -> bool {
+/// Whether an idempotent Session opening stopped only because its bounded view is still being
+/// rebuilt. A durable daemon registration may retry these exact refusals; every other error is a
+/// permanent result for that registration and must be surfaced.
+#[must_use]
+pub fn opening_refreshing(reason: &str) -> bool {
     matches!(
         reason,
         "the room is refreshing saved Sessions; retry"

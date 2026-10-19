@@ -22,7 +22,8 @@ use vox_core::error::Error;
 use vox_core::hash::Digest32;
 use vox_core::node::api::{HistoryCursor, MessageRow, NodeEvent};
 use vox_core::node::daemonipc::{
-    AttachMode, DaemonClient, DaemonFrame, DaemonRequest, KeepSource, NodeName, NodeState, UseNode,
+    AttachMode, DaemonClient, DaemonFrame, DaemonRequest, KeepSource, NodeName, NodeState, Refusal,
+    UseNode,
 };
 use vox_core::node::ipc::{Frame, IpcClient, NodeSocket, Request, SessionSummary};
 use vox_core::node::link::b32_encode;
@@ -1142,6 +1143,10 @@ pub struct FfiRoomRead {
     pub older: u64,
     /// Entry before which the next older page ends, or none once the first page is reached.
     pub before: Option<String>,
+    /// The room's governance fold was behind what the node has received when this page was
+    /// read (ADR-037 R3): a control entry it holds is not folded yet, so what the page shows
+    /// may still be re-ordered or withdrawn. Shown as provisional, never as final, while true.
+    pub provisional: bool,
 }
 
 /// Status of one explicitly requested, bounded peer-history operation. Cached reads do not start it.
@@ -1382,6 +1387,7 @@ async fn room_sessions_page(
             sessions,
             summaries,
             more,
+            ..
         }) => {
             if sessions.len() != summaries.len() {
                 return Err(failed("the Session page has mismatched summaries"));
@@ -1415,6 +1421,7 @@ async fn exact_session(
             sessions,
             summaries,
             more: false,
+            ..
         }) if sessions.len() <= 1
             && sessions.len() == summaries.len()
             && sessions.iter().all(|s| s.node == node && s.id == id) =>
@@ -2611,6 +2618,9 @@ async fn room_view_selection(
         // A held refresh must never replace the owner's older-page metadata.
         older: 0,
         before: None,
+        // An exact re-read of held entries behind a display-revision fence: not a fresh page, so
+        // it carries no fold state of its own.
+        provisional: false,
     })
 }
 
@@ -2735,8 +2745,12 @@ impl VoxClient {
                     limit: ROOM_WINDOW_ROWS as u64,
                 },
             };
-            let (rows, older) = match ask(c, &request).await? {
-                Frame::RoomPage { rows, older } => (rows, older),
+            let (rows, older, provisional) = match ask(c, &request).await? {
+                Frame::RoomPage {
+                    rows,
+                    older,
+                    provisional,
+                } => (rows, older, provisional),
                 other => return Err(unexpected(&other)),
             };
             room_window_bytes(&rows)?;
@@ -2757,6 +2771,7 @@ impl VoxClient {
                     .map(|r| rendered(r, &names, Some(&me)))
                     .collect(),
                 older,
+                provisional,
             })
         })
     }
@@ -2844,6 +2859,9 @@ impl VoxClient {
                     .collect(),
                 older: 0,
                 before: None,
+                // An exact re-read of held entries behind a display-revision fence: not a fresh page, so
+                // it carries no fold state of its own.
+                provisional: false,
             })
         })
     }
@@ -3034,6 +3052,14 @@ impl VoxClient {
                 .await
                 .map_err(|e| said(&socket, e))?;
             match d.request(req).await {
+                Ok(DaemonFrame::Refused(r @ Refusal::WrongPassphrase { .. })) => {
+                    Err(VoxError::WrongPassphrase {
+                        reason: r.to_string(),
+                    })
+                }
+                Ok(DaemonFrame::Refused(r @ Refusal::NodeInUse { .. })) => Err(VoxError::Busy {
+                    reason: r.to_string(),
+                }),
                 Ok(DaemonFrame::Refused(r)) => Err(failed(r.to_string())),
                 Ok(f) => Ok(f),
                 Err(e) if read_only => Err(read_interrupted(e, |e| {
@@ -5663,6 +5689,7 @@ impl VoxClient {
                         sessions,
                         summaries,
                         more,
+                        ..
                     } if sessions.len() == summaries.len() => (sessions, summaries, more),
                     other => return Err(unexpected(&other)),
                 };
@@ -7047,6 +7074,7 @@ impl VoxClient {
                     mut sessions,
                     summaries,
                     more: false,
+                    ..
                 } if sessions.len() <= 1
                     && sessions.len() == summaries.len()
                     && sessions

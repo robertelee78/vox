@@ -268,10 +268,40 @@ impl Node {
                 Err(error) => channel.poison(&error),
             }
         }
-        let settle_pending = channel.sparse_settlement_pending();
+        // An unsettled sparse room rechecks its durable exact own-head acknowledgement on
+        // every ready governance turn. Volatile hint-queue occupancy is not settlement state.
+        let settle_pending =
+            !channel.is_settled() && channel.uses_sparse_history(&store).unwrap_or(false);
         drop(channel);
         if progress.ready && settle_pending {
             self.settle_sparse_room(&room).await;
+        }
+        // The own-history conflict detector (ADR-037 R5): a member seen holding more of this
+        // node's own feed than this node does means a restored older profile. Said once, and
+        // the room refuses this node's writes from here on, instead of letting it equivocate.
+        if progress.ready {
+            let noted = match shared.try_lock() {
+                Ok(mut channel) => match channel.uses_sparse_history(&store) {
+                    Ok(true) => match channel.own_history_conflict(&store) {
+                        Ok(true) => channel.note_own_history_behind(&store).unwrap_or(false),
+                        _ => false,
+                    },
+                    _ => false,
+                },
+                Err(_) => false,
+            };
+            if noted {
+                // One fact, one sentence: the detector says what every refused write will say
+                // (`Error::OwnHistoryBehind`), once. It used to say it in other words, and the
+                // sentence a person then searched for appeared only where a refusal leaked.
+                let _ = self.event_tx.send(NodeEvent::NodeNote {
+                    note: format!(
+                        "room {}: {}",
+                        crate::node::link::b32_encode(&room),
+                        crate::error::Error::OwnHistoryBehind
+                    ),
+                });
+            }
         }
         if progress.ready {
             // Discover stale consent from disk a page at a time. A quiet room must finish

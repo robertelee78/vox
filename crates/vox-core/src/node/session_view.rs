@@ -637,11 +637,33 @@ pub fn render(lines: &[Line], details: bool, answer_with: &str) -> String {
             (_, "") | (None, _) => {}
             (Some(Waiting::Approval), r) => s.push_str(&format!(
                 "    waiting: {answer_with} --approve {}, or {answer_with} --reject {}\n",
-                vox_text::shell::arg(r), vox_text::shell::arg(r)
+                vox_text::shell::arg(r),
+                vox_text::shell::arg(r)
             )),
-            (Some(Waiting::Question), r) => s.push_str(&format!(
-                "    waiting: open this Session in Vox to answer question {r}; in the CLI, use the Session command's --answer flag with this reference and each actual question-id=answer value.\n"
-            )),
+            // A question, too, is answered by a command a person can paste (ADR-029 DR-1.5):
+            // the ref whole, then one `QUESTION=ANSWER` pair per question, its text filled in and
+            // the answer left to type. The earlier sentence named the flag and no command, and
+            // a person reading the Session in a terminal had nothing to copy.
+            (Some(Waiting::Question), r) => {
+                let pairs = l
+                    .request
+                    .as_ref()
+                    .map(|q| {
+                        q.questions
+                            .iter()
+                            .map(|(text, _)| {
+                                vox_text::shell::arg(&format!("{text}=ANSWER")).into_owned()
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })
+                    .filter(|pairs| !pairs.is_empty())
+                    .unwrap_or_else(|| vox_text::shell::arg("QUESTION=ANSWER").into_owned());
+                s.push_str(&format!(
+                    "    waiting: {answer_with} --answer {} {pairs}\n",
+                    vox_text::shell::arg(r)
+                ));
+            }
         }
         if details {
             s.push_str(&details_text(l));

@@ -208,6 +208,10 @@ pub struct MessagePage {
     pub messages: Vec<Message>,
     /// Number of earlier visible rows. Continue before the first message's id.
     pub older: u64,
+    /// The room's governance fold was behind what the node has received when this page was
+    /// read (ADR-037 R3): a control entry it holds is not folded yet, so the page may still be
+    /// re-ordered or withdrawn. Shown as provisional, never as final, while true.
+    pub provisional: bool,
 }
 
 /// An incoming app stream, waiting for [`AppListener::accept`].
@@ -522,6 +526,7 @@ impl VoxNode {
             Ok(MessagePage {
                 messages: page.rows.iter().map(message).collect(),
                 older: page.older,
+                provisional: page.provisional,
             })
         })
         .await
@@ -574,6 +579,11 @@ impl VoxNode {
                     let after = delivered.get(&room).copied();
                     match history.arrival_page(room,after,64).await {
                         Ok(page) => {
+                            // A page read while the room's fold is behind is provisional
+                            // (ADR-037 R3): said once per page that is, before its rows.
+                            if page.provisional && !page.rows.is_empty() {
+                                listener.on_notice(format!("room {}: still folding its control entries; the messages shown are provisional", b32_encode(&room)));
+                            }
                             for row in page.rows {
                                 listener.on_message(b32_encode(&room),message(&row));
                                 delivered.insert(room,vox_core::node::api::HistoryCursor {instance:page.instance, arrival:row.arrival});

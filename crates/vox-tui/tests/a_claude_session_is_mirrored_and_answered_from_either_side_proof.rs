@@ -2528,7 +2528,12 @@ fn a_full_room_recovers_and_keeps_its_session_entries() {
 }
 
 fn complete_room_id(w: &World, node: &str, room: &str) -> vox_core::hash::Digest32 {
-    let json = w.staged(node, &["room", "read", room, "--json"], None);
+    // A room message names its complete room id; a room with none yet gets one probe first.
+    let mut json = w.staged(node, &["room", "read", room, "--json"], None);
+    if json.trim().is_empty() {
+        w.staged(node, &["room", "post", room, "room-id probe"], None);
+        json = w.staged(node, &["room", "read", room, "--json"], None);
+    }
     let id = json
         .lines()
         .find_map(|line| {

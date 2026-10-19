@@ -5,46 +5,47 @@
 // Install:
 //   vox agent plugin opencode > ~/.config/opencode/plugin/vox.js
 //
-// This is a shim, not a second implementation. Everything that decides what an
-// agent has not yet read — attaching to the node, resolving the room, the cursor,
+// This is a shim, not a second implementation. Everything that decides what an agent
+// has not yet read — attaching to the node, resolving the room, the cursor,
 // what counts as unread — lives in `vox agent hook`, exactly as it does for Claude
 // Code and Codex. The only thing that differs per harness is the shape of the
 // injected context, and OpenCode's shape is a text part on the user message. So
 // this reads `--format opencode`: the same words Codex takes, with Vox's own notices
 // apart from what the rooms said, so each is labelled as what it is.
 //
-// ## Measured against OpenCode 1.18.31 with a live model, not read from docs
+// ## The 2.x plugin API (measured against OpenCode 2.0.32 with a live model)
 //
-// The plugin API is undocumented and its failure modes are silent: the plugin
-// appears to do nothing, and the turn either answers without the injection or
-// produces no output at all. What is stated here was measured; where something was
-// believed and then disproved, it says so.
+// OpenCode 2.x loads a plugin as `export default {id, setup}` (the Promise plugin
+// API); the 1.x default-function shape with `event`/`shell.env`/`chat.message`
+// hooks is rejected at load ("Plugin must export a default definition with an id
+// and an effect or setup function"). What this port uses:
 //
-//   - **Rewrite an existing text part; never append a new one.** Pushing a part
-//     hangs the turn indefinitely, with and without a completed `time` field, and
-//     prints nothing on either stream. Appending would also need an id beginning
-//     `prt`, or the turn dies with a `SchemaError` surfacing as a nameless
-//     `UnknownError`. Rewriting in place avoids both, and is why no id is minted.
-//   - **Running `vox` through Bun's `$`**, which arrives on the plugin input, is
-//     the API OpenCode provides for this, and it means no child-process module is
-//     imported at all. It is also why `vox agent hook` has a `--session` flag:
-//     with no child process to pipe, there is no stdin to carry the session id on.
-//     (An earlier version of this comment claimed importing `node:child_process`
-//     breaks the turn. **That was wrong** — a control run without the import
-//     failed identically. The real cause was the environment; see below.)
-//   - **OpenCode installs a `node_modules` tree** into both `.opencode/` in the
-//     project and `$XDG_CONFIG_HOME/opencode/` the first time it is used there.
-//     Until that has happened the plugin may load while its hook never fires, so
-//     a brand-new directory can behave differently from a working one.
-//   - **When spawning OpenCode from a test or a tool, clear the environment.** A
-//     spawned OpenCode that inherits `cargo test`'s environment loads this plugin
-//     and **never fires `chat.message`**; run from a shell, in the same directory
-//     with the same arguments and stdin, it works. Passing only `PATH`, `HOME`,
-//     `SHELL`, `LANG`, `TMPDIR` and `USER` fixes it. This does not affect an
-//     operator running `opencode` normally.
-//   - Touching the OpenCode client inside plugin init deadlocks the TUI — reported
-//     by ctm's own plugin, not measured here. This file touches the client only
-//     when a wake arrives, which is always after init.
+//   - **`ctx.session.hook("context")` replaces `chat.message`.** It fires on the
+//     primary model request with mutable `event.messages`; the operator's input is
+//     the last `role: "user"` message, and rewriting its existing text part in
+//     place injects exactly as before. It fires again on a provider retry with the
+//     same messages, so an already-injected part (its text starts with a Vox fence)
+//     is left alone rather than injected twice.
+//   - **The session's identity reaches every shell without any plugin hook.**
+//     OpenCode 2.x core itself exports `OPENCODE_SESSION_ID` into every shell the
+//     model runs (packages/core/src/tool/plugin/shell.ts), which `vox` reads the
+//     way it reads `CLAUDE_CODE_SESSION_ID`; the 1.x `shell.env` hook has no
+//     equivalent and none is needed.
+//   - **`ctx.event.subscribe()` replaces the 1.x `event` hook.** The stream
+//     delivers OpenCode 2.x events — `{type, data}` with the session-scoped
+//     durable events (`session.*`) and the permission events — and this mirrors
+//     them as the Session adapter consumes them, with the lineage resolved from
+//     `session.created`'s `parentID` (with `ctx.session.get` as the fallback)
+//     instead of per-event metadata lookups.
+//   - **Run calls go through the session domain**: `prompt`, `interrupt`,
+//     `update` (rename), `compact`, `command`, and `ctx.permission.reply`. A
+//     method that rejects leaves the outcome unknown, exactly as a timed-out
+//     transport did; it is never retried on that assumption.
+//
+// Earlier 1.x measurements that still apply: rewrite an existing text part, never
+// append one; when spawning OpenCode from a test or a tool, clear the
+// environment; a plugin that throws breaks the turn it rides on, so every path
+// here is deliberately silent except `VOX_PLUGIN_LOG`.
 //
 // ## Client-owned attention (ADR-020 RA7)
 //
@@ -56,7 +57,7 @@
 // busy work is never aborted. An uncertain acknowledgement must not be retried.
 //
 // A wake carries no room message: the normal hook drains authorized room context.
-// The receiver marks the notice's SDK part metadata so it stays Vox-generated text.
+// The receiver marks the notice's message metadata so it stays Vox-generated text.
 //
 // ## How the session's Session is fed and driven (ADR-029 #542, #544)
 //
@@ -229,12 +230,14 @@ const HEADLESS = process.argv.slice(2).find((a) => !String(a).startsWith("-")) =
  */
 const followers = new Map()
 const parents = new Map()
-/** Requests OpenCode asked (permission or question id → the Session it was shown in). */
+/** Requests OpenCode asked (permission id → the Session it was shown in). */
 const asked = new Map()
+/** This turn's attention receipts per session: the exact input the drain stamped. */
+const receiptsBySession = new Map()
 const MAX_ASKED = 1024
+const MAX_RECEIPTS_SESSIONS = 64
 const MAX_MIRROR_BYTES = 4 << 20
 const MAX_MIRROR_EVENTS = 64
-const MAX_MESSAGE_ROLES = 256
 const MAX_PARENTS = 256
 const MAX_SESSION_META = 64 << 10
 const MAX_CONNECTIONS = 64
@@ -243,44 +246,6 @@ const MAX_QUEUED_FRAMES = 64
 const MAX_CONTROL_BYTES = 64 << 10
 const CALL_WITHIN_MS = 30_000
 let mirrorFailure = null
-
-/** SDK transport with a deadline and bounded response, including non-success bodies. */
-async function boundedJson(client, url, limit) {
-  const controller = new AbortController()
-  const deadline = setTimeout(() => controller.abort(), AUTH_IDLE_MS)
-  deadline.unref?.()
-  try {
-    const transport = client._client.getConfig().fetch ?? globalThis.fetch
-    const result = await client._client.request({ method: "GET", parseAs: "stream",
-      responseStyle: "fields", signal: controller.signal, url,
-      fetch: async (request) => {
-        const response = await transport(request)
-        if (!response.ok) {
-          await response.body?.cancel()
-          throw new Error("OpenCode metadata lookup answered " + response.status)
-        }
-        return response
-      },
-    })
-    const reader = result?.data?.getReader?.()
-    if (!reader) throw new Error("OpenCode did not stream its metadata lookup")
-    const body = new Uint8Array(limit)
-    let used = 0
-    try {
-      for (;;) {
-        const { value, done } = await reader.read()
-        if (done) break
-        if (value.byteLength > body.length - used) throw new Error("OpenCode metadata exceeds its byte bound")
-        body.set(value, used)
-        used += value.byteLength
-      }
-      return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(body.subarray(0, used)))
-    } finally {
-      await reader.cancel().catch(() => {})
-      reader.releaseLock()
-    }
-  } finally { clearTimeout(deadline) }
-}
 
 function rememberParent(info) {
   if (typeof info?.id !== "string" || !info.id || info.id.length > 4096
@@ -293,20 +258,28 @@ function rememberParent(info) {
   if (parents.size > MAX_PARENTS) parents.delete(parents.keys().next().value)
 }
 
-async function ownerOf(client, event) {
-  const p = event?.properties ?? {}
-  let sid = p.sessionID ?? p.part?.sessionID ?? p.info?.sessionID ?? p.info?.id
-  if (typeof sid !== "string") return null
-  if ((event.type === "session.created" || event.type === "session.updated") && p.info?.id === sid) {
-    rememberParent(p.info)
+/**
+ * Resolve an event to the root session that owns it, through the lineage. A
+ * `session.created` carries its own `parentID`, so the common path needs no
+ * lookup; a session first met elsewhere is resolved through `ctx.session.get`.
+ */
+async function ownerOf(ctx, event) {
+  let sid = event?.data?.sessionID
+  if (typeof sid !== "string" || !sid) return null
+  if (event.type === "session.created") {
+    rememberParent({ id: sid, parentID: event.data.parentID ?? null })
   }
   const seen = new Set()
   for (let depth = 0; depth < 32; depth += 1) {
     if (seen.has(sid)) throw new Error("OpenCode session lineage contains a cycle")
     seen.add(sid)
     if (!parents.has(sid)) {
-      const info = await boundedJson(client, `/session/${encodeURIComponent(sid)}`, MAX_SESSION_META)
-      if (info?.id !== sid) throw new Error("OpenCode could not resolve exact session lineage")
+      const found = await ctx.session.get({ sessionID: sid })
+      const info = found?.data ?? found
+      if (info?.id !== sid || (info.parentID != null && typeof info.parentID !== "string")) {
+        throw new Error("OpenCode could not resolve exact session lineage")
+      }
+      if (JSON.stringify(info).length > MAX_SESSION_META) throw new Error("OpenCode session metadata exceeds its bound")
       rememberParent(info)
     }
     const parent = parents.get(sid)
@@ -351,51 +324,29 @@ function receiptDescriptors(value, session, input, empty = false) {
   return value
 }
 
-/** Read only the two exact messages. A busy flag or allocated assistant is not consumption. */
-async function attentionStep(client, part, owner) {
-  if (part.sessionID !== owner) return null // Descendant ownership is not this Session.
-  if (!nativeID(part.id) || !nativeID(part.messageID) || !nativeID(part.sessionID)) {
-    throw new Error("OpenCode step has invalid authoritative identifiers")
-  }
-  const exact = async (id) => boundedJson(client,
-    `/session/${encodeURIComponent(part.sessionID)}/message/${encodeURIComponent(id)}`, MAX_MIRROR_BYTES)
-  const parent = await (async () => {
-    const assistant = await exact(part.messageID)
-    const info = assistant?.info
-    if (info?.id !== part.messageID || info.sessionID !== part.sessionID || info.role !== "assistant"
-      || !nativeID(info.parentID) || !Array.isArray(assistant.parts)
-      || assistant.parts.filter((p) => p.id === part.id && p.type === "step-start"
-        && p.messageID === info.id && p.sessionID === info.sessionID).length !== 1) {
-      throw new Error("OpenCode could not resolve the exact running assistant step")
-    }
-    if (info.summary === true || info.mode === "compaction" || info.agent === "compaction") return null
-    return info.parentID
-  })()
-  if (parent === null) return null
-  const input = await exact(parent)
-  if (input?.info?.id !== parent || input.info.sessionID !== part.sessionID
-    || input.info.role !== "user" || !Array.isArray(input.parts)) {
-    throw new Error("OpenCode could not resolve the step's exact parent input")
-  }
-  const receipts = []
-  for (const p of input.parts) {
-    if (!p.metadata || !Object.hasOwn(p.metadata, "vox_attention_receipts")) continue
-    const stamp = p.metadata.vox_attention_receipts
-    if (p.type !== "text" || p.sessionID !== part.sessionID || p.messageID !== parent
-      || !stamp || stamp.session !== part.sessionID || stamp.input !== parent) {
-      throw new Error("OpenCode persisted attention metadata on a different input")
-    }
-    receipts.push(...receiptDescriptors(stamp.receipts, part.sessionID, parent))
-    // Check the aggregate as well as each stamped part before retaining anything further.
-    receiptDescriptors(receipts, part.sessionID, parent)
-  }
-  if (!receipts.length) return null // An ordinary input with no reserved metadata.
-  return { session: part.sessionID, input: parent, assistant: part.messageID, step: part.id, receipts }
-}
+/**
+ * The OpenCode 2.x events this plugin mirrors, with the lineage a `session.created`
+ * already carries. Nothing else is queued: an unused deletion must not resolve an
+ * unrelated session and stop unrelated observations.
+ */
+const MIRRORED = new Set([
+  "session.created", "session.renamed", "session.inbox.delivered", "session.inbox.enqueued",
+  "session.step.started", "session.text.started", "session.text.delta", "session.text.ended",
+  "session.tool.input.started",
+  "session.tool.called", "session.tool.progress", "session.tool.success", "session.tool.failed",
+  "session.idle", "session.status",
+  "permission.asked", "permission.replied",
+])
 
-/** A bounded optimization only. A cache miss is resolved against OpenCode's own message. */
-function mirrorEvents(client) {
-  const messages = new Map()
+/**
+ * A bounded mirror of the events one subscribed Session's adapter consumes. The
+ * 2.x events carry their own authoritative identities (`data.sessionID`,
+ * `data.assistantMessageID`, `data.id`), so the mirror needs no per-event metadata
+ * lookup; the only enrichment is the attention observation attached to a
+ * `session.step.started`, from the receipts this plugin's own drain stamped on
+ * that turn's input.
+ */
+function mirrorEvents(ctx) {
   const queue = []
   let bytes = 0
   let count = 0
@@ -407,41 +358,31 @@ function mirrorEvents(client) {
     const line = JSON.stringify({ type: "mirror-error", error: mirrorFailure }) + "\n"
     for (const writers of followers.values()) for (const write of writers) write(line)
   }
-  const remember = (info) => {
-    if (!info || typeof info.id !== "string" || typeof info.sessionID !== "string"
-      || !["user", "assistant"].includes(info.role)) return null
-    const value = { id: info.id, sessionID: info.sessionID, role: info.role }
-    for (const field of ["agent", "providerID", "modelID"]) {
-      if (typeof info[field] === "string") value[field] = info[field]
+  /**
+   * Attach this turn's attention observation to the step that consumes it. The
+   * receipts were stamped by the drain on the exact input message of this
+   * session's current turn; a step of that session (its own or a sub-agent's, by
+   * the lineage) is the running assistant step of that input.
+   */
+  const enrich = (event, owner) => {
+    if (event.type !== "session.step.started") return event
+    const held = receiptsBySession.get(event.data.sessionID)
+    if (!held || !nativeID(held.input) || !held.receipts.length) return event
+    const digest = inputDigest(event.data.sessionID, held.input)
+    for (const r of held.receipts) {
+      if (r.input.some((v, i) => v !== digest[i])) throw new Error("stamped attention receipt does not match its input")
     }
-    if (Buffer.byteLength(JSON.stringify(value)) > 4096) throw new Error("message metadata exceeds its bound")
-    const key = JSON.stringify([value.sessionID, value.id])
-    messages.delete(key)
-    messages.set(key, value)
-    if (messages.size > MAX_MESSAGE_ROLES) messages.delete(messages.keys().next().value)
-    return value
-  }
-  const enrich = async (event, owner) => {
-    if (event.type === "message.updated") remember(event.properties?.info)
-    if (event.type !== "message.part.updated") return event
-    const part = event.properties?.part
-    if (typeof part?.sessionID !== "string" || typeof part?.messageID !== "string") {
-      throw new Error("a part has no authoritative message identity")
+    const observation = {
+      session: event.data.sessionID,
+      input: held.input,
+      assistant: event.data.assistantMessageID,
+      step: event.data.assistantMessageID,
+      receipts: held.receipts,
     }
-    const key = JSON.stringify([part.sessionID, part.messageID])
-    let info = messages.get(key)
-    if (!info) {
-      const candidate = (await boundedJson(client,
-        `/session/${encodeURIComponent(part.sessionID)}/message/${encodeURIComponent(part.messageID)}`,
-        MAX_MIRROR_BYTES))?.info
-      if (candidate?.id !== part.messageID || candidate?.sessionID !== part.sessionID) {
-        throw new Error("OpenCode could not resolve a part's message")
-      }
-      info = remember(candidate)
-      if (!info) throw new Error("OpenCode supplied no user or assistant role for a part")
+    if (JSON.stringify(observation).length > MAX_MIRROR_BYTES) {
+      throw new Error("an enriched mirror event exceeds its line bound")
     }
-    const attention = part.type === "step-start" ? await attentionStep(client, part, owner) : null
-    return { ...event, properties: { ...event.properties, voxMessage: info, voxAttention: attention } }
+    return { ...event, data: { ...event.data, voxAttention: observation } }
   }
   const drain = async () => {
     if (running) return
@@ -452,18 +393,13 @@ function mirrorEvents(client) {
         try {
           if (!mirrorFailure) {
             const raw = JSON.parse(item.line)
-            const owner = await ownerOf(client, raw)
-            // A title snapshot can wait behind a live rename's metadata lookup. Check
-            // again here, not only when that snapshot's HTTP response first arrives.
+            const owner = await ownerOf(ctx, raw)
             const writers = (item.targets ?? item.followers.get(owner) ?? [])
-              .filter((write) => write.active && (!item.targets || !write.titleUpdated))
+              .filter((write) => write.active)
             if (owner && writers.length) {
-              const event = await enrich(raw, owner)
+              const event = enrich(raw, owner)
               if (Buffer.byteLength(JSON.stringify({ type: "event", event })) + 1 > MAX_MIRROR_BYTES) {
                 throw new Error("an enriched mirror event exceeds its line bound")
-              }
-              if (!item.targets && event.type === "session.updated" && event.properties?.info?.id === owner) {
-                for (const write of writers) write.titleUpdated = true
               }
               fanout(event, owner, writers)
             }
@@ -481,19 +417,9 @@ function mirrorEvents(client) {
     }
   }
   const enqueue = (event, targets = null) => {
-    // Only events consumed by the Session adapter need lineage. In particular, an unused
-    // deletion must not GET an already-deleted session and stop unrelated observations.
-    if (!["message.updated", "message.part.updated", "session.updated", "session.idle",
-      "permission.asked", "permission.replied", "question.asked", "question.replied",
-      "question.rejected"].includes(event?.type)) return Promise.resolve()
+    if (!MIRRORED.has(event?.type)) return Promise.resolve()
     if (mirrorFailure) return Promise.resolve()
     if (!targets && !followers.size) return Promise.resolve()
-    if (!targets && event.type === "session.updated") {
-      const sid = event.properties?.info?.id
-      // Exact subscribed id is already known; mark this before any asynchronous lineage
-      // work, so an older in-flight snapshot cannot overwrite its live rename.
-      for (const write of followers.get(sid) ?? []) write.titleUpdated = true
-    }
     const line = JSON.stringify(event)
     const size = Buffer.byteLength(line)
     // Admission is synchronous. A concurrent hook cannot create an unbounded chain of
@@ -505,8 +431,9 @@ function mirrorEvents(client) {
     count += 1
     bytes += size
     return new Promise((done) => {
-      // Capture recipients now. A later subscriber receives only the title snapshot, not
-      // old part events that happened to be awaiting another session's metadata lookup.
+      // Capture recipients now. A later subscriber receives only what happens after
+      // it subscribes, not old events that happened to be awaiting another
+      // session's lineage resolution.
       queue.push({ line, bytes: size, done, targets,
         followers: targets ? null : new Map([...followers].map(([id, writers]) => [id, [...writers]])) })
       void drain()
@@ -518,14 +445,14 @@ function mirrorEvents(client) {
 }
 
 function fanout(event, owner, writers) {
-  if (event.type === "permission.asked" || event.type === "question.asked") {
-    const id = event.properties?.id
+  if (event.type === "permission.asked") {
+    const id = event.data?.id
     if (typeof id !== "string" || !id || id.length > 4096) throw new Error("OpenCode request identity is missing or too long")
     if (asked.has(id) && asked.get(id) !== owner) throw new Error("OpenCode reused a pending request for another session")
     if (!asked.has(id) && asked.size >= MAX_ASKED) throw new Error("OpenCode has more than 1024 pending requests; observation must restart")
     asked.set(id, owner)
-  } else if (["permission.replied", "question.replied", "question.rejected"].includes(event.type)) {
-    const id = event.properties?.requestID
+  } else if (event.type === "permission.replied") {
+    const id = event.data?.requestID
     if (asked.get(id) === owner) asked.delete(id)
   }
   const line = JSON.stringify({ type: "event", event }) + "\n"
@@ -533,79 +460,68 @@ function fanout(event, owner, writers) {
 }
 
 /**
- * Run one call from `vox daemon` on `session`, through OpenCode's in-process client. The
- * actions are a whitelist; each names the subscribed session or one of its own requests.
+ * Run one call from `vox daemon` on `session`, through OpenCode's own session domain.
+ * The actions are a whitelist; each names the subscribed session or one of its own
+ * requests. A method that rejects or times out leaves the outcome unknown, and the
+ * caller must not assume it is safe to repeat.
  */
-async function runCall(client, session, call) {
-  const raw = client._client
-  const req = async (method, url, body) => {
-    const controller = new AbortController()
-    const deadline = setTimeout(() => controller.abort(), CALL_WITHIN_MS)
-    deadline.unref?.()
-    try {
-      const result = await raw.request({ method, url, body, signal: controller.signal,
-        parseAs: "stream", responseStyle: "fields",
-        fetch: async (request) => {
-          const response = await (raw.getConfig().fetch ?? globalThis.fetch)(request)
-          // Only status is needed. Neither success nor error response bodies are retained.
-          await response.body?.cancel()
-          return new Response(null, { status: response.status, statusText: response.statusText, headers: response.headers })
-        },
-      })
-      return result
-    } catch (error) {
-      const uncertain = new Error(controller.signal.aborted
-        ? "OpenCode control timed out; outcome unknown, do not assume it is safe to repeat"
-        : "OpenCode control outcome unknown: " + String(error?.message ?? error))
-      uncertain.outcomeUnknown = true
-      throw uncertain
-    } finally { clearTimeout(deadline) }
+async function runCall(ctx, session, call) {
+  const uncertain = (why) => {
+    const error = new Error("OpenCode control outcome unknown: " + why)
+    error.outcomeUnknown = true
+    return error
   }
-  switch (call.action) {
-    case "prompt":
-      if (typeof call.text !== "string") throw new Error("a prompt needs text")
-      return req("POST", `/session/${encodeURIComponent(session)}/prompt_async`, {
-        parts: [{ type: "text", text: call.text }],
-      })
-    case "abort":
-      return req("POST", `/session/${encodeURIComponent(session)}/abort`, {})
-    case "rename":
-      if (typeof call.title !== "string" || !call.title.trim()) throw new Error("a rename needs a title")
-      return req("PATCH", `/session/${encodeURIComponent(session)}`, { title: call.title })
-    case "summarize":
-      if (typeof call.providerID !== "string" || typeof call.modelID !== "string") {
-        throw new Error("a compaction needs the session's provider and model")
-      }
-      return req("POST", `/session/${encodeURIComponent(session)}/summarize`, {
-        providerID: call.providerID,
-        modelID: call.modelID,
-      })
-    case "command":
-      if (typeof call.command !== "string" || !/^[A-Za-z0-9_.:-]+$/.test(call.command)) {
-        throw new Error("not a command name")
-      }
-      return req("POST", `/session/${encodeURIComponent(session)}/command`, {
-        command: call.command,
-        arguments: typeof call.arguments === "string" ? call.arguments : "",
-      })
-    case "permission":
-      if (typeof call.request !== "string" || !["once", "reject"].includes(call.reply)) {
-        throw new Error("a permission reply needs its request and once or reject")
-      }
-      if (asked.get(call.request) !== session) throw new Error("not a request of this session")
-      return req("POST", `/permission/${encodeURIComponent(call.request)}/reply`, {
-        reply: call.reply,
-        ...(typeof call.message === "string" ? { message: call.message } : {}),
-      })
-    case "question":
-      if (typeof call.request !== "string" || !Array.isArray(call.answers)) {
-        throw new Error("a question reply needs its request and answers")
-      }
-      if (asked.get(call.request) !== session) throw new Error("not a request of this session")
-      return req("POST", `/question/${encodeURIComponent(call.request)}/reply`, { answers: call.answers })
-    default:
-      throw new Error("unknown action")
-  }
+  let settled = false
+  const deadline = setTimeout(() => { if (!settled) throw uncertain("control timed out") }, CALL_WITHIN_MS)
+  deadline.unref?.()
+  try {
+    let callPromise
+    switch (call.action) {
+      case "prompt":
+        if (typeof call.text !== "string") throw new Error("a prompt needs text")
+        callPromise = ctx.session.prompt({ sessionID: session, text: { text: call.text } })
+        break
+      case "abort":
+        callPromise = ctx.session.interrupt({ sessionID: session })
+        break
+      case "rename":
+        if (typeof call.title !== "string" || !call.title.trim()) throw new Error("a rename needs a title")
+        callPromise = ctx.session.update({ sessionID: session, title: call.title })
+        break
+      case "summarize":
+        callPromise = ctx.session.compact({ sessionID: session })
+        break
+      case "command":
+        if (typeof call.command !== "string" || !/^[A-Za-z0-9_.:-]+$/.test(call.command)) {
+          throw new Error("not a command name")
+        }
+        callPromise = ctx.session.command({
+          sessionID: session,
+          name: { name: call.command, text: typeof call.arguments === "string" ? call.arguments : "" },
+        })
+        break
+      case "permission":
+        if (typeof call.request !== "string" || !["once", "reject"].includes(call.reply)) {
+          throw new Error("a permission reply needs its request and once or reject")
+        }
+        if (asked.get(call.request) !== session) throw new Error("not a request of this session")
+        callPromise = ctx.permission.reply({
+          sessionID: session,
+          requestID: call.request,
+          decision: call.reply,
+          ...(typeof call.message === "string" ? { message: call.message } : {}),
+        })
+        break
+      default:
+        throw new Error("unknown action")
+    }
+    await callPromise
+    settled = true
+    return { ok: true }
+  } catch (error) {
+    if (settled || error?.outcomeUnknown) throw error
+    throw uncertain(String(error?.message ?? error))
+  } finally { clearTimeout(deadline) }
 }
 
 // Discover only this node/directory's private TUI descriptors. A descriptor is not
@@ -678,7 +594,7 @@ async function attentionRoute(session, directory) {
 }
 
 // Existing server socket remains the Session mirror; it cannot admit client attention.
-function wakeChannel(client, mirrorEvent) {
+function wakeChannel(ctx, mirrorEvent) {
   try {
     // `mkdtemp` makes the directory 0700, so only this user can reach the socket;
     // the token keeps every other process of theirs out as well.
@@ -775,13 +691,11 @@ function wakeChannel(client, mirrorEvent) {
           }
           let reply
           try {
-            const res = await runCall(client, following, msg)
-            const status = res?.response?.status ?? 0
-            reply = status >= 200 && status < 300
-              ? { type: "result", id: msg.id, ok: true }
-              : { type: "result", id: msg.id, ok: false, error: "OpenCode answered " + status }
+            await runCall(ctx, following, msg)
+            reply = { type: "result", id: msg.id, ok: true }
           } catch (e) {
-            reply = { type: "result", id: msg.id, ok: false, error: String(e?.message ?? e) }
+            reply = { type: "result", id: msg.id, ok: false, error: String(e?.message ?? e),
+              ...(e?.outcomeUnknown ? { outcomeUnknown: true } : {}) }
           }
           return write(JSON.stringify(reply) + "\n")
         }
@@ -811,10 +725,11 @@ function wakeChannel(client, mirrorEvent) {
             return
           }
           snapshots += 1
-          boundedJson(client, `/session/${encodeURIComponent(followed)}`, MAX_SESSION_META)
-            .then((info) => {
+          Promise.resolve(ctx.session.get({ sessionID: followed }))
+            .then((found) => {
+              const info = found?.data ?? found
               if (info?.id === followed && typeof info.title === "string" && !write.titleUpdated) {
-                const event = { type: "session.updated", properties: { info } }
+                const event = { type: "session.renamed", data: { sessionID: followed, title: info.title } }
                 void mirrorEvent(event, [write])
               }
             })
@@ -883,74 +798,158 @@ function wakeChannel(client, mirrorEvent) {
   }
 }
 
-export default async function vox({ $, client, directory }) {
-  log("plugin loaded (cwd=" + process.cwd() + ")")
-  const mirrorEvent = mirrorEvents(client)
-  const wake = wakeChannel(client, mirrorEvent)
-  return {
-    // Every event of OpenCode's bus, to the connections following its session (#542). The
-    // `event` hook is fed in-process with the full set (permission.asked, question.asked,
-    // message.*, session.*), and runs for every OpenCode, TUI or not.
-    event: async ({ event }) => {
-      try {
-        await mirrorEvent(event)
-      } catch (e) {
-        log("event: threw: " + e)
+/**
+ * Run `vox agent hook` once for this turn. `.nothrow()` semantics: the hook always
+ * exits 0; a missing binary or a failed spawn is still a value, never an exception
+ * thrown into the turn.
+ */
+function runHook(bin, args, env) {
+  return new Promise((resolve) => {
+    let stdout = ""
+    let overflowed = false
+    let child
+    try {
+      child = spawn(bin, args, { env, stdio: ["ignore", "pipe", "pipe"] })
+    } catch (e) {
+      resolve({ exitCode: 127, stdout: "", spawnError: String(e?.message ?? e) })
+      return
+    }
+    const bail = setTimeout(() => { try { child.kill("SIGKILL") } catch {} }, CALL_WITHIN_MS)
+    bail.unref?.()
+    child.stdout?.on("data", (chunk) => {
+      stdout += chunk
+      if (Buffer.byteLength(stdout) > MAX_MIRROR_BYTES) {
+        overflowed = true
+        try { child.kill("SIGKILL") } catch {}
       }
-    },
-    // **Name the session to every shell this session runs** (ADR-021 §4, §7).
-    // Claude Code and Codex put their session id in every tool's environment
-    // (`CLAUDE_CODE_SESSION_ID`, `CODEX_THREAD_ID`); OpenCode does not. So without
-    // this, `vox room claim` run by the model could not say which session owns the
-    // work, and this plugin's drain — which passes the same `sessionID` as
-    // `--session` — could not recognise that session's own posts.
-    //
-    // Measured against OpenCode 1.18.32: its shell tool triggers `shell.env` with
-    // `{ cwd, sessionID, callID }` and merges `output.env` into the child's
-    // environment.
-    "shell.env": async (input, output) => {
+    })
+    child.stderr?.on("data", () => {})
+    const finish = (code) => {
+      clearTimeout(bail)
+      resolve({ exitCode: code, stdout: overflowed ? "" : stdout })
+    }
+    child.once("error", (e) => finish(127))
+    child.once("close", (code) => finish(code ?? -1))
+  })
+}
+
+export default {
+  id: "vox",
+  setup: async (ctx) => {
+    log("plugin loaded (cwd=" + process.cwd() + ")")
+    const mirrorEvent = mirrorEvents(ctx)
+    const wake = await wakeChannel(ctx, mirrorEvent)
+
+    // **Name the session to every shell this session runs** (ADR-021 §4, §7). OpenCode 2.x
+    // core itself exports `OPENCODE_SESSION_ID` into every shell the model runs, which `vox`
+    // reads the way it reads Claude Code's and Codex's session variables; the 1.x
+    // `shell.env` hook (which carried the session on every call) has no direct equivalent.
+    // The node's own identity (`VOX_NODE`) and the harness mark reach the shell the 1.x way
+    // through the `create.before` hook: the shell tool's execution is already in flight —
+    // `tool.execute.before` carried its exact `sessionID` and `command` — so the invocation
+    // whose `command` matches exactly one in-flight shell execution is that session's
+    // shell. Nothing matching, or two sessions running the same command at once, sets
+    // nothing: an ambiguous shell is left to OpenCode alone rather than named for a guess.
+    const inFlight = new Map()
+    const MAX_IN_FLIGHT = 256
+    await ctx.tool.hook("execute.before", (event) => {
       try {
-        if (input?.sessionID && output?.env) {
-          // shell.env is merged over the server's inherited environment. Empty
-          // overrides remove a parent harness's identity from this tool's sender
-          // selection; deleting output keys would leave the inherited IDs intact.
-          output.env.CODEX_THREAD_ID = ""
-          output.env.CLAUDE_CODE_SESSION_ID = ""
-          output.env.VOX_SESSION = input.sessionID
-          output.env.VOX_HARNESS = "opencode"
-          output.env.VOX_NODE = VOX_NODE
-          log("shell.env: VOX_SESSION=" + input.sessionID + " VOX_NODE=" + VOX_NODE)
+        if (event?.tool !== "shell") return
+        if (typeof event?.id !== "string" || typeof event?.sessionID !== "string") return
+        if (inFlight.size >= MAX_IN_FLIGHT) inFlight.delete(inFlight.keys().next().value)
+        inFlight.set(event.id, { sessionID: event.sessionID, command: event?.input?.command })
+      } catch (e) {
+        log("tool execute.before: threw: " + e)
+      }
+    })
+    await ctx.tool.hook("execute.after", (event) => {
+      try { inFlight.delete(event?.id) } catch (e) { log("tool execute.after: threw: " + e) }
+    })
+    await ctx.shell.hook("create.before", (event) => {
+      try {
+        if (typeof event?.command !== "string" || !event?.env) return
+        const matching = [...inFlight.values()].filter(
+          (flown) => typeof flown?.command === "string" && flown.command === event.command,
+        )
+        if (matching.length !== 1) return
+        const sessionID = matching[0].sessionID
+        // The env is merged over the server's inherited environment, as the 1.x
+        // `shell.env` output was. Empty overrides remove a parent harness's identity
+        // from this tool's sender selection; deleting keys would leave inherited IDs.
+        event.env.CODEX_THREAD_ID = ""
+        event.env.CLAUDE_CODE_SESSION_ID = ""
+        event.env.VOX_SESSION = sessionID
+        event.env.VOX_HARNESS = "opencode"
+        event.env.VOX_NODE = VOX_NODE
+        log("shell create.before: VOX_SESSION=" + sessionID + " VOX_NODE=" + VOX_NODE)
+      } catch (e) {
+        log("shell create.before: threw: " + e)
+      }
+    })
+
+    // The exact input message of a session's current turn, as OpenCode named it at
+    // delivery. The context hook's messages carry it when the provider format maps the
+    // session message ids; this remembers it either way so the attention receipts are
+    // stamped on the exact input identity.
+    const lastPrompt = new Map()
+    await ctx.session.hook("prompt", (event) => {
+      if (typeof event?.sessionID !== "string" || typeof event?.messageID !== "string") return
+      if (lastPrompt.size >= MAX_RECEIPTS_SESSIONS && !lastPrompt.has(event.sessionID)) {
+        lastPrompt.delete(lastPrompt.keys().next().value)
+      }
+      lastPrompt.set(event.sessionID, event.messageID)
+    })
+
+    // Every event of OpenCode's bus that the Session adapter consumes, to the
+    // connections following its session (#542). The stream delivers the session-scoped
+    // durable events and the permission events, and runs for every OpenCode, TUI or not.
+    const stopped = new AbortController()
+    const pump = (async () => {
+      try {
+        for await (const event of ctx.event.subscribe({ signal: stopped.signal })) {
+          try {
+            await mirrorEvent(event)
+          } catch (e) {
+            log("event: threw: " + e)
+          }
         }
       } catch (e) {
-        log("shell.env: threw: " + e)
+        if (!stopped.signal.aborted) log("event stream ended: " + e)
       }
-    },
-    "chat.message": async (input, output) => {
+    })()
+
+    const context = await ctx.session.hook("context", async (event) => {
       try {
-        const sessionID = output.message?.sessionID
-        const inputID = output.message?.id
-        inputDigest(sessionID, inputID)
-        if (input.sessionID && input.sessionID !== sessionID) throw new Error("OpenCode input Session changed")
+        const sessionID = event?.sessionID
+        if (typeof sessionID !== "string" || !sessionID) return
+        const messages = Array.isArray(event?.messages) ? event.messages : []
+        let message = null
+        for (let i = messages.length - 1; i >= 0; i -= 1) {
+          if (messages[i]?.role === "user") { message = messages[i]; break }
+        }
+        if (!message) return
+        const parts = Array.isArray(message.content) ? message.content : []
+        const typed = parts.find((p) => p?.type === "text" && typeof p.text === "string")
+        if (!typed) {
+          log("context: no text part to inject into")
+          return
+        }
+        const inputID = nativeID(message.id) ? message.id : lastPrompt.get(sessionID) ?? null
         const bin = process.env.VOX_BIN || "vox"
 
         // Whether this message is a wake notice Vox relayed, not something the operator typed:
-        // its text is one this session was relayed and has not had a turn on yet.
-        const typed = output.parts.find((p) => p.type === "text" && typeof p.text === "string")
-        const origin = typed?.metadata?.vox_attention
-        // This SDK part metadata is supplied by our actual TUI receiver. Room text
-        // and operator typing cannot synthesize a part's metadata. It labels source;
-        // it grants no room/drive permission and is not an admission credential.
-        const isWake = typed?.synthetic === true && origin?.source === "vox"
+        // its metadata is one this session was relayed and has not had a turn on yet. It is
+        // supplied by our actual TUI receiver; room text and operator typing cannot
+        // synthesize it. It labels source; it grants no room/drive permission and is not an
+        // admission credential.
+        const origin = message.metadata?.vox_attention ?? typed.metadata?.vox_attention
+        const isWake = origin?.source === "vox"
           && /^[0-9a-f]{64}$/.test(origin.client ?? "")
           && /^[0-9a-f]{64}$/.test(origin.route ?? "") && /^[0-9a-f]{32}$/.test(origin.id ?? "")
 
-        // `.quiet()` keeps the child's output out of OpenCode's, `.nothrow()`
-        // makes a non-zero exit a value rather than an exception — `vox agent
-        // hook` always exits 0, but a missing binary would otherwise throw.
-        //
         // The wake channel goes to the hook alone, in its environment: the hook
         // registers it, so `vox daemon` can interrupt this session (see above).
-        const env = { ...process.env, VOX_SESSION: sessionID, VOX_HARNESS: "opencode", VOX_OPENCODE_INPUT_ID: inputID }
+        const env = { ...process.env, VOX_SESSION: sessionID, VOX_HARNESS: "opencode" }
         // This hook belongs to the actual OpenCode Session, even when its server
         // was started by another harness. Neither that parent's ID nor socket is ours.
         for (const key of ["CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_ENTRYPOINT",
@@ -959,7 +958,7 @@ export default async function vox({ $, client, directory }) {
         delete env.VOX_OPENCODE_ATTENTION_SOCKET
         delete env.VOX_OPENCODE_ATTENTION_TOKEN
         delete env.VOX_OPENCODE_ATTENTION_ROUTE
-        const attention = HEADLESS ? null : await attentionRoute(sessionID, directory ?? process.cwd())
+        const attention = HEADLESS ? null : await attentionRoute(sessionID, ctx.location?.directory ?? process.cwd())
         if (attention) {
           env.VOX_OPENCODE_ATTENTION_SOCKET = attention.socket
           env.VOX_OPENCODE_ATTENTION_TOKEN = attention.token
@@ -970,16 +969,16 @@ export default async function vox({ $, client, directory }) {
           env.VOX_OPENCODE_WAKE_TOKEN = wake.token
           env.VOX_OPENCODE_MIRROR_SOCKET = wake.mirrorPath
         }
+        if (inputID) env.VOX_OPENCODE_INPUT_ID = inputID
 
-        const result =
-          await $`${bin} agent hook --node ${VOX_NODE} --format opencode --session ${sessionID}`
-            .env(env)
-            .quiet()
-            .nothrow()
+        const result = await runHook(bin, ["agent", "hook", "--node", VOX_NODE,
+          "--format", "opencode", "--session", sessionID], env)
         let out, receipts
         try {
           out = drained(result.stdout.toString())
-          receipts = receiptDescriptors(out.attention_receipts, sessionID, inputID, true)
+          receipts = inputID
+            ? receiptDescriptors(out.attention_receipts, sessionID, inputID, true)
+            : []
         } catch {
           // Never echo stdout or parser excerpts: they can contain private receipt tickets.
           mirrorEvent.fail("Vox hook returned invalid context or receipt output; no context was injected")
@@ -995,7 +994,18 @@ export default async function vox({ $, client, directory }) {
         // A quiet room injects nothing at all — not "no new messages". A quiet
         // room should cost zero tokens per turn.
         if (!out.vox.trim() && !out.room.trim()) {
-          log("chat.message: nothing to inject")
+          log("context: nothing to inject")
+          if (receipts.length && inputID) {
+            receiptsBySession.set(sessionID, { input: inputID, receipts })
+          }
+          return
+        }
+
+        // **A retried model request re-fires this hook with the same messages**: an
+        // already-injected part (its text starts with a Vox fence) is left as it is,
+        // so a retry never stacks a second copy of the block.
+        if (/^<vox-(?:room|notice)-[0-9a-f]{16}>\n/.test(typed.text)) {
+          log("context: already injected; a retry leaves the one block in place")
           return
         }
 
@@ -1029,21 +1039,24 @@ export default async function vox({ $, client, directory }) {
             `\n</vox-room-${nonce}>\n\n`
           : ""
         const block = notice + room + after
-        for (const part of output.parts) {
-          if (part.type === "text" && typeof part.text === "string") {
-            part.text = block + part.text
-            if (receipts.length) {
-              part.metadata = { ...part.metadata, vox_attention_receipts: { session: sessionID, input: inputID, receipts } }
-            }
-            log("chat.message: injected " + block.length + " chars")
-            return
-          }
+        typed.text = block + typed.text
+        if (receipts.length && inputID) {
+          typed.metadata = { ...typed.metadata, vox_attention_receipts: { session: sessionID, input: inputID, receipts } }
+          receiptsBySession.set(sessionID, { input: inputID, receipts })
+          if (receiptsBySession.size > MAX_RECEIPTS_SESSIONS) receiptsBySession.delete(receiptsBySession.keys().next().value)
         }
-        log("chat.message: no text part to inject into")
+        log("context: injected " + block.length + " chars")
       } catch (e) {
         // Injecting nothing is always better than failing the turn.
-        log("chat.message: threw: " + e)
+        log("context: threw: " + e)
       }
-    },
-  }
+    })
+
+    return async () => {
+      stopped.abort()
+      try { await pump } catch {}
+      try { await context?.dispose() } catch {}
+      wake?.close?.()
+    }
+  },
 }
