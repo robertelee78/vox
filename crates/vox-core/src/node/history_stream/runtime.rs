@@ -50,6 +50,9 @@ enum Operation {
 const LOCAL_TURN_BUDGET: std::time::Duration = std::time::Duration::from_millis(20);
 /// How many local slices one turn runs at most.
 const LOCAL_SLICES_PER_TURN: u32 = 64;
+/// The body bytes one explicit history quantum fetches at most; past it the request pauses and
+/// `vox room read --history resume` asks for the rest.
+const ARCHIVE_QUANTUM_BYTES: u64 = 1024 * 1024;
 #[derive(Clone)]
 struct Task {
     request: RequestId,
@@ -152,7 +155,8 @@ pub(crate) struct Flow {
     live: Option<Staging>,
     control: Option<Staging>,
     history: Option<Staging>,
-    archive_wire_used: bool,
+    /// Body bytes this explicit history quantum has fetched so far (ADR-036: one bounded ask).
+    archive_wire_bytes: u64,
     archive_next: Option<u64>,
     pub(crate) request_fence: Option<Arc<Fence>>,
     initialized: bool,
@@ -235,7 +239,7 @@ impl Flow {
             live: None,
             control: None,
             history: None,
-            archive_wire_used: false,
+            archive_wire_bytes: 0,
             archive_next: None,
             request_fence: None,
             initialized: false,
@@ -350,7 +354,7 @@ impl Flow {
             live: None,
             control: None,
             history: Some(staging),
-            archive_wire_used: false,
+            archive_wire_bytes: 0,
             archive_next: None,
             request_fence: Some(fence),
             initialized: true,
@@ -1115,7 +1119,10 @@ impl Flow {
             }
             Operation::Wire(mut query) => {
                 let body = matches!(query, Query::Entry { .. } | Query::Page { .. });
-                if task.purpose == Purpose::History && body && self.archive_wire_used {
+                if task.purpose == Purpose::History
+                    && body
+                    && self.archive_wire_bytes >= ARCHIVE_QUANTUM_BYTES
+                {
                     self.finish_archive(job).await?;
                     self.tasks.clear();
                     return Ok(());
@@ -1154,9 +1161,6 @@ impl Flow {
                 } else {
                     task.request
                 };
-                if task.purpose == Purpose::History && body {
-                    self.archive_wire_used = true;
-                }
                 let result = super::exchange(
                     &receiver,
                     conn,
@@ -1383,6 +1387,7 @@ impl Flow {
                         .ok_or(Error::Profile("archive state missing"))?;
                     if let Some(body) = &state.state().body {
                         self.archive_next = body.seq.checked_add(1);
+                        self.archive_wire_bytes = self.archive_wire_bytes.saturating_add(body.length);
                         self.push(Task {
                             request: wire_request,
                             purpose: Purpose::History,
@@ -1575,7 +1580,10 @@ impl Flow {
             Operation::Reclaim(purpose) => {
                 if !self.reclaim_stage(purpose, job, false).await? {
                     self.push(task)?;
-                } else if self.archive && self.tasks.is_empty() {
+                } else if self.archive
+                    && self.tasks.is_empty()
+                    && !self.archive_continue(job).await?
+                {
                     self.finish_archive(job).await?;
                 }
             }
@@ -1738,6 +1746,53 @@ impl Flow {
         }
         Ok(complete)
     }
+    /// After a body of an explicit history quantum is applied: the next page of the same bounded
+    /// interval, while entries remain and the quantum's byte budget does. A page response is
+    /// consumed up to its first complete body (one body slot), so one ask fetches its page body
+    /// by body. Returns whether a page was pushed. Measured before this: `vox room read
+    /// --history older` delivered one body and paused, and the newcomer proof's page below the
+    /// live window never arrived.
+    async fn archive_continue(&mut self, job: &Job) -> Result<bool> {
+        let Some(staging) = self.history.clone() else {
+            return Ok(false);
+        };
+        let Some(next) = self.archive_next else {
+            return Ok(false);
+        };
+        if self.archive_wire_bytes >= ARCHIVE_QUANTUM_BYTES {
+            return Ok(false);
+        }
+        let snapshot = inspect(&staging.context, job)
+            .await?
+            .ok_or(Error::Profile("archive state missing"))?;
+        let state = snapshot.state();
+        if state.body.is_some()
+            || state.reclaiming()
+            || state.remaining == 0
+            || next > state.bounds.hi
+        {
+            return Ok(false);
+        }
+        let request = staging
+            .active
+            .lock()
+            .map(|active| active.request())
+            .map_err(|_| Error::Profile("history activation lock failed"))?;
+        let query = Query::Page {
+            head: state.bounds.head,
+            lo: next,
+            hi: state.bounds.hi,
+            entries: state.remaining,
+            wire_bytes: 1024 * 1024,
+        };
+        self.push(Task {
+            request,
+            purpose: Purpose::History,
+            operation: Operation::Wire(query),
+        })?;
+        Ok(true)
+    }
+
     async fn finish_archive(&mut self, job: &Job) -> Result<()> {
         let Some(staging) = self.history.clone() else {
             return Ok(());

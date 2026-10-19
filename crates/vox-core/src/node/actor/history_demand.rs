@@ -1098,16 +1098,22 @@ fn prepare(
             state.remaining,
         )
     } else {
-        if let Some(saved) = saved.as_ref() {
-            if !matches!(
-                saved.state().progress(None),
-                demand::Progress::Complete | demand::Progress::Cancelled
-            ) || saved.state().reclaiming()
-            {
-                answer.status.detail =
-                    "A saved request exists. Resume or cancel it explicitly.".into();
-                return Ok(answer);
-            }
+        // An explicit new ask is the person's newer intent: it ends a paused earlier quantum
+        // instead of being turned away by it; `--history resume` continues one on purpose.
+        // Measured before this: a newcomer paging back was told "A saved request exists" for
+        // 60 s after one quantum paused, and the page below his window never came.
+        let paused = saved
+            .as_ref()
+            .map(|previous| previous.state())
+            .filter(|state| {
+                !matches!(
+                    state.progress(None),
+                    demand::Progress::Complete | demand::Progress::Cancelled
+                ) || state.reclaiming()
+            })
+            .map(|state| state.request);
+        if let Some(request) = paused {
+            cancel_exact(&context, request, job, &fence, deadline)?;
         }
         let selected = select(room, store, action, &fence, deadline, selection_after)
             .map_err(|e| e.to_string())?;
