@@ -5,6 +5,9 @@ use std::time::{Duration, Instant};
 
 use super::session_projection::{floor_index, private_index};
 use super::*;
+
+/// Activity for a Session this node has not opened yet: it waits, queued, for the opening.
+pub(crate) const SESSION_NOT_OPEN: &str = "the Session is not open yet; its activity waits for it";
 use crate::node::sessionstream::{
     Ask, Cursor, Locator, Page, Query as PrivateQuery, Record, MAX_PAGE, MAX_RECORD, PAGE_OVERHEAD,
     PAGE_RECORDS,
@@ -1903,6 +1906,36 @@ impl ChannelState {
         }
         if self.has_left(&self.me()) || self.ended(now).is_some() {
             return Err(Error::Profile("this room has ended or was left"));
+        }
+        // A Session's opening record precedes its activity in this node's drive chain (ADR-029
+        // SE-1). A reader takes the chain in order and cannot place activity whose Session it
+        // has not seen, so activity sealed first stalled every reader on that record for good:
+        // the hook's opening was turned away while the room refreshed and retried, its activity
+        // was queued at once, and a member with drive never read the Session. Hook activity
+        // (the queue's, with its completion) stays queued and is sealed once the opening is this
+        // node's own fact; a direct append names its Session itself and is not queued.
+        if completion.is_some()
+            && attention_after.is_none()
+            && !crate::node::sessions::is_record(&content.body)
+            && !crate::node::drive::is_key_changed(&content.session_id)
+        {
+            use super::session_projection::{Query, Reply};
+            let me = self.me();
+            let open = matches!(
+                self.session_query(
+                    profile.store(),
+                    Query::Lookup {
+                        node: me,
+                        id: content.session_id.clone(),
+                    },
+                    1,
+                    now,
+                ),
+                Ok(Reply::Lookup(Some(_)))
+            );
+            if !open {
+                return Err(Error::StreamRefused(SESSION_NOT_OPEN));
+            }
         }
         if self
             .drive

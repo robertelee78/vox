@@ -104,16 +104,59 @@ pub async fn show(
     } else {
         vox_core::node::drive::SessionFilter::Session(named.clone())
     };
-    let (rows, older, instance) = match client.session_page(channel_id, which, before).await {
-        Ok(Frame::SessionPage {
-            rows,
-            older,
-            instance,
-        }) => (rows, older, instance),
-        Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
-        Ok(other) => return Err(crate::client::unexpected(&other)),
-        Err(e) => return Err(AppError::Usage(e.to_string())),
-    };
+    let (mut rows, mut older, instance) =
+        match client.session_page(channel_id, which.clone(), before).await {
+            Ok(Frame::SessionPage {
+                rows,
+                older,
+                instance,
+            }) => (rows, older, instance),
+            Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
+            Ok(other) => return Err(crate::client::unexpected(&other)),
+            Err(e) => return Err(AppError::Usage(e.to_string())),
+        };
+    // One read shows the whole current turn (ADR-029 CL-2). A page is bounded by the IPC
+    // frame, so a turn with one large tool output ran past it and the prompt and the call that
+    // made the output fell off the page a person reads first ("2 older entries not shown").
+    // The older pages are followed until the turn's prompt is in hand or the Session's start,
+    // a bounded number of pages back; an explicit --before pages by hand, as before.
+    if before.is_none() && !raw {
+        const TURN_PAGES: usize = 8;
+        let has_prompt = |rows: &[_]| {
+            rows.iter().any(|r: &vox_core::node::drive::SessionRow| {
+                serde_json::from_str::<Value>(&r.body)
+                    .is_ok_and(|v| v.get("kind").and_then(Value::as_str) == Some("user"))
+            })
+        };
+        let mut followed = 0;
+        while older > 0 && followed < TURN_PAGES && !has_prompt(&rows) {
+            let Some(first) = rows.first().map(|r| r.entry_hash) else {
+                break;
+            };
+            match client
+                .session_page(channel_id, which.clone(), Some(first))
+                .await
+            {
+                Ok(Frame::SessionPage {
+                    rows: earlier,
+                    older: left,
+                    instance: same,
+                }) => {
+                    if earlier.is_empty() || same != instance {
+                        break;
+                    }
+                    older = left;
+                    let mut all = earlier;
+                    all.extend(rows);
+                    rows = all;
+                }
+                Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
+                Ok(other) => return Err(crate::client::unexpected(&other)),
+                Err(e) => return Err(AppError::Usage(e.to_string())),
+            }
+            followed += 1;
+        }
+    }
     let first = rows
         .first()
         .map(|r| vox_core::node::link::b32_encode(&r.entry_hash));

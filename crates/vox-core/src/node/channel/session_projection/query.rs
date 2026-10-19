@@ -758,13 +758,25 @@ impl ChannelState {
                     if let Some(previous) = &previous {
                         check(previous)?;
                     }
+                    // Every member's Sessions are listed, those this node cannot open among
+                    // them: a member without drive sees a Session's entry and is offered no
+                    // driving action on it (ADR-029 CL-3), and `can_drive` says which. Listing
+                    // only the authors whose drive key this node holds made a Session vanish
+                    // from the list the moment its node took drive back, instead of saying
+                    // `can_drive: false`; the walk stays one sealed path per member per row.
+                    let listed: Vec<Digest32> = self
+                        .authors
+                        .keys()
+                        .copied()
+                        .filter(|member| !self.has_left(member))
+                        .collect();
                     let mut cursor = match after {
                         None => 0,
                         Some(hash) => {
                             let id = read
                                 .find(Tree::OpeningHash, &hash_key(&hash))?
                                 .ok_or(Failure::Request("cursor not among this room's Sessions"))?;
-                            if !authors.contains(&descriptor(&read, id)?.node) {
+                            if !listed.contains(&descriptor(&read, id)?.node) {
                                 return Err(Failure::Request(CHANGED));
                             }
                             id
@@ -772,7 +784,7 @@ impl ChannelState {
                     };
                     let mut rows = Vec::new();
                     let mut bytes = 0u64;
-                    let mut candidate = next(&read, &authors, cursor, open_only)?;
+                    let mut candidate = next(&read, &listed, cursor, open_only)?;
                     while let Some((id, row)) = candidate {
                         let cost = 256u64
                             .saturating_add(row.name.map_or(0, |f| f.bytes))
@@ -791,7 +803,7 @@ impl ChannelState {
                         bytes = bytes.saturating_add(cost);
                         cursor = id;
                         rows.push(Row::from(row));
-                        candidate = next(&read, &authors, cursor, open_only)?;
+                        candidate = next(&read, &listed, cursor, open_only)?;
                     }
                     Ok(Reply::Page {
                         rows,

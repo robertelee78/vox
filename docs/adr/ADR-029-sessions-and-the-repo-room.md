@@ -45,6 +45,12 @@ relies on is ADR-028 K-14.
   that same durable obligation; its deadline MUST NOT turn transient readiness into abandonment.
   A permanent detached opening failure MUST be logged and told to that Session on its next hook
   before a new attempt starts.
+  A Session's opening record MUST precede its activity in the author's drive chain. Activity that
+  arrives while the opening is still being retried MUST stay queued and be sealed only once the
+  opening is the author's own fact: a reader takes the chain in order and cannot place activity
+  whose Session it has not seen, so activity sealed first stalled every reader with drive on that
+  record for good (measured 2026-10-19: the reader asked for the same page 71 times in 120 s and
+  never listed the Session).
 - **SE-2.** A Session's identity MUST be the harness's own session id (Claude Code's
   `session_id`, Codex's thread id, OpenCode's `ses_…` id); Vox MUST NOT mint one. A sub-agent's
   activity MUST belong to its parent's Session, never a Session of its own: each of its entries
@@ -103,7 +109,12 @@ relies on is ADR-028 K-14.
 ### 3. Driving a Session
 
 - **DR-1.** A member the session's node trusts with drive MUST be able, from the TUI and the app:
-  1. to read the Session (SC-1), with Details;
+  1. to read the Session (SC-1), with Details. One read MUST show the whole current turn, from
+     its prompt to its end, whatever the size of a tool output in it: a page is bounded by the
+     IPC frame, and the reader follows older pages until the turn's prompt is in hand (a bounded
+     number of pages); what lies before the turn is what it counts as older. Measured
+     2026-10-19: one 216 KB tool output pushed a turn's prompt and the call that made it off the
+     page a person read first, on v0.4.5 as well;
   2. to type into the session as its operator;
   3. to interrupt it (Esc) and to stop it (Ctrl-C);
   4. to approve or reject its tool calls;
@@ -248,7 +259,10 @@ me specify one if not".)
   drive, a Session waiting on it (an approval or a question pending) MUST count under **needs you**
   (ADR-028 W-2 as amended).
 - **CL-3.** A member without drive MUST see a Session's entry (SC-3) and MUST NOT be offered any
-  driving action on it.
+  driving action on it. A room's Session listing therefore names every member's Sessions, and
+  each row's `can_drive` says whether this node holds that member's drive key; listing only the
+  members whose key it held made a Session vanish from the list the moment its node took drive
+  back, instead of saying `can_drive: false` (measured 2026-10-19, on v0.4.5 as well).
 
 ## Superseded and amended lines
 

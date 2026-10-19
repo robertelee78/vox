@@ -4499,7 +4499,7 @@ impl SessionHolds {
             });
             loss.count += 1;
             loss.last = named;
-            eprintln!("vox daemon: {}: session {}: lost {} held entries, from {} through {}; its bounded hold filled (4 MiB including allocations, or 4096 items) while {}", key.0, key.1, loss.count, loss.first, loss.last, loss.why);
+            eprintln!("vox daemon: {}: session {}: lost {} held entries, from {} through {}; its bounded 4 MiB hold filled (including allocations, or 4096 items) while {}", key.0, key.1, loss.count, loss.first, loss.last, loss.why);
         }
         held.items.shrink_to_fit();
         SessionAdmission::Held(why)

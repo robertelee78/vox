@@ -258,6 +258,9 @@ because the one foreground lane went back to the same flow every round, the node
 never got a round: a post made while the fold was held reached no one in 30 s. Waiting on the
 fold is a local wait, not a body slot held against a busy peer, so it MUST NOT count toward
 retiring the flow's body slot.
+The lane's queue is fair as well: a port whose turn found the lane taken keeps its place ahead
+of the ports that become eligible after it, so the port sorted first cannot retake the lane
+round after round while its flow waits.
 
 ### R12. A late entry re-arms the fold, and the fold re-settles at its own cost
 

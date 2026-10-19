@@ -14465,6 +14465,7 @@ impl Node {
             self.reach_for_sync(&room, peer);
         }
         let mut ran = false;
+        let mut unstarted: Vec<(Digest32, Digest32)> = Vec::new();
         loop {
             let slots = Arc::clone(&self.slots);
             let Some((room, peer)) = self
@@ -14482,6 +14483,21 @@ impl Node {
             }
             if self.start_outbound(room, peer).await {
                 ran = true;
+            } else {
+                unstarted.push((room, peer));
+            }
+        }
+        // A port whose turn found the one foreground lane taken keeps its place, ahead of the
+        // ports that become eligible after it. Re-queueing every eligible port in id order at
+        // the next evaluation let the port sorted first retake the lane round after round: a
+        // peer's flow waiting on a held fold ran 77 rounds a second and the node's other peer
+        // never got one, so a post made while the fold was held reached no one (ADR-037 R11).
+        for (room, peer) in unstarted {
+            if let Some(port) = self.ports.get_mut(&(room, peer)) {
+                if port.out.is_none() && !port.queued {
+                    port.queued = true;
+                    self.port_queue.push(room, peer);
+                }
             }
         }
         for key in newly_queued {

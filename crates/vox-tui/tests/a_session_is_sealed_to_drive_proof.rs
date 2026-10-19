@@ -1473,13 +1473,17 @@ fn private_wire_refused(member: &mut Member, holders: &[&Member], room: [u8; 32]
                 let (mut send, mut recv) = open_typed(&connection, StreamKind::Session)
                     .await
                     .expect("APPARATUS: private wire peer opens stream");
+                // The private Session ask, version 2: the room, its epoch, the donor cursor and
+                // the query, here the live tail (`sessionstream::read_ask`).
                 let mut e = Encoder::new();
-                e.array(5)
-                    .uint(1)
+                e.array(6)
+                    .uint(2)
                     .bytes(&room)
                     .uint(0)
                     .bytes(&incarnation)
-                    .uint(after);
+                    .uint(after)
+                    .array(1)
+                    .uint(0);
                 write_frame(&mut send, &e.finish())
                     .await
                     .expect("APPARATUS: private wire peer asks");
@@ -1490,15 +1494,17 @@ fn private_wire_refused(member: &mut Member, holders: &[&Member], room: [u8; 32]
                     .expect("PRODUCT: member's private Session page exchange failed")
                     .expect("PRODUCT: member received no private Session response")
             });
+            // The answer, version 2: cursor, more, the records each with its position, and the
+            // locator hints (`sessionstream::answer`).
             let mut d = Decoder::new(&bytes);
             assert_eq!(
                 d.array().expect("PRODUCT: private Session page array"),
-                5,
+                6,
                 "PRODUCT: malformed private Session page"
             );
             assert_eq!(
                 d.uint().expect("PRODUCT: private Session page integer"),
-                1,
+                2,
                 "PRODUCT: wrong private Session page version"
             );
             incarnation = d
@@ -1510,10 +1516,26 @@ fn private_wire_refused(member: &mut Member, holders: &[&Member], room: [u8; 32]
             let more = d.uint().expect("PRODUCT: private Session page integer");
             let records = d.array().expect("PRODUCT: private Session page array");
             for _ in 0..records {
+                assert_eq!(
+                    d.array().expect("PRODUCT: private Session record pair"),
+                    2,
+                    "PRODUCT: malformed private Session record pair"
+                );
+                let _position = d.uint().expect("PRODUCT: private Session record position");
                 let wire = d.bytes().expect("PRODUCT: private Session record bytes");
                 let hash = vox_core::hash::sha256(wire);
                 assert!(allowed.contains(&hash),
                     "PRODUCT: {name} served earlier step ciphertext or an unreported lifecycle record to {} outside its current grant", member.name);
+            }
+            let hints = d.array().expect("PRODUCT: private Session hint array");
+            for _ in 0..hints {
+                assert_eq!(
+                    d.array().expect("PRODUCT: private Session hint pair"),
+                    2,
+                    "PRODUCT: malformed private Session hint"
+                );
+                let _ = d.uint().expect("PRODUCT: private Session hint position");
+                let _ = d.bytes().expect("PRODUCT: private Session hint hash");
             }
             d.finish()
                 .expect("PRODUCT: extra bytes in private Session page");
