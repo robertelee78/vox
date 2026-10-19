@@ -9864,6 +9864,11 @@ impl Node {
                 holds_room,
             } => {
                 self.publishing.remove(&(channel_id, board));
+                // A port to this board's peer is ineligible while a publish round to it runs (its
+                // records must reach the board before a session reads it). The round ending is the
+                // event that makes the port eligible again, so the room's ports are evaluated now
+                // rather than at the next event that happens to name the room (ADR-025 D6a).
+                self.sched_rooms.insert(channel_id);
                 // **The board knows this node now**: a circuit it refused as a stranger before its
                 // records were taken (a board that had restarted keeps none, in memory) is asked
                 // again. Reported as it was, `vox forward` said its cleanly stopped anchor had
@@ -14167,6 +14172,17 @@ impl Node {
     fn note_local_append(&mut self, channel_id: &Digest32) {
         if self.net.is_none() {
             return;
+        }
+        // Every peer of the room is owed an announcement of this append (ADR-037 R7): the
+        // inventory exchange carries it, and a port busy draining the peer's backlog on a
+        // hinted continuation gives that exchange its next round rather than the one after
+        // the drain. Measured on the shipped binary before this: a joiner's first post
+        // reached the creator 53–58 s after it was made, when the joiner's drain of her
+        // 150-post window ended and its first inventory since the post finally ran.
+        for ((room, _), port) in &mut self.ports {
+            if room == channel_id {
+                port.own_seq = port.own_seq.saturating_add(1);
+            }
         }
         self.sched_rooms.insert(*channel_id);
         self.discover_rooms.insert(*channel_id);

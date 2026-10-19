@@ -257,6 +257,12 @@ pub struct Port {
     /// When this node's own outbound session last completed cleanly, so the periodic request
     /// passes over a port that was just served (ADR-025 D7, V210-97).
     pub last_clean_out: Option<Instant>,
+    /// This node's own appends in the room, counted (ADR-037 R7): what the peer is told of
+    /// through an inventory exchange, the only exchange that carries this node's heads.
+    pub own_seq: u64,
+    /// `own_seq` when this port last began an inventory exchange. While `own_seq` is past it,
+    /// the port owes the peer an announcement, and a parked hinted continuation waits one round.
+    pub announced_seq: u64,
 }
 
 impl Port {
@@ -277,7 +283,17 @@ impl Port {
             legacy_checked_gen: None,
             last_progress: None,
             last_clean_out: None,
+            own_seq: 0,
+            announced_seq: 0,
         }
+    }
+
+    /// Whether this node appended in the room since this port last announced its heads to
+    /// the peer (ADR-037 R7). An inventory exchange, not a hinted fetch, is what tells the
+    /// peer; a hinted drain of the peer's backlog must not hold that announcement back.
+    #[must_use]
+    pub fn announce_owed(&self) -> bool {
+        self.own_seq > self.announced_seq
     }
 
     /// Whether the port needs a session (ADR-025 D1).

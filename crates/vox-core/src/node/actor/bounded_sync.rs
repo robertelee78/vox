@@ -1029,6 +1029,24 @@ impl Node {
                 self.bounded_sync.ready[0] = self.bounded_sync.deferred.remove(at);
             }
         }
+        // An own append is announced before the next hinted continuation (ADR-037 R7). The
+        // inventory exchange is the only exchange that carries this node's heads to the peer,
+        // and it runs only on a flow with no hint; a parked hinted flow draining the peer's
+        // backlog would otherwise be reused round after round, so the peer learned of this
+        // node's post only when the drain ended (measured: 53–58 s for a 150-post window).
+        // The hinted flow waits one round in the deferred queue and resumes after.
+        let announce_first = self.bounded_sync.running[0].is_none()
+            && self
+                .ports
+                .get(&(room, peer))
+                .is_some_and(crate::node::ports::Port::announce_owed);
+        if announce_first {
+            if let Some(parked) = self.bounded_sync.ready[0]
+                .take_if(|flow| flow.room == room && flow.peer == peer && !flow.inventory)
+            {
+                self.bounded_sync.deferred.push_back(parked);
+            }
+        }
         let existing = (0..2).find(|index| {
             self.bounded_sync.running[*index].is_none()
                 && self.bounded_sync.ready[*index]
@@ -1045,7 +1063,8 @@ impl Node {
             // A retained waiting slice is retried by the existing bounded port backoff. It
             // cannot monopolize the other lane or cause an archive continuation to run.
             if let Some(index) = (0..2).find(|i| {
-                self.bounded_sync.running[*i].is_none()
+                !announce_first
+                    && self.bounded_sync.running[*i].is_none()
                     && self.bounded_sync.ready[*i].as_ref().is_some_and(|flow| {
                         flow.room == room
                             && flow.peer == peer
@@ -1178,17 +1197,20 @@ impl Node {
                             Ok(value) => Arc::new(value),
                             Err(_) => return false,
                         };
-                        let required = self
-                            .bounded_sync
-                            .required
-                            .iter()
-                            .position(|(r, p, _, _)| *r == room && *p == peer)
-                            .and_then(|at| self.bounded_sync.required.remove(at))
-                            .map(|(_, _, head, seq)| (head, seq));
-                        let hint = if required.is_none() {
-                            departure_hint.or_else(|| self.history_hints.take(room, peer, node))
-                        } else {
+                        let required = if announce_first {
                             None
+                        } else {
+                            self.bounded_sync
+                                .required
+                                .iter()
+                                .position(|(r, p, _, _)| *r == room && *p == peer)
+                                .and_then(|at| self.bounded_sync.required.remove(at))
+                                .map(|(_, _, head, seq)| (head, seq))
+                        };
+                        let hint = if announce_first || required.is_some() {
+                            None
+                        } else {
+                            departure_hint.or_else(|| self.history_hints.take(room, peer, node))
                         };
                         match Flow::foreground(
                             room,
@@ -1230,17 +1252,20 @@ impl Node {
                         Ok(value) => Arc::new(value),
                         Err(_) => return false,
                     };
-                    let required = self
-                        .bounded_sync
-                        .required
-                        .iter()
-                        .position(|(r, p, _, _)| *r == room && *p == peer)
-                        .and_then(|at| self.bounded_sync.required.remove(at))
-                        .map(|(_, _, head, seq)| (head, seq));
-                    let hint = if required.is_none() {
-                        departure_hint.or_else(|| self.history_hints.take(room, peer, node))
-                    } else {
+                    let required = if announce_first {
                         None
+                    } else {
+                        self.bounded_sync
+                            .required
+                            .iter()
+                            .position(|(r, p, _, _)| *r == room && *p == peer)
+                            .and_then(|at| self.bounded_sync.required.remove(at))
+                            .map(|(_, _, head, seq)| (head, seq))
+                    };
+                    let hint = if announce_first || required.is_some() {
+                        None
+                    } else {
+                        departure_hint.or_else(|| self.history_hints.take(room, peer, node))
                     };
                     match Flow::foreground(
                         room,
@@ -1329,6 +1354,11 @@ impl Node {
             self.dispose_rearming_hint(flow);
             return false;
         };
+        if flow.inventory {
+            // This exchange carries every own append so far; one landing after this mark
+            // makes the port owe the peer again, and the round after announces it.
+            port.announced_seq = port.own_seq;
+        }
         let token = self.next_token;
         self.next_token += 1;
         let fence = flow
