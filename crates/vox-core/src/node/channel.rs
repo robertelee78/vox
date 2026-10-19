@@ -4792,9 +4792,16 @@ impl ChannelState {
     /// Mark this room poisoned after a real storage or consistency failure.
     /// Pending governance or subtype replay is retryable and keeps the last good display.
     pub fn poison(&mut self, e: &Error) {
+        // A refusal is not a storage fault: a room whose own history is behind (ADR-037 R5) or
+        // that has not synced yet refuses writes and goes on serving. Poisoning it turned every
+        // later command into "cannot save", wrapped the refusal once more per attempt ("store
+        // save room: store save room: …") and said it on every refusal, where the detector had
+        // already said it once.
         if matches!(
             e,
             Error::Profile(legacy_provisional::LEGACY_HISTORY_REQUIRED)
+                | Error::OwnHistoryBehind
+                | Error::RoomNotSynced
         ) || governance::refreshing(e)
             || Self::legacy_classification_refreshing(e)
             || Self::authorization_refreshing(e)
@@ -4802,7 +4809,11 @@ impl ChannelState {
             return;
         }
         self.poisoned = true;
-        self.save_error = Some(e.to_string());
+        // The original cause survives every later refusal (`save_failure`); never wrap it in
+        // itself.
+        if self.save_error.is_none() {
+            self.save_error = Some(e.to_string());
+        }
     }
 
     /// Mark every decision in `order` taken while this room was closed (V210-45), with no
