@@ -67,8 +67,9 @@ governance turn away (R2), never a peer round trip.
 A node MUST NOT download prior messages on its own. Earlier messages come through
 `vox room read --history older --before X`, one bounded page per ask (at most 64 rows, 1 MiB),
 served newest-first so a page cut short leaves a contiguous top and a missing bottom, never a
-hole; the selector counts a row held only once it is rendered. An ask that lands inside the page
-in flight MAY replace it. The decider, 2026-10-19: downloading all prior messages "should not be
+hole; the selector counts a row held only once it is rendered. An ask for a row the page in
+flight already covers joins that page (it is answered with the page's status) and does not
+restart it. The decider, 2026-10-19: downloading all prior messages "should not be
 wired and is not necessarily expected that an agent would choose to do". The live window still
 fetches each author's newest 128 bodies on join; that is the one known deviation from this rule,
 and making the window fetch bodies only from the join on is the next change (see Consequences).

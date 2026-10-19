@@ -71,6 +71,15 @@ struct Running {
     generation: Digest32,
     fence: Arc<Fence>,
     cancellation: demand::Cancellation,
+    /// The page this quantum fetches (head, lo, hi), when it is a page.
+    page: Option<(Digest32, u64, u64)>,
+}
+
+fn page_of(query: &Query) -> Option<(Digest32, u64, u64)> {
+    match query {
+        Query::Page { head, lo, hi, .. } => Some((*head, *lo, *hi)),
+        _ => None,
+    }
 }
 #[derive(Default)]
 pub(super) struct Controller {
@@ -294,6 +303,37 @@ pub(crate) fn saved_status(
 }
 
 impl Node {
+    /// Whether the running quantum's page already covers the position below `before`.
+    fn running_page_covers(&self, room: Digest32, before: &Digest32) -> bool {
+        let Some((head, lo, hi)) = self.history_demand.running.as_ref().and_then(|r| r.page) else {
+            return false;
+        };
+        let Some(profile) = self.profile.as_ref() else {
+            return false;
+        };
+        let Some(shared) = self.channels.get(&room) else {
+            return false;
+        };
+        let Ok(ch) = shared.try_lock() else {
+            return false;
+        };
+        let store = profile.store();
+        let Ok(read) = ch.history_read(store) else {
+            return false;
+        };
+        let Ok(Some(bytes)) = read.history_object(ObjectKind::Header, before) else {
+            return false;
+        };
+        let Ok(entry) = crate::log::entry::Entry::from_wire(&bytes) else {
+            return false;
+        };
+        let Ok(Some(current)) = ch.history_head(store, &entry.skeleton.author_id) else {
+            return false;
+        };
+        let wanted = entry.skeleton.seq.saturating_sub(1);
+        current.id() == head && wanted >= lo && wanted <= hi
+    }
+
     pub(super) fn begin_history_demand(
         &mut self,
         room: Digest32,
@@ -342,7 +382,16 @@ impl Node {
             // and Resume answer the running one as before. Measured before this: a newcomer
             // paging back was told "one bounded history quantum is queued" while nothing was
             // queued, and the page below his live window was never asked for.
-            let replaceable = matches!(action, Action::Newest | Action::Older { .. })
+            // An ask for the page below a row that the page in flight is already bringing is
+            // that same ask: it gets the running quantum's status and lets it finish. Measured:
+            // a reader re-asking as each row showed cancelled its own page every 500 ms and got
+            // two rows per ask.
+            let covered = match action {
+                Action::Older { before } => self.running_page_covers(room, &before),
+                _ => false,
+            };
+            let replaceable = !covered
+                && matches!(action, Action::Newest | Action::Older { .. })
                 && self
                     .history_demand
                     .running
@@ -706,6 +755,7 @@ impl Node {
                         generation: dispatch.generation,
                         fence: dispatch.fence.clone(),
                         cancellation: dispatch.staging.context.cancellation(),
+                        page: None,
                     });
                     self.start_legacy_history(dispatch);
                 }
@@ -715,6 +765,7 @@ impl Node {
                         generation: dispatch.generation,
                         fence: dispatch.fence.clone(),
                         cancellation: dispatch.staging.context.cancellation(),
+                        page: None,
                     });
                     self.start_private_history(dispatch);
                 }
@@ -724,6 +775,7 @@ impl Node {
                         generation: dispatch.generation,
                         fence: dispatch.fence.clone(),
                         cancellation: dispatch.staging.context.cancellation(),
+                        page: page_of(&dispatch.query),
                     });
                     if let Some(port) = self.ports.get_mut(&(dispatch.room, dispatch.peer)) {
                         port.raise();
