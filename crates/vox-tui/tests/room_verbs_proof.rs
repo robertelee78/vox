@@ -909,6 +909,80 @@ fn a_debug_daemon_makes_a_room_takes_a_post_and_keeps_running() {
             "PRODUCT: the post is not in the room: {read}{err}"
         ))
     );
+    // FX-14: the person replies using the displayed entry's eight-character prefix.
+    // Mutant: answers passes re.to_owned() through instead of resolving reply_entry.
+    let root = read
+        .lines()
+        .find(|line| line.ends_with(" posted in debug"))
+        .and_then(|line| line.split_whitespace().next())
+        .expect("PRODUCT: room read did not print the posted entry hash");
+    let post = |args: &[&str]| {
+        let mut argv = vec!["room", "post", &room, "--json"];
+        argv.extend_from_slice(args);
+        let (ok, out, err) = vox(&data, &cfg, &argv, None);
+        assert!(ok, "PRODUCT: room post {args:?} failed: {out}{err}");
+        let row: serde_json::Value = serde_json::from_str(&out)
+            .unwrap_or_else(|e| panic!("PRODUCT: room post returned invalid JSON: {out}: {e}"));
+        row["entry_hash"]
+            .as_str()
+            .expect("PRODUCT: post named no entry")
+            .to_owned()
+    };
+    let reply = post(&["--re", &root[..8], "PREFIX-REPLY"]);
+    let (ok, rows, err) = vox(&data, &cfg, &["room", "read", &room, "--json"], None);
+    assert!(ok, "PRODUCT: read reply failed: {rows}{err}");
+    let reply_row = rows
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|row| row["entry_hash"] == reply)
+        .unwrap_or_else(|| panic!("PRODUCT: room read did not show reply {reply}: {rows}"));
+    assert!(
+        reply_row["envelope"]["re"] == root && reply_row["envelope"]["thread"] == root,
+        "PRODUCT: shortened reply must answer the full entry in its canonical thread: {reply_row}"
+    );
+    let (ok, out, err) = vox(
+        &data,
+        &cfg,
+        &[
+            "room",
+            "post",
+            &room,
+            "--re",
+            "777777777777",
+            "PREFIX-MISSING",
+        ],
+        None,
+    );
+    assert!(
+        !ok && err.contains("no readable message matches"),
+        "PRODUCT: a missing reply prefix must name the problem: {out}{err}"
+    );
+    // More than 32 posts guarantee two hashes with the same first base32 character.
+    let mut first_chars = std::collections::HashSet::new();
+    let ambiguous = (0..33)
+        .find_map(|i| {
+            let entry = post(&[&format!("PREFIX-COLLISION-{i}")]);
+            let first = entry[..1].to_owned();
+            (!first_chars.insert(first.clone())).then_some(first)
+        })
+        .expect("APPARATUS: 33 base32 hashes must share a first character");
+    let (ok, out, err) = vox(
+        &data,
+        &cfg,
+        &[
+            "room",
+            "post",
+            &room,
+            "--re",
+            &ambiguous,
+            "PREFIX-AMBIGUOUS",
+        ],
+        None,
+    );
+    assert!(
+        !ok && err.contains("entry prefix is ambiguous"),
+        "PRODUCT: an ambiguous reply prefix must name the problem: {out}{err}"
+    );
     let exited = node.0.try_wait().ok().flatten();
     assert!(
         exited.is_none(),
