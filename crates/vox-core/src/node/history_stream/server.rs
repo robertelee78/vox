@@ -333,7 +333,12 @@ async fn respond(
             Ok((result.status, cursor))
         }
         Query::Page { head, lo, hi, .. } => {
-            for seq in lo..=hi {
+            // Newest first (ADR-037 R1): a page is what a reader asked for below the oldest row
+            // it shows, so its rows arrive from the top down and an interrupted page leaves a
+            // contiguous top and a missing bottom, never a hole. Served oldest-first, a page the
+            // reader's next ask cut short left rendered rows below unrendered ones; nothing
+            // refilled the hole, and the ask below the bottom row found nothing to fetch.
+            for seq in (lo..=hi).rev() {
                 let result = entry(source, io, preamble, credit, head, seq, 0).await?;
                 if result.status != Status::Complete {
                     return Ok((

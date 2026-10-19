@@ -1386,7 +1386,7 @@ impl Flow {
                         .await?
                         .ok_or(Error::Profile("archive state missing"))?;
                     if let Some(body) = &state.state().body {
-                        self.archive_next = body.seq.checked_add(1);
+                        self.archive_next = body.seq.checked_sub(1).filter(|next| *next >= 1);
                         self.archive_wire_bytes =
                             self.archive_wire_bytes.saturating_add(body.length);
                         self.push(Task {
@@ -1770,7 +1770,7 @@ impl Flow {
         if state.body.is_some()
             || state.reclaiming()
             || state.remaining == 0
-            || next > state.bounds.hi
+            || next < state.bounds.lo
         {
             return Ok(false);
         }
@@ -1781,8 +1781,8 @@ impl Flow {
             .map_err(|_| Error::Profile("history activation lock failed"))?;
         let query = Query::Page {
             head: state.bounds.head,
-            lo: next,
-            hi: state.bounds.hi,
+            lo: state.bounds.lo,
+            hi: next,
             entries: state.remaining,
             wire_bytes: 1024 * 1024,
         };
@@ -1812,7 +1812,7 @@ impl Flow {
                     if snapshot.state().body.is_none() && !snapshot.state().reclaiming() {
                         if let Some(next) = next {
                             let state = snapshot.state();
-                            let cursor = (next <= state.bounds.hi && state.remaining > 0)
+                            let cursor = (next >= state.bounds.lo && state.remaining > 0)
                                 .then_some(super::Continuation {
                                     query_kind: 4,
                                     head: state.bounds.head,
