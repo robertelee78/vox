@@ -64,6 +64,23 @@ exceptions are the irreversible egresses of R3, which wait on the fold being cur
 sparse room's first write, which waits on the room's own settlement (R5). Both are one bounded
 governance turn away (R2), never a peer round trip.
 
+A node MUST NOT download prior messages on its own. Earlier messages come through
+`vox room read --history older --before X`, one bounded page per ask (at most 64 rows, 1 MiB),
+served newest-first so a page cut short leaves a contiguous top and a missing bottom, never a
+hole; the selector counts a row held only once it is rendered. An ask that lands inside the page
+in flight MAY replace it. The decider, 2026-10-19: downloading all prior messages "should not be
+wired and is not necessarily expected that an agent would choose to do". The live window still
+fetches each author's newest 128 bodies on join; that is the one known deviation from this rule,
+and making the window fetch bodies only from the join on is the next change (see Consequences).
+
+A room's preparation on open MUST wait only on work this node finishes alone: its governance
+fold, the restore of its indexes, its legacy imports. Anything that needs a peer (an author's
+control receipt, a pending private pull, a member's prekeys) MUST wait after publication, where
+R4 answers it per author. A preparation step that waits MUST be retried at a pace, not spun.
+Measured on the candidate: a reopened sparse room waited in preparation for a control receipt
+only a sync could bring, and sync runs only for published rooms; it stayed "preparing history"
+at full CPU for as long as the daemon ran, its control socket unanswered.
+
 ### R2. The fold is the gate, and it is fast
 
 There is one governance fold per room. It remains the gate for everything irreversible. What
@@ -100,6 +117,10 @@ MUST print, before the rows,
 The legacy-recovery gate (`require_legacy_current`) MUST stay on every opened path, including
 `private_page` serving saved Session bodies: a legacy-required or legacy-provisional room's
 operator-paused suffix is never folded, so no fold time ever comes to arbitrate it.
+
+An append that finds the fold one turn behind MUST take that turn (R2) and proceed, not refuse:
+a harness sends its activity once. Measured: a fold released from a hold stayed behind until the
+one-second tick, and the harness's next append was refused meanwhile.
 
 Where the constant wait (R1) and a gate in this requirement tension, the gate wins: security
 outranks speed.
@@ -174,6 +195,11 @@ that produces its missing piece. A periodic MAY run as a backstop; it MUST NOT b
 driver of a gate. A quiet room, with no traffic and no commands, MUST still converge through
 its gates.
 
+An own append the peer has not been told of MUST be a reason for the port to run a round
+(`Port::needs`), not only an ordering of the round that happens to run. Measured: a Session
+opened after a room went quiet was never announced, neither port ran a round for 90 s, and the
+member trusted with drive never read it.
+
 ### R8. A Busy refusal is not Unreachable
 
 A Busy refusal (the peer is mid-operation) costs the peer one lookup; an unreachable peer costs
@@ -242,6 +268,16 @@ land in released commits; the measured evidence lives on the tracked issue.
   next timing defect has a named gate to measure rather than a widened bound to blame.
 
 ### Negative
+
+- Whether a port runs a round is decided from five facts kept in five places (the room
+  generation against the port's served generation, a raised request, an owed announcement,
+  pending hints, required work). v0.4.6 adds the one that was missing; it does not consolidate.
+  One derived `needs()` from one set of facts, with nothing else able to start or suppress a
+  round, is the next design change after the body-lazy window.
+- The live window fetches each author's newest 128 bodies on join (about 40 s of lane time per
+  author) against R1's rule. Fetching bodies only from the join on, headers for the rest, is the
+  first change after this release; the newcomer proofs then say: post-join rows at once, earlier
+  rows on demand.
 
 - The tick does settlement work for every open room every second: bounded, but no longer free.
 - A page read while the fold is behind carries a provisional note; a room marked own-history
