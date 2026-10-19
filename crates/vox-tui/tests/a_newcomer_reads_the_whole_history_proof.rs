@@ -423,6 +423,148 @@ fn a_newcomer_talks_both_ways_at_one_wait_fresh_or_behind_a_backlog() {
     );
 }
 
+/// How long the converged room idles while its sync rounds are counted.
+const IDLE: Duration = Duration::from_secs(60);
+
+/// **A quiet room costs nothing and says when it last synced** (ADR-038 FX-15, FX-16; #979,
+/// #980): alice and bob, each on a daemon of their own, read each other once and then nobody
+/// posts. Over [`IDLE`] seconds each profile completes no more sync rounds than the periodic
+/// request allows (one per [`SYNC_INTERVAL_SECS`](vox_core::node::syncstream::SYNC_INTERVAL_SECS)
+/// plus the follow-up each may raise), and `vox status --json` names a last completed sync for
+/// the room and for the member. Measured before the fix: one round per peer per second, the
+/// settlement tick re-offering the own head; "last sync never" on every room.
+///
+/// Mutants: the own-head hint offered to every peer on every tick again (`offer_own_head`
+/// ignoring who acknowledged) turns claim 1 red on its own count; the lane's completion no longer
+/// recording the sync (`note_lane_sync` removed) turns claim 2 red on `last_sync_ms`.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "an idle minute on two real vox daemons; optional, run it in release"]
+fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
+    watchdog::arm_for_setup(1, 6);
+    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("APPARATUS: no temp dir: {e}"));
+    let root = tmp.path();
+    let alice = root.join("alice");
+    let bob = root.join("bob");
+    for d in [&alice, &bob] {
+        std::fs::create_dir_all(d.join("cfg"))
+            .unwrap_or_else(|e| panic!("APPARATUS: could not create {}: {e}", d.display()));
+    }
+    let mut fps = Vec::new();
+    for dir in [&alice, &bob] {
+        let (ok, out, err) = vox(dir, &["id"], None);
+        assert!(ok, "PRODUCT: `vox id` failed: {err}");
+        fps.push(out.trim().to_owned());
+    }
+    for (dir, fp, name) in [(&alice, &fps[1], "bob"), (&bob, &fps[0], "alice")] {
+        let (ok, _, err) = vox(dir, &["trust", "add", fp, "--name", name], None);
+        assert!(ok, "PRODUCT: `vox trust add` of {name} failed: {err}");
+    }
+    let _alice_daemon = daemon(&alice, "alice");
+    attached(&alice, "alice");
+    let (ok, _, err) = vox(
+        &alice,
+        &["room", "create", "--passphrase-file", "-", "--name", "quiet"],
+        Some(&format!("{ROOMPASS}\n")),
+    );
+    assert!(ok, "PRODUCT: `vox room create` failed: {err}");
+    let listed = attached(&alice, "alice");
+    let room = listed
+        .split_whitespace()
+        .find(|w| w.len() >= 8 && w.chars().all(|c| c.is_ascii_alphanumeric()))
+        .unwrap_or_else(|| panic!("PRODUCT: `vox room list` shows no room id: {listed}"))
+        .to_owned();
+    let (ok, link, err) = vox(&alice, &["room", "link", &room], None);
+    assert!(ok, "PRODUCT: `vox room link` failed: {err}");
+    let link = link.trim().to_owned();
+    let _bob_daemon = daemon(&bob, "bob");
+    attached(&bob, "bob");
+    let (ok, _, err) = vox(
+        &bob,
+        &["room", "join", "--passphrase-file", "-", &link],
+        Some(&format!("{ROOMPASS}\n")),
+    );
+    assert!(ok, "PRODUCT: bob's `vox room join` was refused: {err}");
+    let joined = Instant::now();
+    let (ok, out, err) = vox(&alice, &["room", "post", &room, "post 1"], None);
+    assert!(ok, "PRODUCT: alice's post was refused: {out}{err}");
+    let (ok, out, err) = vox(&bob, &["room", "post", &room, "bob is here"], None);
+    assert!(ok, "PRODUCT: bob's first post was refused: {out}{err}");
+    let (to_alice, to_bob) = arrivals(joined, (&alice, "bob is here"), (&bob, "post 1"), &room, BOUND);
+    assert!(
+        to_alice.is_some() && to_bob.is_some(),
+        "PRODUCT: within {BOUND:?} of the join, alice read bob: {to_alice:?}; bob read alice: \
+         {to_bob:?} (None = never)\nbob's daemon said: {}\nalice's daemon said: {}",
+        said(&bob, "bob"),
+        said(&alice, "alice")
+    );
+
+    // ---- the room is quiet: acknowledgements settle, then the rounds are counted ----------
+    std::thread::sleep(Duration::from_secs(20));
+    let before = [synced(&alice), synced(&bob)];
+    let counted = Instant::now();
+    std::thread::sleep(IDLE);
+    let after = [synced(&alice), synced(&bob)];
+    let idled = counted.elapsed();
+    let allowed = 2 * (idled.as_secs() / vox_core::node::syncstream::SYNC_INTERVAL_SECS + 1);
+    let grown: Vec<u64> = (0..2).map(|i| after[i].0.saturating_sub(before[i].0)).collect();
+    println!(
+        "[proof] over {idled:?} of quiet: alice completed {} rounds, bob {} (allowed {allowed}: \
+         one periodic every {} s and its follow-up); last sync recorded: alice {}, bob {}",
+        grown[0],
+        grown[1],
+        vox_core::node::syncstream::SYNC_INTERVAL_SECS,
+        after[0].1,
+        after[1].1
+    );
+    assert!(
+        grown.iter().all(|g| *g <= allowed),
+        "PRODUCT: a quiet room ran sync rounds with nothing to sync (ADR-038 FX-15): over \
+         {idled:?}, alice completed {} and bob {} (allowed {allowed}, one per periodic request \
+         of {} s plus its follow-up)\nalice's status: {}\nbob's status: {}",
+        grown[0],
+        grown[1],
+        vox_core::node::syncstream::SYNC_INTERVAL_SECS,
+        after[0].2,
+        after[1].2
+    );
+    assert!(
+        after[0].1 && after[1].1,
+        "PRODUCT: `vox status` does not say when the room and the member last completed a sync \
+         (ADR-038 FX-16): alice {}, bob {}\nalice's status: {}\nbob's status: {}",
+        after[0].1,
+        after[1].1,
+        after[0].2,
+        after[1].2
+    );
+}
+
+/// `vox status --json` of one profile: completed sync rounds summed over its ports, whether the
+/// room and every other member carry a last completed sync, and the raw status for a red.
+fn synced(dir: &Path) -> (u64, bool, String) {
+    let (ok, out, err) = vox(dir, &["status", "--json"], None);
+    assert!(ok, "PRODUCT: `vox status --json` failed: {err}");
+    let v: serde_json::Value = serde_json::from_str(&out)
+        .unwrap_or_else(|e| panic!("PRODUCT: `vox status --json` is not JSON: {e}: {out}"));
+    let completed = v["sync"]
+        .as_array()
+        .map(|ports| ports.iter().map(|p| p["completed"].as_u64().unwrap_or(0)).sum())
+        .unwrap_or(0);
+    let recorded = v["rooms"].as_array().is_some_and(|rooms| {
+        !rooms.is_empty()
+            && rooms.iter().all(|r| {
+                !r["last_sync_ms"].is_null()
+                    && r["members"].as_array().is_some_and(|members| {
+                        members
+                            .iter()
+                            .filter(|m| m["me"] != serde_json::Value::Bool(true))
+                            .all(|m| !m["last_sync_ms"].is_null())
+                    })
+            })
+    });
+    (completed, recorded, out)
+}
+
 /// Alice posts `posts` times under `root`; bob, trusted before any of them and joining cold, is
 /// read by her and reads her from the join's return (returned: how long each took, each within
 /// [`BOUND`] or a red), and then reads every post exactly once and in order, `page` rows at a
