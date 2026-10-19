@@ -1,5 +1,9 @@
-//! Compact Session selection and bounded text reads. Every query revalidates the
-//! selected room incarnation, published inputs and current drive authority.
+//! Compact Session selection and bounded text reads. Every query answers from the fold the
+//! node has published (ADR-037 R4) and revalidates the selected room incarnation, the
+//! published inputs and the drive authority it answered for. A fold behind its inputs, or an
+//! author whose control effects are not yet current, is said in the answer's [`Revision`],
+//! never a refusal of the room; only an absence that the published fold cannot prove is
+//! refused as refreshing.
 
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -16,15 +20,57 @@ use super::storage::{Read, Tree};
 
 const CHANGED: &str = "the room's Sessions changed; refresh the listing";
 const REFRESHING: &str = "the room is refreshing saved Sessions; retry";
+const CANNOT_READ: &str = "this node cannot read that Session";
 const PAGE_ROWS: usize = 64;
 const TEXT_BYTES: usize = 32 * 1024;
 
+/// What an answer was made from. A continuation naming another basis is told CHANGED and
+/// re-reads: the basis changes when the fold publishes new inputs, when the drive authority
+/// it answered for changes, and when an author it could not answer becomes current.
 #[derive(Clone)]
 pub(crate) struct Revision {
     incarnation: Arc<std::sync::atomic::AtomicU64>,
-    inputs: (u64, u64),
+    /// The inputs the published fold was built from; `None` before any fold has published.
+    published: Option<(u64, u64)>,
+    /// The known and the refreshing drive authors, as one hash ([`drive_basis`]).
     drive: Digest32,
     member: Option<Digest32>,
+    refreshing: Vec<Digest32>,
+    provisional: bool,
+}
+
+// The IPC Session writer is to carry both onto the SessionsPage wire (ADR-037 R4); until that
+// lands nothing in this crate reads them.
+#[allow(dead_code)]
+impl Revision {
+    /// The authors whose Session control effects are not yet current here, sorted. Their
+    /// Sessions are not in this answer; each is named so the caller can say it is fetching
+    /// them now (ADR-036 H-1), never dropped silently.
+    pub fn refreshing(&self) -> &[Digest32] {
+        &self.refreshing
+    }
+
+    /// Whether this answer came from a fold behind the room's current Session inputs, from
+    /// no published fold at all, or during a saved-Session upgrade, restore or import: the
+    /// rows are what was last published, and a later listing may show more.
+    pub fn provisional(&self) -> bool {
+        self.provisional
+    }
+}
+
+/// One hash over the drive authors an answer was made for and the ones it could not answer
+/// for yet. Both lists are sorted by the caller; the length separates them.
+pub(super) fn drive_basis(known: &[Digest32], refreshing: &[Digest32]) -> Digest32 {
+    let mut hash = Sha256::new();
+    hash.update(b"vox/session-drive-basis/v1");
+    hash.update((known.len() as u64).to_be_bytes());
+    for author in known {
+        hash.update(author);
+    }
+    for author in refreshing {
+        hash.update(author);
+    }
+    hash.finalize().into()
 }
 
 #[derive(Clone, Copy)]
@@ -305,9 +351,12 @@ impl ChannelState {
         h.update(self.legacy_sessions.display_revision().to_be_bytes());
         h.update(published.0.to_be_bytes());
         h.update(published.1.to_be_bytes());
-        for author in self.drive_from(store)? {
-            h.update(author);
-        }
+        // An author becoming current, a fold publishing for the first time and a saved-Session
+        // upgrade ending each change what a listing can show (ADR-037 R4): wake every client.
+        let (known, refreshing) = self.drive_from_known(store)?;
+        h.update(drive_basis(&known, &refreshing));
+        h.update([u8::from(read.as_ref().is_some_and(|r| r.header.ready))]);
+        h.update([u8::from(self.needs_session_upgrade())]);
         Ok(h.finalize().into())
     }
 
@@ -316,45 +365,41 @@ impl ChannelState {
         store: &Store,
         query: Query,
         max_bytes: usize,
-        now: u64,
+        _now: u64,
     ) -> std::result::Result<Reply, String> {
         if self.poisoned {
             return Err(self.save_failure().to_string());
         }
-        if self.needs_session_upgrade() {
-            return Err(REFRESHING.into());
-        }
         let result = (|| -> Answer<Reply> {
-            if !self.current_session_controls_ready(store)?
-                || !self.private_expiry_ready(store, now)?
-            {
-                return Err(Failure::Request(REFRESHING));
-            }
+            let (authors, refreshing) = self.drive_from_known(store)?;
             let snapshot = store.snapshot()?;
-            let read = Read::existing(&snapshot, &self.sek, &self.channel_id)?
-                .ok_or(Failure::Request(REFRESHING))?;
+            let read = Read::existing(&snapshot, &self.sek, &self.channel_id)?;
             let public = self
                 .entries
                 .render_view(store, &self.sek, &self.channel_id)?
                 .session_revision();
-            let inputs = (public, read.header.private_generation);
-            if !read.header.ready || read.header.published != Some(inputs) {
-                return Err(Failure::Request(REFRESHING));
-            }
-            let authors = self.drive_from(store)?;
-            let mut hash = Sha256::new();
-            for author in &authors {
-                hash.update(author);
-            }
+            let published = read.as_ref().and_then(|read| read.header.published);
+            // The published fold is the answer. It is provisional while the fold is behind
+            // the room's inputs or has never published, and while a saved-Session upgrade,
+            // restore, import or pending render runs: rows may still be added. What was
+            // last published is shown and said to be provisional, and the next publication
+            // changes the basis so every page re-reads. Expiry only ever removes rows and
+            // applies per row where bodies are read; it makes no absence unproven.
+            let provisional = read.as_ref().is_none_or(|read| {
+                !read.header.ready
+                    || read.header.published != Some((public, read.header.private_generation))
+            }) || self.needs_session_upgrade();
             let revision = Revision {
                 incarnation: self.gen.clone(),
-                inputs,
-                drive: hash.finalize().into(),
+                published,
+                drive: drive_basis(&authors, &refreshing),
                 member: None,
+                refreshing: refreshing.clone(),
+                provisional,
             };
             let check = |previous: &Revision| -> Answer<()> {
                 if !Arc::ptr_eq(&previous.incarnation, &revision.incarnation)
-                    || previous.inputs != revision.inputs
+                    || previous.published != revision.published
                     || previous.drive != revision.drive
                     || previous.member.is_some_and(|node| !self.is_member(&node))
                 {
@@ -362,15 +407,84 @@ impl ChannelState {
                 }
                 Ok(())
             };
+            // Whether this node may read `node`'s Sessions. An author whose control effects
+            // are refreshing is neither readable nor unreadable yet: that is said as such.
+            let readable = |node: &Digest32| -> Answer<()> {
+                if authors.contains(node) {
+                    Ok(())
+                } else if refreshing.contains(node) {
+                    Err(Failure::Request(REFRESHING))
+                } else {
+                    Err(Failure::Request(CANNOT_READ))
+                }
+            };
+            // A provisional fold proves no absence: a Session it does not hold may be among
+            // the unfolded inputs, and "none" would let an idempotent opening post twice.
+            let proven = |found: bool| -> Answer<()> {
+                if !found && provisional {
+                    return Err(Failure::Request(REFRESHING));
+                }
+                Ok(())
+            };
+            let Some(read) = read else {
+                // No fold has run here yet: nothing is known, and every answer says so.
+                return match query {
+                    Query::Waiting => Ok(Reply::Waiting(0)),
+                    Query::Pending { .. } => Ok(Reply::Pending {
+                        targets: Vec::new(),
+                        next: None,
+                    }),
+                    Query::Lifecycle { .. } => Ok(Reply::Lifecycle {
+                        rows: Vec::new(),
+                        older: false,
+                        revision,
+                    }),
+                    Query::Page {
+                        revision: previous, ..
+                    } => {
+                        if let Some(previous) = &previous {
+                            check(previous)?;
+                        }
+                        Ok(Reply::Page {
+                            rows: Vec::new(),
+                            more: false,
+                            revision,
+                        })
+                    }
+                    Query::Validate { revision: previous } => {
+                        check(&previous)?;
+                        Ok(Reply::Valid)
+                    }
+                    Query::Join { node } => {
+                        if self.is_member(&node)
+                            && (authors.contains(&node) || refreshing.contains(&node))
+                        {
+                            return Err(Failure::Request(REFRESHING));
+                        }
+                        Ok(Reply::Page {
+                            rows: Vec::new(),
+                            more: false,
+                            revision: Revision {
+                                member: Some(node),
+                                ..revision
+                            },
+                        })
+                    }
+                    Query::HasOpen { node }
+                    | Query::Exact { node, .. }
+                    | Query::Lookup { node, .. } => {
+                        readable(&node)?;
+                        Err(Failure::Request(REFRESHING))
+                    }
+                    Query::Summary { .. } | Query::Text { .. } => Err(Failure::Request(CHANGED)),
+                };
+            };
             match query {
                 Query::Summary {
                     opening,
                     revision: previous,
                 } => {
                     check(&previous)?;
-                    if !read.header.activity.ready {
-                        return Err(Failure::Request(REFRESHING));
-                    }
                     let descriptor_id = read
                         .find(Tree::OpeningHash, &hash_key(&opening))?
                         .ok_or(Failure::Request(CHANGED))?;
@@ -420,9 +534,6 @@ impl ChannelState {
                 Query::Pending { after } => {
                     use super::activity_index::{arrival_key, fact};
                     use super::activity_state::ActivityTree;
-                    if !read.header.activity.ready {
-                        return Err(Failure::Request(REFRESHING));
-                    }
                     let stamp = self.sessions_revision(store)?;
                     if after.is_some_and(|c| c.revision != stamp) {
                         return Err(Failure::Request(CHANGED));
@@ -501,13 +612,10 @@ impl ChannelState {
                     })
                 }
                 Query::Waiting => {
+                    // The published waiting root answers; a rebuild in flight publishes its
+                    // own root later and changes the room's Session revision, so the count
+                    // is read again then.
                     let waiting = &read.header.activity.waiting;
-                    if !read.header.activity.ready
-                        || !waiting.ready
-                        || waiting.metadata != read.root(Tree::Groups)?
-                    {
-                        return Err(Failure::Request(REFRESHING));
-                    }
                     let mut total = 0u64;
                     for author in &authors {
                         total = total
@@ -589,21 +697,29 @@ impl ChannelState {
                     })
                 }
                 Query::HasOpen { node } => {
-                    if !authors.contains(&node) {
-                        return Err(Failure::Request("this node cannot read that Session"));
-                    }
-                    Ok(Reply::HasOpen(
-                        read.find(Tree::OpenCounts, &hash_key(&node))?.unwrap_or(0) != 0,
-                    ))
+                    readable(&node)?;
+                    let open = read.find(Tree::OpenCounts, &hash_key(&node))?.unwrap_or(0) != 0;
+                    proven(open)?;
+                    Ok(Reply::HasOpen(open))
                 }
                 Query::Join { node } => {
                     // One deterministic current opening, directly from the existing author
-                    // index. Read-only members get the same empty answer as no opening.
+                    // index. Read-only members get the same empty answer as no opening; a
+                    // member whose controls are refreshing, or whose opening a provisional
+                    // fold does not hold yet, is told to retry rather than "none".
                     let row = if authors.contains(&node) && self.is_member(&node) {
                         next(&read, &[node], 0, true)?.map(|(_, row)| row)
                     } else {
                         None
                     };
+                    if self.is_member(&node) {
+                        if refreshing.contains(&node) {
+                            return Err(Failure::Request(REFRESHING));
+                        }
+                        if authors.contains(&node) {
+                            proven(row.is_some())?;
+                        }
+                    }
                     if row.as_ref().is_some_and(|row| {
                         256u64
                             .saturating_add(row.name.map_or(0, |f| f.bytes))
@@ -677,9 +793,7 @@ impl ChannelState {
                     Ok(Reply::Valid)
                 }
                 Query::Exact { node, id } => {
-                    if !authors.contains(&node) {
-                        return Err(Failure::Request("this node cannot read that Session"));
-                    }
+                    readable(&node)?;
                     let group =
                         sha256_concat(&[b"vox/session-projection/id/v1", &node, id.as_bytes()]);
                     let row = read
@@ -687,6 +801,7 @@ impl ChannelState {
                         .map(|id| descriptor(&read, id))
                         .transpose()?
                         .map(Row::from);
+                    proven(row.is_some())?;
                     Ok(Reply::Page {
                         rows: row.into_iter().collect(),
                         more: false,
@@ -694,9 +809,7 @@ impl ChannelState {
                     })
                 }
                 Query::Lookup { node, id } => {
-                    if !authors.contains(&node) {
-                        return Err(Failure::Request("this node cannot read that Session"));
-                    }
+                    readable(&node)?;
                     let group =
                         sha256_concat(&[b"vox/session-projection/id/v1", &node, id.as_bytes()]);
                     let row = read
@@ -704,6 +817,7 @@ impl ChannelState {
                         .map(|id| descriptor(&read, id))
                         .transpose()?
                         .map(Row::from);
+                    proven(row.is_some())?;
                     Ok(Reply::Lookup(row))
                 }
                 Query::Text {

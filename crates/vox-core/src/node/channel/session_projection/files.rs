@@ -1,5 +1,8 @@
 //! Short private-file reads for automatic pulls. No Session list or transcript is
 //! copied into the node snapshot; cursor and permission checks happen on the actor.
+//! A page answers from the rows the node has applied (ADR-037 R4): an author whose Session
+//! control effects are not yet current is not readable this page, and the cyclic file scan
+//! examines that author's rows again once they are. Expiry applies per row.
 
 use crate::atrest::store::SegmentKind;
 use crate::error::{Error, Result};
@@ -11,6 +14,8 @@ use crate::node::store::{Snapshot, Store};
 use super::super::ChannelState;
 use super::record::Key;
 use super::storage::{Read, Tree};
+
+const REFRESHING: &str = "the room is refreshing saved Sessions; retry";
 
 pub(crate) enum FileQuery {
     Exact(Digest32),
@@ -32,13 +37,9 @@ fn key(id: u64) -> Key {
 }
 
 impl ChannelState {
-    fn readable_file(
-        &self,
-        snapshot: &Snapshot,
-        id: u64,
-        authors: &[Digest32],
-        now: u64,
-    ) -> Result<Option<SessionRow>> {
+    /// The unexpired file row saved at `id`, whoever its author is; the caller decides whether
+    /// that author's Sessions are readable here.
+    fn saved_file(&self, snapshot: &Snapshot, id: u64, now: u64) -> Result<Option<SessionRow>> {
         let segment = snapshot
             .get_segment(&self.channel_id, SegmentKind::PrivateSession, id)?
             .ok_or(Error::MalformedAtRest("Session file locator has no record"))?;
@@ -49,7 +50,7 @@ impl ChannelState {
         let Some(row) = saved.row else {
             return Ok(None);
         };
-        if !authors.contains(&row.author) || !crate::node::drive::is_file_out(&row) {
+        if !crate::node::drive::is_file_out(&row) {
             return Ok(None);
         }
         Ok(Some(row))
@@ -65,38 +66,27 @@ impl ChannelState {
         if self.poisoned {
             return Err(self.save_failure().to_string());
         }
-        if self.needs_session_upgrade() {
-            return Err("the room is refreshing saved Sessions; retry".into());
-        }
-        match self
-            .current_session_controls_ready(store)
-            .and_then(|ready| {
-                if ready {
-                    self.private_expiry_ready(store, now)
-                } else {
-                    Ok(false)
-                }
-            }) {
-            Ok(true) => {}
-            Ok(false) => return Err("the room is refreshing saved Sessions; retry".into()),
-            Err(error) => {
-                self.poison(&error);
-                return Err(error.to_string());
-            }
-        }
         let answer = (|| -> Result<FileReply> {
             let instance = self.history_instance(store)?;
-            let authors = self.drive_from(store)?;
+            let (authors, refreshing) = self.drive_from_known(store)?;
             let snapshot = store.snapshot()?;
             let read = Read::existing(&snapshot, &self.sek, &self.channel_id)?;
             match query {
                 FileQuery::Exact(hash) => {
                     let id =
                         super::private_index::find(&snapshot, &self.sek, &self.channel_id, &hash)?;
-                    let row = id
-                        .map(|id| self.readable_file(&snapshot, id, &authors, now))
+                    let row = match id
+                        .map(|id| self.saved_file(&snapshot, id, now))
                         .transpose()?
-                        .flatten();
+                    {
+                        Some(Some(row)) if authors.contains(&row.author) => Some(row),
+                        // Whether this node may still read inside that author's Sessions is
+                        // not known yet: neither an offer nor its absence.
+                        Some(Some(row)) if refreshing.contains(&row.author) => {
+                            return Err(Error::StreamRefused(REFRESHING));
+                        }
+                        _ => None,
+                    };
                     if row.as_ref().is_some_and(|row| row.entry_hash != hash) {
                         return Err(Error::MalformedAtRest("Session file hash differs"));
                     }
@@ -124,7 +114,9 @@ impl ChannelState {
                         if found != key(id) {
                             return Err(Error::MalformedAtRest("Session file cursor differs"));
                         }
-                        let row = self.readable_file(&snapshot, id, &authors, now)?;
+                        let row = self
+                            .saved_file(&snapshot, id, now)?
+                            .filter(|row| authors.contains(&row.author));
                         if let Some(row) = row {
                             let cost = row
                                 .body
@@ -155,7 +147,10 @@ impl ChannelState {
             }
         })();
         if let Err(error) = &answer {
-            self.poison(error);
+            // A refreshing author is not a local failure; a storage error still poisons.
+            if !matches!(error, Error::StreamRefused(_)) {
+                self.poison(error);
+            }
         }
         answer.map_err(|error| error.to_string())
     }
