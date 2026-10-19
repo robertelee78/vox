@@ -253,7 +253,7 @@ pub struct RoomSummary {
     pub open: bool,
     /// The saved room is preparing; it does not need another passphrase.
     pub preparing: bool,
-    /// Empty while the room goes on; else, in words, that this node left it or it ended.
+    /// Empty while the room goes on; else, the departure/end or unsupported-format refusal.
     pub over: String,
 }
 

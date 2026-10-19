@@ -1,19 +1,16 @@
 //! Explicit archive selection and activation. Cache reads never enter this module.
 
 use super::{NetEvent, Node};
-mod legacy;
 use crate::hash::Digest32;
 use crate::node::api::{
     HistoryDemandAction as Action, HistoryDemandPhase as Phase, HistoryDemandStatus as Status,
 };
-use crate::node::channel::legacy_provisional::LegacyProvisionalOwner;
 use crate::node::channel::{entry_store::sparse::ObjectKind, ChannelState};
 use crate::node::history_budget::{Job, Lane};
 use crate::node::history_demand::{self as demand, Binding, Bounds, Context};
 use crate::node::history_stream::{self as stream, Query, RequestId, Staging};
 use crate::node::store::Store;
 use crate::transport::stream_transport::Fence;
-use legacy::LegacyDispatch;
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use tokio::sync::Mutex;
 
@@ -40,7 +37,6 @@ struct PrivateDispatch {
     fence: Arc<Fence>,
 }
 struct PrivateWork {
-    legacy_owner: Option<(Digest32, LegacyProvisionalOwner)>,
     result: Arc<StdMutex<Option<Result<Status, String>>>>,
     request: RequestId,
     generation: Digest32,
@@ -54,8 +50,6 @@ struct Prepared {
     status: Status,
     dispatch: Option<Dispatch>,
     private: Option<PrivateDispatch>,
-    legacy: Option<LegacyDispatch>,
-    legacy_cancelled: Option<LegacyProvisionalOwner>,
     local_only: bool,
     selection_after: Option<Option<Digest32>>,
 }
@@ -88,7 +82,6 @@ pub(super) struct Controller {
     ready: Option<Dispatch>,
     running: Option<Running>,
     private_work: Option<PrivateWork>,
-    cancelled_legacy: Option<(Digest32, LegacyProvisionalOwner)>,
     status: Option<Status>,
     selection: Option<(Digest32, [u8; 16], Option<Digest32>)>,
 }
@@ -106,9 +99,6 @@ impl Controller {
             .map(|dispatch| (dispatch.request, dispatch.generation, dispatch.instance))
     }
 
-    pub(super) fn take_legacy_cleanup(&mut self) -> Option<(Digest32, LegacyProvisionalOwner)> {
-        self.cancelled_legacy.take()
-    }
     pub(super) fn take_ready(&mut self, room: Digest32, peer: Digest32) -> Option<Dispatch> {
         if self
             .ready
@@ -288,11 +278,7 @@ pub(crate) fn saved_status(
                     .map_or_else(|| state.cursor.map_or(0, |c| c.offset), |body| body.offset)
             }),
         headers: state.bounds.entries,
-        wire_bytes: if state.legacy.is_some() {
-            crate::log::sync::LEGACY_QUANTUM_BYTES
-        } else {
-            1024 * 1024
-        },
+        wire_bytes: 1024 * 1024,
         detail: if state.reclaiming() {
             "Provisional history cleanup is pending."
         } else {
@@ -635,7 +621,6 @@ impl Node {
             let _ = tx.try_send(NetEvent::HistoryDemandPrepared { token: 0 });
         });
         self.history_demand.private_work = Some(PrivateWork {
-            legacy_owner: None,
             result,
             request,
             generation,
@@ -647,16 +632,10 @@ impl Node {
     pub(super) fn accept_history_demand(&mut self) -> bool {
         let completed = self.history_demand.private_work.as_ref().and_then(|work| {
             let answer = work.result.try_lock().ok()?.take()?;
-            Some((work.request, work.generation, work.legacy_owner, answer))
+            Some((work.request, work.generation, answer))
         });
-        if let Some((request, generation, legacy_owner, answer)) = completed {
+        if let Some((request, generation, answer)) = completed {
             self.history_demand.private_work = None;
-            if answer
-                .as_ref()
-                .is_ok_and(|status| status.phase == Phase::Cancelled)
-            {
-                self.history_demand.cancelled_legacy = legacy_owner;
-            }
             match answer {
                 Ok(status) => self.history_demand.completed(request, generation, status),
                 Err(reason) => self.history_demand.failed(request, generation, &reason),
@@ -745,20 +724,7 @@ impl Node {
                     self.history_demand.selection =
                         Some((prepared.status.room, prepared.status.instance, after));
                 }
-                if let Some(owner) = prepared.legacy_cancelled {
-                    self.history_demand.cancelled_legacy = Some((prepared.status.room, owner));
-                }
                 self.history_demand.status = Some(prepared.status);
-                if let Some(dispatch) = prepared.legacy {
-                    self.history_demand.running = Some(Running {
-                        request: dispatch.request,
-                        generation: dispatch.generation,
-                        fence: dispatch.fence.clone(),
-                        cancellation: dispatch.staging.context.cancellation(),
-                        page: None,
-                    });
-                    self.start_legacy_history(dispatch);
-                }
                 if let Some(dispatch) = prepared.private {
                     self.history_demand.running = Some(Running {
                         request: dispatch.request,
@@ -968,8 +934,6 @@ fn prepare_local(
         ),
         dispatch: None,
         private: None,
-        legacy: None,
-        legacy_cancelled: None,
         local_only: true,
         selection_after: None,
     };
@@ -995,13 +959,6 @@ fn prepare_local(
     match action {
         Action::Status => {}
         Action::Cancel { request } if request == state.request => {
-            if let Some(plan) = &state.legacy {
-                answer.legacy_cancelled = Some(LegacyProvisionalOwner {
-                    request,
-                    instance,
-                    author: plan.author,
-                });
-            }
             cancel_exact(&context, request, job, fence, deadline)?;
             answer.status.phase = Phase::Cancelled;
             answer.status.detail = "History request cancelled; provisional bytes reclaimed.".into();
@@ -1052,8 +1009,6 @@ fn prepare(
         status: status(id, instance, Phase::Idle, "No history request is saved."),
         dispatch: None,
         private: None,
-        legacy: None,
-        legacy_cancelled: None,
         local_only: false,
         selection_after: None,
     };
@@ -1113,19 +1068,7 @@ fn prepare(
         );
     }
     if !room.uses_sparse_history(store).map_err(|e| e.to_string())? {
-        return legacy::prepare_legacy(
-            room,
-            store,
-            node,
-            instance,
-            action,
-            context,
-            job,
-            peers,
-            answer,
-            saved.as_ref().map(|s| s.state()),
-            fence,
-        );
+        return Err(crate::node::channel::UNSUPPORTED_ROOM_FORMAT.into());
     }
     let (bounds, author, query, active, remaining) = if let Action::Resume { request } = action {
         let saved = saved.as_ref().ok_or("No history request is saved.")?;

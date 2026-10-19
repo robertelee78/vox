@@ -1,10 +1,10 @@
 # ADR-036: Live Messages and Requested History
 
-- **Status**: Proposed for v0.4.6. Requirements reflect the decider's 2026-10-15
-  instructions. The reviewed new-format design and concrete implementation contract below are
-  approved for implementation; existing-format activation remains unresolved. This ADR stays
-  Proposed until that separate decision and delivery are complete. No release acceptance is claimed.
+- **Status**: Proposed; the new-format implementation contract is approved. ADR-038 FX-18
+  supersedes existing-format activation and recovery: pre-v0.4.5 rooms are unsupported.
+  H-1–H-8 remain the current-format requirements; release acceptance is not claimed here.
 - **Date**: 2026-10-15
+- **Updated**: 2026-10-19 — ADR-038 FX-18 deletes legacy recovery and refuses old rooms without resetting data (#982).
 - **Deciders**: Robert E. Lee
 - **Tags**: sync, history, control, authentication, startup, storage
 - **Related**: ADR-007, ADR-008, ADR-010, ADR-018, ADR-025, ADR-026, ADR-031
@@ -151,8 +151,8 @@ descriptor. Neither an entry nor a descriptor hashes itself. Leaf/internal/empty
 encodings are distinct and canonical; all sizes, depth, arithmetic, context cardinality and proof
 bytes are bounded before allocation or traversal. Preserve the existing monotonic per-author
 room feed positions across epochs. An epoch or format change MUST NOT reset prefix consistency,
-discard earlier control or bypass feed termination. The legacy format boundary remains pending
-as described below; this rule does not invent a transition fence.
+discard earlier control or bypass feed termination. ADR-038 FX-18 resolves the legacy format
+boundary by refusing pre-v0.4.5 rooms; this rule does not invent a transition fence.
 
 A parent receipt is derived evidence, not a new independently signed statement. For parent
 sequence `p` (one-based, hence prefix length `p`), it contains an author-signed head of size
@@ -298,19 +298,14 @@ is fetched, an explicit older page retrieved with its exact bodies, and another 
 delivered while that work runs. Restart MUST retain the received page without refetching it.
 Exercise multiple local nodes to expose aggregate scheduling, not just one peer's limit.
 
-**Existing v1 recovery.** A signed v1 witness may cover an unbounded retained suffix. Its
-publication MUST advance only through explicit bounded Resume quanta; startup MUST NOT finish it
-automatically. A room with paused Building or Switched work MUST reopen its published accepted
-cache under current trust, Drive and retention checks and expose the exact saved request's Resume
-and Cancel. Publication-dependent writes may return `Legacy history required`; neither this state
-nor an unverified suffix may be reported as fully current. Cancellation and orphan reclamation may
-run as bounded local maintenance without accepting history. Completed recovery or cancellation
-MUST eventually restore an Idle entry index, including after a crash. Ordinary writes resume once
-no authenticated essential gap remains; cancellation never discards such evidence or certifies
-current authority. The live-before-archive and live-during-archive journey above applies to the
-authenticated new format; existing v1 rooms separately prove responsive cached recovery,
-preserved restart-paused progress, and recovery to Idle. This does not authorize format
-conversion, weaken governance, or grant the unresolved legacy activation exception.
+**Unsupported pre-v0.4.5 rooms (ADR-038 FX-18, 2026-10-19).** The legacy recovery
+flow, its cached-only reads, states and Resume/Cancel prompts are deleted. Opening or joining
+a room whose signed genesis predates authenticated history MUST be refused with one sentence:
+"This room uses an unsupported pre-v0.4.5 format; leave it and create a new one."
+Refusal MUST precede room maintenance and MUST NOT delete, reset or convert stored room data.
+A current-format room with unavailable requested history retains H-1–H-8, including its
+ordinary explicit history status, Resume and Cancel. A missing or damaged current-format
+index is a current-format integrity error, never evidence that the room predates v0.4.5.
 
 Adversarial apparatus MUST exercise omitted control/revocation, conflicting overlapping history,
 wrong room/epoch, missing required authority and malformed proof limits against the real binary.
@@ -343,8 +338,8 @@ are refused. Genesis versions 1 and 2 retain their exact bytes, hashes and signi
 Creating or joining a verified version-3 room initializes the sparse index in the existing
 atomic empty-room transaction, before any authored entry. Reopening a room preserves its
 published format; an empty local join store is not authorization to activate a legacy room.
-This marker does not convert an existing room, create a reset fence or authorize the legacy
-exception below.
+This marker does not convert an existing room or create a reset fence. ADR-038 FX-18
+refuses rooms without this authenticated-history marker.
 
 **Entries and kinds.** Preserve tag `0x0001` version 1, its bytes, hash and signature domain
 exactly. Version 2 is an explicit supported version of that tag, signed with `vox/log-entry/v2`.
@@ -833,6 +828,9 @@ parallel log implementation while leaving the actual EntrySkeleton/sync path on 
 
 ## Adversarial plan review, 2026-10-15
 
+The following review is historical. Its pending legacy-activation question was resolved by
+ADR-038 FX-18 on 2026-10-19: no conversion or recovery; refuse pre-v0.4.5 rooms.
+
 GLM-5.3, Kimi K3 and Fable reviewed this plan, then reviewed concrete counterexamples. All three
 withdrew their initial claim that a selected Lipmaa path proves append-only consistency. A
 receiver holding signed A1 can be shown signed H4 whose skip link reaches A1 while its immediate
@@ -855,7 +853,7 @@ The integration owner accepted the concrete new-format contract after that adjud
 explicit persisted-offset ACK credit, the 288-MiB transient-buffer contract and sparse clock
 recomputation in both directions. No additional whole-plan review cycle is required before
 new-format implementation; changed code still requires its scoped review and user-facing proof.
-Legacy activation remains a separate unresolved operator decision.
+At this review, legacy activation remained unresolved; ADR-038 FX-18 subsequently ruled it out.
 
 The adjudication rejected the claimed root self-hash circularity, an extra independently signed
 receipt, guaranteed fork extraction from a withheld/invalid proof, replacement of signed causal
@@ -871,14 +869,9 @@ An opaque fence, a local reconstruction checkpoint or a peer's evaluated snapsho
 the missing interval contains no applicable revocation or terminal room End. A newly signed
 "active" baseline cannot override an unseen valid End under existing governance rules.
 
-The operator has been asked whether the upgrade may perform a one-time bounded, resumable
-verification of missing legacy history, while preserving data and keeping other ready work
-responsive. This is a proposed exception for existing-format conversion, not permission already
-received, not an automatic archive drain on normal startup, and not a requirement deferred to
-another release. The new-format contract in H-6–H-8 may be implemented independently. Existing-format activation
-remains blocked on that decision and MUST NOT be silently enabled by implementing the new codec,
-by an upgrade, or by opening a node. All H-1–H-8 obligations remain in v0.4.6; this separation is
-not permission to ship a known defect or defer the legacy decision.
+The operator resolved the proposed existing-format conversion exception in ADR-038 FX-18 on
+2026-10-19: it is not authorized. Pre-v0.4.5 rooms are refused, without deleting or resetting
+real data. The current-format H-1–H-8 contract remains unchanged.
 
 ## Consequences
 
@@ -889,7 +882,7 @@ available on disk and can be filled from peers without monopolizing all nodes on
 
 ### Negative
 
-The remote protocol needs an explicit format transition and security review. A node with missing
+Pre-v0.4.5 rooms remain unsupported instead of being converted (ADR-038 FX-18). A node with missing
 essential control evidence must report that limitation; it cannot manufacture current authority.
 
 ### Neutral

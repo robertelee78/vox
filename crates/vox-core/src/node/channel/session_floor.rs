@@ -266,23 +266,10 @@ impl ChannelState {
         // author's still-building receipt made a fresh member's own serve wait on peers whose
         // receipts only its serve could advance.
         let entries = self.entries.read(store, &self.sek, &self.channel_id)?;
-        let accepted_wants: Vec<_> = wants
-            .iter()
-            .filter_map(|want| {
-                let mut want = *want;
-                if let Some(state) = entries
-                    .legacy_provisional()
-                    .filter(|state| state.owner.author == want.author_id)
-                {
-                    want.to_seq = want.to_seq.min(state.base_seq);
-                }
-                (want.from_seq <= want.to_seq).then_some(want)
-            })
-            .collect();
         crate::log::sync::entries_for_wants_bounded(
             &self.dag,
             &entries,
-            &accepted_wants,
+            wants,
             max_entries,
             max_bytes,
         )?

@@ -653,3 +653,164 @@ fn newcomer_reads_the_whole_history(
     drop(alice_daemon);
     (to_alice, to_bob)
 }
+
+/// FX-18 (#982): an unsupported room stays closed without disturbing the current room or
+/// offering a removed recovery flow. Apparatus seals the old manifest representation
+/// (a signed version-2 genesis and manifest), using only a disposable profile.
+/// Mutant: change the unsupported-format refusal to the former recovery prompt; the
+/// assertion on what the daemon tells the person must turn red.
+#[test]
+#[ignore = "real vox daemon and production Argon2id; CI runs it in release"]
+fn an_unsupported_room_is_refused_beside_a_current_room() {
+    use vox_core::atrest::idfactor::SignatureIdentityFactor;
+    use vox_core::atrest::store::{seal_segment, SegmentKind};
+    use vox_core::cbor::Value;
+    use vox_core::identity::composite::RootSigner;
+    use vox_core::node::{paths::Paths, profile::Profile};
+    const REFUSAL: &str =
+        "This room uses an unsupported pre-v0.4.5 format; leave it and create a new one.";
+    watchdog::arm_for_setup(1, 3);
+    let tmp = tempfile::tempdir().expect("APPARATUS: scratch directory");
+    let dir = tmp.path();
+    std::fs::create_dir_all(dir.join("cfg")).expect("APPARATUS: scratch config");
+    let (ok, _, err) = vox(dir, &["id"], None);
+    assert!(ok, "PRODUCT: could not create identity: {err}");
+    let running = daemon(dir, "format-create");
+    attached(dir, "format-create");
+    {
+        let name = "current-format";
+        let (ok, out, err) = vox(
+            dir,
+            &["room", "create", "--name", name, "--passphrase-file", "-"],
+            Some(&format!("{ROOMPASS}\n")),
+        );
+        assert!(ok, "PRODUCT: could not create {name}: {out}{err}");
+    }
+    let (ok, out, err) = vox(
+        dir,
+        &["room", "post", "current-format", "current history survives"],
+        None,
+    );
+    assert!(ok, "PRODUCT: current room post refused: {out}{err}");
+    drop(running);
+    let paths = Paths::resolve("default", Some(dir), Some(&dir.join("cfg")))
+        .expect("APPARATUS: scratch paths");
+    let mut profile = Profile::open(paths.clone()).expect("APPARATUS: stopped profile opens");
+    profile
+        .unlock(IDENTITY.as_bytes())
+        .expect("APPARATUS: scratch identity unlocks");
+    let signer = profile.signer_arc().expect("APPARATUS: fixture signer");
+    let (mut genesis, sek) = vox_core::node::channel::ChannelState::create_genesis(
+        &profile,
+        "old-format",
+        vox_core::time::Ms(vox_core::transport::quic::unix_now_ms()),
+    )
+    .expect("APPARATUS: fixture genesis and key");
+    genesis.body.format = 2;
+    genesis.signature = signer
+        .sign(&genesis.body.signing_input())
+        .expect("APPARATUS: sign pre-v0.4.5 genesis");
+    let room = genesis.channel_id();
+    let wrap = sek
+        .seal(
+            &SignatureIdentityFactor::new(&*signer),
+            &room,
+            ROOMPASS.as_bytes(),
+            Default::default(),
+        )
+        .expect("APPARATUS: fixture key wrap");
+    profile
+        .store()
+        .put_sek_wrap(&room, &wrap)
+        .expect("APPARATUS: save fixture key wrap");
+    let bytes = Value::Array(vec![
+        Value::Uint(2),
+        Value::Bytes(genesis.to_wire()),
+        Value::Text("old-format".into()),
+        Value::Uint(genesis.body.created_ms),
+        Value::Uint(0),
+    ])
+    .to_canonical_vec()
+    .expect("APPARATUS: pre-v0.4.5 manifest");
+    let manifest = seal_segment(&sek, SegmentKind::KeyMaterial, 0, &bytes)
+        .expect("APPARATUS: seal old-format manifest");
+    profile
+        .store()
+        .put_segment(&room, SegmentKind::KeyMaterial, 0, &manifest)
+        .expect("APPARATUS: install old-format manifest");
+    let retained = seal_segment(
+        &sek,
+        SegmentKind::PlaintextCache,
+        1,
+        b"retained pre-v0.4.5 room data",
+    )
+    .expect("APPARATUS: retained old-format bytes");
+    profile
+        .store()
+        .put_segment(&room, SegmentKind::PlaintextCache, 1, &retained)
+        .expect("APPARATUS: install retained bytes");
+    let mut open = vox_core::node::open_rooms::OpenRooms::load(
+        profile.store(),
+        profile.signer().expect("APPARATUS: fixture signer"),
+    )
+    .expect("APPARATUS: remembered rooms");
+    open.remember(
+        room,
+        sek.key_bytes().expect("APPARATUS: fixture key"),
+        ROOMPASS.as_bytes(),
+    )
+    .expect("APPARATUS: remember fixture room");
+    open.save(
+        profile.store(),
+        profile.signer().expect("APPARATUS: fixture signer"),
+    )
+    .expect("APPARATUS: save remembered fixture room");
+    let old_id = vox_core::node::link::b32_encode(&room);
+    drop(signer);
+    drop(profile);
+    let running = daemon(dir, "format-refusal");
+    attached(dir, "format-refusal");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let shown = format!(
+            "{}{}",
+            said(dir, "format-refusal"),
+            std::fs::read_to_string(dir.join("daemon-format-refusal.out")).unwrap_or_default()
+        );
+        if shown.contains(REFUSAL) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT: unsupported room did not say to leave and create a new one: {shown}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let (ok, out, err) = vox(dir, &["room", "read", "current-format"], None);
+        if ok && out.contains("current history survives") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT: current room history unavailable beside unsupported room: {out}{err}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let (ok, out, err) = vox(dir, &["room", "read", &old_id], None);
+    assert!(
+        !ok && format!("{out}{err}").contains(REFUSAL),
+        "PRODUCT: unsupported room did not return its actionable refusal: {out}{err}"
+    );
+    let shown = format!(
+        "{out}{err}{}{}",
+        said(dir, "format-refusal"),
+        std::fs::read_to_string(dir.join("daemon-format-refusal.out")).unwrap_or_default()
+    );
+    assert!(
+        !shown.contains("Legacy history required") && !shown.contains("Resume or Cancel recovery"),
+        "PRODUCT: removed recovery prompt was offered: {shown}"
+    );
+    drop(running);
+}

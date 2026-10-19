@@ -107,11 +107,6 @@ impl ChannelState {
             return Err(Error::Profile("this identity has left the room"));
         }
         let read = self.entries.read(store, &self.sek, &self.channel_id)?;
-        if read.legacy_provisional().is_some() || read.legacy_required_any() {
-            return Err(Error::Profile(
-                "Legacy history required; resume explicit recovery before posting in this room",
-            ));
-        }
         if read.publication_busy()
             || (read.sparse_enabled() && read.history_obligation_capacity() < 2)
         {

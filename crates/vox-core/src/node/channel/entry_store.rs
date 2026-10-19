@@ -6,7 +6,7 @@
 //! A writer reads its own Batch. Roots are installed only by its durable commit.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use zeroize::Zeroizing;
@@ -190,97 +190,13 @@ struct Promotion {
     cleanup_hash: Option<Key>,
 }
 
-/// An authenticated current v1 tip observed from a peer. This records a missing
-/// prerequisite only; it is never an accepted feed, read grant or automatic download request.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct LegacyRequired {
-    pub author: Digest32,
-    pub through: u64,
-    pub hash: Digest32,
-}
-
-/// Durable ownership of one explicitly requested legacy suffix. This is local staging,
-/// never a signature, accepted Feed, or permission to restart network work.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct LegacyProvisionalOwner {
-    pub request: [u8; 16],
-    pub instance: [u8; 16],
-    pub author: Digest32,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct LegacyProvisionalState {
-    pub owner: LegacyProvisionalOwner,
-    pub base_seq: u64,
-    pub base_hash: Digest32,
-    pub tail_seq: u64,
-    pub tail_hash: Digest32,
-    pub first_claimed_ms: u64,
-    pub ended: bool,
-    // A signed witness must pass ordinary publication before this is resumable unsigned work.
-    pub pending_witness: u64,
-}
-
-impl LegacyProvisionalState {
-    fn write(self, e: &mut Encoder) {
-        e.array(10)
-            .bytes(&self.owner.request)
-            .bytes(&self.owner.instance)
-            .bytes(&self.owner.author)
-            .uint(self.base_seq)
-            .bytes(&self.base_hash)
-            .uint(self.tail_seq)
-            .bytes(&self.tail_hash)
-            .uint(self.first_claimed_ms)
-            .uint(u64::from(self.ended))
-            .uint(self.pending_witness);
-    }
-    fn read(d: &mut Decoder<'_>, arity: usize) -> Result<Self> {
-        if arity != 10 {
-            return Err(invalid("legacy provisional state arity"));
-        }
-        Ok(Self {
-            owner: LegacyProvisionalOwner {
-                request: d
-                    .bytes()?
-                    .try_into()
-                    .map_err(|_| invalid("legacy request"))?,
-                instance: d
-                    .bytes()?
-                    .try_into()
-                    .map_err(|_| invalid("legacy instance"))?,
-                author: d
-                    .bytes()?
-                    .try_into()
-                    .map_err(|_| invalid("legacy author"))?,
-            },
-            base_seq: d.uint()?,
-            base_hash: d
-                .bytes()?
-                .try_into()
-                .map_err(|_| invalid("legacy base hash"))?,
-            tail_seq: d.uint()?,
-            tail_hash: d
-                .bytes()?
-                .try_into()
-                .map_err(|_| invalid("legacy tail hash"))?,
-            first_claimed_ms: d.uint()?,
-            ended: flag(d)?,
-            pending_witness: d.uint()?,
-        })
-    }
-}
-
 #[derive(Clone, Debug)]
 struct Directory {
     active: Roots,
     provisional: Roots,
     // One detached garbage root, never visible through ordinary entry lookups.
     retired_provisional: Roots,
-    legacy_provisional: Option<LegacyProvisionalState>,
-    legacy_required: BTreeMap<Digest32, LegacyRequired>,
     // Process-local attachment is deliberately absent from the sealed encoding.
-    provisional_attached: bool,
     provisional_hidden: bool,
     next_page: u64,
     next_provisional: u64,
@@ -310,9 +226,6 @@ impl Default for Directory {
             active: Roots::default(),
             provisional: Roots::default(),
             retired_provisional: Roots::default(),
-            legacy_provisional: None,
-            legacy_required: BTreeMap::new(),
-            provisional_attached: false,
             provisional_hidden: false,
             next_page: 1,
             next_provisional: 1,
@@ -469,19 +382,7 @@ impl Directory {
                 e.array(0);
             }
         }
-        match self.legacy_provisional {
-            Some(state) => state.write(&mut e),
-            None => {
-                e.array(0);
-            }
-        }
-        e.array(self.legacy_required.len());
-        for tip in self.legacy_required.values() {
-            e.array(3)
-                .bytes(&tip.author)
-                .uint(tip.through)
-                .bytes(&tip.hash);
-        }
+        e.array(0).array(0); // retired pre-v0.4.5 recovery slots
         self.retired_provisional.write(&mut e);
         Zeroizing::new(e.finish())
     }
@@ -671,53 +572,11 @@ impl Directory {
         } else {
             None
         };
-        let legacy_provisional = if version >= 11 {
-            let arity = d.array()?;
-            if arity == 0 {
-                None
-            } else {
-                Some(LegacyProvisionalState::read(&mut d, arity)?)
-            }
-        } else {
-            None
-        };
-        let mut legacy_required = BTreeMap::new();
-        if version >= 12 {
-            let count = d.array()?;
-            if count > super::AUTHORS_HARD_LIMIT {
-                return Err(invalid("legacy required author bound"));
-            }
-            let mut previous = None;
-            for _ in 0..count {
-                if d.array()? != 3 {
-                    return Err(invalid("legacy required tip arity"));
-                }
-                let author: Digest32 = d
-                    .bytes()?
-                    .try_into()
-                    .map_err(|_| invalid("legacy required author"))?;
-                let through = d.uint()?;
-                let hash = d
-                    .bytes()?
-                    .try_into()
-                    .map_err(|_| invalid("legacy required hash"))?;
-                if previous.is_some_and(|old| old >= author)
-                    || through == 0
-                    || through > crate::log::feed::MAX_SEQ
-                    || active.sparse.enabled
-                {
-                    return Err(invalid("legacy required tip binding or order"));
-                }
-                legacy_required.insert(
-                    author,
-                    LegacyRequired {
-                        author,
-                        through,
-                        hash,
-                    },
-                );
-                previous = Some(author);
-            }
+        if version >= 11 && d.array()? != 0 {
+            return Err(invalid("retired recovery state in current room directory"));
+        }
+        if version >= 12 && d.array()? != 0 {
+            return Err(invalid("retired recovery state in current room directory"));
         }
         let retired_provisional = if version >= 13 {
             Roots::read(&mut d)?
@@ -744,21 +603,7 @@ impl Directory {
             return Err(invalid("retired provisional roots differ"));
         }
         d.finish()?;
-        if let Some(state) = legacy_provisional {
-            if state.owner.instance != history_instance
-                || active.sparse.enabled
-                || state.base_seq > state.tail_seq
-                || state.tail_seq > crate::log::feed::MAX_SEQ
-                || (state.base_seq == 0 && state.base_hash != [0; 32])
-                || (state.tail_seq == 0 && state.tail_hash != [0; 32])
-                || (state.base_seq == state.tail_seq && state.base_hash != state.tail_hash)
-                || (state.pending_witness != 0
-                    && (state.pending_witness <= state.base_seq
-                        || state.pending_witness > state.tail_seq))
-            {
-                return Err(invalid("legacy provisional state binding"));
-            }
-        }
+
         if next_package == 0
             || active.key_tip >= next_package
             || (packages_ready && packages_cursor.is_some())
@@ -841,9 +686,6 @@ impl Directory {
             active,
             provisional,
             retired_provisional,
-            legacy_provisional,
-            legacy_required,
-            provisional_attached: false,
             provisional_hidden: false,
             next_page,
             next_provisional,
@@ -1244,7 +1086,6 @@ impl Source<'_> {
 pub(crate) struct EntryIndex {
     cache: RefCell<PageCache>,
     cache_revision: Cell<u64>,
-    legacy_attached: Cell<Option<LegacyProvisionalOwner>>,
     provisional_hidden: Cell<bool>,
 }
 
@@ -1265,6 +1106,27 @@ pub(crate) struct Read<'a> {
 }
 
 impl EntryIndex {
+    pub(crate) fn require_current_format(
+        &self,
+        store: &Store,
+        sek: &Sek,
+        channel: &Digest32,
+    ) -> Result<()> {
+        let snapshot = store.snapshot()?;
+        let source = Source::Snapshot(&snapshot);
+        let bytes = source
+            .open(sek, channel, SegmentKind::EntryIndex, DIRECTORY)?
+            .ok_or(invalid("current room entry index directory missing"))?;
+        let mut decoder = Decoder::new(&bytes);
+        decoder.array()?;
+        decoder.uint()?;
+        let active = Roots::read(&mut decoder)?;
+        if !active.sparse.enabled {
+            return Err(invalid("current room entry index format differs"));
+        }
+        Ok(())
+    }
+
     pub(crate) fn read<'a>(
         &'a self,
         store: &Store,
@@ -1277,9 +1139,7 @@ impl EntryIndex {
             .open(sek, channel, SegmentKind::EntryIndex, DIRECTORY)?
             .ok_or(invalid("entry index directory missing"))?;
         let mut directory = Directory::parse(&bytes)?;
-        directory.provisional_attached = directory
-            .legacy_provisional
-            .is_some_and(|s| Some(s.owner) == self.legacy_attached.get());
+
         directory.provisional_hidden = self.provisional_hidden.get();
         if directory.phase == Phase::Rebuilding {
             return Err(invalid("entry index publication incomplete"));
@@ -1308,9 +1168,7 @@ impl Read<'_> {
         Source::Cached(&self.snapshot, self.cache)
     }
     pub(crate) fn staged(&self, author: &Digest32, seq: u64) -> Result<bool> {
-        if self.directory.provisional_hidden
-            || (self.directory.legacy_provisional.is_some() && !self.directory.provisional_attached)
-        {
+        if self.directory.provisional_hidden {
             return Ok(false);
         }
         Ok(self
@@ -1369,10 +1227,7 @@ fn find_position(
         (directory.provisional.sequence, SegmentKind::ProvisionalLog),
         (directory.active.sequence, SegmentKind::LogDb),
     ] {
-        if kind == SegmentKind::ProvisionalLog
-            && (directory.provisional_hidden
-                || (directory.legacy_provisional.is_some() && !directory.provisional_attached))
-        {
+        if kind == SegmentKind::ProvisionalLog && (directory.provisional_hidden) {
             continue;
         }
         if let Some(at) = source.find(sek, channel, root, &key)? {
@@ -1396,10 +1251,7 @@ fn find_hash(
         (directory.provisional.hash, SegmentKind::ProvisionalLog),
         (directory.active.hash, SegmentKind::LogDb),
     ] {
-        if kind == SegmentKind::ProvisionalLog
-            && (directory.provisional_hidden
-                || (directory.legacy_provisional.is_some() && !directory.provisional_attached))
-        {
+        if kind == SegmentKind::ProvisionalLog && (directory.provisional_hidden) {
             continue;
         }
         if let Some(at) = source.find(sek, channel, root, &hashed(hash))? {
@@ -1513,9 +1365,7 @@ impl EntryIndex {
                 None => Directory::default(),
             };
         directory.ensure_instance()?;
-        directory.provisional_attached = directory
-            .legacy_provisional
-            .is_some_and(|s| Some(s.owner) == self.legacy_attached.get());
+
         directory.provisional_hidden = self.provisional_hidden.get();
         Ok(Write {
             kind: SegmentKind::EntryIndex,
@@ -1740,21 +1590,7 @@ impl<'s> Write<'_, 's> {
         if self.directory.phase != Phase::Idle {
             return Err(invalid("entry index publication in progress"));
         }
-        if let Some(state) = self.directory.legacy_provisional {
-            if !self.directory.provisional_attached
-                || state.owner.author != entry.skeleton.author_id
-                || entry.skeleton.channel_id != *self.channel
-                || entry.skeleton.v2.is_some()
-                || entry.skeleton.seq <= state.base_seq
-                || (state.pending_witness != 0 && entry.skeleton.seq != state.pending_witness)
-                || entry.skeleton.seq > state.tail_seq.saturating_add(1)
-                || (entry.skeleton.seq == state.tail_seq + 1
-                    && entry.skeleton.prev_hash != state.tail_hash)
-                || (!entry.is_signed() && entry.payload.is_some())
-            {
-                return Err(invalid("legacy provisional stage ownership or linkage"));
-            }
-        }
+
         let existing = Source::Batch(self.batch).find(
             self.sek,
             self.channel,
@@ -1789,19 +1625,7 @@ impl<'s> Write<'_, 's> {
         self.batch
             .put_segment(self.channel, SegmentKind::ProvisionalLog, id, &sealed)?;
         self.directory.provisional = self.index(self.directory.provisional, entry, id)?;
-        if let Some(state) = &mut self.directory.legacy_provisional {
-            if entry.skeleton.seq == 1 {
-                state.first_claimed_ms = entry.skeleton.claimed_ms;
-            }
-            if entry.skeleton.seq >= state.tail_seq {
-                state.tail_seq = entry.skeleton.seq;
-                state.tail_hash = entry.entry_hash();
-                state.ended = entry.skeleton.end_of_feed;
-            }
-            if entry.is_signed() {
-                state.pending_witness = state.pending_witness.max(entry.skeleton.seq);
-            }
-        }
+
         Ok(id)
     }
     pub(crate) fn seal(&mut self) -> Result<()> {
@@ -2217,38 +2041,7 @@ impl Write<'_, '_> {
                 .restart
                 .as_mut()
                 .ok_or(invalid("restart state missing at publication"))?;
-            if let Some(state) = &mut self.directory.legacy_provisional {
-                if state.owner.author != p.author {
-                    return Err(invalid("legacy publication owner differs"));
-                }
-                state.base_seq = accepted.seq;
-                state.base_hash = accepted.hash;
-                state.first_claimed_ms = accepted.first_claimed_ms;
-                if state.tail_seq <= state.base_seq {
-                    state.tail_seq = state.base_seq;
-                    state.tail_hash = state.base_hash;
-                    state.ended = accepted.ended;
-                }
-                if state.pending_witness <= state.base_seq {
-                    state.pending_witness = 0;
-                }
-            }
-            if let Some(required) = self.directory.legacy_required.get(&p.author).copied() {
-                if accepted.ended && accepted.seq < required.through {
-                    tracing::warn!(author = ?p.author, accepted_end = accepted.seq,
-                        refused_tip = required.through,
-                        "discarding legacy history requirement beyond accepted end of feed");
-                    self.directory.legacy_required.remove(&p.author);
-                } else if accepted.seq >= required.through
-                    && Source::Batch(self.batch)
-                        .find(self.sek, self.channel, p.work.hash, &hashed(&required.hash))?
-                        .is_some_and(|at| {
-                            at.author == required.author && at.seq == required.through
-                        })
-                {
-                    self.directory.legacy_required.remove(&p.author);
-                }
-            }
+
             restart.feeds.insert(p.author, accepted);
             if restart.feeds.len() > super::AUTHORS_HARD_LIMIT {
                 return Err(invalid("restart author bound"));
@@ -2416,72 +2209,10 @@ impl EntryIndex {
         sek: &Sek,
         channel: &Digest32,
         origin: u64,
-        mut paused_owner: impl FnMut(LegacyProvisionalOwner) -> Result<bool>,
     ) -> Result<Preparation> {
-        self.legacy_attached.set(None);
         self.provisional_hidden.set(true);
-        // Never hold a read or write transaction while the verifier opens node-owned demand.
-        let candidate = {
-            let snapshot = store.snapshot()?;
-            Source::Snapshot(&snapshot)
-                .open(sek, channel, SegmentKind::EntryIndex, DIRECTORY)?
-                .map(|bytes| Directory::parse(&bytes))
-                .transpose()?
-                .and_then(|d| d.legacy_provisional.map(|s| s.owner))
-        };
-        let verified_owner = match candidate {
-            Some(owner) => match paused_owner(owner) {
-                Ok(true) => Some(owner),
-                Ok(false) => None,
-                Err(
-                    Error::MalformedAtRest(_)
-                    | Error::AtRestUnlockFailed
-                    | Error::SizeLimitExceeded(_),
-                ) => None,
-                Err(error) => return Err(error),
-            },
-            None => None,
-        };
-        let mut preserved = false;
-        {
-            let read = self.read(store, sek, channel);
-            if let Ok(read) = &read {
-                if let Some(state) = read.directory.legacy_provisional {
-                    let owned_phase = read.directory.phase == Phase::Idle
-                        || (matches!(read.directory.phase, Phase::Building | Phase::Switched)
-                            && read.directory.promotion.as_ref().is_some_and(|p| {
-                                p.sparse_head.is_none() && p.author == state.owner.author
-                            }));
-                    preserved = Some(state.owner) == verified_owner && owned_phase;
-                }
-            }
-            // An absent/Rebuilding directory follows the existing bounded-index initialization
-            // below; malformed present directories are not silently treated as empty.
-            if let Err(error) = read {
-                if candidate.is_some() {
-                    return Err(error);
-                }
-            }
-        }
-        if preserved {
-            self.provisional_hidden.set(false); // owned roots remain detached by owner check
-        } else {
-            // This is the only orphan cleanup quantum performed by open, including when a
-            // publication needs many later rollback/retirement transactions.
-            let snapshot = store.snapshot()?;
-            let existing = Source::Snapshot(&snapshot)
-                .open(sek, channel, SegmentKind::EntryIndex, DIRECTORY)?
-                .map(|v| Directory::parse(&v))
-                .transpose()?;
-            drop(snapshot);
-            if existing
-                .as_ref()
-                .is_some_and(|d| d.phase != Phase::Rebuilding)
-                && self.cleanup_orphan_provisional(store, sek, channel)?
-                    == Preparation::CleanupPending
-            {
-                return Ok(Preparation::CleanupPending);
-            }
+        if self.cleanup_orphan_provisional(store, sek, channel)? == Preparation::CleanupPending {
+            return Ok(Preparation::CleanupPending);
         }
         // No request remains active across reopen. Recover only the capped verifier-work
         // index, in small transactions, after the existing publication crash cleanup.
@@ -2523,10 +2254,6 @@ impl EntryIndex {
             let mut fresh = Directory {
                 origin: Some(origin),
                 history_instance: directory.as_ref().map_or([0; 16], |d| d.history_instance),
-                legacy_required: directory
-                    .as_ref()
-                    .map(|d| d.legacy_required.clone())
-                    .unwrap_or_default(),
                 ..Directory::default()
             };
             fresh.ensure_instance()?;
@@ -2621,9 +2348,7 @@ impl EntryIndex {
                 Phase::Building | Phase::Switched => {
                     let cleaned = writer.cleanup_chunk()?;
                     let empty = writer.directory.provisional == Roots::default();
-                    if cleaned && empty {
-                        writer.directory.legacy_provisional = None;
-                    }
+
                     // Never add an unbounded second phase to this publication quantum.
                     (cleaned && empty, true)
                 }
@@ -2721,27 +2446,18 @@ impl Write<'_, '_> {
             return Err(invalid("provisional quarantine requires idle publication"));
         }
         if self.directory.provisional == Roots::default() {
-            if self.directory.legacy_provisional.is_none() {
-                return Ok((true, false));
-            }
-            let _budget = ProvisionalCleanupBudget::new(&self.directory)?;
-            self.directory.legacy_provisional = None;
-            return Ok((true, true));
+            return Ok((true, false));
         }
         if self.directory.retired_provisional != Roots::default() {
-            let (roots, mut changed) =
-                self.discard_provisional_roots(self.directory.provisional)?;
+            let (roots, changed) = self.discard_provisional_roots(self.directory.provisional)?;
             self.directory.provisional = roots;
             let done = roots == Roots::default();
-            if done {
-                changed |= self.directory.legacy_provisional.take().is_some();
-            }
+
             return Ok((done, changed));
         }
         let _budget = ProvisionalCleanupBudget::new(&self.directory)?;
         self.directory.retired_provisional = self.directory.provisional;
         self.directory.provisional = Roots::default();
-        self.directory.legacy_provisional = None;
         Ok((true, true))
     }
 
@@ -2830,422 +2546,6 @@ impl Write<'_, '_> {
             return Err(invalid("provisional cleanup locator roots disagree"));
         }
         Ok((roots, changed))
-    }
-}
-
-/// Compact progress of an owned legacy witness.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct LegacyPublicationProgress {
-    pub from: u64,
-    pub through: u64,
-    pub after_log: u64,
-    pub switched: bool,
-}
-
-impl Read<'_> {
-    pub(crate) fn legacy_required(&self, author: &Digest32) -> Option<LegacyRequired> {
-        self.directory.legacy_required.get(author).copied()
-    }
-    pub(crate) fn legacy_required_any(&self) -> bool {
-        !self.directory.legacy_required.is_empty()
-    }
-    pub(crate) fn legacy_required_page(
-        &self,
-        after: Option<Digest32>,
-        limit: usize,
-    ) -> Vec<LegacyRequired> {
-        use std::ops::Bound::{Excluded, Unbounded};
-        self.directory
-            .legacy_required
-            .range((after.map_or(Unbounded, Excluded), Unbounded))
-            .take(limit.min(16))
-            .map(|(_, tip)| *tip)
-            .collect()
-    }
-}
-
-impl Write<'_, '_> {
-    /// Resolve an impossible requirement in the same Batch that persists its refusal.
-    /// This releases a blocker only; it never claims the advertised tip was accepted.
-    pub(crate) fn resolve_legacy_required_invalid(
-        &mut self,
-        author: &Digest32,
-        refused_from: u64,
-    ) -> bool {
-        if self
-            .directory
-            .legacy_required
-            .get(author)
-            .is_some_and(|tip| tip.through >= refused_from)
-        {
-            tracing::warn!(
-                ?author,
-                refused_from,
-                "discarding legacy history requirement in refused feed suffix"
-            );
-            self.directory.legacy_required.remove(author);
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Caller verified the retained current-author signature and exact room/epoch. This
-    /// setter cannot accept history; a conflict retains the earlier obligation unchanged.
-    pub(crate) fn note_legacy_required(&mut self, tip: LegacyRequired) -> Result<bool> {
-        if self.directory.active.sparse.enabled
-            || tip.through == 0
-            || tip.through > crate::log::feed::MAX_SEQ
-        {
-            return Err(invalid("legacy required tip bounds"));
-        }
-        let accepted = self
-            .directory
-            .restart
-            .as_ref()
-            .and_then(|r| r.feeds.get(&tip.author));
-        if accepted.is_some_and(|f| f.ended && f.seq < tip.through) {
-            return Err(Error::StreamRefused(
-                "legacy tip extends accepted end of feed",
-            ));
-        }
-        if let Some(old) = self.directory.legacy_required.get(&tip.author) {
-            if old.through > tip.through {
-                return Ok(false);
-            }
-            if old.through == tip.through {
-                if old.hash != tip.hash {
-                    return Err(Error::MalformedBundle(
-                        "conflicting authenticated legacy tip",
-                    ));
-                }
-                return Ok(false);
-            }
-        }
-        if accepted.is_some_and(|f| f.seq >= tip.through) {
-            if Source::Batch(self.batch)
-                .find(
-                    self.sek,
-                    self.channel,
-                    self.directory.active.hash,
-                    &hashed(&tip.hash),
-                )?
-                .is_some_and(|at| at.author == tip.author && at.seq == tip.through)
-            {
-                return Ok(false);
-            }
-            return Err(Error::MalformedBundle(
-                "authenticated legacy tip conflicts with accepted feed",
-            ));
-        }
-        if !self.directory.legacy_required.contains_key(&tip.author)
-            && self.directory.legacy_required.len() >= super::AUTHORS_HARD_LIMIT
-        {
-            return Err(Error::SizeLimitExceeded("legacy required authors"));
-        }
-        self.directory.legacy_required.insert(tip.author, tip);
-        Ok(true)
-    }
-}
-
-impl Read<'_> {
-    pub(crate) fn legacy_provisional(&self) -> Option<LegacyProvisionalState> {
-        self.directory.legacy_provisional
-    }
-    pub(crate) fn legacy_publication(
-        &self,
-        owner: LegacyProvisionalOwner,
-    ) -> Result<Option<LegacyPublicationProgress>> {
-        if self
-            .directory
-            .legacy_provisional
-            .is_none_or(|s| s.owner != owner)
-        {
-            return Err(invalid("legacy provisional owner changed"));
-        }
-        Ok(self
-            .directory
-            .promotion
-            .as_ref()
-            .map(|p| LegacyPublicationProgress {
-                from: p.from,
-                through: p.through,
-                after_log: p.after_log,
-                switched: self.directory.phase == Phase::Switched,
-            }))
-    }
-}
-
-impl EntryIndex {
-    pub(crate) fn bind_legacy_provisional(
-        &self,
-        store: &Store,
-        sek: &Sek,
-        channel: &Digest32,
-        owner: LegacyProvisionalOwner,
-    ) -> Result<LegacyProvisionalState> {
-        if self.provisional_hidden.get() {
-            return Err(invalid("legacy provisional cleanup pending"));
-        }
-        let mut batch = store.batch()?;
-        let mut writer = self.write(&mut batch, sek, channel)?;
-        if let Some(state) = writer.directory.legacy_provisional {
-            if state.owner != owner {
-                return Err(invalid("another legacy request owns provisional state"));
-            }
-            drop(writer);
-            drop(batch);
-            return self.attach_legacy_provisional(store, sek, channel, owner);
-        }
-        // Only explicit legacy staging waits here. Normal current entries can continue
-        // using the independent active/provisional roots during local retirement.
-        if writer.directory.retired_provisional != Roots::default() {
-            return Err(Error::StreamRefused(
-                "legacy history waits for retired staging cleanup",
-            ));
-        }
-        if writer.directory.phase != Phase::Idle
-            || writer.directory.active.sparse.enabled
-            || writer.directory.history_instance != owner.instance
-            || writer.directory.provisional != Roots::default()
-        {
-            return Err(invalid(
-                "legacy provisional bind requires empty matching legacy room",
-            ));
-        }
-        let base = writer
-            .directory
-            .restart
-            .as_ref()
-            .ok_or(invalid("legacy restart state missing"))?
-            .feeds
-            .get(&owner.author)
-            .cloned()
-            .unwrap_or_default();
-        let state = LegacyProvisionalState {
-            owner,
-            base_seq: base.seq,
-            base_hash: base.hash,
-            tail_seq: base.seq,
-            tail_hash: base.hash,
-            first_claimed_ms: base.first_claimed_ms,
-            ended: base.ended,
-            pending_witness: 0,
-        };
-        writer.directory.legacy_provisional = Some(state);
-        writer.seal()?;
-        batch.commit()?;
-        self.committed();
-        self.legacy_attached.set(Some(owner));
-        Ok(state)
-    }
-    pub(crate) fn attach_legacy_provisional(
-        &self,
-        store: &Store,
-        sek: &Sek,
-        channel: &Digest32,
-        owner: LegacyProvisionalOwner,
-    ) -> Result<LegacyProvisionalState> {
-        if self.provisional_hidden.get() {
-            return Err(invalid("legacy provisional cleanup pending"));
-        }
-        let read = self.read(store, sek, channel)?;
-        let state = read
-            .directory
-            .legacy_provisional
-            .filter(|s| s.owner == owner)
-            .ok_or(invalid("legacy provisional owner changed"))?;
-        let base = read
-            .directory
-            .restart
-            .as_ref()
-            .and_then(|r| r.feeds.get(&owner.author))
-            .cloned()
-            .unwrap_or_default();
-        if base.seq != state.base_seq || base.hash != state.base_hash {
-            return Err(invalid("legacy provisional base or witness changed"));
-        }
-        self.legacy_attached.set(Some(owner));
-        Ok(state)
-    }
-    pub(crate) fn detach_legacy_provisional(&self, owner: LegacyProvisionalOwner) -> Result<()> {
-        match self.legacy_attached.get() {
-            Some(actual) if actual != owner => Err(invalid("legacy detach owner differs")),
-            _ => {
-                self.legacy_attached.set(None);
-                Ok(())
-            }
-        }
-    }
-    /// One exact-owner cleanup transaction. Foreign work is untouched; no-op paths do not seal.
-    pub(crate) fn cleanup_legacy_provisional(
-        &self,
-        store: &Store,
-        sek: &Sek,
-        channel: &Digest32,
-        owner: LegacyProvisionalOwner,
-    ) -> Result<bool> {
-        let mut batch = store.batch()?;
-        let mut writer = self.write(&mut batch, sek, channel)?;
-        if writer
-            .directory
-            .legacy_provisional
-            .is_none_or(|s| s.owner != owner)
-        {
-            return Ok(true);
-        }
-        if self.legacy_attached.get() == Some(owner) {
-            self.legacy_attached.set(None);
-        }
-        let (done, changed) = if matches!(writer.directory.phase, Phase::Building | Phase::Switched)
-        {
-            let promotion = writer
-                .directory
-                .promotion
-                .as_ref()
-                .ok_or(invalid("legacy cleanup promotion missing"))?;
-            if promotion.author != owner.author || promotion.sparse_head.is_some() {
-                return Err(invalid("legacy cleanup promotion owner differs"));
-            }
-            let cleanup_done = writer.cleanup_chunk()?;
-            let done = cleanup_done && writer.directory.provisional == Roots::default();
-            if done {
-                writer.directory.legacy_provisional = None;
-            }
-            (done, true)
-        } else if writer.directory.phase == Phase::Idle {
-            writer.quarantine_provisional()?
-        } else {
-            return Err(invalid("legacy cleanup during rebuild"));
-        };
-        if changed {
-            writer.seal()?;
-            batch.commit()?;
-            self.committed();
-        }
-        if done {
-            self.provisional_hidden.set(false);
-        }
-        Ok(done)
-    }
-    pub(crate) fn cleanup_legacy_publication(
-        &self,
-        store: &Store,
-        sek: &Sek,
-        channel: &Digest32,
-        owner: LegacyProvisionalOwner,
-    ) -> Result<bool> {
-        let mut batch = store.batch()?;
-        let mut writer = self.write(&mut batch, sek, channel)?;
-        match writer.directory.legacy_provisional {
-            None => return Ok(true),
-            Some(state) if state.owner != owner => {
-                return Err(invalid("legacy cleanup owner changed"))
-            }
-            Some(_) => {}
-        }
-        if writer.directory.phase == Phase::Idle && writer.directory.promotion.is_none() {
-            if writer.directory.provisional == Roots::default() {
-                writer.directory.legacy_provisional = None;
-                writer.seal()?;
-                batch.commit()?;
-                self.committed();
-                self.legacy_attached.set(None);
-            }
-            return Ok(true);
-        }
-        let promotion = writer
-            .directory
-            .promotion
-            .as_ref()
-            .ok_or(invalid("legacy cleanup publication absent"))?;
-        if writer.directory.phase != Phase::Switched
-            || promotion.author != owner.author
-            || promotion.sparse_head.is_some()
-        {
-            return Err(invalid("legacy cleanup publication phase differs"));
-        }
-        let done = writer.cleanup_chunk()?;
-        if done && writer.directory.provisional == Roots::default() {
-            writer.directory.legacy_provisional = None;
-            self.legacy_attached.set(None);
-        }
-        writer.seal()?;
-        batch.commit()?;
-        self.committed();
-        Ok(done)
-    }
-    pub(crate) fn begin_legacy_publication(
-        &self,
-        store: &Store,
-        sek: &Sek,
-        channel: &Digest32,
-        owner: LegacyProvisionalOwner,
-        publication: Publication<'_>,
-    ) -> Result<()> {
-        let mut batch = store.batch()?;
-        let mut writer = self.write(&mut batch, sek, channel)?;
-        let state = writer
-            .directory
-            .legacy_provisional
-            .filter(|s| s.owner == owner)
-            .ok_or(invalid("legacy publication owner changed"))?;
-        if !writer.directory.provisional_attached
-            || publication.witness.skeleton.author_id != owner.author
-            || publication.from != state.base_seq.saturating_add(1)
-            || publication.witness.skeleton.seq != state.pending_witness
-        {
-            return Err(invalid("legacy publication binding"));
-        }
-        writer.begin_promotion(publication)?;
-        writer.seal()?;
-        batch.commit()?;
-        self.committed();
-        Ok(())
-    }
-    pub(crate) fn advance_legacy_publication(
-        &self,
-        store: &Store,
-        sek: &Sek,
-        channel: &Digest32,
-        owner: LegacyProvisionalOwner,
-    ) -> Result<bool> {
-        let mut batch = store.batch()?;
-        let mut writer = self.write(&mut batch, sek, channel)?;
-        if writer
-            .directory
-            .legacy_provisional
-            .is_none_or(|s| s.owner != owner)
-            || !writer.directory.provisional_attached
-            || writer.directory.phase != Phase::Building
-        {
-            return Err(invalid("legacy publication owner or phase changed"));
-        }
-        let promotion = writer
-            .directory
-            .promotion
-            .as_ref()
-            .ok_or(invalid("legacy publication absent"))?;
-        if promotion.sparse_head.is_some() || promotion.author != owner.author {
-            return Err(invalid("legacy publication author differs"));
-        }
-        let ready = if promotion.cursor <= promotion.through {
-            writer.promotion_chunk()?;
-            writer
-                .directory
-                .promotion
-                .as_ref()
-                .is_some_and(|p| p.cursor > p.through)
-                && writer.directory.work.is_empty()
-        } else if writer.directory.work.is_empty() {
-            return Ok(true);
-        } else {
-            writer.fact_chunk()?
-        };
-        writer.seal()?;
-        batch.commit()?;
-        self.committed();
-        Ok(ready)
     }
 }
 
@@ -3448,9 +2748,7 @@ impl EntryIndex {
             .open(sek, channel, SegmentKind::EntryIndex, DIRECTORY)?
             .ok_or(invalid("entry index directory missing"))?;
         let mut directory = Directory::parse(&bytes)?;
-        directory.provisional_attached = directory
-            .legacy_provisional
-            .is_some_and(|s| Some(s.owner) == self.legacy_attached.get());
+
         directory.provisional_hidden = self.provisional_hidden.get();
         Ok(View {
             transaction,

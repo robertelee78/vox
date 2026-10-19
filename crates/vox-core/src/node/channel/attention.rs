@@ -17,8 +17,8 @@ impl ChannelState {
         // Attention is local bookkeeping over Sessions this node already holds: who is
         // addressed, what is resolved. Nothing here releases a key or chooses an audience, so
         // it answers from known state while the fold catches up (ADR-037 R4); only the
-        // legacy-recovery gate stays, as on every opened path (R3).
-        self.require_legacy_current(store)
+        // current-format integrity guard applies, as on every opened path (R3).
+        self.require_supported_format(store)
             .map_err(|e| e.to_string())?;
         let instance = self.history_instance(store).map_err(|e| e.to_string())?;
         if matches!(operation, Operation::Maintain) {

@@ -381,7 +381,7 @@ impl ChannelState {
     }
 
     /// Whether the legacy indexes have scanned every public position. Encrypted legacy drive
-    /// generations can live in ordinary Content, so only explicit legacy recovery may satisfy
+    /// generations can live in ordinary Content, so only explicitly requested history may satisfy
     /// this predicate when a sparse room omitted those bodies.
     fn legacy_private_controls_ready(&self, store: &Store) -> Result<bool> {
         if self.private_sessions.controls_import || self.private_sessions.restoring {

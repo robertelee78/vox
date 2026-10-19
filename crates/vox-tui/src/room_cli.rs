@@ -163,7 +163,11 @@ pub(crate) async fn room_of(client: &mut IpcClient, prefix: &str) -> Result<Dige
     // A closed room's name is sealed in its manifest, so a node that has not opened it does
     // not know it: the name here is empty, and printing it said `room "" is not open` (#208).
     // Named by the id the operator typed a prefix of, and by its name only when there is one.
-    if let Some((_, name, false, _, preparing)) = rooms.iter().find(|(r, _, _, _, _)| *r == id) {
+    if let Some((_, name, false, status, preparing)) = rooms.iter().find(|(r, _, _, _, _)| *r == id)
+    {
+        if status == vox_core::node::api::Fault::UnsupportedRoomFormat.explain() {
+            return Err(AppError::Usage(status.clone()));
+        }
         if *preparing {
             return Err(AppError::Usage(
                 vox_core::node::api::Fault::RoomPreparing.explain().into(),

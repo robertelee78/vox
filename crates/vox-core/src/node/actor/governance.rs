@@ -207,25 +207,7 @@ impl Node {
             }
         };
         self.governance_work.again |= progress.pending;
-        match channel.legacy_cache_only(&store) {
-            Ok(true) => {
-                // Current trust narrowing is still immediate; all publication-dependent
-                // writes await explicit recovery. Never busy-loop on a parked cursor.
-                if let Err(error) = channel.forget_keys_except(&store, &self.trust.trusted()) {
-                    channel.poison(&error);
-                }
-                drop(channel);
-                if progress.changed {
-                    self.publish().await;
-                }
-                return;
-            }
-            Ok(false) => {}
-            Err(error) => {
-                channel.poison(&error);
-                return;
-            }
-        }
+
         let backfilled = match channel.advance_governance_backfill(&store, self.now_ms()) {
             Ok(count) => count,
             Err(error) => {

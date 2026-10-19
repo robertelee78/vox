@@ -46,7 +46,8 @@ pub struct ChannelSummary {
     /// Number of accepted log entries (0 while closed).
     pub entries: u64,
     /// Whether the room is over for this node, in plain words (V030-08): this identity left it,
-    /// or it ended. `None` while it is going on, and while it is closed.
+    /// or it ended. A refused unsupported closed room carries its actionable refusal here.
+    /// `None` while it is going on or ordinarily closed.
     pub over: Option<String>,
 }
 
@@ -1372,8 +1373,8 @@ pub enum Fault {
     ChannelNotOpen,
     /// Identity is Ready; this room is still preparing its saved state.
     RoomPreparing,
-    /// Explicit legacy recovery must resume before this room accepts a new post.
-    LegacyHistoryRequired,
+    /// The room uses a format older than v0.4.5 and cannot be opened.
+    UnsupportedRoomFormat,
     /// An input exceeded its bound (name or text length).
     TooLong,
     /// A trust add or remove needs the identity passphrase: it was not entered for a keyring
@@ -1617,8 +1618,8 @@ impl Fault {
             Fault::RoomPreparing => {
                 "that room is preparing its saved history; the node is Ready, and the room will become available when preparation finishes — no passphrase is needed"
             }
-            Fault::LegacyHistoryRequired => {
-                "Legacy history required; resume explicit recovery before posting in this room"
+            Fault::UnsupportedRoomFormat => {
+                "This room uses an unsupported pre-v0.4.5 format; leave it and create a new one."
             }
             Fault::ChannelNotOpen => {
                 "that room is not open on this node\n       open it with its passphrase: a line holding the room's id and its passphrase to `vox daemon`, or in `vox tui`"
@@ -1894,7 +1895,7 @@ fault_names!(
     UnknownChannel,
     ChannelNotOpen,
     RoomPreparing,
-    LegacyHistoryRequired,
+    UnsupportedRoomFormat,
     TooLong,
     KeyringFull,
     ServiceOffersFull,

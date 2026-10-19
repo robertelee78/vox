@@ -4748,27 +4748,7 @@ struct RoomPreparation {
     trusted: Option<BTreeSet<Digest32>>,
     removal_after: Option<Digest32>,
     consent_after: Option<Digest32>,
-    legacy_cleanup_due: Option<std::time::Instant>,
-}
-
-fn retained_legacy_owner_for(
-    retained: Option<(
-        Digest32,
-        crate::node::history_stream::RequestId,
-        [u8; 16],
-        Digest32,
-    )>,
-    room: Digest32,
-) -> Option<crate::node::channel::legacy_provisional::LegacyProvisionalOwner> {
-    retained
-        .filter(|(saved_room, _, _, _)| *saved_room == room)
-        .map(|(_, request, instance, author)| {
-            crate::node::channel::legacy_provisional::LegacyProvisionalOwner {
-                request,
-                instance,
-                author,
-            }
-        })
+    publication_cleanup_due: Option<std::time::Instant>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -4999,20 +4979,17 @@ pub struct Node {
     /// Rooms being reopened off the actor at unlock (#208). A room leaves this set when it is
     /// held, closed, or the identity locks; a reopened room not in it is dropped, not held.
     reopening: std::collections::BTreeSet<Digest32>,
+    unsupported_rooms: std::collections::BTreeSet<Digest32>,
     /// The reopening task, aborted at lock: it holds room keys, and a locked node holds none
     /// (ADR-015).
     reopen_task: Option<tokio::task::JoinHandle<()>>,
     /// One unpublished state per room being prepared; round-robin bounded actor turns.
     preparing_rooms: BTreeMap<Digest32, RoomPreparation>,
     preparation_after: Option<Digest32>,
-    /// Bounded local reclamation after a cancelled legacy request or startup quarantine.
-    /// `Some(owner)` cleans that exact current spool first; `None` reclaims detached roots.
-    legacy_cleanup_rooms: BTreeMap<
-        Digest32,
-        Option<crate::node::channel::legacy_provisional::LegacyProvisionalOwner>,
-    >,
-    legacy_cleanup_after: Option<Digest32>,
-    legacy_cleanup_due: std::time::Instant,
+    /// Bounded local reclamation after interrupted current publication.
+    publication_cleanup_rooms: BTreeMap<Digest32, ()>,
+    publication_cleanup_after: Option<Digest32>,
+    publication_cleanup_due: std::time::Instant,
     /// One pending bit per open room; true requests a replay of retained package locators.
     key_package_rooms: BTreeMap<Digest32, bool>,
     key_package_after: Option<Digest32>,
@@ -5644,12 +5621,13 @@ impl Node {
             joining: std::collections::BTreeSet::new(),
             joins_answered: BTreeMap::new(),
             reopening: std::collections::BTreeSet::new(),
+            unsupported_rooms: std::collections::BTreeSet::new(),
             reopen_task: None,
             preparing_rooms: BTreeMap::new(),
             preparation_after: None,
-            legacy_cleanup_rooms: BTreeMap::new(),
-            legacy_cleanup_after: None,
-            legacy_cleanup_due: std::time::Instant::now(),
+            publication_cleanup_rooms: BTreeMap::new(),
+            publication_cleanup_after: None,
+            publication_cleanup_due: std::time::Instant::now(),
             key_package_rooms: BTreeMap::new(),
             key_package_after: None,
             opening_rooms: BTreeMap::new(),
@@ -5874,7 +5852,7 @@ impl Node {
         let mut maintenance_next = 0u8;
         loop {
             tokio::select! {
-                () = tokio::task::yield_now(), if self.governance_work.pending || self.room_preparation_work_ready() || (!self.legacy_cleanup_rooms.is_empty() && std::time::Instant::now() >= self.legacy_cleanup_due) || self.key_package_work_ready() => {
+                () = tokio::task::yield_now(), if self.governance_work.pending || self.room_preparation_work_ready() || (!self.publication_cleanup_rooms.is_empty() && std::time::Instant::now() >= self.publication_cleanup_due) || self.key_package_work_ready() => {
                     if self.apply_computer_keyring().await.is_err() { continue; }
                     for _ in 0..4 {
                         let turn = maintenance_next;
@@ -5884,9 +5862,9 @@ impl Node {
                                 self.advance_room_preparation().await;
                                 break;
                             }
-                            1 if !self.legacy_cleanup_rooms.is_empty()
-                                && std::time::Instant::now() >= self.legacy_cleanup_due => {
-                                self.advance_legacy_cleanup().await;
+                            1 if !self.publication_cleanup_rooms.is_empty()
+                                && std::time::Instant::now() >= self.publication_cleanup_due => {
+                                self.advance_publication_cleanup().await;
                                 break;
                             }
                             2 if self.governance_work.pending => {
@@ -8786,6 +8764,9 @@ impl Node {
             }
             NetEvent::ReopenFailed { channel_id, why } => {
                 self.reopening.remove(&channel_id);
+                if why.contains(crate::node::channel::UNSUPPORTED_ROOM_FORMAT) {
+                    self.unsupported_rooms.insert(channel_id);
+                }
                 let _ = self.event_tx.send(NodeEvent::NodeNote {
                     note: format!(
                         "room {} did not reopen: {why}; it stays closed",
@@ -9248,7 +9229,13 @@ impl Node {
                         self.queue_room_preparation(ch, Some(reply), false);
                         return;
                     }
-                    Err(e) => Some(Outcome::Failed(fault_of(&e))),
+                    Err(e) => {
+                        let fault = fault_of(&e);
+                        if fault == Fault::UnsupportedRoomFormat {
+                            self.unsupported_rooms.insert(channel_id);
+                        }
+                        Some(Outcome::Failed(fault))
+                    }
                 };
                 if let Some(outcome) = outcome {
                     self.answer_when_published(channel_id, reply, outcome).await;
@@ -10598,7 +10585,6 @@ impl Node {
                         .is_some_and(|p| p.token == token)
                 {
                     self.accept_history_demand();
-                    self.queue_cancelled_legacy_cleanup();
                 }
             }
             NetEvent::RoomHistory {
@@ -10648,6 +10634,9 @@ impl Node {
                             }
                             other => other,
                         }
+                    }
+                    _ if self.unsupported_rooms.contains(&channel_id) => {
+                        Err(crate::node::channel::UNSUPPORTED_ROOM_FORMAT.into())
                     }
                     _ => Err("room not open".into()),
                 };
@@ -14375,7 +14364,7 @@ impl Node {
     /// started.
     async fn schedule(&mut self) -> bool {
         self.accept_history_demand();
-        self.queue_cancelled_legacy_cleanup();
+
         self.accept_bounded_sync();
         if self.net.is_none() {
             self.sched_rooms.clear();
@@ -17534,9 +17523,9 @@ impl Node {
             }
         }
         self.preparation_after = None;
-        self.legacy_cleanup_rooms.clear();
-        self.legacy_cleanup_after = None;
-        self.legacy_cleanup_due = std::time::Instant::now();
+        self.publication_cleanup_rooms.clear();
+        self.publication_cleanup_after = None;
+        self.publication_cleanup_due = std::time::Instant::now();
         self.key_package_rooms.clear();
         self.key_package_after = None;
         for (_, waiting) in std::mem::take(&mut self.publish_waiters) {
@@ -17560,6 +17549,7 @@ impl Node {
             task.abort();
         }
         self.reopening.clear();
+        self.unsupported_rooms.clear();
         // An aborted joiner never reports back, so nothing is being joined any more, and what was
         // held for the join goes with the network.
         self.joining.clear();
@@ -17989,7 +17979,7 @@ impl Node {
         // re-verifies its whole log, and that runs **off the actor**, one room at a time, each
         // held as soon as it is open: with many rooms, a reopen on the actor answered nobody until
         // the last one was open.
-        let (store, rooms, me, retained_legacy) = {
+        let (store, rooms, me) = {
             let Some(profile) = self.profile.as_ref() else {
                 return;
             };
@@ -18005,11 +17995,7 @@ impl Node {
                 .filter(|(id, _)| !self.channels.contains_key(*id))
                 .map(|(id, keys)| (*id, keys.sek.clone(), keys.passphrase.clone()))
                 .collect();
-            let Ok(retained_legacy) = crate::node::history_demand::retained_legacy_owner(profile)
-            else {
-                return;
-            };
-            (profile.store_handle(), rooms, me, retained_legacy)
+            (profile.store_handle(), rooms, me)
         };
         if rooms.is_empty() {
             return;
@@ -18020,7 +18006,6 @@ impl Node {
         let task = tokio::spawn(async move {
             for (id, sek, passphrase) in rooms {
                 let store = Arc::clone(&store);
-                let paused_legacy_owner = retained_legacy_owner_for(retained_legacy, id);
                 // The room's key and passphrase go to a blocking thread, which a lock waits for
                 // (V210-94).
                 let opened = secret_blocking(&secret_work, move || {
@@ -18035,16 +18020,8 @@ impl Node {
                     if let Ok(why) = std::env::var(TEST_REOPEN_FAILS_ENV) {
                         return Err(Some(why));
                     }
-                    ChannelState::open_with_sek_owned(
-                        &store,
-                        &id,
-                        sek,
-                        &passphrase,
-                        me,
-                        now_ms,
-                        paused_legacy_owner,
-                    )
-                    .map_err(|e| Some(e.to_string()))
+                    ChannelState::open_with_sek_owned(&store, &id, sek, &passphrase, me, now_ms)
+                        .map_err(|e| Some(e.to_string()))
                 })
                 .await;
                 let event = match opened {
@@ -18117,14 +18094,6 @@ impl Node {
                 return;
             }
         };
-        let paused_legacy_owner = match crate::node::history_demand::retained_legacy_owner(profile)
-        {
-            Ok(retained) => retained_legacy_owner_for(retained, channel_id),
-            Err(e) => {
-                let _ = reply.send(Outcome::Failed(fault_of(&e)));
-                return;
-            }
-        };
         let me = crate::identity::composite::RootSigner::fingerprint(&*signer);
         let store = profile.store_handle();
         let tx = self.net_tx.clone();
@@ -18137,15 +18106,7 @@ impl Node {
                     .ok_or(Error::Profile("no such room on this node"))?;
                 let factor = crate::atrest::idfactor::SignatureIdentityFactor::new(&*signer);
                 let sek = wrap.unwrap_sek(&factor, &channel_id, &passphrase)?;
-                ChannelState::open_with_sek_owned(
-                    &store,
-                    &channel_id,
-                    sek,
-                    &passphrase,
-                    me,
-                    now_ms,
-                    paused_legacy_owner,
-                )
+                ChannelState::open_with_sek_owned(&store, &channel_id, sek, &passphrase, me, now_ms)
             })
             .await
             .unwrap_or(Err(Error::Argon2Failed));
@@ -18180,8 +18141,8 @@ impl Node {
         self.preparing_rooms.insert(
             id,
             RoomPreparation {
-                legacy_cleanup_due: channel
-                    .legacy_startup_cleanup_blocks_current()
+                publication_cleanup_due: channel
+                    .publication_cleanup_blocks_current()
                     .then_some(std::time::Instant::now()),
                 channel: tokio::sync::Mutex::new(channel),
                 reply,
@@ -18198,62 +18159,47 @@ impl Node {
         self.publication_pending
             || self.preparing_rooms.values().any(|prepared| {
                 prepared
-                    .legacy_cleanup_due
+                    .publication_cleanup_due
                     .is_none_or(|due| std::time::Instant::now() >= due)
             })
     }
 
-    fn queue_cancelled_legacy_cleanup(&mut self) {
-        if let Some((room, owner)) = self.history_demand.take_legacy_cleanup() {
-            self.legacy_cleanup_rooms.insert(room, Some(owner));
-            self.legacy_cleanup_due = std::time::Instant::now();
-        }
-    }
-
     /// Advance one room's exact cancellation or detached startup cleanup. Failures are reported
     /// and left for reopen instead of spinning the actor and starving commands.
-    async fn advance_legacy_cleanup(&mut self) {
+    async fn advance_publication_cleanup(&mut self) {
         use std::ops::Bound::{Excluded, Unbounded};
         let id = self
-            .legacy_cleanup_after
+            .publication_cleanup_after
             .and_then(|after| {
-                self.legacy_cleanup_rooms
+                self.publication_cleanup_rooms
                     .range((Excluded(after), Unbounded))
                     .next()
                     .map(|(id, _)| *id)
             })
             .or_else(|| {
-                self.legacy_cleanup_rooms
+                self.publication_cleanup_rooms
                     .first_key_value()
                     .map(|(id, _)| *id)
             });
         let Some(id) = id else { return };
-        self.legacy_cleanup_after = Some(id);
-        let owner = self.legacy_cleanup_rooms.get(&id).copied().flatten();
+        self.publication_cleanup_after = Some(id);
 
         enum Turn {
-            Again(Option<crate::node::channel::legacy_provisional::LegacyProvisionalOwner>),
+            Again,
             Done,
             Failed(String),
         }
         let store = match self.profile.as_ref() {
             Some(profile) => profile.store_handle(),
             None => {
-                self.legacy_cleanup_rooms.clear();
+                self.publication_cleanup_rooms.clear();
                 return;
             }
         };
         let apply = |room: &mut ChannelState| -> crate::error::Result<Turn> {
-            if let Some(owner) = owner {
-                if !room.cleanup_legacy_provisional(&store, owner)? {
-                    return Ok(Turn::Again(Some(owner)));
-                }
-                room.schedule_legacy_startup_cleanup();
-                return Ok(Turn::Again(None));
-            }
-            room.advance_legacy_startup_cleanup(&store)?;
-            Ok(if room.legacy_startup_cleanup_pending() {
-                Turn::Again(None)
+            room.advance_publication_cleanup(&store)?;
+            Ok(if room.publication_cleanup_pending() {
+                Turn::Again
             } else {
                 Turn::Done
             })
@@ -18265,31 +18211,31 @@ impl Node {
         } else if self.store_recovery.contains_key(&id) {
             // The published instance is poisoned while its replacement opens. Cleanup belongs
             // to that replacement and must retain its exact owner until it enters preparation.
-            Turn::Again(owner)
+            Turn::Again
         } else if let Some(shared) = self.channels.get(&id).cloned() {
             match shared.try_lock() {
                 Ok(mut room) => {
                     apply(&mut room).unwrap_or_else(|error| Turn::Failed(error.to_string()))
                 }
-                Err(_) => Turn::Again(owner),
+                Err(_) => Turn::Again,
             }
         } else if self.opening_rooms.contains_key(&id) || self.reopening.contains(&id) {
             // Cancellation can finish while the blocking opener still owns this room. Keep the
             // exact cleanup owner until adoption; dropping it here would preserve a stale spool.
-            Turn::Again(owner)
+            Turn::Again
         } else {
             Turn::Done
         };
         match turn {
-            Turn::Again(owner) => {
-                self.legacy_cleanup_rooms.insert(id, owner);
-                self.legacy_cleanup_due = std::time::Instant::now() + TICK;
+            Turn::Again => {
+                self.publication_cleanup_rooms.insert(id, ());
+                self.publication_cleanup_due = std::time::Instant::now() + TICK;
             }
             Turn::Done => {
-                self.legacy_cleanup_rooms.remove(&id);
+                self.publication_cleanup_rooms.remove(&id);
             }
             Turn::Failed(reason) => {
-                self.legacy_cleanup_rooms.remove(&id);
+                self.publication_cleanup_rooms.remove(&id);
                 let _ = self.event_tx.send(NodeEvent::NodeNote {
                     note: format!(
                         "room {} could not reclaim provisional history: {reason}; reopen will retry",
@@ -18333,13 +18279,21 @@ impl Node {
             .and_then(|after| {
                 self.preparing_rooms
                     .range((Excluded(after), Unbounded))
-                    .find(|(_, prepared)| prepared.legacy_cleanup_due.is_none_or(|due| now >= due))
+                    .find(|(_, prepared)| {
+                        prepared
+                            .publication_cleanup_due
+                            .is_none_or(|due| now >= due)
+                    })
                     .map(|(id, _)| *id)
             })
             .or_else(|| {
                 self.preparing_rooms
                     .iter()
-                    .find(|(_, prepared)| prepared.legacy_cleanup_due.is_none_or(|due| now >= due))
+                    .find(|(_, prepared)| {
+                        prepared
+                            .publication_cleanup_due
+                            .is_none_or(|due| now >= due)
+                    })
                     .map(|(id, _)| *id)
             });
         let Some(id) = id else { return };
@@ -18365,8 +18319,8 @@ impl Node {
             } else {
                 match self.retention_before_publication(&mut prepared).await {
                     Ok(false) => {
-                        if prepared.legacy_cleanup_due.is_none() {
-                            prepared.legacy_cleanup_due =
+                        if prepared.publication_cleanup_due.is_none() {
+                            prepared.publication_cleanup_due =
                                 Some(std::time::Instant::now() + PREPARE_RETRY);
                         }
                         self.preparing_rooms.insert(id, prepared);
@@ -18378,8 +18332,8 @@ impl Node {
                     {
                         // Current policy and classification are prerequisites for private
                         // retention/publication. Pending replay keeps this room unpublished.
-                        if prepared.legacy_cleanup_due.is_none() {
-                            prepared.legacy_cleanup_due =
+                        if prepared.publication_cleanup_due.is_none() {
+                            prepared.publication_cleanup_due =
                                 Some(std::time::Instant::now() + PREPARE_RETRY);
                         }
                         self.preparing_rooms.insert(id, prepared);
@@ -18438,42 +18392,23 @@ impl Node {
         prepared: &mut RoomPreparation,
     ) -> crate::error::Result<bool> {
         let ch = prepared.channel.get_mut();
-        if ch.legacy_startup_cleanup_blocks_current() {
+        if ch.publication_cleanup_blocks_current() {
             let profile = self.profile.as_ref().ok_or(Error::AtRestLocked)?;
-            ch.advance_legacy_startup_cleanup(profile.store())?;
-            prepared.legacy_cleanup_due = ch
-                .legacy_startup_cleanup_blocks_current()
+            ch.advance_publication_cleanup(profile.store())?;
+            prepared.publication_cleanup_due = ch
+                .publication_cleanup_blocks_current()
                 .then_some(std::time::Instant::now() + TICK);
             // Cleanup and policy/retention writes occupy separate actor turns.
             return Ok(false);
         }
-        prepared.legacy_cleanup_due = None;
+        prepared.publication_cleanup_due = None;
         {
             let profile = self.profile.as_ref().ok_or(Error::AtRestLocked)?;
             let now = self.now_ms();
             if !ch.advance_governance(profile.store(), now)?.ready {
                 return Ok(false);
             }
-            if ch.legacy_cache_only(profile.store())? {
-                // A paused exact v1 publication owns the mutable indexes. Publish only its
-                // accepted cache so Resume/Cancel remain reachable. Key release and mutation
-                // remain fenced; no private/projection/retention write enters the work roots.
-                ch.forget_keys_except(profile.store(), &self.trust.trusted())?;
-                ch.set_node_retention(
-                    profile.store(),
-                    self.node_retention.for_room(&ch.channel_id()),
-                )?;
-                ch.set_node_step_retention(
-                    profile.store(),
-                    self.node_step_retention.for_room(&ch.channel_id()),
-                )?;
-                let order = crate::node::consent_order::ConsentOrder::load(
-                    profile.store(),
-                    profile.signer()?,
-                )?;
-                ch.mark_decisions_on_open(profile.store(), &order)?;
-                return Ok(true);
-            }
+
             ch.require_governance_ready(profile.store(), now)?;
         }
         if ch.needs_session_upgrade() && ch.key_packages_pending() {
@@ -18594,9 +18529,11 @@ impl Node {
     /// Publish a room only after both shared and local retention have been applied durably.
     async fn publish_open_channel(&mut self, ch: ChannelState) -> Outcome {
         let channel_id = ch.channel_id();
-        if ch.legacy_startup_cleanup_pending() {
-            self.legacy_cleanup_rooms.entry(channel_id).or_insert(None);
-            self.legacy_cleanup_due = std::time::Instant::now();
+        if ch.publication_cleanup_pending() {
+            self.publication_cleanup_rooms
+                .entry(channel_id)
+                .or_insert(());
+            self.publication_cleanup_due = std::time::Instant::now();
         }
         // What the open set aside is reported (V210-74), as a reopen reports it.
         crate::node::status::SyncBook::note_set_aside(&self.sync_book, channel_id, ch.set_aside());
@@ -18641,7 +18578,7 @@ impl Node {
             }
         }
         self.key_package_rooms.remove(channel_id);
-        self.legacy_cleanup_rooms.remove(channel_id);
+        self.publication_cleanup_rooms.remove(channel_id);
         let preparing = self.cancel_room_preparation(channel_id, Fault::ChannelNotOpen);
         let reopening = self.reopening.remove(channel_id);
         let outcome = match self.channels.remove(channel_id) {
@@ -20638,7 +20575,7 @@ impl Node {
                     error,
                     Error::Profile(
                         "read selection changed; refresh and retry"
-                            | crate::node::channel::legacy_provisional::LEGACY_HISTORY_REQUIRED
+                            | crate::node::channel::UNSUPPORTED_ROOM_FORMAT
                             | "this identity has left the room"
                             | "this room has ended"
                     ) | Error::SizeLimitExceeded(_)
@@ -21657,7 +21594,10 @@ impl Node {
                         || self.opening_rooms.contains_key(id)
                         || self.preparing_rooms.contains_key(id),
                     entries: 0,
-                    over: None,
+                    over: self
+                        .unsupported_rooms
+                        .contains(id)
+                        .then(|| crate::node::channel::UNSUPPORTED_ROOM_FORMAT.to_owned()),
                 },
             });
         }
@@ -22812,8 +22752,8 @@ pub fn fault_of(e: &Error) -> Fault {
         Error::Profile("locked") => Fault::Locked,
         Error::Profile("no such room on this node") => Fault::UnknownChannel,
         Error::Profile(
-            "Legacy history required; resume explicit recovery before posting in this room",
-        ) => Fault::LegacyHistoryRequired,
+            "This room uses an unsupported pre-v0.4.5 format; leave it and create a new one.",
+        ) => Fault::UnsupportedRoomFormat,
         Error::Profile("room publication is busy; retry this operation") => {
             Fault::RoomChangePending
         }

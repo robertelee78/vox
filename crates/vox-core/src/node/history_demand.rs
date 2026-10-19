@@ -43,7 +43,6 @@ const RECLAIM_ROWS: u64 = ((1024 * 1024 - STATE_BYTES) / (PAGE_BYTES + PAGE_PREF
 pub struct Context {
     node: Digest32,
     scope: Digest32,
-    slot: Slot,
     store: Arc<Store>,
     key: Sek,
     cancellation: Cancellation,
@@ -102,7 +101,6 @@ impl Context {
         Ok(Self {
             node,
             scope: node_scope(node, slot),
-            slot,
             store: profile.store_handle(),
             key,
             cancellation: Cancellation(Arc::new(AtomicBool::new(false))),
@@ -234,29 +232,6 @@ impl PrivatePlan {
     }
 }
 
-/// One explicitly selected legacy prefix. The provisional spool owns its exact tail and
-/// publication cursor; this record only preserves the original local authorization.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct LegacyPlan {
-    pub author: Digest32,
-    pub from: u64,
-    pub through: u64,
-    pub expected_base: u64,
-}
-impl LegacyPlan {
-    fn validate(&self, bounds: Bounds) -> Result<()> {
-        if self.from != bounds.lo
-            || self.through != bounds.hi
-            || self.expected_base.checked_add(1) != Some(self.from)
-            || bounds.entries > 64
-        {
-            return Err(bad());
-        }
-        Ok(())
-    }
-}
-
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct State {
@@ -271,8 +246,10 @@ pub struct State {
     pub cursor: Option<Cursor>,
     #[serde(default)]
     pub(crate) private: Option<PrivatePlan>,
-    #[serde(default)]
-    pub(crate) legacy: Option<LegacyPlan>,
+    // Existing current-format request records include a null field here. Accept only
+    // null; a removed legacy recovery plan is deliberately not deserializable.
+    #[serde(default, rename = "legacy", skip_serializing)]
+    _retired: Option<()>,
     progress: Progress,
     serial: u64,
     cleanup: Option<Cleanup>,
@@ -296,23 +273,11 @@ impl State {
         self.bounds.validate()?;
         if let Some(private) = &self.private {
             private.validate(self.bounds)?;
-            if self.body.is_some() || self.cursor.is_some() || self.legacy.is_some() {
+            if self.body.is_some() || self.cursor.is_some() {
                 return Err(bad());
             }
         }
-        if let Some(legacy) = &self.legacy {
-            legacy.validate(self.bounds)?;
-            if self.body.is_some()
-                || self.cursor.is_some()
-                || (self.progress == Progress::Complete && self.remaining != 0)
-            {
-                return Err(bad());
-            }
-        }
-        let maximum_remaining = self.legacy.map_or(Ok(self.bounds.entries), |legacy| {
-            usize::try_from(legacy.through - legacy.expected_base).map_err(|_| bad())
-        })?;
-        if self.serial == 0 || self.remaining > maximum_remaining {
+        if self.serial == 0 || self.remaining > self.bounds.entries {
             return Err(bad());
         }
         if let Some(body) = &self.body {
@@ -432,43 +397,6 @@ fn node_scope(node: Digest32, slot: Slot) -> Digest32 {
     sha256(&bytes)
 }
 
-type RetainedLegacyOwner = (Digest32, RequestId, [u8; 16], Digest32);
-
-/// The exact paused legacy owner retained in the one archive slot, if there is one.
-/// Reopen uses this bounded header read before touching provisional room roots. It does not
-/// create an active handle or authorize network work; an explicit Resume is still required.
-pub(crate) fn retained_legacy_owner(profile: &Profile) -> Result<Option<RetainedLegacyOwner>> {
-    let key = crate::atrest::seal::sek(profile.signer()?, b"vox/history-demand-sek/v1")?;
-    let scope = node_scope(profile.fingerprint(), Slot::Archive);
-    let Some(segment) =
-        profile
-            .store()
-            .snapshot()?
-            .get_segment_bounded(&scope, KIND, HEADER, STATE_BYTES)?
-    else {
-        return Ok(None);
-    };
-    let state = match decode(&key, &scope, &segment) {
-        Ok(state) => state,
-        Err(
-            Error::MalformedAtRest(_) | Error::AtRestUnlockFailed | Error::SizeLimitExceeded(_),
-        ) => {
-            return Ok(None);
-        }
-        Err(error) => return Err(error),
-    };
-    let Some(plan) = state.legacy else {
-        return Ok(None);
-    };
-    Ok(
-        (!state.progress.terminal() && state.cleanup.is_none()).then_some((
-            state.binding.room,
-            state.request,
-            state.binding.instance,
-            plan.author,
-        )),
-    )
-}
 fn decode(
     key: &Sek,
     scope: &Digest32,
@@ -577,7 +505,7 @@ pub fn start(
     bounds: Bounds,
     job: &Job,
 ) -> Result<Active> {
-    start_plan(context, request, binding, bounds, None, None, job)
+    start_plan(context, request, binding, bounds, None, job)
 }
 
 pub(crate) fn start_private(
@@ -590,31 +518,15 @@ pub(crate) fn start_private(
 ) -> Result<Active> {
     bounds.validate()?;
     plan.validate(bounds)?;
-    start_plan(context, request, binding, bounds, Some(plan), None, job)
+    start_plan(context, request, binding, bounds, Some(plan), job)
 }
 
-pub(crate) fn start_legacy(
-    context: &Context,
-    request: RequestId,
-    binding: Binding,
-    bounds: Bounds,
-    plan: LegacyPlan,
-    job: &Job,
-) -> Result<Active> {
-    bounds.validate()?;
-    plan.validate(bounds)?;
-    if context.slot != Slot::Archive {
-        return Err(invalid("legacy recovery requires explicit archive demand"));
-    }
-    start_plan(context, request, binding, bounds, None, Some(plan), job)
-}
 fn start_plan(
     context: &Context,
     request: RequestId,
     binding: Binding,
     bounds: Bounds,
     private: Option<PrivatePlan>,
-    legacy: Option<LegacyPlan>,
     job: &Job,
 ) -> Result<Active> {
     let _charge = charge(job, STATE_WORK)?;
@@ -642,13 +554,11 @@ fn start_plan(
         request,
         binding,
         bounds,
-        remaining: legacy.map_or(Ok(bounds.entries), |plan| {
-            usize::try_from(plan.through - plan.expected_base).map_err(|_| bad())
-        })?,
+        remaining: bounds.entries,
         body: None,
         cursor: None,
         private,
-        legacy,
+        _retired: None,
         progress: Progress::Pending,
         serial,
         cleanup: None,
@@ -1055,42 +965,6 @@ pub(crate) fn checkpoint_private(
         return Err(invalid("private history checkpoint binding"));
     }
     state.private = Some(next);
-    state.remaining = remaining;
-    state.progress = progress;
-    put(&mut batch, key, &scope, &state)?;
-    commit(batch, active, context)?;
-    if progress.terminal() {
-        active.valid = false;
-    }
-    Ok(())
-}
-
-/// A legacy worker acknowledges only already-durable accepted prefix progress. Unsigned
-/// staging and building never decrease remaining; signed publication does. Each explicit
-/// quantum has its separate fixed bounds.entries cap, without resetting the original count.
-pub(crate) fn checkpoint_legacy(
-    context: &Context,
-    active: &mut Active,
-    expected: &LegacyPlan,
-    remaining: usize,
-    progress: Progress,
-    job: &Job,
-) -> Result<()> {
-    let _charge = charge(job, STATE_WORK)?;
-    let key = key(context)?;
-    let scope = scope(context);
-    let mut batch = context.store().batch()?;
-    let mut state = live(&batch, key, &scope, context, active)?;
-    if state.legacy.as_ref() != Some(expected)
-        || remaining > state.remaining
-        || (progress == Progress::Complete && remaining != 0)
-        || !matches!(
-            progress,
-            Progress::More | Progress::Complete | Progress::Unavailable
-        )
-    {
-        return Err(invalid("legacy history checkpoint binding"));
-    }
     state.remaining = remaining;
     state.progress = progress;
     put(&mut batch, key, &scope, &state)?;
