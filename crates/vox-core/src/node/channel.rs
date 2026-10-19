@@ -8533,9 +8533,6 @@ impl ChannelState {
         }
     }
 
-    /// Record that `member`'s node said, in a sync, it holds this identity's feed here up to `seq`
-    /// (ADR-028 R-6). Its last word stands. Kept on disk best effort: a write that fails costs a
-    /// restart the count until the next sync, never the room.
     /// This identity's own feed here: the contiguous verified head, the durable own fact
     /// (ADR-037 R5).
     pub fn own_verified_head(&self) -> u64 {
