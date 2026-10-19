@@ -85,10 +85,23 @@ extension NodeModel {
     }
 
     private func withEarlierRoomEntries(_ items: [TimelineItem]) -> [TimelineItem] {
-        guard roomOlder > 0, let room = roomOnScreen else { return items }
-        var earlier = TimelineItem.notice("older-room-\(room)", "Earlier messages", at: 0)
-        earlier.loadsOlder = true
-        return [earlier] + items
+        guard let room = roomOnScreen else { return items }
+        var out = items
+        if roomOlder > 0 {
+            var earlier = TimelineItem.notice("older-room-\(room)", "Earlier messages", at: 0)
+            earlier.loadsOlder = true
+            out = [earlier] + out
+        }
+        // A page read while the room's governance fold was behind what the node has received
+        // is provisional (ADR-037 R3): said at the top, never shown as final.
+        if roomProvisional {
+            let note = TimelineItem.notice(
+                "provisional-room-\(room)",
+                "This room is still folding its control entries; what is shown is provisional",
+                at: 0)
+            out = [note] + out
+        }
+        return out
     }
 
     /// What the timeline draws.

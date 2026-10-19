@@ -1143,6 +1143,10 @@ pub struct FfiRoomRead {
     pub older: u64,
     /// Entry before which the next older page ends, or none once the first page is reached.
     pub before: Option<String>,
+    /// The room's governance fold was behind what the node has received when this page was
+    /// read (ADR-037 R3): a control entry it holds is not folded yet, so what the page shows
+    /// may still be re-ordered or withdrawn. Shown as provisional, never as final, while true.
+    pub provisional: bool,
 }
 
 /// Status of one explicitly requested, bounded peer-history operation. Cached reads do not start it.
@@ -2612,6 +2616,9 @@ async fn room_view_selection(
         // A held refresh must never replace the owner's older-page metadata.
         older: 0,
         before: None,
+        // An exact re-read of held entries behind a display-revision fence: not a fresh page, so
+        // it carries no fold state of its own.
+        provisional: false,
     })
 }
 
@@ -2736,8 +2743,12 @@ impl VoxClient {
                     limit: ROOM_WINDOW_ROWS as u64,
                 },
             };
-            let (rows, older) = match ask(c, &request).await? {
-                Frame::RoomPage { rows, older, .. } => (rows, older),
+            let (rows, older, provisional) = match ask(c, &request).await? {
+                Frame::RoomPage {
+                    rows,
+                    older,
+                    provisional,
+                } => (rows, older, provisional),
                 other => return Err(unexpected(&other)),
             };
             room_window_bytes(&rows)?;
@@ -2758,6 +2769,7 @@ impl VoxClient {
                     .map(|r| rendered(r, &names, Some(&me)))
                     .collect(),
                 older,
+                provisional,
             })
         })
     }
@@ -2845,6 +2857,9 @@ impl VoxClient {
                     .collect(),
                 older: 0,
                 before: None,
+                // An exact re-read of held entries behind a display-revision fence: not a fresh page, so
+                // it carries no fold state of its own.
+                provisional: false,
             })
         })
     }

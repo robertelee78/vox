@@ -231,6 +231,9 @@ final class NodeModel: ObservableObject {
     }
 
     @Published private(set) var roomOlder: UInt64 = 0
+    /// The room's governance fold was behind what the node has received when the shown page was
+    /// read (ADR-037 R3): the page is provisional, and the timeline says so.
+    @Published private(set) var roomProvisional = false
     private var roomBefore: String?
     private var roomInstance: Data? {
         didSet {
@@ -377,6 +380,7 @@ final class NodeModel: ObservableObject {
             messages = []
             roomBefore = nil
             roomOlder = 0
+            roomProvisional = false
             roomHasNewer = false
             roomReloadNeeded = false
             roomReadingOlder = false
@@ -1257,6 +1261,8 @@ final class NodeModel: ObservableObject {
                 guard current() else { return }
                 roomInstance = page.instance
                 roomOlder = page.older
+            roomProvisional = page.provisional
+                roomProvisional = page.provisional
                 roomBefore = page.before
                 let bounded = Self.boundedRoomRows(page.messages, newest: true)
                 roomOlder += UInt64(page.messages.count - bounded.count)
@@ -1425,6 +1431,7 @@ final class NodeModel: ObservableObject {
                 else { roomHasNewer = true }
             }
             roomOlder = page.older
+            roomProvisional = page.provisional
             roomBefore = page.before
         } catch {
             guard roomHistoryRequest == token, !Task.isCancelled else { return }
@@ -1465,6 +1472,7 @@ final class NodeModel: ObservableObject {
             if bounded.count < joined.count { roomHasNewer = true }
             messages = bounded
             roomOlder = page.older
+            roomProvisional = page.provisional
             roomBefore = page.before
         } catch {
             guard current() else { return }
@@ -1904,6 +1912,7 @@ final class NodeModel: ObservableObject {
             roomInstance = page.instance
             roomHasNewer = false
             roomOlder = page.older
+            roomProvisional = page.provisional
             roomBefore = page.before
             unreadFrom = unread.first
             unreadCount = Int(clamping: unread.addressed + unread.new + unread.coordination)

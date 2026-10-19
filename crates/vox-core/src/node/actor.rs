@@ -9260,16 +9260,6 @@ impl Node {
                     self.publish_channel_to_anchors(&channel_id, PublishCause::BoardNews)
                         .await;
                     self.note_new_members(&channel_id).await;
-                    // A record landing on the board — a member's fresh prekey bundle, a new
-                    // member — is the event an owed key was waiting for (ADR-037 R2b): the keys
-                    // this room still owes go now, not when a refusal backoff runs out. Measured
-                    // before this: a joiner read the creator's first post 48 s after it was made,
-                    // the key having waited out 2 + 4 + 8 + 16 s of refusals for a bundle that
-                    // had landed long since.
-                    self.key_backoff.retain(|(room, _), _| *room != channel_id);
-                    self.one_time_waits
-                        .retain(|(room, _), _| *room != channel_id);
-                    self.deliver_owed_consents(None).await;
                 }
             }
             NetEvent::Pairwise(stream) => {
@@ -14404,6 +14394,12 @@ impl Node {
                 Some(_) => {}
             }
             let eligible = self.port_eligible(&key, now);
+            if let Some(p) = self.ports.get(&key) {
+                let wants = p.needs()
+                    || self.bounded_sync.needs_port(key.0, key.1)
+                    || self.history_hints.pending(key.0, key.1);
+                if wants || eligible {}
+            }
             let Some(port) = self.ports.get_mut(&key) else {
                 continue;
             };
