@@ -603,8 +603,9 @@ impl Flow {
         }
     }
 
-    /// Exactly one local slice or one response quantum. The caller retains its worker/port slot
-    /// through this return, including every spawned blocking worker, even after cancellation.
+    /// Local slices back to back, or one response quantum (ADR-037 R11). The caller retains its
+    /// worker/port slot through this return, including every spawned blocking worker, even after
+    /// cancellation.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn turn(
         &mut self,

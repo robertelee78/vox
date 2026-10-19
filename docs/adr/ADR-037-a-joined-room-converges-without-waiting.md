@@ -194,6 +194,11 @@ to every connected peer, so the next round fetches it now. Settlement MUST be re
 open room on every tick: no other sync event reliably arrives for a room whose remaining piece
 is its own acknowledgement.
 
+The own-author flow records the peer's authenticated head and walks no window: every position
+of the node's own log is already held, and a peer holding more of it is the conflict R5 stops
+the node on, not something to fetch. Measured before this: a creator walked her own ten-entry log
+through a joiner's port for 8 s (103 rounds) while two other joiners' first posts waited.
+
 ### R11. A turn may run several control chunks, never a cycle
 
 Control-lane work is metadata work (a proof check, a header fetch, a verify) where each step
@@ -203,6 +208,13 @@ step that signals a dependency need or a Busy answer MUST end the turn: cycling 
 busy answer inside one turn was measured as a spin (the product held 102% CPU until the proof
 watchdog killed it). Live body work stays one step per round: a body chunk is the expensive
 kind.
+
+This holds for every local slice of a bounded-sync flow, not only control chunks: a turn MUST run
+its local slices (verify, entry, reclaim, window steps) back to back until one needs the wire,
+waits, errs, or the turn has spent 20 ms or 64 slices; a wire exchange still ends the turn. Each
+slice as a turn of its own cost an actor round trip (~10 ms), about thirty per body: a joiner
+drained a 128-position live window at three positions a second, and a creator serving three
+joiners at once read their first posts after 30 s.
 
 ### R12. A late entry re-arms the fold, and the fold re-settles at its own cost
 
