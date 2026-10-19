@@ -4796,10 +4796,12 @@ impl ChannelState {
         // that has not synced yet refuses writes and goes on serving. Poisoning it turned every
         // later command into "cannot save", wrapped the refusal once more per attempt ("store
         // save room: store save room: …") and said it on every refusal, where the detector had
-        // already said it once.
+        // already said it once. A history worker this node's actor cancelled (its ask was
+        // replaced, paused or stopped) was stopped, not failed.
         if matches!(
             e,
             Error::Profile(legacy_provisional::LEGACY_HISTORY_REQUIRED)
+                | Error::Profile(crate::node::history_demand::CANCELLED)
                 | Error::OwnHistoryBehind
                 | Error::RoomNotSynced
         ) || governance::refreshing(e)

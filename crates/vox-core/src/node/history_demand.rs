@@ -120,7 +120,7 @@ impl Context {
     }
     fn check(&self) -> Result<()> {
         if self.cancellation.is_cancelled() {
-            Err(invalid("history worker was cancelled"))
+            Err(invalid(CANCELLED))
         } else {
             Ok(())
         }
@@ -399,6 +399,10 @@ impl Page {
         &self.bytes[PAGE_PREFIX..]
     }
 }
+
+/// The actor replaced, paused or stopped this request; a worker still holding its context stops
+/// at its next store step. A local decision, never a fault of the room or of the peer.
+pub(crate) const CANCELLED: &str = "history worker was cancelled";
 
 fn invalid(message: &'static str) -> Error {
     Error::Profile(message)

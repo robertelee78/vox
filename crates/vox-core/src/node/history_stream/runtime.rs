@@ -50,6 +50,9 @@ enum Operation {
 const LOCAL_TURN_BUDGET: std::time::Duration = std::time::Duration::from_millis(20);
 /// How many local slices one turn runs at most.
 const LOCAL_SLICES_PER_TURN: u32 = 64;
+/// Fold steps an entry slice may take in one turn before it waits for the actor's fold hook
+/// (ADR-037 R11): a hold on the fold cycled the need 32 times a turn, 77 turns a second.
+const GOVERNANCE_STEPS_PER_TURN: u8 = 4;
 /// The body bytes one explicit history quantum fetches at most; past it the request pauses and
 /// `vox room read --history resume` asks for the rest.
 const ARCHIVE_QUANTUM_BYTES: u64 = 1024 * 1024;
@@ -145,6 +148,11 @@ pub(crate) struct Flow {
     /// A durable body chunk moved in this flow's last turn: the waiting slice is
     /// progress, not a busy wait, and its port must not grow a Busy backoff.
     pub(crate) body_progress: bool,
+    /// This turn's slice waits on the room's governance fold, which is not ready yet (ADR-037
+    /// R2): a local wait, not a body slot held against a busy peer, so it never retires the slot,
+    /// and the actor's fold hook is asked to drive the fold.
+    pub(crate) governance_wait: bool,
+    governance_cycles: u8,
     last_head: Option<(super::HeadHint, u8)>,
     request: RequestId,
     cleanup_store: Arc<Store>,
@@ -229,6 +237,8 @@ impl Flow {
             owners: [None, None],
             no_progress: 0,
             body_progress: false,
+            governance_wait: false,
+            governance_cycles: 0,
             last_head: None,
             request,
             cleanup_store,
@@ -334,6 +344,8 @@ impl Flow {
             owners: [None, None],
             no_progress: 0,
             body_progress: false,
+            governance_wait: false,
+            governance_cycles: 0,
             last_head: None,
             request,
             cleanup_store,
@@ -624,6 +636,8 @@ impl Flow {
     ) -> Result<()> {
         self.waiting = false;
         self.body_progress = false;
+        self.governance_wait = false;
+        self.governance_cycles = 0;
         self.external = None;
         // Local slices run back to back inside one turn; a slice that needs the wire, waits,
         // errs or spends the slice budget ends it. Each slice used to be a turn of its own,
@@ -671,7 +685,11 @@ impl Flow {
             self.authorization_changed = true;
             return Ok(());
         }
-        if self.owners.iter().any(Option::is_some) && self.waiting && !self.body_progress {
+        if self.owners.iter().any(Option::is_some)
+            && self.waiting
+            && !self.body_progress
+            && !self.governance_wait
+        {
             self.no_progress = self.no_progress.saturating_add(1);
             if self.no_progress >= 3 {
                 return Err(Error::Unreachable(
@@ -1616,9 +1634,26 @@ impl Flow {
                             .map(|_| Some(()))
                     })
                     .await?;
-                if !matches!(advanced, Lookup::Found(_)) {
-                    self.push(task)?;
-                    self.waiting = true;
+                // A bounded fold step, then the entry slice is re-derived and decides for itself
+                // whether the fold now serves it. A fold that is held or slow left that cycle
+                // running against the same fold, 32 slices a turn and 77 turns a second, and
+                // because the one foreground lane went back to this flow every round, the node's
+                // other peer never got a round (a post made while the fold was held reached no
+                // one in 30 s; ADR-037 R11). After a few steps the flow waits at the port's Busy
+                // cadence and the actor's fold hook drives the fold (R2 b).
+                match advanced {
+                    Lookup::Found(_) if self.governance_cycles < GOVERNANCE_STEPS_PER_TURN => {
+                        self.governance_cycles += 1;
+                    }
+                    Lookup::Found(_) => {
+                        self.push(task)?;
+                        self.waiting = true;
+                        self.governance_wait = true;
+                    }
+                    Lookup::Busy | Lookup::Missing => {
+                        self.push(task)?;
+                        self.waiting = true;
+                    }
                 }
             }
         }

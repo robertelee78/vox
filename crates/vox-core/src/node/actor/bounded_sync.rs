@@ -720,6 +720,12 @@ impl Node {
                     "peer unreachable: selected current body is unavailable or cancelled"
                         | "peer unreachable: required current evidence is unavailable"
                 ) || crate::node::sessions::opening_refreshing(&error);
+                // A worker this actor cancelled (its ask was replaced, paused or stopped) stopped
+                // at its next store step: a local decision, so its port is neither failed nor
+                // backed off, and the replacing ask's own flow runs next.
+                let cancelled = error
+                    == crate::error::Error::Profile(crate::node::history_demand::CANCELLED)
+                        .to_string();
                 if let Some(request) = returned.flow.archive_request {
                     self.history_demand
                         .failed(request, returned.flow.generation, &error);
@@ -734,6 +740,10 @@ impl Node {
                     );
                 }
                 self.bounded_sync.dispose(returned.flow);
+                if cancelled {
+                    self.sched_rooms.insert(work.room);
+                    continue;
+                }
                 if transient {
                     self.enter_backoff(
                         work.room,
@@ -962,6 +972,11 @@ impl Node {
             } else {
                 let waiting = returned.flow.waiting;
                 let body_progress = returned.flow.body_progress;
+                if returned.flow.governance_wait {
+                    // The flow found the fold pending: the actor's fold hook drives it (ADR-037
+                    // R2 b), and the flow's next round finds it ready.
+                    self.governance_work.pending = true;
+                }
                 if index == 0 {
                     if self.bounded_sync.deferred.len() == 8 {
                         if let Some(old) = self.bounded_sync.deferred.pop_front() {

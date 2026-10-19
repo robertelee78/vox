@@ -207,6 +207,11 @@ A Busy refusal (the peer is mid-operation) costs the peer one lookup; an unreach
 a dial. The retry curve for a Busy refusal MUST NOT grow past 1 s. Entries converge at the
 refusal's true cost, not at an unreachable's cost.
 
+A history worker this node's own actor cancelled (its ask was replaced by a newer one, paused or
+stopped) is neither: it stopped at its next store step on a local decision. Its port MUST NOT be
+failed or backed off, and the room MUST NOT be poisoned by the cancellation; the replacing ask's
+own flow runs next.
+
 ### R9. Admission distinguishes accepted from committed
 
 A control admission gate MUST check the head is accepted, committed or proven on chain, not
@@ -242,6 +247,17 @@ waits, errs, or the turn has spent 20 ms or 64 slices; a wire exchange still end
 slice as a turn of its own cost an actor round trip (~10 ms), about thirty per body: a joiner
 drained a 128-position live window at three positions a second, and a creator serving three
 joiners at once read their first posts after 30 s.
+
+A need for the fold is such a dependency need. An entry slice that needs the governance fold
+MAY run a bounded fold step and re-derive itself at most four times in one turn (R2 a); a need
+still open after that MUST end the turn as a wait, MUST mark the actor's fold work pending so its
+hook drives the fold (R2 b), and the flow resumes at the port's Busy cadence (R8). Treating each
+fold step as progress cycled the need without bound: the entry slice ran again at once against
+the same unready fold, 32 slices a turn and 77 turns a second (229,000 fold checks in 59 s), and
+because the one foreground lane went back to the same flow every round, the node's other peer
+never got a round: a post made while the fold was held reached no one in 30 s. Waiting on the
+fold is a local wait, not a body slot held against a busy peer, so it MUST NOT count toward
+retiring the flow's body slot.
 
 ### R12. A late entry re-arms the fold, and the fold re-settles at its own cost
 
