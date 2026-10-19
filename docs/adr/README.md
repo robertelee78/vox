@@ -47,6 +47,7 @@ primitive) precedes ADR-007 (consent, which is stored on the log) in build order
 | [033](ADR-033-the-repo-room-is-where-agents-work-together.md) | The Repo Room Is Where Agents Work Together (threads, pause, room marks, the composer, Session tabs, who does what from the room's claims only) — accepted for v0.4.4 | 020, 021, 028, 029, 031 |
 | [034](ADR-034-the-app-and-daemon-never-hang-or-hide-a-failure.md) | The App and the Daemon Never Hang or Hide a Failure (updates restart the daemon, refusal only on a real incompatibility, bounded waits, paged replies, a room that cannot save recovers, true health, bounded logs, Quit always quits) — accepted for v0.4.4 | 014, 018, 026, 028 |
 | [035](ADR-035-computer-trust-and-daemon-identities.md) | Computer Trust and Daemon Identities (pair once, all managed nodes, selected personal nodes get drive, individual node trust remains) — product requirements and technical contract revision 2 accepted for v0.4.5 | 002, 003, 010, 012, 018, 026, 028, 029, 031 |
+| [037](ADR-037-a-joined-room-converges-without-waiting.md) | A Joined Room Converges Without Waiting (Ready is a constant wait; one fast fold is the gate for everything irreversible and content never holds it; reads answer known data; own-authored state is durable; proofs with mutants) — proposed for v0.4.6 | 007, 008, 018, 026, 029, 031, 036 |
 
 ## Tiers
 
@@ -111,6 +112,7 @@ planned. This is the roll-up.
 | 033 | accepted for v0.4.4 (the decider, 2026-10-10), **not built**; amends 014, 028, 029 |
 | 034 | accepted for v0.4.4 (the decider, 2026-10-10), **not built**; amends 014, 026, 028 |
 | 035 | product requirements accepted for v0.4.5 (the decider, 2026-10-12); technical contract revision 2 independently accepted (GO), **not built**; narrowly amends 002, 010, 020, 026, 031 while preserving node identities and one daemon endpoint |
+| 037 | proposed for v0.4.6 (the decider, 2026-10-19); R1–R6 **not built**, each is to land with its proof; the pacing fixes R8–R11 are on PR #946's branch, unreleased; finishes ADR-036 H-1 on the first-use paths and keeps ADR-007's fold as the gate |
 
 ## Conformance-vector obligations
 
