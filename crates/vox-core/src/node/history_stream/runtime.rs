@@ -1226,7 +1226,8 @@ impl Flow {
                     for head in &result.heads {
                         if head.author == author {
                             if author == self.node {
-                                self.mine_held = Some(self.mine_held.map_or(head.size, |m| m.max(head.size)));
+                                self.mine_held =
+                                    Some(self.mine_held.map_or(head.size, |m| m.max(head.size)));
                             }
                             let repeats = self
                                 .last_head

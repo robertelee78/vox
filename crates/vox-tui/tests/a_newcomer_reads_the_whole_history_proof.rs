@@ -464,7 +464,14 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
     attached(&alice, "alice");
     let (ok, _, err) = vox(
         &alice,
-        &["room", "create", "--passphrase-file", "-", "--name", "quiet"],
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "quiet",
+        ],
         Some(&format!("{ROOMPASS}\n")),
     );
     assert!(ok, "PRODUCT: `vox room create` failed: {err}");
@@ -490,7 +497,13 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
     assert!(ok, "PRODUCT: alice's post was refused: {out}{err}");
     let (ok, out, err) = vox(&bob, &["room", "post", &room, "bob is here"], None);
     assert!(ok, "PRODUCT: bob's first post was refused: {out}{err}");
-    let (to_alice, to_bob) = arrivals(joined, (&alice, "bob is here"), (&bob, "post 1"), &room, BOUND);
+    let (to_alice, to_bob) = arrivals(
+        joined,
+        (&alice, "bob is here"),
+        (&bob, "post 1"),
+        &room,
+        BOUND,
+    );
     assert!(
         to_alice.is_some() && to_bob.is_some(),
         "PRODUCT: within {BOUND:?} of the join, alice read bob: {to_alice:?}; bob read alice: \
@@ -507,7 +520,9 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
     let after = [synced(&alice), synced(&bob)];
     let idled = counted.elapsed();
     let allowed = 2 * (idled.as_secs() / vox_core::node::syncstream::SYNC_INTERVAL_SECS + 1);
-    let grown: Vec<u64> = (0..2).map(|i| after[i].0.saturating_sub(before[i].0)).collect();
+    let grown: Vec<u64> = (0..2)
+        .map(|i| after[i].0.saturating_sub(before[i].0))
+        .collect();
     println!(
         "[proof] over {idled:?} of quiet: alice completed {} rounds, bob {} (allowed {allowed}: \
          one periodic every {} s and its follow-up); last sync recorded: alice {}, bob {}",
@@ -548,7 +563,12 @@ fn synced(dir: &Path) -> (u64, bool, String) {
         .unwrap_or_else(|e| panic!("PRODUCT: `vox status --json` is not JSON: {e}: {out}"));
     let completed = v["sync"]
         .as_array()
-        .map(|ports| ports.iter().map(|p| p["completed"].as_u64().unwrap_or(0)).sum())
+        .map(|ports| {
+            ports
+                .iter()
+                .map(|p| p["completed"].as_u64().unwrap_or(0))
+                .sum()
+        })
         .unwrap_or(0);
     let recorded = v["rooms"].as_array().is_some_and(|rooms| {
         !rooms.is_empty()
