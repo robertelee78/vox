@@ -16,6 +16,9 @@ use zeroize::Zeroizing;
 const KIND: SegmentKind = SegmentKind::GovernanceIndex;
 const HEADER: u64 = 0;
 const HEADER_BYTES: usize = 1024;
+/// The derived index's own format. 4 (v0.4.6, ADR-037): the control settlement queue. An
+/// older header is an obsolete index: `prepare` deletes it and the fold rebuilds from LogDb.
+pub(super) const HEADER_VERSION: u64 = 4;
 
 fn invalid(why: &'static str) -> Error {
     Error::MalformedAtRest(why)
@@ -108,9 +111,13 @@ pub(super) enum Table {
     IssuerRoles,
     ActiveAdmins,
     CurrentAuthority,
+    /// Control rows awaiting frontier work (ADR-037 R2c): in a signed-format room the order
+    /// settles on this queue alone, so content rows never hold the fold. Every row here is
+    /// also in `PendingOrder`, the work queue; this one is worked first.
+    ControlPending,
 }
 
-const TABLES: usize = Table::CurrentAuthority as usize + 1;
+const TABLES: usize = Table::ControlPending as usize + 1;
 
 #[derive(Clone, Copy)]
 pub(super) enum Cursor {
@@ -199,10 +206,19 @@ fn read_hash(d: &mut Decoder<'_>) -> Result<Option<Digest32>> {
     }
 }
 
+/// The format a sealed header's plaintext was written at, if it reads as a header at all.
+pub(super) fn header_version(bytes: &[u8]) -> Option<u64> {
+    let mut d = Decoder::new(bytes);
+    (d.array().ok()? == 22).then(|| d.uint().ok()).flatten()
+}
+
 impl Header {
     fn bytes(&self) -> Zeroizing<Vec<u8>> {
         let mut e = Encoder::new();
-        e.array(22).uint(3).uint(self.next).array(TABLES);
+        e.array(22)
+            .uint(HEADER_VERSION)
+            .uint(self.next)
+            .array(TABLES);
         for root in self.roots {
             e.uint(root);
         }
@@ -243,7 +259,7 @@ impl Header {
             return Err(invalid("governance header size"));
         }
         let mut d = Decoder::new(bytes);
-        if d.array()? != 22 || d.uint()? != 3 {
+        if d.array()? != 22 || d.uint()? != HEADER_VERSION {
             return Err(invalid("governance header format"));
         }
         let next = d.uint()?;
@@ -543,6 +559,9 @@ pub(super) struct Write<'a, 'store> {
     sek: &'a Sek,
     room: &'a Digest32,
     header: Header,
+    /// Whether the order settles on control rows alone (a signed-format room, ADR-037 R2c).
+    /// Set by the caller from the entry index; never persisted.
+    control_only: bool,
 }
 
 impl<'a, 'store> Write<'a, 'store> {
@@ -573,7 +592,18 @@ impl<'a, 'store> Write<'a, 'store> {
             sek,
             room,
             header,
+            control_only: false,
         })
+    }
+
+    /// In a signed-format room every control row carries its own signed control closure, so
+    /// content rows neither raise the barrier nor hold the order (ADR-037 R2c). A legacy
+    /// room's control rows can have content parents, so there everything settles as before.
+    pub(super) fn set_control_only(&mut self, on: bool) {
+        self.control_only = on;
+    }
+    pub(super) fn control_only(&self) -> bool {
+        self.control_only
     }
 
     fn tree(&self) -> session_tree::Read<'_> {
@@ -847,9 +877,14 @@ impl<'a, 'store> Write<'a, 'store> {
     }
 
     pub(super) fn causal_settled(&self) -> Result<bool> {
+        let queue = if self.control_only {
+            Table::ControlPending
+        } else {
+            Table::PendingOrder
+        };
         Ok(self.header.initialized
             && self
-                .first(Table::PendingOrder, None)?
+                .first(queue, None)?
                 .is_none_or(|(key, _)| pending_log(&key) > self.header.barrier))
     }
     pub(super) fn initialized(&self) -> bool {
@@ -1106,8 +1141,10 @@ impl<'a, 'store> Write<'a, 'store> {
         Ok(())
     }
 
-    /// Retain the obligation before acknowledging the accepted input to its caller.
-    pub(super) fn enqueue(&mut self, hash: &Digest32, log: u64) -> Result<()> {
+    /// Retain the obligation before acknowledging the accepted input to its caller. A control
+    /// row is queued on the control settlement queue too (ADR-037 R2c), where it is worked
+    /// first and where a signed-format room's order settles.
+    pub(super) fn enqueue(&mut self, hash: &Digest32, log: u64, control: bool) -> Result<()> {
         if log == 0 {
             return Err(invalid("governance queue source is zero"));
         }
@@ -1126,12 +1163,25 @@ impl<'a, 'store> Write<'a, 'store> {
             pending_key(log, hash),
             Some(self.header.queue_serial),
         )?;
+        if control {
+            self.put(
+                Table::ControlPending,
+                pending_key(log, hash),
+                Some(self.header.queue_serial),
+            )?;
+        }
         Ok(())
     }
 
     pub(super) fn work(&mut self) -> Result<Option<&mut Work>> {
         if self.header.work.entry.is_none() {
-            let Some((key, serial)) = self.first(Table::PendingOrder, None)? else {
+            // Control rows first: the order settles on them, and a room converging must not
+            // wait behind its content backlog (ADR-037 R2c). Content rows follow in log order.
+            let next = match self.first(Table::ControlPending, None)? {
+                Some(control) => Some(control),
+                None => self.first(Table::PendingOrder, None)?,
+            };
+            let Some((key, serial)) = next else {
                 return Ok(None);
             };
             let log = pending_log(&key);
@@ -1175,6 +1225,9 @@ impl<'a, 'store> Write<'a, 'store> {
         }
         if queued == work.serial {
             self.put(Table::PendingOrder, order_key, None)?;
+            if self.get(Table::ControlPending, &order_key)?.is_some() {
+                self.put(Table::ControlPending, order_key, None)?;
+            }
             self.header.roots[Table::Pending as usize] =
                 self.set_root(self.header.roots[Table::Pending as usize], key, None)?;
             self.header.roots[Table::Complete as usize] = self.set_root(

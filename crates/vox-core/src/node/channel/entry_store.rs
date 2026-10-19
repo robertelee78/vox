@@ -3469,6 +3469,9 @@ impl EntryIndex {
     }
 }
 impl View<'_, '_> {
+    pub(crate) fn sparse_enabled(&self) -> bool {
+        self.directory.active.sparse.enabled
+    }
     pub(crate) fn log_id(&self, hash: &Digest32) -> Result<Option<u64>> {
         Ok(self
             .transaction
