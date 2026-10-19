@@ -1638,6 +1638,72 @@ pub(crate) fn shown_tags(tags: &[String]) -> String {
         .join(" ")
 }
 
+/// Resolve a shortened reply selector among readable room messages. Exact hashes keep the
+/// direct lookup path; prefixes scan bounded pages and retain only one matching id.
+async fn reply_entry(
+    client: &mut IpcClient,
+    cid: Digest32,
+    typed: &str,
+) -> Result<String, AppError> {
+    let prefix = typed.trim().to_ascii_lowercase();
+    if prefix.len() == B32_DIGEST_LEN {
+        return Ok(prefix);
+    }
+    if prefix.is_empty()
+        || prefix.len() > B32_DIGEST_LEN
+        || !prefix
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b))
+    {
+        return Err(AppError::Usage(format!(
+            "cannot reply to {typed}: expected an entry hash or its unique base32 prefix"
+        )));
+    }
+    let mut before = None;
+    let mut found = None;
+    loop {
+        let (rows, older) = match client
+            .request(&Request::RoomPage {
+                channel_id: cid,
+                before,
+                limit: 0,
+            })
+            .await?
+        {
+            Frame::RoomPage { rows, older, .. } => (rows, older),
+            Frame::Error { reason } => return Err(AppError::Usage(reason)),
+            other => return Err(crate::client::unexpected(&other)),
+        };
+        for row in rows.iter().filter(|row| !row.owed) {
+            let hash = b32_encode(&row.entry_hash);
+            if hash.starts_with(&prefix) {
+                if found.as_ref().is_some_and(|previous| previous != &hash) {
+                    return Err(AppError::Usage(format!(
+                        "cannot reply to {typed}: entry prefix is ambiguous; use more characters"
+                    )));
+                }
+                found = Some(hash);
+            }
+        }
+        if older == 0 {
+            break;
+        }
+        let next = rows.first().map(|row| row.entry_hash);
+        if next.is_none() || next == before {
+            return Err(AppError::Usage(
+                "cannot resolve reply prefix: the room page changed; read the room and retry"
+                    .into(),
+            ));
+        }
+        before = next;
+    }
+    found.ok_or_else(|| {
+        AppError::Usage(format!(
+        "cannot reply to {typed}: no readable message matches that entry prefix; nothing was posted"
+    ))
+    })
+}
+
 /// What a post answers, its hop budget and its known thread root, by the rule `vox room post` and
 /// `vox share` follow (V210-121, ADR-020 §9): `re` if given, else the one unanswered message that
 /// woke `session`; and that parent's budget less one.
@@ -1660,7 +1726,7 @@ pub(crate) async fn answers(
     // that way woke each other for ever. When exactly one wake is unanswered, that is the reply;
     // with several, the agent must say which.
     let re = match (re, session) {
-        (Some(re), _) => Some(re.to_owned()),
+        (Some(re), _) => Some(reply_entry(client, cid, re).await?),
         (None, None) => None,
         (None, Some(session)) => {
             // The wakes and what followed the oldest of them, read from there (V210-120).
