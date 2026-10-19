@@ -186,6 +186,13 @@ F-9–F-11; RR-1, RR-3, RR-4 (RR-2 is the daemon's); D-3; L-1–L-10; W-1–W-6;
   atomically (download beside it, verify, rename into place, keep the previous bundle for
   `--rollback`), and MUST then ask the person to restart the app and the daemon (ADR-028 I-3).
   An install not made by `install.sh` MUST be refused, as today (ADR-015 17.10).
+- **M-29a.** The previous bundle kept for `--rollback` MUST NOT be launchable as Vox. After the
+  swap the updater MUST take it out of LaunchServices (unregister it, or keep it without its
+  bundle identifier), so that opening Vox from the Dock, Spotlight, Launchpad or by its identifier
+  opens the current bundle; a rollback restores the bundle it swaps back in. Measured 2026-10-19:
+  both bundles were registered as `us.vox.app` with the same `CFBundleVersion`, LaunchServices
+  opened `.Vox.app.previous` (0.4.4) when the decider reopened Vox, and that app reported the
+  0.4.6 daemon as not answering.
 
 ### 6. Proof
 
