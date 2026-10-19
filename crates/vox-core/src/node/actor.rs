@@ -6138,6 +6138,23 @@ impl Node {
                     // the fetch that acknowledgement needs is itself driven — by this call.
                     for room in self.channels.keys().copied().collect::<Vec<_>>() {
                         self.settle_room(&room).await;
+                        // The session-projection catch-up's backstop: one bounded turn per
+                        // tick per open room. Its other drivers are query-shaped (each query
+                        // one turn; the spawned catch-ups step while pending), and the tick's
+                        // own tend stops when the drive-key holders empty — a room nobody
+                        // queries must still converge through its saved-Sessions refresh
+                        // (#934/ADR-037).
+                        if let (Some(profile), Some(shared)) = (
+                            self.profile.as_ref(),
+                            self.channels.get(&room).map(Arc::clone),
+                        ) {
+                            if let Ok(mut ch) = shared.try_lock() {
+                                let now = self.now_ms();
+                                if ch.require_governance_ready(profile.store(), now).is_ok() {
+                                    let _ = ch.advance_sessions(profile.store(), now.get());
+                                }
+                            }
+                        }
                     }
                     // A finished bounded round reports through a `try_send` wake that a full
                     // net queue can drop; its durable result slot stays pollable. The wake
@@ -20939,14 +20956,21 @@ impl Node {
         let now_ms = self.now_ms();
         self.join_tasks.spawn(async move {
             // Capped: a projection that never reports itself done must not spin here.
+            // Step while the projection reports work *pending*, not while a turn
+            // reports progress: a bounded controls catch-up turn answers `false`
+            // while work remains, so break-on-false ended this catch-up after one
+            // turn and the controls converged at the query rate (measured: 40 s
+            // for a three-author room, #934/ADR-037).
             for _ in 0..64 {
                 tokio::task::yield_now().await;
                 let Ok(mut room) = shared.try_lock() else {
                     break;
                 };
-                match room.advance_sessions(&store, now_ms.get()) {
-                    Ok(true) => {}
-                    _ => break,
+                if !room.sessions_projection_pending(&store) {
+                    break;
+                }
+                if room.advance_sessions(&store, now_ms.get()).is_err() {
+                    break;
                 }
             }
         });

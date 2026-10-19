@@ -1051,6 +1051,19 @@ impl ChannelState {
             || self.private_sessions.pending_active
     }
 
+    /// Whether the session projection still owes catch-up work. The saved-Sessions
+    /// refresh refuses queries while any of this is pending, and one bounded
+    /// catch-up turn answers `false` while work *remains* — so a caller stepping
+    /// only while the answer is `true` paced the catch-up at its own query rate
+    /// (measured: 40 s for a three-author room, #934/ADR-037). Step while this
+    /// is true instead.
+    pub(crate) fn sessions_projection_pending(&self, store: &Store) -> bool {
+        if self.needs_session_upgrade() {
+            return true;
+        }
+        !self.current_session_controls_ready(store).unwrap_or(false)
+    }
+
     /// The actor yields between false results and keeps the room unpublished. Key packages
     /// have already been attempted when the initial gate is lifted.
     pub(crate) fn finish_session_upgrade(&mut self, store: &Store, now: u64) -> Result<bool> {
@@ -1872,7 +1885,20 @@ impl ChannelState {
         completion: Option<&crate::node::session_ingress::Completion>,
         attention_after: Option<AttentionOpening>,
     ) -> Result<Digest32> {
-        self.require_governance_ready(profile.store(), crate::time::Ms(now))?;
+        // A local append does not wait on the room's global governance fold (ADR-037
+        // requirement 1; the decider, 2026-10-19: ready is a constant wait, and the
+        // fold is the arbiter, never the gate). The author here is this node, so its
+        // live control frontier is by construction current; a conflict a later fold
+        // reveals in the backlog resolves at fold time by the existing strict-past,
+        // removal-wins and concurrent-ordering rules. Two gates stay (ADR-037
+        // contract items 7 and 8, fable's review, 2026-10-19): the legacy-recovery
+        // gate — an operator-paused suffix is never folded, so a legacy-required
+        // room must not accept Session activity with no fold time ever coming to
+        // arbitrate it — and the settled refusal ahead of `begin_drive` — the drive
+        // generation is never chosen off an incomplete own feed. The
+        // encryption-audience selection below additionally gates on the
+        // control-stream fold (contract item 6, kimi k3's H1) once that gate lands.
+        self.require_legacy_current(profile.store())?;
         if self.poisoned {
             return Err(Error::Profile("room save failed; reopen it"));
         }
