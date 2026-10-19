@@ -1737,11 +1737,7 @@ impl Write<'_, '_> {
             return Err(invalid("live window author has conflicting heads"));
         }
         if let Some(window) = state.live {
-            if window.through >= head.root.leaves
-                || (!window.complete()
-                    && head.root.leaves - window.through
-                        < crate::log::history::MAX_PAGE_ENTRIES as u64)
-            {
+            if window.through >= head.root.leaves {
                 return Ok(window);
             }
         }
@@ -1749,7 +1745,18 @@ impl Write<'_, '_> {
         let floor = through
             .saturating_sub(crate::log::history::MAX_PAGE_ENTRIES as u64 - 1)
             .max(1);
-        let from = state.live.map_or(floor, |old| floor.max(old.through + 1));
+        // A newer head over a finished window starts just above it: everything below was
+        // visited. Over an unfinished window it keeps that window's start, so the fresh
+        // positions above the old top are walked first and the old remainder after them,
+        // positions already held passing locally (ADR-036: live before history). The oldest
+        // positions a 128-wide window can no longer reach are older history, on demand.
+        let from = state.live.map_or(floor, |old| {
+            if old.complete() {
+                floor.max(old.through + 1)
+            } else {
+                floor.max(old.from)
+            }
+        });
         let window = LiveWindow {
             head: head_id,
             from,

@@ -730,12 +730,15 @@ impl Flow {
                                 "live window author has conflicting heads",
                             ));
                         }
+                        // A head no newer than the window's top resumes it. A newer head
+                        // selects a new window at once, even over an unfinished one: fresh
+                        // messages never wait for old bodies (ADR-036; the decider, #934), and
+                        // the selector keeps the unfinished positions inside the new window,
+                        // walked newest first after the fresh ones, held positions passing
+                        // locally. Measured before this: a joiner read the creator's next post
+                        // only when his drain of her 150-post window ended, 51–59 s on.
                         if let Some(window) = state.live {
-                            if window.through >= target.root.leaves
-                                || (!window.complete()
-                                    && target.root.leaves - window.through
-                                        < crate::log::history::MAX_PAGE_ENTRIES as u64)
-                            {
+                            if window.through >= target.root.leaves {
                                 return Ok(Some((window, target.root.leaves)));
                             }
                         }
