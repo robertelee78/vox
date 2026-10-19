@@ -17,6 +17,10 @@ use crate::app::AppError;
 /// How long a client waits for a daemon it started to answer (S-2).
 pub const START_WITHIN: Duration = Duration::from_secs(15);
 
+/// The whole time an agent hook gives a daemon probe and cold start before returning its bounded
+/// answer. The daemon continues under its reaper and the next turn uses the saved registration.
+const HOOK_WITHIN: Duration = Duration::from_millis(500);
+
 /// The hidden flag a client starts the daemon with: no foreground node, its own session, and an
 /// exit once it has no node and no connection (L-8).
 pub const AS_DETACHED: &str = "--as-detached";
@@ -28,6 +32,18 @@ pub enum Daemon {
     Running,
     /// This call started it.
     Started,
+}
+
+/// What the hook's bounded daemon path found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookDaemon {
+    /// A daemon greeted on this version.
+    Ready,
+    /// This hook started a daemon which is still preparing its control socket.
+    Starting,
+    /// The existing daemon socket did not answer within the hook's bound. It must not be raced by
+    /// another daemon start.
+    Unanswered,
 }
 
 /// Make sure `account`'s daemon is running: if its socket does not answer, start one detached,
@@ -63,6 +79,52 @@ pub async fn ensure_daemon(
     start_daemon(&std::env::current_exe()?, account, listen, anchors).await
 }
 
+/// Find or begin a daemon for an agent hook, without making the model's turn wait for network
+/// presence and computer management to finish. A newly started child is owned by a reaper thread
+/// before this returns.
+///
+/// # Errors
+/// As [`ensure_daemon`], when an existing daemon is unusable or the new child definitely failed
+/// before the hook's short bound.
+pub async fn ensure_daemon_for_hook(
+    account: &Account,
+    listen: std::net::SocketAddr,
+    anchors: &[String],
+) -> Result<HookDaemon, AppError> {
+    let began = Instant::now();
+    let socket = account.socket();
+    let greeted = tokio::time::timeout(
+        HOOK_WITHIN,
+        DaemonClient::open_noting(&socket, Some(crate::client::say_daemon_waiting)),
+    )
+    .await;
+    match greeted {
+        Err(_) => return Ok(HookDaemon::Unanswered),
+        Ok(Ok(_)) => return Ok(HookDaemon::Ready),
+        Ok(Err(e @ vox_core::error::Error::Ipc(vox_core::error::IpcHandshake::Silent { .. }))) => {
+            return Err(AppError::Usage(format!("{e}")))
+        }
+        Ok(Err(e @ vox_core::error::Error::Ipc(vox_core::error::IpcHandshake::Root))) => {
+            return Err(AppError::Usage(format!("{e}")))
+        }
+        Ok(Err(e @ vox_core::error::Error::Ipc(vox_core::error::IpcHandshake::Version { .. }))) => {
+            return Err(AppError::Usage(e.to_string()))
+        }
+        Ok(Err(_)) => {}
+    }
+    let remaining = HOOK_WITHIN.saturating_sub(began.elapsed());
+    start_daemon_bounded(
+        &std::env::current_exe()?,
+        account,
+        listen,
+        anchors,
+        remaining,
+        true,
+    )
+    .await
+    .map(|answer| answer.map_or(HookDaemon::Starting, |_| HookDaemon::Ready))
+}
+
 /// Start `exe` as `account`'s daemon, detached, listening on `listen`, and wait for it to answer:
 /// [`ensure_daemon`]'s start, and `vox update`'s restart onto the vox it put in place.
 ///
@@ -74,6 +136,24 @@ pub async fn start_daemon(
     listen: std::net::SocketAddr,
     anchors: &[String],
 ) -> Result<Daemon, AppError> {
+    // This path serves interactive commands and update handoffs, which require a definitive
+    // answer rather than an agent hook's bounded "still starting" result.
+    start_daemon_bounded(exe, account, listen, anchors, START_WITHIN, false)
+        .await
+        .map(Option::unwrap)
+}
+
+/// Start the daemon and wait up to `within` for its socket. When `pending_ok`, an otherwise healthy
+/// child still starting at that bound is `Ok(None)`. The child moves to its reaper immediately, so
+/// returning early can neither abandon an unreaped child nor stop the daemon.
+async fn start_daemon_bounded(
+    exe: &Path,
+    account: &Account,
+    listen: std::net::SocketAddr,
+    anchors: &[String],
+    within: Duration,
+    pending_ok: bool,
+) -> Result<Option<Daemon>, AppError> {
     let socket = account.socket();
     let log_path = account.log_file();
     vox_core::node::paths::create_private_dir(&account.daemon_dir())
@@ -110,46 +190,82 @@ pub async fn start_daemon(
             log_path.display()
         ))
     })?;
+    // Own the child from the moment it exists. In particular, an agent hook may return while this
+    // daemon is still starting; dropping its bounded future must not leave the child unreaped.
+    let (ended_tx, ended_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = ended_tx.send(child.wait());
+    });
     let t0 = Instant::now();
     let mut lost = false;
     let outcome = loop {
-        if DaemonClient::observe(&socket).await.is_ok() {
-            break Ok(Daemon::Started);
+        // Once a socket accepts but does not greet, `observe` has its own ten-second bound. Keep
+        // that wait inside this caller's (shorter, for a hook) total bound too.
+        let remaining = within.saturating_sub(t0.elapsed());
+        if !remaining.is_zero()
+            && matches!(
+                tokio::time::timeout(remaining, DaemonClient::observe(&socket)).await,
+                Ok(Ok(_))
+            )
+        {
+            break Ok(Some(Daemon::Started));
         }
         // **A daemon that ended is not waited for** (S-2): it said why in its log, and the
         // client says it at once. One that ended because another took the lock first left
         // that one answering.
-        if !lost && matches!(child.try_wait(), Ok(Some(_))) {
-            if DaemonClient::observe(&socket).await.is_ok() {
-                break Ok(Daemon::Running);
+        if !lost {
+            match ended_rx.try_recv() {
+                Ok(Ok(_)) => {
+                    let remaining = within.saturating_sub(t0.elapsed());
+                    if !remaining.is_zero()
+                        && matches!(
+                            tokio::time::timeout(remaining, DaemonClient::observe(&socket)).await,
+                            Ok(Ok(_))
+                        )
+                    {
+                        break Ok(Some(Daemon::Running));
+                    }
+                    // **Lost the race to another start** (D-1, S-2): that daemon holds the lock
+                    // and may not have bound the socket yet. Its socket is waited for within the
+                    // same bound.
+                    if startup_text(&startup).contains("a daemon is already running") {
+                        lost = true;
+                        continue;
+                    }
+                    break Err(AppError::Usage(format!(
+                        "the daemon stopped as it started; it said (its log is {}):\n{}",
+                        log_path.display(),
+                        format_args!("{}\n{}", startup_text(&startup), since(&log_path, from))
+                    )));
+                }
+                Ok(Err(e)) => {
+                    break Err(AppError::Usage(format!(
+                        "could not wait for the daemon process: {e}; its log is {}",
+                        log_path.display()
+                    )));
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    break Err(AppError::Usage(format!(
+                        "could not observe the daemon process; its log is {}",
+                        log_path.display()
+                    )));
+                }
             }
-            // **Lost the race to another start** (D-1, S-2): that daemon holds the lock and may
-            // not have bound the socket yet. Its socket is waited for, within the same bound.
-            if startup_text(&startup).contains("a daemon is already running") {
-                lost = true;
-                continue;
-            }
-            break Err(AppError::Usage(format!(
-                "the daemon stopped as it started; it said (its log is {}):\n{}",
-                log_path.display(),
-                format_args!("{}\n{}", startup_text(&startup), since(&log_path, from))
-            )));
         }
-        if t0.elapsed() >= START_WITHIN {
+        if t0.elapsed() >= within {
+            if pending_ok {
+                break Ok(None);
+            }
             break Err(AppError::Usage(format!(
                 "the daemon did not start within {} s. Its log, {}, ends:\n{}",
-                START_WITHIN.as_secs(),
+                within.as_secs(),
                 log_path.display(),
                 format_args!("{}\n{}", startup_text(&startup), tail(&log_path, 20))
             )));
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
-    // Reaped on its own thread: the daemon outlives most clients, and one that ends first must
-    // not stay a zombie for the client's life.
-    std::thread::spawn(move || {
-        let _ = child.wait();
-    });
     outcome
 }
 

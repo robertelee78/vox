@@ -39,10 +39,10 @@
 //! renamed (`session.updated` with its title), and its Session reads the new one.
 //!
 //! **OpenCode** (`an_opencode_session_is_mirrored_and_driven`): one session of `oc-a` through the
-//! hosted plugin: its prompt, a tool call, a question asked and answered by `person` with
-//! `--answer` (the plugin replies to that question on OpenCode's API), the reply and the turn's
-//! end, all in its Session; `--interrupt` reaches it as OpenCode's abort of that session. Then the
-//! same plugin hosted as `opencode run` loads it (OpenCode's own argv as measured, `… run …`) runs
+//! hosted plugin: its prompt, a tool call, the reply and the turn's end, all in its Session
+//! (OpenCode 2.x asks no questions: its forms reach only the client, so none reaches the
+//! plugin); `--interrupt` reaches it as OpenCode's interrupt of that session. Then the same
+//! plugin hosted as `opencode run` loads it (OpenCode's own argv as measured, `… run …`) runs
 //! a turn in the room and opens no Session (ADR-029 SE-1).
 //!
 //! **Which side a red is on.** What `vox room session` printed, what the stand-in app-server
@@ -51,8 +51,8 @@
 //! could not make, or `node` missing, is `APPARATUS:` / `CANNOT MEASURE`.
 //!
 //! **Mutations that must turn it red**, one per claim: a closed thread not subscribed again (#541,
-//! "miss events after a resume") → no second reply; the plugin's `question.asked` not forwarded
-//! (#542, "drop a question event") → no question line; drive input handed to the node's newest
+//! "miss events after a resume") → no second reply; the plugin's `session.inbox.delivered` not
+//! forwarded (#542, "drop a prompt event") → no typed-prompt line; drive input handed to the node's newest
 //! session instead of the named one (#544) → `turn/start` on S2's thread; a Session not renamed
 //! until its next message (the rename record dropped) → neither reads its new name; the plugin
 //! not reading the session's title when a follow begins → the OpenCode Session never reads the
@@ -900,23 +900,24 @@ fn an_opencode_session_is_mirrored_and_driven() {
 
     // ---- (2) the operator's prompt: the plugin's drain registers the session ----
     host.ask("turn Paint e1 the colour I pick.", within);
-    // Its events, as OpenCode's bus gives them to the plugin's `event` hook. Vox follows the
-    // session once it registered; the first events may land before it does, so the prompt is
-    // given again as OpenCode updates it.
-    let user = json!({"type": "message.updated", "properties": {"info": {"id": "msg_u1", "sessionID": OC, "role": "user"}}});
-    let typed = json!({"type": "message.part.updated", "properties": {"part": {"id": "prt_u1", "messageID": "msg_u1", "sessionID": OC, "type": "text", "text": "Paint e1 the colour I pick."}}});
+    // Its events, as OpenCode 2.x's bus gives them to the plugin's `event.subscribe` stream. Vox
+    // follows the session once it registered; the first events may land before it does, so the
+    // prompt is given again as OpenCode updates it.
+    let user = json!({"type": "session.inbox.delivered", "data": {"sessionID": OC, "inboxID": "msg_u1",
+        "item": {"type": "user", "payload": {"text": "Paint e1 the colour I pick."}, "delivery": "queue"}}});
     let deadline = Instant::now() + within;
+    let mut err;
     loop {
         host.event(user.clone());
-        host.event(typed.clone());
-        let (_, plain, _) = w.vox(PERSON, &["room", "session", &w.room, OC], None);
+        let (_, plain, e) = w.vox(PERSON, &["room", "session", &w.room, OC], None);
+        err = e;
         if plain.contains("typed at the terminal: Paint e1") {
             break;
         }
         assert!(
             Instant::now() < deadline,
             "PRODUCT: within {within:?}, the OpenCode session's prompt never reached its \
-             Session; `vox room session` said:\n{plain}"
+             Session; `vox room session` said:\n{plain}--stderr--\n{err}--end--"
         );
         std::thread::sleep(Duration::from_millis(500));
     }
@@ -926,42 +927,19 @@ fn an_opencode_session_is_mirrored_and_driven() {
         titled.lines().next().unwrap_or_default()
     );
 
-    // ---- (3) a tool call, a question answered by person, the reply, the turn's end ----
-    host.event(json!({"type": "message.updated", "properties": {"info": {"id": "msg_a1", "sessionID": OC, "role": "assistant", "providerID": "opencode", "modelID": "kimi-k3"}}}));
-    host.event(json!({"type": "message.part.updated", "properties": {"part": {"id": "prt_t1", "messageID": "msg_a1", "sessionID": OC, "type": "tool", "tool": "bash", "callID": "call_1", "state": {"status": "running", "input": {"command": "ls e1"}}}}}));
-    host.event(json!({"type": "message.part.updated", "properties": {"part": {"id": "prt_t1", "messageID": "msg_a1", "sessionID": OC, "type": "tool", "tool": "bash", "callID": "call_1", "state": {"status": "completed", "input": {"command": "ls e1"}, "output": "e1\n", "title": "ls e1"}}}}));
-    let qid = "que_01";
-    host.event(json!({"type": "question.asked", "properties": {"id": qid, "sessionID": OC, "questions": [
-        {"question": "Which colour?", "header": "Colour", "options": [
-            {"label": "blue", "description": "calm"}, {"label": "red", "description": "loud"}], "multiple": false}
-    ]}}));
-    let asked = w.read_until(OC, "question: Which colour?", within);
-    println!("[proof] (3) Session {OC} with the question waiting:\n{asked}");
-    let (ok, said) = w.drive(PERSON, OC, &["--answer", qid, "Which colour?=blue"]);
-    println!("[proof] (3) person --answer: {said}");
-    assert!(
-        ok,
-        "PRODUCT: {PERSON}'s answer to the question waiting in {OC} must be handed to it; it \
-         said: {said}"
-    );
-    let calls = host.ask("calls 30 1", within)["calls"].clone();
-    println!("[proof] (3) the plugin called OpenCode: {calls}");
-    let reply = calls.as_array().into_iter().flatten().find(|c| {
-        c["url"]
-            .as_str()
-            .is_some_and(|u| u.starts_with("/question/"))
-    });
-    assert!(
-        reply.is_some_and(|c| c["url"] == format!("/question/{qid}/reply")
-            && c["body"]["answers"] == json!([["blue"]])),
-        "PRODUCT: the answer must reach OpenCode as a reply to question {qid} with [[\"blue\"]]; \
-         the plugin made {calls}"
-    );
-    host.event(json!({"type": "question.replied", "properties": {"sessionID": OC, "requestID": qid, "answers": [["blue"]]}}));
-    host.event(json!({"type": "message.part.updated", "properties": {"part": {"id": "prt_r1", "messageID": "msg_a1", "sessionID": OC, "type": "text", "text": "e1 is blue now."}}}));
-    host.event(json!({"type": "session.idle", "properties": {"sessionID": OC}}));
+    // ---- (3) a tool call, the reply, the turn's end ----
+    // OpenCode 2.x asks no questions: its forms reach only the client, and a reply is a
+    // client action, so a question reaches neither this plugin nor its Session.
+    host.event(json!({"type": "session.step.started", "data": {"sessionID": OC, "assistantMessageID": "msg_a1", "agent": "build", "model": "stub/kimi-k3", "started": 0}}));
+    host.event(json!({"type": "session.tool.input.started", "data": {"sessionID": OC, "assistantMessageID": "msg_a1", "id": "call_1", "name": "bash"}}));
+    host.event(json!({"type": "session.tool.called", "data": {"sessionID": OC, "assistantMessageID": "msg_a1", "id": "call_1", "input": {"command": "ls e1"}, "executed": true}}));
+    host.event(json!({"type": "session.tool.success", "data": {"sessionID": OC, "assistantMessageID": "msg_a1", "id": "call_1", "content": [{"type": "text", "text": "e1\n"}], "executed": true}}));
+    host.event(json!({"type": "session.text.ended", "data": {"sessionID": OC, "assistantMessageID": "msg_a1", "ordinal": 0, "text": "e1 is blue now."}}));
+    host.event(json!({"type": "session.idle", "data": {"sessionID": OC}}));
     // Renamed in OpenCode: its Session takes the title with no message posted (ADR-029 MD-1).
-    host.event(json!({"type": "session.updated", "properties": {"info": {"id": OC, "title": "oc renamed"}}}));
+    host.event(
+        json!({"type": "session.renamed", "data": {"sessionID": OC, "title": "oc renamed"}}),
+    );
     let done = w.read_until(OC, "— turn ended —", within);
     let named = w.read_until(OC, "· oc renamed ·", within);
     println!(
@@ -971,24 +949,18 @@ fn an_opencode_session_is_mirrored_and_driven() {
     println!("[proof] (3) Session {OC} after the turn:\n{done}");
     let lines: Vec<&str> = done.lines().collect();
     let at = |needle: &str| lines.iter().position(|l| l.contains(needle));
-    let (called, question, replied, ended) = (
-        at("bash: ls e1 → ls e1"),
-        at("question: Which colour?"),
+    let (called, replied, ended) = (
+        at("bash: ls e1 → e1"),
         at("reply: e1 is blue now."),
         at("— turn ended —"),
     );
     assert!(
-        called.is_some() && question.is_some() && replied.is_some() && ended.is_some(),
-        "PRODUCT: Session {OC} must show the tool call, the question, the reply and the turn's \
-         end; it showed:\n{done}"
+        called.is_some() && replied.is_some() && ended.is_some(),
+        "PRODUCT: Session {OC} must show the tool call, the reply and the turn's end; it \
+         showed:\n{done}"
     );
     assert!(
-        done.lines()
-            .any(|l| l.contains("question: Which colour?") && l.contains("blue")),
-        "PRODUCT: the question must read as answered with blue; the Session showed:\n{done}"
-    );
-    assert!(
-        called < question && question < replied && replied < ended,
+        called < replied && replied < ended,
         "PRODUCT: Session {OC} must keep the turn's order; it showed:\n{done}"
     );
 
@@ -999,15 +971,15 @@ fn an_opencode_session_is_mirrored_and_driven() {
         ok,
         "PRODUCT: {PERSON}'s interrupt must be delivered; it said: {said}"
     );
-    let calls = host.ask("calls 30 2", within)["calls"].clone();
+    let calls = host.ask("calls 30 1", within)["calls"].clone();
     assert!(
         calls
             .as_array()
             .into_iter()
             .flatten()
-            .any(|c| c["method"] == "POST" && c["url"] == format!("/session/{OC}/abort")),
-        "PRODUCT: an interrupt must reach OpenCode as the abort of session {OC}; the plugin made \
-         {calls}"
+            .any(|c| c["method"] == "session.interrupt" && c["input"]["sessionID"] == json!(OC)),
+        "PRODUCT: an interrupt must reach OpenCode as the interrupt of session {OC}; the plugin \
+         made {calls}"
     );
 
     // ---- (5) `opencode run`: headless, so no Session (ADR-029 SE-1) ----

@@ -1445,19 +1445,80 @@ mod journey {
             }
         }
         readable.extend(tmux_dirs.iter().map(PathBuf::as_path));
-        let profile = w.root.join("harness.sb");
-        std::fs::write(
-            &profile,
-            oc_sandbox::offline_profile(&[&w.root], &readable, port),
-        )
-        .unwrap_or_else(|e| panic!("APPARATUS: the sandbox profile: {e}"));
-        oc_sandbox::probe_profile(&profile, &canary, "harnesses on the stand-in model");
-
+        // The journey's own OpenCode managed service port, picked here. `opencode run`
+        // starts, or reaches for, the machine's background service, whose port is
+        // deterministic: the operator's running OpenCode already holds it (measured
+        // twice: "Failed to start server. Is port 49374 in use?"), and no cleared
+        // environment shifts it. `opencode service set port` moves this scratch
+        // environment's managed service to a port of the proof's own, and `run` with
+        // no `--server` then starts it there and runs the turn locally in the CLI,
+        // which is the one place the shipped plugin loads. With `--server` instead,
+        // the turn runs inside the server, whose plugin loader rejects the shipped
+        // plugin ("Plugin must export a default definition with an id and an effect
+        // or setup function") and no Vox context ever reaches the model.
+        let oc_port: u16 = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0")
+                .unwrap_or_else(|e| panic!("APPARATUS: cannot pick OpenCode's server port: {e}"));
+            l.local_addr()
+                .unwrap_or_else(|e| panic!("APPARATUS: OpenCode's server port: {e}"))
+                .port()
+        };
         let xdg = |d: &str| w.root.join("xdg").join(d).display().to_string();
         for d in ["data", "state", "cache"] {
             std::fs::create_dir_all(w.root.join("xdg").join(d))
                 .unwrap_or_else(|e| panic!("APPARATUS: {e}"));
         }
+        let oc_env = [
+            (
+                "XDG_CONFIG_HOME",
+                w.home.join(".config").display().to_string(),
+            ),
+            ("XDG_DATA_HOME", xdg("data")),
+            ("XDG_STATE_HOME", xdg("state")),
+            ("XDG_CACHE_HOME", xdg("cache")),
+            ("OPENCODE_DISABLE_MODELS_FETCH", "1".to_owned()),
+            ("OPENCODE_DISABLE_AUTOUPDATE", "1".to_owned()),
+            ("OPENCODE_DISABLE_LSP_DOWNLOAD", "1".to_owned()),
+            ("OPENCODE_DISABLE_CLAUDE_CODE", "1".to_owned()),
+        ];
+        let profile = w.root.join("harness.sb");
+        // The three ancestor literals (`/private/tmp`, `/private`, `/`): OpenCode's
+        // server, on a session's first turn, resolves the real path of every ancestor
+        // of its working directory to discover its config, and each resolution reads
+        // the ancestor directory's own entry — denied, `/api/location` answers 500 and
+        // the session dies as APPARATUS. The literals admit reading exactly those
+        // directory entries and no file under them: names of siblings in the system
+        // temp, nothing more, and the canary stays unreadable and unlisted.
+        let profile_text = format!(
+            "{}(allow network-outbound (remote ip \"localhost:{oc_port}\"))\n\
+             (allow file-read-data file-read-metadata (literal \"/private/tmp\"))\n\
+             (allow file-read-data file-read-metadata (literal \"/private\"))\n\
+             (allow file-read-data file-read-metadata (literal \"/\"))\n",
+            oc_sandbox::offline_profile(&[&w.root], &readable, port)
+        );
+        std::fs::write(&profile, profile_text)
+            .unwrap_or_else(|e| panic!("APPARATUS: the sandbox profile: {e}"));
+        oc_sandbox::probe_profile(&profile, &canary, "harnesses on the stand-in model");
+        // Point this scratch environment's managed service at the picked port before
+        // any session starts one.
+        let service_set = Command::new("/usr/bin/sandbox-exec")
+            .env_clear()
+            .envs(w.env())
+            .envs(oc_env)
+            .arg("-f")
+            .arg(&profile)
+            .arg(oc_sandbox::opencode_bin())
+            .args(["service", "set", "port", &oc_port.to_string()])
+            .current_dir(&w.repo)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap_or_else(|e| panic!("APPARATUS: cannot set OpenCode's service port: {e}"));
+        assert!(
+            service_set.status.success(),
+            "APPARATUS: `opencode service set port` failed: {}{}",
+            String::from_utf8_lossy(&service_set.stdout),
+            String::from_utf8_lossy(&service_set.stderr)
+        );
         let harnesses: Vec<Harness> = HARNESSES
             .iter()
             .map(|(key, name, node)| {
@@ -1503,6 +1564,9 @@ mod journey {
                         ],
                     ),
                     _ => (
+                        // No `--server`: the run starts this scratch environment's own
+                        // managed service (on the port set above) and runs the turn
+                        // locally in the CLI, which is where the shipped plugin loads.
                         vec!["run", "--model", "standin/stub-model", "hello"],
                         vec![
                             (
@@ -1577,10 +1641,23 @@ mod journey {
             );
             if !out.status.success() || all.lines().count() == before {
                 return Err(format!(
-                    "{} did not finish a turn against the stand-in model (exit {:?}): {}",
+                    "{} did not finish a turn against the stand-in model (exit {:?}): {}{}",
                     h.name,
                     out.status.code(),
-                    last_lines(&said, 15)
+                    last_lines(&said, 15),
+                    if h.key == "opencode" {
+                        let db_log = w
+                            .root
+                            .join("xdg")
+                            .join("data")
+                            .join("opencode/log/opencode.log");
+                        format!(
+                            "\n[the proof's OpenCode db log]:\n{}",
+                            last_lines(&std::fs::read_to_string(&db_log).unwrap_or_default(), 25)
+                        )
+                    } else {
+                        String::new()
+                    }
                 ));
             }
             Ok((sent, said))
@@ -2017,9 +2094,9 @@ mod journey {
                 },
             );
             let read_next = format!(
-                "Next: send \"{}\" this node's fingerprint (`vox id`), so it trusts you too and \
-                 you read what it writes",
-                h.key
+                "Next: send \"{}\" this node's fingerprint (`vox id --node {PERSON}`), so it \
+                 trusts you too and you read what it writes",
+                h.key,
             );
             l.claim(
                 &format!("J8.{}.trust-add", h.key),
@@ -2576,7 +2653,11 @@ mod journey {
             };
             (took, text.trim().to_owned())
         };
-        let mut paths: Vec<(&str, String, &str)> = Vec::new();
+        let locked_pass = w.root.join("hook-locked.pass");
+        std::fs::write(&locked_pass, b"hook locked identity\n")
+            .unwrap_or_else(|e| panic!("APPARATUS: cannot stage the locked hook passphrase: {e}"));
+        let locked_pass = locked_pass.display().to_string();
+        let mut paths: Vec<(&str, String, String)> = Vec::new();
         for (key, cmd) in &wirings {
             match cmd {
                 Some(c) => {
@@ -2585,9 +2666,22 @@ mod journey {
                         .find(|h| h.0 == *key)
                         .map(|h| h.2)
                         .unwrap_or_default();
-                    paths.push(("detached", c.clone(), node));
-                    paths.push(("no-daemon", c.clone(), node));
-                    paths.push(("no-node", c.replace(node, &format!("{node}-gone")), node));
+                    let locked = format!("{node}-locked");
+                    let made =
+                        w.run(&["node", "create", &locked, "--passphrase-file", &locked_pass]);
+                    if !made.ok {
+                        l.apparatus(
+                            &format!("J9.{key}.detached.staged"),
+                            &format!("the protected node could not be made: {}", made.said),
+                        );
+                    }
+                    paths.push(("detached", c.replace(node, &locked), locked));
+                    paths.push(("no-daemon", c.clone(), node.to_owned()));
+                    paths.push((
+                        "no-node",
+                        c.replace(node, &format!("{node}-gone")),
+                        node.to_owned(),
+                    ));
                 }
                 None => {
                     for p in ["detached", "no-daemon", "no-node"] {
@@ -2607,9 +2701,20 @@ mod journey {
             };
             match *path {
                 "detached" => {
-                    // A daemon running, holding the person's node, and this one detached.
+                    // A daemon running, holding the person's node, and this protected one Locked.
                     let _ = w.person(&["node", "attach", PERSON], PERSON);
-                    let _ = w.run(&["node", "detach", node]);
+                    let unlocked =
+                        w.run(&["node", "unlock", node, "--passphrase-file", &locked_pass]);
+                    let locked = w.run(&["node", "lock", node]);
+                    if !unlocked.ok || !locked.ok {
+                        l.apparatus(
+                            &format!("J9.{key}.detached.staged"),
+                            &format!(
+                                "the protected node was not unlocked then locked: {}; {}",
+                                unlocked.said, locked.said
+                            ),
+                        );
+                    }
                 }
                 "no-daemon" => {
                     // The node attached and remembered (typed, as a person attaches it), then no
@@ -2650,9 +2755,10 @@ mod journey {
             };
             let (ok, want) = match *path {
                 "detached" => {
+                    let unlock = vox_text::shell::command(&["vox", "node", "unlock", "--", node]);
                     let want = format!(
                         "Vox node {node} is Locked; ask the operator to run \
-                         `vox node unlock {node}` in a terminal outside this session."
+                         `{unlock}` in a terminal outside this session."
                     );
                     (text == want, want)
                 }

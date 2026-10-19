@@ -128,13 +128,63 @@ impl Drop for Killed {
 }
 
 /// The plugin as OpenCode runs it (`support/opencode_plugin_host.mjs`), one JSON line per command.
+/// A hosted TUI client receiver, the plugin `vox agent plugin opencode --tui` prints,
+/// pinned to one session. The daemon's wake reaches the client, and only the client
+/// submits the notice (ADR-020 RA7), so each session this proof expects to be woken
+/// hosts one; the notice it submits is read by that session's plugin host. Killed
+/// with its host when dropped; the child is held for its drop alone.
+#[allow(dead_code)]
+struct Receiver(Killed);
+
+impl Receiver {
+    /// # Panics
+    /// Apparatus: `node` did not start the TUI client plugin host.
+    fn start(
+        node: &Path,
+        plugin: &Path,
+        session: &str,
+        project: &Path,
+        root: &Path,
+        notices: &Path,
+    ) -> Self {
+        let host_js = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/support/opencode_tui_plugin_host.mjs");
+        let child = Command::new(node)
+            .arg(host_js)
+            .arg(plugin)
+            .arg(session)
+            .arg(notices)
+            .current_dir(project)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", root.join("home"))
+            .env("TMPDIR", root.join("tmp"))
+            .env("VOX_BIN", VOX)
+            .env("VOX_DATA_DIR", root.join("data"))
+            .env("VOX_CONFIG_DIR", root.join("cfg"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("APPARATUS: start the TUI client receiver host");
+        Self(Killed(child))
+    }
+}
+
 struct Host {
     child: Killed,
     lines: std::sync::mpsc::Receiver<String>,
 }
 
 impl Host {
-    fn start(node: &Path, plugin: &Path, session: &str, project: &Path, root: &Path) -> Self {
+    fn start(
+        node: &Path,
+        plugin: &Path,
+        session: &str,
+        project: &Path,
+        root: &Path,
+        notices: &Path,
+    ) -> Self {
         std::fs::create_dir_all(project).expect("APPARATUS: scratch session directory");
         let host_js =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/opencode_plugin_host.mjs");
@@ -150,6 +200,7 @@ impl Host {
             .env("VOX_BIN", VOX)
             .env("VOX_DATA_DIR", root.join("data"))
             .env("VOX_CONFIG_DIR", root.join("cfg"))
+            .env("VOX_PROOF_NOTICES", notices)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -350,6 +401,20 @@ fn room_text_cannot_close_the_plugins_fence_nor_pass_as_the_user() {
     assert!(ok, "PRODUCT (staging): vox agent plugin opencode: {err}");
     let plugin_path = tmp.path().join("vox.mjs");
     std::fs::write(&plugin_path, plugin).expect("APPARATUS: install the plugin");
+    // The TUI client plugin, whose private receiver alone submits a wake notice (ADR-020
+    // RA7); the hosted sessions that are to be woken each host one, pinned to one session.
+    let (ok, tui_plugin, err) = vox(
+        &data,
+        &cfg,
+        &["agent", "plugin", "opencode", "--tui", "--node", "default"],
+        "",
+    );
+    assert!(
+        ok,
+        "PRODUCT (staging): vox agent plugin opencode --tui: {err}"
+    );
+    let tui_plugin_path = tmp.path().join("vox-tui.mjs");
+    std::fs::write(&tui_plugin_path, tui_plugin).expect("APPARATUS: install the TUI plugin");
     let post = |args: &[&str], body: &str| {
         let mut argv = vec!["room", "post", room.as_str(), "--session", "person"];
         argv.extend_from_slice(args);
@@ -361,12 +426,22 @@ fn room_text_cannot_close_the_plugins_fence_nor_pass_as_the_user() {
     // First show the real unbound contract: guidance, no arbitrary room payload. The old
     // fixture expected news here, which stopped being valid when #795 fixed synchronous reads.
     let session = "ses_vox_fence_proof";
+    let main_notices = tmp.path().join("notices-main.json");
     let mut host = Host::start(
         &node,
         &plugin_path,
         session,
         &tmp.path().join("repo-a"),
         tmp.path(),
+        &main_notices,
+    );
+    let _main_receiver = Receiver::start(
+        &node,
+        &tui_plugin_path,
+        session,
+        &tmp.path().join("repo-a"),
+        tmp.path(),
+        &main_notices,
     );
     let turn_within = Duration::from_secs(60);
     post(&[], "UNBOUND-MUST-NOT-READ");
@@ -562,12 +637,22 @@ fn room_text_cannot_close_the_plugins_fence_nor_pass_as_the_user() {
     assert!(ok, "PRODUCT: create the node's second room: {out}{err}");
     let other_room = "other-agents";
     let session_b = "ses_other_repo";
+    let other_notices = tmp.path().join("notices-other.json");
     let mut other = Host::start(
         &node,
         &plugin_path,
         session_b,
         &tmp.path().join("repo-b"),
         tmp.path(),
+        &other_notices,
+    );
+    let _other_receiver = Receiver::start(
+        &node,
+        &tui_plugin_path,
+        session_b,
+        &tmp.path().join("repo-b"),
+        tmp.path(),
+        &other_notices,
     );
     // The third repository is bound by the operator before its harness starts. Its generated
     // plugin must select that saved map entry without deriving a room from node membership.
@@ -593,14 +678,32 @@ fn room_text_cannot_close_the_plugins_fence_nor_pass_as_the_user() {
         ok,
         "PRODUCT: create and map the node's third repository room: {out}{err}"
     );
-    let mut third = Host::start(&node, &plugin_path, "ses_third_repo", &repo_c, tmp.path());
+    let third_notices = tmp.path().join("notices-third.json");
+    let mut third = Host::start(
+        &node,
+        &plugin_path,
+        "ses_third_repo",
+        &repo_c,
+        tmp.path(),
+        &third_notices,
+    );
+    let _third_receiver = Receiver::start(
+        &node,
+        &tui_plugin_path,
+        "ses_third_repo",
+        &repo_c,
+        tmp.path(),
+        &third_notices,
+    );
     third.ask("turn start in third mapped repository", turn_within);
+    let unbound_notices = tmp.path().join("notices-unbound.json");
     let mut unbound = Host::start(
         &node,
         &plugin_path,
         "ses_no_repo_room",
         &tmp.path().join("unbound"),
         tmp.path(),
+        &unbound_notices,
     );
     other.ask("turn register second session", turn_within);
     bind(session_b, other_room);

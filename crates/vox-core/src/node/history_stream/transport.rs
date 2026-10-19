@@ -5,7 +5,10 @@ use std::sync::Arc;
 use quinn::{RecvStream, SendStream};
 use tokio::time::Instant;
 
-use super::{Encoded, Frame, MAX_FRAME_BYTES};
+use super::{
+    Encoded, Frame, ACK_FRAME_MAX_BYTES, MAX_FRAME_BYTES, MAX_HELLO_FRAME_BYTES,
+    MAX_WANT_FRAME_BYTES,
+};
 use crate::error::{Error, Result};
 use crate::node::history_budget::{BufferCharge, Job};
 use crate::transport::framing::write_frame;
@@ -73,11 +76,51 @@ impl Transport {
     /// The caller supplies its remaining response credit including the four-byte prefix.
     /// Reserve before reading even that prefix: Busy never leaves a partially consumed frame.
     pub(super) async fn read(&mut self, remaining_wire: usize) -> Result<Read> {
+        self.read_bounded(remaining_wire, DECODE_ENVELOPE, None)
+            .await
+    }
+
+    /// HELLO has a fixed three-byte maximum and no decoded collection. Keep its reservation
+    /// ahead of the prefix while leaving the attacker-sized envelope on every variable frame.
+    pub(super) async fn read_hello(&mut self) -> Result<Read> {
+        self.read_bounded(MAX_HELLO_FRAME_BYTES + 4, 0, Some(&[0x01]))
+            .await
+    }
+
+    /// This handshake position accepts WANT's bounded scalar Query or a smaller CANCEL.
+    pub(super) async fn read_want_or_cancel(&mut self) -> Result<Read> {
+        self.read_bounded(MAX_WANT_FRAME_BYTES + 4, 0, Some(&[0x03, 0x09]))
+            .await
+    }
+
+    /// ACK and CANCEL are fixed scalar frames. They need no variable-frame decode envelope;
+    /// reserve their structural bound before the prefix and reject every other tag there.
+    pub(super) async fn read_ack_or_cancel(&mut self, remaining_wire: usize) -> Result<Read> {
+        self.read_bounded(
+            remaining_wire.min(ACK_FRAME_MAX_BYTES + 4),
+            0,
+            Some(&[0x0A, 0x09]),
+        )
+        .await
+    }
+
+    async fn read_bounded(
+        &mut self,
+        remaining_wire: usize,
+        decode_envelope: usize,
+        expected_tags: Option<&[u8]>,
+    ) -> Result<Read> {
         let maximum = remaining_wire.saturating_sub(4).min(MAX_FRAME_BYTES);
         if maximum == 0 {
             return Err(Error::SizeLimitExceeded("history response credit"));
         }
-        let Some(charge) = self.job.reserve(maximum + DECODE_ENVELOPE) else {
+        let envelope = maximum
+            .checked_add(decode_envelope)
+            .ok_or(Error::SizeLimitExceeded("history frame envelope"))?;
+        let Some(work_job) = self.job.record_job(envelope) else {
+            return Ok(Read::Busy);
+        };
+        let Some(charge) = work_job.reserve(envelope) else {
             return Ok(Read::Busy);
         };
         let until = self.until();
@@ -85,7 +128,10 @@ impl Transport {
         let result = tokio::select! {
             biased;
             () = fence.retired() => Err(Error::Unreachable("history request cancelled")),
-            result = tokio::time::timeout_at(until, read_charged(&mut self.recv, maximum, charge)) => {
+            result = tokio::time::timeout_at(
+                until,
+                read_charged(&mut self.recv, maximum, charge, expected_tags),
+            ) => {
                 result.unwrap_or(Err(Error::Unreachable("history frame deadline elapsed")))
             }
         };
@@ -151,7 +197,12 @@ impl Transport {
     }
 }
 
-async fn read_charged(recv: &mut RecvStream, maximum: usize, charge: BufferCharge) -> Result<Read> {
+async fn read_charged(
+    recv: &mut RecvStream,
+    maximum: usize,
+    charge: BufferCharge,
+    expected_tags: Option<&[u8]>,
+) -> Result<Read> {
     let mut prefix = [0; 4];
     match recv.read_exact(&mut prefix).await {
         Ok(()) => {}
@@ -164,6 +215,9 @@ async fn read_charged(recv: &mut RecvStream, maximum: usize, charge: BufferCharg
     }
     let mut bytes = vec![0; len];
     recv.read_exact(&mut bytes).await.map_err(read_error)?;
+    if expected_tags.is_some_and(|expected| !expected.contains(&bytes[0])) {
+        return Err(Error::MalformedBundle("history unexpected fixed frame"));
+    }
     Ok(Read::Frame(Incoming {
         bytes,
         _charge: charge,

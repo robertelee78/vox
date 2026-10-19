@@ -168,7 +168,8 @@ struct NodeCard: View {
                 }
                 Hairline()
                 switch act {
-                case .trust? where !trust.inKeyring:
+                case .trust? where !trust.inKeyring
+                    && model.keyringPending?.fingerprint != node.fingerprint:
                     trusting
                 case .compare?:
                     comparing(entry)

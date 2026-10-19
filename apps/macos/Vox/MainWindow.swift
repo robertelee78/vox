@@ -114,13 +114,19 @@ struct MainWindow: View {
                 }
                 }
                 .textSelection(.enabled)
+                .contentSurface()
             }
+            // The sidebar is a rounded pane inside the split view. Its narrow outer gutter shows
+            // the split view's canvas, so that canvas is panel too; the detail above owns bg.base.
+            .background(PanelFill())
             Hairline()
             StatusBar(model: model)
                 .raisedSurface()
                 .textSelection(.enabled)
         }
-        .contentSurface()
+        // Detail owns bg.base above; leave the root transparent so WindowBackground supplies
+        // bg.panel in the narrow gutter outside the sidebar's rounded split-view pane.
+        .foregroundStyle(VoxTokens.Colors.textPrimary)
         // The window's own background, which shows around the floating sidebar's rounded pane,
         // from the tokens too (L-6: never the system background).
         .background(WindowBackground())
@@ -217,6 +223,7 @@ private struct Sidebar: View {
             .frame(maxHeight: available.size.height * 0.4)
         }
         }
+        .background(PanelFill().ignoresSafeArea())
     }
 }
 

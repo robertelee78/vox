@@ -302,7 +302,17 @@ impl Receiver {
                                     head: *head,
                                     size: *tail,
                                 });
-                            } else if *tail > 0 {
+                            } else if *tail == 0 {
+                                // The canonical empty head has no position-zero header. Its
+                                // ordinary empty consistency proof is the complete promotion
+                                // path and makes the exact head available for peer echo.
+                                result.need(Query::Proof {
+                                    head: *head,
+                                    kind: ProofKind::Consistency,
+                                    from: 0,
+                                    to: 0,
+                                })?;
+                            } else {
                                 result.need(Query::Header {
                                     head: *head,
                                     seq: *tail,
@@ -1247,7 +1257,18 @@ impl Receiver {
                     admission::EntryStart::Preflight => {
                         LocalResult::next(next(EntryPhase::Preflight { parent: 0, next: 0 }))
                     }
-                    admission::EntryStart::BodyNeeded => LocalResult::next(next(EntryPhase::Body)),
+                    admission::EntryStart::BodyNeeded => {
+                        // Admission can promote a header-only dependency when its signed
+                        // recipient is this node. Carry that requirement into staging; merely
+                        // changing the phase would otherwise reconstruct the same header again.
+                        LocalResult::next(LocalStep::Entry {
+                            request,
+                            head,
+                            seq,
+                            body: true,
+                            phase: EntryPhase::Body,
+                        })
+                    }
                     admission::EntryStart::Cursor(binding) => {
                         LocalResult::next(next(EntryPhase::Validate(binding)))
                     }
@@ -1466,7 +1487,19 @@ impl Receiver {
                     input.control_sources_complete(&head, through)?
                 };
                 if complete {
-                    return Ok(Some((SourceProgress::Complete { through }, None)));
+                    // Effects may finish while this signed head is still only observed. The
+                    // effect walker then cannot publish its exact-head receipt yet. Once the
+                    // same head commits, do one writer turn even though its prefix is already
+                    // complete so `advance_control_effects` can atomically promote it to
+                    // `control_ready`; otherwise every later inventory re-offers it forever.
+                    let state =
+                        input.sparse_author(&target.binding.author, target.binding.scope)?;
+                    let receipt_ready = !effects
+                        || through < target.root.leaves
+                        || state.is_some_and(|state| state.control_ready == Some(head));
+                    if receipt_ready {
+                        return Ok(Some((SourceProgress::Complete { through }, None)));
+                    }
                 }
                 drop(input);
                 let progress = room.history_write(store, |index| {

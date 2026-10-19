@@ -12,7 +12,7 @@ use crate::wire::WireError;
 
 use super::client::{Received, Receiver};
 use super::transport::{Read, Transport};
-use super::{Frame, Preamble, Query, MAX_FRAME_BYTES};
+use super::{Frame, Preamble, Query};
 
 /// The caller supplies the same fixed fence/deadline used to create the receiver. It must
 /// hold its queue slot and actual buffer charges until this worker has really exited.
@@ -65,7 +65,7 @@ async fn handshake_and_pull(
     overhead += encoded.as_slice().len() + 4;
     io.write_encoded(&encoded).await?;
     drop(encoded);
-    let reply = match io.read(MAX_FRAME_BYTES + 4).await? {
+    let reply = match io.read_hello().await? {
         Read::Frame(frame) => frame,
         Read::Busy => return Err(Error::Unreachable("history HELLO reader busy")),
         Read::End => return Err(Error::Unreachable("history closed before HELLO")),

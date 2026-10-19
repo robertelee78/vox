@@ -1350,6 +1350,22 @@ pub struct ConsistentPrefix {
     root: Descriptor,
 }
 impl ConsistentPrefix {
+    /// Construct the only consistency receipt that needs no tree source: a verified
+    /// canonical empty head against its canonical empty prefix. New sparse rooms persist
+    /// this exact author-signed head so another member can acknowledge an empty feed.
+    pub(crate) fn empty(head: &VerifiedHead) -> Result<Self> {
+        let signed = head.head();
+        let empty = Descriptor::empty(signed.binding);
+        if signed.root != empty {
+            return Err(Error::MalformedBundle("nonempty head used as empty prefix"));
+        }
+        Ok(Self {
+            head_id: signed.id(),
+            binding: signed.binding,
+            prefix: empty,
+            root: empty,
+        })
+    }
     pub(crate) fn local_receipt(&self) -> Result<Vec<u8>> {
         let mut e = Encoder::new();
         e.array(5).uint(1).bytes(&self.head_id);

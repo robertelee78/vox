@@ -2731,9 +2731,14 @@ impl std::fmt::Debug for Computer {
 /// The existing operator boundary, shared by the app's FFI and the terminal pairing client.
 /// A malformed session mark still denotes an agent process. This is not OS-account isolation.
 pub fn operator_only() -> Result<()> {
-    if ["VOX_SESSION", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"]
-        .iter()
-        .any(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()))
+    if [
+        "VOX_SESSION",
+        "CLAUDE_CODE_SESSION_ID",
+        "CODEX_THREAD_ID",
+        "OPENCODE_SESSION_ID",
+    ]
+    .iter()
+    .any(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()))
     {
         return Err(Error::Profile("computer pairing is the person's action: use your own terminal or Vox.app outside the agent session"));
     }

@@ -80,8 +80,8 @@ impl ChannelState {
                 .is_some_and(|p| p.last == (hint.size, false)))
     }
 
-    /// Only the actor's completed authenticated hinted flow may arm this transition.
-    /// Inventory and intermediate source/effect publication never establish settlement.
+    /// Retain the existing exact departure acknowledgement. Ordinary join settlement is
+    /// derived from durable own-head/window facts, never from this completion edge.
     pub(crate) fn note_history_head_complete(
         &mut self,
         store: &Store,
@@ -92,30 +92,52 @@ impl ChannelState {
                 self.generation().load(std::sync::atomic::Ordering::Relaxed),
             ));
         }
-        let read = self.history_read(store)?;
-        let Some(head) = read.history_head(&hint.head)? else {
-            return Ok(None);
-        };
-        if head.binding.author != hint.author
-            || head.root.leaves != hint.size
-            || !read.history_head_committed(&hint.head, head.binding)?
-        {
-            return Ok(None);
-        }
-        let Some(included) = read.history_inclusion_receipt(&hint.head, &hint.author, hint.size)?
-        else {
-            return Ok(None);
-        };
-        if !read.history_effect_finished(&included.header().entry().entry_hash())? {
-            return Ok(None);
-        }
-        drop(read);
-        self.sparse_settle_pending |= !self.settled;
         Ok(None)
     }
 
-    pub(crate) fn sparse_settlement_pending(&self) -> bool {
-        self.sparse_settle_pending
+    /// The own-author committed head whose live-window acknowledgement is the only
+    /// missing piece of [`Self::sparse_settlement_ready`]: the room is unsettled,
+    /// the own sparse state has a committed own head with no observed conflict, the
+    /// local contiguous verified prefix covers that head, and the own live window
+    /// has not (fully) visited it. `None` when the settlement is missing something
+    /// else, or is already ready.
+    pub(crate) fn sparse_settlement_pending_own_head(
+        &self,
+        store: &Store,
+    ) -> Option<(Digest32, Digest32, u64)> {
+        if self.settled {
+            return None;
+        }
+        let read = self.history_read(store).ok()?;
+        if read.publication_busy() {
+            return None;
+        }
+        let own = self.me();
+        let contiguous = self.dag.verified_head(&own);
+        if read
+            .history_settled_tip(&own)
+            .ok()?
+            .is_some_and(|tip| tip.skeleton.seq > contiguous)
+        {
+            return None;
+        }
+        let state = read.sparse_author(&own, LogScope::Public).ok()??;
+        if state.observed_conflict.is_some() {
+            return None;
+        }
+        let committed = state.committed?;
+        let head = read.history_head(&committed).ok()??;
+        let acknowledged = state.live.is_some_and(|window| {
+            window.head == committed && window.through == head.root.leaves && window.complete()
+        });
+        if acknowledged
+            || head.binding.author != own
+            || head.binding.scope != LogScope::Public
+            || head.root.leaves > contiguous
+        {
+            return None;
+        }
+        Some((own, committed, head.root.leaves))
     }
 
     pub(crate) fn sparse_settlement_ready(
@@ -123,9 +145,6 @@ impl ChannelState {
         store: &Store,
         now: crate::time::Ms,
     ) -> Result<bool> {
-        if !self.sparse_settle_pending || self.settled {
-            return Ok(false);
-        }
         let read = self.history_read(store)?;
         if read.publication_busy() {
             return Ok(false);
@@ -141,19 +160,38 @@ impl ChannelState {
         {
             return Ok(false);
         }
-        if let Some(state) = read.sparse_author(&own, LogScope::Public)? {
-            if state.observed_conflict.is_some() {
+        let Some(state) = read.sparse_author(&own, LogScope::Public)? else {
+            return Ok(false);
+        };
+        if state.observed_conflict.is_some() {
+            return Ok(false);
+        }
+        // Settlement is a durable exact acknowledgement, not a moment when a volatile
+        // scheduling queue happens to be empty. A Head(own) answer selects this window;
+        // it must name the current committed own head and be fully visited.
+        let Some(committed) = state.committed else {
+            return Ok(false);
+        };
+        let Some(head) = read.history_head(&committed)? else {
+            return Ok(false);
+        };
+        let acknowledged = state.live.is_some_and(|window| {
+            window.head == committed && window.through == head.root.leaves && window.complete()
+        });
+        if head.binding.author != own
+            || head.binding.scope != LogScope::Public
+            || head.root.leaves > contiguous
+            || !acknowledged
+        {
+            return Ok(false);
+        }
+        // A failed proof fetch must not erase knowledge of a signed higher own head.
+        if let Some(observed) = state.observed {
+            if read
+                .history_head(&observed)?
+                .is_none_or(|observed| observed.root.leaves > contiguous)
+            {
                 return Ok(false);
-            }
-            // A failed proof fetch must not erase knowledge of a signed higher own head.
-            // Both slots are bounded scalars; neither requires an ancestry/body scan.
-            for id in [state.observed, state.committed].into_iter().flatten() {
-                if read
-                    .history_head(&id)?
-                    .is_none_or(|head| head.root.leaves > contiguous)
-                {
-                    return Ok(false);
-                }
             }
         }
         drop(read);
