@@ -8547,6 +8547,9 @@ impl ChannelState {
         self.held.get(member).copied()
     }
 
+    /// Record that `member`'s node said, in a sync, it holds this identity's feed here up to `seq`
+    /// (ADR-028 R-6). Its last word stands. Kept on disk best effort: a write that fails costs a
+    /// restart the count until the next sync, never the room.
     pub fn note_held(&mut self, store: &Store, member: Digest32, seq: u64) {
         if member == self.me() || self.held.get(&member) == Some(&seq) {
             return;
