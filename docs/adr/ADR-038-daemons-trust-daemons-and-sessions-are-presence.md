@@ -11,6 +11,11 @@
 
 ## Context
 
+Vox's agent comms exist so the decider can drive his dark factory from a room: he asks, every
+relevant Session answers, work is claimed and handed off in the room, and progress and proof land
+on GitHub through awa (ADR-020, ADR-021, ADR-033). Every requirement here is judged by whether it
+removes friction from that, with awa as the scoreboard; what does not is polish and ranks below.
+
 v0.4.6 shipped on 2026-10-19 and was used the same day on the decider's two Macs, five nodes in
 two rooms. His verdict: "at some level we might be up and working again but we have so much
 polish that we need to apply", "everything feels like a brittle mess right now especially the
