@@ -291,10 +291,14 @@ impl Node {
                 Err(_) => false,
             };
             if noted {
+                // One fact, one sentence: the detector says what every refused write will say
+                // (`Error::OwnHistoryBehind`), once. It used to say it in other words, and the
+                // sentence a person then searched for appeared only where a refusal leaked.
                 let _ = self.event_tx.send(NodeEvent::NodeNote {
                     note: format!(
-                        "room {}: a member holds entries of this node's own history that this node does not, as after restoring an older backup; this node writes nothing there until that is resolved",
-                        crate::node::link::b32_encode(&room)
+                        "room {}: {}",
+                        crate::node::link::b32_encode(&room),
+                        crate::error::Error::OwnHistoryBehind
                     ),
                 });
             }
