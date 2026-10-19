@@ -9260,6 +9260,16 @@ impl Node {
                     self.publish_channel_to_anchors(&channel_id, PublishCause::BoardNews)
                         .await;
                     self.note_new_members(&channel_id).await;
+                    // A record landing on the board — a member's fresh prekey bundle, a new
+                    // member — is the event an owed key was waiting for (ADR-037 R2b): the keys
+                    // this room still owes go now, not when a refusal backoff runs out. Measured
+                    // before this: a joiner read the creator's first post 48 s after it was made,
+                    // the key having waited out 2 + 4 + 8 + 16 s of refusals for a bundle that
+                    // had landed long since.
+                    self.key_backoff.retain(|(room, _), _| *room != channel_id);
+                    self.one_time_waits
+                        .retain(|(room, _), _| *room != channel_id);
+                    self.deliver_owed_consents(None).await;
                 }
             }
             NetEvent::Pairwise(stream) => {
@@ -9791,9 +9801,12 @@ impl Node {
                     });
                     return;
                 }
-                // 2, 4, 8 … 64s: a refusal that cures (a session that converges, a member learnt
+                // 2, 4, 8, 8 … s: a refusal that cures (a session that converges, a member learnt
                 // from the board) is retried promptly, and one that does not stops costing a
-                // stream every second.
+                // stream every second. The curve stops at 8 s (ADR-037 R2b): the events that cure
+                // a refusal — the peer's own key arriving, a record landing on the board — resend
+                // at once, so the backoff is only the backstop, and a person waits seconds for
+                // it, not a minute.
                 //
                 // A refused hello is cured by the peer's own, which it offers on its next tick,
                 // and adopting it resends at once (`accept_hello`). Should that offer be lost
@@ -9820,7 +9833,7 @@ impl Node {
                 } else {
                     entry.0.saturating_add(1)
                 };
-                entry.1 = now.saturating_add(1_000u64 << entry.0.min(6));
+                entry.1 = now.saturating_add(1_000u64 << entry.0.min(3));
                 let _ = self.event_tx.send(NodeEvent::KeyNotTaken {
                     channel_id,
                     peer,

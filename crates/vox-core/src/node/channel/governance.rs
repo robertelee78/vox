@@ -371,24 +371,27 @@ pub(super) struct Progress {
 /// removed nor treated as empty; the persisted receipt cursor discovers them.
 pub(super) fn prepare(store: &Store, sek: &Sek, room: &Digest32) -> Result<()> {
     use crate::atrest::store::SegmentKind::GovernanceIndex;
-    // An index an older vox wrote (its header is not this build's format) is obsolete, not
-    // malformed: every table here is derived from LogDb, so it is deleted whole and the fold
-    // rebuilds it from the source rows (ADR-026 L-10; ADR-037 R2c added a queue).
+    // An index an older vox wrote at format 3 (every release through v0.4.5) is migrated in
+    // place (ADR-037 R2c): its pending rows are classified from the log rows they name, the
+    // control ones go on the new control settlement queue, and the header is resealed at this
+    // build's format. Bounded by the pending rows, never by the room's history: an upgrade
+    // of a large store does not scan the archive for a queue the rows it holds determine.
     if let Some(sealed) = store.get_segment(room, GovernanceIndex, 0)? {
-        let obsolete = match crate::atrest::store::open_segment(sek, GovernanceIndex, 0, &sealed) {
+        let previous = match crate::atrest::store::open_segment(sek, GovernanceIndex, 0, &sealed) {
             Ok(bytes) => facts::header_version(&bytes).is_some_and(|v| v != facts::HEADER_VERSION),
             Err(_) => false,
         };
-        if obsolete {
-            let mut ids = Vec::new();
-            store.visit_segments(room, GovernanceIndex, |id, _| {
-                ids.push(id);
-                Ok(())
-            })?;
+        if previous {
             let mut batch = store.batch()?;
-            for id in ids {
-                batch.delete_segment(room, GovernanceIndex, id)?;
+            let mut writer = facts::Write::open(&mut batch, sek, room)?;
+            let mut after = None;
+            while let Some((key, log, _hash)) = writer.pending_after(after)? {
+                if is_control(&writer.source_entry(log)?) {
+                    writer.mark_control_pending(key)?;
+                }
+                after = Some(key);
             }
+            writer.seal()?;
             batch.commit()?;
         }
     }

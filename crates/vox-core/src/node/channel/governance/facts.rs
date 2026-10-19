@@ -16,9 +16,13 @@ use zeroize::Zeroizing;
 const KIND: SegmentKind = SegmentKind::GovernanceIndex;
 const HEADER: u64 = 0;
 const HEADER_BYTES: usize = 1024;
-/// The derived index's own format. 4 (v0.4.6, ADR-037): the control settlement queue. An
-/// older header is an obsolete index: `prepare` deletes it and the fold rebuilds from LogDb.
+/// The derived index's own format. 4 (v0.4.6, ADR-037 R2c): the control settlement queue.
+/// A format-3 header (every release through v0.4.5) is read as is, with the new queue empty,
+/// and `prepare` fills that queue from the pending rows and reseals the header at 4: the
+/// index is migrated in place, never rebuilt from the source log, so an upgrade does not pay a
+/// cold scan of a large store for a derived queue it can compute from the rows it already has.
 pub(super) const HEADER_VERSION: u64 = 4;
+const HEADER_VERSION_PREVIOUS: u64 = 3;
 
 fn invalid(why: &'static str) -> Error {
     Error::MalformedAtRest(why)
@@ -259,15 +263,21 @@ impl Header {
             return Err(invalid("governance header size"));
         }
         let mut d = Decoder::new(bytes);
-        if d.array()? != 22 || d.uint()? != HEADER_VERSION {
+        if d.array()? != 22 {
+            return Err(invalid("governance header format"));
+        }
+        let version = d.uint()?;
+        if version != HEADER_VERSION && version != HEADER_VERSION_PREVIOUS {
             return Err(invalid("governance header format"));
         }
         let next = d.uint()?;
-        if d.array()? != TABLES {
+        // Format 3 had every table but the control settlement queue, which is read as empty.
+        let stored = d.array()?;
+        if stored != TABLES && !(version == HEADER_VERSION_PREVIOUS && stored == TABLES - 1) {
             return Err(invalid("governance root count"));
         }
         let mut roots = [0; TABLES];
-        for root in &mut roots {
+        for root in roots.iter_mut().take(stored) {
             *root = d.uint()?;
         }
         if d.array()? != CURSORS {
@@ -1139,6 +1149,45 @@ impl<'a, 'store> Write<'a, 'store> {
             .checked_add(1)
             .ok_or(invalid("governance display revision exhausted"))?;
         Ok(())
+    }
+
+    /// A pending row's source id and hash, for the in-place migration of a format-3 index: the
+    /// rows after `after` in the work queue, in order.
+    pub(super) fn pending_after(
+        &self,
+        after: Option<session_tree::Key>,
+    ) -> Result<Option<(session_tree::Key, u64, Digest32)>> {
+        let Some((key, _)) = self.first(Table::PendingOrder, after)? else {
+            return Ok(None);
+        };
+        let hash: Digest32 = key[8..40]
+            .try_into()
+            .map_err(|_| invalid("governance pending entry"))?;
+        Ok(Some((key, pending_log(&key), hash)))
+    }
+
+    /// Put an already queued row on the control settlement queue too (the migration of a
+    /// format-3 index, whose queue predates that table), with the serial the work queue holds.
+    pub(super) fn mark_control_pending(&mut self, key: session_tree::Key) -> Result<()> {
+        let serial = self
+            .get(Table::PendingOrder, &key)?
+            .ok_or(invalid("governance pending row missing"))?;
+        self.put(Table::ControlPending, key, Some(serial))
+    }
+
+    /// The source row at `log` as the log holds it, for classification only: its hash binding
+    /// is checked, its governance binding is not (a content row has none).
+    pub(super) fn source_entry(&self, log: u64) -> Result<crate::log::entry::Entry> {
+        let sealed = self
+            .batch
+            .get_segment(self.room, SegmentKind::LogDb, log)?
+            .ok_or(invalid("governance source entry missing"))?;
+        let bytes = open_segment(self.sek, SegmentKind::LogDb, log, &sealed)?;
+        let entry = crate::log::entry::Entry::from_wire(&bytes)?;
+        if entry.skeleton.channel_id != *self.room {
+            return Err(invalid("governance source binding"));
+        }
+        Ok(entry)
     }
 
     /// Retain the obligation before acknowledging the accepted input to its caller. A control
