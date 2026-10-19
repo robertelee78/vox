@@ -14,9 +14,10 @@
 //!   count and emission passes share a captured arrival boundary and authority fence.
 //! * Raw request-part counts and logical waiting counts are distinct. A resolution
 //!   retires its parts in bounded turns; exact raw pages refuse until cleanup commits.
-//! * Only a committed projection header publishes roots. Incomplete rebuild or I/O failure
-//!   is a refusal, never an empty Session list. Restart preserves the published version and
-//!   resumes bounded work without accepting an unauthenticated or partially parsed field.
+//! * Only a committed projection header publishes roots. A rebuild in flight answers the last
+//!   published generation and says it is provisional (ADR-037 R4); I/O failure is a refusal,
+//!   never an empty Session list. Restart preserves the published version and resumes
+//!   bounded work without accepting an unauthenticated or partially parsed field.
 
 mod activity_fold;
 mod activity_index;

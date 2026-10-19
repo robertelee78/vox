@@ -102,6 +102,9 @@ async fn select(
     let mut by_id = None;
     let mut by_name = None;
     let (mut id_count, mut name_count) = (0u64, 0u64);
+    // An absence is proven only when every page could answer for the asked node (or, with
+    // no node named, for every member) and none came from a fold still behind (ADR-037 R4).
+    let mut unproven = false;
     let mut after = None;
     loop {
         let reply = client
@@ -113,7 +116,13 @@ async fn select(
                 sessions,
                 summaries,
                 more,
-            } if sessions.len() == summaries.len() => (sessions, more),
+                refreshing,
+                provisional,
+            } if sessions.len() == summaries.len() => {
+                unproven |= provisional
+                    || node.map_or(!refreshing.is_empty(), |node| refreshing.contains(&node));
+                (sessions, more)
+            }
             Frame::Error { reason } => return Err(reason),
             Frame::NodeDetached { node } => {
                 return Err(format!("the connection to node {node} ended"))
@@ -183,6 +192,9 @@ async fn select(
         return Err("the room's Sessions changed while selecting; try again".into());
     }
     match (count, selected) {
+        // The node holds no such Session yet, and the pages could not prove it never will:
+        // a refreshing member's or an unfolded Session is "not received yet", not absent.
+        (0, _) if unproven => Err("that Session has not been received yet; fetching it now".into()),
         (0, _) => Ok(None),
         (1, Some(row)) if !row.open && !ended_ok => Err(format!("{} has ended", label(&row))),
         (1, Some(row)) => Ok(Some(row)),

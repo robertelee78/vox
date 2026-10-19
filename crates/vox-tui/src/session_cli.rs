@@ -282,6 +282,7 @@ pub(crate) async fn attention_context(
             sessions,
             summaries,
             more: false,
+            ..
         }) if sessions.len() == 1 && summaries.len() == 1 => {
             let row = &sessions[0];
             if row.node != owner || row.id != session || !row.can_drive || !row.open {

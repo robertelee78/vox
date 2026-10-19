@@ -1934,6 +1934,7 @@ impl DaemonCore {
                 mut sessions,
                 summaries,
                 more: false,
+                ..
             } if sessions.len() <= 1
                 && sessions.len() == summaries.len()
                 && sessions.iter().all(|s| s.node == node && s.id == id) =>
@@ -1980,6 +1981,7 @@ impl DaemonCore {
                 sessions,
                 summaries,
                 more,
+                ..
             } => {
                 if sessions.len() != summaries.len() {
                     return Err("the Session page has mismatched summaries".into());

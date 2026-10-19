@@ -389,7 +389,9 @@ fn detail_of(
         read_by,
         held,
         unread,
-        drive_from: ch.drive_from(store)?,
+        // The authors this node can answer for now; a refreshing author is named in each
+        // listing's revision rather than holding the whole room's detail back (ADR-037 R4).
+        drive_from: ch.drive_from_known(store)?.0,
         session_revision: ch.sessions_revision(store)?,
     })
 }
@@ -7610,7 +7612,7 @@ impl Node {
                 detail.history_instance == channel.history_instance(profile.store())?
                     && detail.governance_revision
                         == channel.governance_revision(profile.store())?
-                    && detail.drive_from == channel.drive_from(profile.store())?,
+                    && detail.drive_from == channel.drive_from_known(profile.store())?.0,
             ))
         })();
         match published {
@@ -10567,7 +10569,9 @@ impl Node {
                 let result = match (self.channels.get(&channel_id), self.profile.as_ref()) {
                     (Some(shared), Some(profile)) => {
                         let mut room = shared.lock().await;
-                        match room.require_governance_ready(profile.store(), self.now_ms()) {
+                        // As for SessionActivity: the page answers from applied rows, and
+                        // only a local storage fault refuses here (ADR-037 R4).
+                        match room.advance_sessions(profile.store(), self.now_ms().get()) {
                             Ok(_) => room.session_file_query(
                                 profile.store(),
                                 query,

@@ -1387,6 +1387,7 @@ async fn room_sessions_page(
             sessions,
             summaries,
             more,
+            ..
         }) => {
             if sessions.len() != summaries.len() {
                 return Err(failed("the Session page has mismatched summaries"));
@@ -1420,6 +1421,7 @@ async fn exact_session(
             sessions,
             summaries,
             more: false,
+            ..
         }) if sessions.len() <= 1
             && sessions.len() == summaries.len()
             && sessions.iter().all(|s| s.node == node && s.id == id) =>
@@ -5687,6 +5689,7 @@ impl VoxClient {
                         sessions,
                         summaries,
                         more,
+                        ..
                     } if sessions.len() == summaries.len() => (sessions, summaries, more),
                     other => return Err(unexpected(&other)),
                 };
@@ -7071,6 +7074,7 @@ impl VoxClient {
                     mut sessions,
                     summaries,
                     more: false,
+                    ..
                 } if sessions.len() <= 1
                     && sessions.len() == summaries.len()
                     && sessions

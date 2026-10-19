@@ -399,8 +399,12 @@ const T_SESSION_PAGE: u64 = 5436;
 /// `[5437, channel_id, after]` — [`Request::SessionsPage`]; an empty `after` is the start
 /// (ADR-034 FR-1).
 const T_SESSIONS_PAGE_REQ: u64 = 5437;
-/// `[5438, [session, …], [[entries, newest, waiting], …], more]` — [`Frame::SessionsPage`].
+/// `[5438, [session, …], [[entries, newest, waiting], …], more, [member, …], provisional]` —
+/// [`Frame::SessionsPage`]; the members are the ones the page could not answer for yet.
 const T_SESSIONS_PAGE: u64 = 5438;
+/// A page names at most this many refreshing members; the count is checked before anything
+/// is reserved for it.
+const SESSIONS_PAGE_REFRESHING: usize = 1024;
 /// Exact Session metadata, using the existing bounded SessionsPage reply.
 const T_SESSION_LOOKUP: u64 = 8721;
 const T_SESSIONS_WAITING_REQ: u64 = 8722;
@@ -3400,6 +3404,14 @@ pub enum Frame {
         summaries: Vec<SessionSummary>,
         /// Whether more follow the last: ask again with its opening as `after`.
         more: bool,
+        /// The members whose Sessions this page could not answer for yet: their Session
+        /// control effects are still refreshing on this node (ADR-037 R4). Their Sessions are
+        /// not among `sessions`; each is named so a client can say it is fetching them now
+        /// (ADR-036 H-1), never dropped silently.
+        refreshing: Vec<Digest32>,
+        /// The page came from a Session fold that is behind the room's inputs or has not run
+        /// yet: it shows what was last published, and a later page may show more.
+        provisional: bool,
     },
     /// The exact current number of answerable requests across all open Sessions.
     SessionsWaiting {
@@ -3821,8 +3833,10 @@ impl Frame {
                 sessions,
                 summaries,
                 more,
+                refreshing,
+                provisional,
             } => {
-                e.array(4).uint(T_SESSIONS_PAGE);
+                e.array(6).uint(T_SESSIONS_PAGE);
                 crate::node::sessions::put_rows(&mut e, sessions);
                 e.array(summaries.len());
                 for s in summaries {
@@ -3832,6 +3846,11 @@ impl Frame {
                         .uint(u64::from(s.waiting));
                 }
                 e.uint(u64::from(*more));
+                e.array(refreshing.len());
+                for member in refreshing {
+                    e.bytes(member);
+                }
+                e.uint(u64::from(*provisional));
             }
             Frame::SessionsWaiting { waiting } => {
                 e.array(2).uint(T_SESSIONS_WAITING).uint(*waiting);
@@ -4985,7 +5004,7 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             let sessions = crate::node::sessions::read_rows(d)?;
             return Ok(Frame::Sessions { sessions });
         }
-        (T_SESSIONS_PAGE, 4) => {
+        (T_SESSIONS_PAGE, 6) => {
             let bad = || Error::MalformedIpc("ipc session summary");
             let sessions = crate::node::sessions::read_rows_bounded(d, SESSIONS_PAGE_ROWS)?;
             let n = d.array().map_err(|_| bad())?;
@@ -5007,10 +5026,25 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 });
             }
             let more = flag(d, "ipc sessions page more")?;
+            // At most one member per held drive key; a page never names more members
+            // than a room can hold, so the count is bounded before anything is reserved.
+            let n = d
+                .array()
+                .map_err(|_| Error::MalformedIpc("ipc sessions page refreshing"))?;
+            if n > SESSIONS_PAGE_REFRESHING {
+                return Err(Error::MalformedIpc("ipc sessions page refreshing count"));
+            }
+            let mut refreshing = Vec::with_capacity(n);
+            for _ in 0..n {
+                refreshing.push(digest(d)?);
+            }
+            let provisional = flag(d, "ipc sessions page provisional")?;
             return Ok(Frame::SessionsPage {
                 sessions,
                 summaries,
                 more,
+                refreshing,
+                provisional,
             });
         }
         (T_SESSIONS_PENDING, 3) => {
@@ -5980,6 +6014,9 @@ async fn write_sessions(
             return Ok(true);
         }
     };
+    // What this page could not answer for: named on the wire, never dropped (ADR-037 R4).
+    let refreshing = revision.refreshing().to_vec();
+    let provisional = revision.provisional();
     // The old whole-list request cannot demand an unlimited retained collection.
     // Current clients use SessionsPage; a partial whole list is never called complete.
     if whole && more {
@@ -5996,7 +6033,13 @@ async fn write_sessions(
     }
     let mut prefix = Encoder::new();
     prefix
-        .array(if whole { 2 } else { 4 })
+        .array(if whole {
+            2
+        } else if cursors.is_some() {
+            4
+        } else {
+            6
+        })
         .uint(if whole {
             T_SESSIONS
         } else if cursors.is_some() {
@@ -6112,6 +6155,7 @@ async fn write_sessions(
     }
     if !whole {
         let mut suffix = Encoder::new();
+        let lifecycle_page = cursors.is_some();
         if let Some(cursors) = cursors {
             suffix.array(cursors.len());
             for cursor in cursors {
@@ -6128,6 +6172,13 @@ async fn write_sessions(
             }
         }
         suffix.uint(u64::from(more));
+        if !lifecycle_page {
+            suffix.array(refreshing.len());
+            for member in &refreshing {
+                suffix.bytes(member);
+            }
+            suffix.uint(u64::from(provisional));
+        }
         reply_part(stream, &suffix.finish(), &mut offset, false, writing).await?;
     }
     Ok(true)

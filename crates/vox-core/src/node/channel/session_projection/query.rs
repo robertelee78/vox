@@ -39,9 +39,6 @@ pub(crate) struct Revision {
     provisional: bool,
 }
 
-// The IPC Session writer is to carry both onto the SessionsPage wire (ADR-037 R4); until that
-// lands nothing in this crate reads them.
-#[allow(dead_code)]
 impl Revision {
     /// The authors whose Session control effects are not yet current here, sorted. Their
     /// Sessions are not in this answer; each is named so the caller can say it is fetching
