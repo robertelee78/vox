@@ -3169,6 +3169,9 @@ pub enum Frame {
         rows: Vec<MessageRow>,
         /// How many rows precede the first selected message.
         older: u64,
+        /// The room's governance fold was behind its receipt frontier at this read (ADR-037
+        /// R3): the page is provisional, and the reader says so before the rows.
+        provisional: bool,
     },
     /// Sent once on connect, before anything else.
     Hello {
@@ -3545,11 +3548,16 @@ impl Frame {
                 let json = serde_json::to_string(status).expect("bounded history status");
                 e.array(2).uint(T_HISTORY_DEMAND).text(&json);
             }
-            Frame::RoomPage { rows, older } => {
-                e.array(3)
+            Frame::RoomPage {
+                rows,
+                older,
+                provisional,
+            } => {
+                e.array(4)
                     .uint(T_ROOM_PAGE)
                     .bytes(&Frame::Rows { rows: rows.clone() }.to_bytes())
-                    .uint(*older);
+                    .uint(*older)
+                    .uint(u64::from(*provisional));
             }
             Frame::Hello { protocol, me } => {
                 // An absent identity is the empty byte string, so the arity stays
@@ -4573,7 +4581,7 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 page: governance_page::page(d)?,
             })
         }
-        (T_ROOM_PAGE, 3) => {
+        (T_ROOM_PAGE, 4) => {
             let body = d
                 .bytes()
                 .map_err(|_| Error::MalformedIpc("ipc room page rows"))?;
@@ -4587,7 +4595,16 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             let older = d
                 .uint()
                 .map_err(|_| Error::MalformedIpc("ipc room page older"))?;
-            return Ok(Frame::RoomPage { rows, older });
+            let provisional = match d.uint() {
+                Ok(0) => false,
+                Ok(1) => true,
+                _ => return Err(Error::MalformedIpc("ipc room page provisional")),
+            };
+            return Ok(Frame::RoomPage {
+                rows,
+                older,
+                provisional,
+            });
         }
         (T_MEMBER_HELLOS, 6) => {
             let instance = d
@@ -7655,7 +7672,15 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 )
                 .await
             {
-                Ok(Reply::Older { rows, older }) => Frame::RoomPage { rows, older },
+                Ok(Reply::Older {
+                    rows,
+                    older,
+                    provisional,
+                }) => Frame::RoomPage {
+                    rows,
+                    older,
+                    provisional,
+                },
                 Ok(_) => Frame::Error {
                     reason: "unexpected selected room history answer".into(),
                 },
@@ -7679,7 +7704,15 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 .room_history(channel_id, Query::Older { before, limit })
                 .await
             {
-                Ok(Reply::Older { rows, older }) => Frame::RoomPage { rows, older },
+                Ok(Reply::Older {
+                    rows,
+                    older,
+                    provisional,
+                }) => Frame::RoomPage {
+                    rows,
+                    older,
+                    provisional,
+                },
                 Ok(_) => Frame::Error {
                     reason: "unexpected room history answer".into(),
                 },

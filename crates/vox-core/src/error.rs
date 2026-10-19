@@ -347,6 +347,13 @@ pub enum Error {
     #[error("this room has not synced with another member since it was joined")]
     RoomNotSynced,
 
+    /// A member holds entries of this node's own feed in a room that this node does not hold
+    /// (ADR-037 R5): its profile is behind its own history, as after restoring an older
+    /// backup. Writing there at a reused sequence would make it an equivocator, so it writes
+    /// nothing in that room until the person resolves it.
+    #[error("this node's record of its own history in this room is behind what a member holds, as after restoring an older backup; it writes nothing here until that is resolved")]
+    OwnHistoryBehind,
+
     /// A tunnel control message (service request, stream-setup handshake) or an
     /// SSH-CA certificate was structurally malformed on parse, exceeded a size
     /// bound, or carried an out-of-domain value (ADR-013). Carries a static reason.

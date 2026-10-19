@@ -5361,6 +5361,7 @@ type ReleasePlan = Vec<(u64, u64)>;
 ///   whole, the one live at the decision from where it stood then, nothing older.
 /// - With no plan (no recorded decision), **the key held since the consent was decided**
 ///   (V210-30).
+#[allow(clippy::too_many_arguments)]
 fn consent_release(
     consent_keys: &mut crate::node::pending_consent::PendingConsents,
     profile: &Profile,
@@ -5369,6 +5370,7 @@ fn consent_release(
     target: Digest32,
     full: bool,
     decision: Option<crate::node::consent_order::Stamp>,
+    _current: crate::node::channel::governance::GovernanceCurrent,
 ) -> crate::error::Result<(crate::group::skdm::Skdm, Option<ReleasePlan>)> {
     if full {
         let mut all = channel.skdms_for_full_history(profile)?;
@@ -10509,7 +10511,7 @@ impl Node {
                         let mut room = shared.lock().await;
                         match room
                             .require_governance_ready(profile.store(), self.now_ms())
-                            .and_then(|()| {
+                            .and_then(|_| {
                                 room.advance_sessions(profile.store(), self.now_ms().get())
                             }) {
                             Ok(_) => room.session_activity_query(
@@ -10535,7 +10537,7 @@ impl Node {
                         let mut room = shared.lock().await;
                         match room
                             .require_governance_ready(profile.store(), self.now_ms())
-                            .and_then(|()| {
+                            .and_then(|_| {
                                 room.advance_sessions(profile.store(), self.now_ms().get())
                             }) {
                             Ok(_) => room.session_query(
@@ -10561,7 +10563,7 @@ impl Node {
                     (Some(shared), Some(profile)) => {
                         let mut room = shared.lock().await;
                         match room.require_governance_ready(profile.store(), self.now_ms()) {
-                            Ok(()) => room.session_file_query(
+                            Ok(_) => room.session_file_query(
                                 profile.store(),
                                 query,
                                 crate::node::ipc::rows_budget(),
@@ -12718,6 +12720,15 @@ impl Node {
             if !channel.is_settled() {
                 return Outcome::Failed(Fault::RoomNotSynced);
             }
+            if channel.own_history_behind() {
+                return Outcome::Failed(Fault::OwnHistoryBehind);
+            }
+            // A consent key release is irreversible: an admin removal this node holds but has
+            // not folded must not be released past (ADR-037 R3). The fold is one turn away.
+            let current = match channel.require_governance_ready(profile.store(), now_ms) {
+                Ok(current) => current,
+                Err(error) => return Outcome::Failed(fault_of(&error)),
+            };
             // PRD-001 R12's full history, or V210-45's decision-dated plan (`consent_release`).
             match consent_release(
                 &mut self.consent_keys,
@@ -12727,6 +12738,7 @@ impl Node {
                 target,
                 full,
                 decision,
+                current,
             ) {
                 Ok((skdm, p)) => {
                     plan = p;
@@ -15710,6 +15722,12 @@ impl Node {
                         return;
                     };
                     let channel = shared.lock().await;
+                    // Irreversible: released only against a current fold (ADR-037 R3).
+                    let Ok(current) =
+                        channel.require_governance_ready(profile.store(), self.now_ms())
+                    else {
+                        continue;
+                    };
                     let Ok(release) = consent_release(
                         &mut self.consent_keys,
                         profile,
@@ -15718,6 +15736,7 @@ impl Node {
                         peer,
                         full,
                         decision,
+                        current,
                     ) else {
                         continue;
                     };
@@ -19321,7 +19340,7 @@ impl Node {
                 return;
             };
             let room = shared.lock().await;
-            room.sparse_settlement_ready(profile.store(), self.now_ms())
+            room.sparse_settlement_local_ready(profile.store(), self.now_ms())
                 .unwrap_or(false)
         };
         if ready {
@@ -19334,50 +19353,32 @@ impl Node {
             return;
         };
         let now_ms = self.now_ms();
-        let back = {
+        let (back, own_hint) = {
             let Some(profile) = self.profile.as_ref() else {
                 return;
             };
             let mut ch = shared.lock().await;
-            if ch.uses_sparse_history(profile.store()).unwrap_or(true)
+            let sparse = ch.uses_sparse_history(profile.store()).unwrap_or(true);
+            // The node's own feed is its own durable record (ADR-037 R5): a sparse room
+            // settles from local state as soon as governance is current, and never waits for
+            // a peer to acknowledge the own head. The acknowledgement is still asked for — the
+            // own-author hint offered to every connected peer — because it is the evidence the
+            // conflict detector reads: a member holding more of this feed than this node does
+            // means a restored older profile, and that stops writes here instead of risking an
+            // equivocation. No other sync event fetches a node's own head back.
+            let own_hint = if sparse {
+                ch.sparse_settlement_pending_own_head(profile.store())
+            } else {
+                None
+            };
+            if sparse
+                && !ch.is_settled()
                 && !ch
-                    .sparse_settlement_ready(profile.store(), now_ms)
+                    .sparse_settlement_local_ready(profile.store(), now_ms)
                     .unwrap_or(false)
             {
-                // A joiner's settlement acknowledges its own feed's live window as fully
-                // visited — but only a flow visiting that feed ever selects the window, and
-                // no hint drives a flow to a joiner's own author: its entries are authored
-                // here, so nothing fetches them back until the 30-second periodic happens
-                // to. That half-minute was the whole convergence budget: a joined room sat
-                // unsettled — silently refusing every Session opening, drive-key release
-                // and private pull gated on it — until the periodic fetched a node's own
-                // head back from a peer that holds it. When the only missing piece is that
-                // acknowledgement, offer the own-author hint for the committed own head to
-                // every connected peer, so the next round fetches it now and this
-                // settlement settles on the answer.
-                if let Some((author, head, size)) =
-                    ch.sparse_settlement_pending_own_head(profile.store())
-                {
-                    drop(ch);
-                    let hint = crate::node::history_stream::HeadHint { author, size, head };
-                    let generation = self.history_hints.generation();
-                    if let Some(job) = self.history_budget.try_start(
-                        profile.fingerprint(),
-                        crate::node::history_budget::Lane::Control,
-                    ) {
-                        let peers = self.connected_peers();
-                        for peer in peers {
-                            let _ = self.history_hints.offer(
-                                &job,
-                                generation,
-                                *channel_id,
-                                peer,
-                                &[hint],
-                            );
-                        }
-                    }
-                    self.sched_rooms.insert(*channel_id);
-                }
+                drop(ch);
+                self.offer_own_head(channel_id, own_hint);
                 return;
             }
             let settlement = if ch.uses_sparse_history(profile.store()).unwrap_or(true) {
@@ -19389,12 +19390,13 @@ impl Node {
                 ch.catch_up_generation(profile, now_ms)
                     .and_then(|_| ch.say_presence(profile, true, now_ms))
             };
-            settlement.map(|back| {
+            let back = settlement.map(|back| {
                 // Shares made while the room was unsettled are said now (V030-25). A share
                 // left unsaid is offered but unlisted, which is not worth failing the room.
                 let said = ch.say_unsaid_shares(profile, now_ms).unwrap_or(false);
                 back || said
-            })
+            });
+            (back, own_hint)
         };
         match back {
             Ok(true) => self.note_local_append(channel_id),
@@ -19408,6 +19410,33 @@ impl Node {
                 });
             }
         }
+        self.offer_own_head(channel_id, own_hint);
+    }
+
+    /// Offer this node's own committed head to every connected peer, so the next round fetches
+    /// the own live window back (ADR-037 R5): the acknowledgement that settles the own feed's
+    /// bookkeeping, and the evidence the own-history conflict detector reads.
+    fn offer_own_head(&mut self, channel_id: &Digest32, hint: Option<(Digest32, Digest32, u64)>) {
+        let Some((author, head, size)) = hint else {
+            return;
+        };
+        let Some(profile) = self.profile.as_ref() else {
+            return;
+        };
+        let hint = crate::node::history_stream::HeadHint { author, size, head };
+        let generation = self.history_hints.generation();
+        if let Some(job) = self.history_budget.try_start(
+            profile.fingerprint(),
+            crate::node::history_budget::Lane::Control,
+        ) {
+            let peers = self.connected_peers();
+            for peer in peers {
+                let _ = self
+                    .history_hints
+                    .offer(&job, generation, *channel_id, peer, &[hint]);
+            }
+        }
+        self.sched_rooms.insert(*channel_id);
     }
 
     /// Offer a local TCP service in a channel (ADR-013 Bind, M16.1). Offering needs no
@@ -20853,7 +20882,15 @@ impl Node {
                 return false;
             };
             channel
-                .rotate_drive_if_lost(profile.store(), &holders, crate::time::Ms(now))
+                .require_governance_ready(profile.store(), crate::time::Ms(now))
+                .and_then(|current| {
+                    channel.rotate_drive_if_lost(
+                        profile.store(),
+                        &holders,
+                        crate::time::Ms(now),
+                        current,
+                    )
+                })
                 .and_then(|_| {
                     channel.append_ingress_session(
                         profile,
@@ -20902,7 +20939,16 @@ impl Node {
             let mut ch = shared.lock().await;
             // **Never sealed under a key a member that lost drive still holds** (SC-2b): the key
             // changes here, before the entry, whatever the tick has not got to yet.
-            match ch.rotate_drive_if_lost(profile.store(), &holders, crate::time::Ms(now_millis)) {
+            match ch
+                .require_governance_ready(profile.store(), crate::time::Ms(now_millis))
+                .and_then(|current| {
+                    ch.rotate_drive_if_lost(
+                        profile.store(),
+                        &holders,
+                        crate::time::Ms(now_millis),
+                        current,
+                    )
+                }) {
                 Ok(_) => ch.append_session(profile, session_id, body, &holders, now_millis),
                 Err(e) => Err(e),
             }
@@ -21012,13 +21058,11 @@ impl Node {
             };
             let mut ch = shared.lock().await;
             // Pending policy cannot authorize private expiry or a drive-key release.
-            // The shared maintenance branch advances governance independently.
-            if ch
-                .require_governance_ready(profile.store(), now_ms)
-                .is_err()
-            {
+            // The shared maintenance branch advances governance independently. The token is
+            // the proof the release and the drive-generation choice take (ADR-037 R3).
+            let Ok(current) = ch.require_governance_ready(profile.store(), now_ms) else {
                 return;
-            }
+            };
             // Recovery/control catch-up must run before an announcement can refuse
             // for pending facts, or the same refusal would starve its own repair.
             if ch.advance_sessions(profile.store(), now_millis).is_err() {
@@ -21033,7 +21077,7 @@ impl Node {
                 return;
             }
             if ch
-                .rotate_drive_if_lost(profile.store(), holders, now_ms)
+                .rotate_drive_if_lost(profile.store(), holders, now_ms, current)
                 .is_err()
             {
                 return;
@@ -21051,7 +21095,11 @@ impl Node {
                 // A rebuilding or failed projection does not assert absence or release keys.
                 _ => return,
             };
-            if has_session && ch.ensure_drive(profile.store(), holders, now_ms).is_err() {
+            if has_session
+                && ch
+                    .ensure_drive(profile.store(), holders, now_ms, current)
+                    .is_err()
+            {
                 return;
             }
             let owed = match ch.owed_drive(profile, holders, now_ms) {
@@ -21067,7 +21115,7 @@ impl Node {
             }
             let mut releases = Vec::new();
             for member in owed {
-                if let Ok((skdm, generation)) = ch.drive_skdm_for(profile, &member) {
+                if let Ok((skdm, generation)) = ch.drive_skdm_for(profile, &member, current) {
                     releases.push((member, skdm, generation));
                 }
             }
@@ -22349,7 +22397,15 @@ impl HistoryReader {
             )
             .await?
         {
-            Reply::Older { rows, older } => Ok(crate::node::api::HistoryPage { rows, older }),
+            Reply::Older {
+                rows,
+                older,
+                provisional,
+            } => Ok(crate::node::api::HistoryPage {
+                rows,
+                older,
+                provisional,
+            }),
             _ => Err("unexpected older history answer".into()),
         }
     }
@@ -22687,6 +22743,7 @@ pub fn fault_of(e: &Error) -> Fault {
         Error::TunnelLimit(_) => Fault::TunnelLimit,
         Error::ServiceNameTaken(..) => Fault::NameTaken,
         Error::RoomNotSynced => Fault::RoomNotSynced,
+        Error::OwnHistoryBehind => Fault::OwnHistoryBehind,
         Error::Profile("no identity on this node") => Fault::NoIdentity,
         Error::Profile("identity already exists on this node") => Fault::IdentityExists,
         Error::Profile("locked") => Fault::Locked,

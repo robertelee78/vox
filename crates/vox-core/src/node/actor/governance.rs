@@ -276,6 +276,29 @@ impl Node {
         if progress.ready && settle_pending {
             self.settle_sparse_room(&room).await;
         }
+        // The own-history conflict detector (ADR-037 R5): a member seen holding more of this
+        // node's own feed than this node does means a restored older profile. Said once, and
+        // the room refuses this node's writes from here on, instead of letting it equivocate.
+        if progress.ready {
+            let noted = match shared.try_lock() {
+                Ok(mut channel) => match channel.uses_sparse_history(&store) {
+                    Ok(true) => match channel.own_history_conflict(&store) {
+                        Ok(true) => channel.note_own_history_behind(&store).unwrap_or(false),
+                        _ => false,
+                    },
+                    _ => false,
+                },
+                Err(_) => false,
+            };
+            if noted {
+                let _ = self.event_tx.send(NodeEvent::NodeNote {
+                    note: format!(
+                        "room {}: a member holds entries of this node's own history that this node does not, as after restoring an older backup; this node writes nothing there until that is resolved",
+                        crate::node::link::b32_encode(&room)
+                    ),
+                });
+            }
+        }
         if progress.ready {
             // Discover stale consent from disk a page at a time. A quiet room must finish
             // this work too; it cannot depend on another join or trust command arriving.

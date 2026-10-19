@@ -2737,7 +2737,7 @@ impl VoxClient {
                 },
             };
             let (rows, older) = match ask(c, &request).await? {
-                Frame::RoomPage { rows, older } => (rows, older),
+                Frame::RoomPage { rows, older, .. } => (rows, older),
                 other => return Err(unexpected(&other)),
             };
             room_window_bytes(&rows)?;

@@ -155,6 +155,8 @@ pub(crate) enum Reply {
     Older {
         rows: Vec<MessageRow>,
         older: u64,
+        /// The fold was behind the receipt frontier at this read (ADR-037 R3).
+        provisional: bool,
     },
     Count {
         n: u64,
@@ -567,7 +569,11 @@ impl View<'_> {
                 "selected history count smaller than page",
             ))?;
         rows.reverse();
-        Ok(Reply::Older { rows, older })
+        Ok(Reply::Older {
+            rows,
+            older,
+            provisional: !self.ch.governance_ready,
+        })
     }
 
     fn filtered(
@@ -730,6 +736,7 @@ impl View<'_> {
             rows,
             instance,
             next: next.map(|arrival| HistoryCursor { instance, arrival }),
+            provisional: !self.ch.governance_ready,
         })
     }
 
@@ -1446,7 +1453,11 @@ impl View<'_> {
                     .checked_sub(rows.len() as u64)
                     .ok_or(Error::MalformedAtRest("history count smaller than page"))?;
                 rows.reverse();
-                Ok(Reply::Older { rows, older })
+                Ok(Reply::Older {
+                    rows,
+                    older,
+                    provisional: !self.ch.governance_ready,
+                })
             }
             Query::Count { since } => {
                 let mark = match since {

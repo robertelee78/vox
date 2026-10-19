@@ -2423,7 +2423,7 @@ impl DaemonCore {
                 .await
                 .map_err(|e| format!("the room page could not be read: {e}"))?
             {
-                Frame::RoomPage { rows, older } => (rows, older),
+                Frame::RoomPage { rows, older, .. } => (rows, older),
                 Frame::Error { reason } => return Err(reason.into()),
                 Frame::NodeDetached { .. } => return Err(PageFailure::Detached),
                 _ => return Err("the daemon did not answer the room page".into()),

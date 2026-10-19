@@ -379,6 +379,9 @@ pub struct MessagePage {
     pub instance: [u8; 16],
     /// Continue strictly after this cursor, even when there were no matching rows.
     pub next: Option<HistoryCursor>,
+    /// The room's governance fold was behind its receipt frontier when this page was read
+    /// (ADR-037 R3); see [`HistoryPage::provisional`].
+    pub provisional: bool,
 }
 
 /// One reverse page of readable HELLO metadata for current room members. No historical
@@ -460,6 +463,10 @@ pub struct HistoryPage {
     pub rows: Vec<MessageRow>,
     /// Rows strictly before the first returned row.
     pub older: u64,
+    /// The room's governance fold was behind its receipt frontier when this page was read
+    /// (ADR-037 R3): a control entry the node holds is not yet folded, so what this page shows
+    /// may still be re-ordered or withdrawn. Never presented as final while true.
+    pub provisional: bool,
 }
 
 /// A bounded governance selection carried by the existing room-page transport.
@@ -1509,6 +1516,9 @@ pub enum Fault {
     /// A room this node joined has not synced with another member yet, so nothing is written
     /// to it (V210-164).
     RoomNotSynced,
+    /// A member holds entries of this node's own feed that this node does not (ADR-037 R5): a
+    /// restored older profile. Nothing is written in that room until the person resolves it.
+    OwnHistoryBehind,
     /// A leave was written, but no other member of the room took it within the wait: the room
     /// is held until one does (V210-164).
     LeaveNotHeard,
@@ -1747,6 +1757,9 @@ impl Fault {
             Fault::RoomNotSynced => {
                 "this room was joined and has not yet synced with another member, so nothing can be written to it\n       try again once a member is reachable"
             }
+            Fault::OwnHistoryBehind => {
+                "this node's record of its own history in this room is behind what a member holds, as after restoring an older backup; it writes nothing here until that is resolved\n       `vox room status` names the room; a profile restored from a backup must not write where a newer copy of it already has"
+            }
             Fault::LeaveNotHeard => {
                 "no other member of the room could be told within 30s, so this node still holds it\n       it leaves as soon as one can be told, and the members see it then"
             }
@@ -1921,6 +1934,7 @@ fault_names!(
     BindFailed,
     AlreadyMember,
     RoomNotSynced,
+    OwnHistoryBehind,
     LeaveNotHeard,
     LeaveUndone,
     NotAServiceRoom,

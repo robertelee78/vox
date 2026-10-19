@@ -1062,7 +1062,7 @@ impl ChannelState {
     // release them using a policy sampled before the current canonical room history.
     fn private_policy_ready(&self, store: &Store, now: u64) -> Result<bool> {
         match self.require_governance_ready(store, crate::time::Ms(now)) {
-            Ok(()) => Ok(true),
+            Ok(_) => Ok(true),
             Err(error)
                 if super::governance::refreshing(&error) || floor_index::refreshing(&error) =>
             {
@@ -1621,7 +1621,8 @@ impl ChannelState {
         owed: &[Digest32],
         now: u64,
     ) -> Result<bool> {
-        self.rotate_drive_if_lost(profile.store(), holders, crate::time::Ms(now))?;
+        let current = self.require_governance_ready(profile.store(), crate::time::Ms(now))?;
+        self.rotate_drive_if_lost(profile.store(), holders, crate::time::Ms(now), current)?;
         let grant = self.refresh_grant(profile.store(), holders, owed)?;
         let public = self
             .entries
@@ -1872,13 +1873,17 @@ impl ChannelState {
         completion: Option<&crate::node::session_ingress::Completion>,
         attention_after: Option<AttentionOpening>,
     ) -> Result<Digest32> {
-        self.require_governance_ready(profile.store(), crate::time::Ms(now))?;
+        // The encryption audience of a Session step is irreversible: a revocation this node
+        // holds but has not folded must not leave a removed member in it (ADR-037 R3). The
+        // fold is one bounded turn away (R2), so this is a short wait, never a convergence.
+        let current = self.require_governance_ready(profile.store(), crate::time::Ms(now))?;
         if self.poisoned {
             return Err(Error::Profile("room save failed; reopen it"));
         }
         if !self.settled {
             return Err(Error::RoomNotSynced);
         }
+        self.require_own_history_current()?;
         if !self.authors.contains_key(&self.me()) {
             return Err(Error::Profile("this identity is not an author of the room"));
         }
@@ -1891,7 +1896,7 @@ impl ChannelState {
             .as_ref()
             .is_none_or(|c| c.epoch() != self.epoch || c.should_rotate(now))
         {
-            self.begin_drive(profile.store(), holders, now)?;
+            self.begin_drive(profile.store(), holders, now, current)?;
         }
         self.ensure_session_floors(profile, holders, now)?;
         let new_boundary =

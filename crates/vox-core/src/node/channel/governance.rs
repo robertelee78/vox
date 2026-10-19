@@ -41,6 +41,7 @@ fn advance_frontiers(
     let input = entries.read(store, sek, room)?;
     let mut batch = store.batch()?;
     let mut writer = facts::Write::open(&mut batch, sek, room)?;
+    writer.set_control_only(input.sparse_enabled());
     let mut remaining = CAUSAL_WORK;
     let mut bytes = 0usize;
     let mut rows = 0;
@@ -172,7 +173,12 @@ fn advance_frontiers(
                     let log = input
                         .log_id(&child)?
                         .ok_or(Error::MalformedAtRest("governance child locator missing"))?;
-                    writer.enqueue(&child, log)?;
+                    // A verified control child is re-queued on the control queue too, so the
+                    // order waits for its rework; a content child is background work.
+                    let control = writer
+                        .get(facts::Table::Hashes, &facts::hash_key(&child))?
+                        .is_some();
+                    writer.enqueue(&child, log, control)?;
                     work.child = Some(child);
                 }
                 None => {
@@ -193,6 +199,24 @@ fn advance_frontiers(
 
 /// Observe a source entry only after the existing EntryIndex has published it.
 /// This does not acknowledge an unsigned/staged suffix or invent causal edges.
+/// Whether a row is control work: a governance or step-policy row, by its signed kind in the
+/// signed format, or by its payload's classification in the legacy format. A bodyless row is
+/// not control work; its signature alone confers nothing and orders nothing.
+fn is_control(entry: &crate::log::entry::Entry) -> bool {
+    use crate::log::entry::EntryKind;
+    match &entry.skeleton.v2 {
+        Some(v2) => matches!(
+            v2.kind,
+            crate::log::history::SignedEntryKind::Governance
+                | crate::log::history::SignedEntryKind::StepPolicy
+        ),
+        None => entry.payload.as_deref().is_some_and(|payload| {
+            matches!(super::classify_payload(payload), Ok(EntryKind::Governance))
+                || crate::governance::step_policy::is_step_policy(payload)
+        }),
+    }
+}
+
 fn observe(
     writer: &mut facts::Write<'_, '_>,
     log: u64,
@@ -202,11 +226,15 @@ fn observe(
     authors: &std::collections::BTreeMap<Digest32, crate::identity::composite::CompositePublicKey>,
     root: &Digest32,
 ) -> Result<()> {
-    use super::classify_payload;
     use crate::governance::entry::GovEntry;
-    use crate::log::entry::EntryKind;
     let hash = entry.entry_hash();
-    if late {
+    let control = is_control(entry);
+    // A late row (a parent observed after its child) can change the order only through the
+    // frontiers below it. In a signed-format room a control row's frontier is its own signed
+    // control closure, so a late content row changes nothing the order reads: it neither
+    // raises the barrier nor holds the settlement (ADR-037 R2c). A legacy room's control
+    // rows can have content parents, so there every late row still raises it.
+    if late && (control || !writer.control_only()) {
         writer.barrier(log);
     }
     if writer
@@ -216,25 +244,15 @@ fn observe(
             .get(facts::Table::Pending, &facts::hash_key(&hash))?
             .is_none()
     {
-        writer.enqueue(&hash, log)?;
+        writer.enqueue(&hash, log, control)?;
+    }
+    if !control {
+        return Ok(());
     }
     let Some(payload) = entry.payload.as_deref() else {
         return Ok(());
     };
-    let governance = match &entry.skeleton.v2 {
-        Some(v2) => matches!(
-            v2.kind,
-            crate::log::history::SignedEntryKind::Governance
-                | crate::log::history::SignedEntryKind::StepPolicy
-        ),
-        None => {
-            matches!(classify_payload(payload), Ok(EntryKind::Governance))
-                || crate::governance::step_policy::is_step_policy(payload)
-        }
-    };
-    if !governance {
-        return Ok(());
-    }
+    let _ = payload;
     if writer
         .get(facts::Table::Hashes, &facts::hash_key(&hash))?
         .is_some()
@@ -288,6 +306,7 @@ fn advance_source(
     let input = entries.read(store, sek, room)?;
     let mut batch = store.batch()?;
     let mut writer = facts::Write::open(&mut batch, sek, room)?;
+    writer.set_control_only(input.sparse_enabled());
     writer.discover_source()?;
     if writer.initialized() {
         return Ok(true);
@@ -335,7 +354,9 @@ fn advance_source(
 }
 
 pub(super) use channel::{remember_presence, Presence};
-pub use channel::{GovernanceNotices, GovernanceProgress, GovernanceShares, GovernanceTargets};
+pub use channel::{
+    GovernanceCurrent, GovernanceNotices, GovernanceProgress, GovernanceShares, GovernanceTargets,
+};
 pub(super) use view::{Display, View};
 
 /// Readiness and remaining background work are different: later ordinary chat
@@ -349,10 +370,29 @@ pub(super) struct Progress {
 /// Initialize only the derived directory. Authoritative source rows are neither
 /// removed nor treated as empty; the persisted receipt cursor discovers them.
 pub(super) fn prepare(store: &Store, sek: &Sek, room: &Digest32) -> Result<()> {
-    if store
-        .get_segment(room, crate::atrest::store::SegmentKind::GovernanceIndex, 0)?
-        .is_none()
-    {
+    use crate::atrest::store::SegmentKind::GovernanceIndex;
+    // An index an older vox wrote (its header is not this build's format) is obsolete, not
+    // malformed: every table here is derived from LogDb, so it is deleted whole and the fold
+    // rebuilds it from the source rows (ADR-026 L-10; ADR-037 R2c added a queue).
+    if let Some(sealed) = store.get_segment(room, GovernanceIndex, 0)? {
+        let obsolete = match crate::atrest::store::open_segment(sek, GovernanceIndex, 0, &sealed) {
+            Ok(bytes) => facts::header_version(&bytes).is_some_and(|v| v != facts::HEADER_VERSION),
+            Err(_) => false,
+        };
+        if obsolete {
+            let mut ids = Vec::new();
+            store.visit_segments(room, GovernanceIndex, |id, _| {
+                ids.push(id);
+                Ok(())
+            })?;
+            let mut batch = store.batch()?;
+            for id in ids {
+                batch.delete_segment(room, GovernanceIndex, id)?;
+            }
+            batch.commit()?;
+        }
+    }
+    if store.get_segment(room, GovernanceIndex, 0)?.is_none() {
         let mut batch = store.batch()?;
         facts::Write::open(&mut batch, sek, room)?.seal()?;
         batch.commit()?;
@@ -384,12 +424,16 @@ pub(super) fn accepted_into(
     entry: &crate::log::entry::Entry,
     late: bool,
 ) -> Result<()> {
-    let clock = {
+    let (clock, sparse) = {
         let input = entries.in_batch(batch, sek, room)?;
         let hash = entry.entry_hash();
-        published_clock(input.log_id(&hash)?, input.clock(&hash)?, log)?
+        (
+            published_clock(input.log_id(&hash)?, input.clock(&hash)?, log)?,
+            input.sparse_enabled(),
+        )
     };
     let mut writer = facts::Write::open(batch, sek, room)?;
+    writer.set_control_only(sparse);
     observe(&mut writer, log, clock, late, entry, authors, root)?;
     writer.live_receipt(log)?;
     let backfill = writer
@@ -452,21 +496,59 @@ pub(super) fn advance(
     if current.ready && !current.pending {
         return Ok(current);
     }
+    #[cfg(feature = "test-knobs")]
+    if fold_held() {
+        // A proof holds the fold where it stands to stage "received but not yet folded"
+        // (ADR-037 R3's gates). Nothing re-arms a turn until the tick, so a held room does
+        // not spin the actor; the tick marks governance work pending again every second.
+        return Ok(Progress {
+            ready: current.ready,
+            pending: false,
+        });
+    }
     advance_source(store, entries, sek, room, authors, root, me)?;
     advance_frontiers(store, entries, sek, room)?;
     {
         let input = entries.read(store, sek, room)?;
         let mut batch = store.batch()?;
         let mut writer = facts::Write::open(&mut batch, sek, room)?;
+        writer.set_control_only(input.sparse_enabled());
         // Canonical ordering cannot mutate anything before causal settlement.
         // Do not rewrite its sealed header or fsync an otherwise empty turn.
         if writer.causal_settled()? {
-            if canonical::advance(&mut writer)? {
-                fold::advance(&mut writer, &input, root, now)?;
+            // The order and the evaluation run to completion inside this one turn, under a
+            // bounded budget of phase steps and wall time, in one transaction (ADR-037 R2a):
+            // one step per turn paced a room's whole re-fold at the maintenance cadence, so
+            // every control entry closed the room for seconds. Each step is itself bounded;
+            // the budget bounds the turn. Work left over is the next turn's.
+            let started = std::time::Instant::now();
+            for _ in 0..FOLD_STEPS {
+                let ordered = canonical::advance(&mut writer)?;
+                if ordered && fold::advance(&mut writer, &input, root, now)? {
+                    break;
+                }
+                if started.elapsed() >= FOLD_BUDGET {
+                    break;
+                }
             }
             writer.seal()?;
             batch.commit()?;
         }
     }
     progress(store, sek, room, now)
+}
+
+/// At most this many order/evaluation phase steps, and at most this long, per governance turn.
+const FOLD_STEPS: usize = 256;
+const FOLD_BUDGET: std::time::Duration = std::time::Duration::from_millis(40);
+
+/// `VOX_TEST_FOLD_HOLD_FILE`: while the named file exists, no room's governance fold advances.
+/// Read only by a `test-knobs` build; a release `vox` holds nothing (#300).
+#[cfg(feature = "test-knobs")]
+pub const TEST_FOLD_HOLD_ENV: &str = "VOX_TEST_FOLD_HOLD_FILE";
+#[cfg(feature = "test-knobs")]
+fn fold_held() -> bool {
+    std::env::var_os(TEST_FOLD_HOLD_ENV)
+        .filter(|path| !path.is_empty())
+        .is_some_and(|path| std::path::Path::new(&path).exists())
 }
