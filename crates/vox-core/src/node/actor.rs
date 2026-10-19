@@ -4794,6 +4794,9 @@ pub struct Node {
     history_demand: history_demand::Controller,
     bounded_sync: bounded_sync::Controller,
     history_hints: Arc<crate::node::history_stream::HintInbox>,
+    /// Peers' acknowledgements of this node's own feed reported by lane rounds, applied on
+    /// the next schedule (`note_held`).
+    held_notes: Vec<(Digest32, Digest32, u64)>,
     history_budget: Arc<crate::node::history_budget::Budget>,
     governance_work: governance::Maintenance,
     paths: Paths,
@@ -5574,6 +5577,7 @@ impl Node {
             history_demand: history_demand::Controller::default(),
             bounded_sync: bounded_sync::Controller::default(),
             history_hints: crate::node::history_stream::HintInbox::new(),
+            held_notes: Vec::new(),
             history_budget,
             paths,
             decisions,
@@ -14377,6 +14381,7 @@ impl Node {
         self.accept_history_demand();
         self.queue_cancelled_legacy_cleanup();
         self.accept_bounded_sync();
+        self.apply_held_notes().await;
         if self.net.is_none() {
             self.sched_rooms.clear();
             self.sched_all = false;
@@ -19409,7 +19414,7 @@ impl Node {
             return;
         };
         let now_ms = self.now_ms();
-        let (back, own_hint) = {
+        let (back, own_hint, own_targets) = {
             let Some(profile) = self.profile.as_ref() else {
                 return;
             };
@@ -19427,6 +19432,17 @@ impl Node {
             } else {
                 None
             };
+            // Only a peer that has not said it holds the own head is asked (ADR-038 FX-15):
+            // asked of every connected peer on every tick, a quiet room ran a round per
+            // peer per second that fetched nothing (the decider's daemon at 50–67% CPU).
+            let own_targets: Vec<Digest32> = match own_hint {
+                Some((_, _, size)) => self
+                    .connected_peers()
+                    .into_iter()
+                    .filter(|peer| ch.held_through(peer).is_none_or(|held| held < size))
+                    .collect(),
+                None => Vec::new(),
+            };
             if sparse
                 && !ch.is_settled()
                 && !ch
@@ -19434,7 +19450,7 @@ impl Node {
                     .unwrap_or(false)
             {
                 drop(ch);
-                self.offer_own_head(channel_id, own_hint);
+                self.offer_own_head(channel_id, own_hint, own_targets);
                 return;
             }
             let settlement = if ch.uses_sparse_history(profile.store()).unwrap_or(true) {
@@ -19452,7 +19468,7 @@ impl Node {
                 let said = ch.say_unsaid_shares(profile, now_ms).unwrap_or(false);
                 back || said
             });
-            (back, own_hint)
+            (back, own_hint, own_targets)
         };
         match back {
             Ok(true) => self.note_local_append(channel_id),
@@ -19466,16 +19482,42 @@ impl Node {
                 });
             }
         }
-        self.offer_own_head(channel_id, own_hint);
+        self.offer_own_head(channel_id, own_hint, own_targets);
+    }
+
+    /// Record what lane rounds learned about how far each peer holds this node's own feed
+    /// (ADR-028 R-6): the evidence that lets the settlement tick stop asking a peer that
+    /// already holds the own head (ADR-038 FX-15).
+    async fn apply_held_notes(&mut self) {
+        if self.held_notes.is_empty() {
+            return;
+        }
+        let Some(store) = self.profile.as_ref().map(Profile::store_handle) else {
+            self.held_notes.clear();
+            return;
+        };
+        for (room, peer, seq) in std::mem::take(&mut self.held_notes) {
+            if let Some(shared) = self.channels.get(&room).map(Arc::clone) {
+                shared.lock().await.note_held(&store, peer, seq);
+            }
+        }
     }
 
     /// Offer this node's own committed head to every connected peer, so the next round fetches
     /// the own live window back (ADR-037 R5): the acknowledgement that settles the own feed's
     /// bookkeeping, and the evidence the own-history conflict detector reads.
-    fn offer_own_head(&mut self, channel_id: &Digest32, hint: Option<(Digest32, Digest32, u64)>) {
+    fn offer_own_head(
+        &mut self,
+        channel_id: &Digest32,
+        hint: Option<(Digest32, Digest32, u64)>,
+        targets: Vec<Digest32>,
+    ) {
         let Some((author, head, size)) = hint else {
             return;
         };
+        if targets.is_empty() {
+            return;
+        }
         let Some(profile) = self.profile.as_ref() else {
             return;
         };
@@ -19485,8 +19527,7 @@ impl Node {
             profile.fingerprint(),
             crate::node::history_budget::Lane::Control,
         ) {
-            let peers = self.connected_peers();
-            for peer in peers {
+            for peer in targets {
                 let _ = self
                     .history_hints
                     .offer(&job, generation, *channel_id, peer, &[hint]);

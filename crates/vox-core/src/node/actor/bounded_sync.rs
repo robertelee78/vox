@@ -578,6 +578,12 @@ impl Node {
                 self.dispose_rearming_hint(returned.flow);
                 continue;
             }
+            if let Some(seq) = returned.flow.mine_held.take() {
+                // The peer's word on how far it holds this node's feed (ADR-028 R-6), recorded
+                // on the actor's next turn; the settlement tick then stops offering the own
+                // head to that peer (ADR-038 FX-15).
+                self.held_notes.push((work.room, work.peer, seq));
+            }
             if returned.flow.admitted_authors > 0 {
                 returned.flow.admitted_authors = 0;
                 let _ = self.net_tx.try_send(NetEvent::BoardGrew {
@@ -797,6 +803,12 @@ impl Node {
                         counts.backoff = None;
                     },
                 );
+                // A round the lane completed is a completed sync for `vox status` (PRD-001
+                // R35), as a session's clean report was before ADR-037. Without this every
+                // lane-served room read "last sync never" and, after ten minutes, "no completed
+                // sync" while its counters climbed into the thousands (the decider's daemon,
+                // 2026-10-19).
+                self.note_lane_sync(work.room, work.peer);
                 let origin_room =
                     crate::node::ports::RoomRef::Channel(Arc::downgrade(&returned.flow.shared));
                 let origin_live = self
@@ -969,6 +981,12 @@ impl Node {
                     work.peer,
                     |counts| counts.completed += 1,
                 );
+                // A round the lane completed is a completed sync for `vox status` (PRD-001
+                // R35), as a session's clean report was before ADR-037. Without this every
+                // lane-served room read "last sync never" and, after ten minutes, "no completed
+                // sync" while its counters climbed into the thousands (the decider's daemon,
+                // 2026-10-19).
+                self.note_lane_sync(work.room, work.peer);
             } else {
                 let waiting = returned.flow.waiting;
                 let body_progress = returned.flow.body_progress;
@@ -1015,6 +1033,14 @@ impl Node {
                 }
             }
         }
+    }
+
+    /// Records a lane round that completed cleanly as this room's, and this peer's, last
+    /// completed sync, for `vox status` (PRD-001 R35).
+    fn note_lane_sync(&mut self, room: Digest32, peer: Digest32) {
+        let now = self.now_ms().get();
+        self.status.room_synced.insert(room, now);
+        self.status.member_synced.insert(peer, now);
     }
 
     pub(super) async fn start_bounded_outbound(

@@ -459,6 +459,7 @@ impl Source {
             return Ok(super::hints::Offer {
                 added: 0,
                 full: true,
+                mine_held: None,
             });
         };
         let slice = hints.to_vec();
@@ -473,7 +474,32 @@ impl Source {
                     }
                     let read = room.history_read(store)?;
                     let mut missing = Vec::with_capacity(slice.len());
+                    let mut mine: Option<u64> = None;
+                    let own_contiguous = room.own_verified_head();
                     for hint in slice {
+                        if hint.author == room.me() {
+                            // The peer names a head of this node's own feed that this node holds
+                            // and accepted: its word that it holds the feed through there.
+                            if let Some(adv) = read.history_head(&hint.head)? {
+                                if adv.binding.author == hint.author
+                                    && adv.binding.scope == crate::log::history::LogScope::Public
+                                    && adv.root.leaves == hint.size
+                                    && read.history_head_accepted(&hint.head, adv.binding)?
+                                {
+                                    mine = Some(mine.map_or(hint.size, |m| m.max(hint.size)));
+                                    // The own feed is this node's durable fact (ADR-037 R5), and
+                                    // R10 never visits the own live window, so the window test
+                                    // below would keep every own-head echo as a probe forever:
+                                    // a hinted round per peer per inventory that fetched
+                                    // nothing. A known, accepted own head within the contiguous
+                                    // own feed is held; only a longer own feed elsewhere stays a
+                                    // probe, for the own-history conflict detector (R5).
+                                    if hint.size <= own_contiguous {
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
                         let state = read
                             .sparse_author(&hint.author, crate::log::history::LogScope::Public)?;
                         // An inventory scalar is redundant only when its exact signed head is
@@ -535,18 +561,22 @@ impl Source {
                             missing.push(hint);
                         }
                     }
-                    Ok(Some(missing))
+                    Ok(Some((missing, mine)))
                 },
             )
             .await?;
         match filtered {
             Lookup::Found(filtered) => {
                 self.current()?;
-                inbox.offer(job, generation, room_id, self.peer, &filtered.value)
+                let (missing, mine) = filtered.value;
+                let mut offer = inbox.offer(job, generation, room_id, self.peer, &missing)?;
+                offer.mine_held = mine;
+                Ok(offer)
             }
             Lookup::Busy | Lookup::Missing => Ok(super::hints::Offer {
                 added: 0,
                 full: true,
+                mine_held: None,
             }),
         }
     }
