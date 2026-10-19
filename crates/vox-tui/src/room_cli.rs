@@ -1770,7 +1770,7 @@ async fn rows_of(
                         // The room's governance fold was behind what this node has received
                         // (ADR-037 R3): a control entry it holds is not folded yet, so this
                         // page may still be re-ordered or withdrawn. Said before the rows.
-                        println!(
+                        eprintln!(
                             "note: this room is still folding its control entries; this page is provisional"
                         );
                     }

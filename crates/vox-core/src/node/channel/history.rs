@@ -248,6 +248,9 @@ struct View<'a> {
     ch: &'a ChannelState,
     store: &'a Store,
     rendered: entry_store::RenderView<'a>,
+    /// The room's fold was not current at read time (ADR-037 R3): the page is said to be
+    /// provisional, never refused.
+    provisional: bool,
 }
 
 impl View<'_> {
@@ -572,7 +575,7 @@ impl View<'_> {
         Ok(Reply::Older {
             rows,
             older,
-            provisional: !self.ch.governance_ready,
+            provisional: self.provisional,
         })
     }
 
@@ -736,7 +739,7 @@ impl View<'_> {
             rows,
             instance,
             next: next.map(|arrival| HistoryCursor { instance, arrival }),
-            provisional: !self.ch.governance_ready,
+            provisional: self.provisional,
         })
     }
 
@@ -1456,7 +1459,7 @@ impl View<'_> {
                 Ok(Reply::Older {
                     rows,
                     older,
-                    provisional: !self.ch.governance_ready,
+                    provisional: self.provisional,
                 })
             }
             Query::Count { since } => {
@@ -1630,14 +1633,20 @@ impl ChannelState {
                         .render_view(store, &self.sek, &self.channel_id)?,
                     ch: self,
                     store,
+                    provisional: !self.governance_ready,
                 };
                 return view.accepted_cache_answer(query, max_bytes);
             }
-            self.require_governance_ready(store, crate::time::Ms(now_ms))
-                .map_err(|e| match e {
-                    Error::Profile(why) => Failure::Request(why),
-                    e => Failure::Storage(e),
-                })?;
+            // ADR-037 R3/R4: a page is answered from what this node holds; a fold behind its
+            // receipts marks the page provisional and never refuses it. The legacy-recovery
+            // gate above (`legacy_cache_only`) stays. Measured before this: a newcomer's
+            // `vox room read --json --limit 25` was refused "room governance is refreshing"
+            // while the control entries of the room he had just joined were still folding.
+            let provisional = match self.checked_governance(store, now_ms) {
+                Ok(_) => false,
+                Err(e) if super::governance::refreshing(&e) => true,
+                Err(e) => return Err(Failure::Storage(e)),
+            };
             self.prune_retention_page(store)?;
             if self.retention_due(store, 0)?.1 {
                 return Err(Failure::Request(
@@ -1655,6 +1664,7 @@ impl ChannelState {
                     .render_view(store, &self.sek, &self.channel_id)?,
                 ch: self,
                 store,
+                provisional,
             };
             view.answer(query, max_bytes)
         })();
