@@ -20662,10 +20662,13 @@ impl Node {
                 true
             }
             Err(error)
-                if matches!(error, Error::RoomNotSynced)
+                if matches!(error, Error::RoomNotSynced | Error::OwnHistoryBehind)
                     || ChannelState::governance_refreshing(&error)
                     || ChannelState::legacy_classification_refreshing(&error) =>
             {
+                // A room that refuses this node's writes (not synced yet, or its own history is
+                // behind what a member holds, ADR-037 R5) keeps the marks saved and says nothing
+                // here: the detector said the refusal once, and this ran once per attempt.
                 false
             }
             Err(error) => {
