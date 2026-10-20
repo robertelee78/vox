@@ -1670,7 +1670,12 @@ impl Management {
             let me = Arc::clone(self);
             tasks.push((
                 peer,
-                tokio::spawn(async move { me.sync_peer(peer, endpoints, url).await }),
+                tokio::spawn(async move {
+                    // Dated when it finished, not when its result is visited: a slow peer
+                    // awaited before this one must not shift its time.
+                    let outcome = me.sync_peer(peer, endpoints, url).await;
+                    (std::time::Instant::now(), now(), outcome)
+                }),
             ));
         }
         if tasks.is_empty() {
@@ -1681,10 +1686,18 @@ impl Management {
         let mut problem = None;
         for (peer, task) in tasks {
             // A task that panicked is a failed attempt at that computer, backed off like any.
-            let outcome: std::result::Result<(), String> = match task.await {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(e)) => Err(e.to_string()),
-                Err(e) => Err(format!("the exchange task failed: {e}")),
+            let (finished, finished_ms, outcome): (
+                std::time::Instant,
+                u64,
+                std::result::Result<(), String>,
+            ) = match task.await {
+                Ok((at, at_ms, Ok(()))) => (at, at_ms, Ok(())),
+                Ok((at, at_ms, Err(e))) => (at, at_ms, Err(e.to_string())),
+                Err(e) => (
+                    std::time::Instant::now(),
+                    now(),
+                    Err(format!("the exchange task failed: {e}")),
+                ),
             };
             let (revision, involved) = attempted
                 .iter()
@@ -1695,12 +1708,12 @@ impl Management {
             let record = exchanged.entry(peer).or_default();
             // `last` paces the next attempt, succeeded or not; `last_ms` is what a person reads
             // as the last exchange, so only a completed one sets it.
-            record.last = Some(std::time::Instant::now());
+            record.last = Some(finished);
             record.revision = revision;
             record.involved = involved;
             match outcome {
                 Ok(()) => {
-                    record.last_ms = Some(now());
+                    record.last_ms = Some(finished_ms);
                     record.count = record.count.saturating_add(1);
                     record.failures = 0;
                 }

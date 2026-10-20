@@ -294,7 +294,17 @@ fn show(status: &ComputerStatus, json: bool) -> Result<(), AppError> {
                     }
                 )
             }
-            None => "; not exchanged since the daemon started".to_owned(),
+            None => format!(
+                "; not exchanged since the daemon started{}",
+                if application.exchange_failures > 0 {
+                    format!(
+                        ", {} attempt(s) failed in a row",
+                        application.exchange_failures
+                    )
+                } else {
+                    String::new()
+                }
+            ),
         };
         println!(
             "{}  {}  {}{exchanged}",
