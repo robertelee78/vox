@@ -4819,7 +4819,8 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             let mut rooms = Vec::with_capacity(n.min(1024));
             for _ in 0..n {
                 let arity = d.array().map_err(|_| Error::MalformedIpc("ipc room"))?;
-                if !(3..=5).contains(&arity) {
+                // 3..=5 as earlier daemons wrote a row; 7 with what a preparing room waits for.
+                if !matches!(arity, 3..=5 | 7) {
                     return Err(Error::MalformedIpc("ipc room arity"));
                 }
                 let id = digest(d)?;
