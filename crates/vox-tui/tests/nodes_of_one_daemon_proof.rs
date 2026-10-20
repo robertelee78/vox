@@ -2529,13 +2529,15 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
     };
     let during_a = grew(ea0, ea1, "alpha", &shown_a0, &shown_a1);
     let during_b = grew(eb0, eb1, "beta", &shown_b0, &shown_b1);
-    // Every round counted, completed or not: the idle minute allows one per computer, and a
-    // failed round that a later success hides from the completed count still shows here.
+    // Every round counted from its start, completed or not: the idle minute allows one per
+    // computer, so a failed round and its retry (two) are red even when a later success hides
+    // the failure from the completed count. Starts and completions are not equated: an
+    // exchange in flight at either sample would make them differ for no fault.
     let tried_a = grew(aa0, aa1, "alpha", &shown_a0, &shown_a1);
     let tried_b = grew(ab0, ab1, "beta", &shown_b0, &shown_b1);
     assert!(
-        tried_a <= IDLE_EXCHANGES && tried_b <= IDLE_EXCHANGES && tried_a == during_a && tried_b == during_b,
-        "PRODUCT: idle computers ran rounds beyond the fallback, or rounds that failed (ADR-038 FX-15, #989): \
+        tried_a <= IDLE_EXCHANGES && tried_b <= IDLE_EXCHANGES,
+        "PRODUCT: idle computers started rounds beyond the fallback (a failed round and its retry are two) (ADR-038 FX-15, #989): \
          alpha {tried_a} attempt(s) for {during_a} exchange(s), beta {tried_b} for {during_b} over {PAIRED_IDLE:?} (at most {IDLE_EXCHANGES} each)\n{shown_a1}\n{shown_b1}"
     );
     println!(
