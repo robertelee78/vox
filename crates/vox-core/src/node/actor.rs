@@ -18512,7 +18512,13 @@ impl Node {
                                 });
                             }
                         }
+                        // A wait that changed is published at once: the room list, the status
+                        // and the app say it without waiting for another event (#991).
+                        let changed = prepared.waiting != waited_before;
                         self.preparing_rooms.insert(id, prepared);
+                        if changed {
+                            self.publish().await;
+                        }
                         return;
                     }
                     Err(error)
@@ -18531,7 +18537,13 @@ impl Node {
                                     + prepared.retry_after(waited_before.as_ref()),
                             );
                         }
+                        // A wait that changed is published at once: the room list, the status
+                        // and the app say it without waiting for another event (#991).
+                        let changed = prepared.waiting != waited_before;
                         self.preparing_rooms.insert(id, prepared);
+                        if changed {
+                            self.publish().await;
+                        }
                         return;
                     }
                     Ok(true) => {
