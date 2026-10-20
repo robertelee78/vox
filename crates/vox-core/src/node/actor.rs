@@ -4816,16 +4816,22 @@ struct RoomPreparation {
 /// then costs one turn a second, which nobody notices.
 const PREPARE_FAST_TURNS: u32 = 10;
 
-/// `VOX_TEST_PREPARE_HOLD_FILE`: while the named file exists, no room finishes preparing (each
-/// turn ends as a step that did work). Read only by a `test-knobs` build; a release `vox` holds
-/// nothing (#300).
+/// `VOX_TEST_PREPARE_HOLD_FILE`: while the named file exists, the room whose id starts with the
+/// file's contents (every room, when it is empty) never finishes preparing: each turn ends as a
+/// step that did work and cost a few milliseconds. Read only by a `test-knobs` build; a release
+/// `vox` holds nothing (#300).
 #[cfg(feature = "test-knobs")]
 pub const TEST_PREPARE_HOLD_ENV: &str = "VOX_TEST_PREPARE_HOLD_FILE";
 #[cfg(feature = "test-knobs")]
-fn prepare_held() -> bool {
-    std::env::var_os(TEST_PREPARE_HOLD_ENV)
-        .filter(|path| !path.is_empty())
-        .is_some_and(|path| std::path::Path::new(&path).exists())
+fn prepare_held(room: &Digest32) -> bool {
+    let Some(path) = std::env::var_os(TEST_PREPARE_HOLD_ENV).filter(|path| !path.is_empty()) else {
+        return false;
+    };
+    let Ok(which) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    let which = which.trim();
+    which.is_empty() || crate::node::link::b32_encode(room).starts_with(which)
 }
 
 /// A wait this long on one thing is said once in the daemon's log, so a person reading it
@@ -18600,14 +18606,14 @@ impl Node {
     ) -> crate::error::Result<bool> {
         let ch = prepared.channel.get_mut();
         #[cfg(feature = "test-knobs")]
-        if prepare_held() {
-            // A step that never finishes and costs a few milliseconds a turn, as the step that
+        if prepare_held(&ch.channel_id()) {
+            // A step that never finishes and costs tens of milliseconds a turn, as the step that
             // held the decider's room did, for the proof that the room's turns are paced. Its
             // due time is cleared as every real step's is, so the next turn is scheduled.
             prepared.legacy_cleanup_due = None;
             let busy = std::time::Instant::now();
             let mut digest = [0u8; 32];
-            while busy.elapsed() < Duration::from_millis(5) {
+            while busy.elapsed() < Duration::from_millis(40) {
                 digest = crate::hash::sha256(&digest);
             }
             std::hint::black_box(digest);

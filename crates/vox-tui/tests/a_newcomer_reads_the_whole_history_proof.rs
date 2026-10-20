@@ -1653,16 +1653,22 @@ fn a_room_with_its_own_session_records_opens_after_a_restart() {
 const HELD_NAMED_WITHIN: Duration = Duration::from_secs(5);
 /// How long the held room is watched.
 const HELD_IDLE: Duration = Duration::from_secs(30);
-/// CPU time the daemon may spend over [`HELD_IDLE`] on a step that never finishes: ten turns
-/// at the fast retry, then one a second (ADR-038 FX-15; #991).
-const HELD_CPU: Duration = Duration::from_millis(1500);
+/// CPU time the daemon may spend over [`HELD_IDLE`] on a step that never finishes while a peer
+/// keeps it awake: ten turns at the fast retry, then one a second, plus the peer's rows
+/// (ADR-038 FX-15; #991). Measured: paced ~1.2 s, unpaced ~6 s.
+const HELD_CPU: Duration = Duration::from_secs(3);
+/// How often bob posts into the open room through the held window: each row wakes alice's
+/// actor, as the decider's six peers wake his, and a due room runs a turn at every wake.
+const CHATTY_EVERY: Duration = Duration::from_millis(200);
 
-/// A preparation step that never finishes costs the daemon one turn a second, not twenty
-/// (ADR-038 FX-15; #991). Staged with the prepare-hold knob: while its file exists every
-/// preparation turn ends as a step that did work, which is what the decider's room did for
-/// hours at 50 ms a turn. Within [`HELD_NAMED_WITHIN`] `vox room list` MUST name the step;
-/// over [`HELD_IDLE`] the daemon's CPU MUST grow by at most [`HELD_CPU`] while the room keeps
-/// naming it; once the file is removed the room MUST open within [`OPENS_WITHIN`].
+/// A preparation step that never finishes costs the daemon one turn a second, not one per wake
+/// (ADR-038 FX-15; #991). Staged with the prepare-hold knob on one of alice's two rooms: every
+/// preparation turn of that room ends as a step that did work and cost 40 ms, which is what
+/// the decider's room did for hours, while bob posts into her other, open room every
+/// [`CHATTY_EVERY`] so her actor is woken as his is. Within [`HELD_NAMED_WITHIN`] `vox room
+/// list` MUST name the step; over [`HELD_IDLE`] the daemon's CPU MUST grow by at most
+/// [`HELD_CPU`] while the room keeps naming it; once the file is removed the room MUST open
+/// within [`OPENS_WITHIN`].
 ///
 /// Mutant: the pacing removed (`PREPARE_FAST_TURNS` made unreachable) turns the CPU claim red.
 #[cfg(feature = "optional-proofs")]
@@ -1682,30 +1688,74 @@ fn a_preparation_step_that_never_finishes_costs_one_turn_a_second() {
         .expect("APPARATUS: a UTF-8 temp path")
         .to_owned();
     let knob = [("VOX_TEST_PREPARE_HOLD_FILE", hold_path.as_str())];
-    let (ok, _, err) = vox(&alice, &["id"], None);
-    assert!(ok, "PRODUCT: `vox id` failed: {err}");
+    let bob = root.join("bob");
+    std::fs::create_dir_all(bob.join("cfg"))
+        .unwrap_or_else(|e| panic!("APPARATUS: could not create {}: {e}", bob.display()));
+    let mut fps = Vec::new();
+    for dir in [&alice, &bob] {
+        let (ok, out, err) = vox(dir, &["id"], None);
+        assert!(ok, "PRODUCT: `vox id` failed: {err}");
+        fps.push(out.trim().to_owned());
+    }
+    for (dir, fp, name) in [(&alice, &fps[1], "bob"), (&bob, &fps[0], "alice")] {
+        let (ok, _, err) = vox(dir, &["trust", "add", fp, "--name", name], None);
+        assert!(ok, "PRODUCT: `vox trust add` of {name} failed: {err}");
+    }
     let first = daemon_env(&alice, "alice", &knob);
     attached(&alice, "alice");
-    let (ok, _, err) = vox(
-        &alice,
-        &["room", "create", "--passphrase-file", "-", "--name", "held"],
-        Some(&format!("{ROOMPASS}\n")),
-    );
-    assert!(
-        ok,
-        "PRODUCT: `vox room create` failed: {err}\nalice's daemon said: {}",
-        said(&alice, "alice")
-    );
-    let listed = attached(&alice, "alice");
-    let room = listed
-        .split_whitespace()
-        .find(|w| w.len() >= 8 && w.chars().all(|c| c.is_ascii_alphanumeric()))
-        .unwrap_or_else(|| panic!("PRODUCT: `vox room list` shows no room id: {listed}"))
-        .to_owned();
+    // Two rooms: "held" will be held; "chat" stays open and bob posts into it.
+    let mut rooms = Vec::new();
+    for name in ["held", "chat"] {
+        let (ok, _, err) = vox(
+            &alice,
+            &["room", "create", "--passphrase-file", "-", "--name", name],
+            Some(&format!("{ROOMPASS}\n")),
+        );
+        assert!(
+            ok,
+            "PRODUCT: `vox room create` of {name} failed: {err}\nalice's daemon said: {}",
+            said(&alice, "alice")
+        );
+        let listed = attached(&alice, "alice");
+        let id = listed
+            .lines()
+            .find(|l| l.contains(name))
+            .and_then(|l| l.split_whitespace().next())
+            .unwrap_or_else(|| panic!("PRODUCT: `vox room list` shows no room {name}: {listed}"))
+            .to_owned();
+        rooms.push(id);
+    }
+    let (room, chat) = (rooms[0].clone(), rooms[1].clone());
     let (ok, out, err) = vox(&alice, &["room", "post", &room, "a row"], None);
     assert!(ok, "PRODUCT: alice's post was refused: {out}{err}");
+    let (ok, link, err) = vox(&alice, &["room", "link", &chat], None);
+    assert!(ok, "PRODUCT: `vox room link` failed: {err}");
+    let link = link.trim().to_owned();
+    let _bob_daemon = daemon(&bob, "bob");
+    attached(&bob, "bob");
+    let (ok, _, err) = vox(
+        &bob,
+        &["room", "join", "--passphrase-file", "-", &link],
+        Some(&format!("{ROOMPASS}\n")),
+    );
+    assert!(ok, "PRODUCT: bob's `vox room join` was refused: {err}");
+    let (ok, out, err) = vox(&alice, &["room", "post", &chat, "bob, are you there"], None);
+    assert!(
+        ok,
+        "PRODUCT: alice's post into chat was refused: {out}{err}"
+    );
+    let joined = Instant::now();
+    while !reads(&bob, &chat, "bob, are you there") {
+        assert!(
+            joined.elapsed() < Duration::from_secs(90),
+            "PRODUCT (staging): bob did not read alice's row in 90 s\nbob's daemon said: {}",
+            said(&bob, "bob")
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
     first.stop();
-    std::fs::write(&hold, b"").expect("APPARATUS: write the hold file");
+    // Only the "held" room is held: the file names it.
+    std::fs::write(&hold, room.as_bytes()).expect("APPARATUS: write the hold file");
     let second = daemon_env(&alice, "alice", &knob);
     let started = Instant::now();
     loop {
@@ -1730,12 +1780,38 @@ fn a_preparation_step_that_never_finishes_costs_one_turn_a_second() {
         );
         std::thread::sleep(Duration::from_millis(200));
     }
+    // Bob keeps alice's actor awake through the window, as the decider's peers keep his.
+    let chatting = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let chatter = {
+        let chatting = chatting.clone();
+        let bob = bob.clone();
+        let chat = chat.clone();
+        std::thread::spawn(move || {
+            let mut n = 0usize;
+            while chatting.load(std::sync::atomic::Ordering::Relaxed) {
+                n += 1;
+                let _ = vox(
+                    &bob,
+                    &["room", "post", &chat, &format!("chatter {n}")],
+                    None,
+                );
+                std::thread::sleep(CHATTY_EVERY);
+            }
+            n
+        })
+    };
     let pid = second.0.id();
     let cpu0 = cpu_time(pid);
     std::thread::sleep(HELD_IDLE);
     let spent = cpu_time(pid).saturating_sub(cpu0);
+    chatting.store(false, std::sync::atomic::Ordering::Relaxed);
+    let posted = chatter.join().unwrap_or(0);
     let (_, out, _) = vox(&alice, &["room", "list"], None);
-    println!("[proof] over {HELD_IDLE:?} the held step cost the daemon +{spent:?} of CPU (bound {HELD_CPU:?}); the list says: {}", out.trim());
+    println!("[proof] over {HELD_IDLE:?} with bob posting {posted} rows the held step cost the daemon +{spent:?} of CPU (bound {HELD_CPU:?}); the list says: {}", out.trim());
+    assert!(
+        posted >= 50,
+        "APPARATUS: bob posted only {posted} rows in {HELD_IDLE:?}; alice's actor was not kept awake"
+    );
     assert!(
         out.contains("waiting for a step held by a test knob"),
         "PRODUCT: after {HELD_IDLE:?} the room no longer names its held step (#991): {out}"
