@@ -354,10 +354,10 @@ fn sweep(apps: &Path) -> Result<(), AppError> {
             .to_string_lossy()
             .starts_with(RETIRED_PREFIX);
         if retired {
-            if in_use(&entry.path()) {
-                // Still running from: it stays, set aside (again, if an earlier attempt failed).
-                set_aside(&entry.path())?;
-            } else {
+            // Set aside first, again if an earlier attempt failed: the record goes and the
+            // bundle is no application even if it then cannot be removed. One still in use stays.
+            set_aside(&entry.path())?;
+            if !in_use(&entry.path()) {
                 clear(&entry.path())?;
             }
         }

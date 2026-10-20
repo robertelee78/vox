@@ -56,12 +56,10 @@ VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
 [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "cannot read the workspace version from Cargo.toml"
 # LaunchServices prefers the bundle with the greater CFBundleVersion when two are registered as
 # `us.vox.app` (the install keeps the replaced bundle for `vox update --rollback`), so the build
-# number grows with the release: 0.4.7 -> 4007, 1.2.3 -> 1002003 (ADR-014 M-29a). The project's
-# own CURRENT_PROJECT_VERSION is 1 and would tie every release. Minor and patch each get three
-# digits; a version past that is refused rather than given a number that sorts wrong.
-IFS=. read -r major minor patch <<<"$VERSION"
-(( major < 1000 && minor < 1000 && patch < 1000 )) || fail "version $VERSION: each component must stay below 1000 for a monotonic CFBundleVersion"
-BUILD=$((major * 1000000 + minor * 1000 + patch))
+# version is the release version itself: Apple's documented form, one to three period-separated
+# integers, compared component by component (0.4.7 < 0.4.10 < 0.5.0 < 1.0.0). The project's own
+# CURRENT_PROJECT_VERSION is 1 and would tie every release (ADR-014 M-29a).
+BUILD="$VERSION"
 
 # The macOS slice only: a release builds nothing for iOS and nothing for Intel.
 XCFRAMEWORK_SLICES=macos scripts/build-xcframework.sh >&2
