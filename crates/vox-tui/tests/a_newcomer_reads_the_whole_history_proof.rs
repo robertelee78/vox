@@ -865,9 +865,9 @@ const PREPARING_IDLE: Duration = Duration::from_secs(60);
 const PREPARING_CPU: Duration = Duration::from_secs(3);
 /// Once the wait ends, the room MUST open within this (the retry is once a second).
 const OPENS_WITHIN: Duration = Duration::from_secs(10);
-/// Sync rounds the waiting room's daemon may complete over [`PREPARING_IDLE`]: the periodic
-/// request's, toward one peer, and nothing else (FX-15).
-const PREPARING_ROUNDS: u64 = 4;
+/// Sync rounds the waiting room's daemon may complete toward one peer over [`PREPARING_IDLE`]:
+/// the periodic request's, and nothing else (FX-15); measured 0.
+const PREPARING_ROUNDS: u64 = 2;
 
 /// A room that cannot finish preparing says what it waits for, costs nothing while it waits, and
 /// opens once the wait ends (ADR-038 FX-15, FX-16; #991). Staged with the fold-hold knob: alice
@@ -1270,6 +1270,13 @@ fn held_entries(dir: &Path) -> u64 {
         "PRODUCT: `vox room read` of a preparing room does not say the wait the status names \
          ({what:?}) (#991): ok={ok} {out}{err}"
     );
+    // The daemon's own refusal says it too: a post, which the CLI does not pre-check.
+    let (ok, out, err) = vox(&alice, &["room", "post", &room, "a word while it prepares"], None);
+    assert!(
+        !ok && format!("{out}{err}").contains(&format!("it waits for {what}")),
+        "PRODUCT: the daemon's refusal of a post into a preparing room does not say the wait the \
+         status names ({what:?}) (#991): ok={ok} {out}{err}"
+    );
     // Rounds per peer over the idle minute (FX-15): the periodic request is the only cadence.
     let rounds_before = completed_rounds(&alice);
 
@@ -1278,16 +1285,21 @@ fn held_entries(dir: &Path) -> u64 {
     let cpu0 = cpu_time(pid);
     std::thread::sleep(PREPARING_IDLE);
     let spent = cpu_time(pid).saturating_sub(cpu0);
-    let rounds = completed_rounds(&alice).saturating_sub(rounds_before);
+    let rounds_after = completed_rounds(&alice);
+    let per_peer: Vec<(String, u64)> = rounds_after
+        .iter()
+        .map(|(peer, after)| (peer.clone(), after.saturating_sub(*rounds_before.get(peer).unwrap_or(&0))))
+        .collect();
+    let rounds: u64 = per_peer.iter().map(|(_, n)| *n).max().unwrap_or(0);
     let log = std::fs::read_to_string(alice.join(".daemon/log")).unwrap_or_default();
     let noted: Vec<&str> = log.lines().filter(|l| l.contains("is still preparing: it waits for ")).collect();
     println!(
         "[proof] over {PREPARING_IDLE:?} the held room cost the daemon +{spent:?} of CPU (bound {PREPARING_CPU:?}) and {rounds} completed sync round(s) (bound {PREPARING_ROUNDS}); its log says: {noted:?}"
     );
     assert!(
-        rounds <= PREPARING_ROUNDS,
-        "PRODUCT: a room that only waited ran {rounds} sync rounds in {PREPARING_IDLE:?} (ADR-038 FX-15, #991): \
-         the periodic request is the only cadence; lanes: {}",
+        per_peer.iter().all(|(_, n)| *n <= PREPARING_ROUNDS),
+        "PRODUCT: a room that only waited ran sync rounds toward a peer in {PREPARING_IDLE:?} beyond \
+         the periodic request (ADR-038 FX-15, #991): {per_peer:?} (at most {PREPARING_ROUNDS} each); lanes: {}",
         lanes_of(&vox(&alice, &["status", "--json"], None).1)
     );
     assert!(
@@ -1340,23 +1352,61 @@ fn held_entries(dir: &Path) -> u64 {
         );
         std::thread::sleep(Duration::from_millis(500));
     }
+    // FX-16: the round that brought bob's rows is recorded as the room's and bob's last
+    // completed sync.
+    let synced = Instant::now();
+    loop {
+        let (ok, out, _) = vox(&alice, &["status", "--json"], None);
+        let v: serde_json::Value = if ok {
+            serde_json::from_str(&out).unwrap_or_default()
+        } else {
+            serde_json::Value::Null
+        };
+        let recorded = v["rooms"].as_array().is_some_and(|rooms| {
+            rooms.iter().any(|r| {
+                r["id"].as_str().is_some_and(|id| id.starts_with(&room))
+                    && r["last_sync_ms"].as_u64().is_some()
+                    && r["members"].as_array().is_some_and(|ms| {
+                        ms.iter().any(|m| m["me"] == false && m["last_sync_ms"].as_u64().is_some())
+                    })
+            })
+        });
+        if recorded {
+            break;
+        }
+        assert!(
+            synced.elapsed() < Duration::from_secs(30),
+            "PRODUCT: after the room opened and bob's rows arrived, `vox status --json` records no \
+             last completed sync for the room and for bob (ADR-038 FX-16, #991): {}",
+            lanes_of(&out)
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
     drop(second);
 }
 
-/// Completed sync rounds over every lane of a `vox status --json` (0 when unreadable).
-fn completed_rounds(dir: &Path) -> u64 {
-    let (ok, out, _) = vox(dir, &["status", "--json"], None);
-    if !ok {
-        return 0;
+/// Completed sync rounds per peer, from `vox status --json`'s lanes; an unreadable status is
+/// an apparatus fault, never a zero that reads as quiet.
+fn completed_rounds(dir: &Path) -> std::collections::BTreeMap<String, u64> {
+    let (ok, out, err) = vox(dir, &["status", "--json"], None);
+    assert!(ok, "APPARATUS: `vox status --json` failed while counting rounds: {err}");
+    let v: serde_json::Value = serde_json::from_str(&out)
+        .unwrap_or_else(|e| panic!("APPARATUS: `vox status --json` is not JSON: {e}: {out}"));
+    let lanes = v["sync"]
+        .as_array()
+        .unwrap_or_else(|| panic!("APPARATUS: `vox status --json` has no `sync` lanes: {out}"));
+    let mut rounds = std::collections::BTreeMap::new();
+    for lane in lanes {
+        let peer = lane["peer"]
+            .as_str()
+            .unwrap_or_else(|| panic!("APPARATUS: a lane names no peer: {lane}"))
+            .to_owned();
+        let completed = lane["completed"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("APPARATUS: a lane counts no completed rounds: {lane}"));
+        *rounds.entry(peer).or_insert(0) += completed;
     }
-    serde_json::from_str::<serde_json::Value>(&out)
-        .ok()
-        .and_then(|v| {
-            v["sync"]
-                .as_array()
-                .map(|lanes| lanes.iter().map(|l| l["completed"].as_u64().unwrap_or(0)).sum())
-        })
-        .unwrap_or(0)
+    rounds
 }
 
 /// Each lane of a `vox status --json`: peer, completed, partial, failed, running and its last failure.

@@ -18564,7 +18564,7 @@ impl Node {
             prepared.legacy_cleanup_due = ch
                 .legacy_startup_cleanup_blocks_current()
                 .then_some(std::time::Instant::now() + TICK);
-            prepared.progressed("cleaning up its earlier saved form", self.now_ms().get());
+            prepared.wait_on("cleaning up its earlier saved form", self.now_ms().get());
             // Cleanup and policy/retention writes occupy separate actor turns.
             return Ok(false);
         }
@@ -18698,10 +18698,12 @@ impl Node {
             examined += 1;
             if !trusted.contains(&member) {
                 channel.withdraw_consent(profile, member, self.now_ms())?;
-                return Ok(false);
+                prepared.progressed("narrowing its trust", self.now_ms().get());
+            return Ok(false);
             }
             if examined == 64 {
-                return Ok(false);
+                prepared.progressed("narrowing its trust", self.now_ms().get());
+            return Ok(false);
             }
         }
         // Rotation is durable before the removal record is cleared. A failed save is
@@ -18714,10 +18716,12 @@ impl Node {
         if let Some(member) = page.targets.iter().find(|m| !trusted.contains(*m)).copied() {
             channel.withdraw_consent(profile, member, self.now_ms())?;
             prepared.consent_after = Some(member);
+            prepared.progressed("narrowing its trust", self.now_ms().get());
             return Ok(false);
         }
         if let Some(next) = page.next {
             prepared.consent_after = Some(next);
+            prepared.progressed("narrowing its trust", self.now_ms().get());
             return Ok(false);
         }
         let order = crate::node::consent_order::ConsentOrder::load(profile.store(), signer)?;
