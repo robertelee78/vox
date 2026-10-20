@@ -233,7 +233,27 @@ pub struct Management {
     pending_nodes: Mutex<Vec<String>>,
     transport_cache: Mutex<BTreeMap<(Digest32, Digest32), RegisteredLease>>,
     revoked_transport: Mutex<std::collections::BTreeSet<(Digest32, Digest32, u64)>>,
+    /// Per computer: when this node last exchanged state with it, and how many exchanges in a row
+    /// failed since one succeeded. What `retry` keys its cadence on (ADR-038 FX-15; #989).
+    exchanged: Mutex<BTreeMap<Digest32, Exchanged>>,
 }
+
+/// One computer's exchange record.
+#[derive(Clone, Copy, Debug, Default)]
+struct Exchanged {
+    /// The last attempt, succeeded or not.
+    last: Option<std::time::Instant>,
+    /// Failures in a row since the last success; the backoff doubles with each.
+    failures: u32,
+}
+
+/// Without a need, a computer whose receipt covers this node's current state is exchanged with
+/// this often, so a lost message never leaves two computers apart for long.
+const EXCHANGE_FALLBACK: Duration = Duration::from_secs(60);
+/// A computer that could not be reached is tried again after this, doubling per failure.
+const EXCHANGE_BACKOFF: Duration = Duration::from_secs(2);
+/// The longest a failing computer waits between attempts.
+const EXCHANGE_BACKOFF_MAX: Duration = Duration::from_secs(120);
 impl Management {
     /// The account's explicit host:port lookup uses its existing socket, but no management
     /// identity or authority. The returned fingerprint is proved; lookup persists no anchor source.
@@ -365,6 +385,7 @@ impl Management {
             pending_nodes: Mutex::new(Vec::new()),
             transport_cache: Mutex::new(BTreeMap::new()),
             revoked_transport: Mutex::new(Default::default()),
+            exchanged: Mutex::new(BTreeMap::new()),
         });
         let weak = Arc::downgrade(&me);
         tokio::spawn(async move {
@@ -1539,6 +1560,52 @@ impl Management {
             if let Some(g) = &s.pending {
                 peers.insert(g.computers[1 - side(g, &local)?].fingerprint()?);
             }
+            // A computer needs an exchange when it has not acknowledged this node's current
+            // state (its receipt for the current revision is missing), when a pending operation
+            // involves it, or when the fallback interval passed; a computer that could not be
+            // reached waits out its backoff. Measured before this (2026-10-20): every computer
+            // was exchanged with every 2 s, the whole signed history sent and re-verified each
+            // time, 47–95% of a core on the decider's daemon while nothing changed.
+            let current = s
+                .genesis
+                .as_ref()
+                .and_then(|_| receipt_body(&s, s.revision).ok());
+            let involved: Option<Digest32> = s
+                .pending
+                .as_ref()
+                .and_then(|g| {
+                    side(g, &local)
+                        .ok()
+                        .map(|i| g.computers[1 - i].fingerprint().ok())
+                })
+                .flatten();
+            let now = std::time::Instant::now();
+            let exchanged = lock(&self.exchanged);
+            peers.retain(|peer| {
+                let record = exchanged.get(peer).copied().unwrap_or_default();
+                if let Some(last) = record.last {
+                    if record.failures > 0 {
+                        let wait = EXCHANGE_BACKOFF
+                            .saturating_mul(1u32 << record.failures.min(6))
+                            .min(EXCHANGE_BACKOFF_MAX);
+                        if now.duration_since(last) < wait {
+                            return false;
+                        }
+                    } else {
+                        let acknowledged = current.as_ref().is_some_and(|body| {
+                            s.receipts.get(peer).is_some_and(|r| r.body == *body)
+                        });
+                        if acknowledged
+                            && involved != Some(*peer)
+                            && now.duration_since(last) < EXCHANGE_FALLBACK
+                        {
+                            return false;
+                        }
+                    }
+                }
+                true
+            });
+            drop(exchanged);
             peers
                 .into_iter()
                 .map(|peer| {
@@ -1565,14 +1632,24 @@ impl Management {
         let mut tasks = tokio::task::JoinSet::new();
         for (peer, endpoints, url) in peers {
             let me = Arc::clone(self);
-            tasks.spawn(async move { me.sync_peer(peer, endpoints, url).await });
+            tasks.spawn(async move { (peer, me.sync_peer(peer, endpoints, url).await) });
         }
         let mut problem = None;
         while let Some(result) = tasks.join_next().await {
             match result {
-                Ok(Err(e)) => problem = Some(e.to_string()),
+                Ok((peer, outcome)) => {
+                    let mut exchanged = lock(&self.exchanged);
+                    let record = exchanged.entry(peer).or_default();
+                    record.last = Some(std::time::Instant::now());
+                    match outcome {
+                        Ok(()) => record.failures = 0,
+                        Err(e) => {
+                            record.failures = record.failures.saturating_add(1);
+                            problem = Some(e.to_string());
+                        }
+                    }
+                }
                 Err(e) => problem = Some(e.to_string()),
-                _ => {}
             }
         }
         *lock(&self.problem) = problem;
