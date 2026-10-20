@@ -42,7 +42,7 @@
 //! never touched. [`crate::atrest::retention`] drives that upgrade.
 
 use aes_gcm::aead::{Aead, Payload};
-use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+use aes_gcm::{Aes256Gcm, KeyInit};
 use argon2::{Algorithm, Argon2, Params, Version};
 use hkdf::Hkdf;
 use sha2::Sha256;
@@ -357,7 +357,7 @@ impl Sek {
         let cipher = Aes256Gcm::new_from_slice(kek.as_ref()).map_err(|_| Error::Argon2Failed)?;
         let ct = cipher
             .encrypt(
-                Nonce::from_slice(&nonce),
+                &nonce.into(),
                 Payload {
                     msg: key,
                     aad: WRAP_AAD,
@@ -449,7 +449,7 @@ impl SekWrap {
             Aes256Gcm::new_from_slice(kek.as_ref()).map_err(|_| Error::AtRestUnlockFailed)?;
         let mut pt = cipher
             .decrypt(
-                Nonce::from_slice(&self.nonce),
+                &self.nonce.into(),
                 Payload {
                     msg: &self.ciphertext,
                     aad: WRAP_AAD,

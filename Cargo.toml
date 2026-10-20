@@ -69,7 +69,7 @@ base64 = "0.22"
 #   aes-gcm — AES-256-GCM, the vox-suite-1 default AEAD for ratchet envelopes
 hkdf = { version = "0.12", default-features = false }
 hmac = { version = "0.12", default-features = false }
-aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
+aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc"] }
 # At-rest double-lock passphrase factor (ADR-010, M8). Argon2id is the memory-hard
 # `factor_pass` KDF for the channel passphrase and the identity-vault passphrase;
 # pinned to the RustCrypto password-hashes island so it shares one `alloc`/`zeroize`

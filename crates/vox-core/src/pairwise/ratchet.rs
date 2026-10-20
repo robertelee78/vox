@@ -20,7 +20,7 @@
 //! header whose key is already gone simply fails to open.
 
 use aes_gcm::aead::Aead;
-use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+use aes_gcm::{Aes256Gcm, KeyInit};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -98,7 +98,7 @@ fn aead_seal(mk: &Key32, ad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
     let nonce = message_nonce(mk)?;
     cipher
         .encrypt(
-            Nonce::from_slice(&nonce),
+            &nonce.into(),
             aes_gcm::aead::Payload {
                 msg: plaintext,
                 aad: ad,
@@ -116,7 +116,7 @@ fn aead_open(mk: &Key32, ad: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>> {
     let nonce = message_nonce(mk)?;
     cipher
         .decrypt(
-            Nonce::from_slice(&nonce),
+            &nonce.into(),
             aes_gcm::aead::Payload {
                 msg: ciphertext,
                 aad: ad,

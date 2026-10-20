@@ -186,7 +186,7 @@ pub fn seal_pop_with_key(key: &[u8; 32], proof: &IdentityProof) -> Result<Vec<u8
     let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| Error::SigningFailed)?;
     let nonce_bytes = random_array::<POP_NONCE_LEN>()?;
     let ct = cipher
-        .encrypt(Nonce::from_slice(&nonce_bytes), proof.to_bytes().as_ref())
+        .encrypt(&nonce_bytes.into(), proof.to_bytes().as_ref())
         .map_err(|_| Error::SigningFailed)?;
     let mut out = Vec::with_capacity(POP_NONCE_LEN + ct.len());
     out.extend_from_slice(&nonce_bytes);
@@ -203,8 +203,9 @@ pub fn open_pop_with_key(key: &[u8; 32], sealed: &[u8]) -> Result<IdentityProof>
     }
     let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| Error::JoinProofFailed)?;
     let (nonce_bytes, ct) = sealed.split_at(POP_NONCE_LEN);
+    let nonce = Nonce::try_from(nonce_bytes).map_err(|_| Error::JoinProofFailed)?;
     let pt = cipher
-        .decrypt(Nonce::from_slice(nonce_bytes), ct)
+        .decrypt(&nonce, ct)
         .map_err(|_| Error::JoinProofFailed)?;
     IdentityProof::from_bytes(&pt)
 }
