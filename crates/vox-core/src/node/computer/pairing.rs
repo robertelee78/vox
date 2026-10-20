@@ -286,6 +286,18 @@ impl Attempt {
     }
 }
 
+/// A computer reserved as in flight by the operator's pairing, released on drop.
+struct Reserved {
+    me: Arc<Management>,
+    peer: Digest32,
+}
+
+impl Drop for Reserved {
+    fn drop(&mut self) {
+        lock(&self.me.inflight).remove(&self.peer);
+    }
+}
+
 impl Drop for Attempt {
     fn drop(&mut self) {
         if !self.recorded {
@@ -715,17 +727,32 @@ impl Management {
             }
         }
         // The pairing handshake with the link's computer is this computer's exchange with it
-        // for now: the retry leaves it alone meanwhile.
+        // for now: the retry leaves it alone meanwhile, and the reservation ends with the
+        // handshake however it ends (a drop guard), so the computer never stays in flight.
         let target = link.target;
         if !lock(&self.inflight).insert(target) {
             return Err(Error::Profile(
                 "an exchange with that computer is in progress; try again in a moment",
             ));
         }
+        let reserved = Reserved {
+            me: Arc::clone(self),
+            peer: target,
+        };
         let paired = self.pair(&link, url).await;
-        lock(&self.inflight).remove(&target);
-        paired?;
-        *lock(&self.problem) = None;
+        drop(reserved);
+        let revision = lock(&self.computer.state).revision;
+        match paired {
+            Ok(()) => {
+                // The handshake exchanged state: counted and dated like any exchange, and the
+                // status's problem follows from every computer's record.
+                self.record_exchange(target, revision, true, Ok(()));
+            }
+            Err(e) => {
+                self.record_exchange(target, revision, true, Err(e.to_string()));
+                return Err(e);
+            }
+        }
         self.status()
     }
     /// Record this operator's signature of exactly the previewed operation; retry is idempotent.
@@ -1654,11 +1681,7 @@ impl Management {
             let now = std::time::Instant::now();
             let revision = s.revision;
             let exchanged = lock(&self.exchanged);
-            let inflight = lock(&self.inflight).clone();
             peers.retain(|peer| {
-                if inflight.contains(peer) {
-                    return false;
-                }
                 let record = exchanged.get(peer).cloned().unwrap_or_default();
                 if let Some(last) = record.last {
                     if record.failures > 0 {
@@ -1688,6 +1711,13 @@ impl Management {
                 true
             });
             drop(exchanged);
+            // Reserved under one lock, after every other filter: a computer already in
+            // flight (with the retry or with the operator's pairing) is left alone, and no
+            // two exchanges with one computer ever overlap.
+            {
+                let mut inflight = lock(&self.inflight);
+                peers.retain(|peer| inflight.insert(*peer));
+            }
             let attempted: Vec<(Digest32, bool)> =
                 peers.iter().map(|p| (*p, involved == Some(*p))).collect();
             let peers = peers
@@ -1719,7 +1749,6 @@ impl Management {
             let involved = attempted
                 .iter()
                 .any(|(p, involved)| *p == peer && *involved);
-            lock(&self.inflight).insert(peer);
             tokio::spawn(async move {
                 // Each computer's outcome is recorded by its own task the moment it ends,
                 // dated then: a slow computer never delays another's record, status or next
