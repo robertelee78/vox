@@ -235,7 +235,9 @@ pub struct Management {
     net: Arc<NodeNet>,
     anchors: BootstrapSet,
     serving: Mutex<std::collections::BTreeSet<u64>>,
-    exchanges: tokio::sync::Mutex<()>,
+    /// Computers an exchange is in flight with: one at a time per computer, never a round that
+    /// waits for every computer, so a slow one delays no other (#989).
+    inflight: Mutex<BTreeSet<Digest32>>,
     slots: Arc<tokio::sync::Semaphore>,
     problem: Mutex<Option<String>>,
     pending_nodes: Mutex<Vec<String>>,
@@ -247,7 +249,7 @@ pub struct Management {
 }
 
 /// One computer's exchange record.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct Exchanged {
     /// The last attempt, succeeded or not.
     last: Option<std::time::Instant>,
@@ -262,6 +264,39 @@ struct Exchanged {
     /// not; the same state waits the backoff out.
     revision: u64,
     involved: bool,
+    /// The last failure's words, while failures stand.
+    problem: Option<String>,
+}
+
+/// One exchange attempt's bookkeeping: records its outcome when done, and a failure if the
+/// task is torn down before (a panic), so a computer never stays in flight forever.
+struct Attempt {
+    me: Arc<Management>,
+    peer: Digest32,
+    revision: u64,
+    involved: bool,
+    recorded: bool,
+}
+
+impl Attempt {
+    fn done(mut self, outcome: std::result::Result<(), String>) {
+        self.recorded = true;
+        self.me
+            .record_exchange(self.peer, self.revision, self.involved, outcome);
+    }
+}
+
+impl Drop for Attempt {
+    fn drop(&mut self) {
+        if !self.recorded {
+            self.me.record_exchange(
+                self.peer,
+                self.revision,
+                self.involved,
+                Err("the exchange task failed".to_owned()),
+            );
+        }
+    }
 }
 
 /// Without a need, a computer whose receipt covers this node's current state is exchanged with
@@ -271,9 +306,10 @@ const EXCHANGE_FALLBACK: Duration = Duration::from_secs(60);
 const EXCHANGE_BACKOFF: Duration = Duration::from_secs(2);
 /// The longest a failing computer waits between attempts.
 const EXCHANGE_BACKOFF_MAX: Duration = Duration::from_secs(120);
-/// An exchange that has not finished by then counts as failed: a computer that hangs must not
-/// hold the round, and with it every other computer's next attempt, for longer.
-const EXCHANGE_WITHIN: Duration = Duration::from_secs(60);
+/// An exchange that has not finished by then counts as failed and is tried again after its
+/// backoff: a computer that hangs must not stay "in flight" forever. Generous, because a
+/// slow but valid exchange of a long history must complete; no other computer waits on it.
+const EXCHANGE_WITHIN: Duration = Duration::from_secs(600);
 impl Management {
     /// The account's explicit host:port lookup uses its existing socket, but no management
     /// identity or authority. The returned fingerprint is proved; lookup persists no anchor source.
@@ -399,7 +435,7 @@ impl Management {
             net,
             anchors,
             serving: Mutex::new(Default::default()),
-            exchanges: tokio::sync::Mutex::new(()),
+            inflight: Mutex::new(BTreeSet::new()),
             slots: Arc::new(tokio::sync::Semaphore::new(8)),
             problem: Mutex::new(None),
             pending_nodes: Mutex::new(Vec::new()),
@@ -919,7 +955,7 @@ impl Management {
         let applications: Vec<_> = descriptions
             .iter()
             .map(|(id, d)| {
-                let record = exchanged.get(id).copied().unwrap_or_default();
+                let record = exchanged.get(id).cloned().unwrap_or_default();
                 Ok(ComputerApplication {
                     computer: ComputerIdentity::of(d)?,
                     confirmed: !storage_failed
@@ -1571,9 +1607,6 @@ impl Management {
         Ok(())
     }
     async fn retry(self: &Arc<Self>) -> Result<()> {
-        let Ok(_exchange) = self.exchanges.try_lock() else {
-            return Ok(());
-        };
         let (peers, attempted, revision) = {
             let s = lock(&self.computer.state);
             let local = self.computer.signer.fingerprint();
@@ -1612,8 +1645,12 @@ impl Management {
             let now = std::time::Instant::now();
             let revision = s.revision;
             let exchanged = lock(&self.exchanged);
+            let inflight = lock(&self.inflight).clone();
             peers.retain(|peer| {
-                let record = exchanged.get(peer).copied().unwrap_or_default();
+                if inflight.contains(peer) {
+                    return false;
+                }
+                let record = exchanged.get(peer).cloned().unwrap_or_default();
                 if let Some(last) = record.last {
                     if record.failures > 0 {
                         // 2 s after the first failure, doubling, at most EXCHANGE_BACKOFF_MAX;
@@ -1668,23 +1705,26 @@ impl Management {
                 .collect::<Vec<_>>();
             (peers, attempted, revision)
         };
-        let mut tasks = Vec::new();
         for (peer, endpoints, url) in peers {
             let me = Arc::clone(self);
             let involved = attempted
                 .iter()
                 .any(|(p, involved)| *p == peer && *involved);
-            tasks.push((
-                peer,
-                tokio::spawn(async move {
-                    // Each computer's outcome is recorded by its own task the moment it ends,
-                    // dated then: a slow computer never delays another's record, its status or
-                    // its next attempt, and none may hang the round past EXCHANGE_WITHIN.
-                    let outcome = match tokio::time::timeout(
-                        EXCHANGE_WITHIN,
-                        me.sync_peer(peer, endpoints, url),
-                    )
-                    .await
+            lock(&self.inflight).insert(peer);
+            tokio::spawn(async move {
+                // Each computer's outcome is recorded by its own task the moment it ends,
+                // dated then: a slow computer never delays another's record, status or next
+                // attempt, and one that hangs counts as failed after EXCHANGE_WITHIN.
+                let guard = Attempt {
+                    me: Arc::clone(&me),
+                    peer,
+                    revision,
+                    involved,
+                    recorded: false,
+                };
+                let outcome =
+                    match tokio::time::timeout(EXCHANGE_WITHIN, me.sync_peer(peer, endpoints, url))
+                        .await
                     {
                         Ok(Ok(())) => Ok(()),
                         Ok(Err(e)) => Err(e.to_string()),
@@ -1692,46 +1732,23 @@ impl Management {
                             "the exchange did not finish within {EXCHANGE_WITHIN:?}"
                         )),
                     };
-                    me.record_exchange(peer, revision, involved, outcome)
-                }),
-            ));
+                guard.done(outcome);
+            });
         }
-        if tasks.is_empty() {
-            // Nothing was tried: the last outcome stands, so a failure a person saw does not
-            // vanish on a tick that only waited.
-            return Ok(());
-        }
-        let mut problem = None;
-        for (peer, task) in tasks {
-            match task.await {
-                Ok(failed) => problem = failed.or(problem),
-                // A task that panicked is a failed attempt at that computer, backed off like any.
-                Err(e) => {
-                    let involved = attempted
-                        .iter()
-                        .any(|(p, involved)| *p == peer && *involved);
-                    problem = self.record_exchange(
-                        peer,
-                        revision,
-                        involved,
-                        Err(format!("the exchange task failed: {e}")),
-                    );
-                }
-            }
-        }
-        *lock(&self.problem) = problem;
         Ok(())
     }
     /// Record one attempt's outcome for `peer`, now: `last` paces the next attempt whether it
     /// succeeded or not; `last_ms`, what a person reads as the last exchange, is set only by a
-    /// completed one. Returns the failure's words, if it failed.
+    /// completed one. The status's problem is then the words of a computer still failing, or
+    /// none: it never clears while a failure stands, and never stands once every computer is
+    /// exchanged with again.
     fn record_exchange(
         &self,
         peer: Digest32,
         revision: u64,
         involved: bool,
         outcome: std::result::Result<(), String>,
-    ) -> Option<String> {
+    ) {
         let mut exchanged = lock(&self.exchanged);
         let record = exchanged.entry(peer).or_default();
         record.last = Some(std::time::Instant::now());
@@ -1742,13 +1759,19 @@ impl Management {
                 record.last_ms = Some(now());
                 record.count = record.count.saturating_add(1);
                 record.failures = 0;
-                None
+                record.problem = None;
             }
             Err(text) => {
                 record.failures = record.failures.saturating_add(1);
-                Some(text)
+                record.problem = Some(text);
             }
         }
+        *lock(&self.problem) = exchanged
+            .values()
+            .filter(|r| r.failures > 0)
+            .find_map(|r| r.problem.clone());
+        drop(exchanged);
+        lock(&self.inflight).remove(&peer);
     }
     async fn sync_peer(
         self: &Arc<Self>,
