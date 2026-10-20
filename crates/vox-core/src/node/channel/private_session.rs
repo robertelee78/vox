@@ -26,6 +26,17 @@ type TrustNonce = Option<[u8; crate::atrest::sek::NONCE_LEN]>;
 /// disk cursor, not one resident hash for every historical step.
 #[derive(Default)]
 pub(super) struct LegacyPending(bool);
+/// What one bounded turn of a Session-record refresh did (ADR-038 FX-24).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SessionRefresh {
+    /// The records are current.
+    Complete,
+    /// Bounded work was done and more remains: the next turn comes at once.
+    Progressed,
+    /// Nothing could be done yet; what it waits for, in the words a person reads.
+    Waiting(&'static str),
+}
+
 impl LegacyPending {
     pub(super) fn insert(&mut self, _hash: Digest32) {
         self.0 = true;
@@ -1568,25 +1579,29 @@ impl ChannelState {
     }
 
     /// Copy lifecycle source records into a new grant, without assembling whole metadata or
-    /// backfilling activity. False is pending work: callers must not release that grant yet.
+    /// backfilling activity. Anything but [`SessionRefresh::Complete`] is pending work: callers
+    /// must not release that grant yet. A turn that could do nothing says what it waits for, so
+    /// the caller paces it instead of trying again at once (ADR-038 FX-24).
     pub(crate) fn refresh_session_records(
         &mut self,
         profile: &Profile,
         holders: &BTreeSet<Digest32>,
         owed: &[Digest32],
         now: u64,
-    ) -> Result<bool> {
+    ) -> Result<SessionRefresh> {
         if !self.private_policy_ready(profile.store(), now)? {
-            return Ok(false);
+            return Ok(SessionRefresh::Waiting(
+                "its governance records being refreshed",
+            ));
         }
         if self.poisoned {
             return Err(self.save_failure());
         }
         if self.needs_session_upgrade() {
-            return Ok(false);
+            return Ok(SessionRefresh::Waiting("its Session upgrade"));
         }
         if self.has_left(&self.me()) || self.ended(now).is_some() {
-            return Ok(true);
+            return Ok(SessionRefresh::Complete);
         }
         let result = self.refresh_session_records_inner(profile, holders, owed, now);
         if let Err(error) = &result {
@@ -1637,7 +1652,7 @@ impl ChannelState {
         holders: &BTreeSet<Digest32>,
         owed: &[Digest32],
         now: u64,
-    ) -> Result<bool> {
+    ) -> Result<SessionRefresh> {
         let current = self.require_governance_ready(profile.store(), crate::time::Ms(now))?;
         self.rotate_drive_if_lost(profile.store(), holders, crate::time::Ms(now), current)?;
         let grant = self.refresh_grant(profile.store(), holders, owed)?;
@@ -1778,7 +1793,7 @@ impl ChannelState {
         })();
         if progress.as_ref().is_err_and(floor_index::refreshing) {
             self.private_sessions.refresh = Some(work);
-            return Ok(false);
+            return Ok(SessionRefresh::Waiting("its Session index being refreshed"));
         }
         progress?;
         // Our own refresh copies change this generation; they do not invalidate their
@@ -1791,7 +1806,11 @@ impl ChannelState {
         let complete =
             work.stage == 2 && work.grant == self.refresh_grant(profile.store(), holders, owed)?;
         self.private_sessions.refresh = Some(work);
-        Ok(complete)
+        Ok(if complete {
+            SessionRefresh::Complete
+        } else {
+            SessionRefresh::Progressed
+        })
     }
 
     #[allow(clippy::too_many_arguments)]

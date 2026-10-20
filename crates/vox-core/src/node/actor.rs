@@ -39,7 +39,7 @@ use crate::node::api::{
     ChannelDetail, ChannelSummary, Fault, IdentityInfo, MessageRow, NodeCommand, NodeEvent,
     NodeView, Outcome, Secret,
 };
-use crate::node::channel::{ChannelState, Rendered};
+use crate::node::channel::{ChannelState, Rendered, SessionRefresh};
 use crate::node::net::PeerPolicy;
 use crate::node::network::{Inbound, NodeNet};
 use crate::node::open_rooms::OpenRooms;
@@ -4802,36 +4802,6 @@ struct RoomPreparation {
     /// This turn did work (folded, opened a package, built a view): the next turn comes at
     /// once, whatever the words say, since the same words can cover many steps.
     progressed: bool,
-    /// Turns this preparation has ended without opening the room, whatever each said: past
-    /// [`PREPARE_FAST_TURNS`] of them the room is paced at [`PREPARE_WAIT`] however a step
-    /// classifies itself, so no step, and no pair of steps taking turns, can keep the actor
-    /// busy (found 2026-10-20: a step re-ran at 50 ms for hours on the decider's room, 174% of
-    /// a core).
-    turns: u32,
-}
-
-/// How many turns a preparation gets at the fast retry before it is paced at [`PREPARE_WAIT`]:
-/// enough for a bounded job of a few pages, not for one that never ends. A long legitimate job
-/// then proceeds one bounded step a second, which a person waits out; a step that never ends
-/// then costs one turn a second, which nobody notices.
-const PREPARE_FAST_TURNS: u32 = 10;
-
-/// `VOX_TEST_PREPARE_HOLD_FILE`: while the named file exists, the room whose id starts with the
-/// file's contents (every room, when it is empty) never finishes preparing: each turn ends as a
-/// step that did work and cost a few milliseconds. Read only by a `test-knobs` build; a release
-/// `vox` holds nothing (#300).
-#[cfg(feature = "test-knobs")]
-pub const TEST_PREPARE_HOLD_ENV: &str = "VOX_TEST_PREPARE_HOLD_FILE";
-#[cfg(feature = "test-knobs")]
-fn prepare_held(room: &Digest32) -> bool {
-    let Some(path) = std::env::var_os(TEST_PREPARE_HOLD_ENV).filter(|path| !path.is_empty()) else {
-        return false;
-    };
-    let Ok(which) = std::fs::read_to_string(&path) else {
-        return false;
-    };
-    let which = which.trim();
-    which.is_empty() || crate::node::link::b32_encode(room).starts_with(which)
 }
 
 /// A wait this long on one thing is said once in the daemon's log, so a person reading it
@@ -4861,10 +4831,6 @@ impl RoomPreparation {
     /// that waits on a peer costs nothing meanwhile (FX-15).
     fn retry_after(&mut self, previous: Option<&(String, u64)>) -> Duration {
         let progressed = std::mem::take(&mut self.progressed);
-        self.turns = self.turns.saturating_add(1);
-        if self.turns > PREPARE_FAST_TURNS {
-            return PREPARE_WAIT;
-        }
         match (previous, &self.waiting) {
             _ if progressed => PREPARE_RETRY,
             (Some(before), Some(now)) if before == now => PREPARE_WAIT,
@@ -18313,7 +18279,6 @@ impl Node {
                 waiting: None,
                 waiting_noted: false,
                 progressed: false,
-                turns: 0,
                 channel: tokio::sync::Mutex::new(channel),
                 reply,
                 reopening,
@@ -18605,21 +18570,6 @@ impl Node {
         prepared: &mut RoomPreparation,
     ) -> crate::error::Result<bool> {
         let ch = prepared.channel.get_mut();
-        #[cfg(feature = "test-knobs")]
-        if prepare_held(&ch.channel_id()) {
-            // A step that never finishes and costs tens of milliseconds a turn, as the step that
-            // held the decider's room did, for the proof that the room's turns are paced. Its
-            // due time is cleared as every real step's is, so the next turn is scheduled.
-            prepared.legacy_cleanup_due = None;
-            let busy = std::time::Instant::now();
-            let mut digest = [0u8; 32];
-            while busy.elapsed() < Duration::from_millis(40) {
-                digest = crate::hash::sha256(&digest);
-            }
-            std::hint::black_box(digest);
-            prepared.progressed("a step held by a test knob", self.now_ms().get());
-            return Ok(false);
-        }
         if ch.legacy_startup_cleanup_blocks_current() {
             let profile = self.profile.as_ref().ok_or(Error::AtRestLocked)?;
             ch.advance_legacy_startup_cleanup(profile.store())?;
@@ -18738,9 +18688,24 @@ impl Node {
                 return Ok(false);
             }
         }
-        if !ch.refresh_session_records(profile, &self.drive_holders(), &[], self.now_ms().get())? {
-            prepared.progressed("refreshing its Session records", self.now_ms().get());
-            return Ok(false);
+        // A refresh that did bounded work comes back at once; one that could do nothing yet
+        // says what it waits for and is paced like every other wait (ADR-038 FX-24): a step
+        // that reports progress while doing nothing re-queued the decider's room every 50 ms.
+        match ch.refresh_session_records(
+            profile,
+            &self.drive_holders(),
+            &[],
+            self.now_ms().get(),
+        )? {
+            SessionRefresh::Complete => {}
+            SessionRefresh::Progressed => {
+                prepared.progressed("refreshing its Session records", self.now_ms().get());
+                return Ok(false);
+            }
+            SessionRefresh::Waiting(what) => {
+                prepared.wait_on(what, self.now_ms().get());
+                return Ok(false);
+            }
         }
         ch.sweep_retention(profile.store(), self.now_ms())?;
         if ch.legacy_classification_pending(profile.store())? {
@@ -21438,7 +21403,7 @@ impl Node {
             if !owed.is_empty()
                 && !ch
                     .refresh_session_records(profile, holders, &owed, now_millis)
-                    .is_ok_and(|complete| complete)
+                    .is_ok_and(|refresh| refresh == SessionRefresh::Complete)
             {
                 return;
             }

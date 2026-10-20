@@ -127,7 +127,6 @@ impl Node {
                         waiting: None,
                         waiting_noted: false,
                         progressed: false,
-                        turns: 0,
                         channel: tokio::sync::Mutex::new(channel),
                         reply: None,
                         reopening: false,
