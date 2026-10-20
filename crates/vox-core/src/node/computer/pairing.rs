@@ -335,8 +335,6 @@ const EXCHANGE_BACKOFF_MAX: Duration = Duration::from_secs(120);
 /// backoff: a computer that hangs must not stay "in flight" forever. Generous, because a
 /// slow but valid exchange of a long history must complete; no other computer waits on it.
 const EXCHANGE_WITHIN: Duration = Duration::from_secs(600);
-/// The operator's pairing handshake, which a person waits for, has this long.
-const PAIR_WITHIN: Duration = Duration::from_secs(60);
 impl Management {
     /// The account's explicit host:port lookup uses its existing socket, but no management
     /// identity or authority. The returned fingerprint is proved; lookup persists no anchor source.
@@ -769,11 +767,12 @@ impl Management {
             me: Arc::clone(self),
             peer: target,
         };
-        // Bounded like any exchange, and shorter: a person is waiting for it.
-        let paired = match tokio::time::timeout(PAIR_WITHIN, self.pair(&link, url)).await {
+        // Bounded like any exchange, by the same generous bound: a slow but valid handshake
+        // of a long history completes, and a hung one never holds the reservation for good.
+        let paired = match tokio::time::timeout(EXCHANGE_WITHIN, self.pair(&link, url)).await {
             Ok(paired) => paired,
             Err(_) => Err(Error::Profile(
-                "the computer pairing did not finish within a minute; try again",
+                "the computer pairing did not finish within ten minutes; try again",
             )),
         };
         // Recorded while still reserved, with the state it carried, so the record never
