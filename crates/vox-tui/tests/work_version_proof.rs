@@ -16,6 +16,10 @@
 //! 3. `post --work` is refused the same way, `board --json` says `refused` with the
 //!    table, and the drain hook tells the session plainly;
 //! 4. **plain conversation survives** a refusal, so the operator can still talk;
+//! 6. **a session that only reads announces the vox it runs now** (#994): a reader session
+//!    whose last stamp is another version re-announces on its next hook turn, without a
+//!    claim, and coordination resumes; a session that never announced posts nothing; the
+//!    refusal says that the stale worker re-announces on its next turn.
 //! 5. **recovery needs nobody**: once the stale worker runs the current binary, its
 //!    first participating verb announces the current version, and coordination
 //!    resumes for everyone, including an existing session whose old matching hello
@@ -437,5 +441,99 @@ fn a_worker_on_another_version_is_refused_by_name() {
         "bob's returning b1 session to announce itself after bye",
         &["room", "board", r, "--json"],
         |o| participant_is(o, bob, "b1", VERSION),
+    );
+
+    // ---- (6) a session that only reads announces the vox it runs now (#994) ----
+    // Bob's session b-reader announced another version before an update and has only read
+    // since. Found 2026-10-20: such a session kept its old stamp for a day after both Macs
+    // updated, and every worker in the room was refused, including the ones that were current.
+    let stale = serde_json::json!({
+        "v": 1, "type": "hello", "from": "b-reader", "body": "a reader's old announcement",
+        "data": { "vox": other.as_str(), "op": "op-reader-old" }
+    })
+    .to_string();
+    rt.block_on(post_raw(bob, room.cid, &stale));
+    let o = until(
+        alice,
+        Some("a1"),
+        "alice's claim to be refused by bob's stale reader session",
+        &["room", "claim", r, "reader-work"],
+        |o: &Out| o.code == Some(3) && o.stderr.contains("b-reader"),
+    );
+    assert!(
+        o.stderr
+            .contains("announces the version it runs on its next turn")
+            && o.stderr.contains("older than a day no longer counts"),
+        "PRODUCT: the refusal does not say that the stale worker re-announces on its next turn \
+         and that an old announcement lapses (#994): {o:?}"
+    );
+    // The reader's next hook turn, which only reads: it re-announces, without a claim.
+    let hook = bob.vox(
+        Some("b-reader"),
+        &[
+            "agent",
+            "hook",
+            "--node",
+            "default",
+            "--room",
+            r,
+            "--format",
+            "text",
+            "--session",
+            "b-reader",
+        ],
+    );
+    assert!(
+        hook.code == Some(0),
+        "PRODUCT: the reader's hook turn failed: {hook:?}"
+    );
+    until(
+        alice,
+        None,
+        "bob's reader session to announce the current version from its hook turn",
+        &["room", "board", r, "--json"],
+        |o| participant_is(o, bob, "b-reader", VERSION),
+    );
+    // A session that never announced stays silent: its hook turn posts no hello.
+    let silent = bob.vox(
+        Some("b-silent"),
+        &[
+            "agent",
+            "hook",
+            "--node",
+            "default",
+            "--room",
+            r,
+            "--format",
+            "text",
+            "--session",
+            "b-silent",
+        ],
+    );
+    assert!(
+        silent.code == Some(0),
+        "PRODUCT: a silent session's hook turn failed: {silent:?}"
+    );
+    // Bob's row names his latest counted session: still b-reader, so b-silent posted nothing.
+    let board = alice
+        .vox(Some("a1"), &["room", "board", r, "--json"])
+        .json();
+    let bobs = board["participants"]
+        .as_array()
+        .and_then(|ps| ps.iter().find(|p| p["author"] == bob.b32()))
+        .unwrap_or_else(|| {
+            panic!("PRODUCT: board --json has no participants row for bob: {board}")
+        });
+    assert!(
+        bobs["session"] == "b-reader" && bobs["version"] == VERSION,
+        "PRODUCT: a session that never announced posted a hello from its hook turn (#994): bob's \
+         latest counted session is {} at {}, not b-reader",
+        bobs["session"],
+        bobs["version"]
+    );
+    let o = alice.vox(Some("a1"), &["room", "claim", r, "reader-work"]);
+    assert!(
+        o.ok && o.stdout.contains("you hold reader-work"),
+        "PRODUCT: coordination did not resume once the reader re-announced (#994): {o:?}"
     );
 }

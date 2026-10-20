@@ -1043,7 +1043,8 @@ fn a_daemon_answers_the_hook_while_syncing() {
         said(&bob, "bob")
     );
     assert!(
-        runs.iter().any(|(_, _, said)| said.contains(&format!("In room busy ({room})"))),
+        runs.iter()
+            .any(|(_, _, said)| said.contains(&format!("In room busy ({room})"))),
         "APPARATUS: no hook run named the room's news, so the hook never read bob's room; \
          the first said {first_said:?}"
     );
