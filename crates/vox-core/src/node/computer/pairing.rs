@@ -251,7 +251,7 @@ pub struct Management {
 struct Exchanged {
     /// The last attempt, succeeded or not.
     last: Option<std::time::Instant>,
-    /// The same, Unix milliseconds, for the status a person reads.
+    /// The last completed exchange, Unix milliseconds, for the status a person reads.
     last_ms: Option<u64>,
     /// Exchanges completed since the daemon started.
     count: u64,
@@ -1693,12 +1693,14 @@ impl Management {
                 .unwrap_or_default();
             let mut exchanged = lock(&self.exchanged);
             let record = exchanged.entry(peer).or_default();
+            // `last` paces the next attempt, succeeded or not; `last_ms` is what a person reads
+            // as the last exchange, so only a completed one sets it.
             record.last = Some(std::time::Instant::now());
-            record.last_ms = Some(now());
             record.revision = revision;
             record.involved = involved;
             match outcome {
                 Ok(()) => {
+                    record.last_ms = Some(now());
                     record.count = record.count.saturating_add(1);
                     record.failures = 0;
                 }
