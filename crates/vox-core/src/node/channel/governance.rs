@@ -9,6 +9,7 @@ mod facts;
 mod fold;
 mod sparse;
 mod view;
+pub(in crate::node::channel) use view::ConsentFacts;
 
 pub(crate) use sparse::{
     sparse_control_evaluation, ControlEvaluation, PayloadValidation, SparsePayloadState,

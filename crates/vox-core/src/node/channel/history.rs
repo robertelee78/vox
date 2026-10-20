@@ -277,9 +277,12 @@ impl View<'_> {
         ) {
             return Err(Failure::Request(LEGACY_HISTORY_REQUIRED));
         }
-        let authority = self.ch.checked_governance(self.store, self.ch.now_hint)?;
+        // The completed current authority is still required here; who may read whom is
+        // answered from the room's facts in memory (ADR-038 FX-22).
+        self.ch.checked_governance(self.store, self.ch.now_hint)?;
         let me = self.ch.me();
         let answer = self.answer(query, bytes)?;
+        let facts = self.ch.consent_facts(self.store)?;
         let check = |row: &MessageRow| -> Answer<()> {
             // Owed placeholders are not accepted bodies. Do not expose unpublished
             // projection work or label it as an empty historical message.
@@ -295,7 +298,7 @@ impl View<'_> {
             {
                 return Err(Failure::Request(LEGACY_HISTORY_REQUIRED));
             }
-            if row.author != me && !authority.can_read(&me, &row.author)? {
+            if row.author != me && !facts.can_read(&me, &row.author) {
                 return Err(Failure::Request(LEGACY_HISTORY_REQUIRED));
             }
             let tracked = self

@@ -55,6 +55,63 @@ impl Display {
     }
 }
 
+/// A room's consent facts held in memory (ADR-038 FX-22): per author, the readers it has
+/// consented to with that grant's sequence, or that its epoch-0 revocation stands; each author's
+/// consent reset; every pair ever revoked. A semantic projection, never a snapshot, page or row
+/// vector: loaded from the sealed index once per revision of that index, which moves with every
+/// change to it; the index stays the durable source.
+pub(in crate::node::channel) struct ConsentFacts {
+    revision: u64,
+    consent: std::collections::BTreeMap<Digest32, std::collections::BTreeMap<Digest32, Consent>>,
+    resets: std::collections::BTreeMap<Digest32, u64>,
+    revoked: std::collections::BTreeSet<[u8; 64]>,
+}
+
+#[derive(Clone, Copy)]
+enum Consent {
+    Granted(u64),
+    Revoked,
+}
+
+impl ConsentFacts {
+    /// The governance index revision these facts were loaded at.
+    pub(in crate::node::channel) fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// What [`View::can_read`] answers from the index, from memory.
+    pub(in crate::node::channel) fn can_read(&self, reader: &Digest32, author: &Digest32) -> bool {
+        self.grant_sequence(author, reader).is_some()
+    }
+
+    /// What [`View::grant_sequence`] answers from the index, from memory.
+    pub(in crate::node::channel) fn grant_sequence(
+        &self,
+        author: &Digest32,
+        target: &Digest32,
+    ) -> Option<u64> {
+        match self
+            .consent
+            .get(author)
+            .and_then(|readers| readers.get(target))
+        {
+            Some(Consent::Granted(seq)) if *seq > self.resets.get(author).copied().unwrap_or(0) => {
+                Some(*seq)
+            }
+            _ => None,
+        }
+    }
+
+    /// What [`View::ever_revoked`] answers from the index, from memory.
+    pub(in crate::node::channel) fn ever_revoked(
+        &self,
+        author: &Digest32,
+        target: &Digest32,
+    ) -> bool {
+        self.revoked.contains(&pair(author, target))
+    }
+}
+
 pub(in crate::node::channel) struct View<'a> {
     facts: Read<'a>,
     root: Digest32,
@@ -440,42 +497,6 @@ impl<'a> View<'a> {
         Ok(entry.skeleton.seq > reset)
     }
 
-    pub(in crate::node::channel) fn ever_revoked(
-        &self,
-        author: &Digest32,
-        target: &Digest32,
-    ) -> Result<bool> {
-        let Some(log) = self.facts.get(Table::EverRevoked, &pair(author, target))? else {
-            return Ok(false);
-        };
-        let entry = self.facts.entry(log)?;
-        match GovEntry::body_bound_to(&entry)? {
-            GovBody::ConsentRevocation(revoke)
-                if entry.skeleton.author_id == *author
-                    && revoke.body.author_id == *author
-                    && revoke.body.target_id == *target =>
-            {
-                Ok(true)
-            }
-            _ => Err(invalid("governance revoked locator binding")),
-        }
-    }
-
-    pub(in crate::node::channel) fn grant_sequence(
-        &self,
-        author: &Digest32,
-        target: &Digest32,
-    ) -> Result<Option<u64>> {
-        if !self.can_read(target, author)? {
-            return Ok(None);
-        }
-        let log = self
-            .facts
-            .get(Table::Consent, &pair(author, target))?
-            .ok_or(invalid("governance consent disappeared"))?;
-        Ok(Some(self.facts.entry(log)?.skeleton.seq))
-    }
-
     /// The cursor advances over inspected slots, including withdrawn/reset
     /// consent. An empty page is not an end-of-range claim.
     pub(in crate::node::channel) fn consenters(
@@ -642,4 +663,79 @@ pub(in crate::node::channel) struct NoticePage {
 pub(in crate::node::channel) struct SharePage {
     pub rows: Vec<super::super::Share>,
     pub next: Option<(Digest32, Digest32)>,
+}
+
+impl View<'_> {
+    /// Load the room's consent facts from the index, once, with the checks every
+    /// [`Self::can_read`] makes; `revision` is this view's index revision.
+    pub(in crate::node::channel) fn consent_facts(&self, revision: u64) -> Result<ConsentFacts> {
+        fn halves(key: &[u8; 64], what: &'static str) -> Result<(Digest32, Digest32)> {
+            let left: Digest32 = key[..32].try_into().map_err(|_| invalid(what))?;
+            let right: Digest32 = key[32..].try_into().map_err(|_| invalid(what))?;
+            Ok((left, right))
+        }
+        let mut consent: std::collections::BTreeMap<
+            Digest32,
+            std::collections::BTreeMap<Digest32, Consent>,
+        > = std::collections::BTreeMap::new();
+        let mut after = None;
+        while let Some((key, log)) = self.facts.first(Table::Consent, after)? {
+            after = Some(key);
+            let (author, reader) = halves(&key, "governance consent key")?;
+            let entry = self.facts.entry(log)?;
+            if entry.skeleton.author_id != author {
+                return Err(invalid("governance consent author"));
+            }
+            let state = match GovEntry::body_bound_to(&entry)? {
+                GovBody::ConsentGrant(grant) => {
+                    if grant.body.target_id != reader
+                        || grant.body.author_id != author
+                        || grant.body.epoch != 0
+                    {
+                        return Err(invalid("governance consent locator binding"));
+                    }
+                    Consent::Granted(entry.skeleton.seq)
+                }
+                GovBody::ConsentRevocation(revoke)
+                    if revoke.body.author_id == author
+                        && revoke.body.target_id == reader
+                        && revoke.body.epoch == 0 =>
+                {
+                    Consent::Revoked
+                }
+                _ => return Err(invalid("governance consent locator kind")),
+            };
+            consent.entry(author).or_default().insert(reader, state);
+        }
+        let mut resets = std::collections::BTreeMap::new();
+        let mut after = None;
+        while let Some((key, log)) = self.facts.first(Table::ConsentReset, after)? {
+            after = Some(key);
+            let (author, _) = halves(&key, "governance consent reset key")?;
+            resets.insert(author, self.facts.entry(log)?.skeleton.seq);
+        }
+        let mut revoked = std::collections::BTreeSet::new();
+        let mut after = None;
+        while let Some((key, log)) = self.facts.first(Table::EverRevoked, after)? {
+            after = Some(key);
+            let (author, target) = halves(&key, "governance revoked key")?;
+            let entry = self.facts.entry(log)?;
+            match GovEntry::body_bound_to(&entry)? {
+                GovBody::ConsentRevocation(revoke)
+                    if entry.skeleton.author_id == author
+                        && revoke.body.author_id == author
+                        && revoke.body.target_id == target =>
+                {
+                    revoked.insert(key);
+                }
+                _ => return Err(invalid("governance revoked locator binding")),
+            }
+        }
+        Ok(ConsentFacts {
+            revision,
+            consent,
+            resets,
+            revoked,
+        })
+    }
 }
