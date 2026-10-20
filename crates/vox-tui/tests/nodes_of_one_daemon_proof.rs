@@ -2371,3 +2371,134 @@ fn enrolled_computers_follow_node_changes_and_retire_removed_authority() {
     );
     eprintln!("[proof] #801/#802 changed roster, personal drive, removal, transfer, recovery and deliberate re-enrollment outcomes passed");
 }
+
+/// How long two paired computers sit idle while their exchanges are counted.
+const PAIRED_IDLE: Duration = Duration::from_secs(60);
+/// Exchanges a computer may run with a peer over [`PAIRED_IDLE`] when nothing changed: the
+/// fallback one (every 60 s) and the one that may straddle the window's start.
+const IDLE_EXCHANGES: u64 = 2;
+/// CPU time a daemon may spend over [`PAIRED_IDLE`] with nothing to settle.
+const IDLE_CPU: Duration = Duration::from_secs(3);
+
+/// **Two paired computers that are idle exchange nothing** (ADR-038 FX-15; #989): alpha and
+/// beta, two data roots with a daemon each, pair as computers (`vox computer invite`, `pair
+/// --preview`, `approve` on both) and both report `confirmed`. Over [`PAIRED_IDLE`] of nothing
+/// changing, each side's `vox computer status --json` MUST count at most [`IDLE_EXCHANGES`] more
+/// exchanges with the other and name when the last one was, and each daemon's CPU time MUST
+/// grow by at most [`IDLE_CPU`]. Measured before this (2026-10-20, the decider's work Mac): the
+/// pairing manager exchanged the whole signed history with every computer every 2 s and
+/// re-verified it, 47–95% of a core while nothing changed.
+///
+/// Mutant: the need filter in `Management::retry` removed (every computer exchanged every tick)
+/// turns the exchange-count claim red on its own number.
+#[test]
+#[ignore = "a minute of two real vox daemons paired as computers; run in release"]
+fn two_paired_computers_that_are_idle_exchange_nothing() {
+    let a = Account::new();
+    let b = Account::new();
+    let alpha = a.make_node("alpha");
+    let beta = b.make_node("beta");
+    let _ = (alpha, beta);
+    let da = Daemon::start(&a, &["--node", "alpha"], &[]);
+    let db = Daemon::start(&b, &["--node", "beta"], &[]);
+    assert!(
+        wait_until(Duration::from_secs(90), || {
+            a.run(&["computer", "status", "--json"], "").0
+                && b.run(&["computer", "status", "--json"], "").0
+        }),
+        "PRODUCT (staging): a daemon never answered `vox computer status`:\n{}\n{}",
+        da.said(),
+        db.said()
+    );
+    computer(&a, &["personal", "alpha"]);
+    computer(&b, &["personal", "beta"]);
+    let offered = computer(&a, &["invite"]);
+    let link = offered["invite_link"]
+        .as_str()
+        .expect("PRODUCT: Add Computer did not show a pairing link")
+        .to_owned();
+    let preview = computer(&b, &["pair", &link, "--preview"]);
+    let operation = preview["pairing"]["operation_id"]
+        .as_str()
+        .expect("PRODUCT: the pairing preview names no operation")
+        .to_owned();
+    computer(&b, &["approve", &operation]);
+    computer(&a, &["approve", &operation]);
+    assert!(
+        wait_until(Duration::from_secs(90), || {
+            computer(&a, &["status"])["state"] == "confirmed"
+                && computer(&b, &["status"])["state"] == "confirmed"
+        }),
+        "PRODUCT: the two computers never both reached `confirmed`: alpha {}, beta {}\n{}\n{}",
+        computer(&a, &["status"])["state"],
+        computer(&b, &["status"])["state"],
+        da.said(),
+        db.said()
+    );
+    // Let the confirmation's own exchanges settle before the idle minute is counted.
+    std::thread::sleep(Duration::from_secs(10));
+    let exchanges = |acct: &Account| -> (u64, Option<u64>, bool) {
+        let status = computer(acct, &["status"]);
+        let apps = status["applications"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let total: u64 = apps
+            .iter()
+            .map(|p| p["exchanges"].as_u64().unwrap_or(0))
+            .sum();
+        let last = apps
+            .iter()
+            .filter_map(|p| p["last_exchange_ms"].as_u64())
+            .max();
+        let confirmed = apps.iter().all(|p| p["confirmed"] == true);
+        (total, last, confirmed)
+    };
+    let (ea0, _, _) = exchanges(&a);
+    let (eb0, _, _) = exchanges(&b);
+    let cpu0 = (cpu_time(da.child.id()), cpu_time(db.child.id()));
+    std::thread::sleep(PAIRED_IDLE);
+    let (ea1, last_a, confirmed_a) = exchanges(&a);
+    let (eb1, last_b, confirmed_b) = exchanges(&b);
+    let cpu1 = (cpu_time(da.child.id()), cpu_time(db.child.id()));
+    let spent = (cpu1.0.saturating_sub(cpu0.0), cpu1.1.saturating_sub(cpu0.1));
+    println!(
+        "[proof] over {PAIRED_IDLE:?} idle: alpha exchanged {} time(s) with beta (last at {last_a:?}, confirmed {confirmed_a}), beta {} with alpha (last at {last_b:?}, confirmed {confirmed_b}); CPU: alpha's daemon +{:?}, beta's +{:?} (bound {IDLE_CPU:?})",
+        ea1 - ea0,
+        eb1 - eb0,
+        spent.0,
+        spent.1
+    );
+    assert!(
+        confirmed_a && confirmed_b && last_a.is_some() && last_b.is_some(),
+        "PRODUCT: `vox computer status` does not say the peer is confirmed and when it was last exchanged with: alpha {confirmed_a} {last_a:?}, beta {confirmed_b} {last_b:?}"
+    );
+    assert!(
+        ea1 - ea0 <= IDLE_EXCHANGES && eb1 - eb0 <= IDLE_EXCHANGES,
+        "PRODUCT: idle computers kept exchanging state (ADR-038 FX-15, #989): alpha {} and beta {} exchanges over {PAIRED_IDLE:?} (at most {IDLE_EXCHANGES} each)\n{}\n{}",
+        ea1 - ea0,
+        eb1 - eb0,
+        da.said(),
+        db.said()
+    );
+    assert!(
+        spent.0 <= IDLE_CPU && spent.1 <= IDLE_CPU,
+        "PRODUCT: idle paired computers spent CPU (ADR-038 FX-15, #989): alpha's daemon +{:?}, beta's +{:?} over {PAIRED_IDLE:?} (bound {IDLE_CPU:?})",
+        spent.0,
+        spent.1
+    );
+}
+
+/// A process's CPU time so far, as Activity Monitor shows it (`ps -o cputime`).
+fn cpu_time(pid: u32) -> Duration {
+    let out = Command::new("ps")
+        .args(["-o", "cputime=", "-p", &pid.to_string()])
+        .output()
+        .unwrap_or_else(|e| panic!("APPARATUS: ps: {e}"));
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    let mut parts: Vec<&str> = text.split(':').collect();
+    let secs: f64 = parts.pop().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    let mins: f64 = parts.pop().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    let hours: f64 = parts.pop().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    Duration::from_secs_f64(hours * 3600.0 + mins * 60.0 + secs)
+}
