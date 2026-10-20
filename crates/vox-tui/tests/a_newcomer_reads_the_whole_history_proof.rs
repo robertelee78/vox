@@ -554,6 +554,271 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
     );
 }
 
+/// How long the two agents work: a post a second from each into each of [`WORK_ROOMS`] rooms in
+/// turn, what harness hooks at work append.
+const AT_WORK: Duration = Duration::from_secs(60);
+/// Rooms the two agents share while they work: each publication of the daemon's status covers
+/// every open room, so the cost under test grows with this.
+const WORK_ROOMS: usize = 3;
+/// CPU time a daemon may spend over [`AT_WORK`] of two agents posting into [`WORK_ROOMS`] rooms:
+/// Activity Monitor's number. Measured 2026-10-20 on the decider's work Mac (v0.4.7, four nodes,
+/// four rooms, agents working): ~180% of a core, that is 108 s per minute. In this staging the
+/// v0.4.7 code spent 17.5 s per daemon per minute; with each room's trust picture reused across
+/// publications (#990) it spends 8 s, the rest being the rounds the posts themselves run (~9 per
+/// post, #996). The bound is what #990 delivers; #996 lowers it again.
+const WORK_CPU: Duration = Duration::from_secs(10);
+/// Every `vox status --json` during the work answers within this: the control socket is what the
+/// app, the TUI and the harness hook (500 ms of patience) wait on. Measured before this: 0.5 s.
+const ANSWER_WITHIN: Duration = Duration::from_millis(200);
+
+/// **A daemon whose agents are working stays cheap and answers at once** (ADR-038 FX-15, FX-17;
+/// #990): alice and bob, each on a daemon of their own, share [`WORK_ROOMS`] rooms; for
+/// [`AT_WORK`] each posts once a second, round-robin over the rooms, as two harness sessions at
+/// work do. Over that minute each daemon's CPU time MUST grow by at most [`WORK_CPU`], every
+/// `vox status --json` asked meanwhile MUST answer within [`ANSWER_WITHIN`], and the work MUST be
+/// real: each reads the other's last post within [`READY_WITHIN`] of the end.
+///
+/// Mutant: every status publication deriving every room's trust picture again (the reuse in
+/// `detail_of` removed) turns the CPU claim red on its own number.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "a minute of two real vox daemons at work; optional, run it in release"]
+fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
+    watchdog::arm_for_setup(1, 8);
+    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("APPARATUS: no temp dir: {e}"));
+    let root = tmp.path();
+    let alice = root.join("alice");
+    let bob = root.join("bob");
+    for d in [&alice, &bob] {
+        std::fs::create_dir_all(d.join("cfg"))
+            .unwrap_or_else(|e| panic!("APPARATUS: could not create {}: {e}", d.display()));
+    }
+    let mut fps = Vec::new();
+    for dir in [&alice, &bob] {
+        let (ok, out, err) = vox(dir, &["id"], None);
+        assert!(ok, "PRODUCT: `vox id` failed: {err}");
+        fps.push(out.trim().to_owned());
+    }
+    for (dir, fp, name) in [(&alice, &fps[1], "bob"), (&bob, &fps[0], "alice")] {
+        let (ok, _, err) = vox(dir, &["trust", "add", fp, "--name", name], None);
+        assert!(ok, "PRODUCT: `vox trust add` of {name} failed: {err}");
+    }
+    let alice_daemon = daemon(&alice, "alice");
+    attached(&alice, "alice");
+    let bob_daemon = daemon(&bob, "bob");
+    attached(&bob, "bob");
+    let mut rooms = Vec::with_capacity(WORK_ROOMS);
+    for i in 1..=WORK_ROOMS {
+        let name = format!("work-{i}");
+        let (ok, _, err) = vox(
+            &alice,
+            &["room", "create", "--passphrase-file", "-", "--name", &name],
+            Some(&format!("{ROOMPASS}\n")),
+        );
+        assert!(ok, "PRODUCT: `vox room create {name}` failed: {err}");
+        let listed = attached(&alice, "alice");
+        let room = listed
+            .lines()
+            .find(|l| l.contains(&name))
+            .and_then(|l| l.split_whitespace().next())
+            .unwrap_or_else(|| panic!("PRODUCT: `vox room list` shows no room {name}: {listed}"))
+            .to_owned();
+        let (ok, link, err) = vox(&alice, &["room", "link", &room], None);
+        assert!(ok, "PRODUCT: `vox room link` failed: {err}");
+        let (ok, _, err) = vox(
+            &bob,
+            &["room", "join", "--passphrase-file", "-", link.trim()],
+            Some(&format!("{ROOMPASS}\n")),
+        );
+        assert!(
+            ok,
+            "PRODUCT: bob's `vox room join {name}` was refused: {err}"
+        );
+        rooms.push(room);
+    }
+    // Both have read each other in every room before the clock starts.
+    let joined = Instant::now();
+    for room in &rooms {
+        let (ok, out, err) = vox(&alice, &["room", "post", room, "ready, alice"], None);
+        assert!(ok, "PRODUCT: alice's post was refused: {out}{err}");
+        let (ok, out, err) = vox(&bob, &["room", "post", room, "ready, bob"], None);
+        assert!(ok, "PRODUCT: bob's post was refused: {out}{err}");
+        let (to_alice, to_bob) = arrivals(
+            joined,
+            (&alice, "ready, bob"),
+            (&bob, "ready, alice"),
+            room,
+            BOUND,
+        );
+        assert!(
+            to_alice.is_some() && to_bob.is_some(),
+            "PRODUCT: within {BOUND:?} of the join, alice read bob: {to_alice:?}; bob read alice: \
+             {to_bob:?} (None = never) in room {room}\nbob's daemon said: {}\nalice's daemon \
+             said: {}",
+            said(&bob, "bob"),
+            said(&alice, "alice")
+        );
+    }
+    std::thread::sleep(Duration::from_secs(5));
+
+    // ---- the agents work -----------------------------------------------------------------------
+    let cpu0 = (cpu_time(alice_daemon.0.id()), cpu_time(bob_daemon.0.id()));
+    let started = Instant::now();
+    let worker = |dir: std::path::PathBuf, who: &'static str, rooms: Vec<String>| {
+        std::thread::spawn(move || {
+            let mut refused = 0usize;
+            let mut i = 0usize;
+            while started.elapsed() < AT_WORK {
+                let room = &rooms[i % rooms.len()];
+                let (ok, _, _) = vox(
+                    &dir,
+                    &["room", "post", room, &format!("{who} step {i}")],
+                    None,
+                );
+                if !ok {
+                    refused += 1;
+                }
+                i += 1;
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            (i, refused)
+        })
+    };
+    let a = worker(alice.clone(), "alice", rooms.clone());
+    let b = worker(bob.clone(), "bob", rooms.clone());
+    let mut answers: Vec<Duration> = Vec::new();
+    while started.elapsed() < AT_WORK {
+        std::thread::sleep(Duration::from_secs(5));
+        for dir in [&alice, &bob] {
+            let asked = Instant::now();
+            let (ok, _, err) = vox(dir, &["status", "--json"], None);
+            assert!(
+                ok,
+                "PRODUCT: `vox status --json` refused while agents worked: {err}"
+            );
+            answers.push(asked.elapsed());
+        }
+    }
+    let (posted_a, refused_a) = a
+        .join()
+        .unwrap_or_else(|_| panic!("APPARATUS: alice's worker panicked"));
+    let (posted_b, refused_b) = b
+        .join()
+        .unwrap_or_else(|_| panic!("APPARATUS: bob's worker panicked"));
+    let worked = started.elapsed();
+    let cpu1 = (cpu_time(alice_daemon.0.id()), cpu_time(bob_daemon.0.id()));
+    let spent = (cpu1.0.saturating_sub(cpu0.0), cpu1.1.saturating_sub(cpu0.1));
+    let slowest = answers.iter().copied().max().unwrap_or_default();
+    // The work was real: each reads the other's last post, in the room it went to.
+    let alice_last = format!("alice step {}", posted_a.saturating_sub(1));
+    let bob_last = format!("bob step {}", posted_b.saturating_sub(1));
+    let (to_alice, _) = arrivals(
+        started,
+        (&alice, &bob_last),
+        (&bob, &bob_last),
+        &rooms[(posted_b.saturating_sub(1)) % rooms.len()],
+        READY_WITHIN + worked,
+    );
+    let (_, to_bob) = arrivals(
+        started,
+        (&alice, &alice_last),
+        (&bob, &alice_last),
+        &rooms[(posted_a.saturating_sub(1)) % rooms.len()],
+        READY_WITHIN + worked,
+    );
+    let (_, alice_status, _) = vox(&alice, &["status", "--json"], None);
+    let (_, bob_status, _) = vox(&bob, &["status", "--json"], None);
+    println!(
+        "[proof] over {worked:?} alice posted {posted_a} ({refused_a} refused) and bob {posted_b} \
+         ({refused_b} refused) into {WORK_ROOMS} rooms; CPU time: alice's daemon +{:?}, bob's \
+         +{:?} (bound {WORK_CPU:?}); {} status answers, slowest {slowest:?} (bound \
+         {ANSWER_WITHIN:?}); last posts read: alice {to_alice:?}, bob {to_bob:?}; alice's lanes: {}; \
+         bob's lanes: {}",
+        spent.0,
+        spent.1,
+        answers.len(),
+        lanes_of(&alice_status),
+        lanes_of(&bob_status)
+    );
+    assert!(
+        refused_a == 0 && refused_b == 0 && posted_a >= 30 && posted_b >= 30,
+        "APPARATUS: the agents did not work as staged: alice posted {posted_a} ({refused_a} \
+         refused), bob {posted_b} ({refused_b} refused)\nalice's daemon said: {}\nbob's daemon \
+         said: {}",
+        said(&alice, "alice"),
+        said(&bob, "bob")
+    );
+    assert!(
+        to_alice.is_some() && to_bob.is_some(),
+        "PRODUCT: the agents' last posts were not read within {READY_WITHIN:?} of the end: alice \
+         read bob's: {to_alice:?}, bob read alice's: {to_bob:?}\nalice's lanes: {}\nbob's lanes: \
+         {}\nalice's daemon said: {}\nbob's daemon said: {}",
+        lanes_of(&alice_status),
+        lanes_of(&bob_status),
+        said(&alice, "alice"),
+        said(&bob, "bob")
+    );
+    assert!(
+        spent.0 <= WORK_CPU && spent.1 <= WORK_CPU,
+        "PRODUCT: a daemon with agents at work spent more CPU than a person should pay (ADR-038 \
+         FX-15, #990): alice's daemon +{:?}, bob's +{:?} over {worked:?} (bound {WORK_CPU:?})\n\
+         alice's daemon said: {}\nbob's daemon said: {}",
+        spent.0,
+        spent.1,
+        said(&alice, "alice"),
+        said(&bob, "bob")
+    );
+    assert!(
+        slowest <= ANSWER_WITHIN,
+        "PRODUCT: `vox status --json` answered in {slowest:?} while agents worked, over \
+         {ANSWER_WITHIN:?} (ADR-038 FX-17); every answer: {answers:?}"
+    );
+}
+
+/// Each lane of a `vox status --json`: peer, completed, partial, failed, running and its last failure.
+fn lanes_of(status: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(status)
+        .ok()
+        .and_then(|v| {
+            v["sync"].as_array().map(|lanes| {
+                lanes
+                    .iter()
+                    .map(|l| {
+                        format!(
+                            "{}: completed {} partial {} failed {} running {} last_failure {}",
+                            l["peer"]
+                                .as_str()
+                                .map(|p| &p[..p.len().min(12)])
+                                .unwrap_or("?"),
+                            l["completed"],
+                            l["partial"],
+                            l["failed"],
+                            l["running"].as_array().map_or(0, Vec::len),
+                            l["last_failure"]
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            })
+        })
+        .unwrap_or_else(|| format!("(unreadable: {})", status.trim()))
+}
+
+/// A process's CPU time so far, as Activity Monitor shows it (`ps -o cputime`).
+fn cpu_time(pid: u32) -> Duration {
+    let out = Command::new("ps")
+        .args(["-o", "cputime=", "-p", &pid.to_string()])
+        .output()
+        .unwrap_or_else(|e| panic!("APPARATUS: ps: {e}"));
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    // MM:SS.ss or HH:MM:SS
+    let mut parts: Vec<&str> = text.split(':').collect();
+    let secs: f64 = parts.pop().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    let mins: f64 = parts.pop().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    let hours: f64 = parts.pop().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    Duration::from_secs_f64(hours * 3600.0 + mins * 60.0 + secs)
+}
+
 /// `vox status --json` of one profile: completed sync rounds summed over its ports, whether the
 /// room and every other member carry a last completed sync, and the raw status for a red.
 fn synced(dir: &Path) -> (u64, bool, String) {

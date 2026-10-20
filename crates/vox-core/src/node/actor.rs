@@ -341,24 +341,66 @@ fn detail_of(
         ),
     };
     // Who trusts each member (ADR-028 K-7), once: this identity's own entry is `consenting`.
-    let trusted_by = ch.trusted_by(store)?;
-    let member_consent = ch
-        .members()
-        .into_iter()
-        .filter_map(|member| match ch.has_consented(store, &member) {
-            Ok(true) => Some(Ok(member)),
-            Ok(false) => None,
-            Err(e) => Some(Err(e)),
-        })
-        .collect::<crate::error::Result<Vec<_>>>()?;
-    let consenting = trusted_by.get(&ch.me()).cloned().unwrap_or_default();
+    // The trust picture (who reads whom, who consented, the offer bases, where drive comes
+    // from) is derived from the governance facts, which `can_read` decrypts entry by entry for
+    // every pair of members. It changes only with the governance revision, the members or the
+    // epoch, so a detail published before with the same three is reused as it is; otherwise it
+    // is derived again. Measured before this (ADR-038 FX-15, #990): every status publication
+    // derived it afresh for every open room, and a daemon with four working agent nodes spent
+    // ~180% of a core doing so while its control socket answered in 0.5 s.
+    let governance_revision = ch.governance_revision(store)?;
+    let members = ch.members();
+    let epoch = ch.epoch();
+    let session_revision = ch.sessions_revision(store)?;
+    let same_trust = prev.filter(|p| {
+        p.governance_revision == governance_revision && p.members == members && p.epoch == epoch
+    });
+    let (trusted_by, member_consent, consenting, offer_bases) = match same_trust {
+        Some(p) => (
+            p.trusted_by.clone(),
+            p.member_consent.clone(),
+            p.consenting.clone(),
+            p.offer_bases.clone(),
+        ),
+        None => {
+            let trusted_by = ch.trusted_by(store)?;
+            let member_consent = members
+                .iter()
+                .filter_map(|member| match ch.has_consented(store, member) {
+                    Ok(true) => Some(Ok(*member)),
+                    Ok(false) => None,
+                    Err(e) => Some(Err(e)),
+                })
+                .collect::<crate::error::Result<Vec<_>>>()?;
+            let consenting: Vec<Digest32> = trusted_by
+                .get(&ch.me())
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+            let trusted_by = trusted_by
+                .into_iter()
+                .map(|(member, by)| (member, by.into_iter().collect()))
+                .collect();
+            (
+                trusted_by,
+                member_consent,
+                consenting,
+                ch.offer_bases(store)?,
+            )
+        }
+    };
+    let drive_from = match same_trust.filter(|p| p.session_revision == session_revision) {
+        Some(p) => p.drive_from.clone(),
+        None => ch.drive_from_known(store)?.0,
+    };
     Ok(ChannelDetail {
         pause: ch.room_pause(),
         pause_resume_after: ch.pause_resume_after(),
         channel_id: ch.channel_id(),
         name: ch.name().map(str::to_owned),
-        epoch: ch.epoch(),
-        members: ch.members(),
+        epoch,
+        members,
         last_arrival: ch.last_arrival(store)?,
         history_instance: ch.history_instance(store)?,
         display_stamp,
@@ -373,13 +415,10 @@ fn detail_of(
         equivocations: ch.equivocations(),
         creator: ch.genesis().creator_pubkey().fingerprint(),
         member_consent,
-        governance_revision: ch.governance_revision(store)?,
-        consenting: consenting.into_iter().collect(),
-        offer_bases: ch.offer_bases(store)?,
-        trusted_by: trusted_by
-            .into_iter()
-            .map(|(member, by)| (member, by.into_iter().collect()))
-            .collect(),
+        governance_revision,
+        consenting,
+        offer_bases,
+        trusted_by,
         retention: ch.effective_retention(),
         room_retention: ch.room_retention(),
         room_step_retention: ch.room_step_retention(),
@@ -395,8 +434,8 @@ fn detail_of(
         unread,
         // The authors this node can answer for now; a refreshing author is named in each
         // listing's revision rather than holding the whole room's detail back (ADR-037 R4).
-        drive_from: ch.drive_from_known(store)?.0,
-        session_revision: ch.sessions_revision(store)?,
+        drive_from,
+        session_revision,
     })
 }
 
