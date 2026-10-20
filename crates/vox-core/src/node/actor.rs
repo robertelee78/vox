@@ -4802,7 +4802,17 @@ struct RoomPreparation {
     /// This turn did work (folded, opened a package, built a view): the next turn comes at
     /// once, whatever the words say, since the same words can cover many steps.
     progressed: bool,
+    /// Turns in a row that ended on the same words: past [`PREPARE_FAST_TURNS`] of them the
+    /// room is paced at [`PREPARE_WAIT`] whatever the step says, so a step that never finishes
+    /// cannot keep the actor busy (found 2026-10-20: "refreshing its Session records" re-ran at
+    /// 50 ms for hours on the decider's room, 174% of a core).
+    same_turns: u32,
 }
+
+/// How many turns in a row a step may end on the same words at the fast retry before the room
+/// is paced at [`PREPARE_WAIT`]: enough for a bounded job of a few pages, not for one that
+/// never ends.
+const PREPARE_FAST_TURNS: u32 = 10;
 
 /// A wait this long on one thing is said once in the daemon's log, so a person reading it
 /// after the fact sees what the room waited for, not only that it did.
@@ -4813,10 +4823,13 @@ impl RoomPreparation {
     /// wait keeps its start; a new one starts now and may be noted in the log again.
     fn wait_on(&mut self, what: &str, now_ms: u64) {
         match &self.waiting {
-            Some((was, _)) if was == what => {}
+            Some((was, _)) if was == what => {
+                self.same_turns = self.same_turns.saturating_add(1);
+            }
             _ => {
                 self.waiting = Some((what.to_owned(), now_ms));
                 self.waiting_noted = false;
+                self.same_turns = 0;
             }
         }
     }
@@ -4832,7 +4845,7 @@ impl RoomPreparation {
     fn retry_after(&mut self, previous: Option<&(String, u64)>) -> Duration {
         let progressed = std::mem::take(&mut self.progressed);
         match (previous, &self.waiting) {
-            _ if progressed => PREPARE_RETRY,
+            _ if progressed && self.same_turns < PREPARE_FAST_TURNS => PREPARE_RETRY,
             (Some(before), Some(now)) if before == now => PREPARE_WAIT,
             _ => PREPARE_RETRY,
         }
@@ -18279,6 +18292,7 @@ impl Node {
                 waiting: None,
                 waiting_noted: false,
                 progressed: false,
+                same_turns: 0,
                 channel: tokio::sync::Mutex::new(channel),
                 reply,
                 reopening,
