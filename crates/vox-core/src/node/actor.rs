@@ -18601,7 +18601,9 @@ impl Node {
         let ch = prepared.channel.get_mut();
         #[cfg(feature = "test-knobs")]
         if prepare_held() {
-            // A step that never finishes, for the proof that the room's turns are paced.
+            // A step that never finishes, for the proof that the room's turns are paced. Its
+            // due time is cleared as every real step's is, so the next turn is scheduled.
+            prepared.legacy_cleanup_due = None;
             prepared.progressed("a step held by a test knob", self.now_ms().get());
             return Ok(false);
         }
