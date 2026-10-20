@@ -37,6 +37,18 @@ pub(crate) enum SessionRefresh {
     Waiting(&'static str),
 }
 
+/// `VOX_TEST_PRIVATE_POLICY_HOLD_FILE`: while the named file exists, no room's private-Session
+/// policy is ready, as while its Session-floor index refreshes. Read only by a `test-knobs`
+/// build; a release `vox` holds nothing (#300).
+#[cfg(feature = "test-knobs")]
+pub const TEST_PRIVATE_POLICY_HOLD_ENV: &str = "VOX_TEST_PRIVATE_POLICY_HOLD_FILE";
+#[cfg(feature = "test-knobs")]
+fn private_policy_held() -> bool {
+    std::env::var_os(TEST_PRIVATE_POLICY_HOLD_ENV)
+        .filter(|path| !path.is_empty())
+        .is_some_and(|path| std::path::Path::new(&path).exists())
+}
+
 impl LegacyPending {
     pub(super) fn insert(&mut self, _hash: Digest32) {
         self.0 = true;
@@ -1089,6 +1101,13 @@ impl ChannelState {
     // An incomplete governance projection must neither expire saved Session bodies nor
     // release them using a policy sampled before the current canonical room history.
     fn private_policy_ready(&self, store: &Store, now: u64) -> Result<bool> {
+        #[cfg(feature = "test-knobs")]
+        if private_policy_held() {
+            // A proof holds the room here, as a Session-floor index behind its authors' heads
+            // does at a restart, to stage a peer's key that arrives while the policy is not
+            // ready: its pass is saved as pending and not run (ADR-038 FX-26).
+            return Ok(false);
+        }
         match self.require_governance_ready(store, crate::time::Ms(now)) {
             Ok(_) => Ok(true),
             Err(error)
