@@ -1493,8 +1493,9 @@ const REOPENS_WITHIN: Duration = Duration::from_secs(20);
 /// [`REOPENS_WITHIN`], `vox room read` MUST show her rows, within 30 s `vox room sessions
 /// --json` MUST list bob's Session as one she can drive, and the daemon MUST stay quiet.
 ///
-/// Mutant: the preparation's restore step removed; the room then waits on "its Session
-/// upgrade" for as long as the daemon runs, and the opening claim turns red.
+/// Mutant: the preparation and the refresh wait on every pending Session state again
+/// (`needs_session_upgrade`, as v0.4.8 did): the room then sits at "restoring its Sessions"
+/// for as long as the daemon runs, and the opening claim turns red.
 #[cfg(feature = "optional-proofs")]
 #[test]
 #[ignore = "two starts of a real vox daemon, a second daemon, the shipped hook and a test-only knob; optional, run it in release"]
@@ -1589,6 +1590,36 @@ fn a_room_with_its_own_session_records_opens_after_a_restart() {
         );
         std::thread::sleep(Duration::from_millis(500));
     }
+
+    // ---- her private-Session policy is held not ready while bob lets her drive: his drive
+    // key arrives, the pass it schedules is saved as pending and not run (the decider's
+    // daemon, 2026-10-20: a peer's key at a restart, behind that peer's control receipts) --
+    std::fs::write(&hold, b"").expect("APPARATUS: write the hold file");
+    std::thread::sleep(Duration::from_secs(1));
+    let (ok, _, err) = vox(&bob, &["trust", "drive", &fps[0]], None);
+    assert!(
+        ok,
+        "PRODUCT: bob's `vox trust drive` of alice failed: {err}"
+    );
+    std::thread::sleep(Duration::from_secs(10));
+    let drivable = |json: &str| {
+        json.lines()
+            .filter(|l| l.contains("restart-"))
+            .any(|l| l.contains("\"can_drive\":true"))
+    };
+    // Precondition: alice does not yet drive any Session of bob's (the pass his key scheduled
+    // did not run; he has none open yet).
+    let (ok, json, _) = vox(&alice, &["room", "sessions", &room, "--json"], None);
+    assert!(
+        !(ok && drivable(&json)),
+        "APPARATUS (staging): alice already drives bob's Session while her policy is held, so \
+         nothing is left pending for the restart:\n{json}"
+    );
+    first.stop();
+    std::fs::remove_file(&hold).expect("APPARATUS: remove the hold file");
+    // While she is down, bob opens a Session through the shipped hook: his Session's control
+    // entries reach her only once her room is published again, so at her restart the pass his
+    // key scheduled waits behind a receipt that preparation cannot fetch (ADR-037 R1).
     let event = serde_json::json!({
         "session_id": "restart-proof",
         "transcript_path": work.join("transcript.jsonl").display().to_string(),
@@ -1631,33 +1662,7 @@ fn a_room_with_its_own_session_records_opens_after_a_restart() {
         );
         std::thread::sleep(Duration::from_millis(500));
     }
-
-    // ---- her private-Session policy is held not ready while bob lets her drive: his drive
-    // key arrives, the pass it schedules is saved as pending and not run (the decider's
-    // daemon, 2026-10-20: his peers' keys reached him at a restart, while his Session-floor
-    // index was behind their heads) -----------------------------------------------------------
-    std::fs::write(&hold, b"").expect("APPARATUS: write the hold file");
-    std::thread::sleep(Duration::from_secs(1));
-    let (ok, _, err) = vox(&bob, &["trust", "drive", &fps[0]], None);
-    assert!(
-        ok,
-        "PRODUCT: bob's `vox trust drive` of alice failed: {err}"
-    );
-    std::thread::sleep(Duration::from_secs(10));
-    let drivable = |json: &str| {
-        json.lines()
-            .filter(|l| l.contains("restart-"))
-            .any(|l| l.contains("\"can_drive\":true"))
-    };
-    // Precondition: alice does not yet drive bob's Session (the pass his key scheduled did not run).
-    let (ok, json, _) = vox(&alice, &["room", "sessions", &room, "--json"], None);
-    assert!(
-        !(ok && drivable(&json)),
-        "APPARATUS (staging): alice already drives bob's Session while her policy is held, so \
-         nothing is left pending for the restart:\n{json}"
-    );
-    first.stop();
-    std::fs::remove_file(&hold).expect("APPARATUS: remove the hold file");
+    std::thread::sleep(Duration::from_secs(2));
 
     // ---- the restart: the room prepares, says what it waits for, and opens ------------------
     let second = daemon_env(&alice, "alice", &knob);
