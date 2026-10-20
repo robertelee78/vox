@@ -39,7 +39,7 @@ use crate::node::api::{
     ChannelDetail, ChannelSummary, Fault, IdentityInfo, MessageRow, NodeCommand, NodeEvent,
     NodeView, Outcome, Secret,
 };
-use crate::node::channel::{ChannelState, Rendered};
+use crate::node::channel::{ChannelState, Rendered, SessionRefresh};
 use crate::node::net::PeerPolicy;
 use crate::node::network::{Inbound, NodeNet};
 use crate::node::open_rooms::OpenRooms;
@@ -18483,7 +18483,13 @@ impl Node {
                                 });
                             }
                         }
+                        // A wait that changed is published at once: the room list, the status
+                        // and the app say it without waiting for another event (#991).
+                        let changed = prepared.waiting != waited_before;
                         self.preparing_rooms.insert(id, prepared);
+                        if changed {
+                            self.publish().await;
+                        }
                         return;
                     }
                     Err(error)
@@ -18502,7 +18508,13 @@ impl Node {
                                     + prepared.retry_after(waited_before.as_ref()),
                             );
                         }
+                        // A wait that changed is published at once: the room list, the status
+                        // and the app say it without waiting for another event (#991).
+                        let changed = prepared.waiting != waited_before;
                         self.preparing_rooms.insert(id, prepared);
+                        if changed {
+                            self.publish().await;
+                        }
                         return;
                     }
                     Ok(true) => {
@@ -18656,9 +18668,44 @@ impl Node {
             prepared.progressed("finishing its Session upgrade", self.now_ms().get());
             return Ok(false);
         }
-        if !ch.refresh_session_records(profile, &self.drive_holders(), &[], self.now_ms().get())? {
-            prepared.progressed("refreshing its Session records", self.now_ms().get());
-            return Ok(false);
+        // A restored room's private Sessions (its restore, its controls import, its legacy
+        // steps, its pending activity) otherwise advance only once the room is published, and
+        // the refresh below waits on them: a room restored with its own Session records never
+        // opened (found 2026-10-20, the decider's room, 20 h). One bounded step per turn here,
+        // until nothing of that is pending.
+        if ch.needs_session_upgrade() {
+            // An error here is said as the wait and tried again, paced: it never closes a room
+            // that was opening before this step existed.
+            if let Err(error) = ch.advance_private_sessions(profile.store(), self.now_ms().get()) {
+                prepared.wait_on(
+                    &format!("restoring its Sessions ({error})"),
+                    self.now_ms().get(),
+                );
+                return Ok(false);
+            }
+            if ch.needs_session_upgrade() {
+                prepared.progressed("restoring its Sessions", self.now_ms().get());
+                return Ok(false);
+            }
+        }
+        // A refresh that did bounded work comes back at once; one that could do nothing yet
+        // says what it waits for and is paced like every other wait (ADR-038 FX-24): a step
+        // that reports progress while doing nothing re-queued the decider's room every 50 ms.
+        match ch.refresh_session_records(
+            profile,
+            &self.drive_holders(),
+            &[],
+            self.now_ms().get(),
+        )? {
+            SessionRefresh::Complete => {}
+            SessionRefresh::Progressed => {
+                prepared.progressed("refreshing its Session records", self.now_ms().get());
+                return Ok(false);
+            }
+            SessionRefresh::Waiting(what) => {
+                prepared.wait_on(what, self.now_ms().get());
+                return Ok(false);
+            }
         }
         ch.sweep_retention(profile.store(), self.now_ms())?;
         if ch.legacy_classification_pending(profile.store())? {
@@ -21356,7 +21403,7 @@ impl Node {
             if !owed.is_empty()
                 && !ch
                     .refresh_session_records(profile, holders, &owed, now_millis)
-                    .is_ok_and(|complete| complete)
+                    .is_ok_and(|refresh| refresh == SessionRefresh::Complete)
             {
                 return;
             }

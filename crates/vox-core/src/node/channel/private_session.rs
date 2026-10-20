@@ -26,6 +26,29 @@ type TrustNonce = Option<[u8; crate::atrest::sek::NONCE_LEN]>;
 /// disk cursor, not one resident hash for every historical step.
 #[derive(Default)]
 pub(super) struct LegacyPending(bool);
+/// What one bounded turn of a Session-record refresh did (ADR-038 FX-24).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SessionRefresh {
+    /// The records are current.
+    Complete,
+    /// Bounded work was done and more remains: the next turn comes at once.
+    Progressed,
+    /// Nothing could be done yet; what it waits for, in the words a person reads.
+    Waiting(&'static str),
+}
+
+/// `VOX_TEST_PRIVATE_POLICY_HOLD_FILE`: while the named file exists, no room's private-Session
+/// policy is ready, as while its Session-floor index refreshes. Read only by a `test-knobs`
+/// build; a release `vox` holds nothing (#300).
+#[cfg(feature = "test-knobs")]
+pub const TEST_PRIVATE_POLICY_HOLD_ENV: &str = "VOX_TEST_PRIVATE_POLICY_HOLD_FILE";
+#[cfg(feature = "test-knobs")]
+fn private_policy_held() -> bool {
+    std::env::var_os(TEST_PRIVATE_POLICY_HOLD_ENV)
+        .filter(|path| !path.is_empty())
+        .is_some_and(|path| std::path::Path::new(&path).exists())
+}
+
 impl LegacyPending {
     pub(super) fn insert(&mut self, _hash: Digest32) {
         self.0 = true;
@@ -1078,6 +1101,13 @@ impl ChannelState {
     // An incomplete governance projection must neither expire saved Session bodies nor
     // release them using a policy sampled before the current canonical room history.
     fn private_policy_ready(&self, store: &Store, now: u64) -> Result<bool> {
+        #[cfg(feature = "test-knobs")]
+        if private_policy_held() {
+            // A proof holds the room here, as a Session-floor index behind its authors' heads
+            // does at a restart, to stage a peer's key that arrives while the policy is not
+            // ready: its pass is saved as pending and not run (ADR-038 FX-26).
+            return Ok(false);
+        }
         match self.require_governance_ready(store, crate::time::Ms(now)) {
             Ok(_) => Ok(true),
             Err(error)
@@ -1568,25 +1598,29 @@ impl ChannelState {
     }
 
     /// Copy lifecycle source records into a new grant, without assembling whole metadata or
-    /// backfilling activity. False is pending work: callers must not release that grant yet.
+    /// backfilling activity. Anything but [`SessionRefresh::Complete`] is pending work: callers
+    /// must not release that grant yet. A turn that could do nothing says what it waits for, so
+    /// the caller paces it instead of trying again at once (ADR-038 FX-24).
     pub(crate) fn refresh_session_records(
         &mut self,
         profile: &Profile,
         holders: &BTreeSet<Digest32>,
         owed: &[Digest32],
         now: u64,
-    ) -> Result<bool> {
+    ) -> Result<SessionRefresh> {
         if !self.private_policy_ready(profile.store(), now)? {
-            return Ok(false);
+            return Ok(SessionRefresh::Waiting(
+                "its governance records being refreshed",
+            ));
         }
         if self.poisoned {
             return Err(self.save_failure());
         }
         if self.needs_session_upgrade() {
-            return Ok(false);
+            return Ok(SessionRefresh::Waiting("its Session upgrade"));
         }
         if self.has_left(&self.me()) || self.ended(now).is_some() {
-            return Ok(true);
+            return Ok(SessionRefresh::Complete);
         }
         let result = self.refresh_session_records_inner(profile, holders, owed, now);
         if let Err(error) = &result {
@@ -1637,9 +1671,12 @@ impl ChannelState {
         holders: &BTreeSet<Digest32>,
         owed: &[Digest32],
         now: u64,
-    ) -> Result<bool> {
+    ) -> Result<SessionRefresh> {
         let current = self.require_governance_ready(profile.store(), crate::time::Ms(now))?;
-        self.rotate_drive_if_lost(profile.store(), holders, crate::time::Ms(now), current)?;
+        // A rotation is work this turn did, whatever the refresh below finds (FX-24).
+        let rotated = !self
+            .rotate_drive_if_lost(profile.store(), holders, crate::time::Ms(now), current)?
+            .is_empty();
         let grant = self.refresh_grant(profile.store(), holders, owed)?;
         let public = self
             .entries
@@ -1778,7 +1815,11 @@ impl ChannelState {
         })();
         if progress.as_ref().is_err_and(floor_index::refreshing) {
             self.private_sessions.refresh = Some(work);
-            return Ok(false);
+            return Ok(if rotated {
+                SessionRefresh::Progressed
+            } else {
+                SessionRefresh::Waiting("its Session index being refreshed")
+            });
         }
         progress?;
         // Our own refresh copies change this generation; they do not invalidate their
@@ -1791,7 +1832,11 @@ impl ChannelState {
         let complete =
             work.stage == 2 && work.grant == self.refresh_grant(profile.store(), holders, owed)?;
         self.private_sessions.refresh = Some(work);
-        Ok(complete)
+        Ok(if complete {
+            SessionRefresh::Complete
+        } else {
+            SessionRefresh::Progressed
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
