@@ -1181,6 +1181,9 @@ fn held_entries(dir: &Path) -> u64 {
     let (ok, link, err) = vox(&alice, &["room", "link", &room], None);
     assert!(ok, "PRODUCT: `vox room link` failed: {err}");
     let link = link.trim().to_owned();
+    // The hold comes before bob joins: his admission is a governance record alice receives
+    // but cannot fold while held (ordinary posts never go through the fold).
+    std::fs::write(&hold, b"").expect("APPARATUS: write the hold file");
     let _bob_daemon = daemon(&bob, "bob");
     attached(&bob, "bob");
     let (ok, _, err) = vox(
@@ -1189,23 +1192,12 @@ fn held_entries(dir: &Path) -> u64 {
         Some(&format!("{ROOMPASS}\n")),
     );
     assert!(ok, "PRODUCT: bob's `vox room join` was refused: {err}");
-    // Bob reads alice's three rows: the two daemons talk.
-    let joined = Instant::now();
-    while !reads(&bob, &room, "row 3") {
-        assert!(
-            joined.elapsed() < Duration::from_secs(90),
-            "PRODUCT (staging): bob did not read alice's rows in 90 s\nbob's daemon said: {}",
-            said(&bob, "bob")
-        );
-        std::thread::sleep(Duration::from_millis(250));
-    }
-    std::fs::write(&hold, b"").expect("APPARATUS: write the hold file");
     for i in 4..=6 {
         let (ok, out, err) = vox(&bob, &["room", "post", &room, &format!("row {i}")], None);
         assert!(ok, "PRODUCT: bob's post {i} was refused: {out}{err}");
     }
-    // Give alice's daemon time to receive them (it cannot fold them while held).
-    std::thread::sleep(Duration::from_secs(5));
+    // Give alice's daemon time to receive bob's records (it cannot fold them while held).
+    std::thread::sleep(Duration::from_secs(8));
     first.stop();
 
     // ---- the room cannot finish preparing: the daemon says what it waits for ----------------
@@ -1319,11 +1311,20 @@ fn held_entries(dir: &Path) -> u64 {
         );
         std::thread::sleep(Duration::from_millis(200));
     }
-    let (ok, out, err) = vox(&alice, &["room", "read", &room], None);
-    assert!(
-        ok && (1..=6).all(|i| out.contains(&format!("row {i}"))),
-        "PRODUCT: the opened room does not read all six rows: ok={ok}\n{out}{err}"
-    );
+    // Bob's admission folds and his three rows arrive: alice reads all six.
+    let opened = Instant::now();
+    loop {
+        let (ok, out, err) = vox(&alice, &["room", "read", &room], None);
+        if ok && (1..=6).all(|i| out.contains(&format!("row {i}"))) {
+            break;
+        }
+        assert!(
+            opened.elapsed() < Duration::from_secs(60),
+            "PRODUCT: the opened room does not read all six rows within 60 s: ok={ok}\n{out}{err}\nalice's daemon said: {}",
+            said(&alice, "alice")
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
     drop(second);
 }
 
