@@ -32,8 +32,8 @@
 # POSIX sh; runs on both GitHub runners.
 set -eu
 
-BIN="${1:?usage: package-release.sh <binary|app zip> <triple> [app]}"
-TRIPLE="${2:?usage: package-release.sh <binary|app zip> <triple> [app]}"
+BIN="${1:?usage: package-release.sh <binary|app zip> <triple> [app|symbols]}"
+TRIPLE="${2:?usage: package-release.sh <binary|app zip> <triple> [app|symbols]}"
 MODE="${3:-vox}"
 
 if command -v sha256sum >/dev/null 2>&1; then
@@ -55,6 +55,13 @@ case "$MODE" in
     ASSET="vox-${TRIPLE}"
     KIND=vox.standalone-release PACKAGE=vox PREFIX=
     ;;
+  symbols)
+    # The unstripped `vox-<triple>` (ADR-038 FX-25): the same build before `strip`, unsigned and
+    # not for running, so a profile of the shipped daemon symbolizes against it. No records: the
+    # updater never selects it.
+    ASSET="vox-${TRIPLE}-symbols"
+    KIND= PACKAGE= PREFIX=
+    ;;
   app)
     ASSET="Vox-${VERSION}-${TRIPLE}.zip"
     KIND=vox.app-release PACKAGE=Vox.app PREFIX=app-
@@ -72,7 +79,7 @@ case "$MODE" in
     # The checks below then read the helper, which is what the app runs.
     BIN_CHECKED="$HELPER_DIR/vox"
     ;;
-  *) printf 'package-release: unknown mode %s (want vox or app)\n' "$MODE" >&2; exit 2 ;;
+  *) printf 'package-release: unknown mode %s (want vox, app or symbols)\n' "$MODE" >&2; exit 2 ;;
 esac
 
 # **No mutant ships.** ADR-025's P9 and P10 proofs run a deliberately misbehaving sync sender, built
@@ -102,6 +109,10 @@ SIZE=$(stat -c %s "dist/$ASSET" 2>/dev/null || stat -f %z "dist/$ASSET")
 SHA=$(sha_of "dist/$ASSET")
 [ -n "$SIZE" ] && [ -n "$SHA" ] \
   || { printf 'package-release: could not determine size/sha\n' >&2; exit 1; }
+if [ "$MODE" = symbols ]; then
+  ls -l "dist/$ASSET" "dist/$ASSET.sha256"
+  exit 0
+fi
 
 record() {
   printf '{"kind":"%s","schema_version":1,"package":"%s","channel":"%s","target":"%s","version":"%s","size":%s,"sha256":"%s"}\n' \

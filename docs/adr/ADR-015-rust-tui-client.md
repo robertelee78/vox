@@ -329,6 +329,9 @@ same trust model usable as ADR-014 under the same protocol guarantees; only pres
        `APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64`, `APPLE_DEVELOPER_ID_APPLICATION_P12_PASSWORD`,
        `APPLE_NOTARY_KEY_P8_BASE64`. The macOS jobs MUST draw them only from that environment, so a
        fork or pull request cannot produce a release artifact.
+17.21. Every release MUST also publish, per target, `vox-<triple>-symbols`, the same build as
+       `vox-<triple>` before `strip`, with its `.sha256`: unsigned, never selected by the updater,
+       so a profile of the shipped daemon symbolizes against it (ADR-038 FX-25).
 
 ### 18. Proof
 
