@@ -18601,9 +18601,16 @@ impl Node {
         let ch = prepared.channel.get_mut();
         #[cfg(feature = "test-knobs")]
         if prepare_held() {
-            // A step that never finishes, for the proof that the room's turns are paced. Its
+            // A step that never finishes and costs a few milliseconds a turn, as the step that
+            // held the decider's room did, for the proof that the room's turns are paced. Its
             // due time is cleared as every real step's is, so the next turn is scheduled.
             prepared.legacy_cleanup_due = None;
+            let busy = std::time::Instant::now();
+            let mut digest = [0u8; 32];
+            while busy.elapsed() < Duration::from_millis(5) {
+                digest = crate::hash::sha256(&digest);
+            }
+            std::hint::black_box(digest);
             prepared.progressed("a step held by a test knob", self.now_ms().get());
             return Ok(false);
         }
