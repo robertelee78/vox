@@ -1020,6 +1020,8 @@ pub struct ChannelState {
     /// Last published scalar display only. Live authority is read from sealed facts.
     governance_display: governance::Display,
     governance_ready: bool,
+    /// This room's consent facts in memory (ADR-038 FX-22); see [`Self::with_consent_facts`].
+    consent_facts: std::sync::Mutex<Option<std::sync::Arc<governance::ConsentFacts>>>,
     /// A member holds entries of this node's own feed here that this node does not (ADR-037
     /// R5): durable in `SEG_OWN_BEHIND`; every write here refuses with `OwnHistoryBehind`.
     own_behind: bool,
@@ -1926,6 +1928,7 @@ impl ChannelState {
             forks_kept: 0,
             governance_display,
             governance_ready: false,
+            consent_facts: std::sync::Mutex::new(None),
             own_behind: false,
             presence: BTreeMap::new(),
             sparse_applied_tips: BTreeMap::new(),
@@ -2615,6 +2618,7 @@ impl ChannelState {
             forks_kept,
             governance_display,
             governance_ready: false,
+            consent_facts: std::sync::Mutex::new(None),
             own_behind,
             presence,
             sparse_applied_tips,
@@ -2878,6 +2882,7 @@ impl ChannelState {
             forks_kept: 0,
             governance_display,
             governance_ready: false,
+            consent_facts: std::sync::Mutex::new(None),
             own_behind: false,
             presence: BTreeMap::new(),
             sparse_applied_tips: BTreeMap::new(),
@@ -4310,8 +4315,16 @@ impl ChannelState {
         // prune (R14) deleted its origin before the member's refusal of the new key could owe it
         // again, and the member never read what this identity wrote under it. Owed here, its
         // history floor keeps it (`oldest_generation_needed`) until it is taken.
-        let view = match self.current_governance(store) {
-            Ok(view) => Some(view),
+        // Who may read this identity, from the room's facts in memory (FX-22); while they are
+        // refreshing and the lock narrows, every entitled member is kept.
+        let readers: Option<BTreeSet<Digest32>> = match self.with_consent_facts(store, |facts| {
+            self.entitled
+                .keys()
+                .filter(|t| facts.can_read(t, &me))
+                .copied()
+                .collect()
+        }) {
+            Ok(readers) => Some(readers),
             Err(error) if narrowing && governance::refreshing(&error) => None,
             Err(error) => return Err(error),
         };
@@ -4319,11 +4332,7 @@ impl ChannelState {
         for t in self.entitled.keys().copied() {
             if t == me
                 || self.has_left(&t)
-                || !view
-                    .as_ref()
-                    .map(|view| view.can_read(&t, &me))
-                    .transpose()?
-                    .unwrap_or(true)
+                || !readers.as_ref().is_none_or(|readers| readers.contains(&t))
             {
                 continue;
             }
@@ -4339,7 +4348,6 @@ impl ChannelState {
                 owed.push((t, floor));
             }
         }
-        drop(view);
         // The mint's place in the consent order, persisted before the generation exists
         // (V210-45): a value is never handed out twice, so no later decision can tie it.
         let mint_seq = crate::node::consent_order::stamp_mint(
@@ -4501,7 +4509,8 @@ impl ChannelState {
     /// removal which rooms it actually has to change the lock in (ADR-020 §3) —
     /// rotating in a room where nothing was ever granted would be noise.
     pub fn has_consented(&self, store: &Store, target: &Digest32) -> Result<bool> {
-        self.current_governance(store)?.can_read(target, &self.me())
+        let me = self.me();
+        self.with_consent_facts(store, |facts| facts.can_read(target, &me))
     }
 
     /// **Who trusts each member here** (ADR-028 K-7): for every member some other member consents
@@ -4510,17 +4519,48 @@ impl ChannelState {
     /// (V030-17). A consent grant is what a member's node writes once its owner trusts the other (ADR-007
     /// G-9), so this is what a client says of a newcomer: which members already trust it.
     pub fn trusted_by(&self, store: &Store) -> Result<BTreeMap<Digest32, BTreeSet<Digest32>>> {
-        let view = self.current_governance(store)?;
         let members = self.members();
-        let mut by: BTreeMap<Digest32, BTreeSet<Digest32>> = BTreeMap::new();
-        for author in &members {
-            for reader in &members {
-                if reader != author && view.can_read(reader, author)? {
-                    by.entry(*reader).or_default().insert(*author);
+        self.with_consent_facts(store, |facts| {
+            let mut by: BTreeMap<Digest32, BTreeSet<Digest32>> = BTreeMap::new();
+            for author in &members {
+                for reader in &members {
+                    if reader != author && facts.can_read(reader, author) {
+                        by.entry(*reader).or_default().insert(*author);
+                    }
                 }
             }
+            by
+        })
+    }
+
+    /// The room's consent facts in memory (ADR-038 FX-22). The governance index's revision
+    /// moves with every change to it, so the facts are loaded once per revision: a question
+    /// costs the index header (one small sealed segment) and nothing else while the room's
+    /// governance stands. A room whose current facts are not settled refuses here as
+    /// [`Self::current_governance`] does.
+    fn consent_facts(&self, store: &Store) -> Result<std::sync::Arc<governance::ConsentFacts>> {
+        let view = self.current_governance(store)?;
+        let revision = view.revision();
+        let mut held = self
+            .consent_facts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(facts) = held.as_ref().filter(|facts| facts.revision() == revision) {
+            return Ok(std::sync::Arc::clone(facts));
         }
-        Ok(by)
+        let facts = std::sync::Arc::new(view.consent_facts(revision)?);
+        *held = Some(std::sync::Arc::clone(&facts));
+        Ok(facts)
+    }
+
+    /// One consent question answered from [`Self::consent_facts`].
+    fn with_consent_facts<T>(
+        &self,
+        store: &Store,
+        f: impl FnOnce(&governance::ConsentFacts) -> T,
+    ) -> Result<T> {
+        let facts = self.consent_facts(store)?;
+        Ok(f(&facts))
     }
 
     /// The admitted authors in `trusted` this identity has **not yet consented
@@ -4547,18 +4587,19 @@ impl ChannelState {
             return Ok(BTreeSet::new());
         }
         let me = self.me();
-        let view = self.current_governance(store)?;
-        let mut owed = BTreeSet::new();
-        for author in self.authors.keys() {
-            if *author != me
-                && !self.has_left(author)
-                && trusted.contains(author)
-                && !view.can_read(author, &me)?
-            {
-                owed.insert(*author);
+        self.with_consent_facts(store, |facts| {
+            let mut owed = BTreeSet::new();
+            for author in self.authors.keys() {
+                if *author != me
+                    && !self.has_left(author)
+                    && trusted.contains(author)
+                    && !facts.can_read(author, &me)
+                {
+                    owed.insert(*author);
+                }
             }
-        }
-        Ok(owed)
+            owed
+        })
     }
 
     /// The members this identity has consented to that do not yet hold its current
@@ -4909,7 +4950,7 @@ impl ChannelState {
             return Ok(None);
         };
         let me = self.me();
-        if self.current_governance(store)?.ever_revoked(&me, target)? {
+        if self.with_consent_facts(store, |facts| facts.ever_revoked(&me, target))? {
             return Ok(None);
         }
         let current = self.sender.chain_id();
@@ -5038,8 +5079,10 @@ impl ChannelState {
     /// The oldest generation this one current consenter is still owed.
     pub fn owed_history_for(&self, store: &Store, target: &Digest32) -> Result<Option<u64>> {
         let me = self.me();
-        let view = self.current_governance(store)?;
-        if *target == me || self.has_left(target) || !view.can_read(target, &me)? {
+        if *target == me
+            || self.has_left(target)
+            || !self.with_consent_facts(store, |facts| facts.can_read(target, &me))?
+        {
             return Ok(None);
         }
         Ok(self.history.get(target).copied())
@@ -5054,7 +5097,7 @@ impl ChannelState {
     ) -> Result<(BTreeMap<Digest32, u64>, Option<Digest32>)> {
         use std::ops::Bound::{Excluded, Unbounded};
         let me = self.me();
-        let view = self.current_governance(store)?;
+        let facts = self.consent_facts(store)?;
         let mut owed = BTreeMap::new();
         let mut slots = self
             .history
@@ -5065,7 +5108,7 @@ impl ChannelState {
                 return Ok((owed, None));
             };
             next = Some(*target);
-            if *target != me && !self.has_left(target) && view.can_read(target, &me)? {
+            if *target != me && !self.has_left(target) && facts.can_read(target, &me) {
                 owed.insert(*target, *floor);
             }
         }
@@ -8338,7 +8381,7 @@ impl ChannelState {
     /// this identity on the log (ADR-007 per-sender consent). Reading also needs the
     /// sender key itself (the SKDM).
     pub fn may_read(&self, store: &Store, author: &Digest32, me: &Digest32) -> Result<bool> {
-        self.current_governance(store)?.can_read(me, author)
+        self.with_consent_facts(store, |facts| facts.can_read(me, author))
     }
 
     /// **The time to stamp a new post with**: the clock, or just past the latest post this node
@@ -8727,6 +8770,7 @@ impl ChannelState {
                 self.entries
                     .render_view(profile.store(), &self.sek, &self.channel_id)?;
             let governance = self.current_governance(profile.store())?;
+            let facts = self.consent_facts(profile.store())?;
             let mut marks = BTreeSet::new();
             for hash in shown {
                 if rendered.was_read(hash, &me)? {
@@ -8752,7 +8796,7 @@ impl ChannelState {
                 if entry.skeleton.author_id == me {
                     continue;
                 }
-                if !governance.can_read(&me, &entry.skeleton.author_id)? {
+                if !facts.can_read(&me, &entry.skeleton.author_id) {
                     return Err(Error::Profile("read selection changed; refresh and retry"));
                 }
                 marks.insert(*hash);
@@ -8820,6 +8864,7 @@ impl ChannelState {
                 return Ok(None);
             }
             let governance = self.current_governance(profile.store())?;
+            let facts = self.consent_facts(profile.store())?;
             let eligibility = ReadMarkEligibility {
                 reader: me,
                 pending: rendered.pending_reads_root()?,
@@ -8870,7 +8915,7 @@ impl ChannelState {
                         now_ms,
                         self.entry_retention(rendered.transaction(), &entry)?,
                     )
-                    || !governance.can_read(&me, &entry.skeleton.author_id)?
+                    || !facts.can_read(&me, &entry.skeleton.author_id)
                 {
                     continue;
                 }
@@ -9235,9 +9280,15 @@ impl ChannelState {
         use crate::node::api::{OfferBasis, OfferWhy};
         let me = self.me();
         let (_, mine) = self.admission(&me);
-        let view = self.current_governance(store)?;
+        let members = self.members();
+        let grants: BTreeMap<Digest32, u64> = self.with_consent_facts(store, |facts| {
+            members
+                .iter()
+                .filter_map(|member| facts.grant_sequence(member, &me).map(|seq| (*member, seq)))
+                .collect()
+        })?;
         let mut out = Vec::new();
-        for member in self.members() {
+        for member in members {
             if member == me {
                 continue;
             }
@@ -9249,7 +9300,7 @@ impl ChannelState {
                     seq,
                 });
             }
-            if let Some(seq) = view.grant_sequence(&member, &me)? {
+            if let Some(seq) = grants.get(&member).copied() {
                 out.push(OfferBasis {
                     member,
                     why: OfferWhy::TrustsYou,
