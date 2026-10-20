@@ -83,10 +83,10 @@ optional_proof::not_run!(
     a_newcomer_talks_both_ways_at_one_wait_fresh_or_behind_a_backlog,
 );
 
-#[path = "../../vox-core/tests/support/watchdog.rs"]
-mod watchdog;
 #[path = "support/test_knobs.rs"]
 mod test_knobs;
+#[path = "../../vox-core/tests/support/watchdog.rs"]
+mod watchdog;
 
 #[path = "support/attach.rs"]
 mod attach;
@@ -1219,6 +1219,10 @@ fn a_room_that_cannot_finish_preparing_says_why_and_costs_nothing() {
     first.stop();
 
     // ---- the room cannot finish preparing: the daemon says what it waits for ----------------
+    let restarted_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
     let second = daemon_env(&alice, "alice", &knob);
     let started = Instant::now();
     let line = loop {
@@ -1229,6 +1233,12 @@ fn a_room_that_cannot_finish_preparing_says_why_and_costs_nothing() {
             .map(str::to_owned)
             .unwrap_or_default();
         if ok && line.contains("[preparing history: waiting for ") {
+            // The wait a held fold of a peer's records produces, in the words of this change.
+            assert!(
+                line.contains("waiting for governance records from its members"),
+                "PRODUCT: `vox room list` names another wait than the held governance fold \
+                 (#991): {line}"
+            );
             break line;
         }
         if ok && !line.is_empty() && !line.contains("[preparing") {
@@ -1275,9 +1285,18 @@ fn a_room_that_cannot_finish_preparing_says_why_and_costs_nothing() {
             panic!("PRODUCT: `vox status --json` names no wait for the room: {entry}")
         })
         .to_owned();
+    let since_ms = entry["since_ms"].as_u64().unwrap_or_else(|| {
+        panic!("PRODUCT: `vox status --json` dates no wait for the room: {entry}")
+    });
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
     assert!(
-        line.contains(&what) && entry["since_ms"].as_u64().is_some(),
-        "PRODUCT: `vox status --json` ({entry}) and `vox room list` ({line}) do not say the same wait"
+        line.contains(&what) && (restarted_ms..=now_ms).contains(&since_ms),
+        "PRODUCT: `vox status --json` ({entry}) and `vox room list` ({line}) do not say the same \
+         wait, or its start {since_ms} is not between the daemon's restart {restarted_ms} and now \
+         {now_ms}"
     );
     let (ok, out, err) = vox(&alice, &["room", "read", &room], None);
     assert!(
@@ -1286,7 +1305,11 @@ fn a_room_that_cannot_finish_preparing_says_why_and_costs_nothing() {
          ({what:?}) (#991): ok={ok} {out}{err}"
     );
     // The daemon's own refusal says it too: a post, which the CLI does not pre-check.
-    let (ok, out, err) = vox(&alice, &["room", "post", &room, "a word while it prepares"], None);
+    let (ok, out, err) = vox(
+        &alice,
+        &["room", "post", &room, "a word while it prepares"],
+        None,
+    );
     assert!(
         !ok && format!("{out}{err}").contains(&format!("it waits for {what}")),
         "PRODUCT: the daemon's refusal of a post into a preparing room does not say the wait the \
@@ -1301,13 +1324,28 @@ fn a_room_that_cannot_finish_preparing_says_why_and_costs_nothing() {
     std::thread::sleep(PREPARING_IDLE);
     let spent = cpu_time(pid).saturating_sub(cpu0);
     let rounds_after = completed_rounds(&alice);
+    assert!(
+        rounds_before.keys().any(|p| p.starts_with(&fps[1][..12]))
+            && rounds_after.keys().any(|p| p.starts_with(&fps[1][..12])),
+        "APPARATUS: alice's status lists no lane toward bob ({}), so rounds toward him cannot be \
+         counted; before {rounds_before:?}, after {rounds_after:?}",
+        &fps[1][..12]
+    );
     let per_peer: Vec<(String, u64)> = rounds_after
         .iter()
-        .map(|(peer, after)| (peer.clone(), after.saturating_sub(*rounds_before.get(peer).unwrap_or(&0))))
+        .map(|(peer, after)| {
+            (
+                peer.clone(),
+                after.saturating_sub(*rounds_before.get(peer).unwrap_or(&0)),
+            )
+        })
         .collect();
     let rounds: u64 = per_peer.iter().map(|(_, n)| *n).max().unwrap_or(0);
     let log = std::fs::read_to_string(alice.join(".daemon/log")).unwrap_or_default();
-    let noted: Vec<&str> = log.lines().filter(|l| l.contains("is still preparing: it waits for ")).collect();
+    let noted: Vec<&str> = log
+        .lines()
+        .filter(|l| l.contains("is still preparing: it waits for "))
+        .collect();
     println!(
         "[proof] over {PREPARING_IDLE:?} the held room cost the daemon +{spent:?} of CPU (bound {PREPARING_CPU:?}) and {rounds} completed sync round(s) (bound {PREPARING_ROUNDS}); its log says: {noted:?}"
     );
@@ -1377,12 +1415,16 @@ fn a_room_that_cannot_finish_preparing_says_why_and_costs_nothing() {
         } else {
             serde_json::Value::Null
         };
+        // Newer than the restart: the round that brought bob's rows, not one from the staging.
         let recorded = v["rooms"].as_array().is_some_and(|rooms| {
             rooms.iter().any(|r| {
                 r["id"].as_str().is_some_and(|id| id.starts_with(&room))
-                    && r["last_sync_ms"].as_u64().is_some()
+                    && r["last_sync_ms"].as_u64().is_some_and(|t| t > restarted_ms)
                     && r["members"].as_array().is_some_and(|ms| {
-                        ms.iter().any(|m| m["me"] == false && m["last_sync_ms"].as_u64().is_some())
+                        ms.iter().any(|m| {
+                            m["me"] == false
+                                && m["last_sync_ms"].as_u64().is_some_and(|t| t > restarted_ms)
+                        })
                     })
             })
         });
@@ -1404,7 +1446,10 @@ fn a_room_that_cannot_finish_preparing_says_why_and_costs_nothing() {
 /// an apparatus fault, never a zero that reads as quiet.
 fn completed_rounds(dir: &Path) -> std::collections::BTreeMap<String, u64> {
     let (ok, out, err) = vox(dir, &["status", "--json"], None);
-    assert!(ok, "APPARATUS: `vox status --json` failed while counting rounds: {err}");
+    assert!(
+        ok,
+        "APPARATUS: `vox status --json` failed while counting rounds: {err}"
+    );
     let v: serde_json::Value = serde_json::from_str(&out)
         .unwrap_or_else(|e| panic!("APPARATUS: `vox status --json` is not JSON: {e}: {out}"));
     let lanes = v["sync"]
