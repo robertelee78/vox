@@ -706,23 +706,36 @@ fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
     let cpu1 = (cpu_time(alice_daemon.0.id()), cpu_time(bob_daemon.0.id()));
     let spent = (cpu1.0.saturating_sub(cpu0.0), cpu1.1.saturating_sub(cpu0.1));
     let slowest = answers.iter().copied().max().unwrap_or_default();
-    // The work was real: each reads the other's last post.
-    let last_room = &rooms[(posted_a.saturating_sub(1)) % rooms.len()];
-    let (to_alice, to_bob) = arrivals(
+    // The work was real: each reads the other's last post, in the room it went to.
+    let alice_last = format!("alice step {}", posted_a.saturating_sub(1));
+    let bob_last = format!("bob step {}", posted_b.saturating_sub(1));
+    let (to_alice, _) = arrivals(
         started,
-        (&alice, &format!("bob step {}", posted_b.saturating_sub(1))),
-        (&bob, &format!("alice step {}", posted_a.saturating_sub(1))),
-        last_room,
+        (&alice, &bob_last),
+        (&bob, &bob_last),
+        &rooms[(posted_b.saturating_sub(1)) % rooms.len()],
         READY_WITHIN + worked,
     );
+    let (_, to_bob) = arrivals(
+        started,
+        (&alice, &alice_last),
+        (&bob, &alice_last),
+        &rooms[(posted_a.saturating_sub(1)) % rooms.len()],
+        READY_WITHIN + worked,
+    );
+    let (_, alice_status, _) = vox(&alice, &["status", "--json"], None);
+    let (_, bob_status, _) = vox(&bob, &["status", "--json"], None);
     println!(
         "[proof] over {worked:?} alice posted {posted_a} ({refused_a} refused) and bob {posted_b} \
          ({refused_b} refused) into {WORK_ROOMS} rooms; CPU time: alice's daemon +{:?}, bob's \
          +{:?} (bound {WORK_CPU:?}); {} status answers, slowest {slowest:?} (bound \
-         {ANSWER_WITHIN:?}); last posts read: alice {to_alice:?}, bob {to_bob:?}",
+         {ANSWER_WITHIN:?}); last posts read: alice {to_alice:?}, bob {to_bob:?}; alice's lanes: {}; \
+         bob's lanes: {}",
         spent.0,
         spent.1,
-        answers.len()
+        answers.len(),
+        lanes_of(&alice_status),
+        lanes_of(&bob_status)
     );
     assert!(
         refused_a == 0 && refused_b == 0 && posted_a >= 30 && posted_b >= 30,
@@ -735,8 +748,10 @@ fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
     assert!(
         to_alice.is_some() && to_bob.is_some(),
         "PRODUCT: the agents' last posts were not read within {READY_WITHIN:?} of the end: alice \
-         read bob's: {to_alice:?}, bob read alice's: {to_bob:?}\nalice's daemon said: {}\nbob's \
-         daemon said: {}",
+         read bob's: {to_alice:?}, bob read alice's: {to_bob:?}\nalice's lanes: {}\nbob's lanes: \
+         {}\nalice's daemon said: {}\nbob's daemon said: {}",
+        lanes_of(&alice_status),
+        lanes_of(&bob_status),
         said(&alice, "alice"),
         said(&bob, "bob")
     );
@@ -755,6 +770,35 @@ fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
         "PRODUCT: `vox status --json` answered in {slowest:?} while agents worked, over \
          {ANSWER_WITHIN:?} (ADR-038 FX-17); every answer: {answers:?}"
     );
+}
+
+/// Each lane of a `vox status --json`: peer, completed, partial, failed, running and its last failure.
+fn lanes_of(status: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(status)
+        .ok()
+        .and_then(|v| {
+            v["sync"].as_array().map(|lanes| {
+                lanes
+                    .iter()
+                    .map(|l| {
+                        format!(
+                            "{}: completed {} partial {} failed {} running {} last_failure {}",
+                            l["peer"]
+                                .as_str()
+                                .map(|p| &p[..p.len().min(12)])
+                                .unwrap_or("?"),
+                            l["completed"],
+                            l["partial"],
+                            l["failed"],
+                            l["running"].as_array().map_or(0, Vec::len),
+                            l["last_failure"]
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            })
+        })
+        .unwrap_or_else(|| format!("(unreadable: {})", status.trim()))
 }
 
 /// A process's CPU time so far, as Activity Monitor shows it (`ps -o cputime`).
