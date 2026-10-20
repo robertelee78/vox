@@ -1583,12 +1583,21 @@ fn a_room_with_its_own_session_records_opens_after_a_restart() {
         let (ok, out, err) = vox(&alice, &["room", "post", &room, &format!("row {i}")], None);
         assert!(ok, "PRODUCT: alice's post {i} was refused: {out}{err}");
     }
-    // Her own Session record is in the room: the sessions listing shows it.
-    let (ok, sessions, err) = vox(&alice, &["room", "sessions", &room], None);
-    assert!(
-        ok && sessions.contains("restart-proof"),
-        "APPARATUS (staging): alice's room shows no Session of hers: ok={ok} {sessions}{err}"
-    );
+    // Her own Session record is in the room: the sessions listing shows it, once the room has
+    // folded it (the listing says so while it has not).
+    let staged = Instant::now();
+    loop {
+        let (ok, sessions, err) = vox(&alice, &["room", "sessions", &room], None);
+        if ok && sessions.contains("restart-proof") {
+            break;
+        }
+        assert!(
+            staged.elapsed() < Duration::from_secs(30),
+            "APPARATUS (staging): alice's room shows no Session of hers after 30 s: ok={ok} \
+             {sessions}{err}"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
     first.stop();
 
     // ---- the restart: the room prepares, says what it waits for, and opens ------------------
