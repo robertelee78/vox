@@ -1480,6 +1480,164 @@ fn completed_rounds(dir: &Path) -> std::collections::BTreeMap<String, u64> {
     rounds
 }
 
+/// A room with this node's own Session records opens again after a restart, within this.
+const REOPENS_WITHIN: Duration = Duration::from_secs(20);
+
+/// A room that holds this node's own Session records opens again after the daemon restarts
+/// (ADR-038 FX-15, FX-16; #991). Found 2026-10-20 on the decider's work Mac: his room stayed
+/// "preparing" for 20 hours, waiting for "refreshing its Session records": that step copies
+/// the node's Session records and waits on the Session projection, which advanced only for a
+/// room already published. Staged with the shipped hook: alice's harness session opens in her
+/// room (a Session record of her own), she posts three rows, her daemon is stopped and started
+/// again. The room MUST open within [`REOPENS_WITHIN`] and its rows read; while it prepares,
+/// `vox room list` names the wait.
+///
+/// Mutant: the preparation turn no longer indexing the Sessions (the `advance_sessions` step
+/// in `retention_before_publication` removed) turns the opening claim red.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "two starts of a real vox daemon and the shipped hook; optional, run it in release"]
+fn a_room_with_its_own_session_records_opens_after_a_restart() {
+    test_knobs::require(&["VOX_TEST_FOLD_HOLD_FILE"]);
+    watchdog::arm();
+    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("APPARATUS: no temp dir: {e}"));
+    let root = tmp.path();
+    let alice = root.join("alice");
+    let work = root.join("work");
+    for d in [&alice, &work] {
+        std::fs::create_dir_all(d.join("cfg"))
+            .unwrap_or_else(|e| panic!("APPARATUS: could not create {}: {e}", d.display()));
+    }
+    let (ok, _, err) = vox(&alice, &["id"], None);
+    assert!(ok, "PRODUCT: `vox id` failed: {err}");
+    let first = daemon(&alice, "alice");
+    attached(&alice, "alice");
+    let (ok, _, err) = vox(
+        &alice,
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "sessions",
+        ],
+        Some(&format!("{ROOMPASS}\n")),
+    );
+    assert!(
+        ok,
+        "PRODUCT: `vox room create` failed: {err}\nalice's daemon said: {}",
+        said(&alice, "alice")
+    );
+    let listed = attached(&alice, "alice");
+    let room = listed
+        .split_whitespace()
+        .find(|w| w.len() >= 8 && w.chars().all(|c| c.is_ascii_alphanumeric()))
+        .unwrap_or_else(|| panic!("PRODUCT: `vox room list` shows no room id: {listed}"))
+        .to_owned();
+    // Her harness session opens in the room, as Claude Code's hook does it: a Session record
+    // of her own lands in the room.
+    let event = serde_json::json!({
+        "session_id": "restart-proof",
+        "transcript_path": work.join("transcript.jsonl").display().to_string(),
+        "cwd": work.display().to_string(),
+        "permission_mode": "default",
+        "hook_event_name": "UserPromptSubmit",
+        "prompt": "hello",
+    })
+    .to_string();
+    for _ in 0..2 {
+        let mut child = Command::new(VOX)
+            .args(["agent", "hook", "--node", "default", "--room", &room])
+            .env("VOX_DATA_DIR", &alice)
+            .env("VOX_CONFIG_DIR", alice.join("cfg"))
+            .env("CLAUDE_CODE_ENTRYPOINT", "cli")
+            .env_remove("VOX_ROOM")
+            .env_remove("VOX_NODE")
+            .current_dir(&work)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|e| panic!("APPARATUS: cannot start `vox agent hook`: {e}"));
+        if let Some(mut pipe) = child.stdin.take() {
+            let _ = pipe.write_all(event.as_bytes());
+        }
+        let out = child
+            .wait_with_output()
+            .unwrap_or_else(|e| panic!("APPARATUS: `vox agent hook`: {e}"));
+        let said = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            !["has no Vox node", "is Locked", "vox setup", "not attached"]
+                .iter()
+                .any(|w| said.contains(w)),
+            "APPARATUS: the hook answered with setup words instead of joining the room: {said}"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    for i in 1..=3 {
+        let (ok, out, err) = vox(&alice, &["room", "post", &room, &format!("row {i}")], None);
+        assert!(ok, "PRODUCT: alice's post {i} was refused: {out}{err}");
+    }
+    // Her own Session record is in the room: the sessions listing shows it.
+    let (ok, sessions, err) = vox(&alice, &["room", "sessions", &room], None);
+    assert!(
+        ok && sessions.contains("restart-proof"),
+        "APPARATUS (staging): alice's room shows no Session of hers: ok={ok} {sessions}{err}"
+    );
+    first.stop();
+
+    // ---- the restart: the room prepares, says what it waits for, and opens ------------------
+    let second = daemon(&alice, "alice");
+    let started = Instant::now();
+    let mut seen_waiting = Vec::new();
+    loop {
+        let (ok, out, _) = vox(&alice, &["room", "list"], None);
+        let line = out
+            .lines()
+            .find(|l| l.trim_start().starts_with(&room))
+            .map(str::to_owned)
+            .unwrap_or_default();
+        if ok && !line.is_empty() && !line.contains("[preparing") {
+            println!(
+                "[proof] {:?} after the restart the room is open: {line}; while it prepared it said: {seen_waiting:?}",
+                started.elapsed()
+            );
+            break;
+        }
+        if line.contains("[preparing history: waiting for ") && seen_waiting.last() != Some(&line) {
+            seen_waiting.push(line.clone());
+        }
+        assert!(
+            started.elapsed() < REOPENS_WITHIN,
+            "PRODUCT: a room with this node's own Session records did not open within \
+             {REOPENS_WITHIN:?} of the restart (#991): {line:?}; it said while preparing: \
+             {seen_waiting:?}\nalice's daemon said: {}",
+            said(&alice, "alice")
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let (ok, out, err) = vox(&alice, &["room", "read", &room], None);
+    assert!(
+        ok && (1..=3).all(|i| out.contains(&format!("row {i}"))),
+        "PRODUCT: the reopened room does not read its three rows: ok={ok}\n{out}{err}"
+    );
+    let pid = second.0.id();
+    let cpu0 = cpu_time(pid);
+    std::thread::sleep(Duration::from_secs(10));
+    let spent = cpu_time(pid).saturating_sub(cpu0);
+    println!("[proof] 10 s after opening, the daemon's CPU grew by {spent:?}");
+    assert!(
+        spent <= Duration::from_secs(1),
+        "PRODUCT: the daemon spent {spent:?} of CPU in 10 s with one open quiet room (FX-15, #991)"
+    );
+    drop(second);
+}
+
 /// Each lane of a `vox status --json`: peer, completed, partial, failed, running and its last failure.
 fn lanes_of(status: &str) -> String {
     serde_json::from_str::<serde_json::Value>(status)

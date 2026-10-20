@@ -18670,6 +18670,14 @@ impl Node {
             prepared.progressed("finishing its Session upgrade", self.now_ms().get());
             return Ok(false);
         }
+        // The Session projection (its control and floor indexes) otherwise advances only for a
+        // published room, and the refresh below waits on it: a room restored with its own
+        // Session records never opened (found 2026-10-20, the decider's room, 20 h). One
+        // bounded step per turn here, until it is caught up.
+        if !ch.advance_sessions(profile.store(), self.now_ms().get())? {
+            prepared.progressed("indexing its Sessions", self.now_ms().get());
+            return Ok(false);
+        }
         if !ch.refresh_session_records(profile, &self.drive_holders(), &[], self.now_ms().get())? {
             prepared.progressed("refreshing its Session records", self.now_ms().get());
             return Ok(false);
