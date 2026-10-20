@@ -3,7 +3,7 @@
 - **Status**: Proposed, after v0.4.6. The decider's product rulings of 2026-10-19 (one question
   at a time, quoted below) are the requirements; nothing here is built. Each requirement lands
   with its proof (ADR-018) in a small release (FX-19).
-- **Date**: 2026-10-19
+- **Date**: 2026-10-19; amended 2026-10-20 (FX-22–FX-25, the daemon's CPU)
 - **Deciders**: Robert E. Lee
 - **Tags**: trust, daemon identity, sessions, presence, agent comms, sync, health, releases
 - **Related**: ADR-018, ADR-020, ADR-026, ADR-029, ADR-031, ADR-033, ADR-034, ADR-035, ADR-036,
@@ -182,12 +182,50 @@ The decider then answered twelve questions, one at a time. His answers are the d
   the known defects above turned into stories and fixed now. The walkthrough and all staging
   MUST run on the VM setup (the macOS guests of the v0.4.4 app-proof work), not on his working
   Macs ("use the VM stuffs so I'm not losing ability to use my macs").
-- **FX-21.** Every product requirement above (FX-1–FX-10, FX-12–FX-18) lands with a proof that
-  drives the shipped `vox` binary as a person would, with a mutant that turns it red on its own
-  assertion (ADR-018). The two-computer requirements (FX-2–FX-7) are proved by two daemons in
-  two data roots on one machine. FX-11's design, FX-19 and FX-20 are process rulings: FX-19's
-  record is each closed release milestone, FX-20's is the walkthrough's defect record, and
-  FX-11's is the amendment it produces.
+- **FX-21.** Every product requirement above (FX-1–FX-10, FX-12–FX-18, FX-22–FX-24) lands with a
+  proof that drives the shipped `vox` binary as a person would, with a mutant that turns it red
+  on its own assertion (ADR-018). The two-computer requirements (FX-2–FX-7) are proved by two
+  daemons in two data roots on one machine. FX-11's design, FX-19, FX-20 and FX-25 are process
+  rulings: FX-19's record is each closed release milestone, FX-20's is the walkthrough's defect
+  record, FX-11's is the amendment it produces, and FX-25's is each release's asset list.
+- **FX-22.** A governance question (who may read whom, who has consented, what a member offers)
+  MUST cost no store read when nothing changed: a room holds its folded consent facts in memory,
+  loaded once per index revision and kept current by the fold, and `can_read`, `trusted_by`,
+  `offer_bases`, `grant_sequence` and `ever_revoked` answer from them. The sealed index remains
+  the durable source a restart loads from; nothing is rebuilt from the log. Measured cause,
+  2026-10-20 (the decider's daemon, vox 0.4.7, two 10 s samples at 155% of a core): 72% of its
+  busy CPU was the status publication, 44% of it `trusted_by`, which opened a fresh view (a
+  store snapshot and a decrypt of the index header) and asked `can_read` for every ordered pair
+  of members; each answer walked the sealed index (a decrypt per page), decrypted the log entry
+  it named, walked the index again for that entry's binding, and looked up the consent reset
+  the same way. 48% of all busy CPU was decrypting store segments to re-read facts the daemon
+  had already folded. Nothing was cached, by the index's own design ("no snapshot, row vector,
+  or page survives a caller's bounded turn"). #990's reuse of an unchanged room's detail removes
+  the repetition, but still opens the store once per room per publication and re-pays the whole
+  walk on any governance change.
+- **FX-23.** Every AEAD in the product (at rest, messages, join proofs, the ratchet) MUST use the
+  processor's AES and carry-less multiply where it has them, selected at run time by the
+  library, never by a build flag. Measured cause, the same samples: the `aes` 0.8.4 and
+  `polyval` 0.6.2 crates under aes-gcm 0.10.3 compile their ARMv8 backends only under
+  `--cfg aes_armv8` and `--cfg polyval_armv8`, which no build set, so every decrypt on Apple
+  silicon ran the bitsliced software AES and the software POLYVAL (Keccak autodetects and was
+  not affected). aes-gcm 0.11 (aes 0.9, polyval 0.7) autodetects by default; the fix is that
+  upgrade, so the flag cannot be forgotten again.
+- **FX-24.** A preparation step that did no work MUST report what it waits for, never progress,
+  and a room's private Sessions MUST be advanced during its preparation, so a restored room's
+  refresh can finish. The daemon MUST NOT cap or throttle its CPU as a remedy for a cost it has
+  not explained ("caps on cpu seem like … footguns", "we need to understand what is driving the
+  cpu inefficiency rather than capping the cpu", the decider, 2026-10-20); a wait on something
+  outside the turn is tried again at the wait's own pace (FX-15), which is not a cap. Measured
+  cause: the decider's room ended every preparation turn on "refreshing its Session records",
+  reported as progress, because the refresh stopped at its first gate (a pending Session
+  restore that only a published room advanced); the room was re-queued every 50 ms, each turn
+  ended in a publication that paid FX-22 through FX-23, and the daemon ran at 174% of a core
+  for twenty hours while the app said "Preparing room history".
+- **FX-25.** Every release MUST publish the unstripped daemon binary beside the stripped one it
+  ships, so a profile of the shipped daemon symbolizes without a matching local build. Cause:
+  the 2026-10-20 samples of the v0.4.7 helper had to be named by matching its machine code
+  against a local build of the same version.
 
 ## Unchanged rulings
 
@@ -220,6 +258,9 @@ Narrow successor amendments. Requirements not named here remain in force.
 4. FX-11's design story, then FX-8–FX-10 in the app, the CLI, the hook and the skill pack.
 5. FX-12, FX-13, FX-14: the idle window, asks per Session, `--re` prefixes.
 6. FX-20's walkthrough runs from the first cut on; its defects join the queue as found.
+7. FX-24, FX-23, FX-22, FX-25: the daemon's CPU under real rooms, measured on the decider's
+   daemon on 2026-10-20, in that order (the trigger, the cipher, the design, the symbols); one
+   cut (v0.4.8).
 
 Each ADR change under this record is reviewed by an independent session (opencode-work) before
 its stories are extracted.
