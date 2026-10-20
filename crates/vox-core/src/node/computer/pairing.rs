@@ -283,6 +283,7 @@ impl Attempt {
         self.recorded = true;
         self.me
             .record_exchange(self.peer, self.revision, self.involved, outcome);
+        // Dropped here: the reservation is released by its owner, after the record.
     }
 }
 
@@ -308,6 +309,7 @@ impl Drop for Attempt {
                 Err("the exchange task failed".to_owned()),
             );
         }
+        lock(&self.me.inflight).remove(&self.peer);
     }
 }
 
@@ -740,19 +742,18 @@ impl Management {
             peer: target,
         };
         let paired = self.pair(&link, url).await;
-        drop(reserved);
         let revision = lock(&self.computer.state).revision;
-        match paired {
-            Ok(()) => {
-                // The handshake exchanged state: counted and dated like any exchange, and the
-                // status's problem follows from every computer's record.
-                self.record_exchange(target, revision, true, Ok(()));
-            }
-            Err(e) => {
-                self.record_exchange(target, revision, true, Err(e.to_string()));
-                return Err(e);
-            }
-        }
+        // Recorded while still reserved, so the record never touches a reservation the retry
+        // may have taken meanwhile; the guard releases this one after.
+        let outcome = match &paired {
+            // The handshake exchanged state: counted and dated like any exchange, and the
+            // status's problem follows from every computer's record.
+            Ok(()) => Ok(()),
+            Err(e) => Err(e.to_string()),
+        };
+        self.record_exchange(target, revision, true, outcome);
+        drop(reserved);
+        paired?;
         self.status()
     }
     /// Record this operator's signature of exactly the previewed operation; retry is idempotent.
@@ -1680,7 +1681,17 @@ impl Management {
                 .flatten();
             let now = std::time::Instant::now();
             let revision = s.revision;
-            let exchanged = lock(&self.exchanged);
+            let mut exchanged = lock(&self.exchanged);
+            // A computer no longer paired (removed, or its pairing cancelled) keeps no record:
+            // its failure must not stand in the status for good.
+            let known: std::collections::BTreeSet<Digest32> = peers.iter().copied().collect();
+            if exchanged.keys().any(|p| !known.contains(p)) {
+                exchanged.retain(|p, _| known.contains(p));
+                *lock(&self.problem) = exchanged
+                    .values()
+                    .filter(|r| r.failures > 0)
+                    .find_map(|r| r.problem.clone());
+            }
             peers.retain(|peer| {
                 let record = exchanged.get(peer).cloned().unwrap_or_default();
                 if let Some(last) = record.last {
@@ -1808,8 +1819,6 @@ impl Management {
             .values()
             .filter(|r| r.failures > 0)
             .find_map(|r| r.problem.clone());
-        drop(exchanged);
-        lock(&self.inflight).remove(&peer);
     }
     async fn sync_peer(
         self: &Arc<Self>,
