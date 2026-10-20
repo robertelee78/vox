@@ -1324,12 +1324,13 @@ fn a_room_that_cannot_finish_preparing_says_why_and_costs_nothing() {
     std::thread::sleep(PREPARING_IDLE);
     let spent = cpu_time(pid).saturating_sub(cpu0);
     let rounds_after = completed_rounds(&alice);
+    // A room that is not open has no lane: no round can run toward anyone while it waits, and
+    // alice holds no other room. A lane here, or a round on it, is a round without a need.
     assert!(
-        rounds_before.keys().any(|p| p.starts_with(&fps[1][..12]))
-            && rounds_after.keys().any(|p| p.starts_with(&fps[1][..12])),
-        "APPARATUS: alice's status lists no lane toward bob ({}), so rounds toward him cannot be \
-         counted; before {rounds_before:?}, after {rounds_after:?}",
-        &fps[1][..12]
+        rounds_before.is_empty() && rounds_after.is_empty(),
+        "PRODUCT: alice's daemon ran sync lanes while its only room waited to open (ADR-038 \
+         FX-15, #991): before {rounds_before:?}, after {rounds_after:?}; lanes: {}",
+        lanes_of(&vox(&alice, &["status", "--json"], None).1)
     );
     let per_peer: Vec<(String, u64)> = rounds_after
         .iter()
@@ -1415,19 +1416,29 @@ fn a_room_that_cannot_finish_preparing_says_why_and_costs_nothing() {
         } else {
             serde_json::Value::Null
         };
-        // Newer than the restart: the round that brought bob's rows, not one from the staging.
-        let recorded = v["rooms"].as_array().is_some_and(|rooms| {
-            rooms.iter().any(|r| {
-                r["id"].as_str().is_some_and(|id| id.starts_with(&room))
-                    && r["last_sync_ms"].as_u64().is_some_and(|t| t > restarted_ms)
-                    && r["members"].as_array().is_some_and(|ms| {
-                        ms.iter().any(|m| {
-                            m["me"] == false
-                                && m["last_sync_ms"].as_u64().is_some_and(|t| t > restarted_ms)
-                        })
-                    })
+        // Newer than the restart: the round that brought bob's rows, not one from the staging;
+        // and the lane toward bob now exists and completed it.
+        let bobs_lane = v["sync"].as_array().is_some_and(|lanes| {
+            lanes.iter().any(|l| {
+                l["peer"]
+                    .as_str()
+                    .is_some_and(|p| p.starts_with(&fps[1][..12]))
+                    && l["completed"].as_u64().is_some_and(|n| n > 0)
             })
         });
+        let recorded = bobs_lane
+            && v["rooms"].as_array().is_some_and(|rooms| {
+                rooms.iter().any(|r| {
+                    r["id"].as_str().is_some_and(|id| id.starts_with(&room))
+                        && r["last_sync_ms"].as_u64().is_some_and(|t| t > restarted_ms)
+                        && r["members"].as_array().is_some_and(|ms| {
+                            ms.iter().any(|m| {
+                                m["me"] == false
+                                    && m["last_sync_ms"].as_u64().is_some_and(|t| t > restarted_ms)
+                            })
+                        })
+                })
+            });
         if recorded {
             break;
         }
