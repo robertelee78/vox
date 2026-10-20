@@ -1654,7 +1654,10 @@ impl ChannelState {
         now: u64,
     ) -> Result<SessionRefresh> {
         let current = self.require_governance_ready(profile.store(), crate::time::Ms(now))?;
-        self.rotate_drive_if_lost(profile.store(), holders, crate::time::Ms(now), current)?;
+        // A rotation is work this turn did, whatever the refresh below finds (FX-24).
+        let rotated = !self
+            .rotate_drive_if_lost(profile.store(), holders, crate::time::Ms(now), current)?
+            .is_empty();
         let grant = self.refresh_grant(profile.store(), holders, owed)?;
         let public = self
             .entries
@@ -1793,7 +1796,11 @@ impl ChannelState {
         })();
         if progress.as_ref().is_err_and(floor_index::refreshing) {
             self.private_sessions.refresh = Some(work);
-            return Ok(SessionRefresh::Waiting("its Session index being refreshed"));
+            return Ok(if rotated {
+                SessionRefresh::Progressed
+            } else {
+                SessionRefresh::Waiting("its Session index being refreshed")
+            });
         }
         progress?;
         // Our own refresh copies change this generation; they do not invalidate their
