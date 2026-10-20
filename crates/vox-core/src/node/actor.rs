@@ -4802,17 +4802,31 @@ struct RoomPreparation {
     /// This turn did work (folded, opened a package, built a view): the next turn comes at
     /// once, whatever the words say, since the same words can cover many steps.
     progressed: bool,
-    /// Turns in a row that ended on the same words: past [`PREPARE_FAST_TURNS`] of them the
-    /// room is paced at [`PREPARE_WAIT`] whatever the step says, so a step that never finishes
-    /// cannot keep the actor busy (found 2026-10-20: "refreshing its Session records" re-ran at
-    /// 50 ms for hours on the decider's room, 174% of a core).
-    same_turns: u32,
+    /// Turns this preparation has ended without opening the room, whatever each said: past
+    /// [`PREPARE_FAST_TURNS`] of them the room is paced at [`PREPARE_WAIT`] however a step
+    /// classifies itself, so no step, and no pair of steps taking turns, can keep the actor
+    /// busy (found 2026-10-20: a step re-ran at 50 ms for hours on the decider's room, 174% of
+    /// a core).
+    turns: u32,
 }
 
-/// How many turns in a row a step may end on the same words at the fast retry before the room
-/// is paced at [`PREPARE_WAIT`]: enough for a bounded job of a few pages, not for one that
-/// never ends.
+/// How many turns a preparation gets at the fast retry before it is paced at [`PREPARE_WAIT`]:
+/// enough for a bounded job of a few pages, not for one that never ends. A long legitimate job
+/// then proceeds one bounded step a second, which a person waits out; a step that never ends
+/// then costs one turn a second, which nobody notices.
 const PREPARE_FAST_TURNS: u32 = 10;
+
+/// `VOX_TEST_PREPARE_HOLD_FILE`: while the named file exists, no room finishes preparing (each
+/// turn ends as a step that did work). Read only by a `test-knobs` build; a release `vox` holds
+/// nothing (#300).
+#[cfg(feature = "test-knobs")]
+pub const TEST_PREPARE_HOLD_ENV: &str = "VOX_TEST_PREPARE_HOLD_FILE";
+#[cfg(feature = "test-knobs")]
+fn prepare_held() -> bool {
+    std::env::var_os(TEST_PREPARE_HOLD_ENV)
+        .filter(|path| !path.is_empty())
+        .is_some_and(|path| std::path::Path::new(&path).exists())
+}
 
 /// A wait this long on one thing is said once in the daemon's log, so a person reading it
 /// after the fact sees what the room waited for, not only that it did.
@@ -4823,13 +4837,10 @@ impl RoomPreparation {
     /// wait keeps its start; a new one starts now and may be noted in the log again.
     fn wait_on(&mut self, what: &str, now_ms: u64) {
         match &self.waiting {
-            Some((was, _)) if was == what => {
-                self.same_turns = self.same_turns.saturating_add(1);
-            }
+            Some((was, _)) if was == what => {}
             _ => {
                 self.waiting = Some((what.to_owned(), now_ms));
                 self.waiting_noted = false;
-                self.same_turns = 0;
             }
         }
     }
@@ -4844,8 +4855,12 @@ impl RoomPreparation {
     /// that waits on a peer costs nothing meanwhile (FX-15).
     fn retry_after(&mut self, previous: Option<&(String, u64)>) -> Duration {
         let progressed = std::mem::take(&mut self.progressed);
+        self.turns = self.turns.saturating_add(1);
+        if self.turns > PREPARE_FAST_TURNS {
+            return PREPARE_WAIT;
+        }
         match (previous, &self.waiting) {
-            _ if progressed && self.same_turns < PREPARE_FAST_TURNS => PREPARE_RETRY,
+            _ if progressed => PREPARE_RETRY,
             (Some(before), Some(now)) if before == now => PREPARE_WAIT,
             _ => PREPARE_RETRY,
         }
@@ -18292,7 +18307,7 @@ impl Node {
                 waiting: None,
                 waiting_noted: false,
                 progressed: false,
-                same_turns: 0,
+                turns: 0,
                 channel: tokio::sync::Mutex::new(channel),
                 reply,
                 reopening,
@@ -18572,6 +18587,12 @@ impl Node {
         prepared: &mut RoomPreparation,
     ) -> crate::error::Result<bool> {
         let ch = prepared.channel.get_mut();
+        #[cfg(feature = "test-knobs")]
+        if prepare_held() {
+            // A step that never finishes, for the proof that the room's turns are paced.
+            prepared.progressed("a step held by a test knob", self.now_ms().get());
+            return Ok(false);
+        }
         if ch.legacy_startup_cleanup_blocks_current() {
             let profile = self.profile.as_ref().ok_or(Error::AtRestLocked)?;
             ch.advance_legacy_startup_cleanup(profile.store())?;
@@ -18676,7 +18697,15 @@ impl Node {
         // opened (found 2026-10-20, the decider's room, 20 h). One bounded step per turn here,
         // until nothing of that is pending.
         if ch.needs_session_upgrade() {
-            ch.advance_private_sessions(profile.store(), self.now_ms().get())?;
+            // An error here is said as the wait and tried again, paced: it never closes a room
+            // that was opening before this step existed.
+            if let Err(error) = ch.advance_private_sessions(profile.store(), self.now_ms().get()) {
+                prepared.wait_on(
+                    &format!("restoring its Sessions ({error})"),
+                    self.now_ms().get(),
+                );
+                return Ok(false);
+            }
             if ch.needs_session_upgrade() {
                 prepared.progressed("restoring its Sessions", self.now_ms().get());
                 return Ok(false);

@@ -1492,8 +1492,10 @@ const REOPENS_WITHIN: Duration = Duration::from_secs(20);
 /// again. The room MUST open within [`REOPENS_WITHIN`] and its rows read; while it prepares,
 /// `vox room list` names the wait.
 ///
-/// Mutant: the preparation turn no longer indexing the Sessions (the `advance_sessions` step
-/// in `retention_before_publication` removed) turns the opening claim red.
+/// Mutant: a preparation that never finishes (`retention_before_publication` ending every turn
+/// as a step that did work) turns the opening claim red. The restore step itself has no mutant
+/// here: this staging's Sessions need no restore (the room opens without the step), and the
+/// state that held the decider's room is not yet staged.
 #[cfg(feature = "optional-proofs")]
 #[test]
 #[ignore = "two starts of a real vox daemon and the shipped hook; optional, run it in release"]
@@ -1644,6 +1646,127 @@ fn a_room_with_its_own_session_records_opens_after_a_restart() {
         spent <= Duration::from_secs(1),
         "PRODUCT: the daemon spent {spent:?} of CPU in 10 s with one open quiet room (FX-15, #991)"
     );
+    drop(second);
+}
+
+/// `vox room list` MUST name a held preparation within this of the daemon's start.
+const HELD_NAMED_WITHIN: Duration = Duration::from_secs(5);
+/// How long the held room is watched.
+const HELD_IDLE: Duration = Duration::from_secs(30);
+/// CPU time the daemon may spend over [`HELD_IDLE`] on a step that never finishes: ten turns
+/// at the fast retry, then one a second (ADR-038 FX-15; #991).
+const HELD_CPU: Duration = Duration::from_millis(1500);
+
+/// A preparation step that never finishes costs the daemon one turn a second, not twenty
+/// (ADR-038 FX-15; #991). Staged with the prepare-hold knob: while its file exists every
+/// preparation turn ends as a step that did work, which is what the decider's room did for
+/// hours at 50 ms a turn. Within [`HELD_NAMED_WITHIN`] `vox room list` MUST name the step;
+/// over [`HELD_IDLE`] the daemon's CPU MUST grow by at most [`HELD_CPU`] while the room keeps
+/// naming it; once the file is removed the room MUST open within [`OPENS_WITHIN`].
+///
+/// Mutant: the pacing removed (`PREPARE_FAST_TURNS` made unreachable) turns the CPU claim red.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "half a minute of a real vox daemon on a held step, and a test-only knob; optional, run it in release"]
+fn a_preparation_step_that_never_finishes_costs_one_turn_a_second() {
+    test_knobs::require(&["VOX_TEST_PREPARE_HOLD_FILE"]);
+    watchdog::arm();
+    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("APPARATUS: no temp dir: {e}"));
+    let root = tmp.path();
+    let alice = root.join("alice");
+    std::fs::create_dir_all(alice.join("cfg"))
+        .unwrap_or_else(|e| panic!("APPARATUS: could not create {}: {e}", alice.display()));
+    let hold = root.join("prepare-hold");
+    let hold_path = hold
+        .to_str()
+        .expect("APPARATUS: a UTF-8 temp path")
+        .to_owned();
+    let knob = [("VOX_TEST_PREPARE_HOLD_FILE", hold_path.as_str())];
+    let (ok, _, err) = vox(&alice, &["id"], None);
+    assert!(ok, "PRODUCT: `vox id` failed: {err}");
+    let first = daemon_env(&alice, "alice", &knob);
+    attached(&alice, "alice");
+    let (ok, _, err) = vox(
+        &alice,
+        &["room", "create", "--passphrase-file", "-", "--name", "held"],
+        Some(&format!("{ROOMPASS}\n")),
+    );
+    assert!(
+        ok,
+        "PRODUCT: `vox room create` failed: {err}\nalice's daemon said: {}",
+        said(&alice, "alice")
+    );
+    let listed = attached(&alice, "alice");
+    let room = listed
+        .split_whitespace()
+        .find(|w| w.len() >= 8 && w.chars().all(|c| c.is_ascii_alphanumeric()))
+        .unwrap_or_else(|| panic!("PRODUCT: `vox room list` shows no room id: {listed}"))
+        .to_owned();
+    let (ok, out, err) = vox(&alice, &["room", "post", &room, "a row"], None);
+    assert!(ok, "PRODUCT: alice's post was refused: {out}{err}");
+    first.stop();
+    std::fs::write(&hold, b"").expect("APPARATUS: write the hold file");
+    let second = daemon_env(&alice, "alice", &knob);
+    let started = Instant::now();
+    loop {
+        let (ok, out, _) = vox(&alice, &["room", "list"], None);
+        let line = out
+            .lines()
+            .find(|l| l.trim_start().starts_with(&room))
+            .map(str::to_owned)
+            .unwrap_or_default();
+        if ok && line.contains("waiting for a step held by a test knob") {
+            println!("[proof] {:?} after the start: {line}", started.elapsed());
+            break;
+        }
+        if ok && !line.is_empty() && !line.contains("[preparing") {
+            panic!("APPARATUS: the prepare-hold knob did not hold the room: {line}");
+        }
+        assert!(
+            started.elapsed() < HELD_NAMED_WITHIN,
+            "PRODUCT: `vox room list` does not name the held step within {HELD_NAMED_WITHIN:?} \
+             (#991): {line:?}\nalice's daemon said: {}",
+            said(&alice, "alice")
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let pid = second.0.id();
+    let cpu0 = cpu_time(pid);
+    std::thread::sleep(HELD_IDLE);
+    let spent = cpu_time(pid).saturating_sub(cpu0);
+    let (_, out, _) = vox(&alice, &["room", "list"], None);
+    println!("[proof] over {HELD_IDLE:?} the held step cost the daemon +{spent:?} of CPU (bound {HELD_CPU:?}); the list says: {}", out.trim());
+    assert!(
+        out.contains("waiting for a step held by a test knob"),
+        "PRODUCT: after {HELD_IDLE:?} the room no longer names its held step (#991): {out}"
+    );
+    assert!(
+        spent <= HELD_CPU,
+        "PRODUCT: a preparation step that never finishes cost the daemon {spent:?} of CPU over \
+         {HELD_IDLE:?} (ADR-038 FX-15, #991; bound {HELD_CPU:?}): its turns are not paced"
+    );
+    std::fs::remove_file(&hold).expect("APPARATUS: remove the hold file");
+    let released = Instant::now();
+    loop {
+        let (ok, out, _) = vox(&alice, &["room", "list"], None);
+        let line = out
+            .lines()
+            .find(|l| l.trim_start().starts_with(&room))
+            .map(str::to_owned)
+            .unwrap_or_default();
+        if ok && !line.is_empty() && !line.contains("[preparing") {
+            println!(
+                "[proof] {:?} after the hold ended the room is open: {line}",
+                released.elapsed()
+            );
+            break;
+        }
+        assert!(
+            released.elapsed() < OPENS_WITHIN,
+            "PRODUCT: the room did not open within {OPENS_WITHIN:?} after its held step ended (#991): {line:?}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
     drop(second);
 }
 
