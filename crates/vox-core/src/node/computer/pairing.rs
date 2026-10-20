@@ -273,6 +273,7 @@ struct Exchanged {
 struct Attempt {
     me: Arc<Management>,
     peer: Digest32,
+    serial: u64,
     revision: u64,
     involved: bool,
     recorded: bool,
@@ -289,6 +290,9 @@ impl Attempt {
 
 /// One exchange in flight: the state it carries, so a later change can cut it, and how.
 struct Flight {
+    /// This flight, as distinct from any later one with the same computer: an abort handle is
+    /// installed, and a reservation released, only for the flight that owns them.
+    serial: u64,
     revision: u64,
     involved: bool,
     /// Who started it: the retry, or the operator's pairing command.
@@ -297,6 +301,12 @@ struct Flight {
     /// Cut because this node changed meanwhile: its end is no failure, and the next tick
     /// exchanges again. Read and cleared with the flight's removal, under the one lock.
     superseded: bool,
+}
+
+/// The next flight's serial.
+fn next_flight() -> u64 {
+    static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Who started an exchange in flight.
@@ -312,6 +322,7 @@ enum Origin {
 struct Reserved {
     me: Arc<Management>,
     peer: Digest32,
+    serial: u64,
     abort: Option<tokio::task::AbortHandle>,
 }
 
@@ -320,7 +331,13 @@ impl Drop for Reserved {
         if let Some(abort) = &self.abort {
             abort.abort();
         }
-        lock(&self.me.inflight).remove(&self.peer);
+        let mut inflight = lock(&self.me.inflight);
+        if inflight
+            .get(&self.peer)
+            .is_some_and(|f| f.serial == self.serial)
+        {
+            inflight.remove(&self.peer);
+        }
     }
 }
 
@@ -328,9 +345,15 @@ impl Drop for Attempt {
     fn drop(&mut self) {
         // Removed and read in one step under the one lock: a mark set after this cannot
         // linger on a later flight.
-        let superseded = lock(&self.me.inflight)
-            .remove(&self.peer)
-            .is_some_and(|flight| flight.superseded);
+        let superseded = {
+            let mut inflight = lock(&self.me.inflight);
+            match inflight.get(&self.peer) {
+                Some(flight) if flight.serial == self.serial => inflight
+                    .remove(&self.peer)
+                    .is_some_and(|flight| flight.superseded),
+                _ => false,
+            }
+        };
         if !self.recorded && !superseded {
             self.me.record_exchange(
                 self.peer,
@@ -768,6 +791,7 @@ impl Management {
         // is cut (as no failure) and its reservation waited for, briefly; another operator
         // pairing in flight is reported.
         let waited = std::time::Instant::now();
+        let serial = next_flight();
         loop {
             {
                 let mut inflight = lock(&self.inflight);
@@ -776,6 +800,7 @@ impl Management {
                         inflight.insert(
                             target,
                             Flight {
+                                serial,
                                 revision,
                                 involved: true,
                                 origin: Origin::Operator,
@@ -811,6 +836,7 @@ impl Management {
         let mut reserved = Reserved {
             me: Arc::clone(self),
             peer: target,
+            serial,
             abort: None,
         };
         // Bounded like any exchange, by the same generous bound: a slow but valid handshake
@@ -825,7 +851,9 @@ impl Management {
         });
         reserved.abort = Some(task.abort_handle());
         if let Some(flight) = lock(&self.inflight).get_mut(&target) {
-            flight.abort = Some(task.abort_handle());
+            if flight.serial == serial {
+                flight.abort = Some(task.abort_handle());
+            }
         }
         let (paired, superseded) = match task.await {
             Ok(Ok(paired)) => (paired, false),
@@ -1859,6 +1887,7 @@ impl Management {
                     inflight.insert(
                         *peer,
                         Flight {
+                            serial: next_flight(),
                             revision,
                             involved: involved == Some(*peer),
                             origin: Origin::Retry,
@@ -1869,8 +1898,19 @@ impl Management {
                     true
                 });
             }
-            let attempted: Vec<(Digest32, bool)> =
-                peers.iter().map(|p| (*p, involved == Some(*p))).collect();
+            let attempted: Vec<(Digest32, bool, u64)> = {
+                let inflight = lock(&self.inflight);
+                peers
+                    .iter()
+                    .map(|p| {
+                        (
+                            *p,
+                            involved == Some(*p),
+                            inflight.get(p).map_or(0, |f| f.serial),
+                        )
+                    })
+                    .collect()
+            };
             let peers = peers
                 .into_iter()
                 .map(|peer| {
@@ -1897,14 +1937,16 @@ impl Management {
         };
         for (peer, endpoints, url) in peers {
             let me = Arc::clone(self);
-            let involved = attempted
+            let (involved, serial) = attempted
                 .iter()
-                .any(|(p, involved)| *p == peer && *involved);
+                .find(|(p, _, _)| *p == peer)
+                .map_or((false, 0), |(_, involved, serial)| (*involved, *serial));
             // The guard exists before the task does and travels with it: a task cut before
             // its first poll drops the guard all the same, so no reservation ever leaks.
             let guard = Attempt {
                 me: Arc::clone(self),
                 peer,
+                serial,
                 revision,
                 involved,
                 recorded: false,
@@ -1925,8 +1967,12 @@ impl Management {
                     };
                 guard.done(outcome);
             });
+            // Installed on this flight only: a flight that ended and was replaced meanwhile
+            // never receives a handle to a task that is not its own.
             if let Some(flight) = lock(&self.inflight).get_mut(&peer) {
-                flight.abort = Some(task.abort_handle());
+                if flight.serial == serial {
+                    flight.abort = Some(task.abort_handle());
+                }
             }
         }
         Ok(())
