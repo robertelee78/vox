@@ -2755,8 +2755,7 @@ impl VoxClient {
         let view = view.map(|view| view.core()).transpose()?;
         on_held!(self, |c| {
             let actor = c.me().ok_or_else(not_attached)?;
-            let names = names(c).await?;
-            let (fence, (rows, older, provisional)) = under_fence!(
+            let (fence, (names, rows, older, provisional)) = under_fence!(
                 c,
                 channel_id,
                 actor,
@@ -2767,6 +2766,7 @@ impl VoxClient {
                             "The saved room changed. Open its current page again.",
                         ));
                     }
+                    let names = names(c).await?;
                     let request = match view.clone() {
                         Some(view) => Request::RoomViewPage {
                             channel_id,
@@ -2790,7 +2790,7 @@ impl VoxClient {
                         other => return Err(unexpected(&other)),
                     };
                     room_window_bytes(&rows)?;
-                    (rows, older, provisional)
+                    (names, rows, older, provisional)
                 }
             );
             let me = b32_encode(&actor);
@@ -2839,8 +2839,7 @@ impl VoxClient {
             if let Some(view) = view {
                 return room_view_selection(c, channel_id, view, actor, instance, &entries).await;
             }
-            let names = names(c).await?;
-            let (_, mut found) = under_fence!(
+            let (_, (names, mut found)) = under_fence!(
                 c,
                 channel_id,
                 actor,
@@ -2851,6 +2850,7 @@ impl VoxClient {
                             "The saved room changed. Open its current page again.",
                         ));
                     }
+                    let names = names(c).await?;
                     let mut found = HashMap::new();
                     let mut bytes = 0usize;
                     for chunk in entries.chunks(vox_core::node::ipc::MAX_FIND) {
@@ -2883,7 +2883,7 @@ impl VoxClient {
                             found.insert(row.entry_hash, row);
                         }
                     }
-                    found
+                    (names, found)
                 }
             );
             let me = b32_encode(&actor);
@@ -4256,8 +4256,7 @@ impl VoxClient {
             .transpose()?;
         on_held!(self, |c| {
             let actor = c.me().ok_or_else(not_attached)?;
-            let names = names(c).await?;
-            let (fence, (rows, before, after)) = under_fence!(
+            let (fence, (names, rows, before, after)) = under_fence!(
                 c,
                 channel_id,
                 actor,
@@ -4268,6 +4267,7 @@ impl VoxClient {
                             "The saved room changed. Open its current thread again.",
                         ));
                     }
+                    let names = names(c).await?;
                     let (rows, before, after) = match ask(
                         c,
                         &Request::ThreadPage {
@@ -4287,7 +4287,7 @@ impl VoxClient {
                         other => return Err(unexpected(&other)),
                     };
                     room_window_bytes(&rows)?;
-                    (rows, before, after)
+                    (names, rows, before, after)
                 }
             );
             let me = b32_encode(&actor);

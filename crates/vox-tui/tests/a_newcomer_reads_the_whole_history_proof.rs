@@ -1649,10 +1649,19 @@ fn a_room_with_its_own_session_records_opens_after_a_restart() {
     );
     std::thread::sleep(Duration::from_secs(10));
     let drivable = |json: &str| json.lines().any(|l| l.contains("\"can_drive\":true"));
-    // Precondition: alice drives no Session yet (the pass his key scheduled did not run).
-    let (ok, json, _) = vox(&alice, &["room", "sessions", &room, "--json"], None);
+    // Precondition: alice's listing answers, and she drives no Session yet (the pass his key
+    // scheduled did not run).
+    let (ok, json, err) = vox(&alice, &["room", "sessions", &room, "--json"], None);
     assert!(
-        !(ok && drivable(&json)),
+        ok,
+        "APPARATUS (staging): `vox room sessions --json` refused while held: {json}{err}"
+    );
+    println!(
+        "[proof] alice's Sessions while her policy is held: {}",
+        json.trim()
+    );
+    assert!(
+        !drivable(&json),
         "APPARATUS (staging): alice already drives a Session while her policy is held, so \
          nothing is left pending for the restart:\n{json}"
     );

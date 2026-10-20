@@ -205,9 +205,6 @@ pub struct Store {
     /// handle, and the lock with it — never before, which let a vox waiting for the lock open a
     /// store the other was still closing and be refused.
     _lock: Option<std::fs::File>,
-    /// How many batches this store has committed since it was opened. A bounded step of work
-    /// commits a batch; a turn that committed none did nothing (ADR-038 FX-24).
-    commits: std::sync::atomic::AtomicU64,
 }
 
 /// How the store's file is open.
@@ -261,7 +258,6 @@ impl Store {
         let db = open_database(path).map_err(open_error)?;
         super::paths::set_private_file_mode(path)?;
         let store = Self {
-            commits: std::sync::atomic::AtomicU64::new(0),
             db: RwLock::new(Backing::Writable(db)),
             path: path.to_owned(),
             _lock: None,
@@ -284,7 +280,6 @@ impl Store {
             Err(_) => return Self::open(path),
         };
         let store = Self {
-            commits: std::sync::atomic::AtomicU64::new(0),
             db: RwLock::new(Backing::ReadOnly(db)),
             path: path.to_owned(),
             _lock: None,
@@ -773,11 +768,6 @@ impl Store {
         Ok(out)
     }
 
-    /// How many batches this store has committed since it was opened (see the field).
-    pub fn commits(&self) -> u64 {
-        self.commits.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
     /// Begin an atomic multi-write batch. Nothing is visible until
     /// [`Batch::commit`]; a dropped batch writes nothing.
     pub fn batch(&self) -> Result<Batch<'_>> {
@@ -1182,11 +1172,6 @@ impl Batch<'_> {
 
     /// Commit every queued write atomically and durably.
     pub fn commit(self) -> Result<()> {
-        let Batch { txn, _store } = self;
-        txn.commit().map_err(storage("commit"))?;
-        _store
-            .commits
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(())
+        self.txn.commit().map_err(storage("commit"))
     }
 }

@@ -49,6 +49,18 @@ fn private_policy_held() -> bool {
         .is_some_and(|path| std::path::Path::new(&path).exists())
 }
 
+/// What one bounded step of a room's private-Session work was; see
+/// `ChannelState::advance_private_sessions_step`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SessionAdvance {
+    /// Work this turn did; more may remain.
+    Advanced,
+    /// Nothing could be done yet: the policy, the floor index or a peer's control receipt.
+    Waiting,
+    /// Nothing is left.
+    Complete,
+}
+
 impl LegacyPending {
     pub(super) fn insert(&mut self, _hash: Digest32) {
         self.0 = true;
@@ -1121,18 +1133,32 @@ impl ChannelState {
 
     /// Also driven by ordinary maintenance, before Session projection or grant release.
     pub(crate) fn advance_private_sessions(&mut self, store: &Store, now: u64) -> Result<bool> {
+        let step = self.advance_private_sessions_step(store, now)?;
+        Ok(matches!(step, SessionAdvance::Complete) && !self.needs_session_upgrade())
+    }
+
+    /// One bounded step of the private-Session work, and what it was: work this turn did
+    /// (`Advanced`), nothing it could do yet (`Waiting`: its policy, floor index or a peer's
+    /// control receipt), or nothing left (`Complete`). Room-local, so a preparation turn is
+    /// reported as what it did, never by what else the store saw (ADR-038 FX-24).
+    pub(crate) fn advance_private_sessions_step(
+        &mut self,
+        store: &Store,
+        now: u64,
+    ) -> Result<SessionAdvance> {
         if !self.private_policy_ready(store, now)? {
-            return Ok(false);
+            return Ok(SessionAdvance::Waiting);
         }
         if self.poisoned {
             return Err(self.save_failure());
         }
         if self.private_sessions.upgrading {
-            return Ok(false);
+            return Ok(SessionAdvance::Waiting);
         }
         let result = (|| {
             if self.private_sessions.restoring {
-                return self.restore_private_chunk(store);
+                self.restore_private_chunk(store)?;
+                return Ok(SessionAdvance::Advanced);
             }
             if !self.current_session_controls_ready(store)? {
                 // Old sealed author maps and an actually contiguous legacy/current feed still
@@ -1141,29 +1167,38 @@ impl ChannelState {
                 // control receipt instead of spinning this legacy reader.
                 if !self.legacy_private_controls_ready(store)? {
                     self.advance_private_controls(store)?;
+                    return Ok(SessionAdvance::Advanced);
                 }
-                return Ok(false);
+                return Ok(SessionAdvance::Waiting);
             }
             if self.private_sessions.legacy_work.is_some()
                 || !self.private_sessions.legacy_pending.is_empty()
             {
                 if !self.legacy_private_controls_ready(store)? {
                     self.advance_private_controls(store)?;
-                    return Ok(false);
+                    return Ok(SessionAdvance::Advanced);
                 }
                 self.migrate_legacy_steps_inner(store, now)?;
-                return Ok(false);
+                return Ok(SessionAdvance::Advanced);
             }
+            let was_pending = self.private_sessions.pending_active;
             if !self.advance_pending_private(store, now)? {
-                return Ok(false);
+                return Ok(SessionAdvance::Waiting);
             }
             self.sweep_private_sessions(store, now)?;
-            self.private_expiry_ready(store, now)
+            if self.private_expiry_ready(store, now)? {
+                return Ok(SessionAdvance::Complete);
+            }
+            Ok(if was_pending {
+                SessionAdvance::Advanced
+            } else {
+                SessionAdvance::Waiting
+            })
         })();
         if let Err(error) = &result {
             self.private_save_failed(error);
         }
-        result.map(|complete| complete && !self.needs_session_upgrade())
+        result
     }
 
     pub(super) fn supports_private(&mut self, store: &Store, peer: &Digest32) -> Result<bool> {
