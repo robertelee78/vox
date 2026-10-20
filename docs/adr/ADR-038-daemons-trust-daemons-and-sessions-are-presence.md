@@ -3,7 +3,9 @@
 - **Status**: Proposed, after v0.4.6. The decider's product rulings of 2026-10-19 (one question
   at a time, quoted below) are the requirements; nothing here is built. Each requirement lands
   with its proof (ADR-018) in a small release (FX-19).
-- **Date**: 2026-10-19; amended 2026-10-20 (FX-22–FX-27, the daemon's CPU)
+- **Date**: 2026-10-19; amended 2026-10-20 (FX-22–FX-27, the daemon's CPU); amended
+  2026-10-20 (FX-28–FX-32: the idle daemon's disk and CPU, measured on v0.4.9, and the own-feed
+  recovery ruling of 2026-10-19)
 - **Deciders**: Robert E. Lee
 - **Tags**: trust, daemon identity, sessions, presence, agent comms, sync, health, releases
 - **Related**: ADR-018, ADR-020, ADR-026, ADR-029, ADR-031, ADR-033, ADR-034, ADR-035, ADR-036,
@@ -183,19 +185,22 @@ The decider then answered twelve questions, one at a time. His answers are the d
   MUST run on the VM setup (the macOS guests of the v0.4.4 app-proof work), not on his working
   Macs ("use the VM stuffs so I'm not losing ability to use my macs").
 - **FX-21.** Every product requirement above (FX-1–FX-10, FX-12–FX-18, FX-22–FX-24, FX-26,
-  FX-27) lands with a proof that drives the shipped `vox` binary as a person would, with a
-  mutant that turns it red on its own assertion (ADR-018). The two-computer requirements
+  FX-27, FX-28–FX-32) lands with a proof that drives the shipped `vox` binary as a person
+  would, with a mutant that turns it red on its own assertion (ADR-018). The two-computer requirements
   (FX-2–FX-7) are proved by two daemons in two data roots on one machine. FX-11's design, FX-19,
   FX-20 and FX-25 are process rulings: FX-19's record is each closed release milestone, FX-20's
   is the walkthrough's defect record, FX-11's is the amendment it produces, and FX-25's is each
   release's asset list.
 - **FX-22.** A governance question about a room (who may read whom, who has consented, what a
-  member offers) MUST cost no store read and no decrypt when the room's governance has not
-  changed since the question was last answered. Decision: the room keeps its folded consent facts
-  in memory as a semantic projection (per author, the readers it consented to and its reset
-  sequence), never a store snapshot, page or row vector, so the index's bounded-turn rule
-  stands; the sealed index remains the only durable representation, and a restart loads the
-  projection from the index and the entries it names, never by replaying the log. Measured
+  member offers) MUST read nothing from the store but the governance index's header, and decrypt
+  no fact or entry, when the room's governance has not changed since the question was last
+  answered. Decision: the room keeps its folded consent facts in memory as a semantic projection
+  (per author, the readers it consented to and its reset sequence), never a store snapshot, page
+  or row vector, so the index's bounded-turn rule stands; the index header's revision, which
+  moves with every change to the index, says whether the projection is current, so no
+  in-process bookkeeping can miss a write; the sealed index remains the only durable
+  representation, and a restart loads the projection from the index and the entries it names,
+  never by replaying the log. Measured
   cause, 2026-10-20 (the decider's daemon, vox 0.4.7; `ps` 155–170% of a core; two 10 s `sample`
   runs, 13,558 busy samples each, about 1.36 cores): 72% of all busy CPU was the status
   publication and 44% of all busy CPU was `trusted_by`, which opened a fresh view (a store
@@ -236,6 +241,60 @@ The decider then answered twelve questions, one at a time. His answers are the d
   rule and stands unchanged. Ruling: "caps on cpu seem like … footguns", "we need to understand
   what is driving the cpu inefficiency rather than capping the cpu" (the decider, 2026-10-20,
   rejecting a ten-fast-turns-then-one-a-second cap proposed for FX-24's cause).
+- **FX-28.** The daemon MUST reconcile a node's computer trust (ADR-035) only when something it
+  depends on has changed: the computer policy's revision, a node attaching or detaching, or the
+  roster of paired computers; never on a timer, and a node's binding MUST be derived once per
+  revision, not once per question. Measured cause, 2026-10-20 (the decider's daemon, vox 0.4.9,
+  four nodes Ready in eleven rooms, no room gaining an entry; `ps` 0.63 of a core at steady
+  state; two 10 s `sample` runs symbolized from the release symbols, FX-25): 21–24% of the busy
+  CPU was `prepare_computer_binding` → `Computer::bind_node` (`State::derive` and
+  `Binding::verify`: an ML-DSA verification of every management event, `CompositePublicKey::from_bytes`
+  expanding the key for each), reached from a 1 s `tokio::time::interval` in the host's
+  `follow_computer_trust` that calls `reconcile_computer()` for every attached node every second
+  and then `record_application()`, which derives again; a further 6–8% was the app's polling
+  re-deriving the same state per control answer (`individual_trust_eligibility` →
+  `Computer::capability` → `Binding::verify`). Four nodes, nothing changed.
+- **FX-29.** A sync round that brings this node nothing MUST write nothing durable. A hint for an
+  author whose head this node already holds, or whose missing pages the peer has said it does
+  not hold, MUST NOT be pulled again each period; a head or header already held MUST NOT be
+  saved again; and a verifier's progress MUST be persisted once per proof it completes, never
+  once per Merkle join (a proof is bounded and is verified again from its bytes after a crash).
+  Measured cause, the same daemon: 1,367 durable store commits per second across the four node
+  stores (redb transaction ids read 30 s apart: robert-work 524/s, opencode-work 495/s, codex-work
+  197/s, claude-work 151/s; robert-work's store at transaction 20.4 million) with no room gaining
+  an entry. By site, ≈64% of commit wall time was `history_stream::admission::advance` committing
+  the context and the cursor after every `Progress` step of `ControlRangeVerifier` and
+  `InclusionVerifier` (a `WorkBudget` of 4 signatures or 32 descriptors; the step's own CPU was 65
+  of 4,152 samples, the rest the flush), ≈16% `admission::stage` saving every hinted author's head
+  and headers whether or not held, ≈8% the private Session pull that runs with each sync.
+  `offer_inventory` re-offers every hint that is not `held` (committed head, control readiness and
+  a complete live window all at the hint), and a held one again when `missing_page` finds a
+  position within the last page, so an author whose missing bodies no peer holds any more (his
+  rooms are sparse: 200, 188 and 76 of one room's entries on three nodes) is pulled again from
+  every peer every period: 3.67 syncs per second over 39 peer-room pairs, a median 11 s between
+  two syncs of one pair, about 370 commits per sync.
+- **FX-30.** Only what a person would lose MUST be committed with a full flush to disk: a node's
+  own entries and content, consent, trust, keys, Session records and the format marker. Derived
+  sync state (heads and headers already held, verifier contexts, cursors, live windows, client
+  cursors) MUST be committed without `F_FULLFSYNC` (redb `Durability::None` or `Eventual`; a later
+  durable commit carries it to disk), because it is rebuilt from the proofs and the peers after
+  a crash. Measured cause, the same daemon: every `Batch::commit` is redb `Durability::Immediate`
+  → `sync_data` → `fcntl(F_FULLFSYNC)` (vox-core never calls `set_durability`); the process spent
+  0.65 thread-seconds per wall second inside `F_FULLFSYNC` (about 0.5 ms per call back to back;
+  an isolated 8 KiB probe cost 7.6 ms), and that flush was most of the 1,367 commits' cost.
+- **FX-31.** A room's publication, a read, a post and an attention selection MUST NOT wait on a
+  disk flush: no commit's flush runs while the room's lock is held. Measured cause, the same
+  daemon: every commit ran inside `history_write` with the room mutex held (the `read_charged`
+  closure owns the `lock_owned()` guard), so the daemon log said `room publication is busy; retry
+  this operation` 424 times and `attention selection remains pending`, and the app's member list
+  flickered (#983).
+- **FX-32.** A node that finds a member holding more of its own feed than it does (a restored
+  older profile, ADR-037 R5) MUST recover its own entries from that member, each verified under
+  its own key and chain, and MUST keep reading meanwhile: "yes can supplement if signed/done
+  correctly" (the decider, 2026-10-19). Writes stay refused until the own feed is current again,
+  and resume then; the daemon says once that it recovered and from whom. Measured before this: a
+  restored node refused its writes correctly and never read the member's next post (the restarts
+  proof, step 5, 2026-10-19).
 
 ## Unchanged rulings
 
@@ -257,6 +316,9 @@ Narrow successor amendments. Requirements not named here remain in force.
 | ADR-020 4.11 (the ask and answer vocabulary) | An undirected ask is answered per Session that finds it relevant, without cross-replies; an addressed ask by its addressee (FX-13) |
 | ADR-036 legacy history recovery (Legacy history required, resume, cancel, cached-only reads) | Deleted (FX-18) |
 | ADR-037 R7, R11: event-driven gates; a turn may run several chunks, never a cycle | FX-15 adds: no round without a nameable need; a no-progress, no-wait round retires; a hint for a held head finishes on arrival |
+| ADR-037 R5: a member's higher own head marks the room "own history behind"; every write refuses until resolved | FX-32 says what resolves it: the node recovers its own entries from that member (verified under its own key), keeps reading, and writes again once current |
+| ADR-035 CT-9, CT-14: computer-trust changes are reconciled, idempotently and recoverably | Preserved; FX-28 adds when: on a change, never on a timer, one derivation per revision |
+| ADR-025 D7 and ADR-037 R7: the periodic request is the only cadence; a port runs a round only on a need | Preserved; FX-29–FX-31 add what a round may cost: a round that brings nothing writes nothing, derived sync state is not flushed to disk, and no flush holds a room's lock |
 | ADR-034 §5 "Health is true" (HL-1, HL-2), PRD-001 R35 | The lane's completed rounds are completed syncs (FX-16); the control socket answers under sync load (FX-17) |
 
 ## Implementation order and related work
@@ -271,6 +333,9 @@ Narrow successor amendments. Requirements not named here remain in force.
 7. FX-24, FX-26, FX-27, FX-23, FX-22, FX-25: the daemon's CPU under real rooms, measured on
    the decider's daemon on 2026-10-20, in that order (the trigger, the cipher, the design, the
    symbols); one cut (v0.4.8).
+8. FX-28, FX-29, FX-30, FX-31: the idle daemon's disk and CPU, measured on the decider's
+   daemon (v0.4.9) on 2026-10-20, in that order (the tick, the re-pull, the flush, the lock);
+   FX-32 under #934; one cut (v0.4.10).
 
 Each ADR change under this record is reviewed by an independent session (opencode-work) before
 its stories are extracted.
