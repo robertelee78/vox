@@ -190,7 +190,8 @@ F-9–F-11; RR-1, RR-3, RR-4 (RR-2 is the daemon's); D-3; L-1–L-10; W-1–W-6;
   path that sets a bundle aside (publish, retirement, recovery) the updater MUST keep it as no
   application: its `Info.plist` set aside under another name until a rollback restores it, so
   LaunchServices cannot register it even when an app still running from it quits, and any record
-  already made unregistered. Opening Vox from the Dock, Spotlight, Launchpad or by its identifier
+  already made unregistered, tried again at each later transition until it is gone. Opening Vox
+  from the Dock, Spotlight, Launchpad or by its identifier
   then opens the current bundle; a rollback makes the bundle it swaps back in an application
   again before the swap. Each release's `CFBundleVersion` MUST grow with its version. Measured 2026-10-19:
   both bundles were registered as `us.vox.app` with the same `CFBundleVersion`, LaunchServices

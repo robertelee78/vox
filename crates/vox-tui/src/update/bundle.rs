@@ -167,12 +167,20 @@ pub(super) fn rollback(apps: &Path, exe: &Path) -> Result<(), AppError> {
     restore(&previous)?;
     if let Err(failed) = swap(&previous, &active) {
         // Nothing was swapped: the kept bundle is set aside again, never left an application.
-        let _ = set_aside(&previous);
-        return Err(failed);
+        return Err(match set_aside(&previous) {
+            Ok(()) => failed,
+            Err(aside) => AppError::Usage(format!(
+                "the rollback swap failed ({failed}), and {aside}; run `vox update` to repair, \
+                 and until then open Vox as {}",
+                active.display()
+            )),
+        });
     }
     sync_dir(apps)?;
     set_aside(&previous)?;
-    launch_services(true, &active);
+    if let Err(said) = launch_services(true, &active) {
+        println!("note: {said}; the current Vox.app is in place and opens by path");
+    }
     let now = app_version(&active).unwrap_or_else(|| "unknown".to_owned());
     println!("rolled back: {} -> Vox {now}", active.display());
     println!(
@@ -230,7 +238,9 @@ fn publish(apps: &Path, version: &str) -> Result<(), AppError> {
     fs::rename(&staged, &previous).map_err(AppError::Io)?;
     sync_dir(apps)?;
     let aside = set_aside(&previous);
-    launch_services(true, &apps.join(BUNDLE));
+    if let Err(said) = launch_services(true, &apps.join(BUNDLE)) {
+        println!("note: {said}; the current Vox.app is in place and opens by path");
+    }
     // The bundle that was previous before this publish goes, unless something still runs from
     // it: then it is retired, and a later transition removes it (see [`sweep`]).
     let older = journal.join(BUNDLE);
@@ -271,10 +281,11 @@ fn retire(apps: &Path, bundle: &Path) -> Result<(), AppError> {
 /// record a running app may still re-register when it quits. Best effort: a refusal is said,
 /// not fatal. Measured 2026-10-19: both bundles registered as `us.vox.app` with the same
 /// CFBundleVersion, and reopening Vox launched the replaced 0.4.4 against the 0.4.6 daemon.
-fn launch_services(register: bool, bundle: &Path) {
+fn launch_services(register: bool, bundle: &Path) -> Result<(), String> {
     const LSREGISTER: &str = "/System/Library/Frameworks/CoreServices.framework/Frameworks/\
                               LaunchServices.framework/Support/lsregister";
     let flag = if register { "-f" } else { "-u" };
+    let verb = if register { "register" } else { "release" };
     match Command::new(LSREGISTER)
         .arg(flag)
         .arg(bundle)
@@ -283,16 +294,15 @@ fn launch_services(register: bool, bundle: &Path) {
         .stderr(std::process::Stdio::null())
         .status()
     {
-        Ok(status) if status.success() => {}
-        Ok(status) => println!(
-            "note: LaunchServices did not {} {} ({status}); open Vox as /Applications/Vox.app",
-            if register { "register" } else { "release" },
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(format!(
+            "LaunchServices did not {verb} {} ({status})",
             bundle.display()
-        ),
-        Err(e) => println!(
-            "note: LaunchServices was not told about {}: {e}; open Vox as /Applications/Vox.app",
+        )),
+        Err(e) => Err(format!(
+            "LaunchServices was not told to {verb} {}: {e}",
             bundle.display()
-        ),
+        )),
     }
 }
 
@@ -303,14 +313,19 @@ fn launch_services(register: bool, bundle: &Path) {
 const KEPT_INFO_PLIST: &str = "Contents/Info.plist.kept";
 const INFO_PLIST: &str = "Contents/Info.plist";
 
-/// Set a replaced or retired bundle aside: out of LaunchServices while it is still a bundle, then
-/// no `Info.plist`. The rename is the guarantee; the record removal is the second measure.
+/// Set a replaced or retired bundle aside: its LaunchServices record removed, then no
+/// `Info.plist`. The rename is the guarantee (a folder without `Contents/Info.plist` is no
+/// application, whatever record remains); the record removal is the second measure, said when it
+/// fails and tried again by every later transition that finds the bundle still there (`sweep`,
+/// `recover`, the next publish), until it succeeds.
 fn set_aside(bundle: &Path) -> Result<(), AppError> {
+    if let Err(said) = launch_services(false, bundle) {
+        println!("note: {said}; tried again at the next update or rollback");
+    }
     let plist = bundle.join(INFO_PLIST);
     if !plist.is_file() {
         return Ok(());
     }
-    launch_services(false, bundle);
     fs::rename(&plist, bundle.join(KEPT_INFO_PLIST)).map_err(|e| {
         AppError::Usage(format!(
             "{} is still an application: its Info.plist could not be set aside ({e})",
@@ -395,10 +410,11 @@ fn recover(apps: &Path) -> Result<(), AppError> {
     sweep(apps)?;
     let journal = apps.join(PUBLISHING);
     if fs::symlink_metadata(&journal).is_err() {
-        // No publish was cut short. A previous bundle an earlier release left as an application
-        // (before M-29a) is still set aside now, under the lock.
+        // No publish was cut short. A previous bundle is set aside again under the lock: one an
+        // earlier release left as an application (before M-29a), or one whose record removal
+        // failed last time.
         let previous = apps.join(PREVIOUS);
-        if previous.join(INFO_PLIST).is_file() {
+        if fs::symlink_metadata(&previous).is_ok() {
             set_aside(&previous)?;
         }
         return Ok(());
@@ -424,9 +440,9 @@ fn recover(apps: &Path) -> Result<(), AppError> {
     if fs::symlink_metadata(&previous).is_err() && fs::symlink_metadata(&kept).is_ok() {
         fs::rename(&kept, &previous).map_err(AppError::Io)?;
     }
-    // A previous bundle an earlier release left as an application (before M-29a) is set aside
-    // now, under the lock, before anything else reads `apps`.
-    if previous.join(INFO_PLIST).is_file() {
+    // The previous bundle is set aside again under the lock, before anything else reads `apps`:
+    // one an earlier release left as an application, or one whose record removal failed.
+    if fs::symlink_metadata(&previous).is_ok() {
         set_aside(&previous)?;
     }
     sync_dir(apps)?;
