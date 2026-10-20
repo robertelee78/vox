@@ -1668,7 +1668,8 @@ const CHATTY_EVERY: Duration = Duration::from_millis(200);
 /// [`CHATTY_EVERY`] so her actor is woken as his is. Within [`HELD_NAMED_WITHIN`] `vox room
 /// list` MUST name the step; over [`HELD_IDLE`] the held step MUST add at most [`HELD_EXTRA`]
 /// to the daemon's CPU beyond the same window with nothing held, while the room keeps naming
-/// it; once the file is removed the room MUST open within [`OPENS_WITHIN`].
+/// it and the daemon's log says after 30 s that it still waits (a turn wrote it: paced, not
+/// stopped); once the file is removed the room MUST open within [`OPENS_WITHIN`].
 ///
 /// Mutant: the pacing removed (`PREPARE_FAST_TURNS` made unreachable) turns the CPU claim red.
 #[cfg(feature = "optional-proofs")]
@@ -1846,6 +1847,15 @@ fn a_preparation_step_that_never_finishes_costs_one_turn_a_second() {
         "PRODUCT: a preparation step that never finishes cost the daemon {extra:?} of CPU beyond \
          the same window with nothing held, over {HELD_IDLE:?} (ADR-038 FX-15, #991; bound \
          {HELD_EXTRA:?}): its turns are not paced"
+    );
+    // Paced, not stopped: a turn after 30 s of the same wait writes the daemon's log note, so
+    // the note is the person's sign that the room still takes its turns.
+    let log = std::fs::read_to_string(alice.join(".daemon/log")).unwrap_or_default();
+    assert!(
+        log.lines()
+            .any(|l| { l.contains("is still preparing: it waits for a step held by a test knob") }),
+        "PRODUCT: after {HELD_IDLE:?} the daemon's log never said the room still waits on its \
+         held step (#991): either its turns stopped or the note is gone; the log:\n{log}"
     );
     let second = third;
     std::fs::remove_file(&hold).expect("APPARATUS: remove the hold file");
