@@ -131,7 +131,7 @@ pub(super) fn update(
         let _ = clear(&staged);
         return Err(refused);
     }
-    publish(apps, &vox.version_text)?;
+    let aside = publish(apps, &vox.version_text)?;
 
     println!("updated: {} -> Vox {}", active.display(), vox.version_text);
     println!(
@@ -142,7 +142,10 @@ pub(super) fn update(
     let detached = super::restart::restart_daemon(&active.join(HELPER), &vox.version_text);
     shell_setup_from(apps, exe);
     super::restart::say_next(&detached);
-    Ok(())
+    match aside {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 /// `vox update --rollback` for the Vox.app in `apps`: swap it with `.Vox.app.previous`, so a
@@ -177,7 +180,10 @@ pub(super) fn rollback(apps: &Path, exe: &Path) -> Result<(), AppError> {
         });
     }
     sync_dir(apps)?;
-    set_aside(&previous)?;
+    // The rollback is done at this point. A set-aside that fails is reported last, after the
+    // active bundle is registered and the daemon restarted, so a failed step never leaves the
+    // rest of the transition undone or invites a second --rollback that would reverse it.
+    let aside = set_aside(&previous);
     if let Err(said) = launch_services(true, &active) {
         println!("note: {said}; the current Vox.app is in place and opens by path");
     }
@@ -191,7 +197,13 @@ pub(super) fn rollback(apps: &Path, exe: &Path) -> Result<(), AppError> {
     let detached = super::restart::restart_daemon(&active.join(HELPER), &now);
     shell_setup_from(apps, exe);
     super::restart::say_next(&detached);
-    Ok(())
+    aside.map_err(|e| {
+        AppError::Usage(format!(
+            "the rollback is done, but the replaced Vox.app was not set aside: {e}; run `vox \
+             update` to repair, and until then open Vox as {}",
+            active.display()
+        ))
+    })
 }
 
 /// Exchange two paths in one step (`renameatx_np` with `RENAME_SWAP`): each name holds a whole
@@ -213,7 +225,7 @@ fn swap(a: &Path, b: &Path) -> Result<(), AppError> {
 /// rather than removed, so a swap that fails puts it back, and a publish cut short between the
 /// swap and the rename (which leaves the replaced bundle under the partial name) is finished by
 /// [`recover`] rather than having that bundle cleared as scratch.
-fn publish(apps: &Path, version: &str) -> Result<(), AppError> {
+fn publish(apps: &Path, version: &str) -> Result<Option<AppError>, AppError> {
     let staged = apps.join(PARTIAL);
     let previous = apps.join(PREVIOUS);
     let journal = apps.join(PUBLISHING);
@@ -252,13 +264,15 @@ fn publish(apps: &Path, version: &str) -> Result<(), AppError> {
         }
     }
     clear(&journal)?;
-    aside.map_err(|e| {
+    // The publish is done at this point; a set-aside that failed is the caller's to report
+    // after it has restarted the daemon, never a reason to leave the transition half finished.
+    Ok(aside.err().map(|e| {
         AppError::Usage(format!(
             "Vox {version} is in place, but the replaced Vox.app was not set aside: {e}; run \
              `vox update` again to finish, and until then open Vox as {}",
             apps.join(BUNDLE).display()
         ))
-    })
+    }))
 }
 
 /// Bundles retired by earlier transitions while code from them was running: `.Vox.app.retired.*`.

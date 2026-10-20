@@ -193,8 +193,9 @@ F-9–F-11; RR-1, RR-3, RR-4 (RR-2 is the daemon's); D-3; L-1–L-10; W-1–W-6;
   already made unregistered, tried again at each later transition until it is gone. Opening Vox
   from the Dock, Spotlight, Launchpad or by its identifier
   then opens the current bundle; a rollback makes the bundle it swaps back in an application
-  again before the swap. Each release's `CFBundleVersion` MUST be its version, so the newer
-  release is the greater build. Measured 2026-10-19:
+  again before the swap. Each release's `CFBundleVersion` MUST grow with its version in Apple's
+  documented form (three integers, the first above zero): the version with its major raised by
+  one. Measured 2026-10-19:
   both bundles were registered as `us.vox.app` with the same `CFBundleVersion`, LaunchServices
   opened `.Vox.app.previous` (0.4.4) when the decider reopened Vox, and that app reported the
   0.4.6 daemon as not answering.
