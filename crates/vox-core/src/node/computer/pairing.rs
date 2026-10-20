@@ -1571,7 +1571,7 @@ impl Management {
         let Ok(_exchange) = self.exchanges.try_lock() else {
             return Ok(());
         };
-        let peers = {
+        let (peers, attempted, revision) = {
             let s = lock(&self.computer.state);
             let local = self.computer.signer.fingerprint();
             let mut peers: std::collections::BTreeSet<_> = s
@@ -1662,7 +1662,8 @@ impl Management {
                         });
                     (peer, endpoints, url)
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            (peers, attempted, revision)
         };
         let mut tasks = Vec::new();
         for (peer, endpoints, url) in peers {
@@ -1680,9 +1681,10 @@ impl Management {
         let mut problem = None;
         for (peer, task) in tasks {
             // A task that panicked is a failed attempt at that computer, backed off like any.
-            let outcome = match task.await {
-                Ok(outcome) => outcome,
-                Err(e) => Err(Error::Profile(format!("the exchange task failed: {e}"))),
+            let outcome: std::result::Result<(), String> = match task.await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(e) => Err(format!("the exchange task failed: {e}")),
             };
             let (revision, involved) = attempted
                 .iter()
@@ -1700,9 +1702,9 @@ impl Management {
                     record.count = record.count.saturating_add(1);
                     record.failures = 0;
                 }
-                Err(e) => {
+                Err(text) => {
                     record.failures = record.failures.saturating_add(1);
-                    problem = Some(e.to_string());
+                    problem = Some(text);
                 }
             }
         }
