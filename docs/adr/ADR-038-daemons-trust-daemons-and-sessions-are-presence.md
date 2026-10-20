@@ -182,12 +182,12 @@ The decider then answered twelve questions, one at a time. His answers are the d
   the known defects above turned into stories and fixed now. The walkthrough and all staging
   MUST run on the VM setup (the macOS guests of the v0.4.4 app-proof work), not on his working
   Macs ("use the VM stuffs so I'm not losing ability to use my macs").
-- **FX-21.** Every product requirement above (FX-1–FX-10, FX-12–FX-18, FX-22–FX-24, FX-26, FX-27)
-  lands with a proof that drives the shipped `vox` binary as a person would, with a mutant that
-  turns it red on its own assertion (ADR-018). The two-computer requirements (FX-2–FX-7) are
-  proved by two daemons in two data roots on one machine. FX-11's design, FX-19, FX-20 and FX-25
-  are process rulings: FX-19's record is each closed release milestone, FX-20's is the
-  walkthrough's defect record, FX-11's is the amendment it produces, and FX-25's is each
+- **FX-21.** Every product requirement above (FX-1–FX-10, FX-12–FX-18, FX-22–FX-24, FX-26,
+  FX-27) lands with a proof that drives the shipped `vox` binary as a person would, with a
+  mutant that turns it red on its own assertion (ADR-018). The two-computer requirements
+  (FX-2–FX-7) are proved by two daemons in two data roots on one machine. FX-11's design, FX-19,
+  FX-20 and FX-25 are process rulings: FX-19's record is each closed release milestone, FX-20's
+  is the walkthrough's defect record, FX-11's is the amendment it produces, and FX-25's is each
   release's asset list.
 - **FX-22.** A governance question about a room (who may read whom, who has consented, what a
   member offers) MUST cost no store read and no decrypt when the room's governance has not
@@ -214,8 +214,9 @@ The decider then answered twelve questions, one at a time. His answers are the d
   `--cfg aes_armv8` and `--cfg polyval_armv8`, which no build set, so every decrypt on Apple
   silicon ran the bitsliced software AES and the software POLYVAL (`aes::soft::fixslice`,
   `polyval::backend::soft` were the hottest leaves); Keccak autodetects and was not affected.
-- **FX-24.** A preparation step that did no work in its turn MUST report the thing it waits for,
-  in the words `vox room list` and the app show, and MUST NOT report progress. Measured cause,
+- **FX-24.** A preparation turn in which the step did no work MUST end as a wait on the thing the
+  step waits for, in the words `vox room list` and the app show; a wait is the only other way a
+  turn ends, so such a turn is never recorded as progress. Measured cause,
   2026-10-20: the decider's room ended every preparation turn on "refreshing its Session
   records", reported as progress, because the refresh stopped at its first gate; the room was
   re-queued after the 50 ms fast retry, about five turns a second as measured, and each turn
@@ -231,9 +232,10 @@ The decider then answered twelve questions, one at a time. His answers are the d
   advanced only for a published room, and the refresh waited on them, so a room restored with
   such state never opened (the decider's room, 2026-10-20).
 - **FX-27.** The daemon MUST NOT delay, skip or space any turn, publication or sync round by a
-  rule that counts turns or measures CPU time. The only retry schedule is FX-15's: a wait on the
-  same thing outside the turn, repeated, is retried at that wait's own pace; a turn that did
-  work is followed at once. Ruling: "caps on cpu seem like … footguns", "we need to understand
+  rule that counts turns or measures CPU time. FX-15 stands unchanged as the one retry schedule:
+  a repeated wait on the same thing outside the turn is retried at that wait's own pace, and a
+  turn that did work with a nameable need still pending is followed at once; a quiet room runs
+  nothing. Ruling: "caps on cpu seem like … footguns", "we need to understand
   what is driving the cpu inefficiency rather than capping the cpu" (the decider, 2026-10-20,
   rejecting a ten-fast-turns-then-one-a-second cap proposed for FX-24's cause).
 
