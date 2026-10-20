@@ -67,6 +67,14 @@ pub struct ComputerApplication {
     pub computer: ComputerIdentity,
     /// This member signed a complete applied receipt for the current frontier.
     pub confirmed: bool,
+    /// When this node last exchanged pairing state with it, Unix milliseconds; `None` before the
+    /// first exchange since the daemon started.
+    pub last_exchange_ms: Option<u64>,
+    /// Exchanges since the daemon started: with nothing to settle, a few per hour, not one every
+    /// two seconds (ADR-038 FX-15; #989).
+    pub exchanges: u64,
+    /// Attempts in a row that could not reach it; the retry backs off with each.
+    pub exchange_failures: u32,
 }
 /// A node identity proved by its node and managing computer, with current policy role.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -243,6 +251,10 @@ pub struct Management {
 struct Exchanged {
     /// The last attempt, succeeded or not.
     last: Option<std::time::Instant>,
+    /// The same, Unix milliseconds, for the status a person reads.
+    last_ms: Option<u64>,
+    /// Attempts made since the daemon started.
+    count: u64,
     /// Failures in a row since the last success; the backoff doubles with each.
     failures: u32,
 }
@@ -895,15 +907,20 @@ impl Management {
         } else {
             BTreeMap::new()
         };
+        let exchanged = lock(&self.exchanged).clone();
         let applications: Vec<_> = descriptions
             .iter()
             .map(|(id, d)| {
+                let record = exchanged.get(id).copied().unwrap_or_default();
                 Ok(ComputerApplication {
                     computer: ComputerIdentity::of(d)?,
                     confirmed: !storage_failed
                         && s.receipts
                             .get(id)
                             .is_some_and(|r| valid_receipt(&s, id, r).unwrap_or(false)),
+                    last_exchange_ms: record.last_ms,
+                    exchanges: record.count,
+                    exchange_failures: record.failures,
                 })
             })
             .collect::<Result<_>>()?;
@@ -1641,6 +1658,8 @@ impl Management {
                     let mut exchanged = lock(&self.exchanged);
                     let record = exchanged.entry(peer).or_default();
                     record.last = Some(std::time::Instant::now());
+                    record.last_ms = Some(now());
+                    record.count = record.count.saturating_add(1);
                     match outcome {
                         Ok(()) => record.failures = 0,
                         Err(e) => {
