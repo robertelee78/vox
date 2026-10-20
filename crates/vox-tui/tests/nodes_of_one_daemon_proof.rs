@@ -2401,8 +2401,15 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
     let _ = (alpha, beta);
     let da = Daemon::start(&a, &["--node", "alpha"], &[]);
     let db = Daemon::start(&b, &["--node", "beta"], &[]);
+    // Each node is Ready before it is chosen as its computer's personal node.
+    da.expect("node alpha is Ready", Duration::from_secs(90), |l| {
+        l.contains("alpha is Ready")
+    });
+    db.expect("node beta is Ready", Duration::from_secs(90), |l| {
+        l.contains("beta is Ready")
+    });
     assert!(
-        wait_until(Duration::from_secs(90), || {
+        wait_until(Duration::from_secs(60), || {
             a.run(&["computer", "status", "--json"], "").0
                 && b.run(&["computer", "status", "--json"], "").0
         }),
