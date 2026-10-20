@@ -5,8 +5,10 @@
 #
 #   scripts/check-release-assets.sh <release-dir> <version>
 #
-# A release is, per target, `vox-<triple>`, its `.sha256`, `stable-<triple>.json` and
-# `proof-<triple>.json`, for x86_64-unknown-linux-gnu and aarch64-apple-darwin and nothing else
+# A release is, per target, `vox-<triple>`, its `.sha256`, `stable-<triple>.json`,
+# `proof-<triple>.json` and `vox-<triple>-symbols` with its `.sha256` (the unstripped build,
+# unsigned, for symbolizing a profile of the shipped daemon: ADR-038 FX-25), for
+# x86_64-unknown-linux-gnu and aarch64-apple-darwin and nothing else
 # (ADR-014 M-26a: no Intel macOS asset at all). On macOS it is also Vox.app, as
 # `Vox-<version>-aarch64-apple-darwin.zip` with `app-stable-` and `app-proof-` records, and two
 # signing receipts: `apple-proof-aarch64-apple-darwin.json` for vox and
@@ -30,7 +32,8 @@ command -v jq >/dev/null 2>&1 || fail "need jq"
 # Exactly the expected set of names, so an Intel asset, a stray file or a missing one all refuse.
 want=$(
   for t in $TARGETS; do
-    printf '%s\n' "vox-$t" "vox-$t.sha256" "stable-$t.json" "proof-$t.json"
+    printf '%s\n' "vox-$t" "vox-$t.sha256" "stable-$t.json" "proof-$t.json" \
+      "vox-$t-symbols" "vox-$t-symbols.sha256"
   done
   printf '%s\n' "$APP_ZIP" "$APP_ZIP.sha256" "app-stable-$MAC.json" "app-proof-$MAC.json" \
     "apple-proof-$MAC.json" "apple-proof-app-$MAC.json" install.sh

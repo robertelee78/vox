@@ -74,11 +74,15 @@ jobs:
       - name: Build release binary
         run: |
           cargo build --release --bin vox
+          # The unstripped build is published beside the stripped one (ADR-038 FX-25).
+          cp target/release/vox target/release/vox-symbols
           strip target/release/vox
           ls -lh target/release/vox
 
       - name: Package release assets
-        run: scripts/package-release.sh target/release/vox x86_64-unknown-linux-gnu
+        run: |
+          scripts/package-release.sh target/release/vox x86_64-unknown-linux-gnu
+          scripts/package-release.sh target/release/vox-symbols x86_64-unknown-linux-gnu symbols
 
       - uses: actions/upload-artifact@v4
         with:
@@ -107,6 +111,8 @@ jobs:
       - name: Build release binary
         run: |
           cargo build --release --bin vox
+          # The unstripped build is published beside the stripped one (ADR-038 FX-25).
+          cp target/release/vox target/release/vox-symbols
           strip target/release/vox
           ls -lh target/release/vox
           vtool -show-build target/release/vox | grep -E "platform|minos"
@@ -167,6 +173,7 @@ jobs:
           scripts/package-release.sh "$SIGNED_DIR/vox-aarch64-apple-darwin" aarch64-apple-darwin
           scripts/package-release.sh "$SIGNED_APP_DIR/Vox-$VERSION-aarch64-apple-darwin.zip" \
             aarch64-apple-darwin app
+          scripts/package-release.sh target/release/vox-symbols aarch64-apple-darwin symbols
           cp "$SIGNED_DIR"/apple-proof-aarch64-apple-darwin.json dist/
           cp "$SIGNED_APP_DIR"/apple-proof-app-aarch64-apple-darwin.json dist/
 
