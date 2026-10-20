@@ -238,9 +238,6 @@ pub struct Management {
     /// Computers an exchange is in flight with: one at a time per computer, never a round that
     /// waits for every computer, so a slow one delays no other (#989).
     inflight: Mutex<BTreeMap<Digest32, Flight>>,
-    /// Computers whose in-flight exchange was cut because this node changed meanwhile: its end
-    /// is no failure, and the next tick exchanges again.
-    superseded: Mutex<BTreeSet<Digest32>>,
     slots: Arc<tokio::sync::Semaphore>,
     problem: Mutex<Option<String>>,
     pending_nodes: Mutex<Vec<String>>,
@@ -295,6 +292,9 @@ struct Flight {
     revision: u64,
     involved: bool,
     abort: Option<tokio::task::AbortHandle>,
+    /// Cut because this node changed meanwhile: its end is no failure, and the next tick
+    /// exchanges again. Read and cleared with the flight's removal, under the one lock.
+    superseded: bool,
 }
 
 /// A computer reserved as in flight by the operator's pairing, released on drop.
@@ -311,7 +311,11 @@ impl Drop for Reserved {
 
 impl Drop for Attempt {
     fn drop(&mut self) {
-        let superseded = lock(&self.me.superseded).remove(&self.peer);
+        // Removed and read in one step under the one lock: a mark set after this cannot
+        // linger on a later flight.
+        let superseded = lock(&self.me.inflight)
+            .remove(&self.peer)
+            .is_some_and(|flight| flight.superseded);
         if !self.recorded && !superseded {
             self.me.record_exchange(
                 self.peer,
@@ -320,7 +324,6 @@ impl Drop for Attempt {
                 Err("the exchange task failed".to_owned()),
             );
         }
-        lock(&self.me.inflight).remove(&self.peer);
     }
 }
 
@@ -461,7 +464,6 @@ impl Management {
             anchors,
             serving: Mutex::new(Default::default()),
             inflight: Mutex::new(BTreeMap::new()),
-            superseded: Mutex::new(BTreeSet::new()),
             slots: Arc::new(tokio::sync::Semaphore::new(8)),
             problem: Mutex::new(None),
             pending_nodes: Mutex::new(Vec::new()),
@@ -747,21 +749,48 @@ impl Management {
         // The state this handshake carries, read before the reservation: the state lock is
         // never taken under the in-flight lock (the retry takes them the other way round).
         let revision = lock(&self.computer.state).revision;
-        {
-            let mut inflight = lock(&self.inflight);
-            if inflight.contains_key(&target) {
+        // The operator's action comes first: a retry exchange in flight with that computer
+        // is cut (as no failure) and its reservation waited for, briefly; another operator
+        // pairing in flight is reported.
+        let waited = std::time::Instant::now();
+        loop {
+            {
+                let mut inflight = lock(&self.inflight);
+                match inflight.get_mut(&target) {
+                    None => {
+                        inflight.insert(
+                            target,
+                            Flight {
+                                revision,
+                                involved: true,
+                                abort: None,
+                                superseded: false,
+                            },
+                        );
+                        break;
+                    }
+                    Some(flight) if flight.involved && !flight.superseded => {
+                        return Err(Error::Profile(
+                            "a computer pairing with that computer is in progress; try again \
+                             in a moment",
+                        ));
+                    }
+                    Some(flight) => {
+                        if !flight.superseded {
+                            if let Some(abort) = &flight.abort {
+                                flight.superseded = true;
+                                abort.abort();
+                            }
+                        }
+                    }
+                }
+            }
+            if waited.elapsed() > Duration::from_secs(10) {
                 return Err(Error::Profile(
-                    "an exchange with that computer is in progress; try again in a moment",
+                    "an exchange with that computer did not yield within 10 s; try again",
                 ));
             }
-            inflight.insert(
-                target,
-                Flight {
-                    revision,
-                    involved: true,
-                    abort: None,
-                },
-            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
         let reserved = Reserved {
             me: Arc::clone(self),
@@ -780,29 +809,41 @@ impl Management {
         if let Some(flight) = lock(&self.inflight).get_mut(&target) {
             flight.abort = Some(task.abort_handle());
         }
-        let paired = match task.await {
-            Ok(Ok(paired)) => paired,
-            Ok(Err(_)) => Err(Error::Profile(
-                "the computer pairing did not finish within ten minutes; try again",
-            )),
-            Err(_) => {
-                lock(&self.superseded).remove(&target);
+        let (paired, superseded) = match task.await {
+            Ok(Ok(paired)) => (paired, false),
+            Ok(Err(_)) => (
+                Err(Error::Profile(
+                    "the computer pairing did not finish within ten minutes; try again",
+                )),
+                false,
+            ),
+            // Cut by the retry because this node changed: no failure of anyone's.
+            Err(e) if e.is_cancelled() => (
                 Err(Error::Profile(
                     "this computer changed while the pairing ran, so the pairing was \
                      superseded; try again",
-                ))
-            }
+                )),
+                true,
+            ),
+            Err(_) => (
+                Err(Error::Profile(
+                    "the computer pairing task failed; try again",
+                )),
+                false,
+            ),
         };
         // Recorded while still reserved, with the state it carried, so the record never
         // touches a reservation the retry may have taken meanwhile; the guard releases this
-        // one after.
-        let outcome = match &paired {
-            // The handshake exchanged state: counted and dated like any exchange, and the
-            // status's problem follows from every computer's record.
-            Ok(()) => Ok(()),
-            Err(e) => Err(e.to_string()),
-        };
-        self.record_exchange(target, revision, true, outcome);
+        // one after. A superseded handshake is recorded as nothing.
+        if !superseded {
+            let outcome = match &paired {
+                // The handshake exchanged state: counted and dated like any exchange, and
+                // the status's problem follows from every computer's record.
+                Ok(()) => Ok(()),
+                Err(e) => Err(e.to_string()),
+            };
+            self.record_exchange(target, revision, true, outcome);
+        }
         drop(reserved);
         paired?;
         self.status()
@@ -1780,13 +1821,12 @@ impl Management {
             // counts as no failure, and the next tick exchanges the current state.
             {
                 let mut inflight = lock(&self.inflight);
-                let mut superseded = lock(&self.superseded);
-                for (peer, flight) in inflight.iter() {
+                for (peer, flight) in inflight.iter_mut() {
                     let stale =
                         flight.revision != revision || flight.involved != (involved == Some(*peer));
-                    if stale && !superseded.contains(peer) {
+                    if stale && !flight.superseded {
                         if let Some(abort) = &flight.abort {
-                            superseded.insert(*peer);
+                            flight.superseded = true;
                             abort.abort();
                         }
                     }
@@ -1801,6 +1841,7 @@ impl Management {
                             revision,
                             involved: involved == Some(*peer),
                             abort: None,
+                            superseded: false,
                         },
                     );
                     true
