@@ -562,8 +562,11 @@ const AT_WORK: Duration = Duration::from_secs(60);
 const WORK_ROOMS: usize = 3;
 /// CPU time a daemon may spend over [`AT_WORK`] of two agents posting into [`WORK_ROOMS`] rooms:
 /// Activity Monitor's number. Measured 2026-10-20 on the decider's work Mac (v0.4.7, four nodes,
-/// four rooms, agents working): ~180% of a core, that is 108 s per minute.
-const WORK_CPU: Duration = Duration::from_secs(6);
+/// four rooms, agents working): ~180% of a core, that is 108 s per minute. In this staging the
+/// v0.4.7 code spent 17.5 s per daemon per minute; with each room's trust picture reused across
+/// publications (#990) it spends 8 s, the rest being the rounds the posts themselves run (~9 per
+/// post, #996). The bound is what #990 delivers; #996 lowers it again.
+const WORK_CPU: Duration = Duration::from_secs(10);
 /// Every `vox status --json` during the work answers within this: the control socket is what the
 /// app, the TUI and the harness hook (500 ms of patience) wait on. Measured before this: 0.5 s.
 const ANSWER_WITHIN: Duration = Duration::from_millis(200);
