@@ -335,6 +335,8 @@ const EXCHANGE_BACKOFF_MAX: Duration = Duration::from_secs(120);
 /// backoff: a computer that hangs must not stay "in flight" forever. Generous, because a
 /// slow but valid exchange of a long history must complete; no other computer waits on it.
 const EXCHANGE_WITHIN: Duration = Duration::from_secs(600);
+/// The operator's pairing handshake, which a person waits for, has this long.
+const PAIR_WITHIN: Duration = Duration::from_secs(60);
 impl Management {
     /// The account's explicit host:port lookup uses its existing socket, but no management
     /// identity or authority. The returned fingerprint is proved; lookup persists no anchor source.
@@ -744,6 +746,9 @@ impl Management {
         // for now: the retry leaves it alone meanwhile, and the reservation ends with the
         // handshake however it ends (a drop guard), so the computer never stays in flight.
         let target = link.target;
+        // The state this handshake carries, read before the reservation: the state lock is
+        // never taken under the in-flight lock (the retry takes them the other way round).
+        let revision = lock(&self.computer.state).revision;
         {
             let mut inflight = lock(&self.inflight);
             if inflight.contains_key(&target) {
@@ -751,7 +756,6 @@ impl Management {
                     "an exchange with that computer is in progress; try again in a moment",
                 ));
             }
-            let revision = lock(&self.computer.state).revision;
             inflight.insert(
                 target,
                 Flight {
@@ -765,10 +769,16 @@ impl Management {
             me: Arc::clone(self),
             peer: target,
         };
-        let paired = self.pair(&link, url).await;
-        let revision = lock(&self.computer.state).revision;
-        // Recorded while still reserved, so the record never touches a reservation the retry
-        // may have taken meanwhile; the guard releases this one after.
+        // Bounded like any exchange, and shorter: a person is waiting for it.
+        let paired = match tokio::time::timeout(PAIR_WITHIN, self.pair(&link, url)).await {
+            Ok(paired) => paired,
+            Err(_) => Err(Error::Profile(
+                "the computer pairing did not finish within a minute; try again",
+            )),
+        };
+        // Recorded while still reserved, with the state it carried, so the record never
+        // touches a reservation the retry may have taken meanwhile; the guard releases this
+        // one after.
         let outcome = match &paired {
             // The handshake exchanged state: counted and dated like any exchange, and the
             // status's problem follows from every computer's record.
