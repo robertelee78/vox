@@ -3,7 +3,7 @@
 - **Status**: Proposed, after v0.4.6. The decider's product rulings of 2026-10-19 (one question
   at a time, quoted below) are the requirements; nothing here is built. Each requirement lands
   with its proof (ADR-018) in a small release (FX-19).
-- **Date**: 2026-10-19
+- **Date**: 2026-10-19; amended 2026-10-20 (FX-22–FX-27, the daemon's CPU)
 - **Deciders**: Robert E. Lee
 - **Tags**: trust, daemon identity, sessions, presence, agent comms, sync, health, releases
 - **Related**: ADR-018, ADR-020, ADR-026, ADR-029, ADR-031, ADR-033, ADR-034, ADR-035, ADR-036,
@@ -182,12 +182,60 @@ The decider then answered twelve questions, one at a time. His answers are the d
   the known defects above turned into stories and fixed now. The walkthrough and all staging
   MUST run on the VM setup (the macOS guests of the v0.4.4 app-proof work), not on his working
   Macs ("use the VM stuffs so I'm not losing ability to use my macs").
-- **FX-21.** Every product requirement above (FX-1–FX-10, FX-12–FX-18) lands with a proof that
-  drives the shipped `vox` binary as a person would, with a mutant that turns it red on its own
-  assertion (ADR-018). The two-computer requirements (FX-2–FX-7) are proved by two daemons in
-  two data roots on one machine. FX-11's design, FX-19 and FX-20 are process rulings: FX-19's
-  record is each closed release milestone, FX-20's is the walkthrough's defect record, and
-  FX-11's is the amendment it produces.
+- **FX-21.** Every product requirement above (FX-1–FX-10, FX-12–FX-18, FX-22–FX-24, FX-26,
+  FX-27) lands with a proof that drives the shipped `vox` binary as a person would, with a
+  mutant that turns it red on its own assertion (ADR-018). The two-computer requirements
+  (FX-2–FX-7) are proved by two daemons in two data roots on one machine. FX-11's design, FX-19,
+  FX-20 and FX-25 are process rulings: FX-19's record is each closed release milestone, FX-20's
+  is the walkthrough's defect record, FX-11's is the amendment it produces, and FX-25's is each
+  release's asset list.
+- **FX-22.** A governance question about a room (who may read whom, who has consented, what a
+  member offers) MUST cost no store read and no decrypt when the room's governance has not
+  changed since the question was last answered. Decision: the room keeps its folded consent facts
+  in memory as a semantic projection (per author, the readers it consented to and its reset
+  sequence), never a store snapshot, page or row vector, so the index's bounded-turn rule
+  stands; the sealed index remains the only durable representation, and a restart loads the
+  projection from the index and the entries it names, never by replaying the log. Measured
+  cause, 2026-10-20 (the decider's daemon, vox 0.4.7; `ps` 155–170% of a core; two 10 s `sample`
+  runs, 13,558 busy samples each, about 1.36 cores): 72% of all busy CPU was the status
+  publication and 44% of all busy CPU was `trusted_by`, which opened a fresh view (a store
+  snapshot and a decrypt of the index header) and asked `can_read` for every ordered pair of
+  members; each answer walked the sealed index (a decrypt per page), decrypted the log entry it
+  named, walked the index again for that entry's binding, and looked up the consent reset the
+  same way. 48% of all busy CPU was decrypting store segments to re-read facts the daemon had
+  already folded; nothing was cached ("no snapshot, row vector, or page survives a caller's
+  bounded turn"). A publication that reuses an unchanged room's detail (#990) still opens the
+  store for each room's revision check and re-pays the whole walk on any governance change.
+- **FX-23.** Every AES-GCM operation in the shipped daemon MUST use the processor's AES and
+  carry-less multiplication when the processor has them, with the software implementation in
+  the same binary as the fallback otherwise. Decision: aes-gcm 0.11 (aes 0.9, polyval 0.7),
+  which selects the backend at run time. Measured cause, the same samples: the `aes` 0.8.4 and
+  `polyval` 0.6.2 crates under aes-gcm 0.10.3 compile their ARMv8 backends only under
+  `--cfg aes_armv8` and `--cfg polyval_armv8`, which no build set, so every decrypt on Apple
+  silicon ran the bitsliced software AES and the software POLYVAL (`aes::soft::fixslice`,
+  `polyval::backend::soft` were the hottest leaves); Keccak autodetects and was not affected.
+- **FX-24.** A preparation turn in which the step did no work MUST end as a wait, never as
+  progress, on the thing the step waits for, in the words `vox room list` and the app show.
+  Measured cause,
+  2026-10-20: the decider's room ended every preparation turn on "refreshing its Session
+  records", reported as progress, because the refresh stopped at its first gate; the room was
+  re-queued after the 50 ms fast retry, about five turns a second as measured, and each turn
+  ended in a publication that paid FX-22 through FX-23; `ps` showed 174% of a core on the first
+  #991 build, and the app had said "Preparing room history" for twenty hours.
+- **FX-25.** Every release MUST publish the unstripped daemon binary beside the stripped one it
+  ships, so a profile of the shipped daemon symbolizes without a matching local build. Cause:
+  the 2026-10-20 samples of the v0.4.7 helper had to be named by matching its machine code
+  against a local build of the same version.
+- **FX-26.** A room's private Sessions (restore, controls import, legacy steps, pending
+  activity) MUST be advanced during the room's preparation, one bounded step per turn, so a
+  restored room's Session-record refresh can finish before the room is published. Cause: these
+  advanced only for a published room, and the refresh waited on them, so a room restored with
+  such state never opened (the decider's room, 2026-10-20).
+- **FX-27.** The daemon MUST NOT delay, skip or space any turn, publication or sync round by a
+  rule that counts turns or measures CPU time. FX-15's retry of a repeated wait is not such a
+  rule and stands unchanged. Ruling: "caps on cpu seem like … footguns", "we need to understand
+  what is driving the cpu inefficiency rather than capping the cpu" (the decider, 2026-10-20,
+  rejecting a ten-fast-turns-then-one-a-second cap proposed for FX-24's cause).
 
 ## Unchanged rulings
 
@@ -220,6 +268,9 @@ Narrow successor amendments. Requirements not named here remain in force.
 4. FX-11's design story, then FX-8–FX-10 in the app, the CLI, the hook and the skill pack.
 5. FX-12, FX-13, FX-14: the idle window, asks per Session, `--re` prefixes.
 6. FX-20's walkthrough runs from the first cut on; its defects join the queue as found.
+7. FX-24, FX-26, FX-27, FX-23, FX-22, FX-25: the daemon's CPU under real rooms, measured on
+   the decider's daemon on 2026-10-20, in that order (the trigger, the cipher, the design, the
+   symbols); one cut (v0.4.8).
 
 Each ADR change under this record is reviewed by an independent session (opencode-work) before
 its stories are extracted.
