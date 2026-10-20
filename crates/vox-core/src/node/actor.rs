@@ -4796,8 +4796,12 @@ struct RoomPreparation {
     /// What this room waits for before it can open, in words a person reads, and since when
     /// (unix ms): `vox room list`, `vox status` and the app say it (ADR-038 FX-16, #991).
     waiting: Option<(String, u64)>,
-    /// Whether the daemon log has said once that this wait is long (#991).
+    /// Whether the daemon log has said once that this wait is long (#991); re-armed when the
+    /// wait changes.
     waiting_noted: bool,
+    /// This turn did work (folded, opened a package, built a view): the next turn comes at
+    /// once, whatever the words say, since the same words can cover many steps.
+    progressed: bool,
 }
 
 /// A wait this long on one thing is said once in the daemon's log, so a person reading it
@@ -4805,17 +4809,30 @@ struct RoomPreparation {
 const PREPARE_WAIT_NOTED_AFTER_MS: u64 = 30_000;
 
 impl RoomPreparation {
-    /// Record what this turn waited for. The same wait keeps its start; a new one starts now.
+    /// Record what this turn waited for, on something outside this turn's reach. The same
+    /// wait keeps its start; a new one starts now and may be noted in the log again.
     fn wait_on(&mut self, what: &str, now_ms: u64) {
         match &self.waiting {
             Some((was, _)) if was == what => {}
-            _ => self.waiting = Some((what.to_owned(), now_ms)),
+            _ => {
+                self.waiting = Some((what.to_owned(), now_ms));
+                self.waiting_noted = false;
+            }
         }
     }
-    /// When to try again: at once while each turn changes something, once a second while the
-    /// same wait repeats, so a room that waits on a peer costs nothing meanwhile (FX-15).
-    fn retry_after(&self, previous: Option<&(String, u64)>) -> Duration {
+    /// Record that this turn did a bounded step of work named `what`, with more to do: the
+    /// words are shown as the wait, and the next turn comes at once.
+    fn progressed(&mut self, what: &str, now_ms: u64) {
+        self.wait_on(what, now_ms);
+        self.progressed = true;
+    }
+    /// When to try again: at once after a turn that did work, and at once when the wait
+    /// changed; once a second while the same wait on something outside repeats, so a room
+    /// that waits on a peer costs nothing meanwhile (FX-15).
+    fn retry_after(&mut self, previous: Option<&(String, u64)>) -> Duration {
+        let progressed = std::mem::take(&mut self.progressed);
         match (previous, &self.waiting) {
+            _ if progressed => PREPARE_RETRY,
             (Some(before), Some(now)) if before == now => PREPARE_WAIT,
             _ => PREPARE_RETRY,
         }
@@ -18261,6 +18278,7 @@ impl Node {
                     .then_some(std::time::Instant::now()),
                 waiting: None,
                 waiting_noted: false,
+                progressed: false,
                 channel: tokio::sync::Mutex::new(channel),
                 reply,
                 reopening,
@@ -18546,7 +18564,7 @@ impl Node {
             prepared.legacy_cleanup_due = ch
                 .legacy_startup_cleanup_blocks_current()
                 .then_some(std::time::Instant::now() + TICK);
-            prepared.wait_on("cleaning up its earlier saved form", self.now_ms().get());
+            prepared.progressed("cleaning up its earlier saved form", self.now_ms().get());
             // Cleanup and policy/retention writes occupy separate actor turns.
             return Ok(false);
         }
@@ -18556,14 +18574,11 @@ impl Node {
             let now = self.now_ms();
             let governance = ch.advance_governance(profile.store(), now)?;
             if !governance.ready {
-                prepared.wait_on(
-                    if governance.pending {
-                        "folding its governance records"
-                    } else {
-                        "governance records from its members"
-                    },
-                    now.get(),
-                );
+                if governance.pending {
+                    prepared.progressed("folding its governance records", now.get());
+                } else {
+                    prepared.wait_on("governance records from its members", now.get());
+                }
                 return Ok(false);
             }
             if ch.legacy_cache_only(profile.store())? {
@@ -18615,7 +18630,7 @@ impl Node {
                 }
                 let profile = self.profile.as_ref().ok_or(Error::AtRestLocked)?;
                 ch.key_package_attempted(profile.store(), &pending.author, pending.log_id)?;
-                prepared.wait_on("opening members' key packages", self.now_ms().get());
+                prepared.progressed("opening members' key packages", self.now_ms().get());
                 return Ok(false);
             }
             if progress.pending {
@@ -18626,7 +18641,7 @@ impl Node {
         {
             let profile = self.profile.as_ref().ok_or(Error::AtRestLocked)?;
             if ch.advance_legacy_sessions(profile.store(), self.now_ms().get())? {
-                prepared.wait_on("carrying its earlier Sessions over", self.now_ms().get());
+                prepared.progressed("carrying its earlier Sessions over", self.now_ms().get());
                 return Ok(false);
             }
         }
@@ -18638,20 +18653,20 @@ impl Node {
         if !ch.finish_session_upgrade(profile.store(), self.now_ms().get())?
             && ch.session_upgrade_local_work()
         {
-            prepared.wait_on("finishing its Session upgrade", self.now_ms().get());
+            prepared.progressed("finishing its Session upgrade", self.now_ms().get());
             return Ok(false);
         }
         if !ch.refresh_session_records(profile, &self.drive_holders(), &[], self.now_ms().get())? {
-            prepared.wait_on("refreshing its Session records", self.now_ms().get());
+            prepared.progressed("refreshing its Session records", self.now_ms().get());
             return Ok(false);
         }
         ch.sweep_retention(profile.store(), self.now_ms())?;
         if ch.legacy_classification_pending(profile.store())? {
-            prepared.wait_on("classifying its earlier saved history", self.now_ms().get());
+            prepared.progressed("classifying its earlier saved history", self.now_ms().get());
             return Ok(false);
         }
         if ch.advance_room_views(profile.store())?.0 {
-            prepared.wait_on("building its room views", self.now_ms().get());
+            prepared.progressed("building its room views", self.now_ms().get());
             return Ok(false);
         }
         self.reconcile_prepared_trust(prepared)

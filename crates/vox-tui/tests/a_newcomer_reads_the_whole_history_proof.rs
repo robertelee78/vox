@@ -865,6 +865,9 @@ const PREPARING_IDLE: Duration = Duration::from_secs(60);
 const PREPARING_CPU: Duration = Duration::from_secs(3);
 /// Once the wait ends, the room MUST open within this (the retry is once a second).
 const OPENS_WITHIN: Duration = Duration::from_secs(10);
+/// Sync rounds the waiting room's daemon may complete over [`PREPARING_IDLE`]: the periodic
+/// request's, toward one peer, and nothing else (FX-15).
+const PREPARING_ROUNDS: u64 = 4;
 
 /// A room that cannot finish preparing says what it waits for, costs nothing while it waits, and
 /// opens once the wait ends (ADR-038 FX-15, FX-16; #991). Staged with the fold-hold knob: alice
@@ -1263,19 +1266,29 @@ fn held_entries(dir: &Path) -> u64 {
     );
     let (ok, out, err) = vox(&alice, &["room", "read", &room], None);
     assert!(
-        !ok && format!("{out}{err}").contains("it waits for "),
-        "PRODUCT: `vox room read` of a preparing room does not say what it waits for (#991): ok={ok} {out}{err}"
+        !ok && format!("{out}{err}").contains(&format!("it waits for {what}")),
+        "PRODUCT: `vox room read` of a preparing room does not say the wait the status names \
+         ({what:?}) (#991): ok={ok} {out}{err}"
     );
+    // Rounds per peer over the idle minute (FX-15): the periodic request is the only cadence.
+    let rounds_before = completed_rounds(&alice);
 
     // ---- the wait costs nothing -------------------------------------------------------------
     let pid = second.0.id();
     let cpu0 = cpu_time(pid);
     std::thread::sleep(PREPARING_IDLE);
     let spent = cpu_time(pid).saturating_sub(cpu0);
+    let rounds = completed_rounds(&alice).saturating_sub(rounds_before);
     let log = std::fs::read_to_string(alice.join(".daemon/log")).unwrap_or_default();
+    let noted: Vec<&str> = log.lines().filter(|l| l.contains("is still preparing: it waits for ")).collect();
     println!(
-        "[proof] over {PREPARING_IDLE:?} the held room cost the daemon +{spent:?} of CPU (bound {PREPARING_CPU:?}); its log says: {:?}",
-        log.lines().filter(|l| l.contains("still preparing")).collect::<Vec<_>>()
+        "[proof] over {PREPARING_IDLE:?} the held room cost the daemon +{spent:?} of CPU (bound {PREPARING_CPU:?}) and {rounds} completed sync round(s) (bound {PREPARING_ROUNDS}); its log says: {noted:?}"
+    );
+    assert!(
+        rounds <= PREPARING_ROUNDS,
+        "PRODUCT: a room that only waited ran {rounds} sync rounds in {PREPARING_IDLE:?} (ADR-038 FX-15, #991): \
+         the periodic request is the only cadence; lanes: {}",
+        lanes_of(&vox(&alice, &["status", "--json"], None).1)
     );
     assert!(
         spent <= PREPARING_CPU,
@@ -1283,8 +1296,10 @@ fn held_entries(dir: &Path) -> u64 {
          (ADR-038 FX-15, #991; bound {PREPARING_CPU:?})"
     );
     assert!(
-        log.contains("is still preparing: it waits for ") || said(&alice, "alice").contains("is still preparing: it waits for "),
-        "PRODUCT: after {PREPARING_IDLE:?} the daemon's log never said what the room waited for (#991); its log:\n{log}"
+        noted.len() == 1 && noted[0].contains(&format!("it waits for {what}")),
+        "PRODUCT: after {PREPARING_IDLE:?} the daemon's log must say exactly once what the room \
+         waits for ({what:?}) (#991); it said {} time(s):\n{log}",
+        noted.len()
     );
 
     // ---- the wait ends: the room opens and its six rows read ---------------------------------
@@ -1326,6 +1341,22 @@ fn held_entries(dir: &Path) -> u64 {
         std::thread::sleep(Duration::from_millis(500));
     }
     drop(second);
+}
+
+/// Completed sync rounds over every lane of a `vox status --json` (0 when unreadable).
+fn completed_rounds(dir: &Path) -> u64 {
+    let (ok, out, _) = vox(dir, &["status", "--json"], None);
+    if !ok {
+        return 0;
+    }
+    serde_json::from_str::<serde_json::Value>(&out)
+        .ok()
+        .and_then(|v| {
+            v["sync"]
+                .as_array()
+                .map(|lanes| lanes.iter().map(|l| l["completed"].as_u64().unwrap_or(0)).sum())
+        })
+        .unwrap_or(0)
 }
 
 /// Each lane of a `vox status --json`: peer, completed, partial, failed, running and its last failure.
