@@ -86,6 +86,10 @@ pub(super) fn update(
         // **An update still updates** (decider, v0.4.2): with nothing newer, completions and the
         // agent skill pack are refreshed on the Vox.app in place. `--check` changes nothing.
         if !check_only {
+            // A previous bundle left as an application (before M-29a, or by a set-aside that
+            // failed) is repaired here too, so a plain `vox update` finishes the job.
+            let _lock = InstallLock::acquire(apps)?;
+            recover(apps)?;
             shell_setup_from(apps, exe);
             println!("Vox {current} is current; {}", super::skill_said());
         }
@@ -161,11 +165,13 @@ pub(super) fn rollback(apps: &Path, exe: &Path) -> Result<(), AppError> {
     // The kept bundle becomes an application again before it is swapped in; the one it replaces
     // is set aside after, so neither is ever both in place and set aside.
     restore(&previous)?;
-    swap(&previous, &active)?;
-    sync_dir(apps)?;
-    if let Err(error) = set_aside(&previous) {
-        said_not_aside(&previous, &error);
+    if let Err(failed) = swap(&previous, &active) {
+        // Nothing was swapped: the kept bundle is set aside again, never left an application.
+        let _ = set_aside(&previous);
+        return Err(failed);
     }
+    sync_dir(apps)?;
+    set_aside(&previous)?;
     launch_services(true, &active);
     let now = app_version(&active).unwrap_or_else(|| "unknown".to_owned());
     println!("rolled back: {} -> Vox {now}", active.display());
@@ -223,9 +229,7 @@ fn publish(apps: &Path, version: &str) -> Result<(), AppError> {
     // The swap left the replaced bundle under the partial name.
     fs::rename(&staged, &previous).map_err(AppError::Io)?;
     sync_dir(apps)?;
-    if let Err(error) = set_aside(&previous) {
-        said_not_aside(&previous, &error);
-    }
+    let aside = set_aside(&previous);
     launch_services(true, &apps.join(BUNDLE));
     // The bundle that was previous before this publish goes, unless something still runs from
     // it: then it is retired, and a later transition removes it (see [`sweep`]).
@@ -237,7 +241,14 @@ fn publish(apps: &Path, version: &str) -> Result<(), AppError> {
             clear(&older)?;
         }
     }
-    clear(&journal)
+    clear(&journal)?;
+    aside.map_err(|e| {
+        AppError::Usage(format!(
+            "Vox {version} is in place, but the replaced Vox.app was not set aside: {e}; run \
+             `vox update` again to finish, and until then open Vox as {}",
+            apps.join(BUNDLE).display()
+        ))
+    })
 }
 
 /// Bundles retired by earlier transitions while code from them was running: `.Vox.app.retired.*`.
@@ -292,14 +303,20 @@ fn launch_services(register: bool, bundle: &Path) {
 const KEPT_INFO_PLIST: &str = "Contents/Info.plist.kept";
 const INFO_PLIST: &str = "Contents/Info.plist";
 
-/// Set a replaced or retired bundle aside: no `Info.plist`, and out of LaunchServices.
+/// Set a replaced or retired bundle aside: out of LaunchServices while it is still a bundle, then
+/// no `Info.plist`. The rename is the guarantee; the record removal is the second measure.
 fn set_aside(bundle: &Path) -> Result<(), AppError> {
     let plist = bundle.join(INFO_PLIST);
-    if plist.is_file() {
-        fs::rename(&plist, bundle.join(KEPT_INFO_PLIST)).map_err(AppError::Io)?;
+    if !plist.is_file() {
+        return Ok(());
     }
     launch_services(false, bundle);
-    Ok(())
+    fs::rename(&plist, bundle.join(KEPT_INFO_PLIST)).map_err(|e| {
+        AppError::Usage(format!(
+            "{} is still an application: its Info.plist could not be set aside ({e})",
+            bundle.display()
+        ))
+    })
 }
 
 /// Make a set-aside bundle an application again, for the swap that brings it back.
@@ -309,15 +326,6 @@ fn restore(bundle: &Path) -> Result<(), AppError> {
         fs::rename(&kept, bundle.join(INFO_PLIST)).map_err(AppError::Io)?;
     }
     Ok(())
-}
-
-/// Say what to do when a bundle could not be set aside after a transition that already happened.
-fn said_not_aside(bundle: &Path, error: &AppError) {
-    println!(
-        "note: {} could not be set aside ({error}); until the next update, open Vox as \
-         /Applications/Vox.app",
-        bundle.display()
-    );
 }
 
 /// Remove the retired bundles nothing runs from any more.
@@ -330,8 +338,13 @@ fn sweep(apps: &Path) -> Result<(), AppError> {
             .file_name()
             .to_string_lossy()
             .starts_with(RETIRED_PREFIX);
-        if retired && !in_use(&entry.path()) {
-            clear(&entry.path())?;
+        if retired {
+            if in_use(&entry.path()) {
+                // Still running from: it stays, set aside (again, if an earlier attempt failed).
+                set_aside(&entry.path())?;
+            } else {
+                clear(&entry.path())?;
+            }
         }
     }
     Ok(())

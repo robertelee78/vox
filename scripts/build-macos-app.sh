@@ -60,7 +60,7 @@ VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
 # own CURRENT_PROJECT_VERSION is 1 and would tie every release. Minor and patch each get three
 # digits; a version past that is refused rather than given a number that sorts wrong.
 IFS=. read -r major minor patch <<<"$VERSION"
-(( minor < 1000 && patch < 1000 )) || fail "version $VERSION: minor and patch must stay below 1000 for a monotonic CFBundleVersion"
+(( major < 1000 && minor < 1000 && patch < 1000 )) || fail "version $VERSION: each component must stay below 1000 for a monotonic CFBundleVersion"
 BUILD=$((major * 1000000 + minor * 1000 + patch))
 
 # The macOS slice only: a release builds nothing for iOS and nothing for Intel.
