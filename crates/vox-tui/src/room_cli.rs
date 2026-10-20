@@ -165,13 +165,20 @@ pub(crate) async fn room_of(client: &mut IpcClient, prefix: &str) -> Result<Dige
     // A closed room's name is sealed in its manifest, so a node that has not opened it does
     // not know it: the name here is empty, and printing it said `room "" is not open` (#208).
     // Named by the id the operator typed a prefix of, and by its name only when there is one.
-    if let Some((_, name, false, _, preparing, _)) =
+    if let Some((_, name, false, _, preparing, waiting)) =
         rooms.iter().find(|(r, _, _, _, _, _)| *r == id)
     {
         if *preparing {
-            return Err(AppError::Usage(
-                vox_core::node::api::Fault::RoomPreparing.explain().into(),
-            ));
+            // With what it waits for, when the daemon has said (#991): a stuck room and a
+            // slow one read differently.
+            return Err(AppError::Usage(match waiting {
+                Some((what, since)) => format!(
+                    "{}; it waits for {what}, {}",
+                    vox_core::node::api::Fault::RoomPreparing.explain(),
+                    vox_core::node::status::since_text(*since)
+                ),
+                None => vox_core::node::api::Fault::RoomPreparing.explain().into(),
+            }));
         }
         return Err(room_closed(&id, name));
     }
