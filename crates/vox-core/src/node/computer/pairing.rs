@@ -237,7 +237,10 @@ pub struct Management {
     serving: Mutex<std::collections::BTreeSet<u64>>,
     /// Computers an exchange is in flight with: one at a time per computer, never a round that
     /// waits for every computer, so a slow one delays no other (#989).
-    inflight: Mutex<BTreeSet<Digest32>>,
+    inflight: Mutex<BTreeMap<Digest32, Flight>>,
+    /// Computers whose in-flight exchange was cut because this node changed meanwhile: its end
+    /// is no failure, and the next tick exchanges again.
+    superseded: Mutex<BTreeSet<Digest32>>,
     slots: Arc<tokio::sync::Semaphore>,
     problem: Mutex<Option<String>>,
     pending_nodes: Mutex<Vec<String>>,
@@ -287,6 +290,13 @@ impl Attempt {
     }
 }
 
+/// One exchange in flight: the state it carries, so a later change can cut it, and how.
+struct Flight {
+    revision: u64,
+    involved: bool,
+    abort: Option<tokio::task::AbortHandle>,
+}
+
 /// A computer reserved as in flight by the operator's pairing, released on drop.
 struct Reserved {
     me: Arc<Management>,
@@ -301,7 +311,8 @@ impl Drop for Reserved {
 
 impl Drop for Attempt {
     fn drop(&mut self) {
-        if !self.recorded {
+        let superseded = lock(&self.me.superseded).remove(&self.peer);
+        if !self.recorded && !superseded {
             self.me.record_exchange(
                 self.peer,
                 self.revision,
@@ -449,7 +460,8 @@ impl Management {
             net,
             anchors,
             serving: Mutex::new(Default::default()),
-            inflight: Mutex::new(BTreeSet::new()),
+            inflight: Mutex::new(BTreeMap::new()),
+            superseded: Mutex::new(BTreeSet::new()),
             slots: Arc::new(tokio::sync::Semaphore::new(8)),
             problem: Mutex::new(None),
             pending_nodes: Mutex::new(Vec::new()),
@@ -732,10 +744,22 @@ impl Management {
         // for now: the retry leaves it alone meanwhile, and the reservation ends with the
         // handshake however it ends (a drop guard), so the computer never stays in flight.
         let target = link.target;
-        if !lock(&self.inflight).insert(target) {
-            return Err(Error::Profile(
-                "an exchange with that computer is in progress; try again in a moment",
-            ));
+        {
+            let mut inflight = lock(&self.inflight);
+            if inflight.contains_key(&target) {
+                return Err(Error::Profile(
+                    "an exchange with that computer is in progress; try again in a moment",
+                ));
+            }
+            let revision = lock(&self.computer.state).revision;
+            inflight.insert(
+                target,
+                Flight {
+                    revision,
+                    involved: true,
+                    abort: None,
+                },
+            );
         }
         let reserved = Reserved {
             me: Arc::clone(self),
@@ -1724,10 +1748,36 @@ impl Management {
             drop(exchanged);
             // Reserved under one lock, after every other filter: a computer already in
             // flight (with the retry or with the operator's pairing) is left alone, and no
-            // two exchanges with one computer ever overlap.
+            // two exchanges with one computer ever overlap. An exchange in flight that
+            // carries state this node has since changed is cut: its payload is stale, its end
+            // counts as no failure, and the next tick exchanges the current state.
             {
                 let mut inflight = lock(&self.inflight);
-                peers.retain(|peer| inflight.insert(*peer));
+                let mut superseded = lock(&self.superseded);
+                for (peer, flight) in inflight.iter() {
+                    let stale =
+                        flight.revision != revision || flight.involved != (involved == Some(*peer));
+                    if stale && !superseded.contains(peer) {
+                        if let Some(abort) = &flight.abort {
+                            superseded.insert(*peer);
+                            abort.abort();
+                        }
+                    }
+                }
+                peers.retain(|peer| {
+                    if inflight.contains_key(peer) {
+                        return false;
+                    }
+                    inflight.insert(
+                        *peer,
+                        Flight {
+                            revision,
+                            involved: involved == Some(*peer),
+                            abort: None,
+                        },
+                    );
+                    true
+                });
             }
             let attempted: Vec<(Digest32, bool)> =
                 peers.iter().map(|p| (*p, involved == Some(*p))).collect();
@@ -1760,7 +1810,7 @@ impl Management {
             let involved = attempted
                 .iter()
                 .any(|(p, involved)| *p == peer && *involved);
-            tokio::spawn(async move {
+            let task = tokio::spawn(async move {
                 // Each computer's outcome is recorded by its own task the moment it ends,
                 // dated then: a slow computer never delays another's record, status or next
                 // attempt, and one that hangs counts as failed after EXCHANGE_WITHIN.
@@ -1783,6 +1833,9 @@ impl Management {
                     };
                 guard.done(outcome);
             });
+            if let Some(flight) = lock(&self.inflight).get_mut(&peer) {
+                flight.abort = Some(task.abort_handle());
+            }
         }
         Ok(())
     }
