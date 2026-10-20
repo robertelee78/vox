@@ -160,6 +160,8 @@ pub(super) fn rollback(apps: &Path, exe: &Path) -> Result<(), AppError> {
     let was = app_version(&active).unwrap_or_else(|| "unknown".to_owned());
     swap(&previous, &active)?;
     sync_dir(apps)?;
+    launch_services(false, &previous);
+    launch_services(true, &active);
     let now = app_version(&active).unwrap_or_else(|| "unknown".to_owned());
     println!("rolled back: {} -> Vox {now}", active.display());
     println!(
@@ -216,6 +218,8 @@ fn publish(apps: &Path, version: &str) -> Result<(), AppError> {
     // The swap left the replaced bundle under the partial name.
     fs::rename(&staged, &previous).map_err(AppError::Io)?;
     sync_dir(apps)?;
+    launch_services(false, &previous);
+    launch_services(true, &apps.join(BUNDLE));
     // The bundle that was previous before this publish goes, unless something still runs from
     // it: then it is retired, and a later transition removes it (see [`sweep`]).
     let older = journal.join(BUNDLE);
@@ -238,7 +242,41 @@ fn retire(apps: &Path, bundle: &Path) -> Result<(), AppError> {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis());
     let name = format!("{RETIRED_PREFIX}{ms}.{}", std::process::id());
-    fs::rename(bundle, apps.join(name)).map_err(AppError::Io)
+    let retired = apps.join(name);
+    fs::rename(bundle, &retired).map_err(AppError::Io)?;
+    launch_services(false, &retired);
+    Ok(())
+}
+
+/// Tell LaunchServices about a bundle: `register` adds or refreshes the bundle in place;
+/// otherwise the bundle a transition set aside (previous or retired) is taken out, so opening
+/// Vox by its identifier, from the Dock, Spotlight or Launchpad, never lands on it (ADR-014
+/// M-29a). Best effort: the bundle stays on disk for `--rollback` either way, and a refusal is
+/// said, not fatal. Measured 2026-10-19: both bundles registered as `us.vox.app` with the same
+/// CFBundleVersion, and reopening Vox launched the replaced 0.4.4 against the 0.4.6 daemon.
+fn launch_services(register: bool, bundle: &Path) {
+    const LSREGISTER: &str = "/System/Library/Frameworks/CoreServices.framework/Frameworks/\
+                              LaunchServices.framework/Support/lsregister";
+    let flag = if register { "-f" } else { "-u" };
+    match Command::new(LSREGISTER)
+        .arg(flag)
+        .arg(bundle)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+    {
+        Ok(status) if status.success() => {}
+        Ok(status) => println!(
+            "note: LaunchServices did not {} {} ({status}); open Vox as /Applications/Vox.app",
+            if register { "register" } else { "release" },
+            bundle.display()
+        ),
+        Err(e) => println!(
+            "note: LaunchServices was not told about {}: {e}; open Vox as /Applications/Vox.app",
+            bundle.display()
+        ),
+    }
 }
 
 /// Remove the retired bundles nothing runs from any more.
