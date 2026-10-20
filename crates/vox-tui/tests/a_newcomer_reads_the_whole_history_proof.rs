@@ -1484,18 +1484,18 @@ fn completed_rounds(dir: &Path) -> std::collections::BTreeMap<String, u64> {
 const REOPENS_WITHIN: Duration = Duration::from_secs(20);
 
 /// A room restored with pending private-Session work opens again after the daemon restarts
-/// (ADR-038 FX-26, #991). Staged as the decider's room was: bob is a member alice's governance
-/// has folded, with a Session through the shipped hook; then alice's private-Session policy
-/// is held not ready (the `VOX_TEST_PRIVATE_POLICY_HOLD_FILE` knob, as a Session-floor index
-/// behind its authors' heads holds it at a restart) while bob lets her drive, so his drive key
-/// arrives while the policy is not ready: the pass that key schedules is saved as pending and
-/// not run. Her daemon stops, the hold is lifted, it starts again. The room MUST open within
-/// [`REOPENS_WITHIN`], `vox room read` MUST show her rows, within 30 s `vox room sessions
-/// --json` MUST list bob's Session as one she can drive, and the daemon MUST stay quiet.
+/// (ADR-038 FX-24, FX-26; #991). Staged as the decider's room was: bob is a member alice's
+/// governance has folded; her private-Session policy is held not ready (the
+/// `VOX_TEST_PRIVATE_POLICY_HOLD_FILE` knob, as a Session-floor index behind its authors' heads
+/// holds it at a restart) while bob opens a Session through the shipped hook (an older prefix
+/// of his controls reaches her) and lets her drive (his drive key arrives; the pass it schedules
+/// is saved as pending and not run). Her daemon stops; his Session goes on while she is down
+/// (newer controls she lacks); the hold is lifted; her daemon starts again. The room MUST open
+/// within [`REOPENS_WITHIN`], `vox room read` MUST show her rows, within 30 s `vox room
+/// sessions --json` MUST list bob's Session as one she can drive, and the daemon MUST stay quiet.
 ///
 /// Mutant: the preparation and the refresh wait on every pending Session state again
-/// (`needs_session_upgrade`, as v0.4.8 did): the room then sits at "restoring its Sessions"
-/// for as long as the daemon runs, and the opening claim turns red.
+/// (`needs_session_upgrade`, as v0.4.8 did); the run that pins it is reported with the proof.
 #[cfg(feature = "optional-proofs")]
 #[test]
 #[ignore = "two starts of a real vox daemon, a second daemon, the shipped hook and a test-only knob; optional, run it in release"]
@@ -1528,8 +1528,7 @@ fn a_room_with_its_own_session_records_opens_after_a_restart() {
         assert!(ok, "PRODUCT: `vox trust add` of {name} failed: {err}");
     }
 
-    // ---- staging: alice's room with three rows; bob joins, his room opens, alice folds him
-    // in, and he opens a Session through the shipped hook -------------------------------------
+    // ---- staging: alice's room with three rows; bob joins, his room opens, alice folds him in
     let first = daemon_env(&alice, "alice", &knob);
     attached(&alice, "alice");
     let (ok, _, err) = vox(
@@ -1590,46 +1589,17 @@ fn a_room_with_its_own_session_records_opens_after_a_restart() {
         );
         std::thread::sleep(Duration::from_millis(500));
     }
-
-    // ---- her private-Session policy is held not ready while bob lets her drive: his drive
-    // key arrives, the pass it schedules is saved as pending and not run (the decider's
-    // daemon, 2026-10-20: a peer's key at a restart, behind that peer's control receipts) --
-    std::fs::write(&hold, b"").expect("APPARATUS: write the hold file");
-    std::thread::sleep(Duration::from_secs(1));
-    let (ok, _, err) = vox(&bob, &["trust", "drive", &fps[0]], None);
-    assert!(
-        ok,
-        "PRODUCT: bob's `vox trust drive` of alice failed: {err}"
-    );
-    std::thread::sleep(Duration::from_secs(10));
-    let drivable = |json: &str| {
-        json.lines()
-            .filter(|l| l.contains("restart-"))
-            .any(|l| l.contains("\"can_drive\":true"))
-    };
-    // Precondition: alice does not yet drive any Session of bob's (the pass his key scheduled
-    // did not run; he has none open yet).
-    let (ok, json, _) = vox(&alice, &["room", "sessions", &room, "--json"], None);
-    assert!(
-        !(ok && drivable(&json)),
-        "APPARATUS (staging): alice already drives bob's Session while her policy is held, so \
-         nothing is left pending for the restart:\n{json}"
-    );
-    first.stop();
-    std::fs::remove_file(&hold).expect("APPARATUS: remove the hold file");
-    // While she is down, bob opens a Session through the shipped hook: his Session's control
-    // entries reach her only once her room is published again, so at her restart the pass his
-    // key scheduled waits behind a receipt that preparation cannot fetch (ADR-037 R1).
-    let event = serde_json::json!({
-        "session_id": "restart-proof",
-        "transcript_path": work.join("transcript.jsonl").display().to_string(),
-        "cwd": work.display().to_string(),
-        "permission_mode": "default",
-        "hook_event_name": "UserPromptSubmit",
-        "prompt": "hello",
-    })
-    .to_string();
-    for _ in 0..2 {
+    // bob's harness session, through the shipped hook, with the prompt given.
+    let hook = |prompt: &str| {
+        let event = serde_json::json!({
+            "session_id": "restart-proof",
+            "transcript_path": work.join("transcript.jsonl").display().to_string(),
+            "cwd": work.display().to_string(),
+            "permission_mode": "default",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": prompt,
+        })
+        .to_string();
         let mut child = Command::new(VOX)
             .args(["agent", "hook", "--node", "default", "--room", &room])
             .env("VOX_DATA_DIR", &bob)
@@ -1661,7 +1631,37 @@ fn a_room_with_its_own_session_records_opens_after_a_restart() {
             "APPARATUS: bob's hook answered with setup words instead of joining the room: {said}"
         );
         std::thread::sleep(Duration::from_millis(500));
-    }
+    };
+
+    // ---- her private-Session policy is held not ready: bob's Session begins (an older prefix
+    // of his controls reaches her, folded no further), then he lets her drive: his drive key
+    // arrives and the pass it schedules is saved as pending and not run (the decider's daemon,
+    // 2026-10-20: a peer's key at a restart, behind that peer's control receipts) ----------------
+    std::fs::write(&hold, b"").expect("APPARATUS: write the hold file");
+    std::thread::sleep(Duration::from_secs(1));
+    hook("hello");
+    hook("hello again");
+    std::thread::sleep(Duration::from_secs(3));
+    let (ok, _, err) = vox(&bob, &["trust", "drive", &fps[0]], None);
+    assert!(
+        ok,
+        "PRODUCT: bob's `vox trust drive` of alice failed: {err}"
+    );
+    std::thread::sleep(Duration::from_secs(10));
+    let drivable = |json: &str| json.lines().any(|l| l.contains("\"can_drive\":true"));
+    // Precondition: alice drives no Session yet (the pass his key scheduled did not run).
+    let (ok, json, _) = vox(&alice, &["room", "sessions", &room, "--json"], None);
+    assert!(
+        !(ok && drivable(&json)),
+        "APPARATUS (staging): alice already drives a Session while her policy is held, so \
+         nothing is left pending for the restart:\n{json}"
+    );
+    first.stop();
+    std::fs::remove_file(&hold).expect("APPARATUS: remove the hold file");
+    // While she is down, bob's Session goes on: newer control entries she will receive only once
+    // her room is published again, so at her restart the pass his key scheduled waits behind a
+    // receipt that preparation cannot fetch (ADR-037 R1).
+    hook("and once more");
     std::thread::sleep(Duration::from_secs(2));
 
     // ---- the restart: the room prepares, says what it waits for, and opens ------------------
@@ -1688,8 +1688,8 @@ fn a_room_with_its_own_session_records_opens_after_a_restart() {
         assert!(
             started.elapsed() < REOPENS_WITHIN,
             "PRODUCT: a room restored with pending private-Session work did not open within \
-             {REOPENS_WITHIN:?} of the restart (FX-26, #991): {line:?}; it said while preparing: \
-             {seen_waiting:?}\nalice's daemon said: {}",
+             {REOPENS_WITHIN:?} of the restart (FX-24, FX-26; #991): {line:?}; it said while \
+             preparing: {seen_waiting:?}\nalice's daemon said: {}",
             said(&alice, "alice")
         );
         std::thread::sleep(Duration::from_millis(200));
@@ -1699,8 +1699,8 @@ fn a_room_with_its_own_session_records_opens_after_a_restart() {
         ok && (1..=3).all(|i| out.contains(&format!("row {i}"))),
         "PRODUCT: the reopened room does not read its three rows: ok={ok}\n{out}{err}"
     );
-    // The pending pass ran while the room prepared: alice holds bob's drive key, so his
-    // Session is listed as one she can drive, within a person's patience.
+    // Published, the room fetches bob's newer controls and runs the pending pass: his Session is
+    // listed as one she can drive, within a person's patience.
     let opened = Instant::now();
     loop {
         let (ok, json, err) = vox(&alice, &["room", "sessions", &room, "--json"], None);

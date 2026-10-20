@@ -1083,30 +1083,6 @@ impl ChannelState {
     /// published (ADR-037 R1): a room's preparation must not wait on it. Measured on the shipped
     /// candidate: a reopened sparse room waited here for a receipt no sync could bring it, and
     /// stayed "preparing history" for as long as the daemon ran.
-    /// What a turn of the local upgrade work changes: compared before and after a step, so a
-    /// turn that moved nothing is reported as a wait, never as progress (ADR-038 FX-24).
-    pub(crate) fn session_upgrade_mark(
-        &self,
-    ) -> (
-        bool,
-        bool,
-        bool,
-        Option<u64>,
-        bool,
-        bool,
-        Option<(usize, u64, Digest32)>,
-    ) {
-        (
-            self.private_sessions.upgrading,
-            self.private_sessions.restoring,
-            self.private_sessions.controls_import,
-            self.private_sessions.restore_after,
-            self.private_sessions.legacy_pending.is_empty(),
-            self.private_sessions.legacy_work.is_some(),
-            self.private_sessions.controls_import_after,
-        )
-    }
-
     pub(crate) fn session_upgrade_local_work(&self) -> bool {
         self.private_sessions.upgrading
             || self.private_sessions.restoring

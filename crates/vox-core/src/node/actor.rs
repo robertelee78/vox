@@ -18677,7 +18677,7 @@ impl Node {
         // room is published (ADR-037 R1), and the published room runs that pass. Waiting on it
         // here held the same room on v0.4.8 at "restoring its Sessions", re-queued every 50 ms.
         if ch.session_upgrade_local_work() {
-            let before = ch.session_upgrade_mark();
+            let before = profile.store().commits();
             // An error here is said as the wait and tried again, paced: it never closes a room
             // that was opening before this step existed.
             if let Err(error) = ch.advance_private_sessions(profile.store(), self.now_ms().get()) {
@@ -18688,9 +18688,10 @@ impl Node {
                 return Ok(false);
             }
             if ch.session_upgrade_local_work() {
-                // A turn that moved the restore comes back at once; one that could not (its
-                // policy or floor index refreshing) is a named wait, paced (ADR-038 FX-24).
-                if ch.session_upgrade_mark() != before {
+                // A turn that moved the restore committed a batch and comes back at once; one
+                // that committed nothing (its policy or floor index refreshing) is a named
+                // wait, paced (ADR-038 FX-24).
+                if profile.store().commits() != before {
                     prepared.progressed("restoring its Sessions", self.now_ms().get());
                 } else {
                     prepared.wait_on("restoring its Sessions", self.now_ms().get());
