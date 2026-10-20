@@ -39,7 +39,7 @@ use crate::node::api::{
     ChannelDetail, ChannelSummary, Fault, IdentityInfo, MessageRow, NodeCommand, NodeEvent,
     NodeView, Outcome, Secret,
 };
-use crate::node::channel::{ChannelState, Rendered, SessionRefresh};
+use crate::node::channel::{ChannelState, Rendered, SessionAdvance, SessionRefresh};
 use crate::node::net::PeerPolicy;
 use crate::node::network::{Inbound, NodeNet};
 use crate::node::open_rooms::OpenRooms;
@@ -18668,23 +18668,36 @@ impl Node {
             prepared.progressed("finishing its Session upgrade", self.now_ms().get());
             return Ok(false);
         }
-        // A restored room's private Sessions (its restore, its controls import, its legacy
-        // steps, its pending activity) otherwise advance only once the room is published, and
-        // the refresh below waits on them: a room restored with its own Session records never
-        // opened (found 2026-10-20, the decider's room, 20 h). One bounded step per turn here,
-        // until nothing of that is pending.
-        if ch.needs_session_upgrade() {
+        // A restored room's private-Session work that this node finishes alone (its restore,
+        // its controls import, its legacy steps) otherwise advanced only once the room was
+        // published, and the refresh below waited on it: a room restored with its own Session
+        // records never opened (found 2026-10-20, the decider's room, 20 h). One bounded step
+        // per turn here, until none of that is pending. What needs a peer (a pending key pass
+        // behind an author's control receipt) is not waited on: a peer is reached only once the
+        // room is published (ADR-037 R1), and the published room runs that pass. Waiting on it
+        // here held the same room on v0.4.8 at "restoring its Sessions", re-queued every 50 ms.
+        if ch.session_upgrade_local_work() {
             // An error here is said as the wait and tried again, paced: it never closes a room
             // that was opening before this step existed.
-            if let Err(error) = ch.advance_private_sessions(profile.store(), self.now_ms().get()) {
-                prepared.wait_on(
-                    &format!("restoring its Sessions ({error})"),
-                    self.now_ms().get(),
-                );
-                return Ok(false);
-            }
-            if ch.needs_session_upgrade() {
-                prepared.progressed("restoring its Sessions", self.now_ms().get());
+            let step = match ch.advance_private_sessions_step(profile.store(), self.now_ms().get())
+            {
+                Ok(step) => step,
+                Err(error) => {
+                    prepared.wait_on(
+                        &format!("restoring its Sessions ({error})"),
+                        self.now_ms().get(),
+                    );
+                    return Ok(false);
+                }
+            };
+            if ch.session_upgrade_local_work() {
+                // A turn that did work comes back at once; one that could not is a named wait,
+                // paced (ADR-038 FX-24).
+                if step == SessionAdvance::Advanced {
+                    prepared.progressed("restoring its Sessions", self.now_ms().get());
+                } else {
+                    prepared.wait_on("restoring its Sessions", self.now_ms().get());
+                }
                 return Ok(false);
             }
         }

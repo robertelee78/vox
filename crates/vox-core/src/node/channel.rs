@@ -59,7 +59,7 @@ mod legacy_sync;
 mod local_history;
 pub(crate) use legacy_sync::LegacySync;
 mod private_session;
-pub(crate) use private_session::SessionRefresh;
+pub(crate) use private_session::{SessionAdvance, SessionRefresh};
 pub(crate) mod session_floor;
 pub(crate) mod session_projection;
 mod sparse_history;

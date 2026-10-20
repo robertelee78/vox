@@ -33,6 +33,35 @@ use zeroize::Zeroizing;
 
 use crate::{digest, failed, input_fingerprint, VoxError};
 
+/// How many times a read under the room's fence is retried when the fence moved while it ran.
+/// The fence is the room's instance and display revision, and the revision moves with every
+/// row the room applies: under catch-up a row lands every few hundred milliseconds, and a single
+/// attempt almost always lost that race, so the app sat at "members loading" and said "refresh
+/// and try again" to a person (the decider's room, 2026-10-20).
+const FENCED_READ_ATTEMPTS: usize = 8;
+
+/// A read under the room's fence: `$body` runs with `$fence` bound and yields the read's value;
+/// if the fence or the acting node changed meanwhile, the read runs again, up to
+/// [`FENCED_READ_ATTEMPTS`] times, and is refused with `$message` when it keeps changing.
+/// Yields `(fence, value)`.
+macro_rules! under_fence {
+    ($c:expr, $channel_id:expr, $actor:expr, $message:expr, |$fence:ident| $body:block) => {{
+        let mut done = None;
+        for _ in 0..FENCED_READ_ATTEMPTS {
+            let $fence = room_read_fence($c, $channel_id).await?;
+            let value = $body;
+            if room_read_fence($c, $channel_id).await? == $fence && $c.me() == Some($actor) {
+                done = Some(($fence, value));
+                break;
+            }
+        }
+        match done {
+            Some(read) => read,
+            None => return Err(failed($message)),
+        }
+    }};
+}
+
 /// One bounded footer page for an exact displayed message. Continuations mean more people;
 /// clients replace a viewed recipient page instead of accumulating every historical recipient.
 #[derive(Clone, Debug, uniffi::Record)]
@@ -2726,41 +2755,44 @@ impl VoxClient {
         let view = view.map(|view| view.core()).transpose()?;
         on_held!(self, |c| {
             let actor = c.me().ok_or_else(not_attached)?;
-            let fence = room_read_fence(c, channel_id).await?;
-            if instance.is_some_and(|expected| expected != fence.0) {
-                return Err(failed(
-                    "The saved room changed. Open its current page again.",
-                ));
-            }
-            let names = names(c).await?;
-            let request = match view {
-                Some(view) => Request::RoomViewPage {
-                    channel_id,
-                    view,
-                    instance: Some(fence.0),
-                    before,
-                    limit: ROOM_WINDOW_ROWS as u64,
-                },
-                None => Request::RoomPage {
-                    channel_id,
-                    before,
-                    limit: ROOM_WINDOW_ROWS as u64,
-                },
-            };
-            let (rows, older, provisional) = match ask(c, &request).await? {
-                Frame::RoomPage {
-                    rows,
-                    older,
-                    provisional,
-                } => (rows, older, provisional),
-                other => return Err(unexpected(&other)),
-            };
-            room_window_bytes(&rows)?;
-            if room_read_fence(c, channel_id).await? != fence || c.me() != Some(actor) {
-                return Err(failed(
-                    "The room changed while reading. Refresh and try again.",
-                ));
-            }
+            let (fence, (names, rows, older, provisional)) = under_fence!(
+                c,
+                channel_id,
+                actor,
+                "The room changed while reading. Refresh and try again.",
+                |fence| {
+                    if instance.is_some_and(|expected| expected != fence.0) {
+                        return Err(failed(
+                            "The saved room changed. Open its current page again.",
+                        ));
+                    }
+                    let names = names(c).await?;
+                    let request = match view.clone() {
+                        Some(view) => Request::RoomViewPage {
+                            channel_id,
+                            view,
+                            instance: Some(fence.0),
+                            before,
+                            limit: ROOM_WINDOW_ROWS as u64,
+                        },
+                        None => Request::RoomPage {
+                            channel_id,
+                            before,
+                            limit: ROOM_WINDOW_ROWS as u64,
+                        },
+                    };
+                    let (rows, older, provisional) = match ask(c, &request).await? {
+                        Frame::RoomPage {
+                            rows,
+                            older,
+                            provisional,
+                        } => (rows, older, provisional),
+                        other => return Err(unexpected(&other)),
+                    };
+                    room_window_bytes(&rows)?;
+                    (names, rows, older, provisional)
+                }
+            );
             let me = b32_encode(&actor);
             Ok(FfiRoomRead {
                 instance: fence.0.to_vec(),
@@ -2807,50 +2839,53 @@ impl VoxClient {
             if let Some(view) = view {
                 return room_view_selection(c, channel_id, view, actor, instance, &entries).await;
             }
-            let fence = room_read_fence(c, channel_id).await?;
-            if fence.0 != instance {
-                return Err(failed(
-                    "The saved room changed. Open its current page again.",
-                ));
-            }
-            let names = names(c).await?;
-            let mut found = HashMap::new();
-            let mut bytes = 0usize;
-            for chunk in entries.chunks(vox_core::node::ipc::MAX_FIND) {
-                // Find itself streams one coherent selection. At most 64 bounded raw rows
-                // exist in this temporary reply, independent of the room's history size.
-                let request = Request::Find {
-                    channel_id,
-                    entries: chunk.to_vec(),
-                };
-                let rows = match ask(c, &request).await? {
-                    Frame::Rows { rows } => rows,
-                    other => return Err(unexpected(&other)),
-                };
-                for row in rows {
-                    if !chunk.contains(&row.entry_hash) {
+            let (_, (names, mut found)) = under_fence!(
+                c,
+                channel_id,
+                actor,
+                "The room changed while refreshing its held messages. Try again.",
+                |fence| {
+                    if fence.0 != instance {
                         return Err(failed(
-                            "The room returned a message outside the held selection.",
+                            "The saved room changed. Open its current page again.",
                         ));
                     }
-                    if found.contains_key(&row.entry_hash) {
-                        continue;
-                    }
-                    bytes =
-                        bytes.saturating_add(row.text.len() + vox_core::node::ipc::ROW_OVERHEAD);
-                    if !found.is_empty() && bytes > ROOM_WINDOW_BYTES {
-                        return Err(failed(
+                    let names = names(c).await?;
+                    let mut found = HashMap::new();
+                    let mut bytes = 0usize;
+                    for chunk in entries.chunks(vox_core::node::ipc::MAX_FIND) {
+                        // Find itself streams one coherent selection. At most 64 bounded raw rows
+                        // exist in this temporary reply, independent of the room's history size.
+                        let request = Request::Find {
+                            channel_id,
+                            entries: chunk.to_vec(),
+                        };
+                        let rows = match ask(c, &request).await? {
+                            Frame::Rows { rows } => rows,
+                            other => return Err(unexpected(&other)),
+                        };
+                        for row in rows {
+                            if !chunk.contains(&row.entry_hash) {
+                                return Err(failed(
+                                    "The room returned a message outside the held selection.",
+                                ));
+                            }
+                            if found.contains_key(&row.entry_hash) {
+                                continue;
+                            }
+                            bytes = bytes
+                                .saturating_add(row.text.len() + vox_core::node::ipc::ROW_OVERHEAD);
+                            if !found.is_empty() && bytes > ROOM_WINDOW_BYTES {
+                                return Err(failed(
                             "The held room selection exceeds one window's byte budget. Refresh fewer messages.",
                         ));
+                            }
+                            found.insert(row.entry_hash, row);
+                        }
                     }
-                    found.insert(row.entry_hash, row);
+                    (names, found)
                 }
-            }
-            if room_read_fence(c, channel_id).await? != fence || c.me() != Some(actor) {
-                return Err(failed(
-                    "The room changed while refreshing its held messages. Try again.",
-                ));
-            }
+            );
             let me = b32_encode(&actor);
             Ok(FfiRoomRead {
                 instance: instance.to_vec(),
@@ -4221,37 +4256,40 @@ impl VoxClient {
             .transpose()?;
         on_held!(self, |c| {
             let actor = c.me().ok_or_else(not_attached)?;
-            let fence = room_read_fence(c, channel_id).await?;
-            if expected.is_some_and(|instance| instance != fence.0) {
-                return Err(failed(
-                    "The saved room changed. Open its current thread again.",
-                ));
-            }
-            let names = names(c).await?;
-            let (rows, before, after) = match ask(
+            let (fence, (names, rows, before, after)) = under_fence!(
                 c,
-                &Request::ThreadPage {
-                    channel_id,
-                    root,
-                    before,
-                    after,
-                },
-            )
-            .await?
-            {
-                Frame::ThreadPage {
-                    rows,
-                    before,
-                    after,
-                } => (rows, before, after),
-                other => return Err(unexpected(&other)),
-            };
-            room_window_bytes(&rows)?;
-            if room_read_fence(c, channel_id).await? != fence || c.me() != Some(actor) {
-                return Err(failed(
-                    "The thread changed while reading its page. Try again.",
-                ));
-            }
+                channel_id,
+                actor,
+                "The thread changed while reading its page. Try again.",
+                |fence| {
+                    if expected.is_some_and(|instance| instance != fence.0) {
+                        return Err(failed(
+                            "The saved room changed. Open its current thread again.",
+                        ));
+                    }
+                    let names = names(c).await?;
+                    let (rows, before, after) = match ask(
+                        c,
+                        &Request::ThreadPage {
+                            channel_id,
+                            root,
+                            before,
+                            after,
+                        },
+                    )
+                    .await?
+                    {
+                        Frame::ThreadPage {
+                            rows,
+                            before,
+                            after,
+                        } => (rows, before, after),
+                        other => return Err(unexpected(&other)),
+                    };
+                    room_window_bytes(&rows)?;
+                    (names, rows, before, after)
+                }
+            );
             let me = b32_encode(&actor);
             Ok(FfiThreadRead {
                 messages: rows
@@ -4737,17 +4775,28 @@ impl VoxClient {
         .map_err(|e| failed(e.to_string()))?;
         on_held!(self, |c| {
             let actor = c.me().ok_or_else(not_attached)?;
-            let fence = room_read_fence(c, channel_id).await?;
-            let page: Page = match ask(c, &Request::WorkBoard { channel_id, query }).await? {
-                Frame::WorkBoard { page } => serde_json::from_str(&page)
-                    .map_err(|_| failed("Invalid daemon work-board page."))?,
-                other => return Err(unexpected(&other)),
-            };
-            if room_read_fence(c, channel_id).await? != fence || c.me() != Some(actor) {
-                return Err(failed(
-                    "The room changed while reading its work board. Refresh and retry.",
-                ));
-            }
+            let (fence, page) = under_fence!(
+                c,
+                channel_id,
+                actor,
+                "The room changed while reading its work board. Refresh and retry.",
+                |fence| {
+                    let page: Page = match ask(
+                        c,
+                        &Request::WorkBoard {
+                            channel_id,
+                            query: query.clone(),
+                        },
+                    )
+                    .await?
+                    {
+                        Frame::WorkBoard { page } => serde_json::from_str(&page)
+                            .map_err(|_| failed("Invalid daemon work-board page."))?,
+                        other => return Err(unexpected(&other)),
+                    };
+                    page
+                }
+            );
             let mut rows = Vec::with_capacity(page.rows.len());
             for row in page.rows {
                 let Row::Work(row) = row else {
