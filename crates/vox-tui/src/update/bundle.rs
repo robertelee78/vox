@@ -197,13 +197,17 @@ pub(super) fn rollback(apps: &Path, exe: &Path) -> Result<(), AppError> {
     let detached = super::restart::restart_daemon(&active.join(HELPER), &now);
     shell_setup_from(apps, exe);
     super::restart::say_next(&detached);
-    aside.map_err(|e| {
-        AppError::Usage(format!(
-            "the rollback is done, but the replaced Vox.app was not set aside: {e}; run `vox \
-             update` to repair, and until then open Vox as {}",
+    // Said, not failed: the rollback is committed, and a command that reports failure invites
+    // the same command again, which would roll back once more and reverse it. The repair is
+    // `vox update`, which sets the kept bundle aside under the lock without swapping anything.
+    if let Err(e) = aside {
+        println!(
+            "vox: the rollback is done, but the replaced Vox.app was not set aside: {e}; run \
+             `vox update` to repair (it swaps nothing), and until then open Vox as {}",
             active.display()
-        ))
-    })
+        );
+    }
+    Ok(())
 }
 
 /// Exchange two paths in one step (`renameatx_np` with `RENAME_SWAP`): each name holds a whole
