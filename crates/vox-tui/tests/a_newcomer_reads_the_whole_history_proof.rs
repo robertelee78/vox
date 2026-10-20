@@ -83,6 +83,8 @@ optional_proof::not_run!(
     a_newcomer_talks_both_ways_at_one_wait_fresh_or_behind_a_backlog,
 );
 
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
@@ -123,6 +125,23 @@ impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
+    }
+}
+
+impl Daemon {
+    /// Stop it as a person does (SIGTERM, ADR-012: a clean stop), waiting for it to exit.
+    fn stop(mut self) {
+        let _ = Command::new("kill")
+            .args(["-TERM", &self.0.id().to_string()])
+            .status();
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_secs(15) {
+            if let Ok(Some(_)) = self.0.try_wait() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        // Drop kills what did not stop.
     }
 }
 
@@ -187,16 +206,25 @@ fn vox_plain(dir: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String, S
 
 /// Start `vox daemon` with the identity passphrase piped in, its output to files by the profile.
 fn daemon(dir: &Path, tag: &str) -> Daemon {
+    daemon_env(dir, tag, &[])
+}
+
+/// The same, with environment the daemon reads at its start (a test-only knob, for instance).
+fn daemon_env(dir: &Path, tag: &str, env: &[(&str, &str)]) -> Daemon {
     let file = |kind: &str| {
         let at = dir.join(format!("daemon-{tag}.{kind}"));
         std::fs::File::create(&at)
             .unwrap_or_else(|e| panic!("APPARATUS: could not create {}: {e}", at.display()))
     };
-    let mut child = Command::new(VOX)
-        .args(["daemon", "--listen", "127.0.0.1:0"])
+    let mut cmd = Command::new(VOX);
+    cmd.args(["daemon", "--listen", "127.0.0.1:0"])
         .env("VOX_DATA_DIR", dir)
         .env("VOX_CONFIG_DIR", dir.join("cfg"))
-        .env_remove("VOX_ROOM")
+        .env_remove("VOX_ROOM");
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::from(file("out")))
         .stderr(Stdio::from(file("err")))
@@ -828,6 +856,56 @@ fn a_daemon_answers_the_hook_while_syncing() {
     let (ok, _, err) = vox(
         &alice,
         &["room", "create", "--passphrase-file", "-", "--name", "busy"],
+/// `vox room list` MUST name what a preparing room waits for within this of the daemon's start.
+const WAIT_NAMED_WITHIN: Duration = Duration::from_secs(5);
+/// How long the held room is watched doing nothing.
+const PREPARING_IDLE: Duration = Duration::from_secs(60);
+/// CPU time the daemon may spend over [`PREPARING_IDLE`] on a room that only waits: Activity
+/// Monitor's number. Measured before (#991): the room was re-queued every 50 ms, for hours.
+const PREPARING_CPU: Duration = Duration::from_secs(3);
+/// Once the wait ends, the room MUST open within this (the retry is once a second).
+const OPENS_WITHIN: Duration = Duration::from_secs(10);
+
+/// A room that cannot finish preparing says what it waits for, costs nothing while it waits, and
+/// opens once the wait ends (ADR-038 FX-15, FX-16; #991). Staged with the fold-hold knob: alice
+/// posts into her room, the hold file appears, she posts three more rows (accepted, not folded),
+/// her daemon is stopped and started again with the hold still in place, so the room cannot
+/// finish preparing. Within [`WAIT_NAMED_WITHIN`] `vox room list` MUST say `[preparing history:
+/// waiting for …]`, `vox status --json` MUST list the room under `preparing` with the same words,
+/// and `vox room read` MUST refuse with them; over [`PREPARING_IDLE`] the daemon's CPU time MUST
+/// grow by at most [`PREPARING_CPU`] and its log MUST say once what the room waited for; once the
+/// hold file is removed the room MUST open within [`OPENS_WITHIN`] and its six rows read.
+/// Found 2026-10-20 on the decider's work Mac (v0.4.7): a room stayed "[preparing history]" for
+/// 20 hours with no words anywhere, re-queued every 50 ms, absent from `vox status`.
+///
+/// Mutant: the governance wait left unnamed (`wait_on` not called for it in
+/// `retention_before_publication`, actor.rs) turns the first claim red on `vox room list`'s line.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "a minute of a real vox daemon holding a room, and a test-only knob; optional, run it in release"]
+fn a_room_that_cannot_finish_preparing_says_why_and_costs_nothing() {
+    test_knobs::require(&["VOX_TEST_FOLD_HOLD_FILE"]);
+    watchdog::arm();
+    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("APPARATUS: no temp dir: {e}"));
+    let root = tmp.path();
+    let alice = root.join("alice");
+    std::fs::create_dir_all(alice.join("cfg"))
+        .unwrap_or_else(|e| panic!("APPARATUS: could not create {}: {e}", alice.display()));
+    let hold = root.join("fold-hold");
+    let hold_path = hold
+        .to_str()
+        .expect("APPARATUS: a UTF-8 temp path")
+        .to_owned();
+    let knob = [("VOX_TEST_FOLD_HOLD_FILE", hold_path.as_str())];
+    let (ok, _, err) = vox(&alice, &["id"], None);
+    assert!(ok, "PRODUCT: `vox id` failed: {err}");
+
+    // ---- staging: a room with three folded rows, then three held ones ------------------------
+    let first = daemon_env(&alice, "alice", &knob);
+    attached(&alice, "alice");
+    let (ok, _, err) = vox(
+        &alice,
+        &["room", "create", "--passphrase-file", "-", "--name", "held"],
         Some(&format!("{ROOMPASS}\n")),
     );
     assert!(
@@ -1083,6 +1161,137 @@ fn held_entries(dir: &Path) -> u64 {
             })
         })
         .unwrap_or(0)
+    for i in 1..=3 {
+        let (ok, out, err) = vox(&alice, &["room", "post", &room, &format!("row {i}")], None);
+        assert!(ok, "PRODUCT: alice's post {i} was refused: {out}{err}");
+    }
+    std::fs::write(&hold, b"").expect("APPARATUS: write the hold file");
+    for i in 4..=6 {
+        let (ok, out, err) = vox(&alice, &["room", "post", &room, &format!("row {i}")], None);
+        assert!(
+            ok,
+            "PRODUCT: alice's post {i} was refused under the fold hold: {out}{err}"
+        );
+    }
+    first.stop();
+
+    // ---- the room cannot finish preparing: the daemon says what it waits for ----------------
+    let second = daemon_env(&alice, "alice", &knob);
+    let started = Instant::now();
+    let line = loop {
+        let (ok, out, _) = vox(&alice, &["room", "list"], None);
+        let line = out
+            .lines()
+            .find(|l| l.trim_start().starts_with(&room))
+            .map(str::to_owned)
+            .unwrap_or_default();
+        if ok && line.contains("[preparing history: waiting for ") {
+            break line;
+        }
+        if ok && !line.is_empty() && !line.contains("[preparing") {
+            panic!(
+                "APPARATUS: the fold-hold knob did not hold the room, it opened: `vox room list` says {line}"
+            );
+        }
+        assert!(
+            started.elapsed() < WAIT_NAMED_WITHIN,
+            "PRODUCT: `vox room list` does not say what the preparing room waits for within \
+             {WAIT_NAMED_WITHIN:?} (ADR-038 FX-16, #991): {line:?}\nalice's daemon said: {}",
+            said(&alice, "alice")
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    println!(
+        "[proof] {:?} after the daemon's start, `vox room list` said: {line}",
+        started.elapsed()
+    );
+    let (ok, status, err) = vox(&alice, &["status", "--json"], None);
+    assert!(
+        ok,
+        "PRODUCT: `vox status --json` failed while a room prepared: {err}"
+    );
+    let status: serde_json::Value = serde_json::from_str(&status)
+        .unwrap_or_else(|e| panic!("PRODUCT: `vox status --json` is not JSON: {e}: {status}"));
+    let entry = status["preparing"]
+        .as_array()
+        .and_then(|rooms| {
+            rooms
+                .iter()
+                .find(|r| r["id"].as_str().is_some_and(|id| id.starts_with(&room)))
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "PRODUCT: `vox status --json` does not list the preparing room under `preparing` \
+                 (ADR-038 FX-16, #991): {}",
+                status["preparing"]
+            )
+        });
+    let what = entry["waiting"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!("PRODUCT: `vox status --json` names no wait for the room: {entry}")
+        })
+        .to_owned();
+    assert!(
+        line.contains(&what) && entry["since_ms"].as_u64().is_some(),
+        "PRODUCT: `vox status --json` ({entry}) and `vox room list` ({line}) do not say the same wait"
+    );
+    let (ok, out, err) = vox(&alice, &["room", "read", &room], None);
+    assert!(
+        !ok && format!("{out}{err}").contains("it waits for "),
+        "PRODUCT: `vox room read` of a preparing room does not say what it waits for (#991): ok={ok} {out}{err}"
+    );
+
+    // ---- the wait costs nothing -------------------------------------------------------------
+    let pid = second.0.id();
+    let cpu0 = cpu_time(pid);
+    std::thread::sleep(PREPARING_IDLE);
+    let spent = cpu_time(pid).saturating_sub(cpu0);
+    let log = std::fs::read_to_string(alice.join(".daemon/log")).unwrap_or_default();
+    println!(
+        "[proof] over {PREPARING_IDLE:?} the held room cost the daemon +{spent:?} of CPU (bound {PREPARING_CPU:?}); its log says: {:?}",
+        log.lines().filter(|l| l.contains("still preparing")).collect::<Vec<_>>()
+    );
+    assert!(
+        spent <= PREPARING_CPU,
+        "PRODUCT: a room that only waited cost the daemon {spent:?} of CPU over {PREPARING_IDLE:?} \
+         (ADR-038 FX-15, #991; bound {PREPARING_CPU:?})"
+    );
+    assert!(
+        log.contains("is still preparing: it waits for ") || said(&alice, "alice").contains("is still preparing: it waits for "),
+        "PRODUCT: after {PREPARING_IDLE:?} the daemon's log never said what the room waited for (#991); its log:\n{log}"
+    );
+
+    // ---- the wait ends: the room opens and its six rows read ---------------------------------
+    std::fs::remove_file(&hold).expect("APPARATUS: remove the hold file");
+    let released = Instant::now();
+    loop {
+        let (ok, out, _) = vox(&alice, &["room", "list"], None);
+        let line = out
+            .lines()
+            .find(|l| l.trim_start().starts_with(&room))
+            .map(str::to_owned)
+            .unwrap_or_default();
+        if ok && !line.is_empty() && !line.contains("[preparing") {
+            println!(
+                "[proof] {:?} after the hold ended, `vox room list` said: {line}",
+                released.elapsed()
+            );
+            break;
+        }
+        assert!(
+            released.elapsed() < OPENS_WITHIN,
+            "PRODUCT: the room did not open within {OPENS_WITHIN:?} after its wait ended (#991): {line:?}\nalice's daemon said: {}",
+            said(&alice, "alice")
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let (ok, out, err) = vox(&alice, &["room", "read", &room], None);
+    assert!(
+        ok && (1..=6).all(|i| out.contains(&format!("row {i}"))),
+        "PRODUCT: the opened room does not read all six rows: ok={ok}\n{out}{err}"
+    );
+    drop(second);
 }
 
 /// Each lane of a `vox status --json`: peer, completed, partial, failed, running and its last failure.

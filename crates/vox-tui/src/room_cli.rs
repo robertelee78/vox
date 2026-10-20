@@ -46,7 +46,7 @@ pub(crate) async fn attach(paths: &Paths) -> Result<IpcClient, AppError> {
 /// Ask the node for its rooms, as `(id, local name, open, over, preparing)`.
 pub(crate) async fn rooms_of(
     client: &mut IpcClient,
-) -> Result<Vec<(Digest32, String, bool, String, bool)>, AppError> {
+) -> Result<Vec<vox_core::node::ipc::RoomRow>, AppError> {
     match client.rooms().await {
         Ok(Frame::Rooms { rooms }) => Ok(rooms),
         Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
@@ -141,11 +141,13 @@ pub(crate) async fn room_of(client: &mut IpcClient, prefix: &str) -> Result<Dige
             "this node holds no rooms yet — join or create one first".into(),
         ));
     }
-    let ids: Vec<Digest32> = rooms.iter().map(|(id, _, _, _, _)| *id).collect();
+    let ids: Vec<Digest32> = rooms.iter().map(|(id, _, _, _, _, _)| *id).collect();
     let named: Vec<Digest32> = rooms
         .iter()
-        .filter(|(_, name, _, _, _)| !name.is_empty() && name.eq_ignore_ascii_case(prefix.trim()))
-        .map(|(id, _, _, _, _)| *id)
+        .filter(|(_, name, _, _, _, _)| {
+            !name.is_empty() && name.eq_ignore_ascii_case(prefix.trim())
+        })
+        .map(|(id, _, _, _, _, _)| *id)
         .collect();
     let id = match named.as_slice() {
         [] => resolve_prefix(prefix, &ids)?,
@@ -163,7 +165,9 @@ pub(crate) async fn room_of(client: &mut IpcClient, prefix: &str) -> Result<Dige
     // A closed room's name is sealed in its manifest, so a node that has not opened it does
     // not know it: the name here is empty, and printing it said `room "" is not open` (#208).
     // Named by the id the operator typed a prefix of, and by its name only when there is one.
-    if let Some((_, name, false, _, preparing)) = rooms.iter().find(|(r, _, _, _, _)| *r == id) {
+    if let Some((_, name, false, _, preparing, _)) =
+        rooms.iter().find(|(r, _, _, _, _, _)| *r == id)
+    {
         if *preparing {
             return Err(AppError::Usage(
                 vox_core::node::api::Fault::RoomPreparing.explain().into(),
@@ -213,8 +217,8 @@ pub async fn list(paths: &Paths) -> Result<(), AppError> {
     }
     // **Two rooms of one name are each shown by their room ID** (ADR-028 R-3): a rename can give
     // a room the name of another this node holds. Said once, under the list.
-    let clashing = clashing_names(rooms.iter().map(|(_, name, _, _, _)| name.as_str()));
-    for (id, name, open, over, preparing) in &rooms {
+    let clashing = clashing_names(rooms.iter().map(|(_, name, _, _, _, _)| name.as_str()));
+    for (id, name, open, over, preparing, waiting) in &rooms {
         let shown = if clashing.contains(name.as_str()) {
             b32_encode(id)
         } else if name.is_empty() {
@@ -225,12 +229,14 @@ pub async fn list(paths: &Paths) -> Result<(), AppError> {
         println!(
             "{}  {shown}{}{}",
             short(id),
-            if *preparing {
-                "  [preparing history]"
-            } else if *open {
-                ""
-            } else {
-                "  [closed]"
+            match (*preparing, waiting) {
+                (true, Some((what, since))) => format!(
+                    "  [preparing history: waiting for {what}, {}]",
+                    vox_core::node::status::since_text(*since)
+                ),
+                (true, None) => "  [preparing history]".to_owned(),
+                (false, _) if *open => String::new(),
+                _ => "  [closed]".to_owned(),
             },
             if over.is_empty() {
                 String::new()
@@ -243,7 +249,7 @@ pub async fn list(paths: &Paths) -> Result<(), AppError> {
         println!(
             "vox: {} rooms on this node are called {name}, so each is shown by its room ID until \
              one is renamed (`vox room rename`)",
-            rooms.iter().filter(|(_, n, _, _, _)| n == name).count()
+            rooms.iter().filter(|(_, n, _, _, _, _)| n == name).count()
         );
     }
     Ok(())
@@ -5444,7 +5450,7 @@ async fn save_repo_binding(
     if !rooms_of(client)
         .await?
         .into_iter()
-        .any(|(id, _, open, over, _)| id == room && open && over.is_empty())
+        .any(|(id, _, open, over, _, _)| id == room && open && over.is_empty())
     {
         return Err(AppError::Usage(
             "the room is no longer open; the repo was not bound".into(),
@@ -5512,8 +5518,8 @@ pub async fn join(
             .into_iter()
             // A room this identity left is not: it is joined again, with its passphrase, from
             // scratch (V030-08).
-            .find(|(id, _, open, over, _)| *id == parsed.channel_id && *open && over != "left")
-            .map(|(id, name, _, _, _)| {
+            .find(|(id, _, open, over, _, _)| *id == parsed.channel_id && *open && over != "left")
+            .map(|(id, name, _, _, _, _)| {
                 if name.is_empty() {
                     b32_encode(&id)
                 } else {
@@ -5593,8 +5599,8 @@ pub async fn join(
                 Ok(parsed) => rooms_of(&mut client)
                     .await?
                     .into_iter()
-                    .find(|(id, _, _, _, _)| *id == parsed.channel_id)
-                    .map(|(id, name, _, _, _)| {
+                    .find(|(id, _, _, _, _, _)| *id == parsed.channel_id)
+                    .map(|(id, name, _, _, _, _)| {
                         vox_core::node::resolver::room_shown(Some(name.as_str()), &id)
                     }),
                 Err(_) => None,
@@ -5754,10 +5760,10 @@ pub async fn create(
     let mut client = attach(paths).await?;
     // A node holds one room of a name (ADR-028 R-3): said with the room that holds it, before a
     // passphrase is asked for.
-    if let Some((id, _, _, _, _)) = rooms_of(&mut client)
+    if let Some((id, _, _, _, _, _)) = rooms_of(&mut client)
         .await?
         .into_iter()
-        .find(|(_, held, _, _, _)| *held == name)
+        .find(|(_, held, _, _, _, _)| *held == name)
     {
         return Err(AppError::Usage(format!(
             "cannot create the room: the room {} on this node is already called {name}, and a \
@@ -5779,7 +5785,7 @@ pub async fn create(
         Some(_) => rooms_of(&mut client)
             .await?
             .into_iter()
-            .map(|(id, _, _, _, _)| id)
+            .map(|(id, _, _, _, _, _)| id)
             .collect(),
         None => Vec::new(),
     };
@@ -5797,8 +5803,8 @@ pub async fn create(
                 let made = rooms_of(&mut client)
                     .await?
                     .into_iter()
-                    .find(|(_, held, open, over, _)| held == &name && *open && over.is_empty())
-                    .map(|(id, _, _, _, _)| id)
+                    .find(|(_, held, open, over, _, _)| held == &name && *open && over.is_empty())
+                    .map(|(id, _, _, _, _, _)| id)
                     .ok_or_else(|| {
                         AppError::Usage(
                             "the room was created, but is no longer open; the repo was not bound"
@@ -5818,7 +5824,7 @@ pub async fn create(
                 let made = rooms_of(&mut client)
                     .await?
                     .into_iter()
-                    .map(|(id, _, _, _, _)| id)
+                    .map(|(id, _, _, _, _, _)| id)
                     .find(|id| !before.contains(id))
                     .ok_or_else(|| {
                         AppError::Usage(
@@ -6287,7 +6293,7 @@ fn room_said(id: &Digest32, name: &str) -> String {
 /// are not known until it opens, so it is not named.
 async fn rooms_with(client: &mut IpcClient, member: &Digest32) -> Vec<(Digest32, String)> {
     let mut out = Vec::new();
-    for (id, name, open, _, _) in rooms_of(client).await.unwrap_or_default() {
+    for (id, name, open, _, _, _) in rooms_of(client).await.unwrap_or_default() {
         if open
             && members_of(client, id)
                 .await
@@ -6305,8 +6311,8 @@ pub(crate) async fn room_named(client: &mut IpcClient, channel_id: Digest32) -> 
         .await
         .unwrap_or_default()
         .into_iter()
-        .find(|(id, _, _, _, _)| *id == channel_id)
-        .map(|(_, name, _, _, _)| name)
+        .find(|(id, _, _, _, _, _)| *id == channel_id)
+        .map(|(_, name, _, _, _, _)| name)
         .unwrap_or_default();
     room_said(&channel_id, &name)
 }
@@ -6935,8 +6941,8 @@ pub async fn leave(paths: &Paths, room: &str) -> Result<(), AppError> {
     let name = rooms_of(&mut client)
         .await?
         .into_iter()
-        .find(|(id, _, _, _, _)| *id == channel_id)
-        .map(|(_, name, _, _, _)| name)
+        .find(|(id, _, _, _, _, _)| *id == channel_id)
+        .map(|(_, name, _, _, _, _)| name)
         .unwrap_or_default();
     let which = if name.is_empty() {
         format!("room {}", b32_encode(&channel_id))

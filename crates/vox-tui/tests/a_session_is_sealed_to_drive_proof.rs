@@ -466,7 +466,7 @@ fn channel_id(rt: &tokio::runtime::Runtime, m: &Member, short: &str) -> [u8; 32]
     match rt.block_on(m.socket(rt).rooms()) {
         Ok(Frame::Rooms { rooms }) => rooms
             .iter()
-            .map(|(id, _, _, _, _)| *id)
+            .map(|(id, _, _, _, _, _)| *id)
             .find(|id| vox_core::node::link::b32_encode(id).starts_with(short))
             .unwrap_or_else(|| panic!("APPARATUS (staging): the room is not on {}'s node", m.name)),
         other => panic!("APPARATUS (staging): {}'s rooms: {other:?}", m.name),
