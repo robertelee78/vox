@@ -73,6 +73,9 @@ pub struct ComputerApplication {
     /// Exchanges since the daemon started: with nothing to settle, a few per hour, not one every
     /// two seconds (ADR-038 FX-15; #989).
     pub exchanges: u64,
+    /// Attempts since the daemon started, completed or not: every round the retry ran toward
+    /// it, so a proof can count rounds per computer (ADR-038 FX-15).
+    pub exchange_attempts: u64,
     /// Attempts in a row that could not reach it; the retry backs off with each.
     pub exchange_failures: u32,
 }
@@ -257,6 +260,8 @@ struct Exchanged {
     last_ms: Option<u64>,
     /// Exchanges completed since the daemon started.
     count: u64,
+    /// Attempts since the daemon started, completed or not.
+    attempts: u64,
     /// Failures in a row since the last success; the backoff doubles with each.
     failures: u32,
     /// This node's state revision at the last attempt, and whether a pairing operation
@@ -1139,6 +1144,7 @@ impl Management {
                             .is_some_and(|r| valid_receipt(&s, id, r).unwrap_or(false)),
                     last_exchange_ms: record.last_ms,
                     exchanges: record.count,
+                    exchange_attempts: record.attempts,
                     exchange_failures: record.failures,
                 })
             })
@@ -2000,6 +2006,7 @@ impl Management {
         let mut exchanged = lock(&self.exchanged);
         let record = exchanged.entry(peer).or_default();
         record.last = Some(std::time::Instant::now());
+        record.attempts = record.attempts.saturating_add(1);
         record.revision = revision;
         record.involved = involved;
         match outcome {

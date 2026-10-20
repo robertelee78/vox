@@ -285,8 +285,9 @@ fn show(status: &ComputerStatus, json: bool) -> Result<(), AppError> {
                     .saturating_sub(at)
                     / 1000;
                 format!(
-                    "; exchanged {} time(s) since the daemon started, last {ago} s ago{}",
+                    "; exchanged {} time(s) in {} attempt(s) since the daemon started, last {ago} s ago{}",
                     application.exchanges,
+                    application.exchange_attempts,
                     if application.exchange_failures > 0 {
                         format!(", {} failed in a row", application.exchange_failures)
                     } else {

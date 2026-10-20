@@ -2452,7 +2452,7 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
     // What `vox computer status --json` shows: the sum of `exchanges` over the computers listed,
     // the latest `last_exchange_ms`, whether every one is confirmed, and the listing itself for a
     // red to quote.
-    let exchanges = |acct: &Account| -> (u64, Option<u64>, bool, String) {
+    let exchanges = |acct: &Account| -> (u64, u64, Option<u64>, bool, String) {
         let status = computer(acct, &["status"]);
         let apps = status["applications"]
             .as_array()
@@ -2462,15 +2462,30 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
             .iter()
             .map(|p| p["exchanges"].as_u64().unwrap_or(0))
             .sum();
+        // Rounds, completed or not: a failed round is a round (ADR-038 FX-15).
+        let attempts: u64 = apps
+            .iter()
+            .map(|p| {
+                p["exchange_attempts"].as_u64().unwrap_or_else(|| {
+                    panic!("PRODUCT: `vox computer status --json` counts no exchange attempts: {p}")
+                })
+            })
+            .sum();
         let last = apps
             .iter()
             .filter_map(|p| p["last_exchange_ms"].as_u64())
             .max();
         let confirmed = apps.iter().all(|p| p["confirmed"] == true);
-        (total, last, confirmed, status["applications"].to_string())
+        (
+            total,
+            attempts,
+            last,
+            confirmed,
+            status["applications"].to_string(),
+        )
     };
-    let (ea0, last_a0, _, shown_a0) = exchanges(&a);
-    let (eb0, last_b0, _, shown_b0) = exchanges(&b);
+    let (ea0, aa0, last_a0, _, shown_a0) = exchanges(&a);
+    let (eb0, ab0, last_b0, _, shown_b0) = exchanges(&b);
     let cpu0 = (cpu_time(da.child.id()), cpu_time(db.child.id()));
     // Every SAMPLE_EVERY, each side's dated last exchange: a new one must be at least the
     // fallback after the one before it, or the round had no need the status names.
@@ -2480,7 +2495,7 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
     while idle_from.elapsed() < PAIRED_IDLE {
         std::thread::sleep(SAMPLE_EVERY.min(PAIRED_IDLE.saturating_sub(idle_from.elapsed())));
         for (i, acct) in [&a, &b].into_iter().enumerate() {
-            if let (_, Some(last), _, _) = exchanges(acct) {
+            if let (_, _, Some(last), _, _) = exchanges(acct) {
                 if dated[i].last() != Some(&last) {
                     dated[i].push(last);
                 }
@@ -2499,8 +2514,8 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
             );
         }
     }
-    let (ea1, last_a, confirmed_a, shown_a1) = exchanges(&a);
-    let (eb1, last_b, confirmed_b, shown_b1) = exchanges(&b);
+    let (ea1, aa1, last_a, confirmed_a, shown_a1) = exchanges(&a);
+    let (eb1, ab1, last_b, confirmed_b, shown_b1) = exchanges(&b);
     let cpu1 = (cpu_time(da.child.id()), cpu_time(db.child.id()));
     let spent = (cpu1.0.saturating_sub(cpu0.0), cpu1.1.saturating_sub(cpu0.1));
     // The count is "since the daemon started" and the daemons ran throughout: it never shrinks.
@@ -2514,6 +2529,15 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
     };
     let during_a = grew(ea0, ea1, "alpha", &shown_a0, &shown_a1);
     let during_b = grew(eb0, eb1, "beta", &shown_b0, &shown_b1);
+    // Every round counted, completed or not: the idle minute allows one per computer, and a
+    // failed round that a later success hides from the completed count still shows here.
+    let tried_a = grew(aa0, aa1, "alpha", &shown_a0, &shown_a1);
+    let tried_b = grew(ab0, ab1, "beta", &shown_b0, &shown_b1);
+    assert!(
+        tried_a <= IDLE_EXCHANGES && tried_b <= IDLE_EXCHANGES && tried_a == during_a && tried_b == during_b,
+        "PRODUCT: idle computers ran rounds beyond the fallback, or rounds that failed (ADR-038 FX-15, #989): \
+         alpha {tried_a} attempt(s) for {during_a} exchange(s), beta {tried_b} for {during_b} over {PAIRED_IDLE:?} (at most {IDLE_EXCHANGES} each)\n{shown_a1}\n{shown_b1}"
+    );
     println!(
         "[proof] over {PAIRED_IDLE:?} idle: alpha exchanged {during_a} time(s) with beta (last at {last_a:?}, confirmed {confirmed_a}), beta {during_b} with alpha (last at {last_b:?}, confirmed {confirmed_b}); CPU: alpha's daemon +{:?}, beta's +{:?} (bound {IDLE_CPU:?})",
         spent.0,
