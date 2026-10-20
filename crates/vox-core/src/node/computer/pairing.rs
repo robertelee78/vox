@@ -1578,18 +1578,23 @@ impl Management {
                 peers.insert(g.computers[1 - side(g, &local)?].fingerprint()?);
             }
             // A computer needs an exchange when it has not acknowledged this node's current
-            // state (its receipt for the current revision is missing), when a pending operation
-            // involves it, or when the fallback interval passed; a computer that could not be
-            // reached waits out its backoff. Measured before this (2026-10-20): every computer
+            // state (it holds no valid receipt for this node's incarnation, rosters and heads;
+            // each side counts its own revision, so the numbers are never compared), when a
+            // pending operation involves it, or when the fallback interval passed; a computer
+            // that could not be reached waits out its backoff. Measured before this (2026-10-20): every computer
             // was exchanged with every 2 s, the whole signed history sent and re-verified each
             // time, 47–95% of a core on the decider's daemon while nothing changed.
-            let current = s
-                .genesis
-                .as_ref()
-                .and_then(|_| receipt_body(&s, s.revision).ok());
+            // A pairing stays recorded as `pending` after it completes (its intent is part of
+            // every exchange), so the other computer counts as involved only while the
+            // operation is open: an approval is missing, or it has not activated here yet.
             let involved: Option<Digest32> = s
                 .pending
                 .as_ref()
+                .filter(|g| {
+                    g.approvals.iter().any(Option::is_none)
+                        || (g.group.is_none() && s.genesis.is_none())
+                        || (g.group.is_some() && !enrolled(&s, g))
+                })
                 .and_then(|g| {
                     side(g, &local)
                         .ok()
@@ -1609,9 +1614,10 @@ impl Management {
                             return false;
                         }
                     } else {
-                        let acknowledged = current.as_ref().is_some_and(|body| {
-                            s.receipts.get(peer).is_some_and(|r| r.body == *body)
-                        });
+                        let acknowledged = s
+                            .receipts
+                            .get(peer)
+                            .is_some_and(|r| valid_receipt(&s, peer, r).unwrap_or(false));
                         if acknowledged
                             && involved != Some(*peer)
                             && now.duration_since(last) < EXCHANGE_FALLBACK

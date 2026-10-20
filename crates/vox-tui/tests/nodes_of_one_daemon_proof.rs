@@ -2444,7 +2444,10 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
     );
     // Let the confirmation's own exchanges settle before the idle minute is counted.
     std::thread::sleep(Duration::from_secs(10));
-    let exchanges = |acct: &Account| -> (u64, Option<u64>, bool) {
+    // What `vox computer status --json` shows: the sum of `exchanges` over the computers listed,
+    // the latest `last_exchange_ms`, whether every one is confirmed, and the listing itself for a
+    // red to quote.
+    let exchanges = |acct: &Account| -> (u64, Option<u64>, bool, String) {
         let status = computer(acct, &["status"]);
         let apps = status["applications"]
             .as_array()
@@ -2459,20 +2462,29 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
             .filter_map(|p| p["last_exchange_ms"].as_u64())
             .max();
         let confirmed = apps.iter().all(|p| p["confirmed"] == true);
-        (total, last, confirmed)
+        (total, last, confirmed, status["applications"].to_string())
     };
-    let (ea0, _, _) = exchanges(&a);
-    let (eb0, _, _) = exchanges(&b);
+    let (ea0, _, _, shown_a0) = exchanges(&a);
+    let (eb0, _, _, shown_b0) = exchanges(&b);
     let cpu0 = (cpu_time(da.child.id()), cpu_time(db.child.id()));
     std::thread::sleep(PAIRED_IDLE);
-    let (ea1, last_a, confirmed_a) = exchanges(&a);
-    let (eb1, last_b, confirmed_b) = exchanges(&b);
+    let (ea1, last_a, confirmed_a, shown_a1) = exchanges(&a);
+    let (eb1, last_b, confirmed_b, shown_b1) = exchanges(&b);
     let cpu1 = (cpu_time(da.child.id()), cpu_time(db.child.id()));
     let spent = (cpu1.0.saturating_sub(cpu0.0), cpu1.1.saturating_sub(cpu0.1));
+    // The count is "since the daemon started" and the daemons ran throughout: it never shrinks.
+    let grew = |before: u64, after: u64, who: &str, shown0: &str, shown1: &str| -> u64 {
+        after.checked_sub(before).unwrap_or_else(|| {
+            panic!(
+                "PRODUCT: {who}'s `vox computer status` exchange count went backwards over the \
+                 idle minute, from {before} to {after}; it showed {shown0} before and {shown1} after"
+            )
+        })
+    };
+    let during_a = grew(ea0, ea1, "alpha", &shown_a0, &shown_a1);
+    let during_b = grew(eb0, eb1, "beta", &shown_b0, &shown_b1);
     println!(
-        "[proof] over {PAIRED_IDLE:?} idle: alpha exchanged {} time(s) with beta (last at {last_a:?}, confirmed {confirmed_a}), beta {} with alpha (last at {last_b:?}, confirmed {confirmed_b}); CPU: alpha's daemon +{:?}, beta's +{:?} (bound {IDLE_CPU:?})",
-        ea1 - ea0,
-        eb1 - eb0,
+        "[proof] over {PAIRED_IDLE:?} idle: alpha exchanged {during_a} time(s) with beta (last at {last_a:?}, confirmed {confirmed_a}), beta {during_b} with alpha (last at {last_b:?}, confirmed {confirmed_b}); CPU: alpha's daemon +{:?}, beta's +{:?} (bound {IDLE_CPU:?})",
         spent.0,
         spent.1
     );
@@ -2481,10 +2493,10 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
         "PRODUCT: `vox computer status` does not say the peer is confirmed and when it was last exchanged with: alpha {confirmed_a} {last_a:?}, beta {confirmed_b} {last_b:?}"
     );
     assert!(
-        ea1 - ea0 <= IDLE_EXCHANGES && eb1 - eb0 <= IDLE_EXCHANGES,
+        during_a <= IDLE_EXCHANGES && during_b <= IDLE_EXCHANGES,
         "PRODUCT: idle computers kept exchanging state (ADR-038 FX-15, #989): alpha {} and beta {} exchanges over {PAIRED_IDLE:?} (at most {IDLE_EXCHANGES} each)\n{}\n{}",
-        ea1 - ea0,
-        eb1 - eb0,
+        during_a,
+        during_b,
         da.said(),
         db.said()
     );
