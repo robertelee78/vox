@@ -1820,11 +1820,19 @@ impl Management {
             let now = std::time::Instant::now();
             let revision = s.revision;
             let mut exchanged = lock(&self.exchanged);
-            // A computer no longer paired (removed, or its pairing cancelled) keeps no record:
-            // its failure must not stand in the status for good.
+            // A computer no longer paired (removed, or its pairing cancelled) keeps its
+            // counts, which are "since the daemon started" and survive its re-enrollment, but
+            // not its failure: that must not stand in the status for good.
             let known: std::collections::BTreeSet<Digest32> = peers.iter().copied().collect();
-            if exchanged.keys().any(|p| !known.contains(p)) {
-                exchanged.retain(|p, _| known.contains(p));
+            let mut changed = false;
+            for (peer, record) in exchanged.iter_mut() {
+                if !known.contains(peer) && (record.failures > 0 || record.problem.is_some()) {
+                    record.failures = 0;
+                    record.problem = None;
+                    changed = true;
+                }
+            }
+            if changed {
                 *lock(&self.problem) = exchanged
                     .values()
                     .filter(|r| r.failures > 0)
