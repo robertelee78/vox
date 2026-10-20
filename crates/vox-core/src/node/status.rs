@@ -104,6 +104,17 @@ pub struct MemberStatus {
     pub key_waits: Option<String>,
 }
 
+/// One room that is still preparing: not open, not closed, and saying what it waits for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparingRoom {
+    /// The room.
+    pub id: Digest32,
+    /// Its local name, empty while unknown.
+    pub name: String,
+    /// What it waits for, in words, and since when (unix ms); `None` before its first turn.
+    pub waiting: Option<(String, u64)>,
+}
+
 /// One open room.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoomStatus {
@@ -261,6 +272,8 @@ pub struct StatusReport {
     pub listening: Vec<String>,
     /// Its open rooms.
     pub rooms: Vec<RoomStatus>,
+    /// Its rooms still preparing, each with what it waits for (ADR-038 FX-16, #991).
+    pub preparing: Vec<PreparingRoom>,
     /// Its live connections.
     pub peers: Vec<PeerStatus>,
     /// How many circuits it carries for others.
@@ -465,6 +478,20 @@ impl StatusReport {
             )
         });
         let _ = write!(j, "\"rooms\":[{}],", list(rooms));
+        let preparing = self.preparing.iter().map(|r| {
+            format!(
+                "{{\"id\":{},\"name\":{},\"waiting\":{},\"since_ms\":{}}}",
+                q(&b32_encode(&r.id)),
+                q(&r.name),
+                r.waiting
+                    .as_ref()
+                    .map_or_else(|| "null".to_owned(), |(what, _)| q(what)),
+                r.waiting
+                    .as_ref()
+                    .map_or_else(|| "null".to_owned(), |(_, since)| since.to_string())
+            )
+        });
+        let _ = write!(j, "\"preparing\":[{}],", list(preparing));
         let refusals = self.refusals.iter().map(|e| {
             serde_json::json!({
                 "at_ms": e.at_ms,
@@ -2054,5 +2081,21 @@ pub async fn serve_metrics_for<F>(
             let _ = sock.shutdown().await;
             drain_after_answer(&mut sock, DRAIN_AFTER_ANSWER).await;
         });
+    }
+}
+
+/// "for 3 min" / "for 2 h 5 min" / "for 12 s": how long since `since_ms` (unix milliseconds),
+/// as a person says it; "since just now" under a second.
+pub fn since_text(since_ms: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(since_ms);
+    let secs = now.saturating_sub(since_ms) / 1000;
+    match secs {
+        0 => "since just now".to_owned(),
+        1..=59 => format!("for {secs} s"),
+        60..=3599 => format!("for {} min", secs / 60),
+        _ => format!("for {} h {} min", secs / 3600, (secs % 3600) / 60),
     }
 }

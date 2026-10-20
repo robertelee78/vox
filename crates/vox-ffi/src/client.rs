@@ -253,6 +253,10 @@ pub struct RoomSummary {
     pub open: bool,
     /// The saved room is preparing; it does not need another passphrase.
     pub preparing: bool,
+    /// While preparing, what the room waits for, in words; empty when it has not said.
+    pub waiting: String,
+    /// Since when it waits for that, unix milliseconds; 0 when it has not said.
+    pub waiting_since_ms: u64,
     /// Empty while the room goes on; else, in words, that this node left it or it ended.
     pub over: String,
 }
@@ -2415,9 +2419,7 @@ fn pinned_anchor_set(
     Ok(set)
 }
 
-async fn room_ids(
-    client: &mut IpcClient,
-) -> Result<Vec<(Digest32, String, bool, String, bool)>, VoxError> {
+async fn room_ids(client: &mut IpcClient) -> Result<Vec<vox_core::node::ipc::RoomRow>, VoxError> {
     match answered(client.rooms().await.map_err(|e| failed(e.to_string()))?)? {
         Frame::Rooms { rooms } => Ok(rooms),
         other => Err(unexpected(&other)),
@@ -3745,11 +3747,16 @@ impl VoxClient {
     pub async fn rooms(&self) -> Result<Vec<RoomSummary>, VoxError> {
         Ok(on_held!(self, |c| room_ids(c).await)?
             .into_iter()
-            .map(|(id, name, open, over, preparing)| RoomSummary {
+            .map(|(id, name, open, over, preparing, waiting)| RoomSummary {
                 id: b32_encode(&id),
                 name: shown_name(&name),
                 open,
                 preparing,
+                waiting: waiting
+                    .as_ref()
+                    .map(|(what, _)| what.clone())
+                    .unwrap_or_default(),
+                waiting_since_ms: waiting.map_or(0, |(_, since)| since),
                 over,
             })
             .collect())
@@ -4556,7 +4563,7 @@ impl VoxClient {
             room_ids(c)
                 .await?
                 .into_iter()
-                .find(|(id, held, _, _, _)| {
+                .find(|(id, held, _, _, _, _)| {
                     held == &name && !before.iter().any(|(old, ..)| old == id)
                 })
                 .map(|(id, ..)| b32_encode(&id))
@@ -7548,7 +7555,7 @@ impl VoxClient {
             h.mend().await?;
             let mut cursors = HashMap::new();
             let seen = session_revisions(&mut h.client).await?;
-            for (id, _, open, _, _) in room_ids(&mut h.client).await? {
+            for (id, _, open, _, _, _) in room_ids(&mut h.client).await? {
                 if !open {
                     continue;
                 }
@@ -7584,7 +7591,7 @@ impl VoxClient {
             let reanchor = room_ids(&mut h.client)
                 .await?
                 .into_iter()
-                .any(|(id, _, open, _, _)| open && !cursors.contains_key(&id));
+                .any(|(id, _, open, _, _, _)| open && !cursors.contains_key(&id));
             let task_held = Arc::clone(&held);
             // The start signal is only an installation barrier, never a delivery queue. It
             // keeps even the immediate terminal callback outside the setup's Slot guard.

@@ -953,7 +953,7 @@ async fn open_rooms_over_socket(client: &mut IpcClient, line: &str) {
         return;
     };
     let mut opened = false;
-    for (channel_id, _, open, _, preparing) in &rooms {
+    for (channel_id, _, open, _, preparing, _) in &rooms {
         if *open || *preparing {
             continue;
         }
@@ -971,7 +971,7 @@ async fn open_rooms_over_socket(client: &mut IpcClient, line: &str) {
         return;
     }
     if let Some((room, pass)) = line.split_once(' ') {
-        let ids: Vec<_> = rooms.iter().map(|(id, _, _, _, _)| *id).collect();
+        let ids: Vec<_> = rooms.iter().map(|(id, _, _, _, _, _)| *id).collect();
         if let Ok(id) = crate::tunnel_cli::resolve_prefix(room, &ids) {
             let _ = client
                 .request(&Request::OpenRoom {

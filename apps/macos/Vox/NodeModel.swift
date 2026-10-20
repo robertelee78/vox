@@ -40,6 +40,8 @@ final class NodeModel: ObservableObject {
         let name: String
         let open: Bool
         let preparing: Bool
+        /// While preparing, what the room waits for, in the daemon's words; empty when it has not said.
+        var preparingFor: String = ""
         /// Unread messages addressed to this node; of them, urgent.
         var addressed = 0
         var urgent = 0
@@ -1692,6 +1694,7 @@ final class NodeModel: ObservableObject {
             }?.id
             let now = fresh.map { r in
                 var room = Room(id: r.id, name: name(of: r), open: r.open, preparing: r.preparing)
+                room.preparingFor = r.waiting
                 if let held = rooms.first(where: { $0.id == r.id }) {
                     room.addressed = held.addressed
                     room.urgent = held.urgent

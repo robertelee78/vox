@@ -43,6 +43,9 @@ pub struct ChannelSummary {
     pub open: bool,
     /// The room is recovering locally; its history is not yet available.
     pub preparing: bool,
+    /// While preparing: what the room waits for, in words, and since when (unix ms), so a
+    /// person can tell a stuck room from a slow one (ADR-038 FX-16, #991).
+    pub waiting: Option<(String, u64)>,
     /// Number of accepted log entries (0 while closed).
     pub entries: u64,
     /// Whether the room is over for this node, in plain words (V030-08): this identity left it,

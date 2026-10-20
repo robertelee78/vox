@@ -83,6 +83,8 @@ optional_proof::not_run!(
     a_newcomer_talks_both_ways_at_one_wait_fresh_or_behind_a_backlog,
 );
 
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
@@ -123,6 +125,23 @@ impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
+    }
+}
+
+impl Daemon {
+    /// Stop it as a person does (SIGTERM, ADR-012: a clean stop), waiting for it to exit.
+    fn stop(mut self) {
+        let _ = Command::new("kill")
+            .args(["-TERM", &self.0.id().to_string()])
+            .status();
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_secs(15) {
+            if let Ok(Some(_)) = self.0.try_wait() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        // Drop kills what did not stop.
     }
 }
 
@@ -187,16 +206,25 @@ fn vox_plain(dir: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String, S
 
 /// Start `vox daemon` with the identity passphrase piped in, its output to files by the profile.
 fn daemon(dir: &Path, tag: &str) -> Daemon {
+    daemon_env(dir, tag, &[])
+}
+
+/// The same, with environment the daemon reads at its start (a test-only knob, for instance).
+fn daemon_env(dir: &Path, tag: &str, env: &[(&str, &str)]) -> Daemon {
     let file = |kind: &str| {
         let at = dir.join(format!("daemon-{tag}.{kind}"));
         std::fs::File::create(&at)
             .unwrap_or_else(|e| panic!("APPARATUS: could not create {}: {e}", at.display()))
     };
-    let mut child = Command::new(VOX)
-        .args(["daemon", "--listen", "127.0.0.1:0"])
+    let mut cmd = Command::new(VOX);
+    cmd.args(["daemon", "--listen", "127.0.0.1:0"])
         .env("VOX_DATA_DIR", dir)
         .env("VOX_CONFIG_DIR", dir.join("cfg"))
-        .env_remove("VOX_ROOM")
+        .env_remove("VOX_ROOM");
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::from(file("out")))
         .stderr(Stdio::from(file("err")))
@@ -1083,6 +1111,373 @@ fn held_entries(dir: &Path) -> u64 {
             })
         })
         .unwrap_or(0)
+}
+
+/// `vox room list` MUST name what a preparing room waits for within this of the daemon's start.
+const WAIT_NAMED_WITHIN: Duration = Duration::from_secs(5);
+/// How long the held room is watched doing nothing.
+const PREPARING_IDLE: Duration = Duration::from_secs(60);
+/// CPU time the daemon may spend over [`PREPARING_IDLE`] on a room that only waits: Activity
+/// Monitor's number. Measured before (#991): the room was re-queued every 50 ms, for hours.
+const PREPARING_CPU: Duration = Duration::from_secs(3);
+/// Once the wait ends, the room MUST open within this (the retry is once a second).
+const OPENS_WITHIN: Duration = Duration::from_secs(10);
+/// Sync rounds the waiting room's daemon may complete toward one peer over [`PREPARING_IDLE`]:
+/// the periodic request's, and nothing else (FX-15); measured 0.
+const PREPARING_ROUNDS: u64 = 2;
+
+/// A room that cannot finish preparing says what it waits for, costs nothing while it waits, and
+/// opens once the wait ends (ADR-038 FX-15, FX-16; #991). Staged with the fold-hold knob: alice
+/// posts into her room, the hold file appears, she posts three more rows (accepted, not folded),
+/// her daemon is stopped and started again with the hold still in place, so the room cannot
+/// finish preparing. Within [`WAIT_NAMED_WITHIN`] `vox room list` MUST say `[preparing history:
+/// waiting for …]`, `vox status --json` MUST list the room under `preparing` with the same words,
+/// and `vox room read` MUST refuse with them; over [`PREPARING_IDLE`] the daemon's CPU time MUST
+/// grow by at most [`PREPARING_CPU`] and its log MUST say once what the room waited for; once the
+/// hold file is removed the room MUST open within [`OPENS_WITHIN`] and its six rows read.
+/// Found 2026-10-20 on the decider's work Mac (v0.4.7): a room stayed "[preparing history]" for
+/// 20 hours with no words anywhere, re-queued every 50 ms, absent from `vox status`.
+///
+/// Mutant: the governance wait left unnamed (`wait_on` not called for it in
+/// `retention_before_publication`, actor.rs) turns the first claim red on `vox room list`'s line.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "a minute of a real vox daemon holding a room, and a test-only knob; optional, run it in release"]
+fn a_room_that_cannot_finish_preparing_says_why_and_costs_nothing() {
+    test_knobs::require(&["VOX_TEST_FOLD_HOLD_FILE"]);
+    watchdog::arm();
+    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("APPARATUS: no temp dir: {e}"));
+    let root = tmp.path();
+    let alice = root.join("alice");
+    let bob = root.join("bob");
+    for d in [&alice, &bob] {
+        std::fs::create_dir_all(d.join("cfg"))
+            .unwrap_or_else(|e| panic!("APPARATUS: could not create {}: {e}", d.display()));
+    }
+    let hold = root.join("fold-hold");
+    let hold_path = hold
+        .to_str()
+        .expect("APPARATUS: a UTF-8 temp path")
+        .to_owned();
+    let knob = [("VOX_TEST_FOLD_HOLD_FILE", hold_path.as_str())];
+    let mut fps = Vec::new();
+    for dir in [&alice, &bob] {
+        let (ok, out, err) = vox(dir, &["id"], None);
+        assert!(ok, "PRODUCT: `vox id` failed: {err}");
+        fps.push(out.trim().to_owned());
+    }
+    for (dir, fp, name) in [(&alice, &fps[1], "bob"), (&bob, &fps[0], "alice")] {
+        let (ok, _, err) = vox(dir, &["trust", "add", fp, "--name", name], None);
+        assert!(ok, "PRODUCT: `vox trust add` of {name} failed: {err}");
+    }
+
+    // ---- staging: alice's room with three rows; bob joins; three of bob's rows arrive while
+    // alice's fold is held, so they are accepted but not folded (a node's own posts fold as
+    // they are accepted, so only a peer's rows can leave governance unsettled) ---------------
+    let first = daemon_env(&alice, "alice", &knob);
+    attached(&alice, "alice");
+    let (ok, _, err) = vox(
+        &alice,
+        &["room", "create", "--passphrase-file", "-", "--name", "held"],
+        Some(&format!("{ROOMPASS}\n")),
+    );
+    assert!(
+        ok,
+        "PRODUCT: `vox room create` failed: {err}\nalice's daemon said: {}",
+        said(&alice, "alice")
+    );
+    let listed = attached(&alice, "alice");
+    let room = listed
+        .split_whitespace()
+        .find(|w| w.len() >= 8 && w.chars().all(|c| c.is_ascii_alphanumeric()))
+        .unwrap_or_else(|| panic!("PRODUCT: `vox room list` shows no room id: {listed}"))
+        .to_owned();
+    for i in 1..=3 {
+        let (ok, out, err) = vox(&alice, &["room", "post", &room, &format!("row {i}")], None);
+        assert!(ok, "PRODUCT: alice's post {i} was refused: {out}{err}");
+    }
+    let (ok, link, err) = vox(&alice, &["room", "link", &room], None);
+    assert!(ok, "PRODUCT: `vox room link` failed: {err}");
+    let link = link.trim().to_owned();
+    // The hold comes before bob joins: his admission is a governance record alice receives
+    // but cannot fold while held (ordinary posts never go through the fold).
+    std::fs::write(&hold, b"").expect("APPARATUS: write the hold file");
+    let _bob_daemon = daemon(&bob, "bob");
+    attached(&bob, "bob");
+    let (ok, _, err) = vox(
+        &bob,
+        &["room", "join", "--passphrase-file", "-", &link],
+        Some(&format!("{ROOMPASS}\n")),
+    );
+    assert!(ok, "PRODUCT: bob's `vox room join` was refused: {err}");
+    for i in 4..=6 {
+        let (ok, out, err) = vox(&bob, &["room", "post", &room, &format!("row {i}")], None);
+        assert!(ok, "PRODUCT: bob's post {i} was refused: {out}{err}");
+    }
+    // Give alice's daemon time to receive bob's records (it cannot fold them while held).
+    std::thread::sleep(Duration::from_secs(8));
+    first.stop();
+
+    // ---- the room cannot finish preparing: the daemon says what it waits for ----------------
+    let restarted_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let second = daemon_env(&alice, "alice", &knob);
+    let started = Instant::now();
+    let line = loop {
+        let (ok, out, _) = vox(&alice, &["room", "list"], None);
+        let line = out
+            .lines()
+            .find(|l| l.trim_start().starts_with(&room))
+            .map(str::to_owned)
+            .unwrap_or_default();
+        if ok && line.contains("[preparing history: waiting for ") {
+            // The wait a held fold of a peer's records produces, in the words of this change.
+            assert!(
+                line.contains("waiting for governance records from its members"),
+                "PRODUCT: `vox room list` names another wait than the held governance fold \
+                 (#991): {line}"
+            );
+            break line;
+        }
+        if ok && !line.is_empty() && !line.contains("[preparing") {
+            panic!(
+                "APPARATUS: the fold-hold knob did not hold the room, it opened: `vox room list` says {line}"
+            );
+        }
+        assert!(
+            started.elapsed() < WAIT_NAMED_WITHIN,
+            "PRODUCT: `vox room list` does not say what the preparing room waits for within \
+             {WAIT_NAMED_WITHIN:?} (ADR-038 FX-16, #991): {line:?}\nalice's daemon said: {}",
+            said(&alice, "alice")
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    println!(
+        "[proof] {:?} after the daemon's start, `vox room list` said: {line}",
+        started.elapsed()
+    );
+    let (ok, status, err) = vox(&alice, &["status", "--json"], None);
+    assert!(
+        ok,
+        "PRODUCT: `vox status --json` failed while a room prepared: {err}"
+    );
+    let status: serde_json::Value = serde_json::from_str(&status)
+        .unwrap_or_else(|e| panic!("PRODUCT: `vox status --json` is not JSON: {e}: {status}"));
+    let entry = status["preparing"]
+        .as_array()
+        .and_then(|rooms| {
+            rooms
+                .iter()
+                .find(|r| r["id"].as_str().is_some_and(|id| id.starts_with(&room)))
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "PRODUCT: `vox status --json` does not list the preparing room under `preparing` \
+                 (ADR-038 FX-16, #991): {}",
+                status["preparing"]
+            )
+        });
+    let what = entry["waiting"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!("PRODUCT: `vox status --json` names no wait for the room: {entry}")
+        })
+        .to_owned();
+    let since_ms = entry["since_ms"].as_u64().unwrap_or_else(|| {
+        panic!("PRODUCT: `vox status --json` dates no wait for the room: {entry}")
+    });
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    assert!(
+        line.contains(&what) && (restarted_ms..=now_ms).contains(&since_ms),
+        "PRODUCT: `vox status --json` ({entry}) and `vox room list` ({line}) do not say the same \
+         wait, or its start {since_ms} is not between the daemon's restart {restarted_ms} and now \
+         {now_ms}"
+    );
+    let (ok, out, err) = vox(&alice, &["room", "read", &room], None);
+    assert!(
+        !ok && format!("{out}{err}").contains(&format!("it waits for {what}")),
+        "PRODUCT: `vox room read` of a preparing room does not say the wait the status names \
+         ({what:?}) (#991): ok={ok} {out}{err}"
+    );
+    // The daemon's own refusal says it too: a post, which the CLI does not pre-check.
+    let (ok, out, err) = vox(
+        &alice,
+        &["room", "post", &room, "a word while it prepares"],
+        None,
+    );
+    assert!(
+        !ok && format!("{out}{err}").contains(&format!("it waits for {what}")),
+        "PRODUCT: the daemon's refusal of a post into a preparing room does not say the wait the \
+         status names ({what:?}) (#991): ok={ok} {out}{err}"
+    );
+    // Rounds per peer over the idle minute (FX-15): the periodic request is the only cadence.
+    let rounds_before = completed_rounds(&alice);
+
+    // ---- the wait costs nothing -------------------------------------------------------------
+    let pid = second.0.id();
+    let cpu0 = cpu_time(pid);
+    std::thread::sleep(PREPARING_IDLE);
+    let spent = cpu_time(pid).saturating_sub(cpu0);
+    let rounds_after = completed_rounds(&alice);
+    // A room that is not open has no lane: no round can run toward anyone while it waits, and
+    // alice holds no other room. A lane here, or a round on it, is a round without a need.
+    assert!(
+        rounds_before.is_empty() && rounds_after.is_empty(),
+        "PRODUCT: alice's daemon ran sync lanes while its only room waited to open (ADR-038 \
+         FX-15, #991): before {rounds_before:?}, after {rounds_after:?}; lanes: {}",
+        lanes_of(&vox(&alice, &["status", "--json"], None).1)
+    );
+    let per_peer: Vec<(String, u64)> = rounds_after
+        .iter()
+        .map(|(peer, after)| {
+            (
+                peer.clone(),
+                after.saturating_sub(*rounds_before.get(peer).unwrap_or(&0)),
+            )
+        })
+        .collect();
+    let rounds: u64 = per_peer.iter().map(|(_, n)| *n).max().unwrap_or(0);
+    let log = std::fs::read_to_string(alice.join(".daemon/log")).unwrap_or_default();
+    let noted: Vec<&str> = log
+        .lines()
+        .filter(|l| l.contains("is still preparing: it waits for "))
+        .collect();
+    println!(
+        "[proof] over {PREPARING_IDLE:?} the held room cost the daemon +{spent:?} of CPU (bound {PREPARING_CPU:?}) and {rounds} completed sync round(s) (bound {PREPARING_ROUNDS}); its log says: {noted:?}"
+    );
+    assert!(
+        per_peer.iter().all(|(_, n)| *n <= PREPARING_ROUNDS),
+        "PRODUCT: a room that only waited ran sync rounds toward a peer in {PREPARING_IDLE:?} beyond \
+         the periodic request (ADR-038 FX-15, #991): {per_peer:?} (at most {PREPARING_ROUNDS} each); lanes: {}",
+        lanes_of(&vox(&alice, &["status", "--json"], None).1)
+    );
+    assert!(
+        spent <= PREPARING_CPU,
+        "PRODUCT: a room that only waited cost the daemon {spent:?} of CPU over {PREPARING_IDLE:?} \
+         (ADR-038 FX-15, #991; bound {PREPARING_CPU:?})"
+    );
+    assert!(
+        noted.len() == 1 && noted[0].contains(&format!("it waits for {what}")),
+        "PRODUCT: after {PREPARING_IDLE:?} the daemon's log must say exactly once what the room \
+         waits for ({what:?}) (#991); it said {} time(s):\n{log}",
+        noted.len()
+    );
+
+    // ---- the wait ends: the room opens and its six rows read ---------------------------------
+    std::fs::remove_file(&hold).expect("APPARATUS: remove the hold file");
+    let released = Instant::now();
+    loop {
+        let (ok, out, _) = vox(&alice, &["room", "list"], None);
+        let line = out
+            .lines()
+            .find(|l| l.trim_start().starts_with(&room))
+            .map(str::to_owned)
+            .unwrap_or_default();
+        if ok && !line.is_empty() && !line.contains("[preparing") {
+            println!(
+                "[proof] {:?} after the hold ended, `vox room list` said: {line}",
+                released.elapsed()
+            );
+            break;
+        }
+        assert!(
+            released.elapsed() < OPENS_WITHIN,
+            "PRODUCT: the room did not open within {OPENS_WITHIN:?} after its wait ended (#991): {line:?}\nalice's daemon said: {}",
+            said(&alice, "alice")
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    // Bob's admission folds and his three rows arrive: alice reads all six.
+    let opened = Instant::now();
+    loop {
+        let (ok, out, err) = vox(&alice, &["room", "read", &room], None);
+        if ok && (1..=6).all(|i| out.contains(&format!("row {i}"))) {
+            break;
+        }
+        assert!(
+            opened.elapsed() < Duration::from_secs(60),
+            "PRODUCT: the opened room does not read all six rows within 60 s: ok={ok}\n{out}{err}\nalice's daemon said: {}",
+            said(&alice, "alice")
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    // FX-16: the round that brought bob's rows is recorded as the room's and bob's last
+    // completed sync.
+    let synced = Instant::now();
+    loop {
+        let (ok, out, _) = vox(&alice, &["status", "--json"], None);
+        let v: serde_json::Value = if ok {
+            serde_json::from_str(&out).unwrap_or_default()
+        } else {
+            serde_json::Value::Null
+        };
+        // Newer than the restart: the round that brought bob's rows, not one from the staging;
+        // and the lane toward bob now exists and completed it.
+        let bobs_lane = v["sync"].as_array().is_some_and(|lanes| {
+            lanes.iter().any(|l| {
+                l["peer"]
+                    .as_str()
+                    .is_some_and(|p| p.starts_with(&fps[1][..12]))
+                    && l["completed"].as_u64().is_some_and(|n| n > 0)
+            })
+        });
+        let recorded = bobs_lane
+            && v["rooms"].as_array().is_some_and(|rooms| {
+                rooms.iter().any(|r| {
+                    r["id"].as_str().is_some_and(|id| id.starts_with(&room))
+                        && r["last_sync_ms"].as_u64().is_some_and(|t| t > restarted_ms)
+                        && r["members"].as_array().is_some_and(|ms| {
+                            ms.iter().any(|m| {
+                                m["me"] == false
+                                    && m["last_sync_ms"].as_u64().is_some_and(|t| t > restarted_ms)
+                            })
+                        })
+                })
+            });
+        if recorded {
+            break;
+        }
+        assert!(
+            synced.elapsed() < Duration::from_secs(30),
+            "PRODUCT: after the room opened and bob's rows arrived, `vox status --json` records no \
+             last completed sync for the room and for bob (ADR-038 FX-16, #991): {}",
+            lanes_of(&out)
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    drop(second);
+}
+
+/// Completed sync rounds per peer, from `vox status --json`'s lanes; an unreadable status is
+/// an apparatus fault, never a zero that reads as quiet.
+fn completed_rounds(dir: &Path) -> std::collections::BTreeMap<String, u64> {
+    let (ok, out, err) = vox(dir, &["status", "--json"], None);
+    assert!(
+        ok,
+        "APPARATUS: `vox status --json` failed while counting rounds: {err}"
+    );
+    let v: serde_json::Value = serde_json::from_str(&out)
+        .unwrap_or_else(|e| panic!("APPARATUS: `vox status --json` is not JSON: {e}: {out}"));
+    let lanes = v["sync"]
+        .as_array()
+        .unwrap_or_else(|| panic!("APPARATUS: `vox status --json` has no `sync` lanes: {out}"));
+    let mut rounds = std::collections::BTreeMap::new();
+    for lane in lanes {
+        let peer = lane["peer"]
+            .as_str()
+            .unwrap_or_else(|| panic!("APPARATUS: a lane names no peer: {lane}"))
+            .to_owned();
+        let completed = lane["completed"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("APPARATUS: a lane counts no completed rounds: {lane}"));
+        *rounds.entry(peer).or_insert(0) += completed;
+    }
+    rounds
 }
 
 /// Each lane of a `vox status --json`: peer, completed, partial, failed, running and its last failure.

@@ -137,6 +137,10 @@ const TICK: Duration = Duration::from_secs(1);
 /// this, not at once: unpaced, a reopened room ran 74,000 preparation turns in 12 s at full CPU
 /// while its control socket went unanswered.
 const PREPARE_RETRY: Duration = Duration::from_millis(50);
+/// A room whose wait did not change since its last turn is tried again after this, not
+/// [`PREPARE_RETRY`]: measured before (#991), a room waiting on a peer's governance records was
+/// re-queued every 50 ms for hours while `vox room list` said only "[preparing history]".
+const PREPARE_WAIT: Duration = Duration::from_secs(1);
 
 /// Test-only: while the file this names exists, the node opens none of the key-packages the log
 /// brings it; they stay queued, as between a sync session's entries and its end, so a proof can
@@ -293,6 +297,7 @@ fn summary_of(ch: &ChannelState) -> ChannelSummary {
         name: ch.name().map(str::to_owned),
         open: true,
         preparing: false,
+        waiting: None,
         entries: ch.entry_count() as u64,
         over: over_of(ch),
     }
@@ -4788,6 +4793,50 @@ struct RoomPreparation {
     removal_after: Option<Digest32>,
     consent_after: Option<Digest32>,
     legacy_cleanup_due: Option<std::time::Instant>,
+    /// What this room waits for before it can open, in words a person reads, and since when
+    /// (unix ms): `vox room list`, `vox status` and the app say it (ADR-038 FX-16, #991).
+    waiting: Option<(String, u64)>,
+    /// Whether the daemon log has said once that this wait is long (#991); re-armed when the
+    /// wait changes.
+    waiting_noted: bool,
+    /// This turn did work (folded, opened a package, built a view): the next turn comes at
+    /// once, whatever the words say, since the same words can cover many steps.
+    progressed: bool,
+}
+
+/// A wait this long on one thing is said once in the daemon's log, so a person reading it
+/// after the fact sees what the room waited for, not only that it did.
+const PREPARE_WAIT_NOTED_AFTER_MS: u64 = 30_000;
+
+impl RoomPreparation {
+    /// Record what this turn waited for, on something outside this turn's reach. The same
+    /// wait keeps its start; a new one starts now and may be noted in the log again.
+    fn wait_on(&mut self, what: &str, now_ms: u64) {
+        match &self.waiting {
+            Some((was, _)) if was == what => {}
+            _ => {
+                self.waiting = Some((what.to_owned(), now_ms));
+                self.waiting_noted = false;
+            }
+        }
+    }
+    /// Record that this turn did a bounded step of work named `what`, with more to do: the
+    /// words are shown as the wait, and the next turn comes at once.
+    fn progressed(&mut self, what: &str, now_ms: u64) {
+        self.wait_on(what, now_ms);
+        self.progressed = true;
+    }
+    /// When to try again: at once after a turn that did work, and at once when the wait
+    /// changed; once a second while the same wait on something outside repeats, so a room
+    /// that waits on a peer costs nothing meanwhile (FX-15).
+    fn retry_after(&mut self, previous: Option<&(String, u64)>) -> Duration {
+        let progressed = std::mem::take(&mut self.progressed);
+        match (previous, &self.waiting) {
+            _ if progressed => PREPARE_RETRY,
+            (Some(before), Some(now)) if before == now => PREPARE_WAIT,
+            _ => PREPARE_RETRY,
+        }
+    }
 }
 
 fn retained_legacy_owner_for(
@@ -18227,6 +18276,9 @@ impl Node {
                 legacy_cleanup_due: channel
                     .legacy_startup_cleanup_blocks_current()
                     .then_some(std::time::Instant::now()),
+                waiting: None,
+                waiting_noted: false,
+                progressed: false,
                 channel: tokio::sync::Mutex::new(channel),
                 reply,
                 reopening,
@@ -18407,11 +18459,29 @@ impl Node {
             } else if prepared.reopening && !self.reopening.contains(&id) {
                 Outcome::Failed(Fault::ChannelNotOpen)
             } else {
+                let waited_before = prepared.waiting.clone();
                 match self.retention_before_publication(&mut prepared).await {
                     Ok(false) => {
                         if prepared.legacy_cleanup_due.is_none() {
-                            prepared.legacy_cleanup_due =
-                                Some(std::time::Instant::now() + PREPARE_RETRY);
+                            prepared.legacy_cleanup_due = Some(
+                                std::time::Instant::now()
+                                    + prepared.retry_after(waited_before.as_ref()),
+                            );
+                        }
+                        if let Some((what, since)) = &prepared.waiting {
+                            let now = self.now_ms().get();
+                            if !prepared.waiting_noted
+                                && now.saturating_sub(*since) >= PREPARE_WAIT_NOTED_AFTER_MS
+                            {
+                                prepared.waiting_noted = true;
+                                let _ = self.event_tx.send(NodeEvent::NodeNote {
+                                    note: format!(
+                                        "room {} is still preparing: it waits for {what}, {}",
+                                        crate::node::link::b32_encode(&id),
+                                        crate::node::status::since_text(*since)
+                                    ),
+                                });
+                            }
                         }
                         self.preparing_rooms.insert(id, prepared);
                         return;
@@ -18422,9 +18492,15 @@ impl Node {
                     {
                         // Current policy and classification are prerequisites for private
                         // retention/publication. Pending replay keeps this room unpublished.
+                        prepared.wait_on(
+                            "its governance records being refreshed",
+                            self.now_ms().get(),
+                        );
                         if prepared.legacy_cleanup_due.is_none() {
-                            prepared.legacy_cleanup_due =
-                                Some(std::time::Instant::now() + PREPARE_RETRY);
+                            prepared.legacy_cleanup_due = Some(
+                                std::time::Instant::now()
+                                    + prepared.retry_after(waited_before.as_ref()),
+                            );
                         }
                         self.preparing_rooms.insert(id, prepared);
                         return;
@@ -18488,6 +18564,7 @@ impl Node {
             prepared.legacy_cleanup_due = ch
                 .legacy_startup_cleanup_blocks_current()
                 .then_some(std::time::Instant::now() + TICK);
+            prepared.wait_on("cleaning up its earlier saved form", self.now_ms().get());
             // Cleanup and policy/retention writes occupy separate actor turns.
             return Ok(false);
         }
@@ -18495,7 +18572,13 @@ impl Node {
         {
             let profile = self.profile.as_ref().ok_or(Error::AtRestLocked)?;
             let now = self.now_ms();
-            if !ch.advance_governance(profile.store(), now)?.ready {
+            let governance = ch.advance_governance(profile.store(), now)?;
+            if !governance.ready {
+                if governance.pending {
+                    prepared.progressed("folding its governance records", now.get());
+                } else {
+                    prepared.wait_on("governance records from its members", now.get());
+                }
                 return Ok(false);
             }
             if ch.legacy_cache_only(profile.store())? {
@@ -18547,15 +18630,18 @@ impl Node {
                 }
                 let profile = self.profile.as_ref().ok_or(Error::AtRestLocked)?;
                 ch.key_package_attempted(profile.store(), &pending.author, pending.log_id)?;
+                prepared.progressed("opening members' key packages", self.now_ms().get());
                 return Ok(false);
             }
             if progress.pending {
+                prepared.wait_on("a member's key package", self.now_ms().get());
                 return Ok(false);
             }
         }
         {
             let profile = self.profile.as_ref().ok_or(Error::AtRestLocked)?;
             if ch.advance_legacy_sessions(profile.store(), self.now_ms().get())? {
+                prepared.progressed("carrying its earlier Sessions over", self.now_ms().get());
                 return Ok(false);
             }
         }
@@ -18567,16 +18653,20 @@ impl Node {
         if !ch.finish_session_upgrade(profile.store(), self.now_ms().get())?
             && ch.session_upgrade_local_work()
         {
+            prepared.progressed("finishing its Session upgrade", self.now_ms().get());
             return Ok(false);
         }
         if !ch.refresh_session_records(profile, &self.drive_holders(), &[], self.now_ms().get())? {
+            prepared.progressed("refreshing its Session records", self.now_ms().get());
             return Ok(false);
         }
         ch.sweep_retention(profile.store(), self.now_ms())?;
         if ch.legacy_classification_pending(profile.store())? {
+            prepared.progressed("classifying its earlier saved history", self.now_ms().get());
             return Ok(false);
         }
         if ch.advance_room_views(profile.store())?.0 {
+            prepared.progressed("building its room views", self.now_ms().get());
             return Ok(false);
         }
         self.reconcile_prepared_trust(prepared)
@@ -18608,9 +18698,11 @@ impl Node {
             examined += 1;
             if !trusted.contains(&member) {
                 channel.withdraw_consent(profile, member, self.now_ms())?;
+                prepared.progressed("narrowing its trust", self.now_ms().get());
                 return Ok(false);
             }
             if examined == 64 {
+                prepared.progressed("narrowing its trust", self.now_ms().get());
                 return Ok(false);
             }
         }
@@ -18624,10 +18716,12 @@ impl Node {
         if let Some(member) = page.targets.iter().find(|m| !trusted.contains(*m)).copied() {
             channel.withdraw_consent(profile, member, self.now_ms())?;
             prepared.consent_after = Some(member);
+            prepared.progressed("narrowing its trust", self.now_ms().get());
             return Ok(false);
         }
         if let Some(next) = page.next {
             prepared.consent_after = Some(next);
+            prepared.progressed("narrowing its trust", self.now_ms().get());
             return Ok(false);
         }
         let order = crate::node::consent_order::ConsentOrder::load(profile.store(), signer)?;
@@ -20085,6 +20179,16 @@ impl Node {
             },
             ..StatusReport::default()
         };
+        report.preparing = view
+            .channels
+            .iter()
+            .filter(|c| c.preparing)
+            .map(|c| crate::node::status::PreparingRoom {
+                id: c.channel_id,
+                name: c.name.clone().unwrap_or_default(),
+                waiting: c.waiting.clone(),
+            })
+            .collect();
         for room in &view.open_channels {
             let members = room
                 .members
@@ -21428,6 +21532,7 @@ impl Node {
                 name: None,
                 open: false,
                 preparing: false,
+                waiting: None,
                 entries: 0,
                 over: None,
             })
@@ -21725,6 +21830,7 @@ impl Node {
                             name: None,
                             open: true,
                             preparing: false,
+                            waiting: None,
                             entries: 0,
                             over: None,
                         }),
@@ -21736,6 +21842,10 @@ impl Node {
                     preparing: self.reopening.contains(id)
                         || self.opening_rooms.contains_key(id)
                         || self.preparing_rooms.contains_key(id),
+                    waiting: self
+                        .preparing_rooms
+                        .get(id)
+                        .and_then(|prepared| prepared.waiting.clone()),
                     entries: 0,
                     over: None,
                 },

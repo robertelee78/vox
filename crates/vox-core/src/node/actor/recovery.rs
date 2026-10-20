@@ -124,6 +124,9 @@ impl Node {
                         legacy_cleanup_due: channel
                             .legacy_startup_cleanup_blocks_current()
                             .then_some(std::time::Instant::now()),
+                        waiting: None,
+                        waiting_noted: false,
+                        progressed: false,
                         channel: tokio::sync::Mutex::new(channel),
                         reply: None,
                         reopening: false,

@@ -186,6 +186,10 @@ pub struct Room {
     pub open: bool,
     /// Saved room history is preparing locally.
     pub preparing: bool,
+    /// While preparing, what the room waits for, in words; empty when it has not said.
+    pub waiting: String,
+    /// Since when it waits for that, unix milliseconds; 0 when it has not said.
+    pub waiting_since_ms: u64,
 }
 
 /// One rendered message.
@@ -385,6 +389,12 @@ impl VoxNode {
                 name: c.name.unwrap_or_default(),
                 open: c.open,
                 preparing: c.preparing,
+                waiting: c
+                    .waiting
+                    .as_ref()
+                    .map(|(what, _)| what.clone())
+                    .unwrap_or_default(),
+                waiting_since_ms: c.waiting.as_ref().map_or(0, |(_, since)| *since),
             })
             .collect()
     }

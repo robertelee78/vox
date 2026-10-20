@@ -69,6 +69,10 @@ struct MainWindow: View {
                         VStack(spacing: Space.s12) {
                             ProgressView()
                             Text("Preparing room history").title()
+                            if let waiting = model.rooms.first(where: { $0.id == id })?.preparingFor, !waiting.isEmpty {
+                                Text("Waiting for \(waiting).").secondaryText().multilineTextAlignment(.center)
+                                    .accessibilityIdentifier("room-history-preparing-for")
+                            }
                             Text("Your node is Ready. This room will appear when its saved history is ready; no passphrase is needed.")
                                 .secondaryText().multilineTextAlignment(.center)
                         }
@@ -590,7 +594,9 @@ private struct RoomRow: View {
     }
 
     private var preview: String {
-        if room.preparing { return "Preparing room history" }
+        if room.preparing {
+            return room.preparingFor.isEmpty ? "Preparing room history" : "Preparing: waiting for \(room.preparingFor)"
+        }
         if room.offered > 0 { return room.offerSaid }
         if room.waiting > 0 { return room.waiting == 1 ? "a Session needs you" : "\(room.waiting) Session requests need you" }
         return room.last?.words ?? ""

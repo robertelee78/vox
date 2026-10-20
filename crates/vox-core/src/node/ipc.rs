@@ -3107,6 +3107,10 @@ pub struct SharedService {
     pub online: bool,
 }
 
+/// One room as the daemon lists it: id, local name, open, over (words or empty), preparing,
+/// and while preparing what it waits for and since when (unix ms).
+pub type RoomRow = (Digest32, String, bool, String, bool, Option<(String, u64)>);
+
 /// What the node sends.
 ///
 /// Not `#[non_exhaustive]`, for the same reason as
@@ -3349,7 +3353,7 @@ pub enum Frame {
     Rooms {
         /// `(channel_id, local name, open, over)` per room; `over` says, in plain words, that
         /// this identity left the room or it ended (V030-08), and is empty while it goes on.
-        rooms: Vec<(Digest32, String, bool, String, bool)>,
+        rooms: Vec<RoomRow>,
     },
     /// The services a [`Request::Services`] asked for: the room's local name, and
     /// `(service tag, local address)` per service, as the node offers them.
@@ -3727,13 +3731,16 @@ impl Frame {
             }
             Frame::Rooms { rooms } => {
                 e.array(2).uint(T_ROOMS).array(rooms.len());
-                for (id, name, open, over, preparing) in rooms {
-                    e.array(5)
+                for (id, name, open, over, preparing, waiting) in rooms {
+                    let (what, since) = waiting.clone().unwrap_or_default();
+                    e.array(7)
                         .bytes(id)
                         .text(name)
                         .uint(u64::from(*open))
                         .text(over)
-                        .uint(u64::from(*preparing));
+                        .uint(u64::from(*preparing))
+                        .text(&what)
+                        .uint(since);
                 }
             }
             Frame::Presented { entries } => {
@@ -4812,7 +4819,8 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             let mut rooms = Vec::with_capacity(n.min(1024));
             for _ in 0..n {
                 let arity = d.array().map_err(|_| Error::MalformedIpc("ipc room"))?;
-                if !(3..=5).contains(&arity) {
+                // 3..=5 as earlier daemons wrote a row; 7 with what a preparing room waits for.
+                if !matches!(arity, 3..=5 | 7) {
                     return Err(Error::MalformedIpc("ipc room arity"));
                 }
                 let id = digest(d)?;
@@ -4828,14 +4836,26 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 } else {
                     String::new()
                 };
-                let preparing = arity == 5
+                let preparing = arity >= 5
                     && d.uint()
                         .map_err(|_| Error::MalformedIpc("ipc room preparing"))?
                         != 0;
+                let waiting = if arity >= 7 {
+                    let what = d
+                        .text()
+                        .map_err(|_| Error::MalformedIpc("ipc room waiting"))?
+                        .to_owned();
+                    let since = d
+                        .uint()
+                        .map_err(|_| Error::MalformedIpc("ipc room waiting since"))?;
+                    (!what.is_empty()).then_some((what, since))
+                } else {
+                    None
+                };
                 if open && preparing {
                     return Err(Error::MalformedIpc("ipc room availability"));
                 }
-                rooms.push((id, name, open, over, preparing));
+                rooms.push((id, name, open, over, preparing, waiting));
             }
             return Ok(Frame::Rooms { rooms });
         }
@@ -7509,8 +7529,25 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             .iter()
             .any(|c| c.channel_id == *id && c.preparing)
     }) {
+        // With what it waits for, when the room has said: a stuck room and a slow one
+        // read differently (#991).
+        let waiting = room.and_then(|id| {
+            handle
+                .view()
+                .channels
+                .iter()
+                .find(|c| c.channel_id == *id)
+                .and_then(|c| c.waiting.clone())
+        });
         return Frame::Error {
-            reason: crate::node::api::Fault::RoomPreparing.explain().into(),
+            reason: match waiting {
+                Some((what, since)) => format!(
+                    "{}; it waits for {what}, {}",
+                    crate::node::api::Fault::RoomPreparing.explain(),
+                    crate::node::status::since_text(since)
+                ),
+                None => crate::node::api::Fault::RoomPreparing.explain().into(),
+            },
         };
     }
     let frame = match request {
@@ -9027,12 +9064,18 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                         c.open,
                         c.over.clone().unwrap_or_default(),
                         c.preparing,
+                        c.waiting.clone(),
                     )
                 })
                 .collect();
             Frame::Rooms {
-                rooms: page(rooms, after, |(id, name, _, over, _)| {
-                    (*id, name.len() + over.len())
+                rooms: page(rooms, after, |(id, name, _, over, _, waiting)| {
+                    (
+                        *id,
+                        name.len()
+                            + over.len()
+                            + waiting.as_ref().map_or(0, |(what, _)| what.len() + 8),
+                    )
                 }),
             }
         }
