@@ -253,10 +253,15 @@ struct Exchanged {
     last: Option<std::time::Instant>,
     /// The same, Unix milliseconds, for the status a person reads.
     last_ms: Option<u64>,
-    /// Attempts made since the daemon started.
+    /// Exchanges completed since the daemon started.
     count: u64,
     /// Failures in a row since the last success; the backoff doubles with each.
     failures: u32,
+    /// This node's state revision at the last attempt, and whether a pairing operation
+    /// involving the computer was open then: a change in either is tried at once, backoff or
+    /// not; the same state waits the backoff out.
+    revision: u64,
+    involved: bool,
 }
 
 /// Without a need, a computer whose receipt covers this node's current state is exchanged with
@@ -1602,15 +1607,20 @@ impl Management {
                 })
                 .flatten();
             let now = std::time::Instant::now();
+            let revision = s.revision;
             let exchanged = lock(&self.exchanged);
             peers.retain(|peer| {
                 let record = exchanged.get(peer).copied().unwrap_or_default();
                 if let Some(last) = record.last {
                     if record.failures > 0 {
+                        // 2 s after the first failure, doubling, at most EXCHANGE_BACKOFF_MAX;
+                        // unless this node changed since that attempt, which is tried at once.
                         let wait = EXCHANGE_BACKOFF
-                            .saturating_mul(1u32 << record.failures.min(6))
+                            .saturating_mul(1u32 << (record.failures - 1).min(6))
                             .min(EXCHANGE_BACKOFF_MAX);
-                        if now.duration_since(last) < wait {
+                        let unchanged = record.revision == revision
+                            && record.involved == (involved == Some(*peer));
+                        if unchanged && now.duration_since(last) < wait {
                             return false;
                         }
                     } else {
@@ -1629,7 +1639,9 @@ impl Management {
                 true
             });
             drop(exchanged);
-            peers
+            let attempted: Vec<(Digest32, bool)> =
+                peers.iter().map(|p| (*p, involved == Some(*p))).collect();
+            let peers = peers
                 .into_iter()
                 .map(|peer| {
                     let endpoints = s
@@ -1652,29 +1664,46 @@ impl Management {
                 })
                 .collect::<Vec<_>>()
         };
-        let mut tasks = tokio::task::JoinSet::new();
+        let mut tasks = Vec::new();
         for (peer, endpoints, url) in peers {
             let me = Arc::clone(self);
-            tasks.spawn(async move { (peer, me.sync_peer(peer, endpoints, url).await) });
+            tasks.push((
+                peer,
+                tokio::spawn(async move { me.sync_peer(peer, endpoints, url).await }),
+            ));
+        }
+        if tasks.is_empty() {
+            // Nothing was tried: the last outcome stands, so a failure a person saw does not
+            // vanish on a tick that only waited.
+            return Ok(());
         }
         let mut problem = None;
-        while let Some(result) = tasks.join_next().await {
-            match result {
-                Ok((peer, outcome)) => {
-                    let mut exchanged = lock(&self.exchanged);
-                    let record = exchanged.entry(peer).or_default();
-                    record.last = Some(std::time::Instant::now());
-                    record.last_ms = Some(now());
+        for (peer, task) in tasks {
+            // A task that panicked is a failed attempt at that computer, backed off like any.
+            let outcome = match task.await {
+                Ok(outcome) => outcome,
+                Err(e) => Err(Error::Profile(format!("the exchange task failed: {e}"))),
+            };
+            let (revision, involved) = attempted
+                .iter()
+                .find(|(p, _)| *p == peer)
+                .map(|(_, involved)| (revision, *involved))
+                .unwrap_or_default();
+            let mut exchanged = lock(&self.exchanged);
+            let record = exchanged.entry(peer).or_default();
+            record.last = Some(std::time::Instant::now());
+            record.last_ms = Some(now());
+            record.revision = revision;
+            record.involved = involved;
+            match outcome {
+                Ok(()) => {
                     record.count = record.count.saturating_add(1);
-                    match outcome {
-                        Ok(()) => record.failures = 0,
-                        Err(e) => {
-                            record.failures = record.failures.saturating_add(1);
-                            problem = Some(e.to_string());
-                        }
-                    }
+                    record.failures = 0;
                 }
-                Err(e) => problem = Some(e.to_string()),
+                Err(e) => {
+                    record.failures = record.failures.saturating_add(1);
+                    problem = Some(e.to_string());
+                }
             }
         }
         *lock(&self.problem) = problem;

@@ -2376,7 +2376,10 @@ fn enrolled_computers_follow_node_changes_and_retire_removed_authority() {
 const PAIRED_IDLE: Duration = Duration::from_secs(60);
 /// Exchanges a computer may run with a peer over [`PAIRED_IDLE`] when nothing changed: the
 /// fallback one (every 60 s) and the one that may straddle the window's start.
-const IDLE_EXCHANGES: u64 = 2;
+const IDLE_EXCHANGES: u64 = 1;
+/// How far apart two exchanges with a computer that has nothing to say are, at least: the
+/// pairing manager's fallback, which the status dates.
+const FALLBACK_NAMED: Duration = Duration::from_secs(55);
 /// CPU time a daemon may spend over [`PAIRED_IDLE`] with nothing to settle.
 const IDLE_CPU: Duration = Duration::from_secs(3);
 
@@ -2464,8 +2467,8 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
         let confirmed = apps.iter().all(|p| p["confirmed"] == true);
         (total, last, confirmed, status["applications"].to_string())
     };
-    let (ea0, _, _, shown_a0) = exchanges(&a);
-    let (eb0, _, _, shown_b0) = exchanges(&b);
+    let (ea0, last_a0, _, shown_a0) = exchanges(&a);
+    let (eb0, last_b0, _, shown_b0) = exchanges(&b);
     let cpu0 = (cpu_time(da.child.id()), cpu_time(db.child.id()));
     std::thread::sleep(PAIRED_IDLE);
     let (ea1, last_a, confirmed_a, shown_a1) = exchanges(&a);
@@ -2492,6 +2495,38 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
         confirmed_a && confirmed_b && last_a.is_some() && last_b.is_some(),
         "PRODUCT: `vox computer status` does not say the peer is confirmed and when it was last exchanged with: alpha {confirmed_a} {last_a:?}, beta {confirmed_b} {last_b:?}"
     );
+    // The one round the minute allows is the fallback: the status dates it at least
+    // EXCHANGE_FALLBACK after the previous one, never sooner, so its need has a name.
+    for (who, before, after, n) in [
+        ("alpha", last_a0, last_a, during_a),
+        ("beta", last_b0, last_b, during_b),
+    ] {
+        if n > 0 {
+            let (Some(before), Some(after)) = (before, after) else {
+                panic!("PRODUCT: {who}'s `vox computer status` dates no exchange: {before:?} → {after:?}");
+            };
+            assert!(
+                after.saturating_sub(before) >= FALLBACK_NAMED.as_millis() as u64,
+                "PRODUCT: {who} exchanged {} s after its previous exchange with nothing to say \
+                 (ADR-038 FX-15, #989): a quiet computer is exchanged with only every {FALLBACK_NAMED:?}",
+                after.saturating_sub(before) / 1000
+            );
+        }
+    }
+    // The plain `vox computer status` says the same to a person.
+    for (who, acct, n) in [("alpha", &a, during_a), ("beta", &b, during_b)] {
+        let (ok, text, err) = acct.run(&["computer", "status"], "");
+        assert!(ok, "PRODUCT: `vox computer status` failed for {who}: {err}");
+        assert!(
+            text.contains("exchanged ") && text.contains(" time") && text.contains("last "),
+            "PRODUCT: {who}'s `vox computer status` does not say how often and when it exchanged \
+             (#989); it said: {text}"
+        );
+        assert!(
+            !text.contains("failed in a row"),
+            "PRODUCT: {who}'s `vox computer status` reports failures on an idle pair ({n} exchanges): {text}"
+        );
+    }
     assert!(
         during_a <= IDLE_EXCHANGES && during_b <= IDLE_EXCHANGES,
         "PRODUCT: idle computers kept exchanging state (ADR-038 FX-15, #989): alpha {} and beta {} exchanges over {PAIRED_IDLE:?} (at most {IDLE_EXCHANGES} each)\n{}\n{}",
@@ -2515,9 +2550,19 @@ fn cpu_time(pid: u32) -> Duration {
         .output()
         .unwrap_or_else(|e| panic!("APPARATUS: ps: {e}"));
     let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-    let mut parts: Vec<&str> = text.split(':').collect();
-    let secs: f64 = parts.pop().and_then(|s| s.parse().ok()).unwrap_or(0.0);
-    let mins: f64 = parts.pop().and_then(|s| s.parse().ok()).unwrap_or(0.0);
-    let hours: f64 = parts.pop().and_then(|s| s.parse().ok()).unwrap_or(0.0);
-    Duration::from_secs_f64(hours * 3600.0 + mins * 60.0 + secs)
+    // `[[HH:]MM:]SS.ss`; anything else is an apparatus fault, never a zero that reads as cheap.
+    let parts: Vec<f64> = text
+        .split(':')
+        .map(|s| {
+            s.parse().unwrap_or_else(|_| {
+                panic!("APPARATUS: `ps -o cputime= -p {pid}` printed {text:?}, not a CPU time")
+            })
+        })
+        .collect();
+    assert!(
+        (1..=3).contains(&parts.len()),
+        "APPARATUS: `ps -o cputime= -p {pid}` printed {text:?}, not a CPU time"
+    );
+    let secs = parts.iter().fold(0.0, |acc, part| acc * 60.0 + part);
+    Duration::from_secs_f64(secs)
 }
