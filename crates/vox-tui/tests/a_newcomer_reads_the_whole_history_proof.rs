@@ -1588,7 +1588,7 @@ fn a_room_with_its_own_session_records_opens_after_a_restart() {
     let staged = Instant::now();
     loop {
         let (ok, sessions, err) = vox(&alice, &["room", "sessions", &room], None);
-        if ok && sessions.contains("restart-proof") {
+        if ok && sessions.contains("you") && sessions.contains("restart-") {
             break;
         }
         assert!(
