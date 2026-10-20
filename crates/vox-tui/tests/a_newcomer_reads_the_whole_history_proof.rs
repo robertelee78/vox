@@ -1653,10 +1653,10 @@ fn a_room_with_its_own_session_records_opens_after_a_restart() {
 const HELD_NAMED_WITHIN: Duration = Duration::from_secs(5);
 /// How long the held room is watched.
 const HELD_IDLE: Duration = Duration::from_secs(30);
-/// CPU time the daemon may spend over [`HELD_IDLE`] on a step that never finishes while a peer
-/// keeps it awake: ten turns at the fast retry, then one a second, plus the peer's rows
-/// (ADR-038 FX-15; #991). Measured: paced ~1.2 s, unpaced ~6 s.
-const HELD_CPU: Duration = Duration::from_secs(3);
+/// CPU time the held step itself may add over [`HELD_IDLE`] beyond the same chatty window with
+/// nothing held: ten turns at the fast retry, then one a second, at 40 ms each (ADR-038 FX-15;
+/// #991). Unpaced, one turn per wake adds four seconds and more.
+const HELD_EXTRA: Duration = Duration::from_secs(3);
 /// How often bob posts into the open room through the held window: each row wakes alice's
 /// actor, as the decider's six peers wake his, and a due room runs a turn at every wake.
 const CHATTY_EVERY: Duration = Duration::from_millis(200);
@@ -1666,9 +1666,9 @@ const CHATTY_EVERY: Duration = Duration::from_millis(200);
 /// preparation turn of that room ends as a step that did work and cost 40 ms, which is what
 /// the decider's room did for hours, while bob posts into her other, open room every
 /// [`CHATTY_EVERY`] so her actor is woken as his is. Within [`HELD_NAMED_WITHIN`] `vox room
-/// list` MUST name the step; over [`HELD_IDLE`] the daemon's CPU MUST grow by at most
-/// [`HELD_CPU`] while the room keeps naming it; once the file is removed the room MUST open
-/// within [`OPENS_WITHIN`].
+/// list` MUST name the step; over [`HELD_IDLE`] the held step MUST add at most [`HELD_EXTRA`]
+/// to the daemon's CPU beyond the same window with nothing held, while the room keeps naming
+/// it; once the file is removed the room MUST open within [`OPENS_WITHIN`].
 ///
 /// Mutant: the pacing removed (`PREPARE_FAST_TURNS` made unreachable) turns the CPU claim red.
 #[cfg(feature = "optional-proofs")]
@@ -1754,9 +1754,59 @@ fn a_preparation_step_that_never_finishes_costs_one_turn_a_second() {
         std::thread::sleep(Duration::from_millis(250));
     }
     first.stop();
-    // Only the "held" room is held: the file names it.
-    std::fs::write(&hold, room.as_bytes()).expect("APPARATUS: write the hold file");
+    // One chatty window: bob posts into the open room every CHATTY_EVERY for HELD_IDLE, which
+    // wakes alice's actor as the decider's peers wake his; the daemon's CPU over it is returned.
+    let chatty_window = |pid: u32| -> (Duration, usize) {
+        let chatting = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let chatter = {
+            let chatting = chatting.clone();
+            let bob = bob.clone();
+            let chat = chat.clone();
+            std::thread::spawn(move || {
+                let mut n = 0usize;
+                while chatting.load(std::sync::atomic::Ordering::Relaxed) {
+                    n += 1;
+                    let _ = vox(
+                        &bob,
+                        &["room", "post", &chat, &format!("chatter {n}")],
+                        None,
+                    );
+                    std::thread::sleep(CHATTY_EVERY);
+                }
+                n
+            })
+        };
+        let cpu0 = cpu_time(pid);
+        std::thread::sleep(HELD_IDLE);
+        let spent = cpu_time(pid).saturating_sub(cpu0);
+        chatting.store(false, std::sync::atomic::Ordering::Relaxed);
+        let posted = chatter.join().unwrap_or(0);
+        assert!(
+            posted >= 50,
+            "APPARATUS: bob posted only {posted} rows in {HELD_IDLE:?}; alice's actor was not kept awake"
+        );
+        (spent, posted)
+    };
+    // ---- the baseline: the same window with nothing held (the file names no room) ----------
+    std::fs::write(&hold, b"zzzz-no-such-room").expect("APPARATUS: write the hold file");
     let second = daemon_env(&alice, "alice", &knob);
+    let opened = Instant::now();
+    loop {
+        let (ok, out, _) = vox(&alice, &["room", "list"], None);
+        if ok && !out.contains("[preparing") && out.contains(&room) && out.contains(&chat) {
+            break;
+        }
+        assert!(
+            opened.elapsed() < OPENS_WITHIN,
+            "PRODUCT: alice's rooms did not open within {OPENS_WITHIN:?} of a restart with nothing held: {out}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let (baseline, posted_a) = chatty_window(second.0.id());
+    second.stop();
+    // ---- the held window: the file names the "held" room ------------------------------------
+    std::fs::write(&hold, room.as_bytes()).expect("APPARATUS: write the hold file");
+    let third = daemon_env(&alice, "alice", &knob);
     let started = Instant::now();
     loop {
         let (ok, out, _) = vox(&alice, &["room", "list"], None);
@@ -1780,47 +1830,24 @@ fn a_preparation_step_that_never_finishes_costs_one_turn_a_second() {
         );
         std::thread::sleep(Duration::from_millis(200));
     }
-    // Bob keeps alice's actor awake through the window, as the decider's peers keep his.
-    let chatting = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let chatter = {
-        let chatting = chatting.clone();
-        let bob = bob.clone();
-        let chat = chat.clone();
-        std::thread::spawn(move || {
-            let mut n = 0usize;
-            while chatting.load(std::sync::atomic::Ordering::Relaxed) {
-                n += 1;
-                let _ = vox(
-                    &bob,
-                    &["room", "post", &chat, &format!("chatter {n}")],
-                    None,
-                );
-                std::thread::sleep(CHATTY_EVERY);
-            }
-            n
-        })
-    };
-    let pid = second.0.id();
-    let cpu0 = cpu_time(pid);
-    std::thread::sleep(HELD_IDLE);
-    let spent = cpu_time(pid).saturating_sub(cpu0);
-    chatting.store(false, std::sync::atomic::Ordering::Relaxed);
-    let posted = chatter.join().unwrap_or(0);
+    let (held_spent, posted_b) = chatty_window(third.0.id());
+    let extra = held_spent.saturating_sub(baseline);
     let (_, out, _) = vox(&alice, &["room", "list"], None);
-    println!("[proof] over {HELD_IDLE:?} with bob posting {posted} rows the held step cost the daemon +{spent:?} of CPU (bound {HELD_CPU:?}); the list says: {}", out.trim());
-    assert!(
-        posted >= 50,
-        "APPARATUS: bob posted only {posted} rows in {HELD_IDLE:?}; alice's actor was not kept awake"
+    println!(
+        "[proof] over {HELD_IDLE:?} with bob posting ({posted_a} then {posted_b} rows): nothing held +{baseline:?}, the held step +{held_spent:?}, so the held step itself +{extra:?} of CPU (bound {HELD_EXTRA:?}); the list says: {}",
+        out.trim()
     );
     assert!(
         out.contains("waiting for a step held by a test knob"),
         "PRODUCT: after {HELD_IDLE:?} the room no longer names its held step (#991): {out}"
     );
     assert!(
-        spent <= HELD_CPU,
-        "PRODUCT: a preparation step that never finishes cost the daemon {spent:?} of CPU over \
-         {HELD_IDLE:?} (ADR-038 FX-15, #991; bound {HELD_CPU:?}): its turns are not paced"
+        extra <= HELD_EXTRA,
+        "PRODUCT: a preparation step that never finishes cost the daemon {extra:?} of CPU beyond \
+         the same window with nothing held, over {HELD_IDLE:?} (ADR-038 FX-15, #991; bound \
+         {HELD_EXTRA:?}): its turns are not paced"
     );
+    let second = third;
     std::fs::remove_file(&hold).expect("APPARATUS: remove the hold file");
     let released = Instant::now();
     loop {
