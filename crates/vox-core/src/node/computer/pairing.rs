@@ -271,6 +271,9 @@ const EXCHANGE_FALLBACK: Duration = Duration::from_secs(60);
 const EXCHANGE_BACKOFF: Duration = Duration::from_secs(2);
 /// The longest a failing computer waits between attempts.
 const EXCHANGE_BACKOFF_MAX: Duration = Duration::from_secs(120);
+/// An exchange that has not finished by then counts as failed: a computer that hangs must not
+/// hold the round, and with it every other computer's next attempt, for longer.
+const EXCHANGE_WITHIN: Duration = Duration::from_secs(60);
 impl Management {
     /// The account's explicit host:port lookup uses its existing socket, but no management
     /// identity or authority. The returned fingerprint is proved; lookup persists no anchor source.
@@ -1668,13 +1671,28 @@ impl Management {
         let mut tasks = Vec::new();
         for (peer, endpoints, url) in peers {
             let me = Arc::clone(self);
+            let involved = attempted
+                .iter()
+                .any(|(p, involved)| *p == peer && *involved);
             tasks.push((
                 peer,
                 tokio::spawn(async move {
-                    // Dated when it finished, not when its result is visited: a slow peer
-                    // awaited before this one must not shift its time.
-                    let outcome = me.sync_peer(peer, endpoints, url).await;
-                    (std::time::Instant::now(), now(), outcome)
+                    // Each computer's outcome is recorded by its own task the moment it ends,
+                    // dated then: a slow computer never delays another's record, its status or
+                    // its next attempt, and none may hang the round past EXCHANGE_WITHIN.
+                    let outcome = match tokio::time::timeout(
+                        EXCHANGE_WITHIN,
+                        me.sync_peer(peer, endpoints, url),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => Ok(()),
+                        Ok(Err(e)) => Err(e.to_string()),
+                        Err(_) => Err(format!(
+                            "the exchange did not finish within {EXCHANGE_WITHIN:?}"
+                        )),
+                    };
+                    me.record_exchange(peer, revision, involved, outcome)
                 }),
             ));
         }
@@ -1685,46 +1703,52 @@ impl Management {
         }
         let mut problem = None;
         for (peer, task) in tasks {
-            // A task that panicked is a failed attempt at that computer, backed off like any.
-            let (finished, finished_ms, outcome): (
-                std::time::Instant,
-                u64,
-                std::result::Result<(), String>,
-            ) = match task.await {
-                Ok((at, at_ms, Ok(()))) => (at, at_ms, Ok(())),
-                Ok((at, at_ms, Err(e))) => (at, at_ms, Err(e.to_string())),
-                Err(e) => (
-                    std::time::Instant::now(),
-                    now(),
-                    Err(format!("the exchange task failed: {e}")),
-                ),
-            };
-            let (revision, involved) = attempted
-                .iter()
-                .find(|(p, _)| *p == peer)
-                .map(|(_, involved)| (revision, *involved))
-                .unwrap_or_default();
-            let mut exchanged = lock(&self.exchanged);
-            let record = exchanged.entry(peer).or_default();
-            // `last` paces the next attempt, succeeded or not; `last_ms` is what a person reads
-            // as the last exchange, so only a completed one sets it.
-            record.last = Some(finished);
-            record.revision = revision;
-            record.involved = involved;
-            match outcome {
-                Ok(()) => {
-                    record.last_ms = Some(finished_ms);
-                    record.count = record.count.saturating_add(1);
-                    record.failures = 0;
-                }
-                Err(text) => {
-                    record.failures = record.failures.saturating_add(1);
-                    problem = Some(text);
+            match task.await {
+                Ok(failed) => problem = failed.or(problem),
+                // A task that panicked is a failed attempt at that computer, backed off like any.
+                Err(e) => {
+                    let involved = attempted
+                        .iter()
+                        .any(|(p, involved)| *p == peer && *involved);
+                    problem = self.record_exchange(
+                        peer,
+                        revision,
+                        involved,
+                        Err(format!("the exchange task failed: {e}")),
+                    );
                 }
             }
         }
         *lock(&self.problem) = problem;
         Ok(())
+    }
+    /// Record one attempt's outcome for `peer`, now: `last` paces the next attempt whether it
+    /// succeeded or not; `last_ms`, what a person reads as the last exchange, is set only by a
+    /// completed one. Returns the failure's words, if it failed.
+    fn record_exchange(
+        &self,
+        peer: Digest32,
+        revision: u64,
+        involved: bool,
+        outcome: std::result::Result<(), String>,
+    ) -> Option<String> {
+        let mut exchanged = lock(&self.exchanged);
+        let record = exchanged.entry(peer).or_default();
+        record.last = Some(std::time::Instant::now());
+        record.revision = revision;
+        record.involved = involved;
+        match outcome {
+            Ok(()) => {
+                record.last_ms = Some(now());
+                record.count = record.count.saturating_add(1);
+                record.failures = 0;
+                None
+            }
+            Err(text) => {
+                record.failures = record.failures.saturating_add(1);
+                Some(text)
+            }
+        }
     }
     async fn sync_peer(
         self: &Arc<Self>,
