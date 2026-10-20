@@ -27,7 +27,7 @@
 //! ratchet relies on.
 
 use aes_gcm::aead::{Aead, Payload};
-use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+use aes_gcm::{Aes256Gcm, KeyInit};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
@@ -234,7 +234,7 @@ fn aead_seal(mk: &MessageKey, header_body: &[u8], ad: &[u8], plaintext: &[u8]) -
     let nonce = message_nonce(mk, header_body)?;
     cipher
         .encrypt(
-            Nonce::from_slice(&nonce),
+            &nonce.into(),
             Payload {
                 msg: plaintext,
                 aad: ad,
@@ -250,7 +250,7 @@ fn aead_open(mk: &MessageKey, header_body: &[u8], ad: &[u8], ciphertext: &[u8]) 
     let nonce = message_nonce(mk, header_body)?;
     cipher
         .decrypt(
-            Nonce::from_slice(&nonce),
+            &nonce.into(),
             Payload {
                 msg: ciphertext,
                 aad: ad,

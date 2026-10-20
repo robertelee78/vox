@@ -31,7 +31,7 @@
 //! a segment cannot be moved to another slot.
 
 use aes_gcm::aead::{Aead, Payload};
-use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+use aes_gcm::{Aes256Gcm, KeyInit};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::atrest::sek::{Sek, NONCE_LEN, TAG_LEN};
@@ -162,7 +162,7 @@ pub fn seal_segment(
     let aad = segment_aad(kind, segment_id);
     let ct = cipher
         .encrypt(
-            Nonce::from_slice(&nonce),
+            &nonce.into(),
             Payload {
                 msg: plaintext,
                 aad: &aad,
@@ -197,7 +197,7 @@ pub fn open_segment(
     let aad = segment_aad(kind, segment_id);
     cipher
         .decrypt(
-            Nonce::from_slice(&sealed.nonce),
+            &sealed.nonce.into(),
             Payload {
                 msg: &sealed.ciphertext,
                 aad: &aad,

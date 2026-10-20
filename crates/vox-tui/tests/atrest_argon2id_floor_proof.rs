@@ -147,7 +147,7 @@ fn opens_with(v: &Vault, m_cost_kib: u32, t_cost: u32) -> bool {
     Aes256Gcm::new_from_slice(&key)
         .expect("APPARATUS: a 32-byte AES key")
         .decrypt(
-            Nonce::from_slice(&v.nonce),
+            &Nonce::try_from(v.nonce.as_slice()).expect("APPARATUS: the fixture nonce is 12 bytes"),
             Payload {
                 msg: &v.ciphertext,
                 aad: aad(v.version),

@@ -31,7 +31,7 @@
 //! used for both.
 
 use aes_gcm::aead::{Aead, Payload};
-use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+use aes_gcm::{Aes256Gcm, KeyInit};
 use hkdf::Hkdf;
 use sha2::Sha256;
 use zeroize::{Zeroize, Zeroizing};
@@ -131,7 +131,7 @@ impl IdentityVault {
         let mut plaintext = Zeroizing::new(backup.to_canonical_vec());
         let ct = cipher
             .encrypt(
-                Nonce::from_slice(&nonce),
+                &nonce.into(),
                 Payload {
                     msg: plaintext.as_ref(),
                     aad: VAULT_AAD_V2,
@@ -161,7 +161,7 @@ impl IdentityVault {
             Aes256Gcm::new_from_slice(key.as_ref()).map_err(|_| Error::AtRestUnlockFailed)?;
         let mut pt = cipher
             .decrypt(
-                Nonce::from_slice(&self.nonce),
+                &self.nonce.into(),
                 Payload {
                     msg: &self.ciphertext,
                     aad: vault_aad(self.version).map_err(|_| Error::AtRestUnlockFailed)?,
