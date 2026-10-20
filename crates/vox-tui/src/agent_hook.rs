@@ -3421,7 +3421,18 @@ async fn read_room(
     // session that cannot claim work should learn why before it tries, not from an
     // exit status in the middle of a task.
     let (snap, refused) = match crate::coord::snapshot(client, channel_id).await {
-        Ok(snap) => {
+        Ok(mut snap) => {
+            // **A session announces the vox it runs now** (#994): one whose last announcement
+            // here carries another version, after an update, says the current one this turn,
+            // so the room's version table converges without a claim from it.
+            if snap.announced_before(&input.session_id) && !snap.announced(&input.session_id) {
+                if let Ok(fresh) =
+                    crate::coord::announce(paths, client, channel_id, &input.session_id, &snap)
+                        .await
+                {
+                    snap = fresh;
+                }
+            }
             let refused = snap
                 .table
                 .refused()

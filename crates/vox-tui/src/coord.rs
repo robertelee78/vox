@@ -331,6 +331,20 @@ impl Snapshot {
 
     /// Whether this session's announcement still agrees with its and this node's latest
     /// participation records. An old matching hello may have been superseded since.
+    /// Whether this session has ever announced itself here (a counted record of its own), so
+    /// a stale announcement is one to refresh, while a session that only ever read stays
+    /// silent (#994).
+    #[must_use]
+    pub fn announced_before(&self, session: &str) -> bool {
+        self.posted.iter().any(|p| {
+            p.author == self.me
+                && p.envelope.from == session
+                && (claim::is_claim_protocol(&p.envelope)
+                    || (p.envelope.kind == HELLO && p.envelope.data.get(VOX_KEY).is_some())
+                    || p.envelope.kind == BYE)
+        })
+    }
+
     #[must_use]
     pub fn announced(&self, session: &str) -> bool {
         let mut hello = false;
@@ -769,8 +783,9 @@ pub fn refusal(room: &str, table: &VersionTable) -> AppError {
         ));
     }
     msg.push_str(
-        "\n  every worker in a coordinating room must run the same vox version — upgrade \
-         it, or remove it from the room",
+        "\n  every worker in a coordinating room must run the same vox version; a worker \
+         announces the version it runs on its next turn once that is the required one, and \
+         until then every claim here is refused",
     );
     AppError::Refused {
         code: EXIT_VERSION,
@@ -1006,32 +1021,52 @@ pub async fn participate(
 ) -> Result<Snapshot, AppError> {
     let mut snap = snapshot(client, channel_id).await?;
     if !snap.announced(session) {
-        // **How it can be reached rides the hello** (V030-17): a sender on another node cannot
-        // see this node's session registrations, so it learns from the room whether an urgent
-        // message can interrupt this session.
-        let mut data = serde_json::Map::new();
-        data.insert(
-            crate::wake::WAKE_KEY.into(),
-            crate::wake::reachability(paths, session).into(),
-        );
-        // **And which machine it runs on** (ADR-020 §4.9b): filled here, from the machine, never
-        // by the model.
-        crate::platform::insert(&mut data);
-        let hello = Draft {
-            kind: HELLO.into(),
-            body: format!("session {session} runs vox {VERSION}"),
-            data,
-            ..Draft::default()
-        };
-        let op = new_op()?;
-        snap = post_once(client, channel_id, &hello, session, &op, &snap)
-            .await?
-            .after;
+        snap = announce(paths, client, channel_id, session, &snap).await?;
     }
     if snap.table.refused() {
         return Err(refusal(room, &snap.table));
     }
     Ok(snap)
+}
+
+/// Post this session's stamped `hello`: the version it runs now, how it can be reached and
+/// which machine it runs on. Returns the room as it stands after the post.
+///
+/// Called by every participating verb that finds the session unannounced, and by the harness
+/// hook when a session's last announcement carries another version than the vox installed
+/// now (#994): a session that only reads would otherwise keep its old stamp for a day after
+/// an update, and refuse coordination for everyone.
+///
+/// # Errors
+/// A node error.
+pub async fn announce(
+    paths: &vox_core::node::paths::Paths,
+    client: &mut IpcClient,
+    channel_id: Digest32,
+    session: &str,
+    snap: &Snapshot,
+) -> Result<Snapshot, AppError> {
+    // **How it can be reached rides the hello** (V030-17): a sender on another node cannot
+    // see this node's session registrations, so it learns from the room whether an urgent
+    // message can interrupt this session.
+    let mut data = serde_json::Map::new();
+    data.insert(
+        crate::wake::WAKE_KEY.into(),
+        crate::wake::reachability(paths, session).into(),
+    );
+    // **And which machine it runs on** (ADR-020 §4.9b): filled here, from the machine, never
+    // by the model.
+    crate::platform::insert(&mut data);
+    let hello = Draft {
+        kind: HELLO.into(),
+        body: format!("session {session} runs vox {VERSION}"),
+        data,
+        ..Draft::default()
+    };
+    let op = new_op()?;
+    Ok(post_once(client, channel_id, &hello, session, &op, snap)
+        .await?
+        .after)
 }
 
 /// Whether a draft or raw text is a claim-protocol operation, which only the
