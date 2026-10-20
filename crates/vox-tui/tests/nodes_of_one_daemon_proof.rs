@@ -2380,6 +2380,8 @@ const IDLE_EXCHANGES: u64 = 1;
 /// How far apart two exchanges with a computer that has nothing to say are, at least: the
 /// pairing manager's fallback, which the status dates.
 const FALLBACK_NAMED: Duration = Duration::from_secs(55);
+/// How often the idle minute samples each side's status for a new dated exchange.
+const SAMPLE_EVERY: Duration = Duration::from_secs(5);
 /// CPU time a daemon may spend over [`PAIRED_IDLE`] with nothing to settle.
 const IDLE_CPU: Duration = Duration::from_secs(3);
 
@@ -2470,7 +2472,32 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
     let (ea0, last_a0, _, shown_a0) = exchanges(&a);
     let (eb0, last_b0, _, shown_b0) = exchanges(&b);
     let cpu0 = (cpu_time(da.child.id()), cpu_time(db.child.id()));
-    std::thread::sleep(PAIRED_IDLE);
+    // Every SAMPLE_EVERY, each side's dated last exchange: a new one must be at least the
+    // fallback after the one before it, or the round had no need the status names.
+    let mut dated: Vec<Vec<u64>> = vec![last_a0.into_iter().collect(), last_b0.into_iter().collect()];
+    let idle_from = Instant::now();
+    while idle_from.elapsed() < PAIRED_IDLE {
+        std::thread::sleep(SAMPLE_EVERY.min(PAIRED_IDLE.saturating_sub(idle_from.elapsed())));
+        for (i, acct) in [&a, &b].into_iter().enumerate() {
+            if let (_, Some(last), _, _) = exchanges(acct) {
+                if dated[i].last() != Some(&last) {
+                    dated[i].push(last);
+                }
+            }
+        }
+    }
+    for (who, times) in [("alpha", &dated[0]), ("beta", &dated[1])] {
+        for pair in times.windows(2) {
+            let gap = pair[1].saturating_sub(pair[0]);
+            assert!(
+                gap >= FALLBACK_NAMED.as_millis() as u64,
+                "PRODUCT: {who} exchanged {} s after its previous exchange with nothing to say \
+                 (ADR-038 FX-15, #989): a quiet computer is exchanged with only every {FALLBACK_NAMED:?}; \
+                 its dated exchanges: {times:?}",
+                gap / 1000
+            );
+        }
+    }
     let (ea1, last_a, confirmed_a, shown_a1) = exchanges(&a);
     let (eb1, last_b, confirmed_b, shown_b1) = exchanges(&b);
     let cpu1 = (cpu_time(da.child.id()), cpu_time(db.child.id()));
@@ -2495,24 +2522,6 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
         confirmed_a && confirmed_b && last_a.is_some() && last_b.is_some(),
         "PRODUCT: `vox computer status` does not say the peer is confirmed and when it was last exchanged with: alpha {confirmed_a} {last_a:?}, beta {confirmed_b} {last_b:?}"
     );
-    // The one round the minute allows is the fallback: the status dates it at least
-    // EXCHANGE_FALLBACK after the previous one, never sooner, so its need has a name.
-    for (who, before, after, n) in [
-        ("alpha", last_a0, last_a, during_a),
-        ("beta", last_b0, last_b, during_b),
-    ] {
-        if n > 0 {
-            let (Some(before), Some(after)) = (before, after) else {
-                panic!("PRODUCT: {who}'s `vox computer status` dates no exchange: {before:?} → {after:?}");
-            };
-            assert!(
-                after.saturating_sub(before) >= FALLBACK_NAMED.as_millis() as u64,
-                "PRODUCT: {who} exchanged {} s after its previous exchange with nothing to say \
-                 (ADR-038 FX-15, #989): a quiet computer is exchanged with only every {FALLBACK_NAMED:?}",
-                after.saturating_sub(before) / 1000
-            );
-        }
-    }
     // The plain `vox computer status` says the same to a person.
     for (who, acct, n) in [("alpha", &a, during_a), ("beta", &b, during_b)] {
         let (ok, text, err) = acct.run(&["computer", "status"], "");
