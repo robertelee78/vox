@@ -2474,7 +2474,8 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
     let cpu0 = (cpu_time(da.child.id()), cpu_time(db.child.id()));
     // Every SAMPLE_EVERY, each side's dated last exchange: a new one must be at least the
     // fallback after the one before it, or the round had no need the status names.
-    let mut dated: Vec<Vec<u64>> = vec![last_a0.into_iter().collect(), last_b0.into_iter().collect()];
+    let mut dated: Vec<Vec<u64>> =
+        vec![last_a0.into_iter().collect(), last_b0.into_iter().collect()];
     let idle_from = Instant::now();
     while idle_from.elapsed() < PAIRED_IDLE {
         std::thread::sleep(SAMPLE_EVERY.min(PAIRED_IDLE.saturating_sub(idle_from.elapsed())));
