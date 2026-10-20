@@ -773,7 +773,7 @@ impl Management {
         // meanwhile, the handshake carries stale state, the retry supersedes it, and the
         // operator is told to try again (the next tick exchanges the current state).
         let me = Arc::clone(self);
-        let (link_owned, url_owned) = (link.clone(), url.to_owned());
+        let (link_owned, url_owned) = (link, url.to_owned());
         let task = tokio::spawn(async move {
             tokio::time::timeout(EXCHANGE_WITHIN, me.pair(&link_owned, &url_owned)).await
         });
