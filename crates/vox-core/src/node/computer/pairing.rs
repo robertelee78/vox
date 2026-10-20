@@ -291,20 +291,35 @@ impl Attempt {
 struct Flight {
     revision: u64,
     involved: bool,
+    /// Who started it: the retry, or the operator's pairing command.
+    origin: Origin,
     abort: Option<tokio::task::AbortHandle>,
     /// Cut because this node changed meanwhile: its end is no failure, and the next tick
     /// exchanges again. Read and cleared with the flight's removal, under the one lock.
     superseded: bool,
 }
 
-/// A computer reserved as in flight by the operator's pairing, released on drop.
+/// Who started an exchange in flight.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Origin {
+    Retry,
+    Operator,
+}
+
+/// A computer reserved as in flight by the operator's pairing: released on drop, and the
+/// handshake task cut with it, so a pairing command that is dropped (its request cancelled)
+/// leaves no handshake running unreserved.
 struct Reserved {
     me: Arc<Management>,
     peer: Digest32,
+    abort: Option<tokio::task::AbortHandle>,
 }
 
 impl Drop for Reserved {
     fn drop(&mut self) {
+        if let Some(abort) = &self.abort {
+            abort.abort();
+        }
         lock(&self.me.inflight).remove(&self.peer);
     }
 }
@@ -763,13 +778,14 @@ impl Management {
                             Flight {
                                 revision,
                                 involved: true,
+                                origin: Origin::Operator,
                                 abort: None,
                                 superseded: false,
                             },
                         );
                         break;
                     }
-                    Some(flight) if flight.involved && !flight.superseded => {
+                    Some(flight) if flight.origin == Origin::Operator && !flight.superseded => {
                         return Err(Error::Profile(
                             "a computer pairing with that computer is in progress; try again \
                              in a moment",
@@ -792,9 +808,10 @@ impl Management {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        let reserved = Reserved {
+        let mut reserved = Reserved {
             me: Arc::clone(self),
             peer: target,
+            abort: None,
         };
         // Bounded like any exchange, by the same generous bound: a slow but valid handshake
         // of a long history completes, and a hung one never holds the reservation for good.
@@ -806,6 +823,7 @@ impl Management {
         let task = tokio::spawn(async move {
             tokio::time::timeout(EXCHANGE_WITHIN, me.pair(&link_owned, &url_owned)).await
         });
+        reserved.abort = Some(task.abort_handle());
         if let Some(flight) = lock(&self.inflight).get_mut(&target) {
             flight.abort = Some(task.abort_handle());
         }
@@ -1822,8 +1840,11 @@ impl Management {
             {
                 let mut inflight = lock(&self.inflight);
                 for (peer, flight) in inflight.iter_mut() {
-                    let stale =
-                        flight.revision != revision || flight.involved != (involved == Some(*peer));
+                    // Stale: this node's state moved on, or (a retry flight) whether the
+                    // computer is involved in a pending operation changed.
+                    let stale = flight.revision != revision
+                        || (flight.origin == Origin::Retry
+                            && flight.involved != (involved == Some(*peer)));
                     if stale && !flight.superseded {
                         if let Some(abort) = &flight.abort {
                             flight.superseded = true;
@@ -1840,6 +1861,7 @@ impl Management {
                         Flight {
                             revision,
                             involved: involved == Some(*peer),
+                            origin: Origin::Retry,
                             abort: None,
                             superseded: false,
                         },
@@ -1878,17 +1900,19 @@ impl Management {
             let involved = attempted
                 .iter()
                 .any(|(p, involved)| *p == peer && *involved);
+            // The guard exists before the task does and travels with it: a task cut before
+            // its first poll drops the guard all the same, so no reservation ever leaks.
+            let guard = Attempt {
+                me: Arc::clone(self),
+                peer,
+                revision,
+                involved,
+                recorded: false,
+            };
             let task = tokio::spawn(async move {
                 // Each computer's outcome is recorded by its own task the moment it ends,
                 // dated then: a slow computer never delays another's record, status or next
                 // attempt, and one that hangs counts as failed after EXCHANGE_WITHIN.
-                let guard = Attempt {
-                    me: Arc::clone(&me),
-                    peer,
-                    revision,
-                    involved,
-                    recorded: false,
-                };
                 let outcome =
                     match tokio::time::timeout(EXCHANGE_WITHIN, me.sync_peer(peer, endpoints, url))
                         .await
