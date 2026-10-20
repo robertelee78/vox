@@ -769,11 +769,29 @@ impl Management {
         };
         // Bounded like any exchange, by the same generous bound: a slow but valid handshake
         // of a long history completes, and a hung one never holds the reservation for good.
-        let paired = match tokio::time::timeout(EXCHANGE_WITHIN, self.pair(&link, url)).await {
-            Ok(paired) => paired,
-            Err(_) => Err(Error::Profile(
+        // Run as a task the retry can cut like any exchange: should this node change
+        // meanwhile, the handshake carries stale state, the retry supersedes it, and the
+        // operator is told to try again (the next tick exchanges the current state).
+        let me = Arc::clone(self);
+        let (link_owned, url_owned) = (link.clone(), url.to_owned());
+        let task = tokio::spawn(async move {
+            tokio::time::timeout(EXCHANGE_WITHIN, me.pair(&link_owned, &url_owned)).await
+        });
+        if let Some(flight) = lock(&self.inflight).get_mut(&target) {
+            flight.abort = Some(task.abort_handle());
+        }
+        let paired = match task.await {
+            Ok(Ok(paired)) => paired,
+            Ok(Err(_)) => Err(Error::Profile(
                 "the computer pairing did not finish within ten minutes; try again",
             )),
+            Err(_) => {
+                lock(&self.superseded).remove(&target);
+                Err(Error::Profile(
+                    "this computer changed while the pairing ran, so the pairing was \
+                     superseded; try again",
+                ))
+            }
         };
         // Recorded while still reserved, with the state it carried, so the record never
         // touches a reservation the retry may have taken meanwhile; the guard releases this
