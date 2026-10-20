@@ -1083,6 +1083,30 @@ impl ChannelState {
     /// published (ADR-037 R1): a room's preparation must not wait on it. Measured on the shipped
     /// candidate: a reopened sparse room waited here for a receipt no sync could bring it, and
     /// stayed "preparing history" for as long as the daemon ran.
+    /// What a turn of the local upgrade work changes: compared before and after a step, so a
+    /// turn that moved nothing is reported as a wait, never as progress (ADR-038 FX-24).
+    pub(crate) fn session_upgrade_mark(
+        &self,
+    ) -> (
+        bool,
+        bool,
+        bool,
+        Option<u64>,
+        bool,
+        bool,
+        Option<(usize, u64, Digest32)>,
+    ) {
+        (
+            self.private_sessions.upgrading,
+            self.private_sessions.restoring,
+            self.private_sessions.controls_import,
+            self.private_sessions.restore_after,
+            self.private_sessions.legacy_pending.is_empty(),
+            self.private_sessions.legacy_work.is_some(),
+            self.private_sessions.controls_import_after,
+        )
+    }
+
     pub(crate) fn session_upgrade_local_work(&self) -> bool {
         self.private_sessions.upgrading
             || self.private_sessions.restoring
@@ -1616,7 +1640,12 @@ impl ChannelState {
         if self.poisoned {
             return Err(self.save_failure());
         }
-        if self.needs_session_upgrade() {
+        // Only the upgrade work this node finishes alone holds the refresh. A pending key pass
+        // (`pending_active`) can wait on a peer's control receipt, which an unpublished room
+        // never receives (ADR-037 R1); the published room runs that pass. Gating on it kept
+        // the decider's room at "refreshing its Session records" on v0.4.7 and at "restoring
+        // its Sessions" on v0.4.8, for a day each.
+        if self.session_upgrade_local_work() {
             return Ok(SessionRefresh::Waiting("its Session upgrade"));
         }
         if self.has_left(&self.me()) || self.ended(now).is_some() {
