@@ -2548,13 +2548,18 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
         "PRODUCT: `vox computer status` does not say the peer is confirmed and when it was last exchanged with: alpha {confirmed_a} {last_a:?}, beta {confirmed_b} {last_b:?}"
     );
     // The plain `vox computer status` says the same to a person.
-    for (who, acct, n) in [("alpha", &a, during_a), ("beta", &b, during_b)] {
+    for (who, acct, n, total, tried) in [
+        ("alpha", &a, during_a, ea1, aa1),
+        ("beta", &b, during_b, eb1, ab1),
+    ] {
         let (ok, text, err) = acct.run(&["computer", "status"], "");
         assert!(ok, "PRODUCT: `vox computer status` failed for {who}: {err}");
+        // The numbers a person reads are the JSON's: completed exchanges and attempts.
         assert!(
-            text.contains("exchanged ") && text.contains(" time") && text.contains("last "),
-            "PRODUCT: {who}'s `vox computer status` does not say how often and when it exchanged \
-             (#989); it said: {text}"
+            text.contains(&format!("exchanged {total} time(s) in {tried} attempt(s)"))
+                && text.contains("last "),
+            "PRODUCT: {who}'s `vox computer status` does not say how often it exchanged \
+             ({total} time(s) in {tried} attempt(s)) and when (#989); it said: {text}"
         );
         assert!(
             !text.contains("failed in a row"),

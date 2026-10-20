@@ -260,7 +260,8 @@ struct Exchanged {
     last_ms: Option<u64>,
     /// Exchanges completed since the daemon started.
     count: u64,
-    /// Attempts since the daemon started, completed or not.
+    /// Attempts since the daemon started, counted when each starts: completed or not, in
+    /// flight or cut.
     attempts: u64,
     /// Failures in a row since the last success; the backoff doubles with each.
     failures: u32,
@@ -350,16 +351,17 @@ impl Drop for Attempt {
     fn drop(&mut self) {
         // Removed and read in one step under the one lock: a mark set after this cannot
         // linger on a later flight.
-        let superseded = {
-            let mut inflight = lock(&self.me.inflight);
-            match inflight.get(&self.peer) {
-                Some(flight) if flight.serial == self.serial => inflight
-                    .remove(&self.peer)
-                    .is_some_and(|flight| flight.superseded),
-                _ => false,
-            }
+        // Recorded, when it must be, before the flight is released, and both under the one
+        // lock: nothing can reserve, run and record for this computer in between, so an old
+        // result never lands over a newer flight's.
+        let mut inflight = lock(&self.me.inflight);
+        let Some(flight) = inflight.get(&self.peer) else {
+            return;
         };
-        if !self.recorded && !superseded {
+        if flight.serial != self.serial {
+            return;
+        }
+        if !self.recorded && !flight.superseded {
             self.me.record_exchange(
                 self.peer,
                 self.revision,
@@ -367,6 +369,7 @@ impl Drop for Attempt {
                 Err("the exchange task failed".to_owned()),
             );
         }
+        inflight.remove(&self.peer);
     }
 }
 
@@ -813,6 +816,9 @@ impl Management {
                                 superseded: false,
                             },
                         );
+                        let mut exchanged = lock(&self.exchanged);
+                        let record = exchanged.entry(target).or_default();
+                        record.attempts = record.attempts.saturating_add(1);
                         break;
                     }
                     Some(flight) if flight.origin == Origin::Operator && !flight.superseded => {
@@ -1909,6 +1915,10 @@ impl Management {
                             superseded: false,
                         },
                     );
+                    // A round counts from its start: one in flight, or cut, is a round too.
+                    let mut exchanged = lock(&self.exchanged);
+                    let record = exchanged.entry(*peer).or_default();
+                    record.attempts = record.attempts.saturating_add(1);
                     true
                 });
             }
@@ -2006,7 +2016,6 @@ impl Management {
         let mut exchanged = lock(&self.exchanged);
         let record = exchanged.entry(peer).or_default();
         record.last = Some(std::time::Instant::now());
-        record.attempts = record.attempts.saturating_add(1);
         record.revision = revision;
         record.involved = involved;
         match outcome {
