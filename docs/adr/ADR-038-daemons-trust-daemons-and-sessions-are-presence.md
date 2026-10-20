@@ -214,9 +214,9 @@ The decider then answered twelve questions, one at a time. His answers are the d
   `--cfg aes_armv8` and `--cfg polyval_armv8`, which no build set, so every decrypt on Apple
   silicon ran the bitsliced software AES and the software POLYVAL (`aes::soft::fixslice`,
   `polyval::backend::soft` were the hottest leaves); Keccak autodetects and was not affected.
-- **FX-24.** A preparation turn in which the step did no work MUST end as a wait on the thing the
-  step waits for, in the words `vox room list` and the app show; a wait is the only other way a
-  turn ends, so such a turn is never recorded as progress. Measured cause,
+- **FX-24.** A preparation turn in which the step did no work MUST end as a wait, never as
+  progress, on the thing the step waits for, in the words `vox room list` and the app show.
+  Measured cause,
   2026-10-20: the decider's room ended every preparation turn on "refreshing its Session
   records", reported as progress, because the refresh stopped at its first gate; the room was
   re-queued after the 50 ms fast retry, about five turns a second as measured, and each turn
@@ -232,10 +232,8 @@ The decider then answered twelve questions, one at a time. His answers are the d
   advanced only for a published room, and the refresh waited on them, so a room restored with
   such state never opened (the decider's room, 2026-10-20).
 - **FX-27.** The daemon MUST NOT delay, skip or space any turn, publication or sync round by a
-  rule that counts turns or measures CPU time. FX-15 stands unchanged as the one retry schedule:
-  a repeated wait on the same thing outside the turn is retried at that wait's own pace, and a
-  turn that did work with a nameable need still pending is followed at once; a quiet room runs
-  nothing. Ruling: "caps on cpu seem like … footguns", "we need to understand
+  rule that counts turns or measures CPU time. FX-15's retry of a repeated wait is not such a
+  rule and stands unchanged. Ruling: "caps on cpu seem like … footguns", "we need to understand
   what is driving the cpu inefficiency rather than capping the cpu" (the decider, 2026-10-20,
   rejecting a ten-fast-turns-then-one-a-second cap proposed for FX-24's cause).
 
