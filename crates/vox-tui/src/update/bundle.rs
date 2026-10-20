@@ -86,6 +86,10 @@ pub(super) fn update(
         // **An update still updates** (decider, v0.4.2): with nothing newer, completions and the
         // agent skill pack are refreshed on the Vox.app in place. `--check` changes nothing.
         if !check_only {
+            // A previous bundle left as an application (before M-29a, or by a set-aside that
+            // failed) is repaired here too, so a plain `vox update` finishes the job.
+            let _lock = InstallLock::acquire(apps)?;
+            recover(apps)?;
             shell_setup_from(apps, exe);
             println!("Vox {current} is current; {}", super::skill_said());
         }
@@ -127,7 +131,7 @@ pub(super) fn update(
         let _ = clear(&staged);
         return Err(refused);
     }
-    publish(apps, &vox.version_text)?;
+    let aside = publish(apps, &vox.version_text)?;
 
     println!("updated: {} -> Vox {}", active.display(), vox.version_text);
     println!(
@@ -138,7 +142,10 @@ pub(super) fn update(
     let detached = super::restart::restart_daemon(&active.join(HELPER), &vox.version_text);
     shell_setup_from(apps, exe);
     super::restart::say_next(&detached);
-    Ok(())
+    match aside {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 /// `vox update --rollback` for the Vox.app in `apps`: swap it with `.Vox.app.previous`, so a
@@ -158,8 +165,28 @@ pub(super) fn rollback(apps: &Path, exe: &Path) -> Result<(), AppError> {
         )));
     }
     let was = app_version(&active).unwrap_or_else(|| "unknown".to_owned());
-    swap(&previous, &active)?;
+    // The kept bundle becomes an application again before it is swapped in; the one it replaces
+    // is set aside after, so neither is ever both in place and set aside.
+    restore(&previous)?;
+    if let Err(failed) = swap(&previous, &active) {
+        // Nothing was swapped: the kept bundle is set aside again, never left an application.
+        return Err(match set_aside(&previous) {
+            Ok(()) => failed,
+            Err(aside) => AppError::Usage(format!(
+                "the rollback swap failed ({failed}), and {aside}; run `vox update` to repair, \
+                 and until then open Vox as {}",
+                active.display()
+            )),
+        });
+    }
     sync_dir(apps)?;
+    // The rollback is done at this point. A set-aside that fails is reported last, after the
+    // active bundle is registered and the daemon restarted, so a failed step never leaves the
+    // rest of the transition undone or invites a second --rollback that would reverse it.
+    let aside = set_aside(&previous);
+    if let Err(said) = launch_services(true, &active) {
+        println!("note: {said}; the current Vox.app is in place and opens by path");
+    }
     let now = app_version(&active).unwrap_or_else(|| "unknown".to_owned());
     println!("rolled back: {} -> Vox {now}", active.display());
     println!(
@@ -170,6 +197,16 @@ pub(super) fn rollback(apps: &Path, exe: &Path) -> Result<(), AppError> {
     let detached = super::restart::restart_daemon(&active.join(HELPER), &now);
     shell_setup_from(apps, exe);
     super::restart::say_next(&detached);
+    // Said, not failed: the rollback is committed, and a command that reports failure invites
+    // the same command again, which would roll back once more and reverse it. The repair is
+    // `vox update`, which sets the kept bundle aside under the lock without swapping anything.
+    if let Err(e) = aside {
+        println!(
+            "vox: the rollback is done, but the replaced Vox.app was not set aside: {e}; run \
+             `vox update` to repair (it swaps nothing), and until then open Vox as {}",
+            active.display()
+        );
+    }
     Ok(())
 }
 
@@ -192,7 +229,7 @@ fn swap(a: &Path, b: &Path) -> Result<(), AppError> {
 /// rather than removed, so a swap that fails puts it back, and a publish cut short between the
 /// swap and the rename (which leaves the replaced bundle under the partial name) is finished by
 /// [`recover`] rather than having that bundle cleared as scratch.
-fn publish(apps: &Path, version: &str) -> Result<(), AppError> {
+fn publish(apps: &Path, version: &str) -> Result<Option<AppError>, AppError> {
     let staged = apps.join(PARTIAL);
     let previous = apps.join(PREVIOUS);
     let journal = apps.join(PUBLISHING);
@@ -216,6 +253,10 @@ fn publish(apps: &Path, version: &str) -> Result<(), AppError> {
     // The swap left the replaced bundle under the partial name.
     fs::rename(&staged, &previous).map_err(AppError::Io)?;
     sync_dir(apps)?;
+    let aside = set_aside(&previous);
+    if let Err(said) = launch_services(true, &apps.join(BUNDLE)) {
+        println!("note: {said}; the current Vox.app is in place and opens by path");
+    }
     // The bundle that was previous before this publish goes, unless something still runs from
     // it: then it is retired, and a later transition removes it (see [`sweep`]).
     let older = journal.join(BUNDLE);
@@ -226,7 +267,16 @@ fn publish(apps: &Path, version: &str) -> Result<(), AppError> {
             clear(&older)?;
         }
     }
-    clear(&journal)
+    clear(&journal)?;
+    // The publish is done at this point; a set-aside that failed is the caller's to report
+    // after it has restarted the daemon, never a reason to leave the transition half finished.
+    Ok(aside.err().map(|e| {
+        AppError::Usage(format!(
+            "Vox {version} is in place, but the replaced Vox.app was not set aside: {e}; run \
+             `vox update` again to finish, and until then open Vox as {}",
+            apps.join(BUNDLE).display()
+        ))
+    }))
 }
 
 /// Bundles retired by earlier transitions while code from them was running: `.Vox.app.retired.*`.
@@ -238,7 +288,77 @@ fn retire(apps: &Path, bundle: &Path) -> Result<(), AppError> {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis());
     let name = format!("{RETIRED_PREFIX}{ms}.{}", std::process::id());
-    fs::rename(bundle, apps.join(name)).map_err(AppError::Io)
+    let retired = apps.join(name);
+    fs::rename(bundle, &retired).map_err(AppError::Io)?;
+    set_aside(&retired)
+}
+
+/// Tell LaunchServices about a bundle: `register` adds or refreshes the bundle in place;
+/// otherwise a record made for a bundle now set aside is taken out. The set-aside bundle has no
+/// `Info.plist` ([`set_aside`]), which is what keeps it unlaunchable; this call only clears the
+/// record a running app may still re-register when it quits. Best effort: a refusal is said,
+/// not fatal. Measured 2026-10-19: both bundles registered as `us.vox.app` with the same
+/// CFBundleVersion, and reopening Vox launched the replaced 0.4.4 against the 0.4.6 daemon.
+fn launch_services(register: bool, bundle: &Path) -> Result<(), String> {
+    const LSREGISTER: &str = "/System/Library/Frameworks/CoreServices.framework/Frameworks/\
+                              LaunchServices.framework/Support/lsregister";
+    let flag = if register { "-f" } else { "-u" };
+    let verb = if register { "register" } else { "release" };
+    match Command::new(LSREGISTER)
+        .arg(flag)
+        .arg(bundle)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+    {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(format!(
+            "LaunchServices did not {verb} {} ({status})",
+            bundle.display()
+        )),
+        Err(e) => Err(format!(
+            "LaunchServices was not told to {verb} {}: {e}",
+            bundle.display()
+        )),
+    }
+}
+
+/// A set-aside bundle's `Info.plist`, kept under this name until a rollback restores it. Without
+/// `Contents/Info.plist` the folder is no application bundle: LaunchServices cannot register it,
+/// not even when the app still running from it quits, so opening Vox by its identifier never
+/// lands on it (ADR-014 M-29a). `lsregister -u` is the second measure, for a record already made.
+const KEPT_INFO_PLIST: &str = "Contents/Info.plist.kept";
+const INFO_PLIST: &str = "Contents/Info.plist";
+
+/// Set a replaced or retired bundle aside: its LaunchServices record removed, then no
+/// `Info.plist`. The rename is the guarantee (a folder without `Contents/Info.plist` is no
+/// application, whatever record remains); the record removal is the second measure, said when it
+/// fails and tried again by every later transition that finds the bundle still there (`sweep`,
+/// `recover`, the next publish), until it succeeds.
+fn set_aside(bundle: &Path) -> Result<(), AppError> {
+    if let Err(said) = launch_services(false, bundle) {
+        println!("note: {said}; tried again at the next update or rollback");
+    }
+    let plist = bundle.join(INFO_PLIST);
+    if !plist.is_file() {
+        return Ok(());
+    }
+    fs::rename(&plist, bundle.join(KEPT_INFO_PLIST)).map_err(|e| {
+        AppError::Usage(format!(
+            "{} is still an application: its Info.plist could not be set aside ({e})",
+            bundle.display()
+        ))
+    })
+}
+
+/// Make a set-aside bundle an application again, for the swap that brings it back.
+fn restore(bundle: &Path) -> Result<(), AppError> {
+    let kept = bundle.join(KEPT_INFO_PLIST);
+    if kept.is_file() {
+        fs::rename(&kept, bundle.join(INFO_PLIST)).map_err(AppError::Io)?;
+    }
+    Ok(())
 }
 
 /// Remove the retired bundles nothing runs from any more.
@@ -251,8 +371,13 @@ fn sweep(apps: &Path) -> Result<(), AppError> {
             .file_name()
             .to_string_lossy()
             .starts_with(RETIRED_PREFIX);
-        if retired && !in_use(&entry.path()) {
-            clear(&entry.path())?;
+        if retired {
+            // Set aside first, again if an earlier attempt failed: the record goes and the
+            // bundle is no application even if it then cannot be removed. One still in use stays.
+            set_aside(&entry.path())?;
+            if !in_use(&entry.path()) {
+                clear(&entry.path())?;
+            }
         }
     }
     Ok(())
@@ -303,6 +428,13 @@ fn recover(apps: &Path) -> Result<(), AppError> {
     sweep(apps)?;
     let journal = apps.join(PUBLISHING);
     if fs::symlink_metadata(&journal).is_err() {
+        // No publish was cut short. A previous bundle is set aside again under the lock: one an
+        // earlier release left as an application (before M-29a), or one whose record removal
+        // failed last time.
+        let previous = apps.join(PREVIOUS);
+        if fs::symlink_metadata(&previous).is_ok() {
+            set_aside(&previous)?;
+        }
         return Ok(());
     }
     let staged = apps.join(PARTIAL);
@@ -311,6 +443,7 @@ fn recover(apps: &Path) -> Result<(), AppError> {
     if fs::symlink_metadata(&previous).is_err() && staged.join(HELPER).is_file() {
         if app_version(&apps.join(BUNDLE)).as_deref() == Some(published.trim()) {
             fs::rename(&staged, &previous).map_err(AppError::Io)?;
+            set_aside(&previous)?;
             println!(
                 "vox: an update was cut short after Vox {} was put in place; the Vox.app it \
                  replaced is kept at {} for `vox update --rollback`",
@@ -324,6 +457,11 @@ fn recover(apps: &Path) -> Result<(), AppError> {
     let kept = journal.join(BUNDLE);
     if fs::symlink_metadata(&previous).is_err() && fs::symlink_metadata(&kept).is_ok() {
         fs::rename(&kept, &previous).map_err(AppError::Io)?;
+    }
+    // The previous bundle is set aside again under the lock, before anything else reads `apps`:
+    // one an earlier release left as an application, or one whose record removal failed.
+    if fs::symlink_metadata(&previous).is_ok() {
+        set_aside(&previous)?;
     }
     sync_dir(apps)?;
     clear(&journal)
@@ -462,9 +600,13 @@ fn verify_apple(active: &Path, staged: &Path) -> Result<(), AppError> {
 
 /// The bundle's `CFBundleShortVersionString`.
 fn app_version(bundle: &Path) -> Option<String> {
+    let plist = [INFO_PLIST, KEPT_INFO_PLIST]
+        .iter()
+        .map(|p| bundle.join(p))
+        .find(|p| p.is_file())?;
     let out = Command::new("/usr/libexec/PlistBuddy")
         .args(["-c", "Print :CFBundleShortVersionString"])
-        .arg(bundle.join("Contents/Info.plist"))
+        .arg(plist)
         .env_clear()
         .output()
         .ok()?;

@@ -54,6 +54,16 @@ EOF
 # that version whatever the project's MARKETING_VERSION says, so the tag, vox and Vox.app agree.
 VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
 [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "cannot read the workspace version from Cargo.toml"
+# LaunchServices prefers the bundle with the greater CFBundleVersion when two are registered as
+# `us.vox.app` (the install keeps the replaced bundle for `vox update --rollback`), so the build
+# version grows with the release in Apple's documented form: three period-separated integers,
+# the first greater than zero, compared component by component. It is the release version with
+# the major raised by one (0.4.7 -> 1.4.7, 0.4.10 -> 1.4.10, 1.0.0 -> 2.0.0), and minor and
+# patch stay below 100 so no component outgrows the documented width. The project's own
+# CURRENT_PROJECT_VERSION is 1 and would tie every release (ADR-014 M-29a).
+IFS=. read -r major minor patch <<<"$VERSION"
+(( major < 9999 && minor < 100 && patch < 100 )) || fail "version $VERSION: major must stay below 9999 and minor and patch below 100 for the CFBundleVersion form"
+BUILD="$((major + 1)).$minor.$patch"
 
 # The macOS slice only: a release builds nothing for iOS and nothing for Intel.
 XCFRAMEWORK_SLICES=macos scripts/build-xcframework.sh >&2
@@ -63,6 +73,7 @@ xcodebuild -quiet -project apps/macos/Vox.xcodeproj -scheme Vox -configuration R
   -derivedDataPath "$derived" ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
   MACOSX_DEPLOYMENT_TARGET="$MACOSX_DEPLOYMENT_TARGET" \
   MARKETING_VERSION="$VERSION" \
+  CURRENT_PROJECT_VERSION="$BUILD" \
   CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual build >&2
 
 app="$derived/Build/Products/Release/Vox.app"
