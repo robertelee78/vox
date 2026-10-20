@@ -2371,3 +2371,239 @@ fn enrolled_computers_follow_node_changes_and_retire_removed_authority() {
     );
     eprintln!("[proof] #801/#802 changed roster, personal drive, removal, transfer, recovery and deliberate re-enrollment outcomes passed");
 }
+
+/// How long two paired computers sit idle while their exchanges are counted.
+const PAIRED_IDLE: Duration = Duration::from_secs(60);
+/// Exchanges a computer may run with a peer over [`PAIRED_IDLE`] when nothing changed: the
+/// fallback one (every 60 s) and the one that may straddle the window's start.
+const IDLE_EXCHANGES: u64 = 1;
+/// How far apart two exchanges with a computer that has nothing to say are, at least: the
+/// pairing manager's fallback, which the status dates.
+const FALLBACK_NAMED: Duration = Duration::from_secs(55);
+/// How often the idle minute samples each side's status for a new dated exchange.
+const SAMPLE_EVERY: Duration = Duration::from_secs(5);
+/// CPU time a daemon may spend over [`PAIRED_IDLE`] with nothing to settle.
+const IDLE_CPU: Duration = Duration::from_secs(3);
+
+/// **Two paired computers that are idle exchange nothing** (ADR-038 FX-15; #989): alpha and
+/// beta, two data roots with a daemon each, pair as computers (`vox computer invite`, `pair
+/// --preview`, `approve` on both) and both report `confirmed`. Over [`PAIRED_IDLE`] of nothing
+/// changing, each side's `vox computer status --json` MUST count at most [`IDLE_EXCHANGES`] more
+/// exchanges with the other and name when the last one was, and each daemon's CPU time MUST
+/// grow by at most [`IDLE_CPU`]. Measured before this (2026-10-20, the decider's work Mac): the
+/// pairing manager exchanged the whole signed history with every computer every 2 s and
+/// re-verified it, 47–95% of a core while nothing changed.
+///
+/// Mutant: the need filter in `Management::retry` removed (every computer exchanged every tick)
+/// turns the exchange-count claim red on its own number.
+#[test]
+#[ignore = "a minute of two real vox daemons paired as computers; run in release"]
+fn two_paired_computers_that_are_idle_exchange_nothing() {
+    let a = Account::new();
+    let b = Account::new();
+    let alpha = a.make_node("alpha");
+    let beta = b.make_node("beta");
+    let _ = (alpha, beta);
+    let da = Daemon::start(&a, &["--node", "alpha"], &[]);
+    let db = Daemon::start(&b, &["--node", "beta"], &[]);
+    // Each node is Ready before it is chosen as its computer's personal node.
+    da.expect("node alpha is Ready", Duration::from_secs(90), |l| {
+        l.contains("alpha is Ready")
+    });
+    db.expect("node beta is Ready", Duration::from_secs(90), |l| {
+        l.contains("beta is Ready")
+    });
+    assert!(
+        wait_until(Duration::from_secs(60), || {
+            a.run(&["computer", "status", "--json"], "").0
+                && b.run(&["computer", "status", "--json"], "").0
+        }),
+        "PRODUCT (staging): a daemon never answered `vox computer status`:\n{}\n{}",
+        da.said(),
+        db.said()
+    );
+    computer(&a, &["personal", "alpha"]);
+    computer(&b, &["personal", "beta"]);
+    let offered = computer(&a, &["invite"]);
+    let link = offered["invite_link"]
+        .as_str()
+        .expect("PRODUCT: Add Computer did not show a pairing link")
+        .to_owned();
+    let preview = computer(&b, &["pair", &link, "--preview"]);
+    let operation = preview["pairing"]["operation_id"]
+        .as_str()
+        .expect("PRODUCT: the pairing preview names no operation")
+        .to_owned();
+    computer(&b, &["approve", &operation]);
+    computer(&a, &["approve", &operation]);
+    assert!(
+        wait_until(Duration::from_secs(90), || {
+            computer(&a, &["status"])["state"] == "confirmed"
+                && computer(&b, &["status"])["state"] == "confirmed"
+        }),
+        "PRODUCT: the two computers never both reached `confirmed`: alpha {}, beta {}\n{}\n{}",
+        computer(&a, &["status"])["state"],
+        computer(&b, &["status"])["state"],
+        da.said(),
+        db.said()
+    );
+    // Let the confirmation's own exchanges settle before the idle minute is counted.
+    std::thread::sleep(Duration::from_secs(10));
+    // What `vox computer status --json` shows: the sum of `exchanges` over the computers listed,
+    // the latest `last_exchange_ms`, whether every one is confirmed, and the listing itself for a
+    // red to quote.
+    let exchanges = |acct: &Account| -> (u64, u64, Option<u64>, bool, String) {
+        let status = computer(acct, &["status"]);
+        let apps = status["applications"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let total: u64 = apps
+            .iter()
+            .map(|p| p["exchanges"].as_u64().unwrap_or(0))
+            .sum();
+        // Rounds, completed or not: a failed round is a round (ADR-038 FX-15).
+        let attempts: u64 = apps
+            .iter()
+            .map(|p| {
+                p["exchange_attempts"].as_u64().unwrap_or_else(|| {
+                    panic!("PRODUCT: `vox computer status --json` counts no exchange attempts: {p}")
+                })
+            })
+            .sum();
+        let last = apps
+            .iter()
+            .filter_map(|p| p["last_exchange_ms"].as_u64())
+            .max();
+        let confirmed = apps.iter().all(|p| p["confirmed"] == true);
+        (
+            total,
+            attempts,
+            last,
+            confirmed,
+            status["applications"].to_string(),
+        )
+    };
+    let (ea0, aa0, last_a0, _, shown_a0) = exchanges(&a);
+    let (eb0, ab0, last_b0, _, shown_b0) = exchanges(&b);
+    let cpu0 = (cpu_time(da.child.id()), cpu_time(db.child.id()));
+    // Every SAMPLE_EVERY, each side's dated last exchange: a new one must be at least the
+    // fallback after the one before it, or the round had no need the status names.
+    let mut dated: Vec<Vec<u64>> =
+        vec![last_a0.into_iter().collect(), last_b0.into_iter().collect()];
+    let idle_from = Instant::now();
+    while idle_from.elapsed() < PAIRED_IDLE {
+        std::thread::sleep(SAMPLE_EVERY.min(PAIRED_IDLE.saturating_sub(idle_from.elapsed())));
+        for (i, acct) in [&a, &b].into_iter().enumerate() {
+            if let (_, _, Some(last), _, _) = exchanges(acct) {
+                if dated[i].last() != Some(&last) {
+                    dated[i].push(last);
+                }
+            }
+        }
+    }
+    for (who, times) in [("alpha", &dated[0]), ("beta", &dated[1])] {
+        for pair in times.windows(2) {
+            let gap = pair[1].saturating_sub(pair[0]);
+            assert!(
+                gap >= FALLBACK_NAMED.as_millis() as u64,
+                "PRODUCT: {who} exchanged {} s after its previous exchange with nothing to say \
+                 (ADR-038 FX-15, #989): a quiet computer is exchanged with only every {FALLBACK_NAMED:?}; \
+                 its dated exchanges: {times:?}",
+                gap / 1000
+            );
+        }
+    }
+    let (ea1, aa1, last_a, confirmed_a, shown_a1) = exchanges(&a);
+    let (eb1, ab1, last_b, confirmed_b, shown_b1) = exchanges(&b);
+    let cpu1 = (cpu_time(da.child.id()), cpu_time(db.child.id()));
+    let spent = (cpu1.0.saturating_sub(cpu0.0), cpu1.1.saturating_sub(cpu0.1));
+    // The count is "since the daemon started" and the daemons ran throughout: it never shrinks.
+    let grew = |before: u64, after: u64, who: &str, shown0: &str, shown1: &str| -> u64 {
+        after.checked_sub(before).unwrap_or_else(|| {
+            panic!(
+                "PRODUCT: {who}'s `vox computer status` exchange count went backwards over the \
+                 idle minute, from {before} to {after}; it showed {shown0} before and {shown1} after"
+            )
+        })
+    };
+    let during_a = grew(ea0, ea1, "alpha", &shown_a0, &shown_a1);
+    let during_b = grew(eb0, eb1, "beta", &shown_b0, &shown_b1);
+    // Every round counted from its start, completed or not: the idle minute allows one per
+    // computer, so a failed round and its retry (two) are red even when a later success hides
+    // the failure from the completed count. Starts and completions are not equated: an
+    // exchange in flight at either sample would make them differ for no fault.
+    let tried_a = grew(aa0, aa1, "alpha", &shown_a0, &shown_a1);
+    let tried_b = grew(ab0, ab1, "beta", &shown_b0, &shown_b1);
+    assert!(
+        tried_a <= IDLE_EXCHANGES && tried_b <= IDLE_EXCHANGES,
+        "PRODUCT: idle computers started rounds beyond the fallback (a failed round and its retry are two) (ADR-038 FX-15, #989): \
+         alpha {tried_a} attempt(s) for {during_a} exchange(s), beta {tried_b} for {during_b} over {PAIRED_IDLE:?} (at most {IDLE_EXCHANGES} each)\n{shown_a1}\n{shown_b1}"
+    );
+    println!(
+        "[proof] over {PAIRED_IDLE:?} idle: alpha exchanged {during_a} time(s) with beta (last at {last_a:?}, confirmed {confirmed_a}), beta {during_b} with alpha (last at {last_b:?}, confirmed {confirmed_b}); CPU: alpha's daemon +{:?}, beta's +{:?} (bound {IDLE_CPU:?})",
+        spent.0,
+        spent.1
+    );
+    assert!(
+        confirmed_a && confirmed_b && last_a.is_some() && last_b.is_some(),
+        "PRODUCT: `vox computer status` does not say the peer is confirmed and when it was last exchanged with: alpha {confirmed_a} {last_a:?}, beta {confirmed_b} {last_b:?}"
+    );
+    // The plain `vox computer status` says the same to a person.
+    for (who, acct, n, total, tried) in [
+        ("alpha", &a, during_a, ea1, aa1),
+        ("beta", &b, during_b, eb1, ab1),
+    ] {
+        let (ok, text, err) = acct.run(&["computer", "status"], "");
+        assert!(ok, "PRODUCT: `vox computer status` failed for {who}: {err}");
+        // The numbers a person reads are the JSON's: completed exchanges and attempts.
+        assert!(
+            text.contains(&format!("exchanged {total} time(s) in {tried} attempt(s)"))
+                && text.contains("last "),
+            "PRODUCT: {who}'s `vox computer status` does not say how often it exchanged \
+             ({total} time(s) in {tried} attempt(s)) and when (#989); it said: {text}"
+        );
+        assert!(
+            !text.contains("failed in a row"),
+            "PRODUCT: {who}'s `vox computer status` reports failures on an idle pair ({n} exchanges): {text}"
+        );
+    }
+    assert!(
+        during_a <= IDLE_EXCHANGES && during_b <= IDLE_EXCHANGES,
+        "PRODUCT: idle computers kept exchanging state (ADR-038 FX-15, #989): alpha {} and beta {} exchanges over {PAIRED_IDLE:?} (at most {IDLE_EXCHANGES} each)\n{}\n{}",
+        during_a,
+        during_b,
+        da.said(),
+        db.said()
+    );
+    assert!(
+        spent.0 <= IDLE_CPU && spent.1 <= IDLE_CPU,
+        "PRODUCT: idle paired computers spent CPU (ADR-038 FX-15, #989): alpha's daemon +{:?}, beta's +{:?} over {PAIRED_IDLE:?} (bound {IDLE_CPU:?})",
+        spent.0,
+        spent.1
+    );
+}
+
+/// A process's CPU time so far, as Activity Monitor shows it (`ps -o cputime`).
+fn cpu_time(pid: u32) -> Duration {
+    let out = Command::new("ps")
+        .args(["-o", "cputime=", "-p", &pid.to_string()])
+        .output()
+        .unwrap_or_else(|e| panic!("APPARATUS: ps: {e}"));
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    // `[[HH:]MM:]SS.ss`; anything else is an apparatus fault, never a zero that reads as cheap.
+    let parts: Vec<f64> = text
+        .split(':')
+        .map(|s| {
+            s.parse().unwrap_or_else(|_| {
+                panic!("APPARATUS: `ps -o cputime= -p {pid}` printed {text:?}, not a CPU time")
+            })
+        })
+        .collect();
+    assert!(
+        (1..=3).contains(&parts.len()),
+        "APPARATUS: `ps -o cputime= -p {pid}` printed {text:?}, not a CPU time"
+    );
+    let secs = parts.iter().fold(0.0, |acc, part| acc * 60.0 + part);
+    Duration::from_secs_f64(secs)
+}

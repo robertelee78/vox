@@ -277,8 +277,38 @@ fn show(status: &ComputerStatus, json: bool) -> Result<(), AppError> {
         );
     }
     for application in &status.applications {
+        let exchanged = match application.last_exchange_ms {
+            Some(at) => {
+                let ago = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_millis() as u64)
+                    .saturating_sub(at)
+                    / 1000;
+                format!(
+                    "; exchanged {} time(s) in {} attempt(s) since the daemon started, last {ago} s ago{}",
+                    application.exchanges,
+                    application.exchange_attempts,
+                    if application.exchange_failures > 0 {
+                        format!(", {} failed in a row", application.exchange_failures)
+                    } else {
+                        String::new()
+                    }
+                )
+            }
+            None => format!(
+                "; not exchanged since the daemon started{}",
+                if application.exchange_failures > 0 {
+                    format!(
+                        ", {} attempt(s) failed in a row",
+                        application.exchange_failures
+                    )
+                } else {
+                    String::new()
+                }
+            ),
+        };
         println!(
-            "{}  {}  {}",
+            "{}  {}  {}{exchanged}",
             application.computer.name,
             application.computer.fingerprint,
             if application.confirmed {

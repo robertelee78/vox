@@ -67,6 +67,17 @@ pub struct ComputerApplication {
     pub computer: ComputerIdentity,
     /// This member signed a complete applied receipt for the current frontier.
     pub confirmed: bool,
+    /// When this node last exchanged pairing state with it, Unix milliseconds; `None` before the
+    /// first exchange since the daemon started.
+    pub last_exchange_ms: Option<u64>,
+    /// Exchanges since the daemon started: with nothing to settle, a few per hour, not one every
+    /// two seconds (ADR-038 FX-15; #989).
+    pub exchanges: u64,
+    /// Attempts since the daemon started, completed or not: every round the retry ran toward
+    /// it, so a proof can count rounds per computer (ADR-038 FX-15).
+    pub exchange_attempts: u64,
+    /// Attempts in a row that could not reach it; the retry backs off with each.
+    pub exchange_failures: u32,
 }
 /// A node identity proved by its node and managing computer, with current policy role.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -227,13 +238,152 @@ pub struct Management {
     net: Arc<NodeNet>,
     anchors: BootstrapSet,
     serving: Mutex<std::collections::BTreeSet<u64>>,
-    exchanges: tokio::sync::Mutex<()>,
+    /// Computers an exchange is in flight with: one at a time per computer, never a round that
+    /// waits for every computer, so a slow one delays no other (#989).
+    inflight: Mutex<BTreeMap<Digest32, Flight>>,
     slots: Arc<tokio::sync::Semaphore>,
     problem: Mutex<Option<String>>,
     pending_nodes: Mutex<Vec<String>>,
     transport_cache: Mutex<BTreeMap<(Digest32, Digest32), RegisteredLease>>,
     revoked_transport: Mutex<std::collections::BTreeSet<(Digest32, Digest32, u64)>>,
+    /// Per computer: when this node last exchanged state with it, and how many exchanges in a row
+    /// failed since one succeeded. What `retry` keys its cadence on (ADR-038 FX-15; #989).
+    exchanged: Mutex<BTreeMap<Digest32, Exchanged>>,
 }
+
+/// One computer's exchange record.
+#[derive(Clone, Debug, Default)]
+struct Exchanged {
+    /// The last attempt, succeeded or not.
+    last: Option<std::time::Instant>,
+    /// The last completed exchange, Unix milliseconds, for the status a person reads.
+    last_ms: Option<u64>,
+    /// Exchanges completed since the daemon started.
+    count: u64,
+    /// Attempts since the daemon started, counted when each starts: completed or not, in
+    /// flight or cut.
+    attempts: u64,
+    /// Failures in a row since the last success; the backoff doubles with each.
+    failures: u32,
+    /// This node's state revision at the last attempt, and whether a pairing operation
+    /// involving the computer was open then: a change in either is tried at once, backoff or
+    /// not; the same state waits the backoff out.
+    revision: u64,
+    involved: bool,
+    /// The last failure's words, while failures stand.
+    problem: Option<String>,
+}
+
+/// One exchange attempt's bookkeeping: records its outcome when done, and a failure if the
+/// task is torn down before (a panic), so a computer never stays in flight forever.
+struct Attempt {
+    me: Arc<Management>,
+    peer: Digest32,
+    serial: u64,
+    revision: u64,
+    involved: bool,
+    recorded: bool,
+}
+
+impl Attempt {
+    fn done(mut self, outcome: std::result::Result<(), String>) {
+        self.recorded = true;
+        self.me
+            .record_exchange(self.peer, self.revision, self.involved, outcome);
+        // Dropped here: the reservation is released by its owner, after the record.
+    }
+}
+
+/// One exchange in flight: the state it carries, so a later change can cut it, and how.
+struct Flight {
+    /// This flight, as distinct from any later one with the same computer: an abort handle is
+    /// installed, and a reservation released, only for the flight that owns them.
+    serial: u64,
+    revision: u64,
+    involved: bool,
+    /// Who started it: the retry, or the operator's pairing command.
+    origin: Origin,
+    abort: Option<tokio::task::AbortHandle>,
+    /// Cut because this node changed meanwhile: its end is no failure, and the next tick
+    /// exchanges again. Read and cleared with the flight's removal, under the one lock.
+    superseded: bool,
+}
+
+/// The next flight's serial.
+fn next_flight() -> u64 {
+    static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Who started an exchange in flight.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Origin {
+    Retry,
+    Operator,
+}
+
+/// A computer reserved as in flight by the operator's pairing: released on drop, and the
+/// handshake task cut with it, so a pairing command that is dropped (its request cancelled)
+/// leaves no handshake running unreserved.
+struct Reserved {
+    me: Arc<Management>,
+    peer: Digest32,
+    serial: u64,
+    abort: Option<tokio::task::AbortHandle>,
+}
+
+impl Drop for Reserved {
+    fn drop(&mut self) {
+        if let Some(abort) = &self.abort {
+            abort.abort();
+        }
+        let mut inflight = lock(&self.me.inflight);
+        if inflight
+            .get(&self.peer)
+            .is_some_and(|f| f.serial == self.serial)
+        {
+            inflight.remove(&self.peer);
+        }
+    }
+}
+
+impl Drop for Attempt {
+    fn drop(&mut self) {
+        // Removed and read in one step under the one lock: a mark set after this cannot
+        // linger on a later flight.
+        // Recorded, when it must be, before the flight is released, and both under the one
+        // lock: nothing can reserve, run and record for this computer in between, so an old
+        // result never lands over a newer flight's.
+        let mut inflight = lock(&self.me.inflight);
+        let Some(flight) = inflight.get(&self.peer) else {
+            return;
+        };
+        if flight.serial != self.serial {
+            return;
+        }
+        if !self.recorded && !flight.superseded {
+            self.me.record_exchange(
+                self.peer,
+                self.revision,
+                self.involved,
+                Err("the exchange task failed".to_owned()),
+            );
+        }
+        inflight.remove(&self.peer);
+    }
+}
+
+/// Without a need, a computer whose receipt covers this node's current state is exchanged with
+/// this often, so a lost message never leaves two computers apart for long.
+const EXCHANGE_FALLBACK: Duration = Duration::from_secs(60);
+/// A computer that could not be reached is tried again after this, doubling per failure.
+const EXCHANGE_BACKOFF: Duration = Duration::from_secs(2);
+/// The longest a failing computer waits between attempts.
+const EXCHANGE_BACKOFF_MAX: Duration = Duration::from_secs(120);
+/// An exchange that has not finished by then counts as failed and is tried again after its
+/// backoff: a computer that hangs must not stay "in flight" forever. Generous, because a
+/// slow but valid exchange of a long history must complete; no other computer waits on it.
+const EXCHANGE_WITHIN: Duration = Duration::from_secs(600);
 impl Management {
     /// The account's explicit host:port lookup uses its existing socket, but no management
     /// identity or authority. The returned fingerprint is proved; lookup persists no anchor source.
@@ -359,12 +509,13 @@ impl Management {
             net,
             anchors,
             serving: Mutex::new(Default::default()),
-            exchanges: tokio::sync::Mutex::new(()),
+            inflight: Mutex::new(BTreeMap::new()),
             slots: Arc::new(tokio::sync::Semaphore::new(8)),
             problem: Mutex::new(None),
             pending_nodes: Mutex::new(Vec::new()),
             transport_cache: Mutex::new(BTreeMap::new()),
             revoked_transport: Mutex::new(Default::default()),
+            exchanged: Mutex::new(BTreeMap::new()),
         });
         let weak = Arc::downgrade(&me);
         tokio::spawn(async move {
@@ -637,9 +788,121 @@ impl Management {
                 ));
             }
         }
-        let _exchange = self.exchanges.lock().await;
-        self.pair(&link, url).await?;
-        *lock(&self.problem) = None;
+        // The pairing handshake with the link's computer is this computer's exchange with it
+        // for now: the retry leaves it alone meanwhile, and the reservation ends with the
+        // handshake however it ends (a drop guard), so the computer never stays in flight.
+        let target = link.target;
+        // The state this handshake carries, read before the reservation: the state lock is
+        // never taken under the in-flight lock (the retry takes them the other way round).
+        let revision = lock(&self.computer.state).revision;
+        // The operator's action comes first: a retry exchange in flight with that computer
+        // is cut (as no failure) and its reservation waited for, briefly; another operator
+        // pairing in flight is reported.
+        let waited = std::time::Instant::now();
+        let serial = next_flight();
+        loop {
+            {
+                let mut inflight = lock(&self.inflight);
+                match inflight.get_mut(&target) {
+                    None => {
+                        inflight.insert(
+                            target,
+                            Flight {
+                                serial,
+                                revision,
+                                involved: true,
+                                origin: Origin::Operator,
+                                abort: None,
+                                superseded: false,
+                            },
+                        );
+                        let mut exchanged = lock(&self.exchanged);
+                        let record = exchanged.entry(target).or_default();
+                        record.attempts = record.attempts.saturating_add(1);
+                        break;
+                    }
+                    Some(flight) if flight.origin == Origin::Operator && !flight.superseded => {
+                        return Err(Error::Profile(
+                            "a computer pairing with that computer is in progress; try again \
+                             in a moment",
+                        ));
+                    }
+                    Some(flight) => {
+                        if !flight.superseded {
+                            if let Some(abort) = &flight.abort {
+                                flight.superseded = true;
+                                abort.abort();
+                            }
+                        }
+                    }
+                }
+            }
+            if waited.elapsed() > Duration::from_secs(10) {
+                return Err(Error::Profile(
+                    "an exchange with that computer did not yield within 10 s; try again",
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let mut reserved = Reserved {
+            me: Arc::clone(self),
+            peer: target,
+            serial,
+            abort: None,
+        };
+        // Bounded like any exchange, by the same generous bound: a slow but valid handshake
+        // of a long history completes, and a hung one never holds the reservation for good.
+        // Run as a task the retry can cut like any exchange: should this node change
+        // meanwhile, the handshake carries stale state, the retry supersedes it, and the
+        // operator is told to try again (the next tick exchanges the current state).
+        let me = Arc::clone(self);
+        let (link_owned, url_owned) = (link, url.to_owned());
+        let task = tokio::spawn(async move {
+            tokio::time::timeout(EXCHANGE_WITHIN, me.pair(&link_owned, &url_owned)).await
+        });
+        reserved.abort = Some(task.abort_handle());
+        if let Some(flight) = lock(&self.inflight).get_mut(&target) {
+            if flight.serial == serial {
+                flight.abort = Some(task.abort_handle());
+            }
+        }
+        let (paired, superseded) = match task.await {
+            Ok(Ok(paired)) => (paired, false),
+            Ok(Err(_)) => (
+                Err(Error::Profile(
+                    "the computer pairing did not finish within ten minutes; try again",
+                )),
+                false,
+            ),
+            // Cut by the retry because this node changed: no failure of anyone's.
+            Err(e) if e.is_cancelled() => (
+                Err(Error::Profile(
+                    "this computer changed while the pairing ran, so the pairing was \
+                     superseded; try again",
+                )),
+                true,
+            ),
+            Err(_) => (
+                Err(Error::Profile(
+                    "the computer pairing task failed; try again",
+                )),
+                false,
+            ),
+        };
+        // Recorded while still reserved, with the state it carried, so the record never
+        // touches a reservation the retry may have taken meanwhile; the guard releases this
+        // one after. A superseded handshake is recorded as nothing.
+        if !superseded {
+            let outcome = match &paired {
+                // The handshake exchanged state: counted and dated like any exchange, and
+                // the status's problem follows from every computer's record.
+                Ok(()) => Ok(()),
+                Err(e) => Err(e.to_string()),
+            };
+            self.record_exchange(target, revision, true, outcome);
+        }
+        drop(reserved);
+        paired?;
         self.status()
     }
     /// Record this operator's signature of exactly the previewed operation; retry is idempotent.
@@ -874,15 +1137,21 @@ impl Management {
         } else {
             BTreeMap::new()
         };
+        let exchanged = lock(&self.exchanged).clone();
         let applications: Vec<_> = descriptions
             .iter()
             .map(|(id, d)| {
+                let record = exchanged.get(id).cloned().unwrap_or_default();
                 Ok(ComputerApplication {
                     computer: ComputerIdentity::of(d)?,
                     confirmed: !storage_failed
                         && s.receipts
                             .get(id)
                             .is_some_and(|r| valid_receipt(&s, id, r).unwrap_or(false)),
+                    last_exchange_ms: record.last_ms,
+                    exchanges: record.count,
+                    exchange_attempts: record.attempts,
+                    exchange_failures: record.failures,
                 })
             })
             .collect::<Result<_>>()?;
@@ -1525,10 +1794,7 @@ impl Management {
         Ok(())
     }
     async fn retry(self: &Arc<Self>) -> Result<()> {
-        let Ok(_exchange) = self.exchanges.try_lock() else {
-            return Ok(());
-        };
-        let peers = {
+        let (peers, attempted, revision) = {
             let s = lock(&self.computer.state);
             let local = self.computer.signer.fingerprint();
             let mut peers: std::collections::BTreeSet<_> = s
@@ -1539,7 +1805,137 @@ impl Management {
             if let Some(g) = &s.pending {
                 peers.insert(g.computers[1 - side(g, &local)?].fingerprint()?);
             }
-            peers
+            // A computer needs an exchange when it has not acknowledged this node's current
+            // state (it holds no valid receipt for this node's incarnation, rosters and heads;
+            // each side counts its own revision, so the numbers are never compared), when a
+            // pending operation involves it, or when the fallback interval passed; a computer
+            // that could not be reached waits out its backoff. Measured before this (2026-10-20): every computer
+            // was exchanged with every 2 s, the whole signed history sent and re-verified each
+            // time, 47–95% of a core on the decider's daemon while nothing changed.
+            // A pairing stays recorded as `pending` after it completes (its intent is part of
+            // every exchange), so the other computer counts as involved only while the
+            // operation is open: an approval is missing, or it has not activated here yet.
+            let involved: Option<Digest32> = s
+                .pending
+                .as_ref()
+                .filter(|g| {
+                    g.approvals.iter().any(Option::is_none)
+                        || (g.group.is_none() && s.genesis.is_none())
+                        || (g.group.is_some() && !enrolled(&s, g))
+                })
+                .and_then(|g| {
+                    side(g, &local)
+                        .ok()
+                        .map(|i| g.computers[1 - i].fingerprint().ok())
+                })
+                .flatten();
+            let now = std::time::Instant::now();
+            let revision = s.revision;
+            let mut exchanged = lock(&self.exchanged);
+            // A computer no longer paired (removed, or its pairing cancelled) keeps its
+            // counts, which are "since the daemon started" and survive its re-enrollment, but
+            // not its failure: that must not stand in the status for good.
+            let known: std::collections::BTreeSet<Digest32> = peers.iter().copied().collect();
+            let mut changed = false;
+            for (peer, record) in exchanged.iter_mut() {
+                if !known.contains(peer) && (record.failures > 0 || record.problem.is_some()) {
+                    record.failures = 0;
+                    record.problem = None;
+                    changed = true;
+                }
+            }
+            if changed {
+                *lock(&self.problem) = exchanged
+                    .values()
+                    .filter(|r| r.failures > 0)
+                    .find_map(|r| r.problem.clone());
+            }
+            peers.retain(|peer| {
+                let record = exchanged.get(peer).cloned().unwrap_or_default();
+                if let Some(last) = record.last {
+                    if record.failures > 0 {
+                        // 2 s after the first failure, doubling, at most EXCHANGE_BACKOFF_MAX;
+                        // unless this node changed since that attempt, which is tried at once.
+                        let wait = EXCHANGE_BACKOFF
+                            .saturating_mul(1u32 << (record.failures - 1).min(6))
+                            .min(EXCHANGE_BACKOFF_MAX);
+                        let unchanged = record.revision == revision
+                            && record.involved == (involved == Some(*peer));
+                        if unchanged && now.duration_since(last) < wait {
+                            return false;
+                        }
+                    } else {
+                        let acknowledged = s
+                            .receipts
+                            .get(peer)
+                            .is_some_and(|r| valid_receipt(&s, peer, r).unwrap_or(false));
+                        if acknowledged
+                            && involved != Some(*peer)
+                            && now.duration_since(last) < EXCHANGE_FALLBACK
+                        {
+                            return false;
+                        }
+                    }
+                }
+                true
+            });
+            drop(exchanged);
+            // Reserved under one lock, after every other filter: a computer already in
+            // flight (with the retry or with the operator's pairing) is left alone, and no
+            // two exchanges with one computer ever overlap. An exchange in flight that
+            // carries state this node has since changed is cut: its payload is stale, its end
+            // counts as no failure, and the next tick exchanges the current state.
+            {
+                let mut inflight = lock(&self.inflight);
+                for (peer, flight) in inflight.iter_mut() {
+                    // Stale: this node's state moved on, or (a retry flight) whether the
+                    // computer is involved in a pending operation changed.
+                    let stale = flight.revision != revision
+                        || (flight.origin == Origin::Retry
+                            && flight.involved != (involved == Some(*peer)));
+                    if stale && !flight.superseded {
+                        if let Some(abort) = &flight.abort {
+                            flight.superseded = true;
+                            abort.abort();
+                        }
+                    }
+                }
+                peers.retain(|peer| {
+                    if inflight.contains_key(peer) {
+                        return false;
+                    }
+                    inflight.insert(
+                        *peer,
+                        Flight {
+                            serial: next_flight(),
+                            revision,
+                            involved: involved == Some(*peer),
+                            origin: Origin::Retry,
+                            abort: None,
+                            superseded: false,
+                        },
+                    );
+                    // A round counts from its start: one in flight, or cut, is a round too.
+                    let mut exchanged = lock(&self.exchanged);
+                    let record = exchanged.entry(*peer).or_default();
+                    record.attempts = record.attempts.saturating_add(1);
+                    true
+                });
+            }
+            let attempted: Vec<(Digest32, bool, u64)> = {
+                let inflight = lock(&self.inflight);
+                peers
+                    .iter()
+                    .map(|p| {
+                        (
+                            *p,
+                            involved == Some(*p),
+                            inflight.get(p).map_or(0, |f| f.serial),
+                        )
+                    })
+                    .collect()
+            };
+            let peers = peers
                 .into_iter()
                 .map(|peer| {
                     let endpoints = s
@@ -1560,23 +1956,84 @@ impl Management {
                         });
                     (peer, endpoints, url)
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            (peers, attempted, revision)
         };
-        let mut tasks = tokio::task::JoinSet::new();
         for (peer, endpoints, url) in peers {
             let me = Arc::clone(self);
-            tasks.spawn(async move { me.sync_peer(peer, endpoints, url).await });
-        }
-        let mut problem = None;
-        while let Some(result) = tasks.join_next().await {
-            match result {
-                Ok(Err(e)) => problem = Some(e.to_string()),
-                Err(e) => problem = Some(e.to_string()),
-                _ => {}
+            let (involved, serial) = attempted
+                .iter()
+                .find(|(p, _, _)| *p == peer)
+                .map_or((false, 0), |(_, involved, serial)| (*involved, *serial));
+            // The guard exists before the task does and travels with it: a task cut before
+            // its first poll drops the guard all the same, so no reservation ever leaks.
+            let guard = Attempt {
+                me: Arc::clone(self),
+                peer,
+                serial,
+                revision,
+                involved,
+                recorded: false,
+            };
+            let task = tokio::spawn(async move {
+                // Each computer's outcome is recorded by its own task the moment it ends,
+                // dated then: a slow computer never delays another's record, status or next
+                // attempt, and one that hangs counts as failed after EXCHANGE_WITHIN.
+                let outcome =
+                    match tokio::time::timeout(EXCHANGE_WITHIN, me.sync_peer(peer, endpoints, url))
+                        .await
+                    {
+                        Ok(Ok(())) => Ok(()),
+                        Ok(Err(e)) => Err(e.to_string()),
+                        Err(_) => Err(format!(
+                            "the exchange did not finish within {EXCHANGE_WITHIN:?}"
+                        )),
+                    };
+                guard.done(outcome);
+            });
+            // Installed on this flight only: a flight that ended and was replaced meanwhile
+            // never receives a handle to a task that is not its own.
+            if let Some(flight) = lock(&self.inflight).get_mut(&peer) {
+                if flight.serial == serial {
+                    flight.abort = Some(task.abort_handle());
+                }
             }
         }
-        *lock(&self.problem) = problem;
         Ok(())
+    }
+    /// Record one attempt's outcome for `peer`, now: `last` paces the next attempt whether it
+    /// succeeded or not; `last_ms`, what a person reads as the last exchange, is set only by a
+    /// completed one. The status's problem is then the words of a computer still failing, or
+    /// none: it never clears while a failure stands, and never stands once every computer is
+    /// exchanged with again.
+    fn record_exchange(
+        &self,
+        peer: Digest32,
+        revision: u64,
+        involved: bool,
+        outcome: std::result::Result<(), String>,
+    ) {
+        let mut exchanged = lock(&self.exchanged);
+        let record = exchanged.entry(peer).or_default();
+        record.last = Some(std::time::Instant::now());
+        record.revision = revision;
+        record.involved = involved;
+        match outcome {
+            Ok(()) => {
+                record.last_ms = Some(now());
+                record.count = record.count.saturating_add(1);
+                record.failures = 0;
+                record.problem = None;
+            }
+            Err(text) => {
+                record.failures = record.failures.saturating_add(1);
+                record.problem = Some(text);
+            }
+        }
+        *lock(&self.problem) = exchanged
+            .values()
+            .filter(|r| r.failures > 0)
+            .find_map(|r| r.problem.clone());
     }
     async fn sync_peer(
         self: &Arc<Self>,
