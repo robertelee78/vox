@@ -714,8 +714,17 @@ impl Management {
                 ));
             }
         }
-        let _exchange = self.exchanges.lock().await;
-        self.pair(&link, url).await?;
+        // The pairing handshake with the link's computer is this computer's exchange with it
+        // for now: the retry leaves it alone meanwhile.
+        let target = link.target;
+        if !lock(&self.inflight).insert(target) {
+            return Err(Error::Profile(
+                "an exchange with that computer is in progress; try again in a moment",
+            ));
+        }
+        let paired = self.pair(&link, url).await;
+        lock(&self.inflight).remove(&target);
+        paired?;
         *lock(&self.problem) = None;
         self.status()
     }
