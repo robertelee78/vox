@@ -775,6 +775,319 @@ fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
     );
 }
 
+/// How long one run of the shipped hook (`vox agent hook`) has to finish, news printed, the way a
+/// harness waits for it. Inside, the hook gives the daemon's control socket 500 ms for its
+/// greeting (`HOOK_WITHIN`, `daemon_client.rs`) and says "the vox daemon here did not answer
+/// promptly" past that; this proof reads that sentence, never the constant.
+const HOOK_RUN_WITHIN: Duration = Duration::from_secs(2);
+/// The hook's own words for a daemon that did not answer within its wait.
+const HOOK_UNANSWERED: &str = "did not answer promptly";
+/// Hook runs during the load, a quarter second apart: about a minute of a harness at work, the
+/// time a late joiner's live window and the pages below it take to arrive (ADR-037 R1).
+const HOOK_RUNS: usize = 200;
+
+/// **The daemon answers the harness hook while it syncs** (ADR-038 FX-17; #981): alice holds a
+/// room with a [`BACKLOG`] of posts; bob joins, asks for the pages below his window as a reader
+/// paging back does (`--history older`, ADR-037 R1: history on demand), and his daemon fetches
+/// them while alice keeps posting; during that fetch bob's harness hook (`vox agent hook`, the
+/// shipped binary, fed a Claude Code `UserPromptSubmit` event) runs [`HOOK_RUNS`] times. Every run MUST finish within
+/// [`HOOK_RUN_WITHIN`] and MUST NOT say the daemon did not answer promptly; the fetch MUST be
+/// real (bob's held entries grow across the runs) and alice's posts MUST all be accepted, so the
+/// load is the product's, not a refusal's. Measured 2026-10-20 on the decider's work Mac
+/// (v0.4.7, four nodes working): `vox status` answered in 0.5 s and the hook said "did not
+/// answer promptly" twice in one session.
+///
+/// Mutant: the control acceptor made to wait on the actor's turn (a sleep past 500 ms in the
+/// hook's greeting path) turns the first assertion red on the hook's own sentence.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "a timing bound a person feels; two real vox daemons; optional, run it in release"]
+fn a_daemon_answers_the_hook_while_syncing() {
+    watchdog::arm_for_setup(1, 8);
+    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("APPARATUS: no temp dir: {e}"));
+    let root = tmp.path();
+    let alice = root.join("alice");
+    let bob = root.join("bob");
+    let work = root.join("work");
+    for d in [&alice, &bob, &work] {
+        std::fs::create_dir_all(d.join("cfg"))
+            .unwrap_or_else(|e| panic!("APPARATUS: could not create {}: {e}", d.display()));
+    }
+    let mut fps = Vec::new();
+    for dir in [&alice, &bob] {
+        let (ok, out, err) = vox(dir, &["id"], None);
+        assert!(ok, "PRODUCT: `vox id` failed: {err}");
+        fps.push(out.trim().to_owned());
+    }
+    for (dir, fp, name) in [(&alice, &fps[1], "bob"), (&bob, &fps[0], "alice")] {
+        let (ok, _, err) = vox(dir, &["trust", "add", fp, "--name", name], None);
+        assert!(ok, "PRODUCT: `vox trust add` of {name} failed: {err}");
+    }
+    let _alice_daemon = daemon(&alice, "alice");
+    attached(&alice, "alice");
+    let (ok, _, err) = vox(
+        &alice,
+        &["room", "create", "--passphrase-file", "-", "--name", "busy"],
+        Some(&format!("{ROOMPASS}\n")),
+    );
+    assert!(
+        ok,
+        "PRODUCT: `vox room create` failed: {err}\nalice's daemon said: {}",
+        said(&alice, "alice")
+    );
+    let listed = attached(&alice, "alice");
+    let room = listed
+        .split_whitespace()
+        .find(|w| w.len() >= 8 && w.chars().all(|c| c.is_ascii_alphanumeric()))
+        .unwrap_or_else(|| panic!("PRODUCT: `vox room list` shows no room id: {listed}"))
+        .to_owned();
+    // ---- the backlog bob will have to fetch ---------------------------------------------------
+    for i in 1..=BACKLOG {
+        let (ok, out, err) = vox(&alice, &["room", "post", &room, &format!("post {i}")], None);
+        assert!(ok, "PRODUCT: alice's post {i} was refused: {out}{err}");
+    }
+    let (ok, link, err) = vox(&alice, &["room", "link", &room], None);
+    assert!(ok, "PRODUCT: `vox room link` failed: {err}");
+    let link = link.trim().to_owned();
+    let _bob_daemon = daemon(&bob, "bob");
+    attached(&bob, "bob");
+    let (ok, _, err) = vox(
+        &bob,
+        &["room", "join", "--passphrase-file", "-", &link],
+        Some(&format!("{ROOMPASS}\n")),
+    );
+    assert!(ok, "PRODUCT: bob's `vox room join` was refused: {err}");
+    let held_at_join = held(&bob, &room, PAGE).order.len();
+    // Bob pages back through the backlog while the hook runs: each page below his oldest row is
+    // asked for on demand, as the TUI or a reader does, so his daemon's lane is fetching.
+    let paging = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let pager = {
+        let paging = paging.clone();
+        let bob = bob.clone();
+        let room = room.clone();
+        std::thread::spawn(move || {
+            let mut asked = 0usize;
+            while paging.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Some(oldest) = held(&bob, &room, PAGE).oldest {
+                    let _ = vox(
+                        &bob,
+                        &[
+                            "room",
+                            "read",
+                            &room,
+                            "--history",
+                            "older",
+                            "--before",
+                            &oldest,
+                        ],
+                        None,
+                    );
+                    asked += 1;
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            asked
+        })
+    };
+
+    // ---- alice keeps posting while bob fetches, and bob's hook runs as a harness runs it --------
+    let burst_room = room.clone();
+    let burst_dir = alice.clone();
+    let burst = std::thread::spawn(move || {
+        let mut refused = Vec::new();
+        for i in 1..=40 {
+            let (ok, out, err) = vox(
+                &burst_dir,
+                &["room", "post", &burst_room, &format!("live {i}")],
+                None,
+            );
+            if !ok {
+                refused.push(format!("live {i}: {out}{err}"));
+            }
+        }
+        refused
+    });
+    let event = serde_json::json!({
+        "session_id": "hook-under-load",
+        "transcript_path": work.join("transcript.jsonl").display().to_string(),
+        "cwd": work.display().to_string(),
+        "permission_mode": "default",
+        "hook_event_name": "UserPromptSubmit",
+        "prompt": "status?",
+    })
+    .to_string();
+    let mut runs: Vec<(Duration, bool, String)> = Vec::new();
+    let mut held_during = Vec::new();
+    for _ in 0..HOOK_RUNS {
+        let asked = Instant::now();
+        let mut child = Command::new(VOX)
+            // Bob's data root holds the node `vox id` made, the default one; the hook must name
+            // it, or it answers with setup words without ever asking the daemon.
+            .args(["agent", "hook", "--node", "default", "--room", &room])
+            .env("VOX_DATA_DIR", &bob)
+            .env("VOX_CONFIG_DIR", bob.join("cfg"))
+            .env("CLAUDE_CODE_ENTRYPOINT", "cli")
+            .env_remove("VOX_ROOM")
+            .env_remove("VOX_NODE")
+            .current_dir(&work)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|e| panic!("APPARATUS: cannot start `vox agent hook`: {e}"));
+        if let Some(mut pipe) = child.stdin.take() {
+            let _ = pipe.write_all(event.as_bytes());
+        }
+        let out = child
+            .wait_with_output()
+            .unwrap_or_else(|e| panic!("APPARATUS: `vox agent hook`: {e}"));
+        let took = asked.elapsed();
+        let said = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        runs.push((took, out.status.success(), said));
+        if runs.len().is_multiple_of(20) {
+            held_during.push(held(&bob, &room, PAGE).order.len());
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    paging.store(false, std::sync::atomic::Ordering::Relaxed);
+    let pages_asked = pager
+        .join()
+        .unwrap_or_else(|_| panic!("APPARATUS: the paging thread panicked"));
+    let refused = burst
+        .join()
+        .unwrap_or_else(|_| panic!("APPARATUS: the burst thread panicked"));
+    let held_after = held(&bob, &room, PAGE).order.len();
+    let slowest = runs.iter().map(|(d, _, _)| *d).max().unwrap_or_default();
+    // The hook must have talked to the daemon: its output names the room or its news, never
+    // nothing. Without this the timing claim could pass on a hook that never asked.
+    let first_said = runs
+        .first()
+        .map(|(_, _, said)| said.trim().chars().take(240).collect::<String>())
+        .unwrap_or_default();
+    let last_said = runs
+        .last()
+        .map(|(_, _, said)| said.trim().chars().take(240).collect::<String>())
+        .unwrap_or_default();
+    println!("[proof] the first hook run said: {first_said:?}; the last: {last_said:?}");
+    assert!(
+        runs.iter().all(|(_, _, said)| !said.trim().is_empty()),
+        "APPARATUS: a hook run printed nothing, so it cannot have asked the daemon: {:?}",
+        runs.iter()
+            .map(|(_, _, s)| s.trim().chars().take(120).collect::<String>())
+            .collect::<Vec<_>>()
+    );
+    let setup_words = ["has no Vox node", "is Locked", "vox setup", "not attached"];
+    let staged_wrong: Vec<&String> = runs
+        .iter()
+        .map(|(_, _, said)| said)
+        .filter(|said| setup_words.iter().any(|w| said.contains(w)))
+        .collect();
+    assert!(
+        staged_wrong.is_empty(),
+        "APPARATUS: {} hook run(s) answered with setup words instead of asking bob's daemon, \
+         so this proof measured nothing; the first: {:?}",
+        staged_wrong.len(),
+        staged_wrong[0].trim().chars().take(240).collect::<String>()
+    );
+    assert!(
+        runs.iter().any(|(_, _, said)| said.contains(&format!("In room busy ({room})"))),
+        "APPARATUS: no hook run named the room's news, so the hook never read bob's room; \
+         the first said {first_said:?}"
+    );
+    let unanswered: Vec<usize> = runs
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, _, said))| said.contains(HOOK_UNANSWERED))
+        .map(|(i, _)| i)
+        .collect();
+    println!(
+        "[proof] bob held {held_at_join} rows at his join, {held_after} after {HOOK_RUNS} hook runs \
+         ({} during them, {pages_asked} pages asked for); alice's 40 live posts: {} refused; hook \
+         runs: slowest {slowest:?} (bound {HOOK_RUN_WITHIN:?}), {} said \"{HOOK_UNANSWERED}\"",
+        held_during
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+        refused.len(),
+        unanswered.len()
+    );
+    if held_after <= held_at_join + 32 {
+        // Not the claim under test, but the red must say whose fault: what each daemon's lanes
+        // did meanwhile, and whether bob's room is still preparing.
+        let (_, bob_rooms, _) = vox(&bob, &["room", "list"], None);
+        let status_entries = held_entries(&bob);
+        let (_, bob_status, _) = vox(&bob, &["status", "--json"], None);
+        let (_, alice_status, _) = vox(&alice, &["status", "--json"], None);
+        panic!(
+            "PRODUCT: a late joiner's fetch did not run while the harness hook ran: bob held \
+             {held_at_join} rows at his join and {held_after} after {HOOK_RUNS} hook runs over \
+             {:?}, with {pages_asked} pages asked for and alice's 40 live posts accepted (needs 32 \
+             more rows for the fetch to count as under way); `vox status` counts {status_entries} \
+             entries\nbob's rooms: {}\nbob's lanes: {}\n\
+             alice's lanes: {}\nbob's daemon said: {}\nalice's daemon said: {}",
+            runs.iter().map(|(d, _, _)| *d).sum::<Duration>(),
+            bob_rooms.trim(),
+            lanes_of(&bob_status),
+            lanes_of(&alice_status),
+            said(&bob, "bob"),
+            said(&alice, "alice")
+        );
+    }
+    assert!(
+        refused.is_empty(),
+        "PRODUCT: alice's live posts were refused while bob fetched: {refused:?}\nalice's daemon \
+         said: {}",
+        said(&alice, "alice")
+    );
+    assert!(
+        unanswered.is_empty(),
+        "PRODUCT: the harness hook said the daemon \"{HOOK_UNANSWERED}\" while it synced (ADR-038 \
+         FX-17), runs {unanswered:?} of {HOOK_RUNS}: {}\nbob's daemon said: {}",
+        runs[unanswered[0]].2.trim(),
+        said(&bob, "bob")
+    );
+    let failed: Vec<String> = runs
+        .iter()
+        .filter(|(_, ok, _)| !ok)
+        .map(|(_, _, said)| said.trim().to_owned())
+        .collect();
+    assert!(
+        failed.is_empty(),
+        "PRODUCT: the harness hook exited non-zero while the daemon synced: {failed:?}"
+    );
+    assert!(
+        slowest <= HOOK_RUN_WITHIN,
+        "PRODUCT: a harness hook run took {slowest:?} while the daemon synced, over \
+         {HOOK_RUN_WITHIN:?}; every run: {:?}\nbob's daemon said: {}",
+        runs.iter().map(|(d, _, _)| *d).collect::<Vec<_>>(),
+        said(&bob, "bob")
+    );
+}
+
+/// How many rows of the room a profile holds, from `vox status --json` (0 when unreadable).
+fn held_entries(dir: &Path) -> u64 {
+    let (ok, out, _) = vox(dir, &["status", "--json"], None);
+    if !ok {
+        return 0;
+    }
+    serde_json::from_str::<serde_json::Value>(&out)
+        .ok()
+        .and_then(|v| {
+            v["rooms"].as_array().map(|rooms| {
+                rooms
+                    .iter()
+                    .map(|r| r["entries"].as_u64().unwrap_or(0))
+                    .sum()
+            })
+        })
+        .unwrap_or(0)
+}
+
 /// Each lane of a `vox status --json`: peer, completed, partial, failed, running and its last failure.
 fn lanes_of(status: &str) -> String {
     serde_json::from_str::<serde_json::Value>(status)
