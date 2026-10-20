@@ -889,18 +889,31 @@ fn a_room_that_cannot_finish_preparing_says_why_and_costs_nothing() {
     let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("APPARATUS: no temp dir: {e}"));
     let root = tmp.path();
     let alice = root.join("alice");
-    std::fs::create_dir_all(alice.join("cfg"))
-        .unwrap_or_else(|e| panic!("APPARATUS: could not create {}: {e}", alice.display()));
+    let bob = root.join("bob");
+    for d in [&alice, &bob] {
+        std::fs::create_dir_all(d.join("cfg"))
+            .unwrap_or_else(|e| panic!("APPARATUS: could not create {}: {e}", d.display()));
+    }
     let hold = root.join("fold-hold");
     let hold_path = hold
         .to_str()
         .expect("APPARATUS: a UTF-8 temp path")
         .to_owned();
     let knob = [("VOX_TEST_FOLD_HOLD_FILE", hold_path.as_str())];
-    let (ok, _, err) = vox(&alice, &["id"], None);
-    assert!(ok, "PRODUCT: `vox id` failed: {err}");
+    let mut fps = Vec::new();
+    for dir in [&alice, &bob] {
+        let (ok, out, err) = vox(dir, &["id"], None);
+        assert!(ok, "PRODUCT: `vox id` failed: {err}");
+        fps.push(out.trim().to_owned());
+    }
+    for (dir, fp, name) in [(&alice, &fps[1], "bob"), (&bob, &fps[0], "alice")] {
+        let (ok, _, err) = vox(dir, &["trust", "add", fp, "--name", name], None);
+        assert!(ok, "PRODUCT: `vox trust add` of {name} failed: {err}");
+    }
 
-    // ---- staging: a room with three folded rows, then three held ones ------------------------
+    // ---- staging: alice's room with three rows; bob joins; three of bob's rows arrive while
+    // alice's fold is held, so they are accepted but not folded (a node's own posts fold as
+    // they are accepted, so only a peer's rows can leave governance unsettled) ---------------
     let first = daemon_env(&alice, "alice", &knob);
     attached(&alice, "alice");
     let (ok, _, err) = vox(
@@ -1165,14 +1178,34 @@ fn held_entries(dir: &Path) -> u64 {
         let (ok, out, err) = vox(&alice, &["room", "post", &room, &format!("row {i}")], None);
         assert!(ok, "PRODUCT: alice's post {i} was refused: {out}{err}");
     }
+    let (ok, link, err) = vox(&alice, &["room", "link", &room], None);
+    assert!(ok, "PRODUCT: `vox room link` failed: {err}");
+    let link = link.trim().to_owned();
+    let _bob_daemon = daemon(&bob, "bob");
+    attached(&bob, "bob");
+    let (ok, _, err) = vox(
+        &bob,
+        &["room", "join", "--passphrase-file", "-", &link],
+        Some(&format!("{ROOMPASS}\n")),
+    );
+    assert!(ok, "PRODUCT: bob's `vox room join` was refused: {err}");
+    // Bob reads alice's three rows: the two daemons talk.
+    let joined = Instant::now();
+    while !reads(&bob, &room, "row 3") {
+        assert!(
+            joined.elapsed() < Duration::from_secs(90),
+            "PRODUCT (staging): bob did not read alice's rows in 90 s\nbob's daemon said: {}",
+            said(&bob, "bob")
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
     std::fs::write(&hold, b"").expect("APPARATUS: write the hold file");
     for i in 4..=6 {
-        let (ok, out, err) = vox(&alice, &["room", "post", &room, &format!("row {i}")], None);
-        assert!(
-            ok,
-            "PRODUCT: alice's post {i} was refused under the fold hold: {out}{err}"
-        );
+        let (ok, out, err) = vox(&bob, &["room", "post", &room, &format!("row {i}")], None);
+        assert!(ok, "PRODUCT: bob's post {i} was refused: {out}{err}");
     }
+    // Give alice's daemon time to receive them (it cannot fold them while held).
+    std::thread::sleep(Duration::from_secs(5));
     first.stop();
 
     // ---- the room cannot finish preparing: the daemon says what it waits for ----------------
