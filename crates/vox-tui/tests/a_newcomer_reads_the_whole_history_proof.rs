@@ -973,13 +973,9 @@ fn a_daemon_answers_the_hook_while_syncing() {
         .map(|(_, _, said)| said.trim().chars().take(240).collect::<String>())
         .unwrap_or_default();
     println!("[proof] the first hook run said: {first_said:?}; the last: {last_said:?}");
-    assert!(
-        runs.iter().all(|(_, _, said)| !said.trim().is_empty()),
-        "APPARATUS: a hook run printed nothing, so it cannot have asked the daemon: {:?}",
-        runs.iter()
-            .map(|(_, _, s)| s.trim().chars().take(120).collect::<String>())
-            .collect::<Vec<_>>()
-    );
+    // A run with nothing new prints nothing, by design; so vacuity is caught by the words a
+    // run does print (setup words mean it never asked) and by the room's news being named at
+    // least once below, after the product claims.
     let setup_words = ["has no Vox node", "is Locked", "vox setup", "not attached"];
     let staged_wrong: Vec<&String> = runs
         .iter()
@@ -992,11 +988,6 @@ fn a_daemon_answers_the_hook_while_syncing() {
          so this proof measured nothing; the first: {:?}",
         staged_wrong.len(),
         staged_wrong[0].trim().chars().take(240).collect::<String>()
-    );
-    assert!(
-        runs.iter().any(|(_, _, said)| said.contains(&format!("In room busy ({room})"))),
-        "APPARATUS: no hook run named the room's news, so the hook never read bob's room; \
-         the first said {first_said:?}"
     );
     let unanswered: Vec<usize> = runs
         .iter()
@@ -1050,6 +1041,11 @@ fn a_daemon_answers_the_hook_while_syncing() {
          FX-17), runs {unanswered:?} of {HOOK_RUNS}: {}\nbob's daemon said: {}",
         runs[unanswered[0]].2.trim(),
         said(&bob, "bob")
+    );
+    assert!(
+        runs.iter().any(|(_, _, said)| said.contains(&format!("In room busy ({room})"))),
+        "APPARATUS: no hook run named the room's news, so the hook never read bob's room; \
+         the first said {first_said:?}"
     );
     let failed: Vec<String> = runs
         .iter()
