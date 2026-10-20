@@ -18699,11 +18699,11 @@ impl Node {
             if !trusted.contains(&member) {
                 channel.withdraw_consent(profile, member, self.now_ms())?;
                 prepared.progressed("narrowing its trust", self.now_ms().get());
-            return Ok(false);
+                return Ok(false);
             }
             if examined == 64 {
                 prepared.progressed("narrowing its trust", self.now_ms().get());
-            return Ok(false);
+                return Ok(false);
             }
         }
         // Rotation is durable before the removal record is cleared. A failed save is

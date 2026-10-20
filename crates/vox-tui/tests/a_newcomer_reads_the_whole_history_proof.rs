@@ -1204,6 +1204,10 @@ fn held_entries(dir: &Path) -> u64 {
     first.stop();
 
     // ---- the room cannot finish preparing: the daemon says what it waits for ----------------
+    let restarted_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
     let second = daemon_env(&alice, "alice", &knob);
     let started = Instant::now();
     let line = loop {
@@ -1214,6 +1218,12 @@ fn held_entries(dir: &Path) -> u64 {
             .map(str::to_owned)
             .unwrap_or_default();
         if ok && line.contains("[preparing history: waiting for ") {
+            // The wait a held fold of a peer's records produces, in the words of this change.
+            assert!(
+                line.contains("waiting for governance records from its members"),
+                "PRODUCT: `vox room list` names another wait than the held governance fold \
+                 (#991): {line}"
+            );
             break line;
         }
         if ok && !line.is_empty() && !line.contains("[preparing") {
@@ -1260,9 +1270,18 @@ fn held_entries(dir: &Path) -> u64 {
             panic!("PRODUCT: `vox status --json` names no wait for the room: {entry}")
         })
         .to_owned();
+    let since_ms = entry["since_ms"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("PRODUCT: `vox status --json` dates no wait for the room: {entry}"));
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
     assert!(
-        line.contains(&what) && entry["since_ms"].as_u64().is_some(),
-        "PRODUCT: `vox status --json` ({entry}) and `vox room list` ({line}) do not say the same wait"
+        line.contains(&what) && (restarted_ms..=now_ms).contains(&since_ms),
+        "PRODUCT: `vox status --json` ({entry}) and `vox room list` ({line}) do not say the same \
+         wait, or its start {since_ms} is not between the daemon's restart {restarted_ms} and now \
+         {now_ms}"
     );
     let (ok, out, err) = vox(&alice, &["room", "read", &room], None);
     assert!(
@@ -1286,6 +1305,13 @@ fn held_entries(dir: &Path) -> u64 {
     std::thread::sleep(PREPARING_IDLE);
     let spent = cpu_time(pid).saturating_sub(cpu0);
     let rounds_after = completed_rounds(&alice);
+    assert!(
+        rounds_before.keys().any(|p| p.starts_with(&fps[1][..12]))
+            && rounds_after.keys().any(|p| p.starts_with(&fps[1][..12])),
+        "APPARATUS: alice's status lists no lane toward bob ({}), so rounds toward him cannot be \
+         counted; before {rounds_before:?}, after {rounds_after:?}",
+        &fps[1][..12]
+    );
     let per_peer: Vec<(String, u64)> = rounds_after
         .iter()
         .map(|(peer, after)| (peer.clone(), after.saturating_sub(*rounds_before.get(peer).unwrap_or(&0))))
@@ -1362,12 +1388,15 @@ fn held_entries(dir: &Path) -> u64 {
         } else {
             serde_json::Value::Null
         };
+        // Newer than the restart: the round that brought bob's rows, not one from the staging.
         let recorded = v["rooms"].as_array().is_some_and(|rooms| {
             rooms.iter().any(|r| {
                 r["id"].as_str().is_some_and(|id| id.starts_with(&room))
-                    && r["last_sync_ms"].as_u64().is_some()
+                    && r["last_sync_ms"].as_u64().is_some_and(|t| t > restarted_ms)
                     && r["members"].as_array().is_some_and(|ms| {
-                        ms.iter().any(|m| m["me"] == false && m["last_sync_ms"].as_u64().is_some())
+                        ms.iter().any(|m| {
+                            m["me"] == false && m["last_sync_ms"].as_u64().is_some_and(|t| t > restarted_ms)
+                        })
                     })
             })
         });
