@@ -462,9 +462,10 @@ fn a_worker_on_another_version_is_refused_by_name() {
     );
     assert!(
         o.stderr
-            .contains("announces the version it runs on its next turn"),
+            .contains("announces the version it runs on its next turn")
+            && o.stderr.contains("older than a day no longer counts"),
         "PRODUCT: the refusal does not say that the stale worker re-announces on its next turn \
-         (#994): {o:?}"
+         and that an old announcement lapses (#994): {o:?}"
     );
     // The reader's next hook turn, which only reads: it re-announces, without a claim.
     let hook = bob.vox(
@@ -513,11 +514,22 @@ fn a_worker_on_another_version_is_refused_by_name() {
         silent.code == Some(0),
         "PRODUCT: a silent session's hook turn failed: {silent:?}"
     );
-    let board = alice.vox(Some("a1"), &["room", "board", r, "--json"]);
+    // Bob's row names his latest counted session: still b-reader, so b-silent posted nothing.
+    let board = alice
+        .vox(Some("a1"), &["room", "board", r, "--json"])
+        .json();
+    let bobs = board["participants"]
+        .as_array()
+        .and_then(|ps| ps.iter().find(|p| p["author"] == bob.b32()))
+        .unwrap_or_else(|| {
+            panic!("PRODUCT: board --json has no participants row for bob: {board}")
+        });
     assert!(
-        participant_is(&board, bob, "b-reader", VERSION),
-        "PRODUCT: a session that never announced posted a hello from its hook turn (#994): {}",
-        board.stdout
+        bobs["session"] == "b-reader" && bobs["version"] == VERSION,
+        "PRODUCT: a session that never announced posted a hello from its hook turn (#994): bob's \
+         latest counted session is {} at {}, not b-reader",
+        bobs["session"],
+        bobs["version"]
     );
     let o = alice.vox(Some("a1"), &["room", "claim", r, "reader-work"]);
     assert!(

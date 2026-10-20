@@ -331,18 +331,27 @@ impl Snapshot {
 
     /// Whether this session's announcement still agrees with its and this node's latest
     /// participation records. An old matching hello may have been superseded since.
-    /// Whether this session has ever announced itself here (a counted record of its own), so
-    /// a stale announcement is one to refresh, while a session that only ever read stays
-    /// silent (#994).
+    /// Whether this session's latest counted record here still counts: within the
+    /// participation horizon and not a `bye`. Such an announcement, when stale, is one to
+    /// refresh; a session that only ever read, said bye, or whose record lapsed stays silent
+    /// (#994). Counted records and ordering as in `version::version_table`.
     #[must_use]
     pub fn announced_before(&self, session: &str) -> bool {
-        self.posted.iter().any(|p| {
-            p.author == self.me
-                && p.envelope.from == session
-                && (claim::is_claim_protocol(&p.envelope)
-                    || (p.envelope.kind == HELLO && p.envelope.data.get(VOX_KEY).is_some())
-                    || p.envelope.kind == BYE)
-        })
+        self.posted
+            .iter()
+            .filter(|p| {
+                p.author == self.me
+                    && p.envelope.from == session
+                    && (claim::is_claim_protocol(&p.envelope)
+                        || (p.envelope.kind == HELLO && p.envelope.data.get(VOX_KEY).is_some())
+                        || p.envelope.kind == BYE)
+            })
+            .max_by_key(|p| (p.created_millis, p.entry_hash))
+            .is_some_and(|p| {
+                p.envelope.kind != BYE
+                    && self.now_millis.saturating_sub(p.created_millis)
+                        <= version::PARTICIPATION_HORIZON_MILLIS
+            })
     }
 
     #[must_use]
@@ -784,8 +793,8 @@ pub fn refusal(room: &str, table: &VersionTable) -> AppError {
     }
     msg.push_str(
         "\n  every worker in a coordinating room must run the same vox version; a worker \
-         announces the version it runs on its next turn once that is the required one, and \
-         until then every claim here is refused",
+         announces the version it runs on its next turn once that is the required one; an \
+         announcement older than a day no longer counts, nor does a worker that left the room",
     );
     AppError::Refused {
         code: EXIT_VERSION,
