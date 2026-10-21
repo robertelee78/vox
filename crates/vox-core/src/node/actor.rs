@@ -16192,27 +16192,29 @@ impl Node {
                 // Key acceptance is the event that wakes any rows parked on this missing fact.
                 // accept_skdm drains one bounded page itself; one governance turn continues a
                 // retained cursor or observes that it is already empty.
-                if installed.is_ok() {
+                if installed.as_ref().is_ok_and(|accepted| accepted.changed) {
                     self.governance_work.pending = true;
                 }
                 installed
             };
-            if let Ok(backfilled) = installed {
-                changed = true;
-                let _ = self.event_tx.send(
-                    if skdm.body.channel_id == crate::node::drive::drive_channel(channel_id) {
-                        NodeEvent::SessionEntry {
-                            channel_id: *channel_id,
-                            session_id: crate::node::drive::KEY_CHANGED.to_owned(),
-                        }
-                    } else {
-                        NodeEvent::SenderKeyReceived {
-                            channel_id: *channel_id,
-                            peer: skdm.body.author_id,
-                            backfilled: backfilled as u64,
-                        }
-                    },
-                );
+            if let Ok(accepted) = installed {
+                if accepted.changed {
+                    changed = true;
+                    let _ = self.event_tx.send(
+                        if skdm.body.channel_id == crate::node::drive::drive_channel(channel_id) {
+                            NodeEvent::SessionEntry {
+                                channel_id: *channel_id,
+                                session_id: crate::node::drive::KEY_CHANGED.to_owned(),
+                            }
+                        } else {
+                            NodeEvent::SenderKeyReceived {
+                                channel_id: *channel_id,
+                                peer: skdm.body.author_id,
+                                backfilled: accepted.rendered as u64,
+                            }
+                        },
+                    );
+                }
             }
         }
         let mut channel = shared.lock().await;
@@ -17451,14 +17453,14 @@ impl Node {
                 let mut channel = shared.lock().await;
                 fresh = !channel.holds_generation(&author, skdm.body.chain_id);
                 let installed = channel.accept_skdm(profile.store(), skdm, now_ms).ok();
-                if installed.is_some() {
+                if installed.as_ref().is_some_and(|accepted| accepted.changed) {
                     self.governance_work.pending = true;
                 }
                 installed
             }
             _ => None,
         };
-        let Some(n) = backfilled else {
+        let Some(accepted) = backfilled else {
             return Err(KeyRefusal::NotAccepted);
         };
         // A generation new to us: the author may have refused ours while we were untrusted, or
@@ -17467,20 +17469,22 @@ impl Node {
         if fresh {
             self.reoffer.insert((channel_id, author));
         }
-        let _ = self.event_tx.send(
-            if skdm.body.channel_id == crate::node::drive::drive_channel(&channel_id) {
-                NodeEvent::SessionEntry {
-                    channel_id,
-                    session_id: crate::node::drive::KEY_CHANGED.to_owned(),
-                }
-            } else {
-                NodeEvent::SenderKeyReceived {
-                    channel_id,
-                    peer,
-                    backfilled: n as u64,
-                }
-            },
-        );
+        if accepted.changed {
+            let _ = self.event_tx.send(
+                if skdm.body.channel_id == crate::node::drive::drive_channel(&channel_id) {
+                    NodeEvent::SessionEntry {
+                        channel_id,
+                        session_id: crate::node::drive::KEY_CHANGED.to_owned(),
+                    }
+                } else {
+                    NodeEvent::SenderKeyReceived {
+                        channel_id,
+                        peer,
+                        backfilled: accepted.rendered as u64,
+                    }
+                },
+            );
+        }
         Ok(())
     }
 
@@ -18647,11 +18651,11 @@ impl Node {
                 let installed = if let Some(skdm) = opened {
                     match self.profile.as_ref() {
                         Some(profile) => {
-                            let installed = ch.accept_skdm(profile.store(), &skdm, now).map(|_| ());
-                            if installed.is_ok() {
+                            let installed = ch.accept_skdm(profile.store(), &skdm, now);
+                            if installed.as_ref().is_ok_and(|accepted| accepted.changed) {
                                 self.governance_work.pending = true;
                             }
-                            installed
+                            installed.map(|_| ())
                         }
                         None => Err(Error::AtRestLocked),
                     }

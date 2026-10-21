@@ -505,6 +505,10 @@ pub const MAX_AUTHORS: usize = 1024;
 /// that happens. This bound is not the cap; it only keeps a room's authors finite.
 pub const AUTHORS_HARD_LIMIT: usize = 2 * MAX_AUTHORS;
 
+/// Maximum retained rows the room projection examines in one backfill turn. Remaining work is
+/// durable and another event-driven turn continues it.
+pub const RENDER_BACKFILL_ROWS_PER_TURN: usize = governance::PAGE_ROWS;
+
 /// **Test-only**: a smaller room, so a proof fills one with a few members rather than 1,024. Its
 /// value is the most authors a room admits, from 1 to [`MAX_AUTHORS`]. Unset, empty, unparsable or
 /// out of range is [`MAX_AUTHORS`]: nothing in a real deployment sets it, and without the
@@ -770,6 +774,14 @@ pub enum Accepted {
     Checkpoint,
 }
 
+/// Result of taking a sender/drive key. `changed` is false for an unchanged duplicate: callers
+/// acknowledge it but schedule no rendering or governance work.
+#[derive(Debug, Clone, Copy)]
+pub struct AcceptedSkdm {
+    pub(crate) rendered: usize,
+    pub(crate) changed: bool,
+}
+
 /// Why a room is over (V030-08).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoomEnd {
@@ -999,6 +1011,32 @@ struct ReadMarkScan {
     started: ReadMarkEligibility,
 }
 
+/// Restart rebuild of the admitted-member consent projection. One maintenance turn examines at
+/// most [`governance::PAGE_ROWS`] author/target pairs; neither departed nor arbitrary
+/// off-roster targets occupy this state.
+struct ConsentFactsBuild {
+    members: Vec<Digest32>,
+    author: usize,
+    target: usize,
+    facts: governance::ConsentFacts,
+}
+
+impl ConsentFactsBuild {
+    fn new(authors: &BTreeMap<Digest32, CompositePublicKey>) -> Self {
+        Self {
+            members: authors.keys().copied().collect(),
+            author: 0,
+            target: 0,
+            facts: governance::ConsentFacts::empty(),
+        }
+    }
+}
+
+enum ConsentFactsState {
+    Building(ConsentFactsBuild),
+    Ready(std::sync::Arc<governance::ConsentFacts>),
+}
+
 /// An open (SEK-unlocked) channel on this device.
 pub struct ChannelState {
     channel_id: Digest32,
@@ -1020,8 +1058,9 @@ pub struct ChannelState {
     /// Last published scalar display only. Live authority is read from sealed facts.
     governance_display: governance::Display,
     governance_ready: bool,
-    /// This room's consent facts in memory (ADR-038 FX-22); see [`Self::with_consent_facts`].
-    consent_facts: std::sync::Mutex<Option<std::sync::Arc<governance::ConsentFacts>>>,
+    /// This room's admitted-member consent facts in memory (ADR-038 FX-22). Unchanged questions
+    /// never open storage; restart reconstruction advances in bounded governance turns.
+    consent_facts: std::sync::Mutex<ConsentFactsState>,
     /// A member holds entries of this node's own feed here that this node does not (ADR-037
     /// R5): durable in `SEG_OWN_BEHIND`; every write here refuses with `OwnHistoryBehind`.
     own_behind: bool,
@@ -1047,6 +1086,9 @@ pub struct ChannelState {
     /// A render backfill was drained while the governance view was refreshing: nothing
     /// rendered, the queue kept; the next governance turn drains it (ADR-038 FX-22, #1007).
     backfill_refreshing: bool,
+    /// Last author given one backfill row. The durable per-author cursors survive restart; this
+    /// in-memory round-robin cursor only prevents one long author from starving the others.
+    backfill_after: Option<Digest32>,
     /// Sealed exact-hash subtype evidence; never a permission or recovery eligibility decision.
     legacy_sessions: legacy_session::LegacySessions,
     /// Own-feed declaration cursor and the capable readers covered by that scan.
@@ -1931,7 +1973,9 @@ impl ChannelState {
             forks_kept: 0,
             governance_display,
             governance_ready: false,
-            consent_facts: std::sync::Mutex::new(None),
+            consent_facts: std::sync::Mutex::new(ConsentFactsState::Ready(std::sync::Arc::new(
+                governance::ConsentFacts::empty(),
+            ))),
             own_behind: false,
             presence: BTreeMap::new(),
             sparse_applied_tips: BTreeMap::new(),
@@ -1942,6 +1986,7 @@ impl ChannelState {
             set_aside: SetAside::default(),
             chains_advanced: false,
             backfill_refreshing: false,
+            backfill_after: None,
             legacy_sessions: legacy_session::LegacySessions::default(),
             legacy_announced: None,
             private_sessions: private_session::PrivateSessions::default(),
@@ -2608,6 +2653,9 @@ impl ChannelState {
         governance::prepare(store, &sek, channel_id)?;
         // No destructive retention uses a partially rebuilt authority projection.
         let governance_display = governance::Display::genesis(&genesis);
+        let consent_facts = std::sync::Mutex::new(ConsentFactsState::Building(
+            ConsentFactsBuild::new(&authors),
+        ));
         let mut room = Self {
             channel_id: *channel_id,
             genesis,
@@ -2622,7 +2670,7 @@ impl ChannelState {
             forks_kept,
             governance_display,
             governance_ready: false,
-            consent_facts: std::sync::Mutex::new(None),
+            consent_facts,
             own_behind,
             presence,
             sparse_applied_tips,
@@ -2633,6 +2681,7 @@ impl ChannelState {
             set_aside,
             chains_advanced: false,
             backfill_refreshing: false,
+            backfill_after: None,
             legacy_sessions: legacy_session::LegacySessions::default(),
             legacy_announced: None,
             private_sessions: private_session::PrivateSessions::default(),
@@ -2887,7 +2936,9 @@ impl ChannelState {
             forks_kept: 0,
             governance_display,
             governance_ready: false,
-            consent_facts: std::sync::Mutex::new(None),
+            consent_facts: std::sync::Mutex::new(ConsentFactsState::Ready(std::sync::Arc::new(
+                governance::ConsentFacts::empty(),
+            ))),
             own_behind: false,
             presence: BTreeMap::new(),
             sparse_applied_tips: BTreeMap::new(),
@@ -2898,6 +2949,7 @@ impl ChannelState {
             set_aside: SetAside::default(),
             chains_advanced: false,
             backfill_refreshing: false,
+            backfill_after: None,
             legacy_sessions: legacy_session::LegacySessions::default(),
             legacy_announced: None,
             private_sessions: private_session::PrivateSessions::default(),
@@ -3323,6 +3375,11 @@ impl ChannelState {
             self.save_error = Some(e.to_string());
             return Err(e);
         }
+        *self
+            .consent_facts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            ConsentFactsState::Building(ConsentFactsBuild::new(&self.authors));
         // Capability announcements are live room traffic. A newly admitted member cannot read
         // the announcement that predates its admission, so the next bounded maintenance turn
         // republishes it. The obligation is recreated on open if the process stops here.
@@ -4323,7 +4380,7 @@ impl ChannelState {
         // history floor keeps it (`oldest_generation_needed`) until it is taken.
         // Who may read this identity, from the room's facts in memory (FX-22); while they are
         // refreshing and the lock narrows, every entitled member is kept.
-        let readers: Option<BTreeSet<Digest32>> = match self.with_consent_facts(store, |facts| {
+        let readers: Option<BTreeSet<Digest32>> = match self.with_consent_facts(|facts| {
             self.entitled
                 .keys()
                 .filter(|t| facts.can_read(t, &me))
@@ -4514,9 +4571,9 @@ impl ChannelState {
     /// changes the answer because the log says so. This is what tells a keyring
     /// removal which rooms it actually has to change the lock in (ADR-020 §3) —
     /// rotating in a room where nothing was ever granted would be noise.
-    pub fn has_consented(&self, store: &Store, target: &Digest32) -> Result<bool> {
+    pub fn has_consented(&self, _store: &Store, target: &Digest32) -> Result<bool> {
         let me = self.me();
-        self.with_consent_facts(store, |facts| facts.can_read(target, &me))
+        self.with_consent_facts(|facts| facts.can_read(target, &me))
     }
 
     /// **Who trusts each member here** (ADR-028 K-7): for every member some other member consents
@@ -4524,9 +4581,9 @@ impl ChannelState {
     /// identity's own entry is who consents to it reading them, the inbound half of `consented`
     /// (V030-17). A consent grant is what a member's node writes once its owner trusts the other (ADR-007
     /// G-9), so this is what a client says of a newcomer: which members already trust it.
-    pub fn trusted_by(&self, store: &Store) -> Result<BTreeMap<Digest32, BTreeSet<Digest32>>> {
+    pub fn trusted_by(&self, _store: &Store) -> Result<BTreeMap<Digest32, BTreeSet<Digest32>>> {
         let members = self.members();
-        self.with_consent_facts(store, |facts| {
+        self.with_consent_facts(|facts| {
             let mut by: BTreeMap<Digest32, BTreeSet<Digest32>> = BTreeMap::new();
             for author in &members {
                 for reader in &members {
@@ -4539,48 +4596,120 @@ impl ChannelState {
         })
     }
 
-    /// The room's consent facts in memory (ADR-038 FX-22). The governance index's revision
-    /// moves with every change to it, so the facts are loaded once per revision: a question
-    /// costs the index header (one small sealed segment) and nothing else while the room's
-    /// governance stands. A room whose current facts are not settled refuses here as
-    /// [`Self::current_governance`] does.
-    fn consent_facts(&self, store: &Store) -> Result<std::sync::Arc<governance::ConsentFacts>> {
+    /// The admitted-member consent projection. The common path is only this mutex and an Arc
+    /// clone: it opens and decrypts no segment, including the governance header. A restart or a
+    /// newly admitted member returns refreshing until bounded governance turns reconstruct it.
+    fn consent_facts(&self) -> Result<std::sync::Arc<governance::ConsentFacts>> {
         if self.poisoned {
             return Err(self.save_failure());
         }
-        // The common path opens and decrypts only the index header. A first load (including every
-        // restart) and a changed revision take the fully checked view below before rebuilding.
-        let revision = governance::View::projection_revision(store, &self.sek, &self.channel_id)?;
+        if !self.governance_ready {
+            return Err(Error::Profile(governance::REFRESHING));
+        }
+        let held = self
+            .consent_facts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match &*held {
+            ConsentFactsState::Ready(facts) => Ok(std::sync::Arc::clone(facts)),
+            ConsentFactsState::Building(_) => Err(Error::Profile(governance::REFRESHING)),
+        }
+    }
+
+    /// Apply one committed current-input fact to a ready projection. If a restart build is in
+    /// flight, restart it so no already-inspected pair can retain a stale answer.
+    fn note_committed_consent(&self, entry: &Entry) -> Result<()> {
+        let Ok(fact) = GovEntry::body_bound_to(entry) else {
+            return Ok(());
+        };
+        let Some(author_key) = self.authors.get(&entry.skeleton.author_id) else {
+            return Ok(());
+        };
+        // Keep this mirror on exactly the same authenticated input as the sealed current-input
+        // index. `accepted_into` deliberately ignores malformed legacy statements; they must not
+        // gain authority merely because their outer entry was publishable.
+        if fact.verify(author_key).is_err() {
+            return Ok(());
+        }
+        let relevant = match &fact {
+            GovBody::ConsentGrant(grant) => {
+                self.authors.contains_key(&entry.skeleton.author_id)
+                    && self.authors.contains_key(&grant.body.target_id)
+            }
+            GovBody::ConsentRevocation(revoke) => {
+                self.authors.contains_key(&entry.skeleton.author_id)
+                    && self.authors.contains_key(&revoke.body.target_id)
+            }
+            GovBody::Presence(_) => self.authors.contains_key(&entry.skeleton.author_id),
+            _ => false,
+        };
+        if !relevant {
+            return Ok(());
+        }
         let mut held = self
             .consent_facts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(facts) = held.as_ref().filter(|facts| facts.revision() == revision) {
-            return Ok(std::sync::Arc::clone(facts));
+        match &mut *held {
+            ConsentFactsState::Ready(facts) => {
+                std::sync::Arc::make_mut(facts).observe(
+                    entry.skeleton.author_id,
+                    entry.skeleton.seq,
+                    &fact,
+                );
+            }
+            ConsentFactsState::Building(_) => {
+                *held = ConsentFactsState::Building(ConsentFactsBuild::new(&self.authors));
+            }
         }
-        drop(held);
+        Ok(())
+    }
 
-        let view = self.current_governance(store)?;
-        let revision = view.revision();
-        held = self
+    /// Examine at most one production governance page of admitted author/target pairs. Returns
+    /// true only when the restart/admission rebuild is complete.
+    fn advance_consent_facts(&self, view: &governance::View<'_>) -> Result<bool> {
+        let mut held = self
             .consent_facts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(facts) = held.as_ref().filter(|facts| facts.revision() == revision) {
-            return Ok(std::sync::Arc::clone(facts));
+        let ConsentFactsState::Building(build) = &mut *held else {
+            return Ok(true);
+        };
+        let current_members: Vec<Digest32> = self.authors.keys().copied().collect();
+        if build.members != current_members {
+            *build = ConsentFactsBuild::new(&self.authors);
         }
-        let facts = std::sync::Arc::new(view.consent_facts(revision)?);
-        *held = Some(std::sync::Arc::clone(&facts));
-        Ok(facts)
+        let mut examined = 0usize;
+        while build.author < build.members.len() && examined < governance::PAGE_ROWS {
+            let author = build.members[build.author];
+            if build.target == 0 {
+                build.facts.set_reset(author, view.consent_reset(&author)?);
+            }
+            let target = build.members[build.target];
+            build
+                .facts
+                .set_consent(author, target, view.consent_state(&author, &target)?);
+            build
+                .facts
+                .set_ever_revoked(author, target, view.ever_revoked(&author, &target)?);
+            examined += 1;
+            build.target += 1;
+            if build.target == build.members.len() {
+                build.author += 1;
+                build.target = 0;
+            }
+        }
+        if build.author != build.members.len() {
+            return Ok(false);
+        }
+        let facts = std::mem::take(&mut build.facts);
+        *held = ConsentFactsState::Ready(std::sync::Arc::new(facts));
+        Ok(true)
     }
 
     /// One consent question answered from [`Self::consent_facts`].
-    fn with_consent_facts<T>(
-        &self,
-        store: &Store,
-        f: impl FnOnce(&governance::ConsentFacts) -> T,
-    ) -> Result<T> {
-        let facts = self.consent_facts(store)?;
+    fn with_consent_facts<T>(&self, f: impl FnOnce(&governance::ConsentFacts) -> T) -> Result<T> {
+        let facts = self.consent_facts()?;
         Ok(f(&facts))
     }
 
@@ -4598,7 +4727,7 @@ impl ChannelState {
     /// put its fingerprint in the keyring.
     pub fn owed_consents(
         &self,
-        store: &Store,
+        _store: &Store,
         trusted: &BTreeSet<Digest32>,
     ) -> Result<BTreeSet<Digest32>> {
         if self.poisoned {
@@ -4608,7 +4737,7 @@ impl ChannelState {
             return Ok(BTreeSet::new());
         }
         let me = self.me();
-        self.with_consent_facts(store, |facts| {
+        self.with_consent_facts(|facts| {
             let mut owed = BTreeSet::new();
             for author in self.authors.keys() {
                 if *author != me
@@ -4963,7 +5092,7 @@ impl ChannelState {
     /// [`MAX_RETAINED_ORIGINS`]: crate::group::history::MAX_RETAINED_ORIGINS
     pub fn history_plan(
         &self,
-        store: &Store,
+        _store: &Store,
         target: &Digest32,
         decision: Option<Stamp>,
     ) -> Result<Option<Vec<(u64, u64)>>> {
@@ -4971,7 +5100,7 @@ impl ChannelState {
             return Ok(None);
         };
         let me = self.me();
-        if self.with_consent_facts(store, |facts| facts.ever_revoked(&me, target))? {
+        if self.with_consent_facts(|facts| facts.ever_revoked(&me, target))? {
             return Ok(None);
         }
         let current = self.sender.chain_id();
@@ -5098,11 +5227,11 @@ impl ChannelState {
     }
 
     /// The oldest generation this one current consenter is still owed.
-    pub fn owed_history_for(&self, store: &Store, target: &Digest32) -> Result<Option<u64>> {
+    pub fn owed_history_for(&self, _store: &Store, target: &Digest32) -> Result<Option<u64>> {
         let me = self.me();
         if *target == me
             || self.has_left(target)
-            || !self.with_consent_facts(store, |facts| facts.can_read(target, &me))?
+            || !self.with_consent_facts(|facts| facts.can_read(target, &me))?
         {
             return Ok(None);
         }
@@ -5113,12 +5242,12 @@ impl ChannelState {
     /// still has work; revoked and departed targets consume an inspected slot.
     pub fn owed_history_page(
         &self,
-        store: &Store,
+        _store: &Store,
         after: Option<Digest32>,
     ) -> Result<(BTreeMap<Digest32, u64>, Option<Digest32>)> {
         use std::ops::Bound::{Excluded, Unbounded};
         let me = self.me();
-        let facts = self.consent_facts(store)?;
+        let facts = self.consent_facts()?;
         let mut owed = BTreeMap::new();
         let mut slots = self
             .history
@@ -6923,13 +7052,13 @@ impl ChannelState {
     /// entry already stored from that author is retried**, so a message that arrived
     /// as ciphertext before consent renders as soon as the key arrives — the
     /// monotone per-sender fill-in ADR-007 describes. Returns how many entries that
-    /// backfill rendered.
+    /// backfill rendered and whether key state actually changed.
     pub fn accept_skdm(
         &mut self,
         store: &Store,
         skdm: &Skdm,
         now: crate::time::Ms,
-    ) -> Result<usize> {
+    ) -> Result<AcceptedSkdm> {
         self.require_legacy_current(store)?;
         let now_ms = now.get();
         if self.poisoned {
@@ -6954,24 +7083,33 @@ impl ChannelState {
         // bounded rendering obligation so an upgraded v1 profile can recover old cache rows.
         if let Some(existing) = self.receivers.get_mut(&slot) {
             let widened = existing.retain_history_release(&chain)?;
-            if widened {
-                let saved = (|| -> Result<()> {
-                    let mut batch = store.batch()?;
-                    self.queue_receivers(&mut batch)?;
-                    let mut writer = self
-                        .entries
-                        .write(&mut batch, &self.sek, &self.channel_id)?;
-                    writer.queue_backfill(author, Some(1))?;
-                    writer.seal()?;
-                    batch.commit()
-                })();
-                if let Err(error) = saved {
-                    self.poison(&error);
-                    return Err(error);
-                }
-                self.entries.committed();
+            if !widened {
+                return Ok(AcceptedSkdm {
+                    rendered: 0,
+                    changed: false,
+                });
             }
-            return self.backfill(store, &author, now_ms);
+            let saved = (|| -> Result<()> {
+                let mut batch = store.batch()?;
+                self.queue_receivers(&mut batch)?;
+                let mut writer = self
+                    .entries
+                    .write(&mut batch, &self.sek, &self.channel_id)?;
+                writer.queue_backfill(author, Some(1))?;
+                writer.seal()?;
+                batch.commit()
+            })();
+            if let Err(error) = saved {
+                self.poison(&error);
+                return Err(error);
+            }
+            self.entries.committed();
+            return self
+                .backfill(store, &author, now_ms)
+                .map(|rendered| AcceptedSkdm {
+                    rendered,
+                    changed: true,
+                });
         }
         if self.receivers.len() >= MAX_RECEIVER_CHAINS {
             return Err(Error::SizeLimitExceeded("room receiver chains"));
@@ -6998,6 +7136,10 @@ impl ChannelState {
         }
         self.entries.committed();
         self.drain_backfill(store, now_ms)
+            .map(|rendered| AcceptedSkdm {
+                rendered,
+                changed: true,
+            })
     }
 
     /// Whether this node holds a sender key for `author`.
@@ -7347,12 +7489,15 @@ impl ChannelState {
         skdm: &Skdm,
         key: &CompositePublicKey,
         now_ms: u64,
-    ) -> Result<usize> {
+    ) -> Result<AcceptedSkdm> {
         let chain =
             ReceiverChain::from_skdm(skdm, key, &drive_channel(&self.channel_id), self.epoch)?;
         let slot = (skdm.body.author_id, chain.chain_id());
         if self.drive.receivers.contains_key(&slot) {
-            return Ok(0);
+            return Ok(AcceptedSkdm {
+                rendered: 0,
+                changed: false,
+            });
         }
         if self.drive.receivers.len() >= crate::node::drive::MAX_DRIVE_CHAINS {
             return Err(Error::SizeLimitExceeded("room drive keys"));
@@ -7365,10 +7510,13 @@ impl ChannelState {
         self.backfill(store, &skdm.body.author_id, now_ms)?;
         self.render_pending_private(store, now_ms)?;
         // What it opened of Sessions: a key-changed entry is none of theirs.
-        Ok(self.drive.news[before..]
-            .iter()
-            .filter(|id| !crate::node::drive::is_key_changed(id))
-            .count())
+        Ok(AcceptedSkdm {
+            rendered: self.drive.news[before..]
+                .iter()
+                .filter(|id| !crate::node::drive::is_key_changed(id))
+                .count(),
+            changed: true,
+        })
     }
 
     /// Open one Session entry with the drive key it names, if this node holds it, queueing its
@@ -7661,13 +7809,11 @@ impl ChannelState {
         now_ms: u64,
         expired: &mut Vec<(Digest32, Tracked)>,
     ) -> Result<Vec<Rendered>> {
-        match governance::View::current_in_batch(
-            batch,
-            &self.sek,
-            &self.channel_id,
-            self.genesis.creator_pubkey().fingerprint(),
-        ) {
-            Ok(_) => self.backfill_refreshing = false,
+        let consent = match self.consent_facts() {
+            Ok(facts) => {
+                self.backfill_refreshing = false;
+                facts
+            }
             Err(error) if governance::refreshing(&error) => {
                 // Nothing rendered, the queue kept: the governance turn after this refresh
                 // drains it (ADR-038 FX-22, #1007), not the retention sweep.
@@ -7675,14 +7821,20 @@ impl ChannelState {
                 return Ok(Vec::new());
             }
             Err(error) => return Err(error),
-        }
+        };
         let mut rows = Vec::new();
         let mut bytes = 0usize;
-        for _ in 0..64 {
+        for _ in 0..RENDER_BACKFILL_ROWS_PER_TURN {
             let mut writer = self.entries.write(batch, &self.sek, &self.channel_id)?;
-            let Some((author, seq)) = writer.next_backfill()? else {
+            let mut next = writer.next_backfill_after(self.backfill_after)?;
+            if next.is_none() && self.backfill_after.is_some() {
+                next = writer.next_backfill_after(None)?;
+            }
+            let Some((author, seq)) = next else {
+                self.backfill_after = None;
                 break;
             };
+            self.backfill_after = Some(author);
             // Consent applies to every row by this author, and no row by the author can open
             // before this node holds at least one of its sender generations. Remove a blocked
             // author from runnable work instead of scanning or resetting it forever. Acceptance
@@ -7691,14 +7843,7 @@ impl ChannelState {
             let author_ready = if author == self.me() {
                 true
             } else {
-                let consented = governance::View::current_in_batch(
-                    writer.batch(),
-                    &self.sek,
-                    &self.channel_id,
-                    self.genesis.creator_pubkey().fingerprint(),
-                )?
-                .can_read(&self.me(), &author)?;
-                consented && self.has_sender_key(&author)
+                consent.can_read(&self.me(), &author) && self.has_sender_key(&author)
             };
             if !author_ready {
                 writer.queue_backfill(author, None)?;
@@ -7923,13 +8068,8 @@ impl ChannelState {
     ) -> Result<ContentProjection> {
         let me = self.me();
         if author != me {
-            let allowed = match governance::View::current_in_batch(
-                batch,
-                &self.sek,
-                &self.channel_id,
-                self.genesis.creator_pubkey().fingerprint(),
-            ) {
-                Ok(view) => Some(view.can_read(&me, &author)?),
+            let allowed = match self.consent_facts() {
+                Ok(facts) => Some(facts.can_read(&me, &author)),
                 Err(error) if governance::refreshing(&error) => None,
                 Err(error) => return Err(error),
             };
@@ -8426,8 +8566,8 @@ impl ChannelState {
     /// Whether this node may read `author`'s messages: `author` has consented to
     /// this identity on the log (ADR-007 per-sender consent). Reading also needs the
     /// sender key itself (the SKDM).
-    pub fn may_read(&self, store: &Store, author: &Digest32, me: &Digest32) -> Result<bool> {
-        self.with_consent_facts(store, |facts| facts.can_read(me, author))
+    pub fn may_read(&self, _store: &Store, author: &Digest32, me: &Digest32) -> Result<bool> {
+        self.with_consent_facts(|facts| facts.can_read(me, author))
     }
 
     /// **The time to stamp a new post with**: the clock, or just past the latest post this node
@@ -8816,7 +8956,7 @@ impl ChannelState {
                 self.entries
                     .render_view(profile.store(), &self.sek, &self.channel_id)?;
             let governance = self.current_governance(profile.store())?;
-            let facts = self.consent_facts(profile.store())?;
+            let facts = self.consent_facts()?;
             let mut marks = BTreeSet::new();
             for hash in shown {
                 if rendered.was_read(hash, &me)? {
@@ -8910,7 +9050,7 @@ impl ChannelState {
                 return Ok(None);
             }
             let governance = self.current_governance(profile.store())?;
-            let facts = self.consent_facts(profile.store())?;
+            let facts = self.consent_facts()?;
             let eligibility = ReadMarkEligibility {
                 reader: me,
                 pending: rendered.pending_reads_root()?,
@@ -9322,12 +9462,12 @@ impl ChannelState {
     /// log: a member that joined after this node did, by its join, and a member that grants this
     /// node consent (ADR-007 G-9), by its latest grant. Nothing here knows the keyring or what was
     /// dismissed; [`crate::node::offers::offers`] decides over every room.
-    pub fn offer_bases(&self, store: &Store) -> Result<Vec<crate::node::api::OfferBasis>> {
+    pub fn offer_bases(&self, _store: &Store) -> Result<Vec<crate::node::api::OfferBasis>> {
         use crate::node::api::{OfferBasis, OfferWhy};
         let me = self.me();
         let (_, mine) = self.admission(&me);
         let members = self.members();
-        let grants: BTreeMap<Digest32, u64> = self.with_consent_facts(store, |facts| {
+        let grants: BTreeMap<Digest32, u64> = self.with_consent_facts(|facts| {
             members
                 .iter()
                 .filter_map(|member| facts.grant_sequence(member, &me).map(|seq| (*member, seq)))

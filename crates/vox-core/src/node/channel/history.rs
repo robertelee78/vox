@@ -284,7 +284,7 @@ impl View<'_> {
         self.ch.checked_governance(self.store, self.ch.now_hint)?;
         let me = self.ch.me();
         let answer = self.answer(query, bytes)?;
-        let facts = self.ch.consent_facts(self.store)?;
+        let facts = self.ch.consent_facts()?;
         let check = |row: &MessageRow| -> Answer<()> {
             // Owed placeholders are not accepted bodies. Do not expose unpublished
             // projection work or label it as an empty historical message.

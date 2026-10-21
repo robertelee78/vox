@@ -131,7 +131,7 @@ impl ChannelState {
             Query::Admin { .. } => (None, true),
         };
         let revision = if matches!(&query, Query::Consent { .. }) {
-            self.consent_facts(store)?.revision()
+            self.current_governance(store)?.revision()
         } else if authority {
             self.checked_governance(store, self.now_hint)?.revision()
         } else {
@@ -288,18 +288,20 @@ impl ChannelState {
                 &self.me(),
                 now.get(),
             )?;
-            self.governance_ready = state.ready;
             let mut changed = false;
+            let mut consent_ready = false;
             if state.ready {
-                let display = self
-                    .checked_governance(store, now.get())?
-                    .display(&self.genesis)?;
-                changed = !was_ready || self.governance_display.revision != display.revision;
+                let view = self.checked_governance(store, now.get())?;
+                let display = view.display(&self.genesis)?;
+                consent_ready = self.advance_consent_facts(&view)?;
+                changed = self.governance_display.revision != display.revision
+                    || (!was_ready && consent_ready);
                 self.governance_display = display;
             }
+            self.governance_ready = state.ready && consent_ready;
             Ok(GovernanceProgress {
-                ready: state.ready,
-                pending: state.pending,
+                ready: self.governance_ready,
+                pending: state.pending || (state.ready && !consent_ready),
                 changed,
             })
         })();
@@ -333,8 +335,8 @@ impl ChannelState {
         if self.legacy_cache_only(store)? {
             return Ok(false);
         }
-        match self.current_governance(store) {
-            Ok(view) => drop(view),
+        match self.consent_facts() {
+            Ok(facts) => drop(facts),
             // A backfill drained into a refreshing view is still pending work: the turn after
             // the refresh renders it (ADR-038 FX-22, #1007).
             Err(error) if super::refreshing(&error) => return Ok(self.backfill_awaits_refresh()),
@@ -409,7 +411,9 @@ impl ChannelState {
         after: Option<Digest32>,
         limit: usize,
     ) -> Result<GovernanceTargets> {
-        let page = self.consent_facts(store)?.consenters(author, after, limit);
+        let page = self
+            .current_governance(store)?
+            .consenters(author, after, limit)?;
         Ok(GovernanceTargets {
             targets: page.rows,
             next: page.next,
@@ -508,6 +512,10 @@ impl ChannelState {
             entry,
             late,
         )?;
+        // The Batch failure path poisons this ChannelState, so it is safe to advance the
+        // in-memory mirror here with the same accepted input: no usable state can outlive a
+        // failed commit. This covers every publication path without polling a sealed header.
+        self.note_committed_consent(entry)?;
         if late {
             self.governance_ready = false;
         }

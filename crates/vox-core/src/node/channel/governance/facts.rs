@@ -377,37 +377,8 @@ impl Header {
     }
 }
 
-enum Input<'a> {
-    Snapshot(Snapshot),
-    Batch(&'a Batch<'a>),
-}
-impl Input<'_> {
-    fn get_segment(
-        &self,
-        room: &Digest32,
-        kind: SegmentKind,
-        id: u64,
-    ) -> Result<Option<crate::atrest::store::SealedSegment>> {
-        match self {
-            Self::Snapshot(s) => s.get_segment(room, kind, id),
-            Self::Batch(b) => b.get_segment(room, kind, id),
-        }
-    }
-    fn segment_id_after(
-        &self,
-        room: &Digest32,
-        kind: SegmentKind,
-        after: Option<u64>,
-    ) -> Result<Option<u64>> {
-        match self {
-            Self::Snapshot(s) => s.segment_id_after(room, kind, after),
-            Self::Batch(b) => b.segment_id_after(room, kind, after),
-        }
-    }
-}
-
 pub(super) struct Read<'a> {
-    input: Input<'a>,
+    input: Snapshot,
     sek: &'a Sek,
     room: &'a Digest32,
     header: Header,
@@ -415,12 +386,7 @@ pub(super) struct Read<'a> {
 
 impl<'a> Read<'a> {
     pub(super) fn open(store: &Store, sek: &'a Sek, room: &'a Digest32) -> Result<Self> {
-        Self::from_input(Input::Snapshot(store.snapshot()?), sek, room)
-    }
-    pub(super) fn in_batch(batch: &'a Batch<'a>, sek: &'a Sek, room: &'a Digest32) -> Result<Self> {
-        Self::from_input(Input::Batch(batch), sek, room)
-    }
-    fn from_input(input: Input<'a>, sek: &'a Sek, room: &'a Digest32) -> Result<Self> {
+        let input = store.snapshot()?;
         let header = input
             .get_segment(room, KIND, HEADER)?
             .map(|sealed| Header::parse(&open_segment(sek, KIND, HEADER, &sealed)?))
@@ -434,12 +400,7 @@ impl<'a> Read<'a> {
         })
     }
     fn tree(&self) -> session_tree::Read<'_> {
-        match &self.input {
-            Input::Snapshot(snapshot) => {
-                session_tree::Read::snapshot(snapshot, self.sek, self.room, KIND)
-            }
-            Input::Batch(batch) => session_tree::Read::batch(batch, self.sek, self.room, KIND),
-        }
+        session_tree::Read::snapshot(&self.input, self.sek, self.room, KIND)
     }
 
     pub(super) fn get(&self, table: Table, key: &session_tree::Key) -> Result<Option<u64>> {
@@ -517,12 +478,6 @@ impl<'a> Read<'a> {
                 .input
                 .segment_id_after(self.room, SegmentKind::LogDb, Some(self.header.known_tail))?
                 .is_none())
-    }
-    /// Whether the header says the live source receipt barrier is complete. This is sufficient
-    /// only for checking an already-loaded in-memory projection: a restart has no projection and
-    /// takes [`Self::current_ready`] before loading one, including its source-tail check.
-    pub(super) fn projection_ready(&self) -> bool {
-        self.header.initialized
     }
     pub(super) fn ready(&self, now: u64) -> Result<bool> {
         Ok(self.current_ready()?

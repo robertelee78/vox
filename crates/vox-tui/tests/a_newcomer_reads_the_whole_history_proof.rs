@@ -450,6 +450,38 @@ fn wait_for_held_rows(dir: &Path, room: &str, expected_hashes: &[String], hold: 
     }
 }
 
+/// One paged shipped-binary observation proves that these exact retained objects—not merely
+/// equal text from a refetch or duplicate post—became readable once each in source order.
+fn assert_exact_read_rows(
+    dir: &Path,
+    room: &str,
+    expected_hashes: &[String],
+    expected_texts: &[String],
+    ordering: &str,
+) {
+    let rows = room_rows(dir, room);
+    let actual: Vec<(String, Option<String>)> = rows
+        .iter()
+        .filter_map(|row| {
+            let hash = row["entry_hash"].as_str()?;
+            expected_hashes
+                .iter()
+                .any(|expected| expected == hash)
+                .then(|| (hash.to_owned(), row["text"].as_str().map(str::to_owned)))
+        })
+        .collect();
+    let expected: Vec<(String, Option<String>)> = expected_hashes
+        .iter()
+        .cloned()
+        .zip(expected_texts.iter().cloned().map(Some))
+        .collect();
+    assert_eq!(
+        actual, expected,
+        "PRODUCT: after {ordering}, Bob's paged `vox room read --json` did not show each exact \
+         retained object once, readable, and in source order in room {room}; all rows: {rows:?}"
+    );
+}
+
 #[derive(Clone, Copy, Debug)]
 struct RoomStatus {
     log_entries: u64,
@@ -795,7 +827,7 @@ const AT_WORK: Duration = Duration::from_secs(60);
 const WORK_ROOMS: usize = 3;
 /// Rows Alice seals in each work room before Bob joins it. The fold and package marker holds below
 /// make Bob accept these rows before their author's consent and sender key, respectively.
-const BEFORE_KEY: usize = 8;
+const BEFORE_KEY: usize = 2 * vox_core::node::channel::RENDER_BACKFILL_ROWS_PER_TURN + 1;
 /// Apparatus sampling cadence while the absent-fact state idles. It is no deadline or product
 /// threshold; each status command is judged only by the shipped control socket's own contract.
 const IDLE_STATUS_PACE: Duration = Duration::from_secs(1);
@@ -808,10 +840,12 @@ const IDLE_STATUS_PACE: Duration = Duration::from_secs(1);
 /// Bob MUST render every retained row once and in order. The later agent workload proves ordinary
 /// new rows still cross both ways and page exactly after this recovery.
 ///
-/// Mutants: rebuilding unchanged consent facts, or making a row requeue its absent author at
+/// Mutants: rescanning on an unchanged key fact, or making a row requeue its absent author at
 /// sequence one, turns the parked-state CPU verdict red. Letting a held key bypass consent turns
-/// the key-before-consent privacy verdict red. Removing the consent- or SKDM-triggered durable
-/// queue turns its ordering's exact retained-row verdict red after the source is offline.
+/// the key-before-consent privacy verdict red. Losing a bounded continuation, dropping a
+/// competing author's cursor, disabling either fact-triggered wake, retaining consent across a
+/// revocation, or substituting an equal-text/different-hash row each turns its own exact
+/// user-visible assertion red.
 fn key_before_consent_survives_a_restart(root: &Path) {
     let alice = root.join("alice");
     let bob = root.join("bob");
@@ -941,15 +975,12 @@ fn key_before_consent_survives_a_restart(root: &Path) {
     let _bob_restarted = daemon(&bob, "bob-consent-last-restarted");
     attached(&bob, "bob-consent-last-restarted");
     wait_trust_detail(&bob, "bob", &room, "alice", "you trust each other");
-    let texts = room_texts(&bob, &room);
-    let actual: Vec<String> = texts
-        .into_iter()
-        .filter(|text| text.starts_with("key before consent row "))
-        .collect();
-    assert_eq!(
-        actual, expected,
-        "PRODUCT: after a restart with Alice unavailable, Bob did not reproject each exact row \
-         retained before its key and consent once and in order"
+    assert_exact_read_rows(
+        &bob,
+        &room,
+        &hashes,
+        &expected,
+        "row→key→consent with Alice unavailable and Bob restarted",
     );
 }
 
@@ -963,39 +994,68 @@ fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
     key_before_consent_survives_a_restart(&tmp.path().join("key-before-consent"));
     let row_before_key = tmp.path().join("row-before-key");
     let root = row_before_key.as_path();
-    let alice = root.join("alice");
+    let mut alice = root.join("alice");
     let bob = root.join("bob");
-    for d in [&alice, &bob] {
+    let mut carol = root.join("carol");
+    for d in [&alice, &bob, &carol] {
         std::fs::create_dir_all(d.join("cfg"))
             .unwrap_or_else(|e| panic!("APPARATUS: could not create {}: {e}", d.display()));
     }
     let mut fps = Vec::new();
-    for dir in [&alice, &bob] {
+    for dir in [&alice, &bob, &carol] {
         let (ok, out, err) = vox(dir, &["id"], None);
         assert!(ok, "PRODUCT: `vox id` failed: {err}");
         fps.push(out.trim().to_owned());
     }
-    for (dir, fp, name) in [(&alice, &fps[1], "bob"), (&bob, &fps[0], "alice")] {
+    let alice_id = vox_core::node::link::b32_decode(&fps[0], "Alice fingerprint")
+        .unwrap_or_else(|error| panic!("APPARATUS: Alice's fingerprint was malformed: {error}"));
+    let carol_id = vox_core::node::link::b32_decode(&fps[2], "Carol fingerprint")
+        .unwrap_or_else(|error| panic!("APPARATUS: Carol's fingerprint was malformed: {error}"));
+    if alice_id > carol_id {
+        // The durable queue orders by author fingerprint. Give the lower fingerprint the long
+        // backlog so the competing row genuinely observes a round-robin step rather than the
+        // tree's ordinary successor after a short author.
+        std::mem::swap(&mut alice, &mut carol);
+        fps.swap(0, 2);
+    }
+    for (dir, fp, name) in [
+        (&alice, &fps[1], "bob"),
+        (&alice, &fps[2], "carol"),
+        (&bob, &fps[0], "alice"),
+        (&bob, &fps[2], "carol"),
+        (&carol, &fps[0], "alice"),
+        (&carol, &fps[1], "bob"),
+    ] {
         let (ok, _, err) = vox(dir, &["trust", "add", fp, "--name", name], None);
         assert!(ok, "PRODUCT: `vox trust add` of {name} failed: {err}");
     }
     let fold_hold = root.join("fx22-fold-hold");
+    let carol_fold_hold = root.join("fx22-carol-fold-hold");
     let package_hold = root.join("fx22-package-hold");
     let fold_hold_path = fold_hold
         .to_str()
         .expect("APPARATUS: a UTF-8 fold-hold path")
+        .to_owned();
+    let carol_fold_hold_path = carol_fold_hold
+        .to_str()
+        .expect("APPARATUS: a UTF-8 Carol fold-hold path")
         .to_owned();
     let package_hold_path = package_hold
         .to_str()
         .expect("APPARATUS: a UTF-8 package-hold path")
         .to_owned();
     let fold_knob = [("VOX_TEST_FOLD_HOLD_FILE", fold_hold_path.as_str())];
+    let carol_fold_knob = [("VOX_TEST_FOLD_HOLD_FILE", carol_fold_hold_path.as_str())];
     let package_knob = [("VOX_TEST_HOLD_PACKAGES_FILE", package_hold_path.as_str())];
     let alice_daemon = daemon_env(&alice, "alice", &fold_knob);
+    let carol_daemon = daemon_env(&carol, "carol", &carol_fold_knob);
     attached(&alice, "alice");
+    attached(&carol, "carol");
     let mut rooms = Vec::with_capacity(WORK_ROOMS);
     let mut links = Vec::with_capacity(WORK_ROOMS);
     let mut late_hashes = Vec::with_capacity(WORK_ROOMS);
+    let mut competing_hashes = Vec::with_capacity(WORK_ROOMS);
+    let mut competing_texts = Vec::with_capacity(WORK_ROOMS);
     for i in 1..=WORK_ROOMS {
         let name = format!("work-{i}");
         let (ok, _, err) = vox(
@@ -1041,12 +1101,45 @@ fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
         late_hashes.push(room_late_hashes);
     }
 
+    // Carol is an independently keyed source in every room. Her one retained row sits behind
+    // Alice's continuation of more than two production pages, so eventual exact visibility from
+    // both authors proves the per-author queue does not let that continuation starve a peer.
+    for (index, (room, link)) in rooms.iter().zip(&links).enumerate() {
+        let (ok, out, err) = vox(
+            &carol,
+            &["room", "join", "--passphrase-file", "-", link],
+            Some(&format!("{ROOMPASS}\n")),
+        );
+        assert!(
+            ok,
+            "PRODUCT: Carol could not join work-{}: {out}{err}",
+            index + 1
+        );
+        wait_trust_detail(&carol, "carol", room, "alice", "you trust each other");
+        wait_room_status(&carol, "carol", room, false, |status| {
+            status.received_key_generations >= 1
+        });
+        let text = format!("carol competing row room {}", index + 1);
+        let (ok, out, err) = vox(&carol, &["room", "post", room, "--json", "-"], Some(&text));
+        assert!(ok, "PRODUCT: Carol's competing post failed: {out}{err}");
+        let posted: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|error| {
+            panic!("PRODUCT: Carol's post answer was malformed ({error}): {out}")
+        });
+        competing_hashes.push(vec![posted["entry_hash"]
+            .as_str()
+            .unwrap_or_else(|| panic!("PRODUCT: Carol's post named no entry_hash: {posted}"))
+            .to_owned()]);
+        competing_texts.push(vec![text]);
+    }
+
     // Alice may accept Bob's admission but cannot fold it, so she cannot consent or release her
     // key. Bob nevertheless accepts Alice's existing LogDb prefix. The product itself says that
     // the prefix is present, no sender key is held, Alice has not consented, and none of the named
     // content is readable: those are the APPARATUS preconditions for the late-render verdict.
     std::fs::write(&fold_hold, b"")
         .unwrap_or_else(|error| panic!("APPARATUS: could not engage the fold hold: {error}"));
+    std::fs::write(&carol_fold_hold, b"")
+        .unwrap_or_else(|error| panic!("APPARATUS: could not engage Carol's fold hold: {error}"));
     std::fs::write(&package_hold, b"")
         .unwrap_or_else(|error| panic!("APPARATUS: could not engage the package hold: {error}"));
     let bob_before_key = daemon_env(&bob, "bob", &package_knob);
@@ -1070,6 +1163,12 @@ fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
              existing LogDb prefix in room {room}"
         );
         wait_for_held_rows(&bob, room, &late_hashes[i], "governance-fold");
+        assert_eq!(
+            trust_detail(&bob, "bob", room, "carol"),
+            "you trust it, but it has not trusted you: it cannot read you",
+            "APPARATUS: Carol's governance fold was not visibly held in room {room}"
+        );
+        wait_for_held_rows(&bob, room, &competing_hashes[i], "Carol-governance-fold");
         // Alice has durably accepted Bob's join-side rows before he goes offline; only her held
         // governance fold keeps the release from being issued. Take Bob's count after the paged
         // observation above, so any read record it made is before this causal sync boundary too.
@@ -1115,8 +1214,11 @@ fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
     // observations after Alice stops prove Bob retained both.
     std::fs::remove_file(&fold_hold)
         .unwrap_or_else(|error| panic!("APPARATUS: could not release the fold hold: {error}"));
+    std::fs::remove_file(&carol_fold_hold)
+        .unwrap_or_else(|error| panic!("APPARATUS: could not release Carol's fold hold: {error}"));
     for room in &rooms {
         wait_trust_detail(&alice, "alice", room, "bob", "you trust each other");
+        wait_trust_detail(&carol, "carol", room, "bob", "you trust each other");
     }
 
     // Bob now receives Alice's consent and the sealed package row, but the package marker keeps
@@ -1126,8 +1228,10 @@ fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
     attached(&bob, "bob");
     for (i, room) in rooms.iter().enumerate() {
         wait_trust_detail(&bob, "bob", room, "alice", "you trust each other");
+        wait_trust_detail(&bob, "bob", room, "carol", "you trust each other");
         let held = wait_room_status(&bob, "bob", room, true, |_| true);
         wait_for_held_rows(&bob, room, &late_hashes[i], "logged-key-package");
+        wait_for_held_rows(&bob, room, &competing_hashes[i], "Carol-logged-key-package");
         assert_eq!(
             held.received_key_generations, 0,
             "APPARATUS: Bob accepted Alice's sender key while its package hold was engaged in \
@@ -1140,30 +1244,84 @@ fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
     // observation proves all rows accepted before key and consent were rendered exactly once and
     // in order.
     alice_daemon.stop();
+    carol_daemon.stop();
     std::fs::remove_file(&package_hold)
         .unwrap_or_else(|error| panic!("APPARATUS: could not release the package hold: {error}"));
     for (index, room) in rooms.iter().enumerate() {
         let ready = wait_room_status(&bob, "bob", room, false, |status| {
-            status.received_key_generations >= 1
+            status.received_key_generations >= 2
         });
         let expected_before: Vec<String> = (0..BEFORE_KEY)
             .map(|row| format!("alice before key room {} row {row}", index + 1))
             .collect();
-        let texts = room_texts(&bob, room);
-        let actual_before: Vec<String> = texts
-            .iter()
-            .filter(|text| text.starts_with("alice before key room "))
-            .cloned()
-            .collect();
-        assert_eq!(
-            actual_before, expected_before,
-            "PRODUCT: Bob's paged `vox room read --json` observation did not show every row \
-             accepted before Alice's key and consent exactly once and in order after both landed \
-             (ADR-038 FX-22, #1007); room status {ready:?}; all text rows: {texts:?}"
+        assert_exact_read_rows(
+            &bob,
+            room,
+            &late_hashes[index],
+            &expected_before,
+            &format!("row→consent→key with Alice unavailable; room status {ready:?}"),
+        );
+        assert_exact_read_rows(
+            &bob,
+            room,
+            &competing_hashes[index],
+            &competing_texts[index],
+            "competing-author fairness after Alice's >64-row continuation with both sources \
+             unavailable",
         );
     }
     let _alice_daemon = daemon(&alice, "alice");
     attached(&alice, "alice");
+
+    // The exact post after Alice's revocation is a causal boundary: once Bob retains that
+    // descendant, his doctor answer can no longer be an observation made before the revocation.
+    // Alice's key rotation also keeps the descendant unreadable, so this checks the consent
+    // projection itself rather than granting the row through an old key.
+    let (ok, out, err) = vox(&alice, &["trust", "remove", &fps[1]], None);
+    assert!(
+        ok,
+        "PRODUCT: Alice's `vox trust remove bob` failed: {out}{err}"
+    );
+    let revoked_text = "after Alice revoked Bob";
+    let (ok, out, err) = vox(
+        &alice,
+        &["room", "post", &rooms[0], "--json", "-"],
+        Some(revoked_text),
+    );
+    assert!(
+        ok,
+        "PRODUCT: Alice's post after revocation failed: {out}{err}"
+    );
+    let posted: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|error| {
+        panic!("PRODUCT: Alice's post-after-revocation answer was malformed ({error}): {out}")
+    });
+    let revoked_hash = posted["entry_hash"]
+        .as_str()
+        .unwrap_or_else(|| panic!("PRODUCT: post-after-revocation named no entry_hash: {posted}"))
+        .to_owned();
+    wait_for_held_rows(
+        &bob,
+        &rooms[0],
+        std::slice::from_ref(&revoked_hash),
+        "revocation descendant",
+    );
+    assert_eq!(
+        trust_detail(&bob, "bob", &rooms[0], "alice"),
+        "you trust it, but it has not trusted you: it cannot read you",
+        "PRODUCT: after Bob retained Alice's exact post-revocation descendant {revoked_hash}, \
+         `vox agent doctor` still answered from stale in-memory consent"
+    );
+
+    // Restore the ordinary agents-at-work precondition. The revoked row above remains outside
+    // the new grant; subsequent rows use the new generation and must cross both ways below.
+    let (ok, out, err) = vox(&alice, &["trust", "add", &fps[1], "--name", "bob"], None);
+    assert!(
+        ok,
+        "PRODUCT: Alice could not trust Bob again after the revocation check: {out}{err}"
+    );
+    for room in &rooms {
+        wait_trust_detail(&bob, "bob", room, "alice", "you trust each other");
+    }
 
     // Both have read each other in every room before the clock starts.
     let joined = Instant::now();

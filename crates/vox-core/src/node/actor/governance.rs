@@ -197,6 +197,10 @@ impl Node {
         };
         self.governance_work.after = Some(room);
         let Ok(mut channel) = shared.try_lock() else {
+            // This room's durable work was selected but not examined. Carry the wake into the
+            // next round; a quiet room must not wait for a command, network event or timer tick
+            // merely because another bounded operation held its lock for this turn.
+            self.governance_work.again = true;
             return;
         };
         let progress = match channel.advance_governance(&store, self.now_ms()) {
