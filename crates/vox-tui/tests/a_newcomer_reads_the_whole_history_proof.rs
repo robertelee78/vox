@@ -508,72 +508,6 @@ fn assert_exact_read_rows(
     }
 }
 
-/// Observe exact readable rows from both queued authors. If shipped status says the causal
-/// continuation is exhausted first, re-read the room after that stable boundary before judging
-/// the product. This proves neither author was abandoned without sampling an in-flight turn.
-fn wait_for_both_authors_after_release(
-    dir: &Path,
-    reader: &str,
-    room: &str,
-    long_hashes: &[String],
-    competing_hash: &str,
-) {
-    let mut work_seen = false;
-    loop {
-        let rows = room_rows(dir, room);
-        let readable_long = rows
-            .iter()
-            .filter(|row| {
-                row["entry_hash"].as_str().is_some_and(|hash| {
-                    long_hashes.iter().any(|expected| expected == hash)
-                        && row["text"].as_str().is_some()
-                })
-            })
-            .count();
-        let competing = rows.iter().find(|row| row["entry_hash"] == competing_hash);
-        if competing.is_some_and(|row| row["text"].as_str().is_some()) && readable_long > 0 {
-            return;
-        }
-        let status = room_status(dir, reader, room);
-        work_seen |= status.render_backfill_pending
-            || readable_long > 0
-            || competing.is_some_and(|row| row["text"].as_str().is_some());
-        if work_seen && !status.render_backfill_pending {
-            // `room_rows` is paged, so its first walk can mix states while rendering. Status now
-            // says the continuation is over; judge only a fresh observation made after it.
-            let final_rows = room_rows(dir, room);
-            let final_readable_long = final_rows
-                .iter()
-                .filter(|row| {
-                    row["entry_hash"].as_str().is_some_and(|hash| {
-                        long_hashes.iter().any(|expected| expected == hash)
-                            && row["text"].as_str().is_some()
-                    })
-                })
-                .count();
-            let final_competing_readable = final_rows
-                .iter()
-                .any(|row| row["entry_hash"] == competing_hash && row["text"].as_str().is_some());
-            if final_competing_readable && final_readable_long > 0 {
-                return;
-            }
-            let settled = room_status(dir, reader, room);
-            if settled.render_backfill_pending {
-                work_seen = true;
-                continue;
-            }
-            panic!(
-                "PRODUCT: the causally engaged render continuation finished before both authors \
-                 had an exact readable retained row in room {room}; competing hash \
-                 {competing_hash}; first readable long rows {readable_long}; stable readable long \
-                 rows {final_readable_long}; all stable rows: {final_rows:?}; final status: \
-                 {settled:?}"
-            );
-        }
-        std::thread::yield_now();
-    }
-}
-
 #[derive(Clone, Copy, Debug)]
 struct RoomStatus {
     log_entries: u64,
@@ -1270,6 +1204,9 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
     let carol_fold_hold = root.join("fx22-carol-fold-hold");
     let package_hold = root.join("fx22-package-hold");
     let render_hold = root.join("fx22-render-hold");
+    let render_hold_ready = root.join("fx22-render-hold.ready");
+    let render_hold_engaged = root.join("fx22-render-hold.engaged");
+    let render_hold_replacement = root.join("fx22-render-hold-replacement");
     let sweep_hold = root.join("fx22-sweep-hold");
     let sweep_engaged = root.join("fx22-sweep-hold.engaged");
     let fold_hold_path = fold_hold
@@ -1560,20 +1497,121 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
     // in order.
     alice_daemon.stop();
     carol_daemon.stop();
+    let fairness_room = room_id(&bob, "bob", &rooms[0]);
+    let long_author = vox_core::node::link::b32_decode(&fps[0], "long author fingerprint")
+        .unwrap_or_else(|error| panic!("APPARATUS: Alice's fingerprint was malformed: {error}"));
+    let competing_author =
+        vox_core::node::link::b32_decode(&fps[2], "competing author fingerprint").unwrap_or_else(
+            |error| panic!("APPARATUS: Carol's fingerprint was malformed: {error}"),
+        );
+    let mut key_stage = Vec::with_capacity(96);
+    key_stage.extend_from_slice(&fairness_room);
+    key_stage.extend_from_slice(&long_author);
+    key_stage.extend_from_slice(&competing_author);
+    std::fs::write(&render_hold, key_stage).unwrap_or_else(|error| {
+        panic!("APPARATUS: could not hold both exact authors' render cursors: {error}")
+    });
     std::fs::remove_file(&package_hold)
         .unwrap_or_else(|error| panic!("APPARATUS: could not release the package hold: {error}"));
-    // Readiness is author-specific and causal: in every room, observe exact readable retained
-    // rows from both authors. If a paged observation overlaps the final render turn, shipped
-    // pending state supplies a stable boundary and the helper re-observes before any verdict.
-    for (index, room) in rooms.iter().enumerate() {
-        wait_for_both_authors_after_release(
-            &bob,
-            "bob",
-            room,
-            &late_hashes[index],
-            &competing_hashes[index][0],
-        );
+
+    // The 96-byte apparatus marker is renamed only after this real daemon holds the sender keys
+    // of both exact authors. Rendering stays parked, so neither package arrival can win a race
+    // and drain its author before the other author is runnable.
+    while !render_hold_ready.exists() {
+        std::thread::yield_now();
     }
+    let mut fair_turn = Vec::with_capacity(64);
+    fair_turn.extend_from_slice(&fairness_room);
+    fair_turn.extend_from_slice(&competing_author);
+    std::fs::write(&render_hold_replacement, fair_turn).unwrap_or_else(|error| {
+        panic!("APPARATUS: could not prepare the competing-author turn marker: {error}")
+    });
+    std::fs::rename(&render_hold_replacement, &render_hold).unwrap_or_else(|error| {
+        panic!("APPARATUS: could not arm the competing-author turn marker: {error}")
+    });
+    std::fs::remove_file(&render_hold_ready)
+        .unwrap_or_else(|error| panic!("APPARATUS: could not release the exact-key hold: {error}"));
+    let fairness_wake = rename_hash(&bob, "bob", &rooms[0], "fx22-fair-turn");
+    assert!(
+        room_hashes(&bob, "bob", &rooms[0]).contains(&fairness_wake),
+        "PRODUCT: Bob's exact fairness wake {fairness_wake} was absent from room {}",
+        rooms[0]
+    );
+
+    // The marker engages only after one real bounded turn commits Carol's exact-author row, then
+    // parks later turns. If Alice's exact backlog becomes wholly readable before that boundary,
+    // author service was not fair; this cannot depend on catching a transient scheduling window.
+    while !render_hold_engaged.exists() {
+        let rows = room_rows(&bob, &rooms[0]);
+        if render_hold_engaged.exists() {
+            break;
+        }
+        let status = room_status(&bob, "bob", &rooms[0]);
+        if !status.render_backfill_pending && !render_hold_engaged.exists() {
+            panic!(
+                "APPARATUS: Bob's render continuation finished before the exact competing-author \
+                 marker engaged in room {}; staging was not achieved: {status:?}; rows: {rows:?}",
+                rooms[0]
+            );
+        }
+        std::thread::yield_now();
+    }
+    let fair_rows = room_rows(&bob, &rooms[0]);
+    let competing: Vec<_> = fair_rows
+        .iter()
+        .filter(|row| row["entry_hash"] == competing_hashes[0][0])
+        .collect();
+    assert_eq!(
+        competing.len(),
+        1,
+        "PRODUCT: the held fair turn did not show Carol's exact retained row {} once in room {}: \
+         {fair_rows:?}",
+        competing_hashes[0][0],
+        rooms[0]
+    );
+    assert_eq!(
+        competing[0]["text"].as_str(),
+        Some(competing_texts[0][0].as_str()),
+        "PRODUCT: the held fair turn did not make Carol's exact retained row {} readable in room \
+         {}: {}",
+        competing_hashes[0][0],
+        rooms[0],
+        competing[0]
+    );
+    let fair_readable_long = fair_rows
+        .iter()
+        .filter(|row| {
+            row["entry_hash"].as_str().is_some_and(|hash| {
+                late_hashes[0].iter().any(|expected| expected == hash)
+                    && row["text"].as_str().is_some()
+            })
+        })
+        .count();
+    assert!(
+        fair_readable_long < late_hashes[0].len(),
+        "PRODUCT: Carol's exact retained row became readable only after all {} rows of Alice's \
+         continuation in room {}; the bounded author queue was not fair: {fair_rows:?}",
+        late_hashes[0].len(),
+        rooms[0]
+    );
+    let fair_status = room_status(&bob, "bob", &rooms[0]);
+    assert!(
+        fair_status.render_backfill_pending,
+        "PRODUCT: shipped status said no render work remained at the held fair-turn boundary, \
+         although only {fair_readable_long} of Alice's {} exact rows were readable in room {}: \
+         {fair_status:?}",
+        late_hashes[0].len(),
+        rooms[0]
+    );
+    std::fs::remove_file(&render_hold_engaged)
+        .unwrap_or_else(|error| panic!("APPARATUS: could not release the fair-turn hold: {error}"));
+    let continuation_wake = rename_hash(&bob, "bob", &rooms[0], "fx22-fair-turn-resume");
+    assert!(
+        room_hashes(&bob, "bob", &rooms[0]).contains(&continuation_wake),
+        "PRODUCT: Bob's exact continuation wake {continuation_wake} was absent from room {}",
+        rooms[0]
+    );
+
     for (index, room) in rooms.iter().enumerate() {
         let expected_before: Vec<String> = (0..BEFORE_KEY)
             .map(|row| format!("alice before key room {} row {row}", index + 1))

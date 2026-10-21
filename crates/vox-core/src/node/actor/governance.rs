@@ -330,6 +330,17 @@ impl Node {
             Ok(pending) => self.governance_work.again |= pending,
             Err(error) => channel.poison(&error),
         }
+        #[cfg(feature = "test-knobs")]
+        if channel.render_backfill_held_for_proof() {
+            // The durable queue and shipped status remain pending. Apparatus owns the next wake
+            // after it observes the causally held turn; do not spin while its marker is engaged.
+            drop(channel);
+            if progress.changed || backfilled > 0 {
+                self.publish().await;
+            }
+            self.governance_work.pending = false;
+            return;
+        }
         // Classification has no authority until governance is current. Continue its
         // bounded sealed scan in this same round-robin room turn; a quiet room must not
         // need another sync to finish, and an unresolved absent target is not busy work.

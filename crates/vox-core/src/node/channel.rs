@@ -519,17 +519,45 @@ pub const TEST_EXPIRING_ADMIN_ENV: &str = "VOX_TEST_EXPIRING_ADMIN";
 #[cfg(feature = "test-knobs")]
 pub const TEST_EXPIRING_ADMIN_LIFETIME: std::time::Duration = std::time::Duration::from_secs(20);
 
-/// **Test-only**: while the named marker exists, retain an already durable render continuation
-/// without advancing it. Proofs use the shipped status command to distinguish "no work was
-/// queued" from a synchronous rescan that would otherwise finish before the command returns.
+/// **Test-only**: an empty named marker retains every already durable render continuation without
+/// advancing it. A 96-byte marker names one room and two authors; that room remains held until it
+/// has both exact sender keys, when the marker is renamed with `.ready` appended. A 64-byte marker
+/// names one room and one author; the first bounded turn that commits a row by that author renames
+/// it with `.engaged` appended, and later turns for that room park until the engaged marker is
+/// removed. Proofs use shipped status/read commands at the causal boundary; marker states are
+/// apparatus, never verdicts or test-only counts.
 #[cfg(feature = "test-knobs")]
 pub const TEST_HOLD_RENDER_ENV: &str = "VOX_TEST_HOLD_RENDER_FILE";
 
 #[cfg(feature = "test-knobs")]
-fn render_backfill_held() -> bool {
+fn render_hold_path() -> Option<std::path::PathBuf> {
     std::env::var_os(TEST_HOLD_RENDER_ENV)
         .filter(|path| !path.is_empty())
-        .is_some_and(|path| std::path::Path::new(&path).exists())
+        .map(std::path::PathBuf::from)
+}
+
+#[cfg(feature = "test-knobs")]
+fn render_hold_suffixed_path(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+    let mut suffixed = path.as_os_str().to_owned();
+    suffixed.push(suffix);
+    suffixed.into()
+}
+
+#[cfg(feature = "test-knobs")]
+fn engage_render_hold(room: &Digest32, rows: &[Rendered]) {
+    let Some(path) = render_hold_path() else {
+        return;
+    };
+    let Ok(marker) = std::fs::read(&path) else {
+        return;
+    };
+    if marker.len() != 64 || marker[..32] != room[..] {
+        return;
+    }
+    let author = &marker[32..];
+    if rows.iter().any(|row| row.author[..] == author[..]) {
+        let _ = std::fs::rename(&path, render_hold_suffixed_path(&path, ".engaged"));
+    }
 }
 
 /// **Test-only**: a smaller room, so a proof fills one with a few members rather than 1,024. Its
@@ -7842,7 +7870,7 @@ impl ChannelState {
         expired: &mut Vec<(Digest32, Tracked)>,
     ) -> Result<Vec<Rendered>> {
         #[cfg(feature = "test-knobs")]
-        if render_backfill_held() {
+        if self.render_backfill_held_for_proof() {
             return Ok(Vec::new());
         }
         let consent = match self.consent_facts() {
@@ -8013,8 +8041,43 @@ impl ChannelState {
         };
         self.chains_advanced = false;
         let rendered = rows.len();
+        #[cfg(feature = "test-knobs")]
+        engage_render_hold(&self.channel_id, &rows);
         self.place_committed(store, rows, &expired)?;
         Ok(rendered)
+    }
+
+    /// Whether test apparatus has parked this room after a causally named render turn. The
+    /// durable queue remains truthful through [`Self::governance_backfill_pending`]; the actor
+    /// merely stops rescheduling until the proof removes the marker and supplies its next event.
+    #[cfg(feature = "test-knobs")]
+    #[must_use]
+    pub fn render_backfill_held_for_proof(&self) -> bool {
+        let Some(path) = render_hold_path() else {
+            return false;
+        };
+        if let Ok(marker) = std::fs::read(&path) {
+            if marker.is_empty() {
+                return true;
+            }
+            if marker.len() == 96 && marker[..32] == self.channel_id[..] {
+                let mut first = [0; 32];
+                first.copy_from_slice(&marker[32..64]);
+                let mut second = [0; 32];
+                second.copy_from_slice(&marker[64..]);
+                if self.has_sender_key(&first) && self.has_sender_key(&second) {
+                    let _ = std::fs::rename(&path, render_hold_suffixed_path(&path, ".ready"));
+                }
+                return true;
+            }
+        }
+        if std::fs::read(render_hold_suffixed_path(&path, ".ready"))
+            .is_ok_and(|marker| marker.len() == 96 && marker[..32] == self.channel_id[..])
+        {
+            return true;
+        }
+        std::fs::read(render_hold_suffixed_path(&path, ".engaged"))
+            .is_ok_and(|marker| marker.len() == 64 && marker[..32] == self.channel_id[..])
     }
 
     /// Try to decrypt one stored content payload and, on success, render it into the
