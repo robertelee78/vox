@@ -100,11 +100,11 @@ pub const MIN_TEST_FRAME: usize = 4 * 1024;
 ///
 /// #189's proof shows that `vox room list` and `vox trust list` name every entry past one frame,
 /// through the shipped binary. At the real 256 KiB frame that takes about 1,540 rooms, each
-/// sealed with production Argon2id, which does not fit a watchdog; the decider puts a node's
-/// realistic ceiling at a couple of hundred rooms. With a smaller frame, a couple of hundred
-/// rooms outgrow one, so a reply that is not paged fails exactly as the defect did ("ipc frame
-/// length"), and a paged one crosses several pages. It only ever lowers the limit, clamped to
-/// [`MIN_TEST_FRAME`]..=[`MAX_FRAME`]; unset, empty or unparsable is [`MAX_FRAME`]. Under it, a
+/// sealed with production Argon2id, which makes the real-limit journey needlessly expensive; the
+/// decider puts a node's realistic ceiling at a couple of hundred rooms. With a smaller frame, a
+/// couple of hundred rooms outgrow one, so a reply that is not paged fails exactly as the defect
+/// did ("ipc frame length"), and a paged one crosses several pages. It only ever lowers the limit,
+/// clamped to [`MIN_TEST_FRAME`]..=[`MAX_FRAME`]; unset, empty or unparsable is [`MAX_FRAME`]. Under it, a
 /// single row larger than half the frame (a long message) is refused, so a proof that sets it
 /// keeps its rows small.
 #[cfg(feature = "test-knobs")]

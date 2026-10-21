@@ -264,14 +264,12 @@ const STALL_BUDGET: Duration = Duration::from_secs(30);
 #[test]
 #[ignore = "real daemons and `vox tui` in a pty, with production Argon2id; CI runs it in release"]
 fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
-    // A hung proof is a failing proof (ADR-018 §6), and the driver is bounded on its own (#240).
-    // Its bounds are the product's: a member waits 480 s for a joiner's proof of work (V210-87),
-    // which a debug build can take minutes to grind, and the driver joins three members at once, then
-    // a fourth while the TUI is open and has it join again twice (`reoffer`), opens the TUI once more
-    // (`offer`) and three times more (`depths`, about 90 s).
-    // So the driver's budget is 1950 s, it is stopped from outside at 1980 s, and the watchdog is
-    // past both. A release run takes about two minutes.
-    watchdog::arm_for(Duration::from_secs(2080));
+    // The driver has causal step bounds (#240). A member waits 480 s for a joiner's proof of work
+    // (V210-87), which a debug build can take minutes to grind, and the driver joins three members
+    // at once, then a fourth while the TUI is open and has it join again twice (`reoffer`), opens
+    // the TUI once more (`offer`) and three times more (`depths`, about 90 s).
+    // The driver reports no result after 1980 s; a release run takes about two minutes.
+    watchdog::arm();
     // Bob's keyring window is a minute, so the trust prompt's passphrase field is typed into
     // (`trust`): the window is closed by then.
     test_knobs::require(&["VOX_TEST_KEYRING_WINDOW_SECS"]);

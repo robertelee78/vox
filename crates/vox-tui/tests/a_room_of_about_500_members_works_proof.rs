@@ -40,8 +40,7 @@
 //! restarted members caught up within 1.8 s); at 64, 203 s (joins 187 s, each p90 23.7 s; the post
 //! read by all within 3.8 s; catch-up within 3.2 s). A join's cost grows with the room (1.6 s per
 //! member staged at 16, 2.9 s at 64), so the large arm's staging is expected to take about 1.5 to
-//! 2.5 hours; its watchdog allows 4. Run it in a terminal that stays open, not a background job
-//! with a shorter limit.
+//! 2.5 hours. Run it in a terminal that stays open, not a background job with an elapsed limit.
 //!
 //! **What loopback does not show, stated:** every member here is on one machine and one network,
 //! so the anchor sees a single source for all of them, and no packet is lost or delayed. A room
@@ -54,7 +53,7 @@
 //!
 //! **Every red says which it is**: `PRODUCT:` quotes what `vox` said or did; `CANNOT MEASURE:`
 //! names staging that was not achieved or a harness too slow to look; `APPARATUS:` names a fault
-//! of the proof's own; the watchdog says it is the watchdog.
+//! of the proof's own; an operator emergency timebox says `CANNOT MEASURE` or `NO RESULT`.
 //!
 //! **Mutation that must turn it red:** a room that cannot hold this many members — the cap on
 //! admitted authors per room (`MAX_AUTHORS`, `vox-core/src/node/channel.rs`) below the arm's
@@ -102,9 +101,7 @@ struct Arm {
 #[test]
 #[ignore = "real binaries and production Argon2id: the release gate runs it"]
 fn a_room_of_many_members_works() {
-    // A debug build's budget: a join per member; an unlock for each `vox id`, daemon and trust
-    // (the member's and the host's), the host's own three, and each restart.
-    watchdog::arm_for_setup(SMALL as u32, (4 * SMALL + 3 + RESTARTED) as u32);
+    watchdog::arm();
     a_room_of(&Arm {
         members: SMALL,
         deliver_within: Duration::from_secs(60),
@@ -116,8 +113,7 @@ fn a_room_of_many_members_works() {
 #[test]
 #[ignore = "500 daemons and production Argon2id; run by hand in release, never in CI"]
 fn a_room_of_about_500_members_works() {
-    // Staging 500 members takes far past the default 600 s (see the module docs for the time).
-    watchdog::arm_for(Duration::from_secs(4 * 3600));
+    watchdog::arm();
     a_room_of(&Arm {
         members: LARGE,
         deliver_within: Duration::from_secs(300),

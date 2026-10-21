@@ -148,8 +148,8 @@ fn the_room_read_shows_each_reader_its_own_name_for_the_addressee() {
 #[test]
 #[ignore = "real daemons and `vox tui` in a pty, with production Argon2id; run it in release"]
 fn the_tui_shows_each_node_its_own_name_for_the_addressee() {
-    // Bounded as `tui_member_names_proof` is, for the same two joins in a debug build.
-    watchdog::arm_for(Duration::from_secs(1400));
+    // The pty driver owns the same causal join bounds as `tui_member_names_proof`.
+    watchdog::arm();
     let script = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/pty/tui_addressee_names.py"

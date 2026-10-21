@@ -405,7 +405,7 @@ fn arrivals(
 #[test]
 #[ignore = "real vox daemons and production Argon2id; CI runs it in release"]
 fn a_newcomer_reads_a_short_history_once_each_in_order() {
-    watchdog::arm_for_setup(1, 7);
+    watchdog::arm();
     let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("APPARATUS: no temp dir: {e}"));
     newcomer_reads_the_whole_history(tmp.path(), BACKLOG, PAGE);
 }
@@ -415,7 +415,7 @@ fn a_newcomer_reads_a_short_history_once_each_in_order() {
 #[test]
 #[ignore = "real vox daemons, 1,500 CLI posts and production Argon2id; optional, run it in release"]
 fn a_newcomer_trusted_before_every_post_reads_all_of_them() {
-    watchdog::arm_for_setup(1, 7);
+    watchdog::arm();
     let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("APPARATUS: no temp dir: {e}"));
     newcomer_reads_the_whole_history(tmp.path(), 1_500, 500);
 }
@@ -427,7 +427,7 @@ fn a_newcomer_trusted_before_every_post_reads_all_of_them() {
 #[test]
 #[ignore = "a timing bound a person feels; real vox daemons; optional, run it in release on a real machine"]
 fn a_newcomer_talks_both_ways_at_one_wait_fresh_or_behind_a_backlog() {
-    watchdog::arm_for_setup(2, 14);
+    watchdog::arm();
     let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("APPARATUS: no temp dir: {e}"));
     let mut measured = Vec::new();
     for (name, posts) in [("fresh", 0usize), ("backlog", BACKLOG)] {
@@ -474,7 +474,7 @@ const IDLE: Duration = Duration::from_secs(60);
 #[test]
 #[ignore = "an idle minute on two real vox daemons; optional, run it in release"]
 fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
-    watchdog::arm_for_setup(1, 6);
+    watchdog::arm();
     let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("APPARATUS: no temp dir: {e}"));
     let root = tmp.path();
     let alice = root.join("alice");
@@ -617,7 +617,7 @@ const ANSWER_WITHIN: Duration = Duration::from_millis(200);
 #[test]
 #[ignore = "a minute of two real vox daemons at work; optional, run it in release"]
 fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
-    watchdog::arm_for_setup(1, 8);
+    watchdog::arm();
     let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("APPARATUS: no temp dir: {e}"));
     let root = tmp.path();
     let alice = root.join("alice");
@@ -852,7 +852,7 @@ const COUNT_STILL_WITHIN: Duration = Duration::from_secs(10);
 #[test]
 #[ignore = "a timing bound a person feels; two real vox daemons; optional, run it in release"]
 fn a_daemon_answers_the_hook_while_syncing() {
-    watchdog::arm_for_setup(1, 8);
+    watchdog::arm();
     let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("APPARATUS: no temp dir: {e}"));
     let root = tmp.path();
     let alice = root.join("alice");

@@ -489,9 +489,9 @@ const CARD_IMAGE: &[u8; 1024] = &[0x5a; 1024];
 #[ignore = "builds the xcframework, compiles Swift, runs a real daemon; CI runs it in release on macOS"]
 fn a_swift_app_embeds_the_node_and_talks_to_a_daemon() {
     let tmp = tempfile::tempdir().unwrap();
-    // Built before the watchdog is armed: the build is a release compile of the workspace plus
-    // the bindings, minutes on a CI runner, and the 600 s budget bounds a hung *proof*, not cargo
-    // (#257: the watchdog killed aws-lc-sys's build script mid-compile).
+    // Built before optional emergency cleanup is armed: the build is a release compile of the
+    // workspace plus the bindings and can take minutes on a runner. An operator's elapsed
+    // timebox is for the proof run, not cargo (#257: the old default killed aws-lc-sys mid-build).
     let harness = &harnesses().node;
     watchdog::arm();
 

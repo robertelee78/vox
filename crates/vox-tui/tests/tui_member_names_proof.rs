@@ -24,13 +24,12 @@ use std::time::Duration;
 #[test]
 #[ignore = "real daemons and `vox tui` in a pty, with production Argon2id; CI runs it in release"]
 fn the_tui_names_a_trusted_member_by_name_and_anyone_else_by_fingerprint_marked() {
-    // A hung proof is a failing proof (ADR-018 §6), and the driver is bounded on its own (V210-54,
-    // #240). Its bounds are the product's: a member waits 480 s for a joiner's proof of work
-    // (V210-87), which a debug build grinds for a minute or more, and the driver joins two members.
-    // At a 240 s budget a debug run was cut off mid-join and read as a hang (V210-111, #307). So the
-    // driver's budget is 1260 s, it is stopped from outside at 1290 s, and the watchdog is past
-    // both. A release run takes about 40 s.
-    watchdog::arm_for(Duration::from_secs(1400));
+    // The driver has causal step bounds (V210-54, #240). A member waits 480 s for a joiner's proof
+    // of work (V210-87), which a debug build grinds for a minute or more, and the driver joins two
+    // members.
+    // At 240 s a debug run was cut off mid-join and read as a hang (V210-111, #307). The driver now
+    // reports no result after 1290 s; a release run takes about 40 s.
+    watchdog::arm();
     let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/pty/tui_member_names.py");
     let out = pty_driver::run_within(
         script,

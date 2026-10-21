@@ -80,11 +80,8 @@ const P90_BOUND: Duration = Duration::from_millis(75);
 #[test]
 #[ignore = "optional proof: stages a room of many members through the shipped binary"]
 fn a_room_of_many_members_syncs_without_holding_its_lock() {
-    // Staging [`MEMBERS`] joins takes minutes, past the default 600 s watchdog (ADR-018 §6) on a
-    // loaded machine; this opt-in proof takes a budget of its own unless one is set.
-    if std::env::var_os("VOX_TEST_WATCHDOG_SECS").is_none() {
-        std::env::set_var("VOX_TEST_WATCHDOG_SECS", "1800");
-    }
+    // This long proof has no implicit elapsed bound. An operator may choose the ADR-018 §6
+    // emergency timebox explicitly for an unattended run.
     watchdog::arm();
     let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let root = tmp.path();

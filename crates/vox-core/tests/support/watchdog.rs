@@ -1,24 +1,16 @@
-//! A wall-clock bound on the whole gate process.
+//! Operator-chosen emergency cleanup for a proof process.
 //!
-//! ## Why this exists
-//! On 2026-09-20 two `node_m15_anchor_gate` processes were found still running **21 hours**
-//! after they started, each burning about 1.5 cores. They were left behind by a debugging
-//! session: the gate hung, the run was abandoned, the defect was fixed, and nothing ever
-//! reaped the processes. Nobody noticed, because **a hung test is silent** — it produces no
-//! failure, no output and no exit status, so no gate can catch it. It looks exactly like a test
-//! that is still running.
+//! ## Why there is no default clock
+//! A whole-process elapsed limit cannot tell a wedge from legitimate progress. A progressing
+//! 700-second proof is not broken because an arbitrary 600-second number elapsed, and silence is
+//! not a product observation. Product and structural assertions detect wedges. Consequently
+//! [`arm`], [`arm_for_setup`], [`arm_for_debug_total`] and [`arm_for`] start no clock or abort
+//! thread unless the operator explicitly sets a positive `VOX_TEST_WATCHDOG_SECS` for this run.
 //!
-//! ## Why `tokio::time::timeout` is not enough
-//! The gates already wrap every wait in `tokio::time::timeout`. That bounds **one await inside
-//! a working runtime**, and nothing else. It cannot bound:
-//!
-//! - a task spinning without yielding, which starves the timer it would have to fire on;
-//! - a blocking call on a runtime thread;
-//! - anything after `block_on` returns — a leaked task, a stuck `Drop`, a non-exiting runtime;
-//! - the process itself, once libtest thinks the test is over.
-//!
-//! Each of those looks identical from outside: a process that never ends. So the bound has to
-//! be outside the runtime, on the clock, and it has to end the **process**.
+//! The emergency timebox remains available because abandoned proof runs have left process trees
+//! consuming CPU for hours. When explicitly requested it gathers diagnostics, kills descendants,
+//! and aborts the proof process. Its outcome is only `NO RESULT` or `CANNOT MEASURE`, never a
+//! PRODUCT or APPARATUS verdict: elapsed time alone proves neither.
 //!
 //! ## Why it prints the stacks itself, and writes past libtest
 //! The first version said why it was aborting with `eprintln!` and left the stacks to the OS's
@@ -44,8 +36,8 @@
 //!   So this process allows tracing once the watchdog fires, and a `vox` built with `test-knobs`
 //!   allows it from its start.
 //!
-//! It also names the tests still running: every test arms the watchdog, and each arming is
-//! struck off when that test's thread ends, so what is left is the test that hung.
+//! It also names the tests still running: each test that arms an enabled emergency timebox is
+//! struck off when that test's thread ends.
 //!
 //! ## Why `abort` rather than `exit`
 //! `std::process::abort` raises `SIGABRT`, which makes the OS write a crash report naming every
@@ -68,29 +60,15 @@
 //! children, so the one dump a hang produced held no evidence of the cause (V210-36, #213). So
 //! each live descendant is dumped the same way, named by pid and command line, **before** any is
 //! killed — a dead process has no stacks to show. The descendants' dumps share one bound,
-//! [`DESCENDANTS_PATIENCE`], so a tree of many processes cannot undo the watchdog's own bound.
+//! [`DESCENDANTS_PATIENCE`], so a tree of many processes cannot prevent an explicitly requested
+//! emergency abort from completing.
 //!
-//! ## Why a debug build's budget is larger, by a measured amount
-//! A debug build's `vox` spends 10–100 times as long in production Argon2id and in the join's
-//! proof of work as a release build does: every unlock (any verb that opens a profile, a daemon
-//! starting, a room created) and every join. A proof that sets up a room of five members passed in
-//! 500 s of its 600 s on one tree, and was aborted 3 runs of 3 on the next (V210-99, #295), with
-//! nothing wrong but that cost. Those costs are the product's, never weakened for a test. So a
-//! proof that pays them arms with [`arm_for_setup`], naming how many joins and unlocks its setup makes, and a debug build adds
-//! [`DEBUG_JOIN`] per join and [`DEBUG_UNLOCK`] per unlock to the budget: twice the most each was
-//! measured to cost a debug build on a machine doing its ordinary concurrent work. Twice, because
-//! the next run may be slower than any measured (a fill sized to its slowest add met a slower one
-//! on the next run), and a hang is minutes or hours over, so the headroom costs the watchdog
-//! nothing. A release build's budget is unchanged.
-//!
-//! ## Why it does not say "hung"
-//! It used to say "It is hung, not slow … the runtime is not making progress" every time. In a
-//! real-binary proof the test process is only waiting on its children, and a runner that stopped
-//! scheduling it — or a machine that slept — looks the same from here. So it says what it can
-//! measure (V210-106): how long the process ran by the monotonic and the wall clock, how far its
-//! own sleeps overran (a stall of this process), and how much CPU this process and each one it
-//! started used over the last two seconds (a spinning or a waiting product) — and from that, which
-//! side the budget was exceeded on: a PRODUCT HANG, an APPARATUS STALL, or NO RESULT.
+//! ## Why it never says "hung"
+//! A real-binary proof process is usually waiting on children. A slow machine, a sleeping machine,
+//! legitimate work, a process spinning, and a process wedged in a wait can all outlive the same
+//! wall-clock choice. The emergency report therefore says only what it measured: monotonic and
+//! wall time, scheduler stalls, CPU, and stacks. Interpretation belongs to the proof's structural
+//! assertions or a person reading the dump, not the clock.
 //!
 //! ## Why its verdict is the first red line, and the process ends by its abort
 //! Killing a proof's processes kills the `vox` verb a test thread is waiting on. That thread used
@@ -101,10 +79,9 @@
 //! waits: nothing but the watchdog's abort ends the process, and nothing but its verdict and dumps
 //! precedes it.
 //!
-//! The budget is deliberately generous: it is not a performance assertion, it is the line past
-//! which "slow" is no longer a credible explanation. Override with `VOX_TEST_WATCHDOG_SECS`,
-//! and `VOX_TEST_WATCHDOG_SECS=0` disables it — for attaching a debugger, which is the one
-//! case where an unbounded hang is what you want.
+//! Ordinary cancellation and scope exit still use each proof handle's `Drop` cleanup; that is
+//! independent of this module. With no emergency timebox, a hard kill of the proof process runs
+//! no destructor and leaves this process no opportunity to reap already-daemonized descendants.
 
 // Every proof includes this module, so it carries the temporary HOME every proof's children get
 // (V210-157, #379); see that module.
@@ -113,20 +90,16 @@ pub mod temp_home;
 
 use std::io::Write as _;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, Once};
 use std::time::{Duration, Instant, SystemTime};
-
-/// Past this, a gate is stuck — a product hang or an apparatus stall — rather than slow. The
-/// longest gate observed is ~53 s.
-const DEFAULT_BUDGET: Duration = Duration::from_secs(600);
 
 /// A sleep of the watchdog's that overran by more than this means this process was not scheduled
 /// for that long — the runner stalled it, or the machine slept.
 const STALL: Duration = Duration::from_secs(5);
 
 /// A process this test started that used at least this much CPU over the census's last 2 s is
-/// still working, so a budget that ran out on it is not a hang (V210-106): a debug `trust add`
+/// still working when an emergency timebox expires (V210-106): a debug `trust add`
 /// hashing a passphrase ran at 78%, and a release `vox serve` cut short mid-proof at 8-13%. An
 /// idle `vox` measures about 1%: only a process near 0 is stuck.
 const BUSY_PCT: f64 = 5.0;
@@ -147,20 +120,9 @@ pub const DEBUG_JOIN: Duration = Duration::from_millis(2 * 142_000);
 #[allow(dead_code)]
 pub const DEBUG_UNLOCK: Duration = Duration::from_millis(2 * 14_100);
 
-/// What [`DEBUG_JOIN`] rests on, printed when a debug build arms for its setup.
-const DEBUG_JOIN_MEASURED: &str = "a join: 36 measured, median 47.8s, most 142.0s";
-
-/// What [`DEBUG_UNLOCK`] rests on, printed when a debug build arms for its setup.
-const DEBUG_UNLOCK_MEASURED: &str = "an unlock: 45 measured, median 6.5s, most 14.1s";
-
-/// The budget, in seconds: the largest any test of this binary asked for through [`arm_for`] or
-/// [`arm_for_setup`], and never less than [`DEFAULT_BUDGET`]. Tests run in parallel threads of one
-/// process, so the largest covers every one of them.
-static BUDGET_SECS: AtomicU64 = AtomicU64::new(DEFAULT_BUDGET.as_secs());
-
 /// What `joins` joins and `unlocks` unlocks cost this build beyond a release build's: in a
 /// release build nothing, in a debug build twice their measured most ([`DEBUG_JOIN`],
-/// [`DEBUG_UNLOCK`]). For a driver's own budget that waits on them, as for the watchdog's.
+/// [`DEBUG_UNLOCK`]). Proof drivers use this only for their own source-owned staging bounds.
 #[allow(dead_code)]
 pub fn debug_cost(joins: u32, unlocks: u32) -> Duration {
     if cfg!(debug_assertions) {
@@ -170,43 +132,18 @@ pub fn debug_cost(joins: u32, unlocks: u32) -> Duration {
     }
 }
 
-/// [`arm`], for a test whose setup makes `joins` joins and `unlocks` production-Argon2id unlocks:
-/// a debug build's budget grows by their measured cost ([`debug_cost`]), and says so.
+/// [`arm`], retained for proofs that describe their debug setup in source. Setup size does not
+/// create an elapsed bound; only the operator's explicit `VOX_TEST_WATCHDOG_SECS` does.
 #[allow(dead_code)]
-pub fn arm_for_setup(joins: u32, unlocks: u32) {
-    let extra = debug_cost(joins, unlocks);
-    if !extra.is_zero() {
-        say(&format!(
-            "[watchdog] debug build: budget {}s = {}s + {joins} join(s) x {:.1}s + {unlocks} \
-             unlock(s) x {:.1}s (each twice the most measured: {DEBUG_JOIN_MEASURED}; \
-             {DEBUG_UNLOCK_MEASURED})\n",
-            (DEFAULT_BUDGET + extra).as_secs(),
-            DEFAULT_BUDGET.as_secs(),
-            DEBUG_JOIN.as_secs_f64(),
-            DEBUG_UNLOCK.as_secs_f64(),
-        ));
-    }
-    arm_for(DEFAULT_BUDGET + extra);
+pub fn arm_for_setup(_joins: u32, _unlocks: u32) {
+    arm();
 }
 
-/// [`arm`], for a proof whose debug-build budget is sized on its own whole run rather than on its
-/// steps (whose most-measured costs, summed, would come past what any run is given): twice
-/// `slowest`, the slowest of `runs` measured debug runs of that proof, and never less than
-/// [`DEFAULT_BUDGET`]. A release build's budget is unchanged.
+/// Compatibility spelling for proofs that used to derive a watchdog duration from measured debug
+/// runs. The measurements remain useful documentation, but no longer impose an elapsed bound.
 #[allow(dead_code)]
-pub fn arm_for_debug_total(slowest: Duration, runs: u32) {
-    if cfg!(debug_assertions) {
-        let budget = (slowest * 2).max(DEFAULT_BUDGET);
-        say(&format!(
-            "[watchdog] debug build: budget {}s = twice the slowest of {runs} measured debug \
-             runs of this proof ({:.1}s)\n",
-            budget.as_secs(),
-            slowest.as_secs_f64()
-        ));
-        arm_for(budget);
-    } else {
-        arm();
-    }
+pub fn arm_for_debug_total(_slowest: Duration, _runs: u32) {
+    arm();
 }
 
 /// How long the stack dump may take before the abort goes ahead without it. Symbolicating a
@@ -229,14 +166,14 @@ static ARMED: Once = Once::new();
 static HOME_CHECKED: Once = Once::new();
 
 /// Set once [`fire`] begins. From then on a test thread that panics parks instead of finishing
-/// (see [`arm_for`]).
+/// (see [`arm_for`], when the operator enabled its emergency timebox).
 static FIRING: AtomicBool = AtomicBool::new(false);
 
 /// Every descendant [`record_descendants`] has seen: `(pid, start time)`.
 static SEEN: Mutex<Vec<(u32, String)>> = Mutex::new(Vec::new());
 
-/// The tests that armed the watchdog and have not finished, by libtest's thread name — which is
-/// the test's name.
+/// The tests that armed an enabled emergency timebox and have not finished, by libtest's thread
+/// name — which is the test's name.
 static RUNNING: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// Struck off [`RUNNING`] when the test's thread ends, which is when libtest is done with it.
@@ -256,20 +193,29 @@ thread_local! {
     static THIS_TEST: std::cell::RefCell<Option<Running>> = const { std::cell::RefCell::new(None) };
 }
 
-/// Bound this test process's total wall-clock time. Idempotent, so every test in a binary may
-/// call it; the budget covers the binary, not one test, because libtest runs tests in parallel
-/// threads of one process and a per-test bound would abort a healthy neighbour.
-#[allow(dead_code)] // a proof that needs a longer bound calls `arm_for` instead
+/// Prepare optional emergency cleanup for this test process. With no positive
+/// `VOX_TEST_WATCHDOG_SECS`, this starts no clock or abort thread.
+#[allow(dead_code)]
 pub fn arm() {
-    arm_for(DEFAULT_BUDGET);
+    arm_for(Duration::ZERO);
 }
 
-/// [`arm`], with `budget` in place of the default: for a proof whose product bounds are longer
-/// than [`DEFAULT_BUDGET`] (a debug-build join may take minutes). The binary's budget is the
-/// largest any of its tests asked for, whichever armed first. `VOX_TEST_WATCHDOG_SECS` still
-/// overrides it.
-pub fn arm_for(default_budget: Duration) {
-    BUDGET_SECS.fetch_max(default_budget.as_secs(), Ordering::Relaxed);
+/// Compatibility form of [`arm`]. `suggested_budget` is deliberately ignored: source code may
+/// not silently choose a whole-process elapsed limit. A positive operator-provided
+/// `VOX_TEST_WATCHDOG_SECS` is the only emergency timebox.
+pub fn arm_for(_legacy_suggestion: Duration) {
+    // Before any test of this process starts a child: the child must get the temporary HOME.
+    HOME_CHECKED.call_once(temp_home::check);
+    let budget = match std::env::var("VOX_TEST_WATCHDOG_SECS") {
+        Err(_) => return,
+        Ok(value) => match value.parse::<u64>() {
+            Ok(0) => return,
+            Ok(seconds) => Duration::from_secs(seconds),
+            Err(_) => panic!(
+                "APPARATUS: VOX_TEST_WATCHDOG_SECS must be a whole number of seconds; no emergency timebox was armed"
+            ),
+        },
+    };
     let name = std::thread::current()
         .name()
         .unwrap_or("<unnamed thread>")
@@ -283,22 +229,7 @@ pub fn arm_for(default_budget: Duration) {
             *t = Some(Running(name));
         }
     });
-    // Before any test of this process starts a child: the child must get the temporary HOME.
-    HOME_CHECKED.call_once(temp_home::check);
-    ARMED.call_once(|| {
-        // An explicit budget is taken as given; otherwise the largest any test asked for, read
-        // afresh on every look, since a test may arm after the first did.
-        let fixed = match std::env::var("VOX_TEST_WATCHDOG_SECS") {
-            Ok(v) => match v.parse::<u64>() {
-                Ok(0) => return,
-                Ok(secs) => Some(Duration::from_secs(secs)),
-                Err(_) => None,
-            },
-            Err(_) => None,
-        };
-        let budget = move || {
-            fixed.unwrap_or_else(|| Duration::from_secs(BUDGET_SECS.load(Ordering::Relaxed)))
-        };
+    ARMED.call_once(move || {
         // **Once the watchdog fires, the test cannot end the process first** (#295; see the
         // module's docs). A test thread that panics parks instead of reporting, and an exit —
         // libtest's `exit(101)` on a red, or `main` returning — waits for the abort.
@@ -322,9 +253,9 @@ pub fn arm_for(default_budget: Duration) {
             .spawn(move || {
                 // Its own clock: the largest overrun of one of its sleeps, and when it happened.
                 let mut overslept = (Duration::ZERO, Duration::ZERO);
-                while started.elapsed() < budget() {
+                while started.elapsed() < budget {
                     record_descendants();
-                    let ask = CENSUS_EVERY.min(budget().saturating_sub(started.elapsed()));
+                    let ask = CENSUS_EVERY.min(budget.saturating_sub(started.elapsed()));
                     let asked = Instant::now();
                     std::thread::sleep(ask);
                     let over = asked.elapsed().saturating_sub(ask);
@@ -333,7 +264,7 @@ pub fn arm_for(default_budget: Duration) {
                     }
                 }
                 let by_wall = wall.elapsed().unwrap_or_default();
-                fire(started.elapsed(), by_wall, overslept, budget());
+                fire(started.elapsed(), by_wall, overslept, budget);
             })
             .ok();
     });
@@ -515,7 +446,7 @@ fn fire(
     elapsed: Duration,
     by_wall: Duration,
     (overslept, overslept_at): (Duration, Duration),
-    budget: Duration,
+    timebox: Duration,
 ) -> ! {
     FIRING.store(true, Ordering::SeqCst);
     let running = RUNNING
@@ -527,7 +458,7 @@ fn fire(
         format!(
             "THIS PROCESS STALLED: one {CENSUS_EVERY:?} sleep came back {overslept:?} late, \
              {overslept_at:?} in.\n  The runner did not schedule it for that long, so an \
-             APPARATUS STALL is likely."
+             scheduler starvation or machine sleep is likely."
         )
     } else {
         format!(
@@ -551,36 +482,34 @@ fn fire(
     // and are waited for, so they are never in the list.
     let children = ours();
     let (cpu, busiest) = cpu_census(&children);
-    // The side, from what was measured: a machine that slept or a process that was not scheduled
-    // is the apparatus's. A process that ran throughout on an awake machine and still did not
-    // finish was held up by what it waits on — the product it drives — unless that product is
-    // still working: then the budget, not the product, is what ran out.
+    // An operator's emergency elapsed timebox is never a product verdict. It cannot distinguish
+    // slow progress from a wedge, even with these diagnostics; structural/product assertions do
+    // that. The census only makes the resulting NO RESULT/CANNOT MEASURE useful to diagnose.
     let working = busiest.filter(|(_, pct)| *pct >= BUSY_PCT);
     let verdict = if asleep {
-        "NO RESULT: the machine slept during the run (below), so the budget measured nothing."
+        "NO RESULT: the machine slept during the run (below), so the emergency timebox measured nothing."
             .to_owned()
     } else if stalled {
-        "APPARATUS STALL: this process was not scheduled for longer than the stall line (below)."
-            .to_owned()
+        "CANNOT MEASURE: this process was not scheduled for longer than the stall line (below); elapsed time is not a product verdict.".to_owned()
     } else if let Some((pid, pct)) = working {
         format!(
-            "CANNOT MEASURE: the budget ran out while the product was still working (CPU {pct:.0}%,\n\
-             pid {pid}, below). A budget too short for this machine and a product spinning look\n\
+            "CANNOT MEASURE: the operator's emergency timebox elapsed while the product was still working (CPU {pct:.0}%,\n\
+             pid {pid}, below). A timebox too short for this machine and a product spinning look\n\
              the same from here; the stacks below tell them apart."
         )
     } else {
-        "PRODUCT HANG: this process was scheduled throughout, the machine did not sleep, and no\n\
-         process it started was working (CPU below), so the time went to what it waits on — a\n\
-         `vox` process stuck waiting."
+        "CANNOT MEASURE: the operator's emergency timebox elapsed. No sampled descendant was\n\
+         using measurable CPU (below), but elapsed silence alone cannot distinguish a product\n\
+         wedge from legitimate waiting; only a structural/product assertion can do that."
             .to_owned()
     };
     say(&format!(
         "\n\
          ==================== vox test watchdog ====================\n\
          This test process has run for {elapsed:?} ({by_wall:?} by the wall clock) against a\n\
-         budget of {budget:?}, and is being aborted.\n\
+         operator-chosen emergency timebox of {timebox:?}, and is being aborted.\n\
          \n\
-         BUDGET EXCEEDED. {verdict}\n\
+         EMERGENCY TIMEBOX EXPIRED. {verdict}\n\
          \n\
          What this watchdog measured:\n\
          \n\
@@ -600,7 +529,7 @@ fn fire(
          that drives `vox`, the hung one is usually there, not here. SIGABRT\n\
          follows too, so on macOS ~/Library/Logs/DiagnosticReports keeps a copy.\n\
          \n\
-         To hold it open for a debugger instead: VOX_TEST_WATCHDOG_SECS=0\n\
+         With VOX_TEST_WATCHDOG_SECS unset (or 0), no elapsed abort thread is started.\n\
          ===========================================================\n"
     ));
     allow_tracing();

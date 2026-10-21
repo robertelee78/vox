@@ -375,9 +375,9 @@ impl Agent<'_> {
         let mut child = cmd
             .spawn()
             .unwrap_or_else(|e| panic!("APPARATUS: cannot run opencode in its sandbox: {e}"));
-        // Every turn has a deadline of its own, so a turn that never returns is reported
-        // as exactly that — with its output — rather than surfacing as the whole-process
-        // watchdog, which says only that something, somewhere, hung.
+        // Every turn has a protocol deadline of its own, so a turn that never returns is reported
+        // as exactly that — with its output — rather than relying on an elapsed whole-process
+        // observation that cannot identify a product defect.
         let deadline = std::time::Instant::now() + kill_after.unwrap_or(Duration::from_secs(240));
         while child.try_wait().ok().flatten().is_none() && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(200));

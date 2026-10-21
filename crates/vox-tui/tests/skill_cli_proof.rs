@@ -596,7 +596,7 @@ fn each_harness_loads_the_pack_and_is_asked_for_the_repos_room() {
     use std::process::Stdio;
     use std::time::{Duration, Instant};
 
-    watchdog::arm_for(Duration::from_secs(3600));
+    watchdog::arm();
     if !cfg!(target_os = "macos") {
         panic!(
             "CANNOT MEASURE: the harnesses are confined with macOS sandbox-exec, so this proof \

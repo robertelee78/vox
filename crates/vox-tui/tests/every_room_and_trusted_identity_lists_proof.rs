@@ -9,7 +9,8 @@
 //!
 //! **At the scale a node really has.** The decider puts a node's rooms at "a couple of hundred
 //! at most" (2026-09-28). Reaching the real 256 KiB frame takes about 1,540 rooms, each sealed
-//! with production Argon2id, which never fitted this proof's watchdog. So this proof runs every
+//! with production Argon2id, which makes the real-limit journey needlessly expensive. So this
+//! proof runs every
 //! process with `VOX_TEST_MAX_FRAME` = [`FRAME`] (`ipc::frame_limit`, test-only, which only
 //! lowers the limit): 200 rooms then outgrow one frame, as 1,540 do at the real one.
 //!

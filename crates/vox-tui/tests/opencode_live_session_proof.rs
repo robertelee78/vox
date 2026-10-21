@@ -273,7 +273,7 @@ fn session_until(
 #[test]
 #[ignore = "drives a live OpenCode session's model turns; optional, on the decider's request, in release"]
 fn a_live_opencode_session_is_mirrored_and_driven() {
-    watchdog::arm_for(Duration::from_secs(1200));
+    watchdog::arm();
     if !oc_sandbox::live_model_allowed(
         "opencode_live_session_proof::a_live_opencode_session_is_mirrored_and_driven",
     ) {

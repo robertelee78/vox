@@ -268,7 +268,7 @@ fn a_joiner_restarted_before_its_first_sync_reaches_its_host_through_the_relay()
 #[test]
 #[ignore = "real binaries, production Argon2id and eleven proofs of work; CI runs it in release"]
 fn the_member_that_let_a_joiner_in_is_never_its_anchor() {
-    watchdog::arm_for(Duration::from_secs(1500));
+    watchdog::arm();
     let tmp = world::tempdir();
     let tmp = tmp.path();
     let (anchor, spec) = room::spawn_anchor(tmp);

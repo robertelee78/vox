@@ -1,5 +1,5 @@
 //! A dial whose first address answers **as somebody else** must go on to the next address, not
-//! spin. ADR-018 §6's 21-hour hang, found and reproduced (v0.2.10 V210-17).
+//! spin. The 21-hour hang was found and reproduced in v0.2.10 (V210-17).
 //!
 //! **What hung.** On 2026-09-20 two `node_m15_anchor_gate` processes ran 21 hours at ~1.5 cores
 //! each. Rebuilt on 2026-09-26 with `connect_direct` as it was before M15.1 (`3037525^`), that gate
@@ -27,7 +27,8 @@
 //! counting UDP relay, which is how the proof knows the guest really dialled it and really got an
 //! answer — without that, a guest that skipped the decoy would pass for the wrong reason.
 //!
-//! Mutation-checked by restoring the pre-M15.1 loop in `nat/reachability.rs`: see ADR-018 §6a.
+//! Mutation-checked by restoring the pre-M15.1 loop in `nat/reachability.rs`, as ADR-018 §7
+//! requires.
 
 #![cfg(unix)]
 

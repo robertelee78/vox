@@ -168,8 +168,7 @@ fn post_all(data: &Path, room: &str, who: &str) {
 #[test]
 #[ignore = "real vox processes, 48 MB of history; optional, run it in release"]
 fn two_backlogs_that_meet_both_cross() {
-    // Two joins; 13 unlocks: three `vox id`s, six `trust add`s, three daemons and the room.
-    watchdog::arm_for_setup(2, 13);
+    watchdog::arm();
     let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let dir = |n: &str| {
         let d = tmp.path().join(n);

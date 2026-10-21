@@ -3221,7 +3221,7 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
     }
     // The join in (1) is bounded by the product's own patience (below), and the rest of the arm
     // takes a few minutes more.
-    watchdog::arm_for(Duration::from_secs(1200));
+    watchdog::arm();
     let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     // Alice holds two rooms; the agent's node holds none.
     let alice = Daemon::start(&tmp.path().join("alice"));
@@ -4842,7 +4842,7 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
 /// `answers` names (a piece of the question, the keys) in order: everything it printed.
 // A selected portion of the existing mapping journey, not another test or shipped knob.
 fn room_ask_step() {
-    watchdog::arm_for(Duration::from_secs(180));
+    watchdog::arm();
     let tmp = tempfile::tempdir().expect("APPARATUS: no scratch directory");
     let actor = Daemon::start_bare(&tmp.path().join("actor"));
     let repo = tmp.path().join("unbound repo");
