@@ -1201,13 +1201,29 @@ impl Controller {
             self.cancel_archive_admission();
         }
         if let Some(mut admission) = self.archive_admission.take() {
+            // Register again before rechecking. The event that scheduled this actor may have been
+            // a same-lane eligibility edge won by another ticket; the later real release still
+            // needs an enabled listener owned by this exact retained admission.
+            let wake = admission.ticket.wake();
             if let Some(job) = admission.ticket.try_admit() {
                 admission.task.abort();
                 return ArchiveTurn::Ready(job);
             }
-            // The original task still owns the enabled wake and this exact ticket. Rechecking
-            // because another actor request scheduled the port must not replace its identity or
-            // open a lost-notification window before the capacity edge arrives.
+            admission.task.abort();
+            let tx = net_tx.clone();
+            let wake_token = *next_token;
+            *next_token += 1;
+            admission.token = wake_token;
+            admission.task = tokio::spawn(async move {
+                wake.await;
+                let _ = tx
+                    .send(NetEvent::ArchiveAdmissionReady {
+                        token: wake_token,
+                        room,
+                        peer,
+                    })
+                    .await;
+            });
             self.archive_admission = Some(admission);
             return ArchiveTurn::Waiting;
         }
@@ -1265,12 +1281,26 @@ impl Controller {
             }
         }
         if let Some(mut admission) = self.foreground_admission[index].take() {
+            let wake = admission.ticket.wake();
             if let Some(job) = admission.ticket.try_admit() {
                 admission.task.abort();
                 return ForegroundTurn::Ready(job);
             }
-            // Preserve the first admission and its already-enabled exact release wait across
-            // unrelated schedules. Its token is the user-visible identity the proof binds.
+            admission.task.abort();
+            let tx = net_tx.clone();
+            let wake_token = *next_token;
+            *next_token += 1;
+            admission.token = wake_token;
+            admission.task = tokio::spawn(async move {
+                wake.await;
+                let _ = tx
+                    .send(NetEvent::ForegroundAdmissionReady {
+                        token: wake_token,
+                        room,
+                        peer,
+                    })
+                    .await;
+            });
             self.foreground_admission[index] = Some(admission);
             return ForegroundTurn::Waiting;
         }

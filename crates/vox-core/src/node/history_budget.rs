@@ -180,6 +180,29 @@ impl State {
             }
         }
     }
+
+    fn admissible_waiter(&self, lane: Lane) -> bool {
+        if self.queues[lane.index()].is_empty() {
+            return false;
+        }
+        match lane {
+            Lane::Archive => self.queues[lane.index()]
+                .iter()
+                .any(|waiting| self.available(waiting.node, lane)),
+            Lane::Control | Lane::LargeControl | Lane::Live => self.queues[lane.index()]
+                .front()
+                .is_some_and(|waiting| self.available(waiting.node, lane)),
+        }
+    }
+
+    fn admission_changed_waiter(&self, lane: Lane) -> bool {
+        match lane {
+            Lane::Archive | Lane::Control => self.admissible_waiter(lane),
+            Lane::LargeControl | Lane::Live => {
+                self.admissible_waiter(Lane::LargeControl) || self.admissible_waiter(Lane::Live)
+            }
+        }
+    }
 }
 
 /// One exact cleanup obligation. The actor registration and request ID distinguish a retired
@@ -277,7 +300,6 @@ impl Budget {
         let ticket = state.allocate_ticket(lane);
         state.queues[lane.index()].push_back(Waiting { ticket, node });
         drop(state);
-        self.notify_lane(lane);
         Ticket {
             budget: Arc::clone(self),
             node,
@@ -344,9 +366,14 @@ impl Ticket {
             }
         }
         self.queued = false;
+        let notify_next = state.admission_changed_waiter(self.lane);
         drop(state);
-        // A second archive slot or another reserved lane may also be available.
-        self.budget.notify_lane(self.lane);
+        // Admission is a wake only when removing this queue head or changing foreground priority
+        // made another retained ticket actually admissible. Consuming the final slot broadcasts
+        // nothing; that spurious edge used to strand one-shot waiters before the real release.
+        if notify_next {
+            self.budget.notify_lane(self.lane);
+        }
         let flow_owner = self
             .budget
             .pool
