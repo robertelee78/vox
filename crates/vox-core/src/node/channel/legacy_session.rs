@@ -409,14 +409,15 @@ impl ChannelState {
         // 2026-10-20 on the decider's node (ADR-038 FX-33): a retention change's sweep walked a
         // declaration's steps onto a format-2 entry, refused it as "Session classification
         // source unverified", and poisoned the room on every tick.
-        if entry.skeleton.v2.is_some() {
-            return Ok(Some(false));
-        }
-        // An entry of another room under this hash is a real integrity failure and stays one.
+        // An entry of another room under this hash is a real integrity failure and stays one;
+        // only an entry that belongs here is then deferred or classified.
         if entry.skeleton.channel_id != self.channel_id {
             return Err(Error::MalformedAtRest(
                 "Session classification source unverified",
             ));
+        }
+        if entry.skeleton.v2.is_some() {
+            return Ok(Some(false));
         }
         let author = entry.skeleton.author_id;
         if entry.skeleton.seq > self.dag.verified_head(&author) {
@@ -496,18 +497,17 @@ impl ChannelState {
                 "Session classification target unverified",
             ));
         };
-        // Nothing to remember for a signed-format entry, and nothing yet for one past its
-        // author's verified head (ADR-038 FX-33): the next pass classifies what it can. An entry
-        // of another room or author is a real integrity failure and stays one.
-        if entry.skeleton.v2.is_some()
-            || entry.skeleton.seq > self.dag.verified_head(&entry.skeleton.author_id)
-        {
-            return Ok(());
-        }
+        // An entry of another room or author is a real integrity failure and stays one; for
+        // an entry that belongs here there is nothing to remember when it is signed-format, and
+        // nothing yet when it is past its author's verified head (ADR-038 FX-33): the next pass
+        // classifies what it can.
         if entry.skeleton.channel_id != self.channel_id || entry.skeleton.author_id != author {
             return Err(Error::MalformedAtRest(
                 "Session classification target unverified",
             ));
+        }
+        if entry.skeleton.v2.is_some() || entry.skeleton.seq > self.dag.verified_head(&author) {
+            return Ok(());
         }
         let id = page_id(log, false)?;
         let page = Page::Target {
