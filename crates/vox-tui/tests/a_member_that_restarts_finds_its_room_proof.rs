@@ -59,22 +59,25 @@
 //!
 //! - (e) **a member whose daemon crashes keeps what it was told it has** (ADR-038 FX-30, #1022).
 //!   Only what a person would lose is flushed to disk; derived sync state is not, and is rebuilt
-//!   after a crash. Three crashes, each a SIGKILL by PID (nothing is closed, nothing is flushed
-//!   on the way out): (1) alice posts [`CRASH_POSTS`] rows and her daemon is killed the moment
-//!   the last `vox room post` has returned; back on her port she reads every one of them and
-//!   `vox trust list` still names bob. (2) alice posts once more and the proof waits until her
-//!   own row says it is held on bob's node (`vox room read --json`'s `held`, ADR-028 R-6: bob's
-//!   own word in a sync, which the design flushes before); bob's daemon is killed; back on his
-//!   port he reads it. (3) carol, trusted before alice's [`CRASH_BACKLOG`] posts, joins cold;
-//!   the moment `vox room join` returns her daemon is frozen (SIGSTOP), her data root copied,
-//!   her daemon resumed and killed, and a daemon started from the copy on her port: it opens the
-//!   room, what it reads is consistent (every `post <i>` at most once), and within
-//!   [`SYNCS_ON_WITHIN`] it holds every post, the cursors and heads the copy lost rebuilt from
-//!   alice. A copy of a frozen process is a crash image: redb advances its on-disk commit slot
-//!   only on a flushed commit, so what was committed without one is absent from the copy as it
-//!   is after a power loss. Mutations: own posts committed without a flush — (1) red, a post
-//!   `vox room post` accepted is gone; the flush before a node says what it holds removed — (2)
-//!   red, bob's acknowledged row is gone.
+//!   after a crash. Staged with bob's post read under the key he released and a Session of alice's
+//!   opened through the shipped hook; three crashes, each a SIGKILL by PID (nothing is closed,
+//!   nothing is flushed on the way out): (1) alice posts [`CRASH_POSTS`] rows and her daemon is
+//!   killed the moment the last `vox room post` has returned; with bob's daemon frozen (nothing
+//!   can be fetched again) she comes back on her port: `vox room list` shows the room open, she
+//!   reads every kept row and bob's post (his key), `vox trust list` still names bob and carol
+//!   (consent), and `vox room sessions --json` lists the same Session. (2) alice posts once more
+//!   and the proof waits until her own row says it is held on bob's node (`vox room read --json`'s
+//!   `held`, ADR-028 R-6: bob's own word in a sync, which the design flushes before); bob's daemon
+//!   is killed; back on his port his room is open and he reads it. (3) carol, trusted before
+//!   alice's [`CRASH_BACKLOG`] posts, joins cold; once her read shows some of them and not all,
+//!   her daemon is frozen (SIGSTOP, `ps` state `T`), her data root copied, her daemon resumed and
+//!   killed; with alice frozen a daemon started from the copy on carol's port opens the room and
+//!   shows no row twice; alice resumed, within [`SYNCS_ON_WITHIN`] it shows every post exactly
+//!   once, the cursors and heads the copy lost rebuilt from her. A copy of a frozen process is a
+//!   crash image: redb advances its on-disk commit slot only on a flushed commit, so what was
+//!   committed without one is absent from the copy as it is after a power loss. Mutations: own
+//!   posts committed without a flush — (1) red, a post `vox room post` accepted is gone; the
+//!   flush before a node says what it holds removed — (2) red, bob's acknowledged row is gone.
 
 #![cfg(unix)]
 
@@ -569,11 +572,14 @@ fn until_reads(reader: &Path, room: &str, text: &str, within: Duration) -> bool 
 /// Rows alice posts before her daemon is killed (e, 1).
 const CRASH_POSTS: usize = 3;
 /// Alice's backlog that carol's daemon is fetching when its data root is copied (e, 3): under
-/// one `vox room read` page (64 rows), so a plain read sees it whole; the fetch is under way
-/// all the same, since `vox room join` returns before the window arrives (ADR-037 R1).
+/// one `vox room read` page (64 rows), so a plain read sees it whole.
 const CRASH_BACKLOG: usize = 60;
 /// How long alice's row has to show as held on bob's node (e, 2): a sync round each way.
 const HELD_WITHIN: Duration = Duration::from_secs(90);
+/// Within this of carol's join her read MUST show some of the backlog and not all of it (e, 3):
+/// the moment her daemon is frozen mid-fetch. Apparatus: a fetch that was never caught under way
+/// gives a clean image, not a crash during a sync.
+const MID_FETCH_WITHIN: Duration = Duration::from_secs(60);
 /// Once the daemon started from the copy answers, how long it has to hold the whole backlog.
 const SYNCS_ON_WITHIN: Duration = Duration::from_secs(120);
 
@@ -588,6 +594,8 @@ fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
     let (alice, alice_fp) = identity(t.path(), "alice");
     let (bob, bob_fp) = identity(t.path(), "bob");
     let (carol, carol_fp) = identity(t.path(), "carol");
+    let work = t.path().join("work");
+    std::fs::create_dir_all(&work).expect("APPARATUS: cannot make the work directory");
     let alice_d = daemon(
         &alice,
         "alice",
@@ -613,14 +621,42 @@ fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
     trust(&carol, &alice_fp, "alice");
     until_readable(&alice, &[&bob], &room);
     until_readable(&bob, &[&alice], &room);
+    // The rest of the ruled set, as a person sees it: a post of bob's, which alice reads only
+    // under the sender key he released to her; a Session of alice's, opened through the shipped
+    // hook, which `vox room sessions --json` lists.
+    post(&bob, &room, "from bob");
+    assert!(
+        until_reads(&alice, &room, "from bob", Duration::from_secs(60)),
+        "PRODUCT (staging): alice never read bob's post: she reads {:?}",
+        read(&alice, &room)
+    );
+    hook(&alice, &room, &work, "a word from alice");
+    let listed_at = Instant::now();
+    let sessions_before = loop {
+        let sessions = sessions_of(&alice, &room);
+        if !sessions.is_empty() {
+            break sessions;
+        }
+        assert!(
+            listed_at.elapsed() < Duration::from_secs(30),
+            "PRODUCT (staging): 30 s after the hook ran, `vox room sessions --json` lists no \
+             Session of alice's, so no Session record could be staged"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    };
 
-    // ---- (1) alice's own posts survive her daemon's SIGKILL right after they were accepted ----
+    // ---- (1) alice's own posts, her keys, consent and Session survive her daemon's SIGKILL ----
     for i in 1..=CRASH_POSTS {
         post(&alice, &room, &format!("kept {i}"));
     }
     drop(alice_d);
+    // Bob frozen: nothing alice shows after her restart can have been fetched from him again.
+    let bob_pid = bob_d.0.id().to_string();
+    signal(&bob_pid, "STOP");
     println!(
-        "[proof] (1) alice's daemon killed the moment `vox room post kept {CRASH_POSTS}` returned"
+        "[proof] (1) alice's daemon killed the moment `vox room post kept {CRASH_POSTS}` returned; \
+         bob's daemon frozen ({})",
+        process_state(&bob_pid)
     );
     let alice_d = daemon(
         &alice,
@@ -636,11 +672,22 @@ fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
         vox(&alice, &["room", "read", &room], None).2,
         daemon_said(&alice, "alice-2")
     );
+    let listed = room_list_line(&alice, &room);
+    assert!(
+        !listed.contains("[preparing") && !listed.contains("closed"),
+        "PRODUCT: after a crash of the daemon the room is not open (ADR-038 FX-30, #1022): `vox \
+         room list` says {listed:?}"
+    );
     let hers = read(&alice, &room);
     assert!(
         holds(&hers, "kept", CRASH_POSTS) == CRASH_POSTS,
         "PRODUCT: a post `vox room post` had accepted was lost by a crash of the daemon (ADR-038 \
          FX-30, #1022): alice posted kept 1..={CRASH_POSTS}, was killed, and reads {hers:?}"
+    );
+    assert!(
+        hers.iter().any(|t| t == "from bob"),
+        "PRODUCT: a key bob released to alice was lost by a crash of her daemon (ADR-038 FX-30, \
+         #1022): with bob's daemon frozen she reads {hers:?}, and not his post"
     );
     let (ok, trusted, err) = vox(&alice, &["trust", "list"], None);
     assert!(
@@ -648,7 +695,18 @@ fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
         "PRODUCT: a trust decision was lost by a crash of the daemon (ADR-038 FX-30, #1022): \
          `vox trust list` after the restart: {trusted}{err}"
     );
-    println!("[proof] (1) after the crash alice reads {hers:?} and still trusts bob and carol");
+    let sessions_after = sessions_of(&alice, &room);
+    assert!(
+        sessions_after == sessions_before,
+        "PRODUCT: a Session record was lost by a crash of the daemon (ADR-038 FX-30, #1022): `vox \
+         room sessions --json` listed {sessions_before:?} before the crash and {sessions_after:?} \
+         after"
+    );
+    signal(&bob_pid, "CONT");
+    println!(
+        "[proof] (1) after the crash alice reads {hers:?}, trusts bob and carol, and lists her \
+         Session {sessions_after:?}"
+    );
 
     // ---- (2) a post bob's node said it holds survives bob's SIGKILL ------------------------------
     post(&alice, &room, "acked");
@@ -690,6 +748,12 @@ fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
         vox(&bob, &["room", "read", &room], None).2,
         daemon_said(&bob, "bob-2")
     );
+    let listed = room_list_line(&bob, &room);
+    assert!(
+        !listed.contains("[preparing") && !listed.contains("closed"),
+        "PRODUCT: after a crash of the daemon bob's room is not open (ADR-038 FX-30, #1022): `vox \
+         room list` says {listed:?}"
+    );
     let his = read(&bob, &room);
     assert!(
         his.iter().any(|t| t == "acked"),
@@ -698,7 +762,7 @@ fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
     );
     println!("[proof] (2) after the crash bob reads the acknowledged post");
 
-    // ---- (3) a data root copied at an instant during a fetch reopens whole and syncs on ---------
+    // ---- (3) a data root copied mid-fetch reopens whole and syncs on ----------------------------
     for i in 1..=CRASH_BACKLOG {
         post(&alice, &room, &format!("post {i}"));
     }
@@ -711,21 +775,40 @@ fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
     );
     let carol_at = listening(&carol);
     join(&alice, &carol, &room);
-    // The moment the join returned her lane is fetching: freeze, copy, resume, kill.
+    let joined = Instant::now();
+    // Caught under way: her read shows some of the backlog and not all of it.
+    let partial = loop {
+        let n = holds(&read(&carol, &room), "post", CRASH_BACKLOG);
+        if (1..CRASH_BACKLOG).contains(&n) {
+            break n;
+        }
+        assert!(
+            joined.elapsed() < MID_FETCH_WITHIN,
+            "APPARATUS: staging not achieved: within {MID_FETCH_WITHIN:?} of her join carol's \
+             read never showed some but not all of the {CRASH_BACKLOG} posts (last {n}), so no \
+             copy could be taken mid-fetch"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
     let pid = carol_d.0.id().to_string();
-    let stopped = Command::new("kill")
-        .args(["-STOP", &pid])
-        .status()
-        .is_ok_and(|s| s.success());
-    assert!(stopped, "APPARATUS: `kill -STOP {pid}` did not take");
+    signal(&pid, "STOP");
+    let state = process_state(&pid);
+    assert!(
+        state.starts_with('T'),
+        "APPARATUS: carol's daemon is not stopped while its data root is copied: `ps` state {state:?}"
+    );
     let copy = t.path().join("carol-copy");
     copy_dir(&carol, &copy);
-    let resumed = Command::new("kill")
-        .args(["-CONT", &pid])
-        .status()
-        .is_ok_and(|s| s.success());
-    assert!(resumed, "APPARATUS: `kill -CONT {pid}` did not take");
+    signal(&pid, "CONT");
     drop(carol_d);
+    println!(
+        "[proof] (3) carol's data root copied {:?} after her join with her daemon stopped ({state}) \
+         and {partial} of {CRASH_BACKLOG} posts read before the freeze",
+        joined.elapsed()
+    );
+    // Alice frozen while the copy's daemon reads what it holds: no row or key can come from her.
+    let alice_pid = alice_d.0.id().to_string();
+    signal(&alice_pid, "STOP");
     std::fs::create_dir_all(copy.join("cfg"))
         .unwrap_or_else(|e| panic!("APPARATUS: cannot make {}: {e}", copy.display()));
     let tag = "carol-copy";
@@ -736,24 +819,39 @@ fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
         &carol_at,
         &unheard,
     );
+    let opened = room_answers(&copy, &room, REOPENS_WITHIN);
+    let listed = if opened {
+        room_list_line(&copy, &room)
+    } else {
+        String::new()
+    };
+    let at_reopen = if opened {
+        read(&copy, &room)
+    } else {
+        Vec::new()
+    };
+    signal(&alice_pid, "CONT");
     assert!(
-        room_answers(&copy, &room, REOPENS_WITHIN),
+        opened,
         "PRODUCT: the daemon started from a data root copied during a fetch did not open the \
          room within {REOPENS_WITHIN:?} (ADR-038 FX-30, #1022): {}\nits daemon said:\n{}",
         vox(&copy, &["room", "read", &room], None).2,
         daemon_said(&copy, tag)
     );
-    let at_reopen = read(&copy, &room);
-    let held_at_reopen = holds(&at_reopen, "post", CRASH_BACKLOG);
-    let duplicates: Vec<&String> = at_reopen
-        .iter()
-        .filter(|t| t.starts_with("post "))
-        .filter(|t| at_reopen.iter().filter(|u| u == t).count() > 1)
-        .collect();
     assert!(
-        duplicates.is_empty(),
-        "PRODUCT: the room reopened from a copy taken during a fetch shows a row twice (ADR-038 \
-         FX-30, #1022): {duplicates:?}; it reads {at_reopen:?}"
+        !listed.contains("[preparing") && !listed.contains("closed"),
+        "PRODUCT: the room reopened from a copy taken during a fetch is not open (ADR-038 FX-30, \
+         #1022): `vox room list` says {listed:?}"
+    );
+    let held_at_reopen = holds(&at_reopen, "post", CRASH_BACKLOG);
+    let twice = not_once_each(&at_reopen, "post", CRASH_BACKLOG)
+        .into_iter()
+        .filter(|(_, n)| *n > 1)
+        .collect::<Vec<_>>();
+    assert!(
+        twice.is_empty(),
+        "PRODUCT: the room reopened from a copy taken during a fetch shows a row more than once \
+         (ADR-038 FX-30, #1022): (post, times) {twice:?}; it reads {at_reopen:?}"
     );
     let synced_on = Instant::now();
     assert!(
@@ -767,12 +865,107 @@ fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
         daemon_said(&copy, tag),
         daemon_said(&alice, "alice-2")
     );
+    let whole = read(&copy, &room);
+    let not_once = not_once_each(&whole, "post", CRASH_BACKLOG);
+    assert!(
+        not_once.is_empty(),
+        "PRODUCT: after syncing on, the room reopened from a copy does not show every post \
+         exactly once (ADR-038 FX-30, #1022): (post, times) {not_once:?}; it reads {whole:?}"
+    );
     println!(
-        "[proof] (3) the copy taken as carol's join returned held {held_at_reopen} of \
-         {CRASH_BACKLOG} posts at reopen and every one {:?} later; nothing read twice",
+        "[proof] (3) the copy held {held_at_reopen} of {CRASH_BACKLOG} posts at reopen, with alice \
+         frozen, and every one exactly once {:?} after she was resumed",
         synced_on.elapsed()
     );
     drop(alice_d);
+}
+
+/// `kill -<sig> <pid>`, or an APPARATUS red.
+fn signal(pid: &str, sig: &str) {
+    let sent = Command::new("kill")
+        .args([&format!("-{sig}"), pid])
+        .status()
+        .is_ok_and(|s| s.success());
+    assert!(sent, "APPARATUS: `kill -{sig} {pid}` did not take");
+}
+
+/// The process's state letter(s) as `ps` prints them (`T` = stopped).
+fn process_state(pid: &str) -> String {
+    let out = Command::new("ps")
+        .args(["-o", "state=", "-p", pid])
+        .output()
+        .unwrap_or_else(|e| panic!("APPARATUS: ps: {e}"));
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}
+
+/// The `vox room list` line naming `room` as `dir`, or an empty string.
+fn room_list_line(dir: &Path, room: &str) -> String {
+    let (_, out, _) = vox(dir, &["room", "list"], None);
+    out.lines()
+        .find(|l| l.contains(room))
+        .map(str::to_owned)
+        .unwrap_or_default()
+}
+
+/// Every `"<prefix> <i>"` for `i` in `1..=n` that `texts` does not show exactly once: `(i,
+/// times shown)`.
+fn not_once_each(texts: &[String], prefix: &str, n: usize) -> Vec<(usize, usize)> {
+    (1..=n)
+        .map(|i| {
+            let want = format!("{prefix} {i}");
+            (i, texts.iter().filter(|t| **t == want).count())
+        })
+        .filter(|(_, times)| *times != 1)
+        .collect()
+}
+
+/// The ids `vox room sessions --json` lists for `room` as `dir`, in order.
+fn sessions_of(dir: &Path, room: &str) -> Vec<String> {
+    let (ok, out, err) = vox(dir, &["room", "sessions", room, "--json"], None);
+    assert!(ok, "PRODUCT: `vox room sessions --json` failed: {err}");
+    out.lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter_map(|v| v["id"].as_str().map(str::to_owned))
+        .collect()
+}
+
+/// One run of the shipped harness hook (`vox agent hook`) for `dir`'s node in `room`, fed a
+/// Claude Code `UserPromptSubmit` event: it opens the node's Session in the room.
+fn hook(dir: &Path, room: &str, work: &Path, prompt: &str) {
+    let event = serde_json::json!({
+        "session_id": "crash-proof",
+        "transcript_path": work.join("transcript.jsonl").display().to_string(),
+        "cwd": work.display().to_string(),
+        "permission_mode": "default",
+        "hook_event_name": "UserPromptSubmit",
+        "prompt": prompt,
+    })
+    .to_string();
+    let mut child = Command::new(VOX)
+        .args(["agent", "hook", "--node", "default", "--room", room])
+        .env("VOX_DATA_DIR", dir)
+        .env("VOX_CONFIG_DIR", dir.join("cfg"))
+        .env("CLAUDE_CODE_ENTRYPOINT", "cli")
+        .env_remove("VOX_ROOM")
+        .env_remove("VOX_NODE")
+        .current_dir(work)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot start `vox agent hook`: {e}"));
+    if let Some(mut pipe) = child.stdin.take() {
+        let _ = pipe.write_all(event.as_bytes());
+    }
+    let out = child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("APPARATUS: `vox agent hook`: {e}"));
+    assert!(
+        out.status.success(),
+        "PRODUCT (staging): `vox agent hook` exited non-zero: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 /// `vox room read --json` of `room` as `dir`: the own row with `text`'s `held`/`others` footer
@@ -781,7 +974,7 @@ fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
 fn held_on(dir: &Path, room: &str, text: &str) -> Option<(u64, u64)> {
     let (ok, out, _) = vox(
         dir,
-        &["room", "read", room, "--json", "--limit", "128"],
+        &["room", "read", room, "--json", "--limit", "64"],
         None,
     );
     if !ok {
