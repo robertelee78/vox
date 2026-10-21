@@ -216,8 +216,40 @@ pub struct StoreCounts {
 /// The store's running counts, for `vox status`.
 #[derive(Default)]
 struct Counting {
+    /// Even while the published pair is stable, odd while its one writer publishes it.
+    sequence: AtomicU64,
     commits: AtomicU64,
     flushes: AtomicU64,
+}
+
+impl Counting {
+    fn committed(&self, flushed: bool) {
+        // Store writes are already serialized by `Store::writer`; this sequence only makes the
+        // two counters one coherent, nonblocking status snapshot.
+        self.sequence.fetch_add(1, Ordering::AcqRel);
+        self.commits.fetch_add(1, Ordering::Relaxed);
+        if flushed {
+            self.flushes.fetch_add(1, Ordering::Relaxed);
+        }
+        self.sequence.fetch_add(1, Ordering::Release);
+    }
+
+    fn snapshot(&self) -> StoreCounts {
+        loop {
+            let before = self.sequence.load(Ordering::Acquire);
+            if before & 1 != 0 {
+                std::hint::spin_loop();
+                continue;
+            }
+            let counts = StoreCounts {
+                commits: self.commits.load(Ordering::Relaxed),
+                flushes: self.flushes.load(Ordering::Relaxed),
+            };
+            if self.sequence.load(Ordering::Acquire) == before {
+                return counts;
+            }
+        }
+    }
 }
 
 /// Whether a received entry committed without a flush is still waiting for one (ADR-038
@@ -230,6 +262,10 @@ struct Counting {
 struct Epochs {
     received: u64,
     flushed: u64,
+    /// The received epoch copied into an installed fresh database whose directory entry has not
+    /// yet been synced. This debt survives reopen or directory-sync failure and gates every
+    /// later write and acknowledgement until the exact replacement becomes durable.
+    replacement: Option<u64>,
 }
 
 /// What a [`Batch`] holds, which decides how it commits (ADR-038 FX-30). Only what a person
@@ -380,6 +416,7 @@ impl Store {
         // Taking the read snapshot first would let a rewrite hold `writer` while waiting for
         // this `db` read, and this recovery wait for `writer` in the other direction.
         let mut epochs = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        self.finish_replacement(&mut epochs)?;
         let backing = self.db.read().unwrap_or_else(PoisonError::into_inner);
         let Backing::Writable(db) = &*backing else {
             return Err(Error::Storage {
@@ -472,6 +509,7 @@ impl Store {
         // Serialize the complete snapshot and replacement with every such transaction, or one
         // can commit to the old inode after the snapshot and disappear at the rename.
         let mut epochs = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        self.finish_replacement(&mut epochs)?;
         let mut backing = self.db.write().unwrap_or_else(PoisonError::into_inner);
         let Backing::Writable(old) = &*backing else {
             return Err(Error::Storage {
@@ -530,16 +568,44 @@ impl Store {
                 detail: format!("{}: {e}", self.path.display()),
             });
         }
-        // The store is open again before the directory's flush is reported, so a failed flush
-        // leaves a usable store and says so, rather than being ignored (V210-55).
+        // Rename has installed the new inode, but it is not durable until its directory is
+        // synced. Record that exact debt before either fallible step. A failed reopen leaves the
+        // backing closed; a failed directory sync leaves it writable; both refuse a false peer
+        // acknowledgement and are retried by the next writer.
+        epochs.replacement = Some(epochs.received);
         *backing = Backing::Writable(open_database(&self.path).map_err(open_error)?);
-        super::paths::sync_dir(&self.path)?;
-        // Only the installed, directory-durable replacement covers the pending epochs. A
-        // failed copy, rename, reopen or directory flush leaves the counters and epochs alone.
-        self.counts.commits.fetch_add(1, Ordering::Relaxed);
-        self.counts.flushes.fetch_add(1, Ordering::Relaxed);
-        epochs.flushed = epochs.received;
+        drop(backing);
+        self.finish_replacement(&mut epochs)?;
         Ok(())
+    }
+
+    /// Finish an installed store replacement before any later write can hide its directory-sync
+    /// debt. Returns whether this call made the replacement durable (and therefore flushed its
+    /// captured received epoch).
+    fn finish_replacement(&self, epochs: &mut Epochs) -> Result<bool> {
+        let Some(covered) = epochs.replacement else {
+            return Ok(false);
+        };
+        {
+            let mut backing = self.db.write().unwrap_or_else(PoisonError::into_inner);
+            if matches!(*backing, Backing::Closed) {
+                *backing = Backing::Writable(open_database(&self.path).map_err(open_error)?);
+                super::paths::set_private_file_mode(&self.path)?;
+            }
+            if !matches!(*backing, Backing::Writable(_)) {
+                return Err(Error::Storage {
+                    op: "finish store replacement",
+                    detail: "the installed store is not open for writing".into(),
+                });
+            }
+        }
+        // Clear the debt only after the directory entry is durable. If this fails, every later
+        // writer and every pending-received acknowledgement comes back through this exact step.
+        super::paths::sync_dir(&self.path)?;
+        self.counts.committed(true);
+        epochs.flushed = epochs.flushed.max(covered);
+        epochs.replacement = None;
+        Ok(true)
     }
 
     /// Begin a read transaction on whichever handle is open.
@@ -553,7 +619,8 @@ impl Store {
     /// Begin a write transaction, holding the store's writer — refused, writing nothing, while
     /// the store is read-only.
     fn begin_write(&self) -> Result<(MutexGuard<'_, Epochs>, Cached<redb::WriteTransaction>)> {
-        let epochs = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut epochs = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        self.finish_replacement(&mut epochs)?;
         match &*self.db.read().unwrap_or_else(PoisonError::into_inner) {
             Backing::Writable(db) => {
                 Ok((epochs, db.begin_write().map_err(storage("begin write"))?))
@@ -898,13 +965,15 @@ impl Store {
     /// flush, every row on disk after a SIGKILL). It holds redb's one writer for the whole disk
     /// flush. No measured duration is a correctness bound: FX-31 moves flush latency off paths
     /// that do not depend on it. Nothing to flush costs one `F_FULLFSYNC` all the same, so callers
-    /// ask [`Self::flush_if_received_pending`] (ADR-038 FX-30). A store that is read-only or
-    /// closed has nothing pending and flushes nothing.
+    /// ask [`Self::flush_if_received_pending`] (ADR-038 FX-30).
     ///
     /// # Errors
     /// The transaction cannot be begun or committed.
     pub fn flush(&self) -> Result<()> {
         let mut epochs = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.finish_replacement(&mut epochs)? {
+            return Ok(());
+        }
         let txn = match &*self.db.read().unwrap_or_else(PoisonError::into_inner) {
             Backing::Writable(db) => db.begin_write().map_err(storage("begin flush"))?,
             Backing::ReadOnly(_) | Backing::Closed => return Ok(()),
@@ -926,9 +995,18 @@ impl Store {
         if epochs.received <= epochs.flushed {
             return Ok(false);
         }
+        if self.finish_replacement(&mut epochs)? {
+            return Ok(true);
+        }
         let txn = match &*self.db.read().unwrap_or_else(PoisonError::into_inner) {
             Backing::Writable(db) => db.begin_write().map_err(storage("begin flush"))?,
-            Backing::ReadOnly(_) | Backing::Closed => return Ok(false),
+            Backing::ReadOnly(_) | Backing::Closed => {
+                return Err(Error::Storage {
+                    op: "begin received flush",
+                    detail: "received entries are pending but the store is not open for writing"
+                        .into(),
+                })
+            }
         };
         self.commit_flushed(txn, &mut epochs, "flush")?;
         Ok(true)
@@ -952,10 +1030,7 @@ impl Store {
     /// What this store has committed since it was opened (ADR-038 FX-30).
     #[must_use]
     pub fn counts(&self) -> StoreCounts {
-        StoreCounts {
-            commits: self.counts.commits.load(Ordering::Relaxed),
-            flushes: self.counts.flushes.load(Ordering::Relaxed),
-        }
+        self.counts.snapshot()
     }
 
     /// Commit a raw transaction flushed to disk, counted; under the writer it covers every
@@ -967,8 +1042,7 @@ impl Store {
         op: &'static str,
     ) -> Result<()> {
         txn.commit().map_err(storage(op))?;
-        self.counts.commits.fetch_add(1, Ordering::Relaxed);
-        self.counts.flushes.fetch_add(1, Ordering::Relaxed);
+        self.counts.committed(true);
         epochs.flushed = epochs.received;
         Ok(())
     }
@@ -1415,12 +1489,11 @@ impl Batch<'_> {
         // flushed commit that succeeded covers every Received commit so far, before any other
         // holder can look (see `Epochs`). A commit that failed moves nothing.
         txn.commit().map_err(storage("commit"))?;
-        store.counts.commits.fetch_add(1, Ordering::Relaxed);
         if matches!(class, Class::Received) {
             epochs.received += 1;
         }
+        store.counts.committed(flushed);
         if flushed {
-            store.counts.flushes.fetch_add(1, Ordering::Relaxed);
             epochs.flushed = epochs.received;
         }
         Ok(())

@@ -1000,6 +1000,18 @@ fn crash_and_restart(
 fn ruled_set_intact(dir: &Path, tag: &str, room: &str, ruled: &Ruled, when: &str) {
     let listed = room_list_line(dir, room);
     assert_open_line(&listed, room, &format!("{tag}, after the crash ({when})"));
+    // Check the key through the shipped status surface before attempting to render the post that
+    // uses it. A key-only mutant therefore reaches its own assertion rather than being hidden by
+    // the later, deliberately combined post-or-key readability verdict.
+    if let Some(keys) = ruled.keys {
+        let now = received_key_generations(dir, room);
+        assert!(
+            now == keys,
+            "PRODUCT: a received key was lost by a crash of the daemon (ADR-038 FX-30, #1022; \
+             {when}): `vox status --json` counted {keys} received key generation(s) for the room \
+             before the crash and {now} after {tag}'s restart"
+        );
+    }
     let rows = read(dir, room);
     assert!(
         holds(&rows, "kept", ruled.kept) == ruled.kept,
@@ -1030,15 +1042,6 @@ fn ruled_set_intact(dir: &Path, tag: &str, room: &str, ruled: &Ruled, when: &str
          {tag}'s restart",
         ruled.sessions
     );
-    if let Some(keys) = ruled.keys {
-        let now = received_key_generations(dir, room);
-        assert!(
-            now == keys,
-            "PRODUCT: a received key was lost by a crash of the daemon (ADR-038 FX-30, #1022; \
-             {when}): `vox status --json` counted {keys} received key generation(s) for the room \
-             before the crash and {now} after {tag}'s restart"
-        );
-    }
     println!(
         "[proof] {tag}: after the crash ({when}) the room is open, it reads {rows:?}, trusts {:?}, \
          lists Sessions {sessions:?} and holds {:?} received key generation(s)",

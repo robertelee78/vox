@@ -67,6 +67,9 @@
 //!   the live window — claim 2 red as `PRODUCT: … older page never arrived`;
 //! - the consent release covering no history (`history_plan` returns nothing): the 1,500-post arm
 //!   red with bob short of 1,500 once the pages are asked for.
+//! - derived batches using Immediate durability again: with the backlog donor stopped, the first
+//!   accepted `--history older` advances Bob's commit count and its own PRODUCT assertion sees
+//!   the flush count advance too.
 
 // Two blocking-or-optional arms (decider, 2026-10-01: "Valid proofs block; rest optional"). The
 // 160-post history BLOCKS: a newcomer reads every post exactly once and in order, the part below
@@ -81,6 +84,8 @@ mod optional_proof;
 optional_proof::not_run!(
     a_newcomer_trusted_before_every_post_reads_all_of_them,
     a_newcomer_talks_both_ways_at_one_wait_fresh_or_behind_a_backlog,
+    a_quiet_room_costs_no_rounds_and_says_when_it_last_synced,
+    a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once,
 );
 
 #[path = "support/test_knobs.rs"]
@@ -243,6 +248,39 @@ fn daemon_env(dir: &Path, tag: &str, env: &[(&str, &str)]) -> Daemon {
 fn said(dir: &Path, tag: &str) -> String {
     std::fs::read_to_string(dir.join(format!("daemon-{tag}.err")))
         .unwrap_or_else(|e| format!("(its stderr could not be read: {e})"))
+}
+
+/// Stop or continue a proof daemon and observe that exact OS event before the journey uses it.
+/// This has no product time quota: the proof watchdog owns apparatus failure if the machine
+/// never delivers the signal.
+fn signal_daemon(pid: u32, signal: &str, stopped: bool) {
+    let sent = Command::new("kill")
+        .args([signal, &pid.to_string()])
+        .status()
+        .is_ok_and(|status| status.success());
+    assert!(
+        sent,
+        "APPARATUS: `kill {signal} {pid}` did not accept the daemon signal"
+    );
+    loop {
+        let state = Command::new("ps")
+            .args(["-o", "state=", "-p", &pid.to_string()])
+            .output()
+            .unwrap_or_else(|e| panic!("APPARATUS: could not observe daemon {pid}: {e}"));
+        assert!(
+            state.status.success(),
+            "APPARATUS: `ps` could not observe daemon {pid} after {signal}"
+        );
+        let state = String::from_utf8_lossy(&state.stdout);
+        assert!(
+            !state.trim().is_empty(),
+            "APPARATUS: daemon {pid} exited while applying {signal}"
+        );
+        if state.trim_start().starts_with('T') == stopped {
+            return;
+        }
+        std::thread::yield_now();
+    }
 }
 
 /// `vox room list` once the daemon's socket answers.
@@ -2118,6 +2156,16 @@ fn newcomer_reads_the_whole_history(
             std::thread::sleep(Duration::from_millis(500));
             continue;
         };
+        // The first page request also independently proves that a real derived-only commit does
+        // not flush. Stop the shipped donor so no fetched entry can cause the count; the shipped
+        // requester still accepts and records its exact bounded request. Resume the donor
+        // immediately after reading the coherent public counters.
+        let derived_before = if demands == 0 {
+            signal_daemon(alice_daemon.0.id(), "-STOP", true);
+            Some(store_counts(&bob))
+        } else {
+            None
+        };
         // The page below the oldest row he holds, on demand (R1).
         let (ok, out, err) = vox(
             &bob,
@@ -2132,10 +2180,38 @@ fn newcomer_reads_the_whole_history(
             ],
             None,
         );
+        let derived_after = derived_before.map(|_| store_counts(&bob));
+        if derived_before.is_some() {
+            signal_daemon(alice_daemon.0.id(), "-CONT", false);
+        }
         assert!(
             ok,
             "PRODUCT: bob's `vox room read --history older --before {oldest}` was refused: {out}{err}"
         );
+        if let (Some(before), Some(after)) = (derived_before, derived_after) {
+            assert!(
+                after.0 > before.0,
+                "PRODUCT: bob's accepted explicit history request made no derived store commit \
+                 (ADR-038 FX-30, #1022): commits {} -> {}, flushes {} -> {}\nbob's status: {}",
+                before.0,
+                after.0,
+                before.1,
+                after.1,
+                synced(&bob).2
+            );
+            assert_eq!(
+                after.1,
+                before.1,
+                "PRODUCT: an explicit history request flushed derived-only state to disk \
+                 (ADR-038 FX-30, #1022): bob's commits {} -> {}, flushes {} -> {}\nbob's \
+                 status: {}",
+                before.0,
+                after.0,
+                before.1,
+                after.1,
+                synced(&bob).2
+            );
+        }
         demands += 1;
         println!(
             "[proof] bob asked for the page before {}…: {}",
