@@ -244,7 +244,15 @@ The decider then answered twelve questions, one at a time. His answers are the d
 - **FX-28.** The daemon MUST reconcile a node's computer trust (ADR-035) only when something it
   depends on has changed: the computer policy's revision, a node attaching or detaching, or the
   roster of paired computers; never on a timer, and a node's binding MUST be derived once per
-  revision, not once per question. Measured cause, 2026-10-20 (the decider's daemon, vox 0.4.9,
+  revision, not once per question. The detection of a change MUST be sound across daemons, not
+  only within one: "we need the detection of change logic to be sound. Easy for local daemon to
+  notice, but daemon to daemon update needs to be solid" (the decider, 2026-10-20). Decision: a
+  change made at another computer reaches this daemon through the pairing exchange its author
+  starts (ADR-035; a computer whose revision its peer has not receipted exchanges, #989), a
+  merged exchange that moves this daemon's revision is a change here, and the periodic fallback
+  exchange stays as the net for a lost one; the proof changes computer trust on one daemon and
+  asserts that a node on the other daemon is bound to the new policy within the bound, with no
+  tick. Measured cause, 2026-10-20 (the decider's daemon, vox 0.4.9,
   four nodes Ready in eleven rooms, no room gaining an entry; `ps` 0.63 of a core at steady
   state; two 10 s `sample` runs symbolized from the release symbols, FX-25): 21–24% of the busy
   CPU was `prepare_computer_binding` → `Computer::bind_node` (`State::derive` and
