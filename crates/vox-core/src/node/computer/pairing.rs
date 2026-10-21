@@ -60,6 +60,18 @@ pub struct PairingPreview {
     /// Invitation expiry, Unix milliseconds.
     pub expires_ms: u64,
 }
+/// One completed exchange of pairing state with a computer, as `vox computer status` dates it
+/// (ADR-038 FX-28): when it completed, this daemon's policy revision it sent, and this daemon's
+/// revision after merging what the computer sent (the same number when the merge moved nothing).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ExchangeRecord {
+    /// When the exchange completed, Unix milliseconds.
+    pub at_ms: u64,
+    /// This daemon's policy revision in the state it sent.
+    pub sent_revision: u64,
+    /// This daemon's policy revision after merging the computer's state.
+    pub merged_revision: u64,
+}
 /// Signed application of the exact current group frontier, independent of present reachability.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ComputerApplication {
@@ -78,6 +90,14 @@ pub struct ComputerApplication {
     pub exchange_attempts: u64,
     /// Attempts in a row that could not reach it; the retry backs off with each.
     pub exchange_failures: u32,
+    /// The last exchange this daemon started with it that completed: a change made here
+    /// travels in one of these (ADR-038 FX-28).
+    #[serde(default)]
+    pub last_started_exchange: Option<ExchangeRecord>,
+    /// The last exchange it started that this daemon answered: a change made there arrives in
+    /// one of these, or in the reply to one this daemon started.
+    #[serde(default)]
+    pub last_answered_exchange: Option<ExchangeRecord>,
 }
 /// A node identity proved by its node and managing computer, with current policy role.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -284,6 +304,9 @@ struct Exchanged {
     involved: bool,
     /// The last failure's words, while failures stand.
     problem: Option<String>,
+    /// The last completed exchange this node started, and the last one it answered.
+    last_started: Option<ExchangeRecord>,
+    last_answered: Option<ExchangeRecord>,
 }
 
 /// One exchange attempt's bookkeeping: records its outcome when done, and a failure if the
@@ -298,7 +321,7 @@ struct Attempt {
 }
 
 impl Attempt {
-    fn done(mut self, outcome: std::result::Result<(), String>) {
+    fn done(mut self, outcome: std::result::Result<(u64, u64), String>) {
         self.recorded = true;
         self.me
             .record_exchange(self.peer, self.revision, self.involved, outcome);
@@ -911,9 +934,10 @@ impl Management {
         // one after. A superseded handshake is recorded as nothing.
         if !superseded {
             let outcome = match &paired {
-                // The handshake exchanged state: counted and dated like any exchange, and
-                // the status's problem follows from every computer's record.
-                Ok(()) => Ok(()),
+                // The handshake exchanged state: counted and dated like any exchange, with
+                // the revisions it carried, and the status's problem follows from every
+                // computer's record.
+                Ok(revisions) => Ok(*revisions),
                 Err(e) => Err(e.to_string()),
             };
             self.record_exchange(target, revision, true, outcome);
@@ -1169,6 +1193,8 @@ impl Management {
                     exchanges: record.count,
                     exchange_attempts: record.attempts,
                     exchange_failures: record.failures,
+                    last_started_exchange: record.last_started,
+                    last_answered_exchange: record.last_answered,
                 })
             })
             .collect::<Result<_>>()?;
@@ -1632,7 +1658,9 @@ impl Management {
         self.serve(Arc::clone(&conn));
         Ok(conn)
     }
-    async fn pair(self: &Arc<Self>, link: &Link, url: &str) -> Result<()> {
+    /// The operator's pairing handshake with the inviting computer: this node's revision as it
+    /// stood when the handshake began, and after the computer's state was merged.
+    async fn pair(self: &Arc<Self>, link: &Link, url: &str) -> Result<(u64, u64)> {
         let conn = self
             .connect(link.target, &link.endpoints, Some(link))
             .await?;
@@ -1687,7 +1715,8 @@ impl Management {
         pop::verify(&proof, &ci, &transcript, &link.target)?;
         let exchange = d.bytes()?.to_vec();
         d.finish()?;
-        self.computer.change(|s| {
+        let sent = self.computer.revision();
+        let merged = self.computer.change(|s| {
             if s.pending
                 .as_ref()
                 .is_some_and(|p| !enrolled(s, p) && p.body() != g.body())
@@ -1705,10 +1734,10 @@ impl Management {
             s.pending_expires = link.expires;
             s.pair_link = Some(Zeroizing::new(url.to_owned()));
             merge(s, &exchange, link.target, self.computer.signer.as_ref())?;
-            Ok(())
+            Ok(s.revision)
         })?;
         let _ = send.finish();
-        Ok(())
+        Ok((sent, merged))
     }
     async fn answer(
         &self,
@@ -1720,10 +1749,14 @@ impl Management {
         write_frame(send, &hello(op, &self.computer.description(), &id)).await?;
         if op == 2 {
             let payload = frame(recv).await?;
-            self.computer
-                .change(|s| merge(s, &payload, conn.peer_id(), self.computer.signer.as_ref()))?;
+            // A merge that moves this daemon's revision is a change here (ADR-038 FX-28).
+            let merged = self.computer.change(|s| {
+                merge(s, &payload, conn.peer_id(), self.computer.signer.as_ref())
+                    .map(|()| s.revision)
+            })?;
             let payload = exchange(&lock(&self.computer.state))?;
             write_frame(send, &payload).await?;
+            self.record_answered(conn.peer_id(), merged);
             return Ok(());
         }
         if op != 1 {
@@ -2006,7 +2039,7 @@ impl Management {
                     match tokio::time::timeout(EXCHANGE_WITHIN, me.sync_peer(peer, endpoints, url))
                         .await
                     {
-                        Ok(Ok(())) => Ok(()),
+                        Ok(Ok(revisions)) => Ok(revisions),
                         Ok(Err(e)) => Err(e.to_string()),
                         Err(_) => Err(format!(
                             "the exchange did not finish within {EXCHANGE_WITHIN:?}"
@@ -2034,7 +2067,7 @@ impl Management {
         peer: Digest32,
         revision: u64,
         involved: bool,
-        outcome: std::result::Result<(), String>,
+        outcome: std::result::Result<(u64, u64), String>,
     ) {
         let mut exchanged = lock(&self.exchanged);
         let record = exchanged.entry(peer).or_default();
@@ -2042,11 +2075,17 @@ impl Management {
         record.revision = revision;
         record.involved = involved;
         match outcome {
-            Ok(()) => {
-                record.last_ms = Some(now());
+            Ok((sent_revision, merged_revision)) => {
+                let at_ms = now();
+                record.last_ms = Some(at_ms);
                 record.count = record.count.saturating_add(1);
                 record.failures = 0;
                 record.problem = None;
+                record.last_started = Some(ExchangeRecord {
+                    at_ms,
+                    sent_revision,
+                    merged_revision,
+                });
             }
             Err(text) => {
                 record.failures = record.failures.saturating_add(1);
@@ -2058,17 +2097,22 @@ impl Management {
             .filter(|r| r.failures > 0)
             .find_map(|r| r.problem.clone());
     }
+    /// One exchange this node starts with `peer`: this node's revision as sent, and after the
+    /// computer's state was merged.
     async fn sync_peer(
         self: &Arc<Self>,
         peer: Digest32,
         endpoints: EndpointList,
         url: Option<Zeroizing<String>>,
-    ) -> Result<()> {
+    ) -> Result<(u64, u64)> {
         let link = url.as_ref().map(|l| Link::parse(l)).transpose()?;
         let endpoints = link.as_ref().map(|l| &l.endpoints).unwrap_or(&endpoints);
         let conn = self.connect(peer, endpoints, link.as_ref()).await?;
         self.serve(Arc::clone(&conn));
-        let payload = exchange(&lock(&self.computer.state))?;
+        let (payload, sent) = {
+            let s = lock(&self.computer.state);
+            (exchange(&s)?, s.revision)
+        };
         let (mut send, mut recv) = streams::open_typed(&conn, StreamKind::Computer).await?;
         write_frame(&mut send, &hello(2, &self.computer.description(), &[0; 32])).await?;
         let (op, _, _) = read_hello(&mut recv, &conn).await?;
@@ -2077,10 +2121,24 @@ impl Management {
         }
         write_frame(&mut send, &payload).await?;
         let f = frame(&mut recv).await?;
-        self.computer
-            .change(|s| merge(s, &f, peer, self.computer.signer.as_ref()))?;
+        // A merge that moves this daemon's revision is a change here: `change` wakes the
+        // daemon's follower on it (ADR-038 FX-28).
+        let merged = self
+            .computer
+            .change(|s| merge(s, &f, peer, self.computer.signer.as_ref()).map(|()| s.revision))?;
         let _ = send.finish();
-        Ok(())
+        Ok((sent, merged))
+    }
+
+    /// Record an exchange `peer` started and this node answered, now: what a person reads as
+    /// the last exchange answered, with this daemon's revision after the merge (what it sent).
+    fn record_answered(&self, peer: Digest32, revision: u64) {
+        let mut exchanged = lock(&self.exchanged);
+        exchanged.entry(peer).or_default().last_answered = Some(ExchangeRecord {
+            at_ms: now(),
+            sent_revision: revision,
+            merged_revision: revision,
+        });
     }
 }
 fn side(g: &Enrollment, id: &Digest32) -> Result<usize> {

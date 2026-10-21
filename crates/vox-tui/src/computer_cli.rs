@@ -277,14 +277,30 @@ fn show(status: &ComputerStatus, json: bool) -> Result<(), AppError> {
             vox_text::shell::command(&["vox", "computer", "cancel", id])
         );
     }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
     for application in &status.applications {
+        // The last exchange this daemon started and the last it answered, each with the policy
+        // revision it sent and the one it stood at after merging: which exchange carried a
+        // change (ADR-038 FX-28).
+        let mut carried = String::new();
+        for (what, record) in [
+            ("started", application.last_started_exchange),
+            ("answered", application.last_answered_exchange),
+        ] {
+            if let Some(r) = record {
+                carried.push_str(&format!(
+                    "; last exchange {what} {} s ago sent revision {}, merged to revision {}",
+                    now_ms.saturating_sub(r.at_ms) / 1000,
+                    r.sent_revision,
+                    r.merged_revision
+                ));
+            }
+        }
         let exchanged = match application.last_exchange_ms {
             Some(at) => {
-                let ago = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |d| d.as_millis() as u64)
-                    .saturating_sub(at)
-                    / 1000;
+                let ago = now_ms.saturating_sub(at) / 1000;
                 format!(
                     "; exchanged {} time(s) in {} attempt(s) since the daemon started, last {ago} s ago{}",
                     application.exchanges,
@@ -309,7 +325,7 @@ fn show(status: &ComputerStatus, json: bool) -> Result<(), AppError> {
             ),
         };
         println!(
-            "{}  {}  {}{exchanged}",
+            "{}  {}  {}{exchanged}{carried}",
             application.computer.name,
             application.computer.fingerprint,
             if application.confirmed {
@@ -319,9 +335,6 @@ fn show(status: &ComputerStatus, json: bool) -> Result<(), AppError> {
             }
         );
     }
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64);
     for node in &status.nodes {
         // A node of this computer says at which policy revision its binding was derived and
         // when: current when it names the status's revision, stale otherwise (ADR-038 FX-28).

@@ -1,6 +1,10 @@
 //! The daemon composes computer policy with already-attached node actors; no new unlock path.
 use super::*;
 
+/// How long one node may take to apply computer trust before it is treated as a failed write:
+/// its stale grants must not stand on the network, and the other nodes never wait on it.
+const RECONCILE_WITHIN: Duration = Duration::from_secs(30);
+
 impl Router {
     /// Reconcile the daemon's nodes with computer trust on change, and on no timer (ADR-038
     /// FX-28): when the policy revision moves (a change made here, or a merged exchange that
@@ -55,8 +59,10 @@ impl Router {
     }
 
     /// One reconciliation pass: the roster follows the nodes on disk, every attached node that
-    /// is behind the policy derives its binding and applies its keyring, and the application
-    /// receipt is recorded. A node at the current revision is not asked.
+    /// is behind the policy derives its binding and applies its keyring, all at once and each
+    /// within [`RECONCILE_WITHIN`], and the application receipt is recorded. A node at the
+    /// current revision is not asked; one that fails or does not answer is detached, off this
+    /// task, so no node holds the follower.
     async fn reconcile_computer_trust(&self) {
         let management = Arc::clone(&self.inner.defaults.computer);
         if management.computer.binding_group().is_none() && !management.computer.grouped() {
@@ -78,11 +84,10 @@ impl Router {
             return;
         }
         let mut pending = Vec::new();
+        let mut behind = tokio::task::JoinSet::new();
+        let attached = self.attached_handles();
         for info in self.nodes() {
-            let Some((_, handle)) = self
-                .attached_handles()
-                .into_iter()
-                .find(|(name, _)| name == info.name.as_str())
+            let Some((_, handle)) = attached.iter().find(|(name, _)| name == info.name.as_str())
             else {
                 pending.push(format!(
                     "{}: make this node Ready to apply computer trust",
@@ -93,10 +98,37 @@ impl Router {
             if handle.computer_current() {
                 continue;
             }
-            if let Err(e) = handle.reconcile_computer().await {
-                pending.push(format!("{}: {e}", info.name));
-                // A failed write must not leave stale grants on the network.
-                let _ = self.detach(&info.name, DetachCause::Requested).await;
+            let handle = handle.clone();
+            let name = info.name.clone();
+            behind.spawn(async move {
+                let outcome =
+                    match tokio::time::timeout(RECONCILE_WITHIN, handle.reconcile_computer()).await
+                    {
+                        Ok(Ok(())) => Ok(()),
+                        Ok(Err(e)) => Err(e.to_string()),
+                        Err(_) => Err(format!(
+                            "did not apply computer trust within {RECONCILE_WITHIN:?}"
+                        )),
+                    };
+                (name, outcome)
+            });
+        }
+        while let Some(joined) = behind.join_next().await {
+            let (name, outcome) = match joined {
+                Ok(done) => done,
+                Err(e) => {
+                    eprintln!("vox daemon: computer trust application stopped: {e}");
+                    continue;
+                }
+            };
+            if let Err(e) = outcome {
+                pending.push(format!("{name}: {e}"));
+                // A failed write must not leave stale grants on the network. The detach waits
+                // for the node's actor to end, which a wedged one may not do soon: off this task.
+                let router = self.clone();
+                self.inner.rt.spawn(async move {
+                    let _ = router.detach(&name, DetachCause::Requested).await;
+                });
             }
         }
         management.pending_nodes(pending);

@@ -21,7 +21,7 @@ use zeroize::Zeroizing;
 mod pairing;
 pub use pairing::{
     ComputerApplication, ComputerBindingAction, ComputerIdentity, ComputerNode, ComputerStatus,
-    Management, PairingPreview,
+    ExchangeRecord, Management, PairingPreview,
 };
 
 /// The one fixed policy, displayed before either operator approves an enrollment.
@@ -854,6 +854,10 @@ pub(crate) struct State {
     pub pending: Option<Enrollment>,
     /// Exact local policy application revision for each attached node; never a distributed clock.
     pub applied: BTreeMap<Digest32, AppliedPolicy>,
+    /// Per node of this computer, the revision its binding was last derived at and when
+    /// (ADR-038 FX-28): a binding is derived once per revision, across restarts too, and a node
+    /// whose record names the current revision is left alone.
+    pub derived: BTreeMap<Digest32, DerivedBinding>,
     intervals: BTreeMap<Digest32, Vec<MembershipInterval>>,
     retired_nodes: BTreeMap<Digest32, u64>,
     individual: BTreeMap<Digest32, BTreeMap<Digest32, u64>>,
@@ -1442,7 +1446,7 @@ impl State {
 
     fn body(&self) -> Vec<u8> {
         let mut e = Encoder::for_secrets();
-        e.array(25)
+        e.array(26)
             .bytes(&self.description.encode())
             .uint(self.revision)
             .array(self.invitations.len());
@@ -1563,11 +1567,20 @@ impl State {
         for (group, genesis) in &self.retired_groups {
             e.array(2).bytes(group).bytes(&genesis.encode());
         }
+        e.array(self.derived.len());
+        for (node, d) in &self.derived {
+            e.array(3).bytes(node).uint(d.revision).uint(d.at_ms);
+        }
         e.finish()
     }
     fn read(vault: Vec<u8>, body: &[u8]) -> Result<Self> {
         let mut d = Decoder::new(body);
-        arity(&mut d, 25)?;
+        // 26 elements; a state written before the derived record existed has 25 and no record,
+        // so every binding is derived once more at its revision.
+        let fields = count(&mut d)?;
+        if fields != 25 && fields != 26 {
+            return Err(bad());
+        }
         let description = Description::decode(d.bytes()?)?;
         let revision = d.uint()?;
         let n = count(&mut d)?;
@@ -1815,8 +1828,31 @@ impl State {
                 return Err(bad());
             }
         }
+        let mut derived = BTreeMap::new();
+        if fields == 26 {
+            for _ in 0..count(&mut d)? {
+                arity(&mut d, 3)?;
+                let node = digest(&mut d)?;
+                let at = d.uint()?;
+                let at_ms = d.uint()?;
+                if at > revision
+                    || derived
+                        .insert(
+                            node,
+                            DerivedBinding {
+                                revision: at,
+                                at_ms,
+                            },
+                        )
+                        .is_some()
+                {
+                    return Err(bad());
+                }
+            }
+        }
         d.finish()?;
         let mut s = Self {
+            derived,
             retired_groups,
             binding_approvals,
             intervals,
@@ -2065,9 +2101,6 @@ pub struct Computer {
     /// The policy revision, sent whenever a change moves it: a local change or a merged
     /// exchange alike (ADR-038 FX-28). The daemon reconciles its nodes on this, and on no timer.
     changed: tokio::sync::watch::Sender<u64>,
-    /// Per node, the revision its binding was last derived at and when: a binding is derived
-    /// once per revision, and a node whose record names the current revision is left alone.
-    derived: Mutex<BTreeMap<Digest32, DerivedBinding>>,
     /// Each node's plan at the revision it was derived at: the app's polling and every trust
     /// command answer from it while the revision stands, instead of verifying the history again.
     plans: Mutex<BTreeMap<Digest32, (u64, PolicyPlan)>>,
@@ -2075,8 +2108,9 @@ pub struct Computer {
 
 /// When a node's management binding was last derived, and at which policy revision (ADR-038
 /// FX-28): what `vox computer status` shows, so a person can tell a stale binding from a
-/// current one. In memory only: a daemon derives each node's binding again when it attaches.
-#[derive(Clone, Copy, Debug)]
+/// current one. Part of the signed state, so a restart derives nothing again at the same
+/// revision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DerivedBinding {
     /// The policy revision the binding was derived at.
     pub revision: u64,
@@ -2098,14 +2132,14 @@ impl Computer {
     /// Whether `node`'s binding was derived at the current policy revision.
     pub fn binding_current(&self, node: &Digest32) -> bool {
         let s = lock(&self.state);
-        lock(&self.derived)
+        s.derived
             .get(node)
             .is_some_and(|d| d.revision == s.revision)
     }
 
-    /// When `node`'s binding was last derived since the daemon started, and at which revision.
+    /// When `node`'s binding was last derived, and at which revision.
     pub(crate) fn derived_binding(&self, node: &Digest32) -> Option<DerivedBinding> {
-        lock(&self.derived).get(node).copied()
+        lock(&self.state).derived.get(node).copied()
     }
 
     /// A failed policy write invalidates current grants even when the durable revision did not
@@ -2194,7 +2228,6 @@ impl Computer {
         if self.binding_current(&key) {
             return Ok(());
         }
-        let mut derived_at = None;
         self.change(|s| {
             if s.quarantined.contains(&local) {
                 return Ok(());
@@ -2281,20 +2314,17 @@ impl Computer {
                 s.binding_approvals.remove(&key);
             }
             // The revision the binding now stands at: the one the roster event just made, or
-            // the one it was found current at.
-            derived_at = Some(s.revision);
-            Ok(())
-        })?;
-        if let Some(revision) = derived_at {
-            lock(&self.derived).insert(
+            // the one it was found current at. Saved with the state, so a restart does not
+            // derive it again.
+            s.derived.insert(
                 key,
                 DerivedBinding {
-                    revision,
+                    revision: s.revision,
                     at_ms: pairing::now(),
                 },
             );
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Exact policy for an attached node, from verified durable rosters. No roster grants room
@@ -2632,7 +2662,6 @@ impl Computer {
                 state: Mutex::new(state),
                 reachers: Mutex::new(Vec::new()),
                 changed: tokio::sync::watch::channel(revision).0,
-                derived: Mutex::new(BTreeMap::new()),
                 plans: Mutex::new(BTreeMap::new()),
             });
             // Validate present storage before any endpoint or managed node can resume authority.
@@ -2686,6 +2715,7 @@ impl Computer {
             rosters: BTreeMap::new(),
             pending: None,
             applied: BTreeMap::new(),
+            derived: BTreeMap::new(),
         };
         let c = Arc::new(Self {
             path,
@@ -2694,7 +2724,6 @@ impl Computer {
             state: Mutex::new(state),
             reachers: Mutex::new(Vec::new()),
             changed: tokio::sync::watch::channel(0).0,
-            derived: Mutex::new(BTreeMap::new()),
             plans: Mutex::new(BTreeMap::new()),
         });
         c.save(&lock(&c.state))?;

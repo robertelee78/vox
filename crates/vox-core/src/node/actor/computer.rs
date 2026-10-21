@@ -193,7 +193,9 @@ impl Node {
         }
         let Some(profile) = &self.profile else {
             if let Some(signer) = &self.headless {
-                computer.mark_applied(signer.fingerprint(), revision, &[])?;
+                if !computer.applied(&signer.fingerprint(), revision) {
+                    computer.mark_applied(signer.fingerprint(), revision, &[])?;
+                }
                 self.computer_revision
                     .store(revision, std::sync::atomic::Ordering::Release);
             }
@@ -203,6 +205,13 @@ impl Node {
             return Ok(Vec::new());
         }
         let me = profile.fingerprint();
+        // Applied at this revision already: recorded after the keyring was saved, and kept
+        // across a restart, so nothing is derived or written again (ADR-038 FX-28).
+        if computer.applied(&me, revision) {
+            self.computer_revision
+                .store(revision, std::sync::atomic::Ordering::Release);
+            return Ok(Vec::new());
+        }
         let Some(plan) = computer.plan(me)? else {
             return Ok(Vec::new());
         };
