@@ -245,9 +245,12 @@ The decider then answered twelve questions, one at a time. His answers are the d
   attaching or detaching, a computer joining or leaving the roster) made on either of two paired
   daemons MUST show on every attached node of both: `vox computer status` asked of each such
   node names the new policy (the computer added or removed, the drive granted or revoked, the
-  node attached or detached in the bound roster) within 5 s of the change when the exchange the
-  changing daemon starts (#989) completes, and within 60 s, the fallback exchange's period, when
-  that exchange is lost. Two daemons on which nothing changed MUST spend nothing on it:
+  node attached or detached in the bound roster) within 5 s of the change on the daemon where
+  it was made, whatever the other daemon does; on the other daemon within 5 s of the exchange
+  the changing daemon starts for it (#989) completing, and, when that exchange does not
+  complete (the peer unreachable, the stream cut), within 60 s of the change, the fallback
+  exchange's period, once the peer is reachable again. Two daemons on which nothing changed
+  MUST spend nothing on it:
   over an idle minute their CPU grows by no more than FX-15's quiet-room bound. "We need the
   detection of change logic to be sound. Easy for local daemon to notice, but daemon to daemon
   update needs to be solid" (the decider, 2026-10-20). Decision: a node's binding is derived
@@ -294,21 +297,25 @@ The decider then answered twelve questions, one at a time. His answers are the d
   the peers it can reach. A sync round that persists only derived state MUST make no full flush:
   `vox status --json` names the daemon's count of full flushes, and over a quiet minute it MUST
   NOT move. Decision: derived state commits at redb `Durability::None` or `Eventual` (a later
-  durable commit carries it) and the ruled set stays `Immediate`; a received entry and the
-  header that carries it commit with the derived state that admitted them and reach disk with
-  the next durable commit, so a crash in between loses nothing a peer does not still hold.
-  Measured cause, the same daemon: every `Batch::commit` is redb `Durability::Immediate` →
+  durable commit carries it) and the ruled set stays `Immediate` however it arrived: a
+  received consent, trust change, key package or Session record is flushed like the node's own.
+  Any other received entry commits with the derived state that admitted it and reaches disk
+  with the next durable commit, before this node acknowledges holding it to its sender (ADR-028
+  R-6), so a crash in between loses only what the sender has not yet seen acknowledged and
+  offers again. Measured cause, the same daemon: every `Batch::commit` is redb `Durability::Immediate` →
   `sync_data` → `fcntl(F_FULLFSYNC)` (vox-core never calls `set_durability`); the process spent
   0.65 thread-seconds per wall second inside `F_FULLFSYNC` (about 0.5 ms per call back to back;
   an isolated 8 KiB probe cost 7.6 ms), and that flush was most of the 1,367 commits' cost.
 - **FX-31.** A flush to disk of one commit MUST NOT delay what does not depend on it: while a
   flush is held (apparatus: the store's flush stalled by a `VOX_TEST_*` knob of the `test-knobs`
   build, the way every held-step proof here stages a stall), the daemon's status
-  publication, a member's read in that room, a post in any other room and attention selection
-  MUST answer within FX-17's bound, a post in that room MUST be accepted within the bound plus
-  the held flush's duration, and `vox status` MUST NOT say "room publication is busy" for a
-  room whose only activity is a flush. Decision: no commit's flush runs while the room's lock
-  is held; the batch is written under the lock and flushed after it. Measured cause, the same daemon: every commit ran inside `history_write` with
+  publication, a member's read in that room, a post in that room or any other, and attention
+  selection MUST answer within FX-17's bound ("publications, reads, posts and attention never
+  wait on" a flush, ruled 2026-10-20: "sounds right"), and `vox status` MUST NOT say "room
+  publication is busy" for a room whose only activity is a flush. Decision: no commit's flush
+  runs while the room's lock is held; a post's batch is written under the lock and its own
+  flush completes after the lock is released, so the post is accepted, and durable, within the
+  bound while an earlier flush is still held. Measured cause, the same daemon: every commit ran inside `history_write` with
   the room mutex held (the `read_charged` closure owns the `lock_owned()` guard), so the daemon
   log said `room publication is busy; retry this operation` 424 times and `attention selection
   remains pending`, and the app's member list flickered (#983).
