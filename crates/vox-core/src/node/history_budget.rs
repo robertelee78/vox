@@ -147,6 +147,21 @@ impl Default for State {
 }
 
 impl State {
+    /// Allocate an identity not held by another waiter in this lane. Serial wrap is ordinary:
+    /// the queue can hold fewer identities than the `u64` space on every supported target, so
+    /// walking past the finite live set always finds a free value and never refuses exact work.
+    fn allocate_ticket(&mut self, lane: Lane) -> u64 {
+        loop {
+            self.next_ticket = self.next_ticket.wrapping_add(1);
+            if !self.queues[lane.index()]
+                .iter()
+                .any(|waiting| waiting.ticket == self.next_ticket)
+            {
+                return self.next_ticket;
+            }
+        }
+    }
+
     fn available(&self, node: Digest32, lane: Lane) -> bool {
         match lane {
             Lane::Archive => {
@@ -225,12 +240,12 @@ impl Budget {
     /// Admit one exact daemon job without borrowing an already-admitted worker. Retirement and
     /// other local cleanup use this so a parked flow retains only durable demand, never a lane
     /// slot. The ticket subscribes before each attempt; capacity release is the only wake.
-    pub(crate) async fn admit_job(self: &Arc<Self>, node: Digest32, lane: Lane) -> Option<Job> {
-        let mut ticket = self.enqueue(node, lane)?;
+    pub(crate) async fn admit_job(self: &Arc<Self>, node: Digest32, lane: Lane) -> Job {
+        let mut ticket = self.enqueue(node, lane);
         loop {
             let wake = ticket.wake();
             if let Some(job) = ticket.try_admit() {
-                return Some(job);
+                return job;
             }
             wake.await;
         }
@@ -254,28 +269,27 @@ impl Budget {
         }
     }
 
-    /// Queue one bounded operation. Refusal is only ticket-id exhaustion, never permission to
-    /// start an unaccounted worker. No actor lock may be held while awaiting the returned ticket.
-    /// Dropping it cancels the queued operation.
-    pub fn enqueue(self: &Arc<Self>, node: Digest32, lane: Lane) -> Option<Ticket> {
+    /// Queue one bounded operation. Ticket identities wrap past the finite active set, so serial
+    /// exhaustion cannot refuse or dispose exact work. No actor lock may be held while awaiting
+    /// the returned ticket. Dropping it cancels the queued operation.
+    pub fn enqueue(self: &Arc<Self>, node: Digest32, lane: Lane) -> Ticket {
         let mut state = self.state();
-        let ticket = state.next_ticket.checked_add(1)?;
-        state.next_ticket = ticket;
+        let ticket = state.allocate_ticket(lane);
         state.queues[lane.index()].push_back(Waiting { ticket, node });
         drop(state);
         self.notify_lane(lane);
-        Some(Ticket {
+        Ticket {
             budget: Arc::clone(self),
             node,
             lane,
             ticket,
             queued: true,
-        })
+        }
     }
 
     /// Nonblocking admission for an actor: queued workers retain their place ahead of it.
     pub fn try_start(self: &Arc<Self>, node: Digest32, lane: Lane) -> Option<Job> {
-        self.enqueue(node, lane)?.try_admit()
+        self.enqueue(node, lane).try_admit()
     }
 }
 
@@ -654,7 +668,7 @@ impl Job {
     /// with the last actual buffer.
     pub(crate) async fn record_job(&self, envelope: usize) -> Option<Self> {
         if self.0.lane == Lane::Control && envelope > MIB {
-            let mut ticket = self.0.budget.enqueue(self.0.node, Lane::LargeControl)?;
+            let mut ticket = self.0.budget.enqueue(self.0.node, Lane::LargeControl);
             loop {
                 // Subscribe first: a release between the failed admission and the await cannot
                 // be lost. The retained ticket keeps its fair position; no periodic retry is

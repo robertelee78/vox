@@ -610,13 +610,10 @@ impl Flow {
             .any(|task| matches!(task.operation, Operation::Reclaim(Purpose::Control)));
         // A parked flow owns no worker. Retirement admits one independent large-control job for
         // this bounded local slice and gives it back before the flow is retained again.
-        let Some(cleanup_job) = self
+        let cleanup_job = self
             .cleanup_budget
             .admit_job(self.node, crate::node::history_budget::Lane::LargeControl)
-            .await
-        else {
-            return Ok(false);
-        };
+            .await;
         if reclaim_live
             && !self
                 .reclaim_stage(Purpose::Live, &cleanup_job, true)

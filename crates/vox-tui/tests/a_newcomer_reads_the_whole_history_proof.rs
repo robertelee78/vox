@@ -1233,10 +1233,14 @@ struct TailObserver {
 
 #[cfg(feature = "optional-proofs")]
 impl TailObserver {
-    fn attach(dir: &Path, node: Option<&str>, room: &str) -> Self {
+    fn attach(dir: &Path, node: Option<&str>, room: &str, since: Option<&str>) -> Self {
         let mut command = Command::new(VOX);
+        let mut args = vec!["room", "tail", room];
+        if let Some(since) = since {
+            args.extend(["--since", since]);
+        }
         command
-            .args(as_node(&["room", "tail", room], node))
+            .args(as_node(&args, node))
             .env("VOX_DATA_DIR", dir)
             .env("VOX_CONFIG_DIR", dir.join("cfg"))
             .env("VOX_IDENTITY_PASSPHRASE", IDENTITY)
@@ -1291,7 +1295,7 @@ impl TailObserver {
                 }
                 Ok((seen, Ok(line))) if line.contains(target) => panic!(
                     "APPARATUS: {who}'s causal target {target:?} was already visible at \
-                     {seen:?}, before the observed PoolFull snapshot"
+                     {seen:?}, before the observed admission's release edge"
                 ),
                 Ok((_, Ok(_))) => {}
                 Ok((_, Err(error))) if product => {
@@ -1442,19 +1446,79 @@ fn generation_accounting_keeps_actor_incarnations_exact(staged: &Staged) {
     // Two independent authors now give the replacement more than the one remaining shared
     // slot. Its first worker reaches the charged-flow barrier; the second exact port must say
     // NodeBusy. Replacing the actor may neither create two more slots nor misname this PoolFull.
-    for (index, text) in [
-        "generation-accounting-successor-one",
-        "generation-accounting-successor-two",
-    ]
-    .into_iter()
-    .enumerate()
-    {
+    let successors = [
+        (
+            staged.rooms[0].as_str(),
+            staged.everyone[0].3.as_str(),
+            "generation-accounting-successor-one",
+        ),
+        (
+            staged.rooms[1].as_str(),
+            staged.everyone[1].3.as_str(),
+            "generation-accounting-successor-two",
+        ),
+    ];
+    let tail_ready: Vec<(String, String)> = successors
+        .iter()
+        .map(|(room, _, _)| {
+            let (ok, out, err) = vox(
+                &staged.host,
+                &as_node(&["room", "read", room, "--json"], Some(running_name)),
+                None,
+            );
+            assert!(
+                ok,
+                "APPARATUS: could not choose a causal tail cursor in {room}: {out}{err}"
+            );
+            let rows: Vec<serde_json::Value> = out
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(|line| {
+                    serde_json::from_str(line).unwrap_or_else(|error| {
+                        panic!("APPARATUS: tail cursor row is not JSON ({error}): {line}")
+                    })
+                })
+                .collect();
+            assert!(
+                rows.len() >= 2,
+                "APPARATUS: {room} has fewer than two rows for a causal tail cursor: {out}"
+            );
+            (
+                rows[0]["entry_hash"]
+                    .as_str()
+                    .expect("APPARATUS: tail cursor row omitted entry_hash")
+                    .to_owned(),
+                rows[1]["text"]
+                    .as_str()
+                    .expect("APPARATUS: tail readiness row omitted text")
+                    .to_owned(),
+            )
+        })
+        .collect();
+    let successor_tails = [
+        TailObserver::attach(
+            &staged.host,
+            Some(running_name),
+            successors[0].0,
+            Some(&tail_ready[0].0),
+        ),
+        TailObserver::attach(
+            &staged.host,
+            Some(running_name),
+            successors[1].0,
+            Some(&tail_ready[1].0),
+        ),
+    ];
+    // Establish both shipped tails before either successor exists. This is apparatus readiness,
+    // and happens before the admission under verdict; after release, no command may schedule it.
+    for (index, tail) in successor_tails.iter().enumerate() {
+        tail.wait_for(&tail_ready[index].1, running_name, false);
         let (dir, node, name, _) = &staged.everyone[index];
-        stage_post(dir, *node, name, &staged.rooms[index], text);
+        stage_post(dir, *node, name, successors[index].0, successors[index].2);
     }
 
     let replacement_by = Instant::now() + vox_core::node::history_budget::BOUNDED_ROUND_PATIENCE;
-    loop {
+    let refused = loop {
         let replacement = synced(&staged.host, Some(running_name));
         let replacement: serde_json::Value = serde_json::from_str(&replacement.status)
             .expect("PRODUCT: generation-accounting status was not JSON");
@@ -1486,11 +1550,41 @@ fn generation_accounting_keeps_actor_incarnations_exact(staged: &Staged) {
                     && new_actor.is_some_and(|actor| round["actor"] == actor)
             })
         });
-        let node_busy = replacement["lanes"]["ports"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .any(|port| port["start_reason"] == "flow_state_node_busy");
+        // Bind the refusal to one expected successor port and the retained controller flow and
+        // pool admission that name its exact room, peer, root and lane. A refusal on some other
+        // port cannot satisfy this claim.
+        let bounded = &replacement["lanes"]["bounded"];
+        let bound_refusals: Vec<(usize, String, String, u64)> = successors
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (room, peer, _))| {
+                let port = replacement["lanes"]["ports"]
+                    .as_array()?
+                    .iter()
+                    .find(|port| {
+                        port["room"] == *room
+                            && port["peer"] == *peer
+                            && port["start_reason"] == "flow_state_node_busy"
+                    })?;
+                let _ = port;
+                let admission = bounded["admissions"].as_array()?.iter().find(|admission| {
+                    admission["gate"] == "node_slots"
+                        && admission["room"] == *room
+                        && admission["peer"] == *peer
+                })?;
+                let root = admission["root"].as_str()?.to_owned();
+                let lane = admission["lane"].as_str()?.to_owned();
+                let token = admission["admission"].as_u64()?;
+                bounded["ready"].as_array()?.iter().find(|flow| {
+                    flow["room"] == *room
+                        && flow["peer"] == *peer
+                        && flow["root"].as_str() == Some(root.as_str())
+                        && flow["lane"].as_str() == Some(lane.as_str())
+                })?;
+                Some((index, root, lane, token))
+            })
+            .collect();
+        let exact_refusal = (bound_refusals.len() == 1).then(|| bound_refusals[0].clone());
         let pool_full = replacement["lanes"]["ports"]
             .as_array()
             .into_iter()
@@ -1509,7 +1603,9 @@ fn generation_accounting_keeps_actor_incarnations_exact(staged: &Staged) {
             .filter_map(|actor| actor["in_use"].as_u64())
             .sum();
         let running_count = pool["running"].as_array().map_or(0, Vec::len) as u64;
-        if old.is_some() && new.is_some() && running_old && running_new && node_busy {
+        if let Some(exact_refusal) =
+            exact_refusal.filter(|_| old.is_some() && new.is_some() && running_old && running_new)
+        {
             assert!(
                 generations.len() == 2
                     && retiring
@@ -1530,7 +1626,7 @@ fn generation_accounting_keeps_actor_incarnations_exact(staged: &Staged) {
                  actor into the same two node slots, or named the refusal PoolFull: {}",
                 pool
             );
-            break;
+            break exact_refusal;
         }
         assert!(
             !pool_full,
@@ -1541,15 +1637,31 @@ fn generation_accounting_keeps_actor_incarnations_exact(staged: &Staged) {
         assert!(
             Instant::now() < replacement_by,
             "PRODUCT: the replacement and its retired generation did not aggregate to two \
-             charged workers plus an exact NodeBusy refusal within the source-owned \
-             bounded-round contract: {}",
+             charged workers plus one exact room/peer/root/lane NodeBusy refusal within the \
+             source-owned bounded-round contract: {}",
             replacement["lanes"]
         );
         std::thread::sleep(Duration::from_millis(20));
-    }
+    };
 
+    let release_started = Instant::now();
     std::fs::remove_file(hold)
         .unwrap_or_else(|error| panic!("APPARATUS: could not release {}: {error}", hold.display()));
+    let (refused_index, refused_root, refused_lane, refused_admission) = refused;
+    successor_tails[refused_index].wait_for_after(
+        successors[refused_index].2,
+        running_name,
+        true,
+        Some(release_started),
+    );
+    println!(
+        "[proof] NodeBusy admission {refused_admission} retained {}/{} ({refused_root}, \
+         {refused_lane}) and its already-attached tail received {:?} from the charge-release wake",
+        successors[refused_index].0, successors[refused_index].1, successors[refused_index].2
+    );
+
+    // The causal refused-flow verdict is complete before these ordinary reads. They retain the
+    // broader generation-control claim, but cannot revive or substitute for the refused flow.
     let released_by = Instant::now() + vox_core::node::history_budget::BOUNDED_ROUND_PATIENCE;
     for (room, text) in [
         (&staged.rooms[0], target),
@@ -1571,8 +1683,8 @@ fn generation_accounting_keeps_actor_incarnations_exact(staged: &Staged) {
             }
             assert!(
                 Instant::now() < released_by,
-                "PRODUCT: the exact NodeBusy admission did not resume from the retired charge's \
-                 release within the source-owned bounded-round contract: {text:?}"
+                "PRODUCT: generation-accounting control did not converge within the \
+                 source-owned bounded-round contract: {text:?}"
             );
             std::thread::sleep(Duration::from_millis(200));
         }
@@ -1603,6 +1715,9 @@ fn generation_accounting_keeps_actor_incarnations_exact(staged: &Staged) {
 /// tail short of its target at the source-owned PRODUCT bound with periodic scheduling disabled
 /// and no post-release request; dropping archive ownership turns the exact shipped archive
 /// request's own bounded PRODUCT assertion red, never the global watchdog;
+/// `scratchpad/mutant_fx35_node_release.py` drops the charged worker's pool, lane and completion
+/// release notifications, so the exact room/peer/root/lane NodeBusy admission remains visible
+/// but its already-attached tail turns PRODUCT red without a command that could schedule it;
 /// giving a replacement generation two new node slots instead of sharing the retired actor's
 /// source-owned pair prevents the exact NodeBusy verdict and makes the generation assertion
 /// PRODUCT-red (and returning PoolFull names that separate PRODUCT defect); removing the
@@ -1637,7 +1752,7 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
     let pressure_room = &staged.rooms[0];
     let pressure_tails: BTreeMap<&str, TailObserver> = staged.everyone[..staged.hosted]
         .iter()
-        .map(|(dir, node, name, _)| (*name, TailObserver::attach(dir, *node, pressure_room)))
+        .map(|(dir, node, name, _)| (*name, TailObserver::attach(dir, *node, pressure_room, None)))
         .collect();
     let ready = "pool-release-tails-attached";
     let (pressure_dir, pressure_node, pressure_name, _) = &staged.everyone[staged.hosted];

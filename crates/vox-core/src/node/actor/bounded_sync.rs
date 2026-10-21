@@ -321,12 +321,10 @@ struct PoolWait {
 enum ArchiveTurn {
     Ready(crate::node::history_budget::Job),
     Waiting,
-    Full,
 }
 enum ForegroundTurn {
     Ready(crate::node::history_budget::Job),
     Waiting,
-    Full,
 }
 
 const fn lane_name(lane: crate::node::history_budget::Lane) -> &'static str {
@@ -1214,10 +1212,7 @@ impl Controller {
             return ArchiveTurn::Waiting;
         }
 
-        let Some(mut ticket) = budget.enqueue(node, crate::node::history_budget::Lane::Archive)
-        else {
-            return ArchiveTurn::Full;
-        };
+        let mut ticket = budget.enqueue(node, crate::node::history_budget::Lane::Archive);
         let wake = ticket.wake();
         if let Some(job) = ticket.try_admit() {
             return ArchiveTurn::Ready(job);
@@ -1280,9 +1275,7 @@ impl Controller {
             return ForegroundTurn::Waiting;
         }
 
-        let Some(mut ticket) = budget.enqueue(node, lane) else {
-            return ForegroundTurn::Full;
-        };
+        let mut ticket = budget.enqueue(node, lane);
         let wake = ticket.wake();
         if let Some(job) = ticket.try_admit() {
             return ForegroundTurn::Ready(job);
@@ -2062,15 +2055,6 @@ impl Node {
                                 self.note_start(room, peer, "archive_budget_busy");
                                 return false;
                             }
-                            ArchiveTurn::Full => {
-                                self.history_demand.busy(
-                                    request,
-                                    generation,
-                                    "The daemon archive queue is full; resume this request later.",
-                                );
-                                self.note_start(room, peer, "archive_budget_busy");
-                                return false;
-                            }
                         }
                     }
                 }
@@ -2098,7 +2082,7 @@ impl Node {
                     crate::node::history_budget::Lane::Control,
                 ) {
                     ForegroundTurn::Ready(job) => job,
-                    ForegroundTurn::Waiting | ForegroundTurn::Full => {
+                    ForegroundTurn::Waiting => {
                         self.note_start(room, peer, "control_budget_busy");
                         return false;
                     }
@@ -2340,16 +2324,6 @@ impl Node {
                         self.shelve_exact(flow, index);
                         return false;
                     }
-                    ArchiveTurn::Full => {
-                        self.history_demand.busy(
-                            request,
-                            flow.generation,
-                            "The daemon archive queue is full; resume this request later.",
-                        );
-                        self.note_start(room, peer, "archive_budget_busy");
-                        self.bounded_sync.dispose(flow);
-                        return false;
-                    }
                 }
             }
         } else if lane == crate::node::history_budget::Lane::Control {
@@ -2367,7 +2341,7 @@ impl Node {
                     lane,
                 ) {
                     ForegroundTurn::Ready(job) => job,
-                    ForegroundTurn::Waiting | ForegroundTurn::Full => {
+                    ForegroundTurn::Waiting => {
                         self.note_start(room, peer, "control_budget_busy");
                         self.shelve_exact(flow, index);
                         return false;
@@ -2386,7 +2360,7 @@ impl Node {
                 lane,
             ) {
                 ForegroundTurn::Ready(job) => job,
-                ForegroundTurn::Waiting | ForegroundTurn::Full => {
+                ForegroundTurn::Waiting => {
                     // The retained lane ticket wakes this exact port on a relevant release.
                     self.note_start(room, peer, "control_budget_busy");
                     self.shelve_exact(flow, index);
@@ -2413,7 +2387,7 @@ impl Node {
                 crate::node::history_budget::Lane::Control,
             ) {
                 ForegroundTurn::Ready(job) => job,
-                ForegroundTurn::Waiting | ForegroundTurn::Full => {
+                ForegroundTurn::Waiting => {
                     self.note_start(room, peer, "control_budget_busy");
                     self.shelve_exact(flow, index);
                     return false;

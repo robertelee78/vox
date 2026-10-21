@@ -169,26 +169,6 @@ impl Controller {
         }
         true
     }
-    /// The daemon's bounded archive queue could not retain this request. Keep its durable
-    /// identity available for an explicit retry, but report the capacity refusal honestly.
-    pub(super) fn busy(&mut self, request: RequestId, generation: Digest32, detail: &str) {
-        if !self
-            .running
-            .as_ref()
-            .is_some_and(|r| r.request == request && r.generation == generation)
-        {
-            return;
-        }
-        if let Some(running) = self.running.take() {
-            running.fence.retire();
-            running.cancellation.cancel();
-        }
-        self.ready = None;
-        if let Some(status) = self.status.as_mut().filter(|s| s.request == Some(request)) {
-            status.phase = Phase::Busy;
-            status.detail = detail.chars().take(128).collect();
-        }
-    }
     pub(super) fn retire_room(&mut self, room: Digest32) {
         if self.status.as_ref().is_none_or(|s| s.room != room) {
             return;
