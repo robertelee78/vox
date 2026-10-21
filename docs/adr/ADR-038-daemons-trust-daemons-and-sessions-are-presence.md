@@ -385,20 +385,23 @@ The decider then answered twelve questions, one at a time. His answers are the d
   before re-queuing the port, repeat the following while that reservation has not succeeded
   and a parked flow remains: choose and dispose exactly one parked flow under the ordering
   below, release its charge, and retry that port's reservation. The release and retry MUST be
-  atomic with respect to other flow-state reservations. The daemon MUST re-queue the port only
-  if its reservation still fails after no parked flow remains. Ordering: parked flows of ports
+  atomic with respect to other flow-state reservations. If the reservation still fails after
+  no parked flow remains, the daemon MUST re-queue the port; it MUST NOT re-queue the port
+  before then. Ordering: parked flows of ports
   without a need first; if they do not suffice, other parked flows; within either group the
   flow parked longest first, ties broken arbitrarily. Flow-state reclamation under this rule
   MUST be triggered only by an eligible port's failed reservation of a full pool. A period
   count, turn count, elapsed-time threshold or CPU-time threshold MUST NOT trigger disposal,
   expiry, deferral or flow-state reclamation (FX-27); parked duration MAY be used only to apply
-  the longest-first ordering above. Disposing a flow MUST re-arm only work still outstanding
-  under FX-29 and MUST NOT create a need from a hint the node already holds. A start attempt
+  the longest-first ordering above. Disposing a flow MUST re-arm all and only work still
+  outstanding under FX-29 and MUST NOT create a need from a hint the node already holds. A start attempt
   is one scheduler invocation for an eligible port, including every reclamation and
   reservation retry required above; it ends `started` only when it launches the bounded-sync
   round, otherwise `not_started`. `vox status --json` MUST report, for every port under
-  `lanes.ports[]`, `start_outcome`, equal to `never_attempted` before the first start attempt
-  and thereafter `started` or `not_started`, each later attempt replacing the earlier, and
+  `lanes.ports[]`, `start_outcome`, equal to `never_attempted` until the first start attempt in
+  the current daemon process ends and thereafter equal to `started` or `not_started` for the
+  most recently ended attempt (an in-progress attempt does not replace that value, and a daemon
+  restart resets it to `never_attempted`), and
   `start_reason`, present if and only if `start_outcome` is `not_started`, the first gate the
   attempt failed in the order the daemon tests them: `room_busy` (the room's state could not be
   taken without waiting), `live_lane_busy` (the node's live flow slot holds another flow),
@@ -409,8 +412,8 @@ The decider then answered twelve questions, one at a time. His answers are the d
   `lanes.budget.flow_state` as the integers
   `in_use` and `limit` and, under `by_node`, an integer in-use count per hosted node whose sum
   equals `in_use`. After a start attempt for any port in a room ends `flow_state_pool_full`,
-  and until a later start attempt for any port in that room ends `started`, the room's "no
-  completed sync" text in `vox status` and in the app MUST name the flow-state pool. Measured
+  and until a later start attempt in the same daemon process for any port in that room ends
+  `started`, the room's "no completed sync" text in `vox status` and in the app MUST name the flow-state pool. Measured
   cause, 2026-10-21 (UTC, as
   every date in this record): on the decider's daemon (four hosted nodes, three rooms,
   restarted 02:32Z) every port of every node had started no round, `queued` froze, every room
