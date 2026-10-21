@@ -460,36 +460,49 @@ fn a_newcomer_talks_both_ways_at_one_wait_fresh_or_behind_a_backlog() {
 const IDLE: Duration = Duration::from_secs(60);
 
 /// **A quiet room costs nothing and says when it last synced** (ADR-038 FX-15, FX-16; #979,
-/// #980): alice and bob, each on a daemon of their own, read each other once and then nobody
-/// posts. Over [`IDLE`] seconds each profile completes no more sync rounds than the periodic
+/// #980, #996): alice and bob, each on a daemon of their own, read each other once. Carol joins,
+/// then goes offline; alice's consent must therefore travel as a key-package in her public feed.
+/// Bob reads alice's later marker, proving that he crossed the package addressed only to carol,
+/// while carol's package installer is held by the test-knob marker. Over [`IDLE`] seconds nobody
+/// posts, no lane becomes partial merely because bob correctly holds only that package's public
+/// header, and each profile completes no more sync rounds than the periodic
 /// request allows (one per [`SYNC_INTERVAL_SECS`](vox_core::node::syncstream::SYNC_INTERVAL_SECS)
 /// plus the follow-up each may raise), and `vox status --json` names a last completed sync for
-/// the room and for the member. Measured before the fix: one round per peer per second, the
-/// settlement tick re-offering the own head; "last sync never" on every room.
+/// the room and for the member. Once the apparatus releases carol's package, she reads alice's
+/// marker and all three members still exchange visible posts. Measured before #996's role-aware
+/// settlement: the package's header-only position remained a missing body on bob, whose periodic
+/// inventory probe ended partial forever.
 ///
 /// Mutants: the own-head hint offered to every peer on every tick again (`offer_own_head`
-/// ignoring who acknowledged) turns claim 1 red on its own count; the lane's completion no longer
-/// recording the sync (`note_lane_sync` removed) turns claim 2 red on `last_sync_ms`.
+/// ignoring who acknowledged) turns the round-count claim red; undoing role-aware settlement for
+/// the non-recipient package turns the zero-partial claim red; the lane's completion no longer
+/// recording the sync (`note_lane_sync` removed) turns the last-sync claim red.
 #[cfg(feature = "optional-proofs")]
 #[test]
 #[ignore = "an idle minute on two real vox daemons; optional, run it in release"]
 fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
+    test_knobs::require(&["VOX_TEST_HOLD_PACKAGES_FILE"]);
     watchdog::arm();
     let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("APPARATUS: no temp dir: {e}"));
     let root = tmp.path();
     let alice = root.join("alice");
     let bob = root.join("bob");
-    for d in [&alice, &bob] {
+    let carol = root.join("carol");
+    for d in [&alice, &bob, &carol] {
         std::fs::create_dir_all(d.join("cfg"))
             .unwrap_or_else(|e| panic!("APPARATUS: could not create {}: {e}", d.display()));
     }
     let mut fps = Vec::new();
-    for dir in [&alice, &bob] {
+    for dir in [&alice, &bob, &carol] {
         let (ok, out, err) = vox(dir, &["id"], None);
         assert!(ok, "PRODUCT: `vox id` failed: {err}");
         fps.push(out.trim().to_owned());
     }
-    for (dir, fp, name) in [(&alice, &fps[1], "bob"), (&bob, &fps[0], "alice")] {
+    for (dir, fp, name) in [
+        (&alice, &fps[1], "bob"),
+        (&bob, &fps[0], "alice"),
+        (&carol, &fps[0], "alice"),
+    ] {
         let (ok, _, err) = vox(dir, &["trust", "add", fp, "--name", name], None);
         assert!(ok, "PRODUCT: `vox trust add` of {name} failed: {err}");
     }
@@ -545,12 +558,90 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         said(&alice, "alice")
     );
 
+    // ---- a private package Carol is owed is a header-only, role-complete row on Bob --------
+    let hold = root.join("hold-carol-packages");
+    std::fs::write(&hold, b"")
+        .unwrap_or_else(|e| panic!("APPARATUS: could not create {}: {e}", hold.display()));
+    let hold_path = hold
+        .to_str()
+        .expect("APPARATUS: a UTF-8 package-hold path")
+        .to_owned();
+    let knob = [("VOX_TEST_HOLD_PACKAGES_FILE", hold_path.as_str())];
+    let carol_daemon = daemon_env(&carol, "carol", &knob);
+    attached(&carol, "carol");
+    let (ok, _, err) = vox(
+        &carol,
+        &["room", "join", "--passphrase-file", "-", &link],
+        Some(&format!("{ROOMPASS}\n")),
+    );
+    assert!(ok, "PRODUCT: carol's `vox room join` was refused: {err}");
+
+    // Carol must be a visible member before going offline; otherwise no package can be addressed
+    // to her. Her join completing alone is not that observation on Alice's node.
+    let membership_deadline = Instant::now() + READY_WITHIN;
+    while !vox(&alice, &["status", "--json"], None).1.contains(&fps[2]) {
+        assert!(
+            Instant::now() < membership_deadline,
+            "APPARATUS: alice did not list carol as a room member within {READY_WITHIN:?}; \
+             a package addressed to carol was not staged\nalice's daemon said: {}",
+            said(&alice, "alice")
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    carol_daemon.stop();
+    let before_package = status_rows(&alice, &room).unwrap_or_else(|| {
+        panic!(
+            "PRODUCT: alice's `vox status --json` did not report the room before the private \
+             package was staged"
+        )
+    });
+    let (ok, _, err) = vox(&alice, &["trust", "add", &fps[2], "--name", "carol"], None);
+    assert!(
+        ok,
+        "PRODUCT: alice's `vox trust add` of carol failed: {err}"
+    );
+    // With the recipient offline, the shipped daemon's store-and-forward path appends the
+    // recipient-scoped package. `entries` is the operator-visible durable log count, and the
+    // member's `key_waits` clearing says that the offline delivery finished; together they rule
+    // out mistaking only the public consent record for the package.
+    let package_deadline = Instant::now() + READY_WITHIN;
+    while status_rows(&alice, &room).is_none_or(|entries| entries <= before_package)
+        || member_key_waits(&alice, &fps[2]) != Some(None)
+    {
+        assert!(
+            Instant::now() < package_deadline,
+            "APPARATUS: alice's visible room entry count did not advance within \
+             {READY_WITHIN:?} while carol was offline; the key-package was not staged\n\
+             alice's daemon said: {}",
+            said(&alice, "alice")
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let package_marker = "after carol's private package";
+    let (ok, out, err) = vox(&alice, &["room", "post", &room, package_marker], None);
+    assert!(
+        ok,
+        "PRODUCT: alice's package marker was refused: {out}{err}"
+    );
+    let crossed_deadline = Instant::now() + READY_WITHIN;
+    while !reads(&bob, &room, package_marker) {
+        assert!(
+            Instant::now() < crossed_deadline,
+            "APPARATUS: bob did not read alice's later marker within {READY_WITHIN:?}, so the \
+             proof did not establish that his authenticated feed crossed carol's package\n\
+             bob's daemon said: {}",
+            said(&bob, "bob")
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
     // ---- the room is quiet: acknowledgements settle, then the rounds are counted ----------
-    std::thread::sleep(Duration::from_secs(20));
     let before = [synced(&alice), synced(&bob)];
+    let before_lanes = [lane_why(&before[0].2), lane_why(&before[1].2)];
     let counted = Instant::now();
     std::thread::sleep(IDLE);
     let after = [synced(&alice), synced(&bob)];
+    let after_lanes = [lane_why(&after[0].2), lane_why(&after[1].2)];
     let idled = counted.elapsed();
     let allowed = 2 * (idled.as_secs() / vox_core::node::syncstream::SYNC_INTERVAL_SECS + 1);
     let grown: Vec<u64> = (0..2)
@@ -585,6 +676,61 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         after[0].2,
         after[1].2
     );
+    let partial = [0usize, 1].map(|i| {
+        after_lanes[i]
+            .partial
+            .saturating_sub(before_lanes[i].partial)
+    });
+    assert_eq!(
+        partial,
+        [0, 0],
+        "PRODUCT: a quiet peer treated carol's private key-package body as owed after holding its \
+         authenticated header: partial syncs over {idled:?} were alice {}, bob {}\n\
+         alice's lane before: {}; after: {}\n\
+         bob's lane before: {}; after: {}",
+        partial[0],
+        partial[1],
+        before_lanes[0],
+        after_lanes[0],
+        before_lanes[1],
+        after_lanes[1]
+    );
+
+    // Releasing only the apparatus hold makes the intended recipient able to use the private
+    // package. Bob's visible marker remains ordinary room content; no package body is surfaced.
+    let _carol_daemon = daemon_env(&carol, "carol-after-hold", &knob);
+    attached(&carol, "carol-after-hold");
+    assert!(
+        !reads(&carol, &room, package_marker),
+        "APPARATUS: carol read alice's marker while package opening was held; this binary lacks \
+         the required `test-knobs` staging"
+    );
+    std::fs::remove_file(&hold)
+        .unwrap_or_else(|e| panic!("APPARATUS: could not release {}: {e}", hold.display()));
+    let released_deadline = Instant::now() + READY_WITHIN;
+    while !reads(&carol, &room, package_marker) {
+        assert!(
+            Instant::now() < released_deadline,
+            "PRODUCT: carol did not read alice's marker within {READY_WITHIN:?} after her \
+             key-package hold was released\ncarol's daemon said: {}",
+            said(&carol, "carol-after-hold")
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let carol_reply = "carol sees the room";
+    let (ok, out, err) = vox(&carol, &["room", "post", &room, carol_reply], None);
+    assert!(ok, "PRODUCT: carol's post was refused: {out}{err}");
+    let converged_deadline = Instant::now() + READY_WITHIN;
+    while !(reads(&alice, &room, carol_reply) && reads(&bob, &room, carol_reply)) {
+        assert!(
+            Instant::now() < converged_deadline,
+            "PRODUCT: alice and bob did not both read carol's post within {READY_WITHIN:?} after \
+             her package landed\nalice's daemon said: {}\nbob's daemon said: {}",
+            said(&alice, "alice"),
+            said(&bob, "bob")
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }
 
 /// How long the two agents work: a post a second from each into each of [`WORK_ROOMS`] rooms in
@@ -1304,6 +1450,25 @@ fn status_rows(dir: &Path, room: &str) -> Option<u64> {
         .iter()
         .find(|r| r["id"].as_str().is_some_and(|id| id.starts_with(room)))?["entries"]
         .as_u64()
+}
+
+/// The operator-visible key-delivery state for one member: outer `None` means the member is not
+/// listed, inner `None` means the member is listed and this node says no key waits for delivery.
+fn member_key_waits(dir: &Path, member: &str) -> Option<Option<String>> {
+    let (ok, out, _) = vox(dir, &["status", "--json"], None);
+    if !ok {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(&out).ok()?;
+    value["rooms"].as_array()?.iter().find_map(|room| {
+        room["members"].as_array()?.iter().find_map(|row| {
+            (row["id"].as_str() == Some(member)).then(|| {
+                row["key_waits"]
+                    .as_str()
+                    .map(std::borrow::ToOwned::to_owned)
+            })
+        })
+    })
 }
 
 /// `vox room list` MUST name what a preparing room waits for within this of the daemon's start.

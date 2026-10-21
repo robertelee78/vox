@@ -39,6 +39,19 @@ pub(crate) struct LocalHistorySettlement {
 const MAX_OBLIGATIONS: u64 = 4096;
 const STATE_BYTES: usize = 256;
 
+/// Whether a bodyless authenticated source still owes its body to this node's role. Ordinary
+/// content and a package addressed here are owed; a package addressed only to another member is
+/// complete here after its signed header/effect is accepted, and its private body must stay away.
+fn body_owed_to(entry: &Entry, local_id: &Digest32) -> bool {
+    if entry.payload.is_some() {
+        return false;
+    }
+    !entry.skeleton.v2.as_ref().is_some_and(|v2| {
+        v2.kind == crate::log::history::SignedEntryKind::KeyPackage
+            && v2.recipient.is_some_and(|recipient| recipient != *local_id)
+    })
+}
+
 fn expected_entry_wire(header: &Entry) -> Result<usize> {
     let length = usize::try_from(header.skeleton.payload_len)
         .map_err(|_| invalid("history payload length"))?;
@@ -697,6 +710,16 @@ impl Read<'_> {
             &hashed(hash),
         )? == Some(Value::Present))
     }
+    /// The last authenticated, semantically complete contiguous position of this author's
+    /// public feed for this node's role. Unlike `settled_tips`, this cannot jump across an
+    /// unfinished predecessor. The hash binds a receipt to the exact accepted position.
+    pub(crate) fn history_held_through(&self, author: &Digest32) -> Option<(u64, Digest32)> {
+        self.directory
+            .restart
+            .as_ref()
+            .and_then(|state| state.feeds.get(author))
+            .map(|feed| (feed.seq, feed.hash))
+    }
     pub(crate) fn control_effects_complete(&self, head: &Digest32, through: u64) -> Result<bool> {
         let source = self.source();
         if source.find_value(
@@ -1165,11 +1188,20 @@ impl Write<'_, '_> {
         &mut self,
         entry: &Entry,
         finished: &super::super::sparse_history::FinishedHistoryEffect,
+        local_id: Digest32,
     ) -> Result<()> {
         if finished.entry_hash() != entry.entry_hash() {
             return Err(invalid("sparse effect token differs"));
         }
-        self.finish_history_effect_bookkeeping(entry, None)
+        self.finish_history_effect_bookkeeping(entry, None)?;
+        // A recipient-scoped package is satisfied for every other member by its authenticated
+        // header and completed semantic dispatch. Its private body is neither owed nor fetched.
+        // `entry` is the exact accepted source named by `finished`, so untrusted tag data cannot
+        // clear recovery work. This lands with the effect receipt and survives restart.
+        if !body_owed_to(entry, &local_id) {
+            self.set_missing(&entry.skeleton.author_id, entry.skeleton.seq, false)?;
+        }
+        Ok(())
     }
 
     /// Consume only the opaque token returned by this exact local publication. The caller has
@@ -2461,11 +2493,14 @@ impl EntryRead for HeaderRead<'_, '_> {
 }
 
 impl Write<'_, '_> {
-    /// At most one actually held, semantically settled next position. There is no scan,
-    /// guessed prefix, or promotion to the signed head's leaf count.
+    /// Advance through at most one live-window page of actually held, semantically settled
+    /// successors. There is no unbounded scan, guessed prefix, or promotion to a signed head's
+    /// leaf count. Closing a formerly missing position can therefore carry already-settled later
+    /// positions forward in this same bounded event instead of waiting for a timer or new peer.
     pub(crate) fn advance_sparse_contiguous(
         &mut self,
         author: &Digest32,
+        local_id: &Digest32,
     ) -> Result<Option<crate::log::dag::PublishedFeed>> {
         self.require_sparse_idle()?;
         let restart = self
@@ -2474,55 +2509,72 @@ impl Write<'_, '_> {
             .as_ref()
             .ok_or(invalid("sparse restart state absent"))?;
         let mut state = restart.feeds.get(author).cloned().unwrap_or_default();
-        if state.ended {
-            return Ok(None);
+        let mut advanced = false;
+        for _ in 0..crate::log::history::MAX_PAGE_ENTRIES {
+            if state.ended {
+                break;
+            }
+            let next = state
+                .seq
+                .checked_add(1)
+                .ok_or(invalid("contiguous sequence overflow"))?;
+            let headers = HeaderRead {
+                source: Source::Batch(self.batch),
+                sek: self.sek,
+                room: self.channel,
+                roots: self.directory.active,
+            };
+            let Some(entry) = headers.get(author, next)? else {
+                break;
+            };
+            if headers.source.find_value(
+                self.sek,
+                self.channel,
+                self.directory.active.sparse.settled_entries,
+                &hashed(&entry.entry_hash()),
+            )? != Some(Value::Present)
+            {
+                break;
+            }
+            // Effect completion alone is not receipt of a body this role is entitled to.
+            // Conversely, another member's private key-package body is deliberately absent and
+            // cannot hold the public feed prefix back.
+            if headers.source.find_value(
+                self.sek,
+                self.channel,
+                self.directory.active.missing_positions,
+                &position(author, next),
+            )? == Some(Value::Present)
+                && body_owed_to(&entry, local_id)
+            {
+                break;
+            }
+            let feed = if state.seq == 0 {
+                crate::log::feed::Feed::default()
+            } else {
+                crate::log::feed::Feed::restore_published(
+                    *author,
+                    state.seq,
+                    state.hash,
+                    state.first_claimed_ms,
+                    state.ended,
+                )?
+            };
+            feed.validate_next(&headers, &entry)
+                .map_err(|error| match error {
+                    crate::log::feed::FeedError::Invalid(error)
+                    | crate::log::feed::FeedError::Local(error) => error,
+                })?;
+            restart::advance(&mut state, &entry)?;
+            self.directory
+                .restart
+                .as_mut()
+                .ok_or(invalid("sparse restart state vanished"))?
+                .feeds
+                .insert(*author, state.clone());
+            advanced = true;
         }
-        let next = state
-            .seq
-            .checked_add(1)
-            .ok_or(invalid("contiguous sequence overflow"))?;
-        let headers = HeaderRead {
-            source: Source::Batch(self.batch),
-            sek: self.sek,
-            room: self.channel,
-            roots: self.directory.active,
-        };
-        let Some(entry) = headers.get(author, next)? else {
-            return Ok(None);
-        };
-        if headers.source.find_value(
-            self.sek,
-            self.channel,
-            self.directory.active.sparse.settled_entries,
-            &hashed(&entry.entry_hash()),
-        )? != Some(Value::Present)
-        {
-            return Ok(None);
-        }
-        let feed = if state.seq == 0 {
-            crate::log::feed::Feed::default()
-        } else {
-            crate::log::feed::Feed::restore_published(
-                *author,
-                state.seq,
-                state.hash,
-                state.first_claimed_ms,
-                state.ended,
-            )?
-        };
-        feed.validate_next(&headers, &entry)
-            .map_err(|error| match error {
-                crate::log::feed::FeedError::Invalid(error)
-                | crate::log::feed::FeedError::Local(error) => error,
-            })?;
-        restart::advance(&mut state, &entry)?;
-        self.directory
-            .restart
-            .as_mut()
-            .ok_or(invalid("sparse restart state vanished"))?
-            .feeds
-            .insert(*author, state.clone());
-        Ok(Some(state))
+        Ok(advanced.then_some(state))
     }
 }
 

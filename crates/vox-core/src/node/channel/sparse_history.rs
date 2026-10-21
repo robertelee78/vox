@@ -786,7 +786,7 @@ impl ChannelState {
             let mut index = self
                 .entries
                 .write(&mut batch, &self.sek, &self.channel_id)?;
-            index.finish_history_effect(&entry, &finished)?;
+            index.finish_history_effect(&entry, &finished, self.me())?;
             index.seal()?;
             session_projection::private_index::observe_public(
                 &mut batch,
@@ -901,7 +901,7 @@ impl ChannelState {
         let mut index = self
             .entries
             .write(&mut batch, &self.sek, &self.channel_id)?;
-        let Some(state) = index.advance_sparse_contiguous(author)? else {
+        let Some(state) = index.advance_sparse_contiguous(author, &self.me())? else {
             return Ok(false);
         };
         index.seal()?;
@@ -1033,6 +1033,12 @@ impl ChannelState {
             self.gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let rendered = !rows.is_empty();
             self.place_committed(store, rows, &expired)?;
+            if settled && !deferred && !unavailable {
+                // The source effect may have completed before its owed body arrived. Receipt is
+                // role-contiguous, so the durable feed prefix advances only after this refill's
+                // body/projection transaction has made that position complete.
+                self.advance_history_contiguous(store, &entry.skeleton.author_id)?;
+            }
             Ok(if unavailable {
                 HistoryEffectProgress::BodyUnavailable
             } else if deferred {

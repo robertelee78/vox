@@ -155,17 +155,14 @@ async fn respond(
                         return Ok(None);
                     };
                     if receipt {
-                        // Delivery acknowledgement cannot precede the required body/effect.
-                        // Merely verifying a signed nonempty head or inclusion never proves
-                        // receipt. A canonical empty head has no terminal entry: holding that
-                        // exact committed head is the complete acknowledgement of an empty feed.
+                        // A receipt names the last authenticated feed position whose source and
+                        // semantic effect are complete for this node's role. The durable restart
+                        // prefix cannot jump across an entry this role still owes. In particular,
+                        // another member's key-package is complete here after its authenticated
+                        // header is dispatched; its private body is never requested or claimed.
                         let read = room.history_read(store)?;
-                        if head.root.leaves == 0 {
-                            if read.history_settled_tip(&author)?.is_some() {
-                                return Ok(None);
-                            }
-                        } else {
-                            let Some(tip) = read.history_settled_tip(&author)? else {
+                        if head.root.leaves != 0 {
+                            let Some((through, hash)) = read.history_held_through(&author) else {
                                 return Ok(None);
                             };
                             let Some(included) = read.history_inclusion_receipt(
@@ -176,8 +173,8 @@ async fn respond(
                             else {
                                 return Ok(None);
                             };
-                            if tip.skeleton.seq != head.root.leaves
-                                || tip.entry_hash() != included.header().entry().entry_hash()
+                            if through != head.root.leaves
+                                || hash != included.header().entry().entry_hash()
                             {
                                 return Ok(None);
                             }
