@@ -137,6 +137,10 @@ pub(crate) struct Flow {
     pub(crate) published: bool,
     pub(crate) rendered: bool,
     pub(crate) governance: bool,
+    /// An exchange of this flow fetched something this node did not hold (an object it saved,
+    /// a body chunk, a hint it did not have): a completed flow that brought nothing is an
+    /// `empty` round in `vox status --json` (ADR-038 FX-29).
+    pub(crate) brought: bool,
     pub(crate) admitted_authors: usize,
     pub(crate) external: Option<(Digest32, u64)>,
     pub(crate) archive_status: Option<crate::node::api::HistoryDemandStatus>,
@@ -282,6 +286,7 @@ impl Flow {
             published: false,
             rendered: false,
             governance: false,
+            brought: false,
             admitted_authors: 0,
             external: None,
             archive_status: None,
@@ -396,6 +401,7 @@ impl Flow {
             published: false,
             rendered: false,
             governance: false,
+            brought: false,
             admitted_authors: 0,
             external: None,
             archive_status: None,
@@ -1310,6 +1316,7 @@ impl Flow {
                 )
                 .await?;
                 self.body_progress |= result.body_progress;
+                self.brought |= result.brought || result.body_progress;
                 if self.route_origin.is_some()
                     && !matches!(result.status, Status::Busy | Status::EvidenceUnavailable)
                 {
@@ -1367,9 +1374,10 @@ impl Flow {
                 }
                 if let Some(inventory) = result.inventory {
                     for page in inventory.hints.chunks(64) {
-                        source
+                        let offered = source
                             .offer_inventory(job, inbox, inbox_generation, self.room, page)
                             .await?;
+                        self.brought |= offered.added != 0;
                     }
                 }
                 if result.status == Status::BodyNotHeld && task.purpose == Purpose::Live {
@@ -1378,6 +1386,17 @@ impl Flow {
                             "live body refusal has no exact entry",
                         ));
                     };
+                    // The advertising peer does not hold a missing body of the hinted author's
+                    // newest window. Its inventory's same head is not pulled from it again
+                    // until it names another (ADR-038 FX-29): an author whose missing bodies
+                    // no peer held any more was pulled from every peer every period, about
+                    // 370 commits a sync, for bodies none of them had.
+                    if let Some(hint) = self.hint {
+                        inbox.decline(self.room, self.hint_peer, hint.author, hint.head);
+                        if head != hint.head {
+                            inbox.decline(self.room, self.hint_peer, hint.author, head);
+                        }
+                    }
                     if !self.tasks.iter().any(|pending| matches!(pending.operation,
                         Operation::LiveAdvance { window, .. } if window.head == head && window.next == seq)) {
                         return Err(Error::MalformedBundle("live body refusal is outside the selected window"));

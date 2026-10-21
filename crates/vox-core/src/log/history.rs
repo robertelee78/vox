@@ -663,6 +663,19 @@ impl WorkBudget {
         self.coordinates_left -= visits;
         true
     }
+    /// A context load charged at the maximum size turned out to hold `coordinates`: the
+    /// passes walked that many, and the rest of the charge returns to this slice. The charge
+    /// stays conservative before the load, so no work starts that the slice could not afford;
+    /// after it, the slice is charged what the load cost. Without this a room of a few members
+    /// paid 8,192 coordinates for a context of three and a verifier yielded after four joins,
+    /// each yield a commit of its cursor (ADR-038 FX-29).
+    pub(crate) fn refund_context_load(&mut self, coordinates: usize) {
+        let charged = 4 * MAX_CONTEXT_AUTHORS;
+        let walked = 4 * coordinates.saturating_add(1);
+        self.coordinates_left = self
+            .coordinates_left
+            .saturating_add(charged.saturating_sub(walked));
+    }
     pub(crate) fn take_control_lookup(&mut self) -> bool {
         // A control source locator, its bounded signed header and its completion receipt,
         // plus binary-search/hash binding work in the already loaded canonical maps.
@@ -720,6 +733,7 @@ fn read_context(
     if context.room != binding.room || context.scope != binding.scope || context.hash() != *hash {
         return Err(Error::MalformedBundle("context object binding/hash"));
     }
+    budget.refund_context_load(context.coordinates.len());
     Ok(HistoryStep::Complete(context))
 }
 

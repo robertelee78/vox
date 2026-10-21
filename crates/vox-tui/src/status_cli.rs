@@ -394,13 +394,14 @@ fn render(v: &Value) -> String {
     for r in sync {
         let _ = write!(
             o,
-            "  room {} peer {}: opened {} admitted {} completed {} partial {} failed {} busy-refused {} \
-             stale {} refused {} skipped {} queued {}",
+            "  room {} peer {}: opened {} admitted {} completed {} empty {} partial {} failed {} \
+             busy-refused {} stale {} refused {} skipped {} queued {}",
             short(s(r, "room")),
             short(s(r, "peer")),
             n(r, "opened"),
             n(r, "admitted"),
             n(r, "completed"),
+            n(r, "empty"),
             n(r, "partial"),
             n(r, "failed"),
             n(r, "busy_refused"),

@@ -15,19 +15,29 @@ use super::{Object, Proof, ProofKind, Query, RequestId};
 use entry_store::sparse::{CursorBinding, HistoryVerifier};
 
 // A bounded transient result covered by the existing verifier working reservation.
+// `brought` on an object says this node did not hold it before: what a round fetched, as
+// `vox status --json` counts an `empty` round (ADR-038 FX-29). An object already held is
+// not saved again: the round writes nothing for it.
 #[allow(clippy::large_enum_variant)]
 pub(super) enum Staged {
-    Object,
+    Object {
+        brought: bool,
+    },
     Head {
         head: Digest32,
         author: Digest32,
         tail: u64,
         departure_receipt: bool,
+        /// The exact head is already in this author's accepted chain: nothing of it is
+        /// fetched or verified again (no header, no inclusion proof, no promotion).
+        held: bool,
+        brought: bool,
     },
     Header {
         entry: Entry,
         head: Digest32,
         body_allowed: bool,
+        brought: bool,
     },
     Verifier(CursorBinding),
     Busy,
@@ -67,10 +77,37 @@ pub(super) fn stage(
                 return Ok(Staged::Busy);
             };
             let id = head.id();
-            let conflict =
-                room.history_write(store, |index| index.observe_history_head(&verified))?;
-            if conflict {
-                return Err(invalid("conflicting authenticated heads retained"));
+            // A head already observed is not saved again (ADR-038 FX-29): every periodic
+            // round's head probe of a held author committed its head and author state
+            // unchanged. Only what `observe_history_head` would change is written: a head
+            // object not retained, or an author state it would move. A retained conflict
+            // still takes the write path and is refused there as before.
+            let input = room.history_read(store)?;
+            let retained = input
+                .history_head(&id)?
+                .is_some_and(|stored| stored.binding == head.binding && stored.root == head.root);
+            let state = input.sparse_author(author, LogScope::Public)?;
+            let observed_already = match state {
+                Some(state) if state.observed_conflict.is_none() => {
+                    state.observed == Some(id)
+                        || match state.observed {
+                            Some(observed) => input
+                                .history_head(&observed)?
+                                .is_some_and(|prior| prior.root.leaves > head.root.leaves),
+                            None => false,
+                        }
+                }
+                _ => false,
+            };
+            let held = retained && input.history_head_accepted(&id, head.binding)?;
+            drop(input);
+            let brought = !(retained && observed_already);
+            if brought {
+                let conflict =
+                    room.history_write(store, |index| index.observe_history_head(&verified))?;
+                if conflict {
+                    return Err(invalid("conflicting authenticated heads retained"));
+                }
             }
             let departure_receipt = room.history_departure_matches(
                 store,
@@ -85,6 +122,8 @@ pub(super) fn stage(
                 author: *author,
                 tail: head.root.leaves,
                 departure_receipt,
+                held,
+                brought,
             })
         }
         (Query::Context(expected), Object::Context(bytes)) => {
@@ -95,8 +134,16 @@ pub(super) fn stage(
             {
                 return Err(invalid("requested context differs"));
             }
+            // A context already held is not saved again (ADR-038 FX-29).
+            if room
+                .history_read(store)?
+                .history_context(expected)?
+                .is_some()
+            {
+                return Ok(Staged::Object { brought: false });
+            }
             room.history_write(store, |index| index.keep_history_context(&context))?;
-            Ok(Staged::Object)
+            Ok(Staged::Object { brought: true })
         }
         (Query::Entry { head, seq, .. } | Query::Header { head, seq }, Object::Header(bytes)) => {
             stage_header(room, store, *head, *seq, *seq, bytes, &mut work)
@@ -211,23 +258,64 @@ fn stage_header(
     else {
         return Ok(Staged::Busy);
     };
+    // A header already held under this head is not saved again (ADR-038 FX-29): a live retry
+    // of a missing body receives its header with every answer, and each one committed the
+    // same header and pending position unchanged.
+    let held = input
+        .history_pending_header(&head_id, entry.skeleton.seq)?
+        .is_some_and(|pending| pending.entry_hash() == entry.entry_hash());
     drop(input);
-    room.history_write(store, |index| {
-        index.keep_history_header(&header)?;
-        index.keep_history_pending_header(&head_id, &header)
-    })?;
-    // Header authentication is the authority for recipient privacy.  A peer cannot make a
+    // Header authentication is the authority for recipient privacy. A peer cannot make a
     // private key package body admissible by merely sending it after its public header.
     let body_allowed = !entry.skeleton.v2.as_ref().is_some_and(|v2| {
         v2.kind == crate::log::history::SignedEntryKind::KeyPackage
             && v2.recipient != Some(room.me())
     });
+    if held {
+        return Ok(Staged::Header {
+            entry,
+            head: head_id,
+            body_allowed,
+            brought: false,
+        });
+    }
+    room.history_write(store, |index| {
+        index.keep_history_header(&header)?;
+        index.keep_history_pending_header(&head_id, &header)
+    })?;
     Ok(Staged::Header {
         entry,
         head: head_id,
         body_allowed,
+        brought: true,
     })
 }
+
+/// Contexts a verifier generated in this turn, readable by its next joins before they are
+/// committed. The verifier runs to its proof's end, or to the turn's budget, and the turn
+/// commits once (ADR-038 FX-29): committing the context and the cursor after every Merkle join
+/// was ~64% of the idle daemon's commit time. A proof is bounded, and after a crash it is
+/// verified again from its bytes, so progress between joins needs no durability.
+struct Overlay<'a> {
+    inner: &'a entry_store::Read<'a>,
+    generated: std::cell::RefCell<Vec<(Digest32, ControlContext)>>,
+}
+impl crate::log::history::ContextSource for Overlay<'_> {
+    fn context(&self, hash: &Digest32) -> Result<Option<ControlContext>> {
+        if let Some((_, context)) = self
+            .generated
+            .borrow()
+            .iter()
+            .find(|(generated, _)| generated == hash)
+        {
+            return Ok(Some(context.clone()));
+        }
+        self.inner.history_context(hash)
+    }
+}
+/// Generated contexts a turn holds uncommitted at most, in coordinates: past this the turn
+/// commits them and yields, inside the verifier envelope the caller reserved.
+const TURN_CONTEXT_COORDINATES: usize = 4 * crate::log::history::MAX_CONTEXT_AUTHORS;
 
 pub(super) enum Advanced {
     Progress,
@@ -237,8 +325,9 @@ pub(super) enum Advanced {
     Busy,
 }
 
-/// Exactly one verifier step. Generated context and the advanced cursor commit together,
-/// before the actor may schedule another slice. A missing proof is never fork evidence.
+/// One verifier turn: the proof's steps run to its end, or until the turn's work budget is
+/// spent or a context is missing, and what they generated commits once with the cursor (or the
+/// receipt). A missing proof is never fork evidence.
 pub(super) fn advance(
     room: &ChannelState,
     store: &Store,
@@ -258,41 +347,61 @@ pub(super) fn advance(
     // A bounded transient result covered by the existing verifier working reservation.
     #[allow(clippy::large_enum_variant)]
     enum ResultStep {
-        Context(ControlContext),
         Missing(Digest32),
         Yielded,
         Included(crate::log::history::IncludedHeader),
         Prefix(crate::log::history::ConsistentPrefix),
         Controls(crate::log::history::VerifiedControlRange),
     }
-    let result = match &mut cursor {
-        HistoryVerifier::Inclusion(value) => match value.advance(&input, &mut work)? {
-            HistoryStep::Complete(value) => ResultStep::Included(value),
-            HistoryStep::Progress(value) => ResultStep::Context(value),
-            HistoryStep::MissingContext(hash) => ResultStep::Missing(hash),
-            HistoryStep::Yielded => ResultStep::Yielded,
-        },
-        HistoryVerifier::Consistency(value) => match value.advance(&input, &mut work)? {
-            HistoryStep::Complete(value) => ResultStep::Prefix(value),
-            HistoryStep::Progress(value) => ResultStep::Context(value),
-            HistoryStep::MissingContext(hash) => ResultStep::Missing(hash),
-            HistoryStep::Yielded => ResultStep::Yielded,
-        },
-        HistoryVerifier::ControlRange(value) => match value.advance(&key, &input, &mut work)? {
-            HistoryStep::Complete(value) => ResultStep::Controls(value),
-            HistoryStep::Progress(value) => ResultStep::Context(value),
-            HistoryStep::MissingContext(hash) => ResultStep::Missing(hash),
-            HistoryStep::Yielded => ResultStep::Yielded,
-        },
-        HistoryVerifier::Validation(_) => {
-            return Err(invalid("entry closure requires the admission driver"))
+    let overlay = Overlay {
+        inner: &input,
+        generated: std::cell::RefCell::new(Vec::new()),
+    };
+    let mut held_coordinates = 0usize;
+    let result = loop {
+        let step = match &mut cursor {
+            HistoryVerifier::Inclusion(value) => match value.advance(&overlay, &mut work)? {
+                HistoryStep::Complete(value) => break ResultStep::Included(value),
+                HistoryStep::Progress(value) => value,
+                HistoryStep::MissingContext(hash) => break ResultStep::Missing(hash),
+                HistoryStep::Yielded => break ResultStep::Yielded,
+            },
+            HistoryVerifier::Consistency(value) => match value.advance(&overlay, &mut work)? {
+                HistoryStep::Complete(value) => break ResultStep::Prefix(value),
+                HistoryStep::Progress(value) => value,
+                HistoryStep::MissingContext(hash) => break ResultStep::Missing(hash),
+                HistoryStep::Yielded => break ResultStep::Yielded,
+            },
+            HistoryVerifier::ControlRange(value) => {
+                match value.advance(&key, &overlay, &mut work)? {
+                    HistoryStep::Complete(value) => break ResultStep::Controls(value),
+                    HistoryStep::Progress(value) => value,
+                    HistoryStep::MissingContext(hash) => break ResultStep::Missing(hash),
+                    HistoryStep::Yielded => break ResultStep::Yielded,
+                }
+            }
+            HistoryVerifier::Validation(_) => {
+                return Err(invalid("entry closure requires the admission driver"))
+            }
+        };
+        held_coordinates += step.coordinates.len() + 1;
+        overlay.generated.borrow_mut().push((step.hash(), step));
+        if held_coordinates > TURN_CONTEXT_COORDINATES {
+            break ResultStep::Yielded;
         }
     };
+    let generated = overlay.generated.into_inner();
     drop(input);
+    let keep_generated = |index: &mut entry_store::Write<'_, '_>| -> Result<()> {
+        for (_, context) in &generated {
+            index.keep_history_context(context)?;
+        }
+        Ok(())
+    };
     match result {
-        ResultStep::Context(context) => {
+        ResultStep::Yielded => {
             room.history_write(store, |index| {
-                index.keep_history_context(&context)?;
+                keep_generated(index)?;
                 if !index.keep_history_verifier_cursor(*binding, &cursor)? {
                     return Err(invalid("existing verifier capacity vanished"));
                 }
@@ -302,18 +411,14 @@ pub(super) fn advance(
         }
         ResultStep::Missing(hash) => {
             room.history_write(store, |index| {
+                keep_generated(index)?;
                 index.keep_history_verifier_cursor(*binding, &cursor)
             })?;
             Ok(Advanced::MissingContext(hash))
         }
-        ResultStep::Yielded => {
-            room.history_write(store, |index| {
-                index.keep_history_verifier_cursor(*binding, &cursor)
-            })?;
-            Ok(Advanced::Progress)
-        }
         ResultStep::Included(included) => {
             room.history_write(store, |index| {
+                keep_generated(index)?;
                 index.keep_history_inclusion_receipt(&included)?;
                 index.finish_history_verifier_cursor(*binding)
             })?;
@@ -322,6 +427,7 @@ pub(super) fn advance(
         }
         ResultStep::Prefix(prefix) => {
             room.history_write(store, |index| {
+                keep_generated(index)?;
                 index.keep_history_prefix_receipt(&prefix)?;
                 index.finish_history_verifier_cursor(*binding)
             })?;
@@ -344,12 +450,22 @@ pub(super) fn advance(
             let accepted = input.history_head_accepted(&controls.head_id(), controls.binding())?;
             drop(input);
             if !accepted {
+                // The finished cursor is kept with what it generated: the next turn, after
+                // the promotion, completes at once instead of verifying the range again.
+                room.history_write(store, |index| {
+                    keep_generated(index)?;
+                    if !index.keep_history_verifier_cursor(*binding, &cursor)? {
+                        return Err(invalid("existing verifier capacity vanished"));
+                    }
+                    Ok(())
+                })?;
                 return Ok(match promote_head(room, store, binding.head)? {
                     Advanced::Complete => Advanced::Progress,
                     other => other,
                 });
             }
             room.history_write(store, |index| {
+                keep_generated(index)?;
                 if index.keep_control_coverage(&controls, 0)?.is_some() {
                     return Err(invalid("bounded control coverage unexpectedly incomplete"));
                 }

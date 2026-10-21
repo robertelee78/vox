@@ -1961,6 +1961,10 @@ impl Node {
                     self.sched_rooms.insert(work.room);
                 }
                 let reason = flow.reason;
+                // A round that fetched nothing this node did not hold is an `empty` one: in a
+                // quiet room every round is, and a person sees a re-pull as `completed`
+                // climbing faster than `empty` (ADR-038 FX-29).
+                let brought = flow.brought;
                 crate::node::status::SyncBook::with(
                     &self.sync_book,
                     work.room,
@@ -1968,6 +1972,9 @@ impl Node {
                     |counts| {
                         counts.completed += 1;
                         counts.reasons.count(reason);
+                        if !brought {
+                            counts.empty += 1;
+                        }
                     },
                 );
                 // A round the lane completed is a completed sync for `vox status` (PRD-001

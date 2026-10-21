@@ -69,6 +69,9 @@ pub(crate) struct Received {
     pub(crate) inventory: Option<Inventory>,
     pub(crate) heads: Vec<super::HeadHint>,
     pub(crate) departure_receipt: Option<super::HeadHint>,
+    /// The exchange fetched an object this node did not hold (a head, header, context or
+    /// proof it saved): what makes a round not `empty` in `vox status --json` (ADR-038 FX-29).
+    pub(crate) brought: bool,
 }
 impl Received {
     fn pending(status: Status) -> Self {
@@ -83,6 +86,7 @@ impl Received {
             inventory: None,
             heads: Vec::new(),
             departure_receipt: None,
+            brought: false,
         }
     }
     fn need(&mut self, query: Query) -> Result<()> {
@@ -351,7 +355,7 @@ impl Receiver {
                         return Ok(result);
                     };
                     match &staged.value {
-                        Staged::Object => {}
+                        Staged::Object { brought } => result.brought |= *brought,
                         Staged::Busy => {
                             io.abort(WireError::SessionBusy);
                             result.status = Status::Busy;
@@ -362,10 +366,13 @@ impl Receiver {
                             tail,
                             author,
                             departure_receipt,
+                            held,
+                            brought,
                         } => {
                             if result.heads.len() >= MAX_NEEDS {
                                 return Err(Error::SizeLimitExceeded("history head result bound"));
                             }
+                            result.brought |= *brought;
                             result.heads.push(super::HeadHint {
                                 author: *author,
                                 head: *head,
@@ -377,6 +384,12 @@ impl Receiver {
                                     head: *head,
                                     size: *tail,
                                 });
+                            } else if *held {
+                                // Already in the author's accepted chain: its tail header,
+                                // inclusion proof and promotion are done. Fetching and
+                                // verifying them again every period wrote a cursor, a
+                                // context per join and a receipt for nothing (ADR-038
+                                // FX-29); the window below resumes from what is held.
                             } else if *tail == 0 {
                                 // The canonical empty head has no position-zero header. Its
                                 // ordinary empty consistency proof is the complete promotion
@@ -398,13 +411,16 @@ impl Receiver {
                             if result.verifiers.len() == MAX_NEEDS {
                                 return Err(Error::SizeLimitExceeded("history verifier handoff"));
                             }
+                            result.brought = true;
                             result.verifiers.push(*binding);
                         }
                         Staged::Header {
                             entry,
                             head,
                             body_allowed,
+                            brought,
                         } => {
+                            result.brought |= *brought;
                             let seq = entry.skeleton.seq;
                             result.need(Query::Proof {
                                 head: *head,

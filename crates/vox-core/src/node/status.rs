@@ -1197,6 +1197,10 @@ pub struct PortCounters {
     pub completed: u64,
     /// Why each of them ran (ADR-038 FX-15, #996): one count per `completed`.
     pub reasons: RoundReasons,
+    /// Completed rounds this node ran that fetched nothing it did not hold: no head, header,
+    /// context, proof, body or hint it lacked (ADR-038 FX-29). In a quiet room every round is
+    /// one; a lane whose `completed` climbs faster than its `empty` is pulling something.
+    pub empty: u64,
     /// Sessions that ended without error but left requested entries unreceived (a bounded serve).
     pub partial: u64,
     /// Sessions that failed.
@@ -1641,7 +1645,7 @@ impl SyncBook {
             let _ = write!(
                 s,
                 "{{\"room\":\"{}\",\"peer\":\"{}\",\"opened\":{},\"admitted\":{},\"busy_refused\":{},\
-                 \"completed\":{},\"reasons\":{},\"partial\":{},\"failed\":{},\"last_failure\":{},\
+                 \"completed\":{},\"reasons\":{},\"empty\":{},\"partial\":{},\"failed\":{},\"last_failure\":{},\
                  \"stale\":{},\"refused\":{},\"skipped_at_cap\":{},\"queued\":{},\"backoff\":{},\
                  \"running\":[{}]}}",
                 b32_encode(room),
@@ -1651,6 +1655,7 @@ impl SyncBook {
                 c.busy_refused,
                 c.completed,
                 c.reasons.json(),
+                c.empty,
                 c.partial,
                 c.failed,
                 c.last_failure

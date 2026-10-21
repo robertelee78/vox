@@ -17,12 +17,26 @@ struct Pending {
     hint: HeadHint,
     in_flight: bool,
 }
+/// A hint a peer answered for already: it said it does not hold the missing bodies of this
+/// author's newest window (ADR-038 FX-29). The peer is not asked for that hint again until its
+/// inventory names another head for the author; a restart forgets it, so the first period after
+/// one asks once more.
+#[derive(Clone, Copy)]
+struct Declined {
+    room: Digest32,
+    peer: Digest32,
+    author: Digest32,
+    head: Digest32,
+}
+/// Declined hints kept at most, oldest forgotten first: 128 bytes each, no charge.
+const MAX_DECLINED: usize = 4096;
 #[derive(Default)]
 struct State {
     /// Retirement belongs to one room/peer lane. A stopped room or peer must not invalidate an
     /// unrelated worker that happened to read inventory concurrently.
     generations: BTreeMap<(Digest32, Digest32), u64>,
     pending: Vec<Pending>,
+    declined: Vec<Declined>,
 }
 #[derive(Default)]
 pub(crate) struct HintInbox(Mutex<State>);
@@ -62,6 +76,20 @@ impl HintInbox {
         }
         let mut outcome = Offer::default();
         for hint in hints {
+            // The peer's inventory names the head it declined to fill: not asked again. A
+            // different head for the author is a changed inventory, so the record goes and the
+            // hint is offered (ADR-038 FX-29).
+            let same_declined = |declined: &Declined| {
+                declined.room == room && declined.peer == peer && declined.author == hint.author
+            };
+            if state
+                .declined
+                .iter()
+                .any(|declined| same_declined(declined) && declined.head == hint.head)
+            {
+                continue;
+            }
+            state.declined.retain(|declined| !same_declined(declined));
             if state.pending.iter().any(|p| {
                 p.room == room
                     && p.peer == peer
@@ -213,12 +241,40 @@ impl HintInbox {
             pending.in_flight = false;
         }
     }
+    /// The peer said it does not hold the missing bodies this hint's newest window asked it for
+    /// (`BodyNotHeld` to a live retry). Its inventory's same head is not offered again until it
+    /// names another head for the author (ADR-038 FX-29): before this, an author whose missing
+    /// bodies no peer held any more was pulled again from every peer every period.
+    pub(crate) fn decline(&self, room: Digest32, peer: Digest32, author: Digest32, head: Digest32) {
+        let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.declined.iter().any(|declined| {
+            declined.room == room
+                && declined.peer == peer
+                && declined.author == author
+                && declined.head == head
+        }) {
+            return;
+        }
+        if state.declined.len() >= MAX_DECLINED {
+            state.declined.remove(0);
+        }
+        state.declined.push(Declined {
+            room,
+            peer,
+            author,
+            head,
+        });
+    }
     pub(crate) fn retire_peer(&self, room: Digest32, peer: Digest32) {
         let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         // MAX is a permanently retired generation: offer refuses it rather than wrapping.
         let generation = state.generations.entry((room, peer)).or_default();
         *generation = generation.saturating_add(1);
         state.pending.retain(|p| p.room != room || p.peer != peer);
+        // A port that comes back may be a restarted peer holding more: ask it once again.
+        state
+            .declined
+            .retain(|declined| declined.room != room || declined.peer != peer);
         Self::release_empty(&mut state);
     }
     pub(crate) fn retire_room(&self, room: Digest32) {
@@ -232,6 +288,7 @@ impl HintInbox {
             }
         }
         state.pending.retain(|p| p.room != room);
+        state.declined.retain(|declined| declined.room != room);
         Self::release_empty(&mut state);
     }
     pub(crate) fn clear(&self) {
@@ -242,6 +299,7 @@ impl HintInbox {
             *generation = generation.saturating_add(1);
         }
         state.pending = Vec::new();
+        state.declined = Vec::new();
     }
     fn release_empty(state: &mut State) {
         if state.pending.is_empty() {
