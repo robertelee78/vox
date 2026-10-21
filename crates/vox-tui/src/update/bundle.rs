@@ -426,11 +426,12 @@ fn in_use(bundle: &Path) -> bool {
 /// Finish or undo a publish that was cut short (see [`publish`]); nothing when none was. Run
 /// under the install lock, before anything else reads `apps`.
 ///
-/// With no [`PREVIOUS`] but a bundle under [`PARTIAL`], the journal's version says which side of
-/// the swap the publish stopped on: if [`BUNDLE`] is that version, the swap happened and the
-/// partial name holds the replaced bundle, which becomes [`PREVIOUS`]; otherwise the partial is
-/// the unpublished candidate, and goes. Either way the journal's earlier previous bundle comes
-/// back when nothing has taken its place.
+/// The journal's version and the active bundle say which side of the swap the publish stopped on:
+/// if [`BUNDLE`] is that version, the swap happened and a remaining [`PARTIAL`] holds the replaced
+/// bundle; otherwise a remaining partial is the unpublished candidate, and goes. This also covers
+/// a stop before the version file was written. Either way the journal's earlier previous bundle
+/// comes back when nothing has taken its place, and every journal is reported as an interrupted
+/// publish even when no rename remains to perform.
 fn recover(apps: &Path) -> Result<Recovery, AppError> {
     let mut repaired = Recovery::default();
     sweep(apps, &mut repaired)?;
@@ -448,14 +449,23 @@ fn recover(apps: &Path) -> Result<Recovery, AppError> {
     let staged = apps.join(PARTIAL);
     let previous = apps.join(PREVIOUS);
     let published = fs::read_to_string(journal.join(PUBLISHING_VERSION)).unwrap_or_default();
-    if fs::symlink_metadata(&previous).is_err() && staged.join(HELPER).is_file() {
-        if app_version(&apps.join(BUNDLE)).as_deref() == Some(published.trim()) {
+    let published = published.trim();
+    let swapped =
+        !published.is_empty() && app_version(&apps.join(BUNDLE)).as_deref() == Some(published);
+    repaired.interrupted_publish = Some(if swapped {
+        InterruptedPublish::PutInPlace(published.to_owned())
+    } else {
+        InterruptedPublish::BeforeSwap(published.to_owned())
+    });
+    if swapped {
+        if fs::symlink_metadata(&previous).is_err() && staged.join(HELPER).is_file() {
             fs::rename(&staged, &previous).map_err(AppError::Io)?;
             let _ = set_aside(&previous)?;
-            repaired.interrupted_publish = Some(published.trim().to_owned());
-        } else {
-            clear(&staged)?;
         }
+    } else if fs::symlink_metadata(&staged).is_ok() {
+        // The active app was never exchanged: the partial name is only the unpublished
+        // candidate, including when an existing previous bundle had not yet entered the journal.
+        clear(&staged)?;
     }
     let kept = journal.join(BUNDLE);
     if fs::symlink_metadata(&previous).is_err() && fs::symlink_metadata(&kept).is_ok() {
@@ -476,10 +486,17 @@ fn recover(apps: &Path) -> Result<Recovery, AppError> {
 /// exchange the active bundle (ADR-014 M-29a).
 #[derive(Default)]
 struct Recovery {
-    interrupted_publish: Option<String>,
+    interrupted_publish: Option<InterruptedPublish>,
     previous_set_aside: bool,
     retired_set_aside: usize,
     retired_removed: usize,
+}
+
+enum InterruptedPublish {
+    /// The journal exists but the active app is not its version: the candidate never published.
+    BeforeSwap(String),
+    /// The journal's version is active: finish retaining the bundle it replaced.
+    PutInPlace(String),
 }
 
 impl Recovery {
@@ -492,10 +509,18 @@ impl Recovery {
 
     fn detail(&self) -> String {
         let mut parts = Vec::new();
-        if let Some(version) = &self.interrupted_publish {
-            parts.push(format!(
-                "finished the update cut short after Vox {version} was put in place and kept the replaced app for rollback"
-            ));
+        if let Some(interrupted) = &self.interrupted_publish {
+            parts.push(match interrupted {
+                InterruptedPublish::BeforeSwap(version) if !version.is_empty() => format!(
+                    "finished the update cut short before Vox {version} was put in place and discarded its unpublished candidate"
+                ),
+                InterruptedPublish::BeforeSwap(_) => {
+                    "finished an update cut short before its candidate was put in place and discarded that unpublished candidate".to_owned()
+                }
+                InterruptedPublish::PutInPlace(version) => format!(
+                    "finished the update cut short after Vox {version} was put in place and kept the replaced app for rollback"
+                ),
+            });
         }
         if self.previous_set_aside {
             parts.push("made the kept previous bundle non-launchable again".to_owned());
