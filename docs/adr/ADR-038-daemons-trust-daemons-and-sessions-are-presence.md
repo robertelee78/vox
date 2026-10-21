@@ -330,7 +330,11 @@ The decider then answered twelve questions, one at a time. His answers are the d
 - **FX-33.** A change to a room's retention MUST NOT stop the room: after the admin shortens
   it, every member MUST still read and post there, the rows the member holds that are older
   than the new lifetime MUST expire on it, and no daemon MUST say it cannot save because of the
-  sweep that change started. Decision: the sweep prunes what the node holds; a signed-format
+  sweep that change started. A room's recovery after a failed save MUST NOT touch the node's
+  other rooms: while one room recovers, and when its recovery fails, every other room of the
+  node MUST still read and post, and the daemon MUST NOT close the node's store to recover a
+  room. Decision: the recovery re-saves the room's sealed state in an ordinary write
+  transaction on the store as it is open, never by closing and reopening the file; the sweep prunes what the node holds; a signed-format
   entry is never a legacy Session; an entry whose body never arrived, or that sits past its
   author's verified head, is skipped that sweep and is not evidence of a malformed store; a row
   the sweep cannot classify (a Session step or a message) expires under the message lifetime,
@@ -343,7 +347,13 @@ The decider then answered twelve questions, one at a time. His answers are the d
   malformed at-rest artifact … It recovers by itself when writes succeed again", which it
   cannot while every tick's sweep hits the same entry; the same log shows two earlier sweeps
   that day (19:32:57Z and 23:21:31Z) poisoning rooms with "retention entry missing" (a body
-  never received has no first-seen fact), cleared when the room was reopened (23:21:35Z).
+  never received has no first-seen fact), cleared when the room was reopened (23:21:35Z). At
+  00:15:30Z the poisoned room's recovery closed robert-work's whole store to reopen it
+  writable; redb refused the reopen while another handle in the daemon was alive, the fallback
+  left the store read-only or closed, and from then on every room of the node answered "the
+  store is read-only until the identity is unlocked" or "the store is being reopened" on each
+  one-second retry, for hours, until a restart: the app, `vox status` and the hooks got no
+  answer from the daemon.
 - **FX-34.** Unlocking a node is not remembering it. `vox node unlock` with a passphrase typed
   at the terminal, read from stdin or taken from `VOX_IDENTITY_PASSPHRASE` MUST make the node
   Ready for this daemon's life on every system, and the Locked status line MUST name a command
