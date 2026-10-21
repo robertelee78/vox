@@ -6,7 +6,8 @@
 - **Date**: 2026-10-19; amended 2026-10-20 (FX-22–FX-27, the daemon's CPU); amended
   2026-10-20 (FX-28–FX-34: the idle daemon's disk and CPU, measured on v0.4.9, the own-feed
   recovery ruling of 2026-10-19, a retention change that poisoned a room, and a node on Linux
-  that could not be unlocked)
+  that could not be unlocked); amended 2026-10-21 (FX-35: a daemon whose parked flows held
+  the flow-state pool synced nothing)
 - **Deciders**: Robert E. Lee
 - **Tags**: trust, daemon identity, sessions, presence, agent comms, sync, health, releases
 - **Related**: ADR-018, ADR-020, ADR-026, ADR-029, ADR-031, ADR-033, ADR-034, ADR-035, ADR-036,
@@ -186,7 +187,7 @@ The decider then answered twelve questions, one at a time. His answers are the d
   MUST run on the VM setup (the macOS guests of the v0.4.4 app-proof work), not on his working
   Macs ("use the VM stuffs so I'm not losing ability to use my macs").
 - **FX-21.** Every product requirement above (FX-1–FX-10, FX-12–FX-18, FX-22–FX-24, FX-26,
-  FX-27, FX-28–FX-34) lands with a proof that drives the shipped `vox` binary as a person
+  FX-27, FX-28–FX-35) lands with a proof that drives the shipped `vox` binary as a person
   would, with a mutant that turns it red on its own assertion (ADR-018). The two-computer requirements
   (FX-2–FX-7) are proved by two daemons in two data roots on one machine. FX-11's design, FX-19,
   FX-20 and FX-25 are process rulings: FX-19's record is each closed release milestone, FX-20's
@@ -374,6 +375,28 @@ The decider then answered twelve questions, one at a time. His answers are the d
   persistent file", while the status line said "Unlock with vox node unlock …": the product's
   advice looped into its refusal. Introduced by 6d9f286fa (2026-10-13), shipped in v0.4.5
   through v0.4.9; the Keychain path hid it on macOS.
+- **FX-35.** A flow a node keeps between turns MUST NOT starve a lane: a port with a need
+  MUST start its round even when every parked flow of the daemon holds flow state, so the
+  daemon-wide flow-state pool (`RETAINED_FLOWS`, 16 per daemon today, each 128 KiB) is never
+  held indefinitely by flows that are not running. Decision: a bounded flow that is ready but
+  not running, deferred, retiring or awaiting cleanup holds the pool for at most one period;
+  when a port with a need finds the pool full, the pool is reclaimed from the parked flows,
+  oldest first, of ports with nothing due (a reclaimed flow is disposed and its hint re-arms),
+  and a flow that cannot reserve the pool again when it resumes is disposed, never left to hold
+  its port. No cap is raised and nothing is paced (FX-27). A round that cannot start MUST say
+  why: `vox status --json` names, for every port, the reason its last start ended as it did
+  and the flow-state pool as it stands (in use, limit, by node), and a room's "no completed
+  sync" line names the pool when the pool is the reason, so a person can tell a quiet room from
+  a stuck one. Measured cause, 2026-10-21: on the decider's daemon (four hosted nodes, three
+  rooms, restarted 02:32Z) every port of every node had opened no session, `queued` froze,
+  every room said "no completed sync in 10 minutes", and posts moved neither between the two
+  Macs nor between two nodes of one daemon while the daemons were connected; in the #986
+  staging on main bb4062651, instrumented, every port was eligible, popped and re-queued each
+  pass with `start_bounded_outbound` returning false at `reserve_flow_state` 370,156 times in
+  one run, the pool full (16 of 16) by the first fifth of the run with 1,951 flows started
+  before and none after, the outbound slots 0 of 16 in use and the archive lane empty
+  throughout. The product said only the symptom. "please make vox work"; "be methodical" (the
+  decider, 2026-10-21).
 
 ## Unchanged rulings
 
@@ -401,6 +424,7 @@ Narrow successor amendments. Requirements not named here remain in force.
 | No predecessor: no ADR names a durability class for the store or a flush under a room's lock | FX-30 and FX-31 are new rules |
 | PRD-001 R7, R8; ADR-023 M23.1: the admin sets the room's retention; it applies to what is stored at the next sweep | Preserved; FX-33 adds that the sweep never stops the room |
 | ADR-028 K-10, ADR-031 CW-2, CW-7: a node unlocked at a terminal is remembered in the Keychain so the daemon makes it Ready at each start | Preserved where a credential store exists (the Keychain); FX-34 adds that unlocking never depends on remembering, that Linux remembers nothing for now, and that Vox never writes a passphrase file on its own |
+| ADR-037 R7, R11; ADR-026: a bounded flow keeps its state between turns, within a daemon-wide pool | FX-35 adds that a parked flow never holds the pool against a port with a need, and that a round which cannot start says why |
 | ADR-034 §5 "Health is true" (HL-1, HL-2), PRD-001 R35 | The lane's completed rounds are completed syncs (FX-16); the control socket answers under sync load (FX-17) |
 
 ## Implementation order and related work
@@ -417,7 +441,8 @@ Narrow successor amendments. Requirements not named here remain in force.
    symbols); one cut (v0.4.8).
 8. FX-28, FX-29, FX-30, FX-31: the idle daemon's disk and CPU, measured on the decider's
    daemon (v0.4.9) on 2026-10-20, in that order (the tick, the re-pull, the flush, the lock);
-   FX-32 under #934; FX-33 and FX-34 with them; one cut (v0.4.10).
+   FX-32 under #934; FX-33 and FX-34 with them; FX-35 first among them, since until it lands a
+   daemon hosting four nodes syncs nothing; one cut (v0.4.10).
 
 Each ADR change under this record is reviewed by an independent session (opencode-work) before
 its stories are extracted.
