@@ -812,12 +812,16 @@ pub async fn node_create(
         })
 }
 
-/// Unlock a node and remember it for every daemon start (ADR-031 CW-2/CW-7).
-/// A Mac stores any supplied secret in the Keychain. Elsewhere a protected node needs a
-/// persistent passphrase file; no new secret store is created for terminal or environment input.
+/// Unlock a node, and remember it for every daemon start where this system keeps secrets
+/// (ADR-031 CW-2/CW-7). A Mac stores any supplied secret in the Keychain. Elsewhere a passphrase
+/// from a persistent file is remembered by that file; a passphrase typed, read from stdin or
+/// taken from `VOX_IDENTITY_PASSPHRASE` unlocks the node for this daemon's life and is stored
+/// nowhere, which is said. Unlocking is not remembering (ADR-038 FX-34): measured 2026-10-21 on
+/// the decider's Linux host (vox 0.4.9), every unlock without a file was refused, so after the
+/// update's daemon restart no node could be unlocked at all.
 ///
 /// # Errors
-/// A missing node, no durable way to remember it, or the daemon's refusal. A Keychain failure
+/// A missing node, an unusable passphrase file, or the daemon's refusal. A Keychain failure
 /// names the partial result: the node is Ready but not remembered, and this command fails.
 pub async fn node_unlock(
     args: &NodeArgs,
@@ -859,28 +863,24 @@ pub async fn node_unlock(
     let passphrase = tokio::task::spawn_blocking(move || attach_passphrase(None, file))
         .await
         .map_err(|e| AppError::Usage(format!("asking for a passphrase: {e}")))??;
+    // How the node is remembered, if it is: `None` unlocks it for this daemon's life only.
     let keep = if passphrase.is_empty() {
-        KeepSource::None
+        Some(KeepSource::None)
     } else if cfg!(target_os = "macos") {
-        KeepSource::Keychain(String::new())
+        Some(KeepSource::Keychain(String::new()))
     } else {
-        KeepSource::File(persistent_file.ok_or_else(|| {
-            AppError::Usage(format!(
-                "node {name} cannot be remembered from a typed passphrase, an environment \
-                 variable or stdin on this system; save its passphrase in a private persistent \
-                 file, then unlock node {name} with --passphrase-file naming that file"
-            ))
-        })?)
+        persistent_file.map(KeepSource::File)
     };
+    let remembering = keep.is_some();
     ensure_daemon(&account, args.listen, &args.anchor_specs()).await?;
     let mut d = daemon(&account).await?;
     attach_request(
         &mut d,
         &name,
         passphrase,
-        Some(keep),
+        keep,
         args.anchor_specs(),
-        true,
+        remembering,
     )
     .await?;
     println!(
