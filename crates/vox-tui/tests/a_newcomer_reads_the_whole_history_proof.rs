@@ -719,19 +719,11 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         std::thread::sleep(Duration::from_millis(200));
     }
 
-    // Alice must trust Carol before Carol builds the competing-author suffix: an untrusted
-    // author's key is correctly refused.  Carol must also be offline at that exact decision:
-    // otherwise the key takes the direct pairwise path and no package exists in Alice's feed.
-    // Remember Carol's contiguous log before the offline append so her later increase proves she
-    // actually fetched the row, package and consent grant, rather than merely reporting an
-    // unscanned package queue after restart.
-    let carol_log_before_package = status_log_entries(&carol, &room).unwrap_or_else(|| {
-        panic!(
-            "APPARATUS: carol's shipped status did not name her contiguous log before the \
-             offline package was staged"
-        )
-    });
-    carol_daemon.stop();
+    // Put one ordinary row immediately before the package while Carol is still reachable. Alice
+    // must then trust Carol only after Carol is visibly disconnected: an existing connection
+    // takes the direct pairwise path, while the failed dial from this offline state selects the
+    // store-and-forward package path. Alice must make that trust decision before Carol authors
+    // the competing suffix, because a key from an untrusted author is correctly refused.
     let before_package_text = "alice row before carol's package";
     let (ok, out, err) = vox(&alice, &["room", "post", &room, before_package_text], None);
     assert!(
@@ -743,10 +735,10 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
             "PRODUCT: alice's shipped JSON read omitted the accepted row before the private package"
         )
     });
-    let before_package_rows = status_rows(&alice, &room).unwrap_or_else(|| {
+    let before_package_log = status_log_entries(&alice, &room).unwrap_or_else(|| {
         panic!(
-            "PRODUCT: alice's `vox status --json` did not report the room before the private \
-             package was staged"
+            "PRODUCT: alice's `vox status --json` did not report her contiguous log before the \
+             private package was staged"
         )
     });
     let before_package_through = room_own_feed_through(&alice, &room).unwrap_or_else(|| {
@@ -755,28 +747,62 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
              private package was staged"
         )
     });
+    let pre_package_replicated_deadline = Instant::now() + READY_WITHIN;
+    while member_holds_through(&carol, &room, &fps[0])
+        .is_none_or(|through| through < before_package_through)
+    {
+        assert!(
+            Instant::now() < pre_package_replicated_deadline,
+            "APPARATUS: before going offline, Carol did not report holding Alice's exact \
+             pre-package feed position {before_package_through}; the package boundary was not \
+             staged\nalice said: {}\ncarol said: {}",
+            said(&alice, "alice"),
+            said(&carol, "carol")
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let carol_log_before_package = status_log_entries(&carol, &room).unwrap_or_else(|| {
+        panic!(
+            "APPARATUS: carol's shipped status did not name her contiguous log at Alice's exact \
+             pre-package feed position {before_package_through}"
+        )
+    });
+    carol_daemon.stop();
+    let disconnected_deadline = Instant::now() + READY_WITHIN;
+    while member_connected(&alice, &room, &fps[2]) != Some(false) {
+        assert!(
+            Instant::now() < disconnected_deadline,
+            "APPARATUS: after Carol's process stopped, Alice's shipped status did not report the \
+             exact room member disconnected; an existing direct connection could still consume \
+             the consent instead of the log fallback\nalice said: {}",
+            said(&alice, "alice")
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
     let (ok, _, err) = vox(&alice, &["trust", "add", &fps[2], "--name", "carol"], None);
     assert!(
         ok,
         "PRODUCT: alice's `vox trust add` of carol failed: {err}"
     );
-    // With Carol offline, a completed delivery must add two distinct rows after the visible
-    // pre-package row: the recipient-scoped package and its consent grant.  Requiring both the
-    // shipped row count and Alice's exact authenticated feed to advance twice cannot be satisfied
-    // by the consent row alone; `key_packages_pending` is deliberately not used for this append
-    // observation because a held initial scan makes that bit true without a package.
+    // Alice had no direct connection at the decision and Carol's process remains stopped, so its
+    // dial can only fail. After that failure, the fallback appends the recipient-scoped package
+    // and consent grant. A new trust can independently owe at most one private-support row;
+    // therefore two exact contiguous-log/feed advances from this boundary require the fallback
+    // package to have been appended. `entries` is not used: packages and governance facts are log
+    // rows, not necessarily visible timeline rows.
     let package_deadline = Instant::now() + READY_WITHIN;
-    while status_rows(&alice, &room)
-        .is_none_or(|entries| entries < before_package_rows.saturating_add(2))
+    while status_log_entries(&alice, &room)
+        .is_none_or(|entries| entries < before_package_log.saturating_add(2))
         || room_own_feed_through(&alice, &room)
             .is_none_or(|through| through < before_package_through.saturating_add(2))
         || member_key_waits(&alice, &fps[2]) != Some(None)
     {
         assert!(
             Instant::now() < package_deadline,
-            "APPARATUS: while carol was offline, Alice's shipped row count and authenticated feed \
-             did not each advance through the package and consent grant within {READY_WITHIN:?}; \
-             the private package was not staged\nalice said: {}",
+            "APPARATUS: after Alice visibly lost Carol's direct connection, her shipped \
+             contiguous log and authenticated feed did not each advance twice from \
+             {before_package_log}/{before_package_through}; the failed-direct fallback did not \
+             visibly append Carol's package\nalice said: {}",
             said(&alice, "alice")
         );
         std::thread::sleep(Duration::from_millis(200));
@@ -788,25 +814,29 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         )
     });
 
-    // Restart Carol with the installer held only after the package exists.  Three new contiguous
-    // rows since her stop (the visible pre-package row, package, and consent grant) prove she
-    // fetched across that exact append.  Pending package work is no longer a vacuous held-scan
-    // observation: it is paired with the exact source-feed append and recipient-log increase.
+    // Restart Carol with the installer held only after the package exists. Her exact local
+    // role-complete cursor must reach Alice's package-bearing feed position: that shipped cursor,
+    // not a generic queue bit or an aggregate count, proves she fetched the segment. The log
+    // count and pending bit supplement it by showing that the new rows are durable and package
+    // installation is still held.
     std::fs::write(&hold, b"")
         .unwrap_or_else(|e| panic!("APPARATUS: could not create {}: {e}", hold.display()));
     let carol_daemon = daemon_env(&carol, "carol-package-held", &knob);
     attached(&carol, "carol-package-held");
     let retained_deadline = Instant::now() + READY_WITHIN;
-    while status_log_entries(&carol, &room)
-        .is_none_or(|entries| entries < carol_log_before_package.saturating_add(3))
+    while member_holds_through(&carol, &room, &fps[0])
+        .is_none_or(|through| through < package_feed_through)
+        || status_log_entries(&carol, &room)
+            .is_none_or(|entries| entries < carol_log_before_package.saturating_add(2))
         || key_packages_pending(&carol, &room) != Some(true)
     {
         assert!(
             Instant::now() < retained_deadline,
-            "APPARATUS: after Carol restarted with package installation held, her contiguous log \
-             did not cross Alice's exact pre-package row, package, and consent grant while \
-             package work remained pending; the private package was not retained (Alice's \
-             authenticated feed after delivery: {package_feed_through})\nalice said: {}\ncarol said: {}",
+            "APPARATUS: after Carol restarted with package installation held, her shipped \
+             role-complete cursor did not reach Alice's exact package-bearing feed position \
+             {package_feed_through} while her log gained the package/fact rows and package work \
+             remained pending; the exact private package segment was not retained\nalice said: \
+             {}\ncarol said: {}",
             said(&alice, "alice"),
             said(&carol, "carol-package-held")
         );
@@ -2081,6 +2111,24 @@ fn member_key_waits(dir: &Path, member: &str) -> Option<Option<String>> {
             })
         })
     })
+}
+
+/// Whether shipped status says one exact room member has a live connection. `None` means the
+/// command, room, member, or field was absent rather than silently meaning disconnected.
+fn member_connected(dir: &Path, room: &str, member: &str) -> Option<bool> {
+    let (ok, out, _) = vox(dir, &["status", "--json"], None);
+    if !ok {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(&out).ok()?;
+    value["rooms"]
+        .as_array()?
+        .iter()
+        .find(|row| row["id"].as_str().is_some_and(|id| id.starts_with(room)))?["members"]
+        .as_array()?
+        .iter()
+        .find(|row| row["id"].as_str() == Some(member))?["connected"]
+        .as_bool()
 }
 
 fn room_own_feed_through(dir: &Path, room: &str) -> Option<u64> {
