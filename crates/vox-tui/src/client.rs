@@ -821,8 +821,8 @@ pub async fn node_create(
 /// update's daemon restart no node could be unlocked at all.
 ///
 /// # Errors
-/// A missing node, an unusable passphrase file, or the daemon's refusal. A Keychain failure
-/// names the partial result: the node is Ready but not remembered, and this command fails.
+/// A missing node, an unusable passphrase file, or the daemon's refusal. A Keychain that cannot
+/// take the passphrase is said, and the node is Ready, not remembered: not an error.
 pub async fn node_unlock(
     args: &NodeArgs,
     name: &str,
@@ -871,18 +871,12 @@ pub async fn node_unlock(
     } else {
         persistent_file.map(KeepSource::File)
     };
-    let remembering = keep.is_some();
     ensure_daemon(&account, args.listen, &args.anchor_specs()).await?;
     let mut d = daemon(&account).await?;
-    attach_request(
-        &mut d,
-        &name,
-        passphrase,
-        keep,
-        args.anchor_specs(),
-        remembering,
-    )
-    .await?;
+    // Unlocking never depends on remembering (ADR-038 FX-34): a Keychain that cannot take the
+    // passphrase leaves the node Ready and not remembered, which the reply says; the command
+    // used to fail then, with the node Ready behind it.
+    attach_request(&mut d, &name, passphrase, keep, args.anchor_specs(), false).await?;
     println!(
         "Next: start a new session in the harness wired to node {name}, or run `{}` to see its rooms",
         vox_text::shell::node_command(&["vox", "room", "list"], name.as_str())

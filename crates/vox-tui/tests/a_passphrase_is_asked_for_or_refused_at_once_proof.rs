@@ -621,7 +621,6 @@ fn a_locked_node_is_unlocked_without_a_persistent_file() {
     let (bob, _) = profile(tmp.path(), "bob");
     let _reaper = layout::Reaper(vec![bob.clone()]);
     let mut daemon = daemon_with_locked_nodes(&bob);
-    let remembering_store = cfg!(target_os = "macos");
 
     // ---- 1. unlocked from stdin: Ready, and said to be not remembered where nothing keeps it ----
     let out = vox_cmd(
@@ -647,9 +646,13 @@ fn a_locked_node_is_unlocked_without_a_persistent_file() {
     assert!(
         out.status.success() && said.contains("is Ready") && node_list(&bob).contains("Ready"),
         "PRODUCT: `vox node unlock default --passphrase-file -` with the passphrase on stdin did \
-         not make the node Ready (ADR-038 FX-34); it said:\n{said}\n`vox node list`: {}",
+         not make the node Ready, or failed with it Ready (ADR-038 FX-34); it said:\n{said}\n\
+         `vox node list`: {}",
         node_list(&bob)
     );
+    // Whether this system remembered it is what the unlock itself said: the Keychain on a Mac
+    // that has one; nothing anywhere else, or on a Mac whose keychain is not available here.
+    let remembering_store = said.contains("is Ready and remembered");
     if !remembering_store {
         assert!(
             said.contains("not remembered"),
