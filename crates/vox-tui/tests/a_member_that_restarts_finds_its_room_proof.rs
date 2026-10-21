@@ -56,6 +56,25 @@
 //!   APPARATUS. Mutation: the background detector removed (a peer's higher own head not compared
 //!   with the local own feed) — her post is accepted and signed at a taken place; red on the
 //!   refusal's assertion.
+//!
+//! - (e) **a member whose daemon crashes keeps what it was told it has** (ADR-038 FX-30, #1022).
+//!   Only what a person would lose is flushed to disk; derived sync state is not, and is rebuilt
+//!   after a crash. Three crashes, each a SIGKILL by PID (nothing is closed, nothing is flushed
+//!   on the way out): (1) alice posts [`CRASH_POSTS`] rows and her daemon is killed the moment
+//!   the last `vox room post` has returned; back on her port she reads every one of them and
+//!   `vox trust list` still names bob. (2) alice posts once more and the proof waits until her
+//!   own row says it is held on bob's node (`vox room read --json`'s `held`, ADR-028 R-6: bob's
+//!   own word in a sync, which the design flushes before); bob's daemon is killed; back on his
+//!   port he reads it. (3) carol, trusted before alice's [`CRASH_BACKLOG`] posts, joins cold;
+//!   the moment `vox room join` returns her daemon is frozen (SIGSTOP), her data root copied,
+//!   her daemon resumed and killed, and a daemon started from the copy on her port: it opens the
+//!   room, what it reads is consistent (every `post <i>` at most once), and within
+//!   [`SYNCS_ON_WITHIN`] it holds every post, the cursors and heads the copy lost rebuilt from
+//!   alice. A copy of a frozen process is a crash image: redb advances its on-disk commit slot
+//!   only on a flushed commit, so what was committed without one is absent from the copy as it
+//!   is after a power loss. Mutations: own posts committed without a flush — (1) red, a post
+//!   `vox room post` accepted is gone; the flush before a node says what it holds removed — (2)
+//!   red, bob's acknowledged row is gone.
 
 #![cfg(unix)]
 
@@ -545,6 +564,233 @@ fn until_reads(reader: &Path, room: &str, text: &str, within: Duration) -> bool 
         std::thread::sleep(Duration::from_millis(250));
     }
     false
+}
+
+/// Rows alice posts before her daemon is killed (e, 1).
+const CRASH_POSTS: usize = 3;
+/// Alice's backlog that carol's daemon is fetching when its data root is copied (e, 3): under
+/// one `vox room read` page (64 rows), so a plain read sees it whole; the fetch is under way
+/// all the same, since `vox room join` returns before the window arrives (ADR-037 R1).
+const CRASH_BACKLOG: usize = 60;
+/// How long alice's row has to show as held on bob's node (e, 2): a sync round each way.
+const HELD_WITHIN: Duration = Duration::from_secs(90);
+/// Once the daemon started from the copy answers, how long it has to hold the whole backlog.
+const SYNCS_ON_WITHIN: Duration = Duration::from_secs(120);
+
+/// (e) — see the module doc.
+#[test]
+#[ignore = "real vox daemons and production Argon2id; CI runs it in release"]
+fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
+    watchdog::arm();
+    test_knobs::require(&["VOX_TEST_NO_NEARBY"]);
+    let unheard = [("VOX_TEST_NO_NEARBY", "1".to_owned())];
+    let t = tempfile::tempdir().expect("APPARATUS: no temp dir");
+    let (alice, alice_fp) = identity(t.path(), "alice");
+    let (bob, bob_fp) = identity(t.path(), "bob");
+    let (carol, carol_fp) = identity(t.path(), "carol");
+    let alice_d = daemon(
+        &alice,
+        "alice",
+        &format!("{IDENTITY}\n"),
+        "127.0.0.1:0",
+        &unheard,
+    );
+    let alice_at = listening(&alice);
+    let bob_d = daemon(
+        &bob,
+        "bob",
+        &format!("{IDENTITY}\n"),
+        "127.0.0.1:0",
+        &unheard,
+    );
+    let bob_at = listening(&bob);
+    let room = create(&alice);
+    join(&alice, &bob, &room);
+    trust(&alice, &bob_fp, "bob");
+    trust(&bob, &alice_fp, "alice");
+    // Carol is trusted before any of the backlog, so she reads all of it when she joins.
+    trust(&alice, &carol_fp, "carol");
+    trust(&carol, &alice_fp, "alice");
+    until_readable(&alice, &[&bob], &room);
+    until_readable(&bob, &[&alice], &room);
+
+    // ---- (1) alice's own posts survive her daemon's SIGKILL right after they were accepted ----
+    for i in 1..=CRASH_POSTS {
+        post(&alice, &room, &format!("kept {i}"));
+    }
+    drop(alice_d);
+    println!(
+        "[proof] (1) alice's daemon killed the moment `vox room post kept {CRASH_POSTS}` returned"
+    );
+    let alice_d = daemon(
+        &alice,
+        "alice-2",
+        &format!("{IDENTITY}\n{ROOMPASS}\n"),
+        &alice_at,
+        &unheard,
+    );
+    assert!(
+        room_answers(&alice, &room, REOPENS_WITHIN),
+        "PRODUCT (staging): alice's room did not answer `vox room read` within {REOPENS_WITHIN:?} \
+         of her restart after a SIGKILL: {}\nher daemon said:\n{}",
+        vox(&alice, &["room", "read", &room], None).2,
+        daemon_said(&alice, "alice-2")
+    );
+    let hers = read(&alice, &room);
+    assert!(
+        holds(&hers, "kept", CRASH_POSTS) == CRASH_POSTS,
+        "PRODUCT: a post `vox room post` had accepted was lost by a crash of the daemon (ADR-038 \
+         FX-30, #1022): alice posted kept 1..={CRASH_POSTS}, was killed, and reads {hers:?}"
+    );
+    let (ok, trusted, err) = vox(&alice, &["trust", "list"], None);
+    assert!(
+        ok && trusted.contains("bob") && trusted.contains("carol"),
+        "PRODUCT: a trust decision was lost by a crash of the daemon (ADR-038 FX-30, #1022): \
+         `vox trust list` after the restart: {trusted}{err}"
+    );
+    println!("[proof] (1) after the crash alice reads {hers:?} and still trusts bob and carol");
+
+    // ---- (2) a post bob's node said it holds survives bob's SIGKILL ------------------------------
+    post(&alice, &room, "acked");
+    let asked = Instant::now();
+    let held_on_bob = loop {
+        match held_on(&alice, &room, "acked") {
+            Some((held, _)) if held >= 1 => break asked.elapsed(),
+            seen => {
+                assert!(
+                    asked.elapsed() < HELD_WITHIN,
+                    "PRODUCT (staging): within {HELD_WITHIN:?} alice's own row never showed as held \
+                     on bob's node (`vox room read --json` held/others: {seen:?}; bob reads {:?}), \
+                     so bob's acknowledgement could not be staged\nalice's daemon said:\n{}\nbob's \
+                     daemon said:\n{}",
+                    read(&bob, &room),
+                    daemon_said(&alice, "alice-2"),
+                    daemon_said(&bob, "bob")
+                );
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        }
+    };
+    drop(bob_d);
+    println!(
+        "[proof] (2) alice's row showed as held on bob's node {held_on_bob:?} after the post; bob's \
+         daemon killed"
+    );
+    let _bob_d = daemon(
+        &bob,
+        "bob-2",
+        &format!("{IDENTITY}\n{ROOMPASS}\n"),
+        &bob_at,
+        &unheard,
+    );
+    assert!(
+        room_answers(&bob, &room, REOPENS_WITHIN),
+        "PRODUCT (staging): bob's room did not answer `vox room read` within {REOPENS_WITHIN:?} of \
+         his restart after a SIGKILL: {}\nhis daemon said:\n{}",
+        vox(&bob, &["room", "read", &room], None).2,
+        daemon_said(&bob, "bob-2")
+    );
+    let his = read(&bob, &room);
+    assert!(
+        his.iter().any(|t| t == "acked"),
+        "PRODUCT: a post bob's node had acknowledged holding (alice's row showed held on 1 \
+         node) was lost by a crash of his daemon (ADR-038 FX-30, #1022): bob reads {his:?}"
+    );
+    println!("[proof] (2) after the crash bob reads the acknowledged post");
+
+    // ---- (3) a data root copied at an instant during a fetch reopens whole and syncs on ---------
+    for i in 1..=CRASH_BACKLOG {
+        post(&alice, &room, &format!("post {i}"));
+    }
+    let carol_d = daemon(
+        &carol,
+        "carol",
+        &format!("{IDENTITY}\n"),
+        "127.0.0.1:0",
+        &unheard,
+    );
+    let carol_at = listening(&carol);
+    join(&alice, &carol, &room);
+    // The moment the join returned her lane is fetching: freeze, copy, resume, kill.
+    let pid = carol_d.0.id().to_string();
+    let stopped = Command::new("kill")
+        .args(["-STOP", &pid])
+        .status()
+        .is_ok_and(|s| s.success());
+    assert!(stopped, "APPARATUS: `kill -STOP {pid}` did not take");
+    let copy = t.path().join("carol-copy");
+    copy_dir(&carol, &copy);
+    let resumed = Command::new("kill")
+        .args(["-CONT", &pid])
+        .status()
+        .is_ok_and(|s| s.success());
+    assert!(resumed, "APPARATUS: `kill -CONT {pid}` did not take");
+    drop(carol_d);
+    std::fs::create_dir_all(copy.join("cfg"))
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot make {}: {e}", copy.display()));
+    let tag = "carol-copy";
+    let _carol_copy_d = daemon(
+        &copy,
+        tag,
+        &format!("{IDENTITY}\n{ROOMPASS}\n"),
+        &carol_at,
+        &unheard,
+    );
+    assert!(
+        room_answers(&copy, &room, REOPENS_WITHIN),
+        "PRODUCT: the daemon started from a data root copied during a fetch did not open the \
+         room within {REOPENS_WITHIN:?} (ADR-038 FX-30, #1022): {}\nits daemon said:\n{}",
+        vox(&copy, &["room", "read", &room], None).2,
+        daemon_said(&copy, tag)
+    );
+    let at_reopen = read(&copy, &room);
+    let held_at_reopen = holds(&at_reopen, "post", CRASH_BACKLOG);
+    let duplicates: Vec<&String> = at_reopen
+        .iter()
+        .filter(|t| t.starts_with("post "))
+        .filter(|t| at_reopen.iter().filter(|u| u == t).count() > 1)
+        .collect();
+    assert!(
+        duplicates.is_empty(),
+        "PRODUCT: the room reopened from a copy taken during a fetch shows a row twice (ADR-038 \
+         FX-30, #1022): {duplicates:?}; it reads {at_reopen:?}"
+    );
+    let synced_on = Instant::now();
+    assert!(
+        until_holds(&copy, &room, "post", CRASH_BACKLOG, SYNCS_ON_WITHIN),
+        "PRODUCT: the room reopened from a copy taken during a fetch did not sync on (ADR-038 \
+         FX-30, #1022): it held {held_at_reopen} of {CRASH_BACKLOG} posts at reopen and, \
+         {SYNCS_ON_WITHIN:?} later, {} of them; it reads {:?}\nits daemon said:\n{}\nalice's daemon \
+         said:\n{}",
+        holds(&read(&copy, &room), "post", CRASH_BACKLOG),
+        read(&copy, &room),
+        daemon_said(&copy, tag),
+        daemon_said(&alice, "alice-2")
+    );
+    println!(
+        "[proof] (3) the copy taken as carol's join returned held {held_at_reopen} of \
+         {CRASH_BACKLOG} posts at reopen and every one {:?} later; nothing read twice",
+        synced_on.elapsed()
+    );
+    drop(alice_d);
+}
+
+/// `vox room read --json` of `room` as `dir`: the own row with `text`'s `held`/`others` footer
+/// (ADR-028 R-6, on how many other members' nodes it is held), `None` while the row or its
+/// footer is not shown.
+fn held_on(dir: &Path, room: &str, text: &str) -> Option<(u64, u64)> {
+    let (ok, out, _) = vox(
+        dir,
+        &["room", "read", room, "--json", "--limit", "128"],
+        None,
+    );
+    if !ok {
+        return None;
+    }
+    out.lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|row| row["text"].as_str() == Some(text))
+        .and_then(|row| Some((row["held"].as_u64()?, row["others"].as_u64()?)))
 }
 
 /// (d) — see the module doc.
