@@ -27,7 +27,7 @@
 //! the node schedules it after pruning (ADR-016 §Consequences).
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
 
 use redb::{Database, ReadOnlyDatabase, ReadableDatabase, ReadableTable, TableDefinition};
@@ -134,6 +134,13 @@ impl Cached<redb::WriteTransaction> {
         drop(cache);
         result
     }
+
+    fn set_durability(
+        &mut self,
+        durability: redb::Durability,
+    ) -> std::result::Result<(), redb::SetDurabilityError> {
+        self.inner.set_durability(durability)
+    }
 }
 
 fn database_builder() -> (redb::Builder, Arc<DatabaseCacheLease>) {
@@ -196,10 +203,49 @@ fn storage<E: std::fmt::Display>(op: &'static str) -> impl FnOnce(E) -> Error {
     }
 }
 
+/// What a store has committed since it was opened, for `vox status` (ADR-038 FX-30).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StoreCounts {
+    /// Write transactions committed, at any durability.
+    pub commits: u64,
+    /// Of those, the ones flushed to disk (redb `Durability::Immediate`, one `F_FULLFSYNC`
+    /// each): the ruled set's commits and the flushes that carry received entries.
+    pub flushes: u64,
+}
+
+/// The store's running counts and its one pending fact: a received entry committed without a
+/// flush that no peer has been told this node holds yet (ADR-038 FX-30).
+#[derive(Default)]
+struct Counting {
+    commits: AtomicU64,
+    flushes: AtomicU64,
+    received_pending: AtomicBool,
+}
+
+/// What a [`Batch`] holds, which decides how it commits (ADR-038 FX-30). Only what a person
+/// would lose is flushed to disk: a node's own entries, consent, trust, keys, Session records
+/// and the format marker, received or own. Derived state (indexes, render caches, cursors,
+/// verifier contexts, held positions, sweeps) commits without a flush and is rebuilt after a
+/// crash from the entries, the proofs and the peers. Any other received entry commits without a
+/// flush too, and reaches disk with the next durable commit, before this node acknowledges
+/// holding it ([`Store::flush_if_received_pending`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Class {
+    /// Nothing said: flushed, as every commit was before FX-30. The safe default.
+    Unsaid,
+    /// Holds something of the ruled set: flushed, whatever else was said of the batch.
+    Ruled,
+    /// Derived state only: committed in memory, carried by the next flush.
+    Derived,
+    /// A received entry outside the ruled set, with the derived state that admitted it.
+    Received,
+}
+
 /// The profile store.
 pub struct Store {
     db: RwLock<Backing>,
     path: PathBuf,
+    counts: Counting,
     /// The profile directory's lock, when this store is a profile's (V210-100). Declared after
     /// `db` so it is released only after the database is closed: the store goes with its last
     /// handle, and the lock with it — never before, which let a vox waiting for the lock open a
@@ -260,6 +306,7 @@ impl Store {
         let store = Self {
             db: RwLock::new(Backing::Writable(db)),
             path: path.to_owned(),
+            counts: Counting::default(),
             _lock: None,
         };
         store.init_schema()?;
@@ -282,6 +329,7 @@ impl Store {
         let store = Self {
             db: RwLock::new(Backing::ReadOnly(db)),
             path: path.to_owned(),
+            counts: Counting::default(),
             _lock: None,
         };
         if store.schema_is_current()? {
@@ -352,7 +400,7 @@ impl Store {
                     .map_err(storage("retry save room wrap"))?;
             }
         }
-        txn.commit().map_err(storage("retry commit room"))
+        self.commit_flushed(txn, "retry commit room")
     }
 
     /// Reopen a read-only store writable; a no-op for one that already is.
@@ -529,7 +577,7 @@ impl Store {
                 }
             }
         }
-        txn.commit().map_err(storage("commit"))
+        self.commit_flushed(txn, "commit")
     }
 
     /// Whether every table exists and the stored schema is this build's — a store that needs
@@ -588,6 +636,21 @@ impl Store {
         seg: &SealedSegment,
     ) -> Result<()> {
         let mut b = self.batch()?;
+        b.put_segment(channel, kind, id, seg)?;
+        b.commit()
+    }
+
+    /// Write one sealed segment of derived state, its own transaction, without a flush
+    /// ([`Batch::derived`]; ADR-038 FX-30).
+    pub fn put_segment_derived(
+        &self,
+        channel: &Digest32,
+        kind: SegmentKind,
+        id: u64,
+        seg: &SealedSegment,
+    ) -> Result<()> {
+        let mut b = self.batch()?;
+        b.derived();
         b.put_segment(channel, kind, id, seg)?;
         b.commit()
     }
@@ -659,6 +722,20 @@ impl Store {
         Ok(existed)
     }
 
+    /// Delete one sealed segment of derived state without a flush ([`Batch::derived`]).
+    pub fn delete_segment_derived(
+        &self,
+        channel: &Digest32,
+        kind: SegmentKind,
+        id: u64,
+    ) -> Result<bool> {
+        let mut b = self.batch()?;
+        b.derived();
+        let existed = b.delete_segment(channel, kind, id)?;
+        b.commit()?;
+        Ok(existed)
+    }
+
     /// Delete **everything this store holds of one channel** (a room left or ended, V030-08): every
     /// sealed segment of every kind and its SEK wrap, in one durable transaction. Returns how
     /// many rows went. The freed pages still hold the old bytes until the space is reused; a
@@ -711,7 +788,7 @@ impl Store {
             let mut meta = txn.open_table(META).map_err(storage("open meta"))?;
             meta.insert(name, value).map_err(storage("write meta"))?;
         }
-        txn.commit().map_err(storage("commit"))
+        self.commit_flushed(txn, "commit")
     }
 
     /// Read a public metadata entry.
@@ -762,15 +839,78 @@ impl Store {
                 .map_err(storage("write meta"))?;
             out
         };
-        txn.commit().map_err(storage("commit"))?;
+        self.commit_flushed(txn, "commit")?;
         Ok(out)
     }
 
     /// Begin an atomic multi-write batch. Nothing is visible until
-    /// [`Batch::commit`]; a dropped batch writes nothing.
+    /// [`Batch::commit`]; a dropped batch writes nothing. It commits flushed to disk unless it
+    /// says it holds only derived state ([`Batch::derived`]) or a received entry outside the
+    /// ruled set ([`Batch::received`]); a batch that says so and then queues something of the
+    /// ruled set is flushed anyway ([`Batch::ruled`]) (ADR-038 FX-30).
     pub fn batch(&self) -> Result<Batch<'_>> {
         let txn = self.begin_write()?;
-        Ok(Batch { txn, _store: self })
+        Ok(Batch {
+            txn,
+            store: self,
+            class: Class::Unsaid,
+        })
+    }
+
+    /// One flushed, empty write transaction: it carries every commit made without a flush since
+    /// the last one to disk (redb persists its pending `Durability::None` commits with the next
+    /// `Immediate` one; measured 2026-10-21 on redb 4.3.0: 2,000 unflushed commits then one
+    /// flush, every row on disk after a SIGKILL). Nothing to flush costs one `F_FULLFSYNC` all
+    /// the same, so callers ask [`Self::flush_if_received_pending`] (ADR-038 FX-30). A store
+    /// that is read-only or closed has nothing pending and flushes nothing.
+    ///
+    /// # Errors
+    /// The transaction cannot be begun or committed.
+    pub fn flush(&self) -> Result<()> {
+        let txn = match &*self.db.read().unwrap_or_else(PoisonError::into_inner) {
+            Backing::Writable(db) => db.begin_write().map_err(storage("begin flush"))?,
+            Backing::ReadOnly(_) | Backing::Closed => return Ok(()),
+        };
+        self.commit_flushed(txn, "flush")
+    }
+
+    /// Flush, if a received entry committed without a flush is still waiting for one: the
+    /// moment before this node tells a peer what it holds (its inventory, its answer to a head
+    /// probe), and the end of a sync round that received something (ADR-038 FX-30). Returns
+    /// whether it flushed.
+    ///
+    /// # Errors
+    /// As [`Self::flush`].
+    pub fn flush_if_received_pending(&self) -> Result<bool> {
+        if !self.received_pending() {
+            return Ok(false);
+        }
+        self.flush()?;
+        Ok(true)
+    }
+
+    /// Whether a received entry committed without a flush is still waiting for one.
+    #[must_use]
+    pub fn received_pending(&self) -> bool {
+        self.counts.received_pending.load(Ordering::Acquire)
+    }
+
+    /// What this store has committed since it was opened (ADR-038 FX-30).
+    #[must_use]
+    pub fn counts(&self) -> StoreCounts {
+        StoreCounts {
+            commits: self.counts.commits.load(Ordering::Relaxed),
+            flushes: self.counts.flushes.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Commit a raw transaction flushed to disk, counted.
+    fn commit_flushed(&self, txn: Cached<redb::WriteTransaction>, op: &'static str) -> Result<()> {
+        txn.commit().map_err(storage(op))?;
+        self.counts.commits.fetch_add(1, Ordering::Relaxed);
+        self.counts.flushes.fetch_add(1, Ordering::Relaxed);
+        self.counts.received_pending.store(false, Ordering::Release);
+        Ok(())
     }
 
     /// Reclaim space after deletions. Returns whether anything was compacted.
@@ -932,10 +1072,37 @@ impl Snapshot {
 /// An open write transaction over the store (see [`Store::batch`]).
 pub struct Batch<'a> {
     txn: Cached<redb::WriteTransaction>,
-    _store: &'a Store,
+    store: &'a Store,
+    class: Class,
 }
 
 impl Batch<'_> {
+    /// This batch holds derived state only (ADR-038 FX-30): it commits without a flush and
+    /// rides to disk with the next flushed commit. Said once, at the top of the batch; a later
+    /// [`Self::ruled`] overrides it.
+    pub fn derived(&mut self) {
+        if matches!(self.class, Class::Unsaid) {
+            self.class = Class::Derived;
+        }
+    }
+
+    /// This batch admits a received entry outside the ruled set, with the derived state that
+    /// admitted it (ADR-038 FX-30): it commits without a flush, and the store remembers that a
+    /// flush is owed before this node acknowledges holding anything to a peer. A later
+    /// [`Self::ruled`] overrides it.
+    pub fn received(&mut self) {
+        if !matches!(self.class, Class::Ruled) {
+            self.class = Class::Received;
+        }
+    }
+
+    /// This batch holds something of the ruled set (an own entry, consent, trust, a key, a
+    /// Session record, the format marker), so it is flushed to disk whatever else was said of
+    /// it (ADR-038 FX-30). The writers of such things say so themselves.
+    pub fn ruled(&mut self) {
+        self.class = Class::Ruled;
+    }
+
     /// Read a fixed metadata incarnation inside the same serialized publication transaction.
     pub(crate) fn get_meta_prefix<const N: usize>(&self, name: &str) -> Result<Option<[u8; N]>> {
         let meta = self.txn.open_table(META).map_err(storage("open meta"))?;
@@ -1168,8 +1335,30 @@ impl Batch<'_> {
         Ok(())
     }
 
-    /// Commit every queued write atomically and durably.
+    /// Commit every queued write atomically: flushed to disk unless the batch said it holds
+    /// only derived state or a received entry outside the ruled set ([`Class`]).
     pub fn commit(self) -> Result<()> {
-        self.txn.commit().map_err(storage("commit"))
+        let Self {
+            mut txn,
+            store,
+            class,
+        } = self;
+        let flushed = matches!(class, Class::Unsaid | Class::Ruled);
+        if !flushed {
+            txn.set_durability(redb::Durability::None)
+                .map_err(storage("set durability"))?;
+        }
+        txn.commit().map_err(storage("commit"))?;
+        store.counts.commits.fetch_add(1, Ordering::Relaxed);
+        if flushed {
+            store.counts.flushes.fetch_add(1, Ordering::Relaxed);
+            store
+                .counts
+                .received_pending
+                .store(false, Ordering::Release);
+        } else if matches!(class, Class::Received) {
+            store.counts.received_pending.store(true, Ordering::Release);
+        }
+        Ok(())
     }
 }

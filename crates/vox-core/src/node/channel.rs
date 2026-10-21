@@ -3220,7 +3220,7 @@ impl ChannelState {
             SEG_BOARD_KEPT,
             &board_kept_bytes(&self.board_kept),
         )?;
-        if let Err(e) = store.put_segment(
+        if let Err(e) = store.put_segment_derived(
             &self.channel_id,
             SegmentKind::KeyMaterial,
             SEG_BOARD_KEPT,
@@ -3302,7 +3302,7 @@ impl ChannelState {
             SEG_AUTHORS,
             &authors_bytes(&self.authors),
         )?;
-        if let Err(e) = store.put_segment(
+        if let Err(e) = store.put_segment_derived(
             &self.channel_id,
             SegmentKind::KeyMaterial,
             SEG_AUTHORS,
@@ -3694,6 +3694,7 @@ impl ChannelState {
         let result = (|| -> Result<()> {
             loop {
                 let mut batch = store.batch()?;
+                batch.derived();
                 let mut index = self
                     .entries
                     .write(&mut batch, &self.sek, &self.channel_id)?;
@@ -3862,7 +3863,7 @@ impl ChannelState {
             SEG_KNOWN_MEMBERS,
             &known_members_bytes(&self.known_members),
         )?;
-        if let Err(e) = store.put_segment(
+        if let Err(e) = store.put_segment_derived(
             &self.channel_id,
             SegmentKind::KeyMaterial,
             SEG_KNOWN_MEMBERS,
@@ -4049,7 +4050,7 @@ impl ChannelState {
             SEG_ORIGINS,
             &self.origins.to_state(),
         )?;
-        if let Err(e) = store.put_segment(
+        if let Err(e) = store.put_segment_derived(
             &self.channel_id,
             SegmentKind::KeyMaterial,
             SEG_ORIGINS,
@@ -5379,6 +5380,7 @@ impl ChannelState {
     fn forget_settled_owed(&mut self, store: &Store) -> Result<()> {
         let result = (|| -> Result<()> {
             let mut batch = store.batch()?;
+            batch.derived();
             let mut writer = self
                 .entries
                 .write(&mut batch, &self.sek, &self.channel_id)?;
@@ -5751,6 +5753,7 @@ impl ChannelState {
         }
         let result = (|| -> Result<usize> {
             let mut batch = store.batch()?;
+            batch.derived();
             let mut index = self
                 .entries
                 .write(&mut batch, &self.sek, &self.channel_id)?;
@@ -5897,6 +5900,7 @@ impl ChannelState {
         let mut display_changed = false;
         let persisted = (|| -> Result<()> {
             let mut batch = store.batch()?;
+            batch.derived();
             for (hash, tracked) in &due {
                 let entry = self
                     .dag
@@ -6532,6 +6536,10 @@ impl ChannelState {
                 return Err(e);
             }
         };
+        // Received entries with the derived state that admits them (ADR-038 FX-30): committed
+        // without a flush, flushed before this node acknowledges holding them; a key package, a
+        // governance entry or a key written below says `ruled` and the batch is flushed.
+        batch.received();
         if let Some(request) = authorization {
             request.check_in(self, &batch)?;
         }
@@ -6643,6 +6651,7 @@ impl ChannelState {
                         EntryKind::Content | EntryKind::Governance => None,
                     };
                     if gov.is_some() {
+                        batch.ruled();
                         out.governance += 1;
                         return Ok(Ok(Vec::new()));
                     }
@@ -6650,6 +6659,7 @@ impl ChannelState {
                     // A key-package is queued for the actor to install, never rendered or aged as
                     // a message.
                     if crate::node::keypackage::KeyPackage::is_key_package(payload) {
+                        batch.ruled();
                         if key_package_for(&held, &self.me()) {
                             packages.push((author, id));
                         }
@@ -7551,6 +7561,7 @@ impl ChannelState {
         let mut expired: Vec<(Digest32, Tracked)> = Vec::new();
         let result = (|| -> Result<()> {
             let mut batch = store.batch()?;
+            batch.derived();
             rows =
                 self.backfill_into(&mut batch, author, &BTreeSet::new(), now_ms, &mut expired)?;
             // Even an unrendered page advances the durable work cursor. Do not discard it
@@ -7715,6 +7726,7 @@ impl ChannelState {
                 return Ok(Vec::new());
             }
             let mut batch = store.batch()?;
+            batch.derived();
             let rows =
                 self.drain_backfill_into(&mut batch, &BTreeSet::new(), now_ms, &mut expired)?;
             if self.chains_advanced {
@@ -7755,6 +7767,7 @@ impl ChannelState {
         let mut expired: Vec<(Digest32, Tracked)> = Vec::new();
         let persisted = (|| -> Result<Option<Rendered>> {
             let mut batch = store.batch()?;
+            batch.derived();
             let projection = self.render_content_into(
                 &mut batch,
                 author,
@@ -8027,6 +8040,7 @@ impl ChannelState {
         let shown = shown_now();
         let result = (|| -> Result<()> {
             let mut batch = store.batch()?;
+            batch.derived();
             let mut index = self
                 .entries
                 .write(&mut batch, &self.sek, &self.channel_id)?;
@@ -8081,6 +8095,8 @@ impl ChannelState {
 
     /// Queue the receiver chains, as they stand now, into `batch`.
     fn queue_receivers(&self, batch: &mut crate::node::store::Batch<'_>) -> Result<()> {
+        // Other members' sender keys and the drive keys: keys are flushed (ADR-038 FX-30).
+        batch.ruled();
         let receivers_seg = seal_segment(
             &self.sek,
             SegmentKind::KeyMaterial,
@@ -8275,6 +8291,17 @@ impl ChannelState {
         let persisted = (|| -> Result<()> {
             self.prepare_entry(store, &entry, kind, &key, now_ms)?;
             let mut batch = store.batch()?;
+            // A received entry (ADR-038 FX-30): flushed before this node acknowledges it, at
+            // once when it is consent, governance or a key package.
+            batch.received();
+            if gov.is_some()
+                || entry
+                    .payload
+                    .as_deref()
+                    .is_some_and(crate::node::keypackage::KeyPackage::is_key_package)
+            {
+                batch.ruled();
+            }
             if self.publish_entry_into(&mut batch, &entry)?.is_some() {
                 return Err(Error::Profile("remote entry produced local settlement"));
             }
@@ -8578,7 +8605,12 @@ impl ChannelState {
             SEG_HELD,
             &held_bytes(&self.held),
         ) {
-            let _ = store.put_segment(&self.channel_id, SegmentKind::KeyMaterial, SEG_HELD, &seg);
+            let _ = store.put_segment_derived(
+                &self.channel_id,
+                SegmentKind::KeyMaterial,
+                SEG_HELD,
+                &seg,
+            );
         }
     }
 
@@ -10104,6 +10136,7 @@ impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
                 };
             }
         };
+        batch.derived();
         if let Some(request) = self.legacy {
             if request.check_in(ch, &batch).is_err() {
                 // Expected cancellation before any DAG/index mutation is not room corruption.

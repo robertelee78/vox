@@ -533,8 +533,11 @@ fn authorize_in(batch: &Batch<'_>, context: &Context, binding: Binding) -> Resul
     }
     Ok(())
 }
-fn commit_context(batch: Batch<'_>, context: &Context) -> Result<()> {
+fn commit_context(mut batch: Batch<'_>, context: &Context) -> Result<()> {
     context.check()?;
+    // Provisional archive pages and the demand's staging are derived: the person's request is
+    // asked again if a crash loses them (ADR-038 FX-30).
+    batch.derived();
     batch.commit()?;
     context.check()
 }

@@ -148,6 +148,7 @@ async fn respond(
             Ok((status, None))
         }
         Query::Head(author) => {
+            source.flush_received_before_ack().await?;
             let receipt = author == source.peer;
             let found = source
                 .read(&job, 128 * 1024, move |room, store| {

@@ -1829,6 +1829,7 @@ impl ChannelState {
                 self.projection_state.through = None;
             }
             let mut batch = store.batch()?;
+            batch.derived();
             let mut writer = self
                 .entries
                 .write(&mut batch, &self.sek, &self.channel_id)?;

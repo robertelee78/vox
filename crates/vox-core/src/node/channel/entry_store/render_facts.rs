@@ -1174,6 +1174,7 @@ impl EntryIndex {
         channel: &Digest32,
     ) -> Result<bool> {
         let mut batch = store.batch()?;
+        batch.derived();
         let mut writer = self.write(&mut batch, sek, channel)?;
         if writer.directory.phase == Phase::Building {
             return Ok(true);
@@ -1339,6 +1340,7 @@ impl EntryIndex {
     ) -> Result<()> {
         loop {
             let mut batch = store.batch()?;
+            batch.derived();
             let mut writer = self.write(&mut batch, sek, channel)?;
             if writer.directory.render_ready {
                 break;
@@ -1382,6 +1384,7 @@ impl EntryIndex {
         // Prior-open rows were already visible on restart. Their old epoch derives a zero
         // shown time without rewriting either all cache bodies or all ranked leaves.
         let mut batch = store.batch()?;
+        batch.derived();
         let mut writer = self.write(&mut batch, sek, channel)?;
         writer.directory.render_epoch = writer
             .directory

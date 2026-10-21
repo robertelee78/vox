@@ -19686,6 +19686,25 @@ impl Node {
         self.offer_own_head(channel_id, own_hint, own_targets);
     }
 
+    /// Flush the store once, off the actor, if a received entry committed without a flush is
+    /// waiting for one (ADR-038 FX-30): called when a lane round completes. A round that
+    /// persisted only derived state, or nothing, costs no `F_FULLFSYNC` here. The inventory and
+    /// head answers this node serves flush for themselves before they speak, so a peer is never
+    /// told of an entry that is not on disk even while a round still runs.
+    fn flush_received_off_actor(&self) {
+        let Some(store) = self.profile.as_ref().map(Profile::store_handle) else {
+            return;
+        };
+        if !store.received_pending() {
+            return;
+        }
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = store.flush_if_received_pending() {
+                eprintln!("vox: the store could not flush received entries to disk: {e}");
+            }
+        });
+    }
+
     /// Record what lane rounds learned about how far each peer holds this node's own feed
     /// (ADR-028 R-6): the evidence that lets the settlement tick stop asking a peer that
     /// already holds the own head (ADR-038 FX-15).
@@ -20203,6 +20222,11 @@ impl Node {
             .unwrap_or_default();
         let mut report = StatusReport {
             now,
+            store: self
+                .profile
+                .as_ref()
+                .map(|p| p.store().counts())
+                .unwrap_or_default(),
             log_path: self.paths.account().log_file().display().to_string(),
             refusals: self.decisions.recent(
                 crate::node::decisions::REFUSALS_SHOWN,

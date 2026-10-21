@@ -363,6 +363,8 @@ impl ChannelState {
         &self,
         batch: &mut crate::node::store::Batch<'_>,
     ) -> Result<()> {
+        // Drive generations are keys: flushed (ADR-038 FX-30).
+        batch.ruled();
         for (hash, (author, generation)) in &self.private_sessions.observed_generations {
             if self
                 .entries
@@ -563,6 +565,7 @@ impl ChannelState {
             }
             bytes = bytes.saturating_add(size);
             let mut batch = store.batch()?;
+            batch.derived();
             private_index::observe_public(
                 &mut batch,
                 &self.sek,
@@ -621,6 +624,8 @@ impl ChannelState {
         let mut d = Decoder::new(rest);
         let mut done = done;
         let mut batch = store.batch()?;
+        // Imported Session controls are Session records: flushed (ADR-038 FX-30).
+        batch.ruled();
         for _ in 0..WORK_ROWS {
             if done == count as u64 {
                 break;
@@ -1048,6 +1053,7 @@ impl ChannelState {
                     if let Some(current) = self.private_at(store, id)? {
                         if current.row.is_none() {
                             let mut batch = store.batch()?;
+                            batch.derived();
                             batch.delete_segment(
                                 &self.channel_id,
                                 SegmentKind::PrivateSession,
@@ -1377,6 +1383,7 @@ impl ChannelState {
             &e.finish(),
         )?;
         let mut batch = store.batch()?;
+        batch.derived();
         if let Some(expected) = authority {
             if batch.get_meta_prefix::<{ crate::atrest::sek::NONCE_LEN }>(
                 crate::node::trust::TRUST_META_KEY,
@@ -1408,6 +1415,7 @@ impl ChannelState {
 
     fn save_private_progress(&self, store: &Store) -> Result<()> {
         let mut batch = store.batch()?;
+        batch.derived();
         self.queue_private_progress(&mut batch)?;
         batch.commit()
     }
@@ -1439,6 +1447,7 @@ impl ChannelState {
                 .checked_add(1)
                 .ok_or(Error::MalformedAtRest("private Session id exhausted"))?;
             let mut batch = store.batch()?;
+            batch.derived();
             private_index::put(&mut batch, &self.sek, &self.channel_id, id, &saved)?;
             self.private_sessions.next = self.private_sessions.next.max(next);
             self.private_sessions.restore_after = Some(id);
@@ -1496,6 +1505,7 @@ impl ChannelState {
             }
             let result = (|| {
                 let mut batch = store.batch()?;
+                batch.derived();
                 batch.delete_segment(&self.channel_id, SegmentKind::PrivateSession, id)?;
                 private_index::remove(&mut batch, &self.sek, &self.channel_id, id, &saved)?;
                 batch.commit()
@@ -1583,6 +1593,8 @@ impl ChannelState {
         let result = (|| {
             let segment = seal_segment(&self.sek, SegmentKind::PrivateSession, id, &saved.bytes())?;
             let mut batch = store.batch()?;
+            // A Session record is of the ruled set: flushed (ADR-038 FX-30).
+            batch.ruled();
             if let Some(expected) = authority {
                 if batch.get_meta_prefix::<{ crate::atrest::sek::NONCE_LEN }>(
                     crate::node::trust::TRUST_META_KEY,

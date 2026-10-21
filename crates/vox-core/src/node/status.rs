@@ -259,6 +259,9 @@ pub struct StatusReport {
     pub log_path: String,
     /// When this was taken, unix milliseconds.
     pub now: u64,
+    /// What this node's store committed since it opened, and how many of those commits were
+    /// flushed to disk (ADR-038 FX-30): over a quiet minute `flushes` does not move.
+    pub store: crate::node::store::StoreCounts,
     /// The node's most recent refusals, newest first, from its decision record (ADR-028 D-3).
     pub refusals: Vec<crate::node::decisions::Event>,
     /// How many seconds a keyring change still goes without the identity passphrase, or `None`
@@ -498,6 +501,11 @@ impl StatusReport {
             )
         });
         let _ = write!(j, "\"preparing\":[{}],", list(preparing));
+        let _ = write!(
+            j,
+            "\"store\":{{\"commits\":{},\"flushes\":{}}},",
+            self.store.commits, self.store.flushes
+        );
         let refusals = self.refusals.iter().map(|e| {
             serde_json::json!({
                 "at_ms": e.at_ms,

@@ -225,6 +225,9 @@ impl ChannelState {
             return Err(self.save_failure());
         }
         let mut batch = store.batch()?;
+        // The lane's writes are derived: heads, headers, contexts, cursors, receipts, windows,
+        // rebuilt from the proofs and the peers after a crash (ADR-038 FX-30).
+        batch.derived();
         let mut index = self
             .entries
             .write(&mut batch, &self.sek, &self.channel_id)?;
@@ -504,6 +507,9 @@ impl ChannelState {
         let late = read.child_after(&hash, None)?.is_some();
         drop(read);
         let mut batch = store.batch()?;
+        // Received source entries, promoted (ADR-038 FX-30): flushed before this node
+        // acknowledges them; their semantic effects follow in `advance_history_effect`.
+        batch.received();
         on_publish(&mut batch)?;
         let mut index = self
             .entries
@@ -580,6 +586,7 @@ impl ChannelState {
             return Ok((false, after));
         }
         let mut batch = store.batch()?;
+        batch.derived();
         let mut index = self
             .entries
             .write(&mut batch, &self.sek, &self.channel_id)?;
@@ -781,6 +788,9 @@ impl ChannelState {
         // A changed grant is an ordinary cancellation before projection/index mutation.
         // The held Batch serializes trust writes through the final publication.
         check_binding(&batch)?;
+        // A received entry's effect (ADR-038 FX-30): flushed before this node acknowledges it;
+        // governance and key packages say `ruled` below and are flushed at once.
+        batch.received();
         let applied = (|| -> Result<(bool, bool, bool, bool)> {
             let finished = FinishedHistoryEffect { hash: *hash };
             let mut index = self
@@ -799,7 +809,11 @@ impl ChannelState {
                 kind,
                 SignedEntryKind::Governance | SignedEntryKind::StepPolicy
             ) {
+                batch.ruled();
                 self.observe_governance_into(store, &mut batch, &entry, log)?;
+            }
+            if kind == SignedEntryKind::KeyPackage {
+                batch.ruled();
             }
             let mut expired = Vec::new();
             let mut rows = Vec::new();
@@ -898,6 +912,7 @@ impl ChannelState {
             return Ok(false);
         }
         let mut batch = store.batch()?;
+        batch.derived();
         let mut index = self
             .entries
             .write(&mut batch, &self.sek, &self.channel_id)?;
@@ -978,6 +993,15 @@ impl ChannelState {
         // A changed grant is an ordinary cancellation before projection/index mutation.
         // The held Batch serializes trust writes through the final publication.
         check_binding(&batch)?;
+        // A received body (ADR-038 FX-30): flushed before this node acknowledges it, at once
+        // when it is a key package or governance.
+        batch.received();
+        if matches!(
+            kind,
+            SignedEntryKind::Governance | SignedEntryKind::StepPolicy | SignedEntryKind::KeyPackage
+        ) {
+            batch.ruled();
+        }
         let applied = (|| -> Result<HistoryEffectProgress> {
             let mut index = self
                 .entries

@@ -344,6 +344,7 @@ impl ChannelState {
                     .is_some();
                 if published {
                     let mut batch = store.batch()?;
+                    batch.derived();
                     private_index::observe_public(
                         &mut batch,
                         &self.sek,
@@ -376,6 +377,7 @@ impl ChannelState {
             };
             if published {
                 let mut batch = store.batch()?;
+                batch.derived();
                 let withheld = self.filter_received_session_body_into(&mut batch, &mut entry)?;
                 if withheld || self.legacy_sessions.dirty() {
                     batch.commit()?;

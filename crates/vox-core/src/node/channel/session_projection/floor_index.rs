@@ -276,6 +276,7 @@ pub(in crate::node::channel) fn continuity_step(
     membership: u64,
 ) -> Result<Option<Option<(Generation, Generation)>>> {
     let mut batch = store.batch()?;
+    batch.derived();
     let mut index = Write::open(&mut batch, sek, room)?;
     let state = index
         .find(Tree::FloorAuthors, &author_key(author))?
@@ -418,6 +419,7 @@ pub(in crate::node::channel) fn first_sequence(
         e.uint(seq);
     }
     let mut batch = store.batch()?;
+    batch.derived();
     let mut index = Write::open(&mut batch, sek, room)?;
     replace(&mut index, Tree::FloorFirst, key, &e.finish())?;
     index.seal()?;
