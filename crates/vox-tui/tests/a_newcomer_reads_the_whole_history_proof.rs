@@ -465,6 +465,7 @@ fn wait_for_held_rows(dir: &Path, room: &str, expected_hashes: &[String], hold: 
 /// became readable once each in source order.
 fn assert_exact_read_rows(
     dir: &Path,
+    reader: &str,
     room: &str,
     expected_hashes: &[String],
     expected_texts: &[String],
@@ -476,6 +477,7 @@ fn assert_exact_read_rows(
         .zip(expected_texts.iter().cloned().map(Some))
         .collect();
     let deadline = Instant::now() + BOUND;
+    let mut work_seen = false;
     loop {
         let rows = room_rows(dir, room);
         let actual: Vec<(String, Option<String>)> = rows
@@ -491,11 +493,22 @@ fn assert_exact_read_rows(
         if actual == expected {
             return;
         }
+        let status = room_status(dir, reader, room);
+        if work_seen && !status.render_backfill_pending {
+            panic!(
+                "PRODUCT: after {ordering}, Bob's causally engaged render continuation finished \
+                 without showing each exact retained object once, readable, and in source order \
+                 in room {room}; expected: {expected:?}; actual: {actual:?}; all rows: {rows:?}; \
+                 final status: {status:?}"
+            );
+        }
+        work_seen |= status.render_backfill_pending;
         assert!(
             Instant::now() < deadline,
-            "PRODUCT: within {BOUND:?} after {ordering}, Bob's paged `vox room read --json` did \
-             not show each exact retained object once, readable, and in source order in room \
-             {room}; expected: {expected:?}; actual: {actual:?}; all rows: {rows:?}"
+            "APPARATUS: within the journey watchdog {BOUND:?} after {ordering}, the shipped \
+             status never exposed a causally engaged render continuation and the exact retained \
+             rows did not become observable in room {room}; expected: {expected:?}; actual: \
+             {actual:?}; all rows: {rows:?}; last status: {status:?}"
         );
         std::thread::yield_now();
     }
@@ -506,11 +519,13 @@ fn assert_exact_read_rows(
 /// after the long queue drains cannot prove that the competing author received a turn.
 fn wait_for_competing_author_turn(
     dir: &Path,
+    reader: &str,
     room: &str,
     long_hashes: &[String],
     competing_hash: &str,
 ) {
     let deadline = Instant::now() + BOUND;
+    let mut work_seen = false;
     loop {
         let rows = room_rows(dir, room);
         let readable_long = rows
@@ -541,11 +556,21 @@ fn wait_for_competing_author_turn(
              room {room}; all rows: {rows:?}",
             long_hashes.len()
         );
+        let status = room_status(dir, reader, room);
+        if work_seen && !status.render_backfill_pending {
+            panic!(
+                "PRODUCT: the causally engaged render continuation finished before the \
+                 competing author's exact retained row {competing_hash} became readable in \
+                 room {room}; all rows: {rows:?}; final status: {status:?}"
+            );
+        }
+        work_seen |= status.render_backfill_pending;
         assert!(
             Instant::now() < deadline,
-            "PRODUCT: within {BOUND:?}, the competing author's exact retained row \
-             {competing_hash} never became readable during the long author's bounded \
-             continuation in room {room}; all rows: {rows:?}"
+            "APPARATUS: within the journey watchdog {BOUND:?}, the shipped status never exposed \
+             the causally engaged continuation and the competing author's exact retained row \
+             {competing_hash} did not become observable in room {room}; all rows: {rows:?}; \
+             last status: {status:?}"
         );
         std::thread::yield_now();
     }
@@ -728,7 +753,7 @@ fn wait_governance_current(dir: &Path, reader: &str, room: &str, claim: &str) {
         );
         assert!(
             Instant::now() < deadline,
-            "PRODUCT: within {BOUND:?}, {claim}; {reader}'s authority-dependent page for \
+            "APPARATUS: within the journey watchdog {BOUND:?}, {claim}; {reader}'s authority-dependent page for \
              {room} remained refreshing: {out}{err}"
         );
         std::thread::yield_now();
@@ -758,10 +783,10 @@ fn wait_room_status(
         }
         assert!(
             Instant::now() < deadline,
-            "PRODUCT: within {BOUND:?}, {claim}; {reader}'s last shipped room status for \
+            "APPARATUS: within the journey watchdog {BOUND:?}, {claim}; {reader}'s last shipped room status for \
              {room} was {status:?}"
         );
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::yield_now();
     }
 }
 
@@ -1071,9 +1096,11 @@ const IDLE_STATUS_PACE: Duration = Duration::from_secs(1);
 /// sequence one, turns the parked-state CPU verdict red. Letting a held key bypass consent turns
 /// the key-before-consent privacy verdict red. Losing a bounded continuation, dropping a
 /// competing author's cursor, disabling either fact-triggered wake, retaining consent across a
-/// revocation, suppressing the exact authority-expiry wake, returning rename success without its
-/// named authenticated row, or substituting an equal-text/different-hash row each turns its own
-/// exact user-visible assertion red.
+/// revocation, leaving either the durable Consent locator or live RAM sequence at grant₁ when an
+/// equal grant₂ arrives, spuriously revising that equal grant, suppressing the exact
+/// authority-expiry wake, returning rename success without its named authenticated row, or
+/// substituting an equal-text/different-hash row each turns its own exact user-visible assertion
+/// red.
 fn key_before_consent_survives_a_restart(root: &Path) {
     let alice = root.join("alice");
     let bob = root.join("bob");
@@ -1222,6 +1249,7 @@ fn key_before_consent_survives_a_restart(root: &Path) {
     wait_trust_detail(&bob, "bob", &room, "alice", "you trust each other");
     assert_exact_read_rows(
         &bob,
+        "bob",
         &room,
         &hashes,
         &expected,
@@ -1541,7 +1569,7 @@ fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
     // Bob now receives Alice's consent and the sealed package row, but the package marker keeps
     // the shipped daemon from opening it. Doctor says consent is mutual while status still says
     // zero received generations: the second hold is visibly engaged.
-    let _bob_daemon = daemon_env(&bob, "bob", &package_knob);
+    let mut bob_daemon = daemon_env(&bob, "bob", &package_knob);
     attached(&bob, "bob");
     for (i, room) in rooms.iter().enumerate() {
         wait_trust_detail(&bob, "bob", room, "alice", "you trust each other");
@@ -1571,8 +1599,11 @@ fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
     carol_daemon.stop();
     std::fs::remove_file(&package_hold)
         .unwrap_or_else(|error| panic!("APPARATUS: could not release the package hold: {error}"));
-    wait_for_competing_author_turn(&bob, &rooms[0], &late_hashes[0], &competing_hashes[0][0]);
-    for (index, room) in rooms.iter().enumerate() {
+    // Every author is causally runnable before the fairness read begins. Otherwise Alice's long
+    // continuation could legitimately finish while Carol still lacked a sender key and the
+    // proof would blame the product for apparatus ordering.
+    let mut ready_rooms = Vec::with_capacity(rooms.len());
+    for room in &rooms {
         let ready = wait_room_status(
             &bob,
             "bob",
@@ -1581,11 +1612,23 @@ fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
             "Bob never accepted both retained authors' sender keys",
             |status| status.received_key_generations >= 2,
         );
+        ready_rooms.push(ready);
+    }
+    wait_for_competing_author_turn(
+        &bob,
+        "bob",
+        &rooms[0],
+        &late_hashes[0],
+        &competing_hashes[0][0],
+    );
+    for (index, room) in rooms.iter().enumerate() {
+        let ready = ready_rooms[index];
         let expected_before: Vec<String> = (0..BEFORE_KEY)
             .map(|row| format!("alice before key room {} row {row}", index + 1))
             .collect();
         assert_exact_read_rows(
             &bob,
+            "bob",
             room,
             &late_hashes[index],
             &expected_before,
@@ -1593,6 +1636,7 @@ fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
         );
         assert_exact_read_rows(
             &bob,
+            "bob",
             room,
             &competing_hashes[index],
             &competing_texts[index],
@@ -1642,7 +1686,7 @@ fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
     );
     std::fs::remove_file(&render_hold)
         .unwrap_or_else(|error| panic!("APPARATUS: could not release render hold: {error}"));
-    let _alice_daemon = daemon_env(&alice, "alice", &fold_knob);
+    let mut alice_restarted = daemon_env(&alice, "alice", &fold_knob);
     attached(&alice, "alice");
 
     // A same-value authenticated action exists in the immutable room order but is not a new
@@ -1671,6 +1715,155 @@ fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
          meaning unchanged: before {semantic_before:?}, after {semantic_after:?}",
         rooms[0]
     );
+
+    // The original Alice→Bob grant is already user-visible and its sender key is held. Take Bob
+    // offline, then drive one source-owned sender-generation bound through the shipped post
+    // command. The rotation appends an authenticated Presence reset between the original grant
+    // and Alice's automatic, equal grant to every still-trusted reader. Bob's sparse catch-up
+    // admits the newest control fact before filling the older reset, which is the reachable
+    // grant₁ → reset → identical grant₂ → late-reset order: sequence, not arrival, must win.
+    let repeated_before = room_status(&bob, "bob", &rooms[0]);
+    assert_eq!(
+        trust_detail(&bob, "bob", &rooms[0], "alice"),
+        "you trust each other",
+        "APPARATUS: the first Alice→Bob grant was not visibly effective before staging the \
+         repeated-grant sequence"
+    );
+    bob_daemon.stop();
+    let mut last_rotated = None;
+    for row in 0..vox_core::group::ROTATE_AFTER_MESSAGES {
+        let text = format!("Alice rotation proof row {row}");
+        let (ok, out, err) = vox(
+            &alice,
+            &["room", "post", &rooms[0], "--json", "-"],
+            Some(&text),
+        );
+        assert!(
+            ok,
+            "PRODUCT: Alice's shipped post {row} of the source-owned sender-generation bound \
+             was refused: {out}{err}"
+        );
+        if row + 1 == vox_core::group::ROTATE_AFTER_MESSAGES {
+            let posted: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|error| {
+                panic!(
+                    "PRODUCT: Alice's final rotation-bound post answer was malformed ({error}): \
+                     {out}"
+                )
+            });
+            last_rotated = Some((
+                posted["entry_hash"]
+                    .as_str()
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "PRODUCT: the final rotation-bound post named no entry_hash: {posted}"
+                        )
+                    })
+                    .to_owned(),
+                text,
+            ));
+        }
+    }
+    let (last_rotated_hash, last_rotated_text) = last_rotated
+        .unwrap_or_else(|| panic!("APPARATUS: the source-owned rotation bound was empty"));
+    // `trust add` is idempotent as a human decision, but the shipped command completes only
+    // after it has applied that decision to every open room and retried the retained key release.
+    // This is the causal boundary that keeps Bob offline until grant₂ is durable; no sleep or
+    // guessed count of governance rows stands in for it.
+    let (ok, out, err) = vox(&alice, &["trust", "add", &fps[1], "--name", "bob"], None);
+    assert!(
+        ok,
+        "PRODUCT: Alice's idempotent shipped trust decision did not finish the rotated \
+         generation's retained grant while Bob was offline: {out}{err}"
+    );
+    let repeated_source_hashes = room_hashes(&alice, "alice", &rooms[0]);
+    bob_daemon = daemon_env(&bob, "bob-repeated-grant", &package_knob);
+    attached(&bob, "bob-repeated-grant");
+    let repeated_key_ready = wait_room_status(
+        &bob,
+        "bob",
+        &rooms[0],
+        false,
+        "Bob never accepted Alice's rotated sender generation and repeated grant",
+        |status| status.received_key_generations > repeated_before.received_key_generations,
+    );
+    let feed_watchdog = Instant::now() + BOUND;
+    loop {
+        let held = room_hashes(&bob, "bob", &rooms[0]);
+        if repeated_source_hashes.is_subset(&held) {
+            break;
+        }
+        let missing: Vec<_> = repeated_source_hashes.difference(&held).cloned().collect();
+        assert!(
+            Instant::now() < feed_watchdog,
+            "APPARATUS: within the journey watchdog {BOUND:?}, Bob never retained Alice's exact \
+             authenticated interval containing grant1, reset and grant2; missing hashes: \
+             {missing:?}"
+        );
+        std::thread::yield_now();
+    }
+    wait_governance_current(
+        &bob,
+        "bob",
+        &rooms[0],
+        "the equal repeated grant and late reset never completed their bounded governance fold",
+    );
+    assert_eq!(
+        trust_detail(&bob, "bob", &rooms[0], "alice"),
+        "you trust each other",
+        "PRODUCT: after the equal repeated grant and late reset completed, Bob no longer saw \
+         Alice's newer grant as effective"
+    );
+    let repeated_live = room_status(&bob, "bob", &rooms[0]);
+    assert_eq!(
+        repeated_live.governance_revision, repeated_before.governance_revision,
+        "PRODUCT: Alice's equal repeated grant invented a displayed governance revision after \
+         the intervening reset: before {repeated_before:?}, after {repeated_live:?}"
+    );
+    assert!(
+        repeated_live.received_key_generations > repeated_before.received_key_generations,
+        "PRODUCT: Bob lost Alice's causally observed rotated generation after the equal grant \
+         completed: ready {repeated_key_ready:?}, final {repeated_live:?}"
+    );
+    assert_exact_read_rows(
+        &bob,
+        "bob",
+        &rooms[0],
+        std::slice::from_ref(&last_rotated_hash),
+        std::slice::from_ref(&last_rotated_text),
+        "the newer equal grant and late older reset reached Bob",
+    );
+
+    // Restart with Alice unavailable. The same exact retained object still reading proves the
+    // durable Consent locator advanced to grant₂; the pre-restart observation above proves the
+    // live RAM sequence also rejected the late, older reset.
+    alice_restarted.stop();
+    bob_daemon.stop();
+    bob_daemon = daemon_env(&bob, "bob-repeated-grant-restarted", &package_knob);
+    attached(&bob, "bob-repeated-grant-restarted");
+    wait_governance_current(
+        &bob,
+        "bob",
+        &rooms[0],
+        "Bob's durable governance projection never completed after restart",
+    );
+    assert_eq!(
+        trust_detail(&bob, "bob", &rooms[0], "alice"),
+        "you trust each other",
+        "PRODUCT: after Bob's durable governance projection completed on restart, the older \
+         reset revoked Alice's newer equal grant"
+    );
+    assert_exact_read_rows(
+        &bob,
+        "bob",
+        &rooms[0],
+        std::slice::from_ref(&last_rotated_hash),
+        std::slice::from_ref(&last_rotated_text),
+        "Bob restarted with Alice unavailable after the equal-grant sequence",
+    );
+    alice_restarted = daemon_env(&alice, "alice-after-repeated-grant", &fold_knob);
+    attached(&alice, "alice-after-repeated-grant");
+    // Keep both shipped daemons alive for the remaining user journey.
+    let _running_after_repeated_grant = (&alice_restarted, &bob_daemon);
 
     // The test-only certificate lifetime is owned by the product source; the proof does not
     // invent a delay or use unrelated traffic as the trigger. The shipped admin page first
