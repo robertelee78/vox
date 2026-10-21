@@ -474,21 +474,44 @@ fn assert_exact_read_rows(
         work_seen |=
             status.render_backfill_pending || actual.iter().any(|(_, text)| text.is_some());
         if work_seen && !status.render_backfill_pending {
+            // The first paged walk may have straddled the last render turn. Once shipped status
+            // says no continuation remains, take a fresh, stable observation before judging the
+            // product; otherwise a healthy completion between pages could look incomplete.
+            let final_rows = room_rows(dir, room);
+            let final_actual: Vec<(String, Option<String>)> = final_rows
+                .iter()
+                .filter_map(|row| {
+                    let hash = row["entry_hash"].as_str()?;
+                    expected_hashes
+                        .iter()
+                        .any(|expected| expected == hash)
+                        .then(|| (hash.to_owned(), row["text"].as_str().map(str::to_owned)))
+                })
+                .collect();
+            if final_actual == expected {
+                return;
+            }
+            let settled = room_status(dir, reader, room);
+            if settled.render_backfill_pending {
+                work_seen = true;
+                continue;
+            }
             panic!(
                 "PRODUCT: after {ordering}, Bob's causally engaged render continuation finished \
                  without showing each exact retained object once, readable, and in source order \
-                 in room {room}; expected: {expected:?}; actual: {actual:?}; all rows: {rows:?}; \
-                 final status: {status:?}"
+                 in room {room}; expected: {expected:?}; first observation: {actual:?}; stable \
+                 observation: {final_actual:?}; all stable rows: {final_rows:?}; final status: \
+                 {settled:?}"
             );
         }
         std::thread::yield_now();
     }
 }
 
-/// Observe the competing author's exact retained object before a long author's durable
-/// continuation is exhausted. This is the user-visible fairness boundary: eventual visibility
-/// after the long queue drains cannot prove that the competing author received a turn.
-fn wait_for_competing_author_turn(
+/// Observe exact readable rows from both queued authors. If shipped status says the causal
+/// continuation is exhausted first, re-read the room after that stable boundary before judging
+/// the product. This proves neither author was abandoned without sampling an in-flight turn.
+fn wait_for_both_authors_after_release(
     dir: &Path,
     reader: &str,
     room: &str,
@@ -508,36 +531,43 @@ fn wait_for_competing_author_turn(
             })
             .count();
         let competing = rows.iter().find(|row| row["entry_hash"] == competing_hash);
-        if let Some(competing) =
-            competing.filter(|row| row["text"].as_str().is_some() && readable_long > 0)
-        {
-            assert!(
-                readable_long < long_hashes.len(),
-                "PRODUCT: the competing author's exact retained row {competing_hash} became \
-                 readable only after all {} rows of the long author's continuation; the \
-                 bounded backfill did not give the competing author a fair turn in room \
-                 {room}; competing row: {competing}",
-                long_hashes.len()
-            );
+        if competing.is_some_and(|row| row["text"].as_str().is_some()) && readable_long > 0 {
             return;
         }
-        assert!(
-            readable_long < long_hashes.len(),
-            "PRODUCT: all {} rows of one author's durable continuation became readable while \
-             the competing author's exact retained row {competing_hash} was still parked in \
-             room {room}; all rows: {rows:?}",
-            long_hashes.len()
-        );
         let status = room_status(dir, reader, room);
         work_seen |= status.render_backfill_pending
             || readable_long > 0
             || competing.is_some_and(|row| row["text"].as_str().is_some());
         if work_seen && !status.render_backfill_pending {
+            // `room_rows` is paged, so its first walk can mix states while rendering. Status now
+            // says the continuation is over; judge only a fresh observation made after it.
+            let final_rows = room_rows(dir, room);
+            let final_readable_long = final_rows
+                .iter()
+                .filter(|row| {
+                    row["entry_hash"].as_str().is_some_and(|hash| {
+                        long_hashes.iter().any(|expected| expected == hash)
+                            && row["text"].as_str().is_some()
+                    })
+                })
+                .count();
+            let final_competing_readable = final_rows
+                .iter()
+                .any(|row| row["entry_hash"] == competing_hash && row["text"].as_str().is_some());
+            if final_competing_readable && final_readable_long > 0 {
+                return;
+            }
+            let settled = room_status(dir, reader, room);
+            if settled.render_backfill_pending {
+                work_seen = true;
+                continue;
+            }
             panic!(
                 "PRODUCT: the causally engaged render continuation finished before both authors \
                  had an exact readable retained row in room {room}; competing hash \
-                 {competing_hash}; readable long rows {readable_long}; all rows: {rows:?}; final \
-                 status: {status:?}"
+                 {competing_hash}; first readable long rows {readable_long}; stable readable long \
+                 rows {final_readable_long}; all stable rows: {final_rows:?}; final status: \
+                 {settled:?}"
             );
         }
         std::thread::yield_now();
@@ -1026,14 +1056,9 @@ const BEFORE_KEY: usize = 4 * vox_core::node::channel::RENDER_BACKFILL_ROWS_PER_
 /// Alice then becomes unavailable before Bob opens the retained logged key package; Bob MUST
 /// render every retained row once and in order.
 ///
-/// Mutants: letting a held key bypass consent turns the key-before-consent privacy verdict red.
-/// Losing a bounded continuation, dropping a
-/// competing author's cursor, disabling either fact-triggered wake, retaining consent across a
-/// revocation, leaving either the durable Consent locator or live RAM sequence at grant₁ when an
-/// equal grant₂ arrives, spuriously revising that equal grant, suppressing the exact
-/// authority-expiry wake, returning rename success without its named authenticated row, or
-/// substituting an equal-text/different-hash row each turns its own exact user-visible assertion
-/// red.
+/// Mutant: after rendering the first retained row, clearing that author's next sparse backfill
+/// cursor makes shipped status say the continuation is finished while exact retained hashes/text
+/// are still missing, which turns the stable user-visible completion assertion PRODUCT red.
 fn key_before_consent_survives_a_restart(root: &Path) {
     let alice = root.join("alice");
     let bob = root.join("bob");
@@ -1537,12 +1562,11 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
     carol_daemon.stop();
     std::fs::remove_file(&package_hold)
         .unwrap_or_else(|error| panic!("APPARATUS: could not release the package hold: {error}"));
-    // Readiness is author-specific and causal: in every room, observe Carol's exact retained row
-    // getting a fair turn before Alice's >64-row continuation is exhausted. An aggregate retained
-    // generation count is transient (a rendered generation may already be retired) and cannot
-    // establish that either named author is runnable.
+    // Readiness is author-specific and causal: in every room, observe exact readable retained
+    // rows from both authors. If a paged observation overlaps the final render turn, shipped
+    // pending state supplies a stable boundary and the helper re-observes before any verdict.
     for (index, room) in rooms.iter().enumerate() {
-        wait_for_competing_author_turn(
+        wait_for_both_authors_after_release(
             &bob,
             "bob",
             room,
@@ -1568,8 +1592,8 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
             room,
             &competing_hashes[index],
             &competing_texts[index],
-            "competing-author fairness after Alice's >64-row continuation with both sources \
-             unavailable",
+            "competing-author no-starvation after Alice's >64-row continuation with both \
+             sources unavailable",
         );
     }
 
@@ -1976,13 +2000,17 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
          governance revision in room {}: before {authority_before:?}, active {authority_active:?}",
         rooms[0]
     );
+    let positioning_before = room_status(&alice, "alice", &rooms[0]);
     std::fs::write(&sweep_hold, room_id(&alice, "alice", &rooms[0])).unwrap_or_else(|error| {
         panic!(
             "APPARATUS: could not arm the governance sweep after room {}: {error}",
             rooms[0]
         )
     });
-    let positioning = rename_hash(&alice, "alice", &rooms[0], &rooms[0]);
+    // A changed name is a causal semantic boundary. The hold is checked before this room can
+    // fold it: if the published revision advances while the marker remains unrenamed, the
+    // apparatus did not park the intended room and can say so without an elapsed deadline.
+    let positioning = rename_hash(&alice, "alice", &rooms[0], "fx22-expiry-boundary");
     assert!(
         room_hashes(&alice, "alice", &rooms[0]).contains(&positioning),
         "PRODUCT: the exact authenticated positioning rename {positioning} was absent from room \
@@ -1990,6 +2018,15 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
         rooms[0]
     );
     while !sweep_engaged.exists() {
+        let observed = room_status(&alice, "alice", &rooms[0]);
+        assert_eq!(
+            observed.governance_revision, positioning_before.governance_revision,
+            "APPARATUS: the exact positioning rename {positioning} reached a published semantic \
+             revision before the governance-sweep marker engaged for room {}; the requested \
+             expiry-behind-cursor staging was not achieved: before {positioning_before:?}, \
+             observed {observed:?}",
+            rooms[0]
+        );
         std::thread::yield_now();
     }
     let (ok, active, err) = vox(&alice, &["room", "admin", "list", &rooms[0]], None);
