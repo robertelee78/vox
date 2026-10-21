@@ -275,6 +275,25 @@ The decider then answered twelve questions, one at a time. His answers are the d
   `record_application()`, which derives again; a further 6–8% was the app's polling re-deriving
   the same state per control answer (`individual_trust_eligibility` → `Computer::capability` →
   `Binding::verify`). Four nodes, nothing changed.
+  Deadline contract and RCA, 2026-10-21: an early FX-28 repair converted its local monotonic
+  deadline to Unix milliseconds and the answering daemon subtracted its own Unix clock. Those
+  clocks need not agree: a receiver ahead could expire valid work immediately, while one behind
+  could extend it. A causal deadline is therefore never transported as an absolute time. The
+  initiating daemon owns and enforces its original monotonic `Instant` through dial, exchange and
+  local reconciliation. Its hello carries only the duration budget remaining when the hello is
+  sent. The answerer caps that duration to the operation's public contract and applies it to its
+  own monotonic clock; this bounds remote transaction and reconciliation work without claiming to
+  reconstruct the initiator's instant. Network transit continues to consume the initiator's
+  original deadline, so a late answer cannot turn its miss into an on-time result. A missed bound
+  is still repaired, but never reported as having met the bound. The shipped journey restarts one
+  daemon with its Unix clock one hour ahead and then proves changes in both directions. A recovery
+  proof evaluates no PRODUCT timing verdict until it has causal apparatus evidence of reachability
+  (both anchor registrations, or a round trip through the exact userspace forward); failure to
+  establish that precondition is APPARATUS/NO RESULT, never a PRODUCT retry verdict. The retained
+  local deadline still measures the real restoration event. Absence of idle derivation is compared across
+  the next dated, completed fallback exchange named by shipped status, not an arbitrary quiet
+  window: the unchanged revision is a structural cause boundary and every binding's durable
+  derivation record must remain identical across it.
 - **FX-29.** A sync round that brings this node nothing (no entry, header, proof or key it did
   not already hold) MUST write nothing: over a quiet minute a member's store MUST gain no
   commit at all from its rounds. Decision: a hint this node holds (its committed head, its

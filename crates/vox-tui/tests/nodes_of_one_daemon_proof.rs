@@ -40,6 +40,10 @@ use vox_core::node::computer::{
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 const PASS: &str = "identity passphrase";
 const ROOM_PASS: &str = "room passphrase for the daemon proof";
+/// Deliberately larger than both the one-minute return contract and ten-minute pairing command.
+/// A receiver that reconstructs a sender deadline from Unix time expires immediately under this
+/// skew; duration-budget transport remains governed by each daemon's monotonic clock.
+const REMOTE_CLOCK_SKEW_MS: &str = "3600000";
 
 /// One account: a data root and a config directory, short enough for a socket path.
 struct Account {
@@ -1659,8 +1663,22 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
     );
 
     // No local command, daemon restart or network transition follows: the anchor process alone
-    // returns. Failed registration is durable work and must cause its own retry.
+    // returns. First establish the apparatus precondition from the restarted anchor's own
+    // event-driven connection view: both daemons have registered there. Starting a listener is
+    // not evidence that either registration completed. A broken/late anchor never reaches a
+    // PRODUCT verdict; the suite watchdog, when an operator enables it, names NO RESULT.
     relay = start_anchor(&anchor_listen);
+    relay.expect_apparatus_event(
+        "both computer daemons registered at the restored anchor",
+        |line| line.contains("2 peer(s) connected"),
+    );
+    assert!(
+        Instant::now() < first_deadline,
+        "APPARATUS: both computer daemons registered at the restored anchor only after the first revision's causal deadline; the recovery precondition was staged too late: {}",
+        relay.said()
+    );
+    // Failed registration is durable work and must cause its own retry. Only now that the anchor
+    // says both endpoints are registered may a miss of the retained local deadline name PRODUCT.
     let takeover_finished = wait_until(
         first_deadline.saturating_duration_since(Instant::now()),
         || takeover.try_wait().is_ok_and(|status| status.is_some()),
@@ -2949,13 +2967,6 @@ fn enrolled_computers_follow_node_changes_and_retire_removed_authority() {
     eprintln!("[proof] #801/#802 changed roster, personal drive, removal, transfer, recovery and deliberate re-enrollment outcomes passed");
 }
 
-/// How long two paired computers sit idle while their exchanges are counted.
-const PAIRED_IDLE: Duration = Duration::from_secs(60);
-/// Exchanges a computer may run with a peer over [`PAIRED_IDLE`] when nothing changed: the
-/// fallback one (every 60 s) and the one that may straddle the window's start.
-const IDLE_EXCHANGES: u64 = 1;
-/// How often the idle minute samples each side's status for a new dated exchange.
-const SAMPLE_EVERY: Duration = Duration::from_secs(5);
 /// **Two paired computers follow each other's changes and are idle otherwise** (ADR-038 FX-15,
 /// FX-28; #989, #1020): alpha and beta, two data roots with a daemon each, pair as computers
 /// (`vox computer invite`, `pair --preview`, `approve` on both) and both report `confirmed`.
@@ -2971,32 +2982,35 @@ const SAMPLE_EVERY: Duration = Duration::from_secs(5);
 /// other again each time.
 ///
 /// A restart derives nothing: beta's daemon is stopped and started again on the same port with
-/// nothing changed, and every binding there shows the same policy revision and the same derived
-/// moment as before.
+/// nothing changed and its Unix clock one hour ahead. Every binding there shows the same policy
+/// revision and the same derived moment as before; later cross-daemon changes still converge, so
+/// neither daemon reconstructs a deadline from the other's wall clock.
 ///
 /// A change made while the computers' only userspace path is closed arrives when that path is
-/// opened, with both daemon PIDs alive throughout. Within [`RETURN_WITHIN`] of
-/// the open, after every final status and trust observation finishes, beta shows gamma personal,
-/// every binding current and every expected keyring grant, and both computers confirmed. The
-/// exported broader [`RETURN_WITHIN`] contract still names a peer that must reconnect.
+/// opened and its exact apparatus path proves a round trip, with both daemon PIDs alive
+/// throughout. Within [`RETURN_WITHIN`] of that causal restoration boundary, after every final
+/// status and trust observation finishes, beta shows gamma personal, every binding current and
+/// every expected keyring grant, and both computers confirmed. The exported broader
+/// [`RETURN_WITHIN`] contract still names a peer that must reconnect.
 ///
-/// Over [`PAIRED_IDLE`] of nothing changing, with four nodes hosted, each side's `vox computer
-/// status --json` MUST count at most [`IDLE_EXCHANGES`] more exchanges with the other and name
-/// when the last one was, every node's binding MUST stand derived at the current policy
-/// revision at the same moment as before the minute (nothing was derived again). Those shipped
-/// observations name the unnecessary work directly; a machine-dependent CPU cutoff is not a
-/// product verdict. Measured before this (2026-10-20, the decider's work Mac): the pairing manager
-/// exchanged the whole signed history with every computer every 2 s and re-verified it, and a 1 s
-/// tick re-derived every attached node's binding with nothing changed.
+/// With four nodes hosted and nothing changing, the proof waits for each side's shipped status to
+/// name its next completed, dated fallback exchange. Across that causal boundary it MUST count
+/// exactly that one attempt/exchange, no earlier round, and every node's binding MUST stand derived
+/// at the current policy revision at the same durable moment as before the unchanged-state
+/// exchange. There is no arbitrary quiet window: lack of the named boundary yields no result, and
+/// the status observations name unnecessary work directly. A machine-dependent CPU cutoff is not
+/// a product verdict. Measured before this (2026-10-20, the decider's work Mac): the pairing
+/// manager exchanged the whole signed history with every computer every 2 s and re-verified it,
+/// and a 1 s tick re-derived every attached node's binding with nothing changed.
 /// Finally, a test-only held actor message keeps delta queued for 15 s while epsilon attaches.
 /// Within [`CHANGE_SHOWN_WITHIN`], after all final observations finish, beta has applied epsilon
 /// on its healthy node and `vox node list` shows delta no longer attached. Cleanup may continue;
 /// queued room/node work cannot turn a late observation into an apparent pass.
 ///
-/// Independent mutants: (1) remove the need filter in `Management::retry`: the idle
-/// exchange-attempt count turns PRODUCT red (unchanged means no network); (2) remove the
-/// `computer_current` short circuit: the binding-derived moments turn PRODUCT red (unchanged
-/// means no re-derive); (3) discard the remote merge before publishing its change: the remote
+/// Independent mutants: (1) remove the need filter in `Management::retry`: extra attempts before
+/// the fallback boundary turn PRODUCT red (unchanged means no network); (2) remove the
+/// `computer_current` short circuit: the binding-derived moments move across that causal boundary
+/// and turn PRODUCT red (unchanged means no re-derive); (3) discard the remote merge before publishing its change: the remote
 /// roster/keyring claim turns PRODUCT red; (4) suppress the authenticated reachability wake:
 /// the saturated-backoff live heal misses [`RETURN_WITHIN`] and turns PRODUCT red; (5) give
 /// reconciliation a fresh timeout or delay `Detaching`: held delta remains Ready past
@@ -3011,6 +3025,7 @@ const SAMPLE_EVERY: Duration = Duration::from_secs(5);
 fn two_paired_computers_that_are_idle_exchange_nothing() {
     test_knobs::require(&[
         "VOX_TEST_ADVERTISE",
+        "VOX_TEST_CLOCK_STEP_MS",
         "VOX_TEST_HOLD_COMPUTER_POLICY",
         "VOX_TEST_HOLD_COMPUTER_POLICY_REPLY",
         "VOX_TEST_MARK_COMPUTER_STATUS_FILE",
@@ -3143,7 +3158,20 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    // ---- a change on either daemon shows on both (ADR-038 FX-28; #1020) ------------------
+    // ---- restart under skew before proving changes in both directions --------------------
+    let db = a_restart_derives_nothing(
+        (&a, &da),
+        (
+            &b,
+            db,
+            &[("beta", beta.as_str())],
+            &listen_b,
+            &hold_spec,
+            &reply_spec,
+        ),
+    );
+
+    // ---- a change on either daemon shows on both despite the clock skew (#1020) -----------
     let gamma = a.make_node("gamma");
     let nodes_a = [("alpha", alpha.as_str()), ("gamma", gamma.as_str())];
     change_shows_on_both(
@@ -3155,20 +3183,12 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
     let nodes_b = [("beta", beta.as_str()), ("delta", delta.as_str())];
     change_shows_on_both((&b, &db, &nodes_b), (&a, &da, &nodes_a), "delta");
 
-    // ---- a restart derives nothing: each binding's (revision, when) survives it -----------
-    let db = a_restart_derives_nothing(
-        (&a, &da),
-        (&b, db, &nodes_b, &listen_b, &hold_spec, &reply_spec),
-    );
-
     // ---- a stale reconciliation cannot detach a replacement attachment -------------------
     replacement_generation_survives((&a, &da), (&b, &db), &reply_marker);
 
     // ---- both live daemons converge when their userspace path is restored -----------------
     change_reaches_a_live_computer((&a, &da, &nodes_a), (&b, &db, &nodes_b), &forward);
 
-    // Let the confirmation's own exchanges settle before the idle minute is counted.
-    std::thread::sleep(Duration::from_secs(10));
     // What `vox computer status --json` shows: the sum of `exchanges` over the computers listed,
     // the latest `last_exchange_ms`, whether every one is confirmed, and the listing itself for a
     // red to quote.
@@ -3206,8 +3226,9 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
     };
     let (ea0, aa0, last_a0, _, shown_a0) = exchanges(&a);
     let (eb0, ab0, last_b0, _, shown_b0) = exchanges(&b);
-    // Every binding stands derived at the current policy revision before the minute, and the
-    // moment it was derived must not move during it: nothing is derived with nothing changed.
+    // Every binding stands derived at the current policy revision before the next structural
+    // boundary. Its moment must not move when the named fallback exchange carries the unchanged
+    // revision: derivation follows policy revision events, not elapsed time or network activity.
     let derived0 = (
         bindings_shown(&computer(&a, &["status"])),
         bindings_shown(&computer(&b, &["status"])),
@@ -3219,40 +3240,47 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
         for node in nodes {
             assert!(
                 shown.get(node).is_some_and(|(at, _)| *at == Some(*revision)),
-                "PRODUCT: before the idle minute {who}'s `vox computer status` does not show {node}'s \
+                "PRODUCT: before the quiet fallback boundary {who}'s `vox computer status` does not show {node}'s \
                  binding derived at its policy revision {revision} (ADR-038 FX-28): {shown:?}"
             );
         }
     }
-    // Every SAMPLE_EVERY, each side's dated last exchange: a new one must be at least the
-    // fallback after the one before it, or the round had no need the status names.
-    let mut dated: Vec<Vec<u64>> =
-        vec![last_a0.into_iter().collect(), last_b0.into_iter().collect()];
-    let idle_from = Instant::now();
-    while idle_from.elapsed() < PAIRED_IDLE {
-        std::thread::sleep(SAMPLE_EVERY.min(PAIRED_IDLE.saturating_sub(idle_from.elapsed())));
-        for (i, acct) in [&a, &b].into_iter().enumerate() {
-            if let (_, _, Some(last), _, _) = exchanges(acct) {
-                if dated[i].last() != Some(&last) {
-                    dated[i].push(last);
-                }
-            }
+    // Do not choose an observation window. Wait for each shipped status to name the next
+    // completed fallback exchange it started. That status transition is the causal boundary: a
+    // timer restored anywhere in binding derivation crosses it and moves the durable derivation
+    // record; a too-eager exchange moves attempts before this boundary and is counted below.
+    // Lack of a boundary yields no verdict until an operator's optional watchdog says NO RESULT.
+    let ((ea1, aa1, last_a, confirmed_a, shown_a1), (eb1, ab1, last_b, confirmed_b, shown_b1)) = loop {
+        let after_a = exchanges(&a);
+        let after_b = exchanges(&b);
+        if after_a.0 > ea0 && after_a.1 > aa0 && after_b.0 > eb0 && after_b.1 > ab0 {
+            break (after_a, after_b);
         }
-    }
-    for (who, times) in [("alpha", &dated[0]), ("beta", &dated[1])] {
-        for pair in times.windows(2) {
-            let gap = pair[1].saturating_sub(pair[0]);
-            assert!(
-                gap >= FALLBACK_NAMED.as_millis() as u64,
-                "PRODUCT: {who} exchanged {} s after its previous exchange with nothing to say \
-                 (ADR-038 FX-15, #989): a quiet computer is exchanged with only every {FALLBACK_NAMED:?}; \
-                 its dated exchanges: {times:?}",
-                gap / 1000
+        assert!(
+                daemon_alive(da.child.id()) && daemon_alive(db.child.id()),
+                "PRODUCT: a paired daemon exited before its status named the next quiet fallback exchange: alpha {}; beta {}\n{}\n{}",
+                after_a.4,
+                after_b.4,
+                da.said(),
+                db.said()
             );
-        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    for (who, before, after) in [("alpha", last_a0, last_a), ("beta", last_b0, last_b)] {
+        let (Some(before), Some(after)) = (before, after) else {
+            panic!(
+                "PRODUCT: {who}'s shipped status did not date both sides of its quiet fallback exchange"
+            );
+        };
+        let gap = after.saturating_sub(before);
+        assert!(
+            gap >= FALLBACK_NAMED.as_millis() as u64,
+            "PRODUCT: {who} completed a quiet exchange {} s after its previous exchange \
+             (ADR-038 FX-15, #989), before the named {FALLBACK_NAMED:?} fallback: before \
+             {before}, after {after}",
+            gap / 1000
+        );
     }
-    let (ea1, aa1, last_a, confirmed_a, shown_a1) = exchanges(&a);
-    let (eb1, ab1, last_b, confirmed_b, shown_b1) = exchanges(&b);
     let derived1 = (
         bindings_shown(&computer(&a, &["status"])),
         bindings_shown(&computer(&b, &["status"])),
@@ -3261,34 +3289,33 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
     let grew = |before: u64, after: u64, who: &str, shown0: &str, shown1: &str| -> u64 {
         after.checked_sub(before).unwrap_or_else(|| {
             panic!(
-                "PRODUCT: {who}'s `vox computer status` exchange count went backwards over the \
-                 idle minute, from {before} to {after}; it showed {shown0} before and {shown1} after"
+                "PRODUCT: {who}'s `vox computer status` exchange count went backwards across the \
+                 quiet fallback boundary, from {before} to {after}; it showed {shown0} before and {shown1} after"
             )
         })
     };
     let during_a = grew(ea0, ea1, "alpha", &shown_a0, &shown_a1);
     let during_b = grew(eb0, eb1, "beta", &shown_b0, &shown_b1);
-    // Every round counted from its start, completed or not: the idle minute allows one per
-    // computer, so a failed round and its retry (two) are red even when a later success hides
-    // the failure from the completed count. Starts and completions are not equated: an
-    // exchange in flight at either sample would make them differ for no fault.
+    // Every round is counted from its start, completed or not. We stopped on exactly the first
+    // completed fallback boundary from each side, so a failed round and its retry (two), or an
+    // eager round before the fallback, are red even when a later success hides the failure.
     let tried_a = grew(aa0, aa1, "alpha", &shown_a0, &shown_a1);
     let tried_b = grew(ab0, ab1, "beta", &shown_b0, &shown_b1);
     assert!(
-        tried_a <= IDLE_EXCHANGES && tried_b <= IDLE_EXCHANGES,
-        "PRODUCT: idle computers started rounds beyond the fallback (a failed round and its retry are two) (ADR-038 FX-15, #989): \
-         alpha {tried_a} attempt(s) for {during_a} exchange(s), beta {tried_b} for {during_b} over {PAIRED_IDLE:?} (at most {IDLE_EXCHANGES} each)\n{shown_a1}\n{shown_b1}"
+        tried_a == 1 && tried_b == 1 && during_a == 1 && during_b == 1,
+        "PRODUCT: before each computer completed its one named quiet fallback, it started or completed extra rounds (a failed round and its retry are two) (ADR-038 FX-15, #989): \
+         alpha {tried_a} attempt(s) for {during_a} exchange(s), beta {tried_b} for {during_b}\n{shown_a1}\n{shown_b1}"
     );
     println!(
-        "[proof] over {PAIRED_IDLE:?} idle with four nodes hosted: alpha exchanged {during_a} time(s) with beta (last at {last_a:?}, confirmed {confirmed_a}), beta {during_b} with alpha (last at {last_b:?}, confirmed {confirmed_b}); bindings: alpha's computer at policy revision {} {:?}, beta's at {} {:?}, derived again during the minute: {}",
+        "[proof] at each side's next named quiet fallback boundary with four nodes hosted: alpha exchanged {during_a} time(s) with beta (last at {last_a:?}, confirmed {confirmed_a}), beta {during_b} with alpha (last at {last_b:?}, confirmed {confirmed_b}); bindings: alpha's computer at policy revision {} {:?}, beta's at {} {:?}, derived again across the boundary: {}",
         derived1.0 .0,
         derived1.0 .1,
         derived1.1 .0,
         derived1.1 .1,
         derived0 != derived1
     );
-    // Nothing was derived again: every binding names the same revision and the same moment as
-    // before the minute, and that revision is still the policy's.
+    // Nothing was derived again: every binding names the same revision and the same moment on
+    // both sides of a real unchanged-state exchange, and that revision is still the policy's.
     for (who, (revision0, before), (revision1, after)) in [
         ("alpha", &derived0.0, &derived1.0),
         ("beta", &derived0.1, &derived1.1),
@@ -3296,8 +3323,8 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
         assert!(
             revision0 == revision1 && before == after,
             "PRODUCT: {who}'s computer derived a node's binding again with nothing changed \
-             (ADR-038 FX-28, #1020): before the idle minute policy revision {revision0}, bindings \
-             (revision, derived at ms) {before:?}; after it revision {revision1}, {after:?}"
+             (ADR-038 FX-28, #1020): before the quiet fallback policy revision {revision0}, bindings \
+             (revision, derived at ms) {before:?}; after its completed unchanged-state exchange revision {revision1}, {after:?}"
         );
     }
     assert!(
@@ -3337,14 +3364,6 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
             nodes.len()
         );
     }
-    assert!(
-        during_a <= IDLE_EXCHANGES && during_b <= IDLE_EXCHANGES,
-        "PRODUCT: idle computers kept exchanging state (ADR-038 FX-15, #989): alpha {} and beta {} exchanges over {PAIRED_IDLE:?} (at most {IDLE_EXCHANGES} each)\n{}\n{}",
-        during_a,
-        during_b,
-        da.said(),
-        db.said()
-    );
     // ---- one queued node applies or becomes non-attached without a late apparent pass -------
     delayed_node_does_not_make_a_late_pass(
         (&a, &da, &nodes_a),
@@ -3708,9 +3727,10 @@ fn free_v6_udp_port() -> u16 {
         .unwrap_or_else(|e| panic!("APPARATUS: no free UDP port on [::1]: {e}"))
 }
 
-/// **A restart derives nothing** (ADR-038 FX-28; #1020): with nothing changed, beta's daemon
-/// is stopped and started again on the same port, its two nodes come back Ready, and its
-/// `vox computer status` shows every binding at the same policy revision and the same derived
+/// **A restart derives nothing across unsynchronized host clocks** (ADR-038 FX-28; #1020): with
+/// nothing changed, beta's daemon is stopped and started again on the same port with its Unix
+/// clock one hour ahead, its attached nodes come back Ready, and its `vox computer status` shows
+/// every binding at the same policy revision and the same derived
 /// moment as before the restart: the record survived, and nothing was derived again. Both
 /// computers confirm each other again (staging). Returns beta's new daemon.
 fn a_restart_derives_nothing(
@@ -3737,12 +3757,17 @@ fn a_restart_derives_nothing(
         &["--node", "beta"],
         &[
             ("VOX_LISTEN", listen_b),
+            ("VOX_TEST_CLOCK_STEP_MS", REMOTE_CLOCK_SKEW_MS),
             ("VOX_TEST_HOLD_COMPUTER_POLICY", hold_spec),
             ("VOX_TEST_HOLD_COMPUTER_POLICY_REPLY", reply_spec),
         ],
     );
-    db.expect_apparatus_event("node beta is Ready", |l| l.contains("beta is Ready"));
-    db.expect_apparatus_event("node delta is Ready", |l| l.contains("delta is Ready"));
+    for name in &names_b {
+        let ready = format!("{name} is Ready");
+        db.expect_apparatus_event(&format!("node {name} is Ready"), |line| {
+            line.contains(&ready)
+        });
+    }
     let after = bindings_shown(&computer(b, &["status"]));
     assert!(
         after == before,
@@ -3757,7 +3782,7 @@ fn a_restart_derives_nothing(
         db.said()
     );
     println!(
-        "[proof] {:?} after beta's daemon was restarted with nothing changed, both nodes are Ready and every binding stands at policy revision {} with the same derived moment as before: {:?}",
+        "[proof] {:?} after beta's daemon was restarted with nothing changed, its attached nodes are Ready and every binding stands at policy revision {} with the same derived moment as before: {:?}",
         restarted.elapsed(),
         after.0,
         after.1
@@ -3942,11 +3967,14 @@ fn change_reaches_a_live_computer(
         db.child.id()
     );
 
-    // Opening the only path is the restoration event. The clock is not sampled until every final
-    // product observation below has returned.
+    // Opening a boolean switch is not yet a restored-path precondition. The apparatus first sends
+    // a private probe through both legs of this exact forward (never to Vox); only its round trip
+    // establishes that the userspace path is carrying traffic. A broken/late emulator is
+    // APPARATUS. The forward returns the instant its switch opened, but no PRODUCT timing verdict
+    // is evaluated until the causal probe has succeeded; the clock is not sampled until every
+    // final product observation below has returned.
     forward.set_delay(Duration::from_secs(3));
-    let restored = Instant::now();
-    forward.open();
+    let restored = forward.open_and_verify();
     let applied_at = loop {
         let status = computer(b, &["status"]);
         let gamma_personal = status["nodes"].as_array().into_iter().flatten().any(|n| {
@@ -4043,8 +4071,7 @@ fn delayed_node_does_not_make_a_late_pass(
         std::thread::sleep(Duration::from_millis(100));
     }
     forward.set_delay(Duration::from_secs(3));
-    let restored = Instant::now();
-    forward.open();
+    let restored = forward.open_and_verify();
 
     let mut carried_at = None;
     loop {

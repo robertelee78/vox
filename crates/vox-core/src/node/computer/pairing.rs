@@ -1913,14 +1913,14 @@ impl Management {
             .connect(link.target, &link.endpoints, Some(link))
             .await?;
         let (mut send, mut recv) = streams::open_typed(&conn, StreamKind::Computer).await?;
-        let return_by_ms = wire_deadline(deadline);
+        let remaining_ms = wire_budget(deadline);
         write_frame(
             &mut send,
-            &hello(1, &self.computer.description(), &link.invite, return_by_ms),
+            &hello(1, &self.computer.description(), &link.invite, remaining_ms),
         )
         .await?;
-        let (op, peer, _, echoed_return_by_ms) = read_hello(&mut recv, &conn).await?;
-        if op != 1 || echoed_return_by_ms != return_by_ms {
+        let (op, peer, _, echoed_remaining_ms) = read_hello(&mut recv, &conn).await?;
+        if op != 1 || echoed_remaining_ms != remaining_ms {
             return Err(bad());
         }
         let f = frame(&mut recv).await?;
@@ -1999,24 +1999,24 @@ impl Management {
         send: &mut SendStream,
         recv: &mut RecvStream,
     ) -> Result<()> {
-        let (op, peer, id, return_by_ms) = read_hello(recv, conn).await?;
+        let (op, peer, id, remaining_ms) = read_hello(recv, conn).await?;
         write_frame(
             send,
-            &hello(op, &self.computer.description(), &id, return_by_ms),
+            &hello(op, &self.computer.description(), &id, remaining_ms),
         )
         .await?;
         if op == REACHABILITY_WAKE_OP {
             return Ok(());
         }
         if op == 2 {
-            if return_by_ms == 0 {
+            if remaining_ms == 0 {
                 return Err(bad());
             }
             let payload = frame(recv).await?;
             // A merge that moves this daemon's revision is a change here (ADR-038 FX-28). The
             // reply is the merged state, encoded under the same lock, so the revision the
             // record names is the revision the reply carries.
-            let deadline = causal_deadline(return_by_ms);
+            let deadline = local_deadline(remaining_ms, COMPUTER_RETURN_SHOWN_WITHIN);
             let (merged, reply) = self.computer.change_until(deadline, |s| {
                 merge(s, &payload, conn.peer_id(), self.computer.signer.as_ref())?;
                 Ok((s.revision, exchange(s)?))
@@ -2028,10 +2028,10 @@ impl Management {
         if op != 1 {
             return Err(bad());
         }
-        if return_by_ms == 0 {
+        if remaining_ms == 0 {
             return Err(bad());
         }
-        let deadline = causal_deadline(return_by_ms);
+        let deadline = local_deadline(remaining_ms, PAIR_WITHIN);
         let (invite, mut g) = {
             let s = lock(&self.computer.state);
             let i=s.invitations.iter().find(|i|i.id==id&&!i.cancelled&&i.expires>now()).ok_or(Error::Profile("computer pairing code expired, cancelled, or unknown; no new trust was established"))?;
@@ -2601,14 +2601,14 @@ impl Management {
             (exchange(&s)?, s.revision)
         };
         let (mut send, mut recv) = streams::open_typed(&conn, StreamKind::Computer).await?;
-        let return_by_ms = wire_deadline(deadline);
+        let remaining_ms = wire_budget(deadline);
         write_frame(
             &mut send,
-            &hello(2, &self.computer.description(), &[0; 32], return_by_ms),
+            &hello(2, &self.computer.description(), &[0; 32], remaining_ms),
         )
         .await?;
-        let (op, _, _, echoed_return_by_ms) = read_hello(&mut recv, &conn).await?;
-        if op != 2 || echoed_return_by_ms != return_by_ms {
+        let (op, _, _, echoed_remaining_ms) = read_hello(&mut recv, &conn).await?;
+        if op != 2 || echoed_remaining_ms != remaining_ms {
             return Err(bad());
         }
         write_frame(&mut send, &payload).await?;
@@ -2831,18 +2831,27 @@ fn context(invite: &Digest32, transport: &Digest32, g: &Enrollment) -> Vec<u8> {
         .uint(PROTOCOL);
     [PAIR_DOMAIN, &sha256(&e.finish())].concat()
 }
-/// Convert this process's monotonic causal deadline once to an absolute wire value. The answerer
-/// reconstructs the same end rather than starting another return interval after network delay.
-fn wire_deadline(deadline: std::time::Instant) -> u64 {
+/// Advertise only the work budget left on this process's monotonic causal deadline. An `Instant`
+/// is process-local and a Unix timestamp assumes clocks are synchronized, so neither can be a
+/// cross-daemon deadline. The initiator continues to enforce `deadline` itself; this budget only
+/// prevents the answerer from giving its local merge a fresh full interval. Zero remains reserved
+/// for the reachability wake hello, so an already-expired repair advertises the smallest budget.
+fn wire_budget(deadline: std::time::Instant) -> u64 {
     let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-    now().saturating_add(u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX))
+    u64::try_from(remaining.as_millis())
+        .unwrap_or(u64::MAX)
+        .max(1)
 }
 
-fn causal_deadline(return_by_ms: u64) -> std::time::Instant {
-    std::time::Instant::now() + Duration::from_millis(return_by_ms.saturating_sub(now()))
+/// Bound remote work on this process's monotonic clock. The sender's remaining duration is capped
+/// by the operation's public contract; it is never compared with this host's Unix clock. Network
+/// transit still consumes the initiator's original deadline because that process keeps enforcing
+/// it while this answer is prepared.
+fn local_deadline(remaining_ms: u64, contract: Duration) -> std::time::Instant {
+    std::time::Instant::now() + Duration::from_millis(remaining_ms).min(contract)
 }
 
-fn hello(op: u64, d: &Description, id: &Digest32, return_by_ms: u64) -> Vec<u8> {
+fn hello(op: u64, d: &Description, id: &Digest32, remaining_ms: u64) -> Vec<u8> {
     let mut e = Encoder::new();
     e.array(6)
         .uint(PROTOCOL)
@@ -2850,7 +2859,7 @@ fn hello(op: u64, d: &Description, id: &Digest32, return_by_ms: u64) -> Vec<u8> 
         .uint(op)
         .bytes(&d.encode())
         .bytes(id)
-        .uint(return_by_ms);
+        .uint(remaining_ms);
     e.finish()
 }
 async fn read_hello(
@@ -2871,12 +2880,12 @@ fn parse_hello(f: &[u8], conn: &VoxConnection) -> Result<(u64, Description, Dige
     let op = d.uint()?;
     let desc = Description::decode(d.bytes()?)?;
     let id = digest(&mut d)?;
-    let return_by_ms = d.uint()?;
+    let remaining_ms = d.uint()?;
     d.finish()?;
     if desc.fingerprint()? != conn.peer_id() {
         return Err(Error::SignatureInvalid);
     }
-    Ok((op, desc, id, return_by_ms))
+    Ok((op, desc, id, remaining_ms))
 }
 async fn frame(recv: &mut RecvStream) -> Result<Vec<u8>> {
     let f = read_frame_within(recv, MAX_FRAME, PATIENCE)
