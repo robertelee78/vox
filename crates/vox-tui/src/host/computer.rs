@@ -30,11 +30,16 @@ impl Router {
                 }
                 Router { inner }.reconcile_computer_trust(deadline).await;
                 deadline = tokio::select! {
-                    moved = policy.changed() => {
-                        if moved.is_err() {
-                            return;
+                    moved = policy.recv() => {
+                        match moved {
+                            Ok(event) => event.apply_deadline(),
+                            Err(broadcast::error::RecvError::Lagged(_)) => {
+                                // A missed earlier event may already be at its bound; never
+                                // replace it with a later five-second window.
+                                std::time::Instant::now()
+                            }
+                            Err(broadcast::error::RecvError::Closed) => return,
                         }
-                        policy.borrow_and_update().apply_deadline()
                     }
                     moved = endpoints.changed() => {
                         if moved.is_err() {
@@ -149,13 +154,17 @@ impl Router {
                 };
                 match outcome {
                     Ok(()) => {
+                        if router.attachment_generation(&name) != Some(generation) {
+                            return;
+                        }
                         if let Err(e) = management.record_application() {
                             eprintln!("vox daemon: computer trust application pending: {e}");
                         }
                     }
                     Err(why) => {
-                        router.detach_failed_computer_node(name.clone(), generation);
-                        management.node_pending(name.as_str(), &why);
+                        if router.detach_failed_computer_node(name.clone(), generation) {
+                            management.node_pending(name.as_str(), &why);
+                        }
                     }
                 }
             });
@@ -164,7 +173,14 @@ impl Router {
 
     /// Make a failed node non-attached in the same synchronous critical section that decides it,
     /// then leave its potentially slow actor cleanup to an independent task.
-    fn detach_failed_computer_node(&self, node: NodeName, generation: u64) {
+    fn attachment_generation(&self, node: &NodeName) -> Option<u64> {
+        match lock(&self.inner.slots).get(node) {
+            Some(Slot::Attached(attached)) => Some(attached.generation),
+            _ => None,
+        }
+    }
+
+    fn detach_failed_computer_node(&self, node: NodeName, generation: u64) -> bool {
         let going = {
             let mut slots = lock(&self.inner.slots);
             match slots.get(&node) {
@@ -181,6 +197,9 @@ impl Router {
                     .finish_detach(node, attached, done, DetachCause::Requested)
                     .await;
             });
+            true
+        } else {
+            false
         }
     }
 

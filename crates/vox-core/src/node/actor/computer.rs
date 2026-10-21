@@ -9,6 +9,8 @@ use crate::node::trust::HistoryGrant;
 /// name nor read this variable (V210-105).
 #[cfg(feature = "test-knobs")]
 const TEST_HOLD_COMPUTER_POLICY_ENV: &str = "VOX_TEST_HOLD_COMPUTER_POLICY";
+#[cfg(feature = "test-knobs")]
+const TEST_HOLD_COMPUTER_POLICY_REPLY_ENV: &str = "VOX_TEST_HOLD_COMPUTER_POLICY_REPLY";
 
 #[cfg(feature = "test-knobs")]
 impl Node {
@@ -33,6 +35,27 @@ impl Node {
         if mine == Some(node) && std::path::Path::new(marker).is_file() {
             tokio::time::sleep(Duration::from_millis(delay)).await;
         }
+    }
+
+    /// Test apparatus: delay only the reply to an applied policy event, leaving the actor free
+    /// to detach. This stages a replacement attachment before an old reconciliation resolves.
+    #[cfg(feature = "test-knobs")]
+    pub(super) fn hold_computer_policy_reply_for_proof(&self) -> Option<Duration> {
+        let spec = std::env::var(TEST_HOLD_COMPUTER_POLICY_REPLY_ENV).ok()?;
+        let mut fields = spec.splitn(3, '\t');
+        let (node, milliseconds, marker) = (fields.next()?, fields.next()?, fields.next()?);
+        let mine = self.paths.profile_dir.file_name()?.to_str()?;
+        if mine != node || !std::path::Path::new(marker).is_file() {
+            return None;
+        }
+        let delay = milliseconds
+            .parse::<u64>()
+            .ok()
+            .map(Duration::from_millis)?;
+        // One-shot, and observable by the apparatus: its disappearance proves the old actor
+        // accepted the event before the proof replaces that attachment.
+        std::fs::remove_file(marker).ok()?;
+        Some(delay)
     }
 }
 

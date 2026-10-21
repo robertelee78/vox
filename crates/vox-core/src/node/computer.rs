@@ -33,6 +33,9 @@ pub const COMPUTER_CHANGE_SHOWN_WITHIN: Duration = Duration::from_secs(5);
 /// failed path becomes reachable again (ADR-038 FX-28).
 pub const COMPUTER_RETURN_SHOWN_WITHIN: Duration = Duration::from_secs(60);
 
+/// A confirmed computer with no state to settle is not exchanged before this fallback cadence.
+pub const COMPUTER_QUIET_EXCHANGE_AFTER: Duration = Duration::from_secs(60);
+
 /// One durable policy revision and the absolute ends of the two user-visible contracts its
 /// cause began. A remote merge may shorten the local apply deadline, but never restarts the
 /// outer return deadline shared by exchange and reconciliation.
@@ -2150,7 +2153,7 @@ pub struct Computer {
     >,
     /// The policy revision, sent whenever a change moves it: a local change or a merged
     /// exchange alike (ADR-038 FX-28). The daemon reconciles its nodes on this, and on no timer.
-    changed: tokio::sync::watch::Sender<ComputerChange>,
+    changed: tokio::sync::broadcast::Sender<ComputerChange>,
     /// Each node's plan at the revision it was derived at: the app's polling and every trust
     /// command answer from it while the revision stands, instead of verifying the history again.
     plans: Mutex<BTreeMap<Digest32, (u64, PolicyPlan)>>,
@@ -2175,7 +2178,7 @@ impl Computer {
 
     /// Follow the policy revision: `changed()` resolves when a change moved it, whether the
     /// change was made here or arrived in an exchange (ADR-038 FX-28).
-    pub fn changes(&self) -> tokio::sync::watch::Receiver<ComputerChange> {
+    pub fn changes(&self) -> tokio::sync::broadcast::Receiver<ComputerChange> {
         self.changed.subscribe()
     }
 
@@ -2699,14 +2702,13 @@ impl Computer {
             if state.history.len() >= MAX_RECORDS {
                 return Err(Error::Profile(HISTORY_FULL));
             }
-            let revision = state.revision;
             let c = Arc::new(Self {
                 path,
                 storage_failed: std::sync::atomic::AtomicBool::new(false),
                 signer,
                 state: Mutex::new(state),
                 reachers: Mutex::new(Vec::new()),
-                changed: tokio::sync::watch::channel(ComputerChange::now(revision)).0,
+                changed: tokio::sync::broadcast::channel(MAX_RECORDS).0,
                 plans: Mutex::new(BTreeMap::new()),
             });
             // Validate present storage before any endpoint or managed node can resume authority.
@@ -2768,7 +2770,7 @@ impl Computer {
             signer: Arc::new(root),
             state: Mutex::new(state),
             reachers: Mutex::new(Vec::new()),
-            changed: tokio::sync::watch::channel(ComputerChange::now(0)).0,
+            changed: tokio::sync::broadcast::channel(MAX_RECORDS).0,
             plans: Mutex::new(BTreeMap::new()),
         });
         c.save(&lock(&c.state))?;
@@ -2795,7 +2797,7 @@ impl Computer {
     }
     /// Commit a complete management transaction before publishing it to live authorization.
     pub(crate) fn change<T>(&self, f: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
-        self.change_until(std::time::Instant::now() + COMPUTER_CHANGE_SHOWN_WITHIN, f)
+        self.change_until(std::time::Instant::now() + COMPUTER_RETURN_SHOWN_WITHIN, f)
     }
 
     /// Commit a transaction whose causal event already owns `deadline`. A merge and the
@@ -2830,7 +2832,7 @@ impl Computer {
                 // A change here, or a merged exchange that moved this daemon's revision: either
                 // is a change here (ADR-038 FX-28), and the daemon reconciles its nodes on it.
                 // The local apply contract may shorten an outer return deadline, never extend it.
-                self.changed.send_replace(ComputerChange {
+                let _ = self.changed.send(ComputerChange {
                     revision: held.revision,
                     apply_deadline: deadline
                         .min(std::time::Instant::now() + COMPUTER_CHANGE_SHOWN_WITHIN),

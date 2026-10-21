@@ -34,7 +34,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 use vox_core::node::computer::{
     COMPUTER_CHANGE_SHOWN_WITHIN as CHANGE_SHOWN_WITHIN,
-    COMPUTER_RETURN_SHOWN_WITHIN as RETURN_WITHIN,
+    COMPUTER_QUIET_EXCHANGE_AFTER as FALLBACK_NAMED, COMPUTER_RETURN_SHOWN_WITHIN as RETURN_WITHIN,
 };
 
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
@@ -2380,9 +2380,6 @@ const PAIRED_IDLE: Duration = Duration::from_secs(60);
 /// Exchanges a computer may run with a peer over [`PAIRED_IDLE`] when nothing changed: the
 /// fallback one (every 60 s) and the one that may straddle the window's start.
 const IDLE_EXCHANGES: u64 = 1;
-/// How far apart two exchanges with a computer that has nothing to say are, at least: the
-/// pairing manager's fallback, which the status dates.
-const FALLBACK_NAMED: Duration = Duration::from_secs(55);
 /// How often the idle minute samples each side's status for a new dated exchange.
 const SAMPLE_EVERY: Duration = Duration::from_secs(5);
 /// CPU time a daemon may spend over [`PAIRED_IDLE`] with nothing to settle: the quiet bound of
@@ -2434,11 +2431,19 @@ const IDLE_CPU: Duration = Duration::from_secs(3);
 /// the saturated-backoff live heal misses [`RETURN_WITHIN`] and turns PRODUCT red; (5) give
 /// reconciliation a fresh timeout or delay `Detaching`: held delta remains Ready past
 /// [`CHANGE_SHOWN_WITHIN`] and turns PRODUCT red; (6) serialize siblings behind held delta:
-/// beta's binding/keyring claim misses that same bound and turns PRODUCT red.
+/// beta's binding/keyring claim misses that same bound and turns PRODUCT red; (7) remove the
+/// attachment-generation checks: the old delayed result detaches replacement delta and turns
+/// PRODUCT red; (8) restore actor-tick policy application and bypass its current-revision guard:
+/// the idle binding-derived moments move and turn PRODUCT red. The stuck-node phase begins behind
+/// saturated backoff, so resetting either exchange or apply clocks turns its return bound red.
 #[test]
 #[ignore = "five minutes of two real vox daemons paired as computers; run in release"]
 fn two_paired_computers_that_are_idle_exchange_nothing() {
-    test_knobs::require(&["VOX_TEST_ADVERTISE", "VOX_TEST_HOLD_COMPUTER_POLICY"]);
+    test_knobs::require(&[
+        "VOX_TEST_ADVERTISE",
+        "VOX_TEST_HOLD_COMPUTER_POLICY",
+        "VOX_TEST_HOLD_COMPUTER_POLICY_REPLY",
+    ]);
     let a = Account::new();
     let b = Account::new();
     let alpha = a.make_node("alpha");
@@ -2458,6 +2463,8 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
     let listen_b = format!("[::1]:{}", free_v6_udp_port());
     let hold_marker = b.data.join("hold-delta-computer-policy");
     let hold_spec = format!("delta\t15000\t{}", hold_marker.display());
+    let reply_marker = b.data.join("hold-delta-computer-policy-reply");
+    let reply_spec = format!("delta\t15000\t{}", reply_marker.display());
     let da = Daemon::start(
         &a,
         &["--node", "alpha"],
@@ -2472,6 +2479,7 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
         &[
             ("VOX_LISTEN", &listen_b),
             ("VOX_TEST_HOLD_COMPUTER_POLICY", &hold_spec),
+            ("VOX_TEST_HOLD_COMPUTER_POLICY_REPLY", &reply_spec),
         ],
     );
     // Each node is Ready before it is chosen as its computer's personal node.
@@ -2529,7 +2537,13 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
     change_shows_on_both((&b, &db, &nodes_b), (&a, &da, &nodes_a), "delta");
 
     // ---- a restart derives nothing: each binding's (revision, when) survives it -----------
-    let db = a_restart_derives_nothing((&a, &da), (&b, db, &nodes_b, &listen_b, &hold_spec));
+    let db = a_restart_derives_nothing(
+        (&a, &da),
+        (&b, db, &nodes_b, &listen_b, &hold_spec, &reply_spec),
+    );
+
+    // ---- a stale reconciliation cannot detach a replacement attachment -------------------
+    replacement_generation_survives((&a, &da), (&b, &db), &reply_marker);
 
     // ---- both live daemons converge when their userspace path is restored -----------------
     change_reaches_a_live_computer((&a, &da, &nodes_a), (&b, &db, &nodes_b), &forward);
@@ -2725,7 +2739,12 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
     );
 
     // ---- one queued node applies or becomes non-attached without a late apparent pass -------
-    delayed_node_does_not_make_a_late_pass((&a, &da, &nodes_a), (&b, &db, &nodes_b), &hold_marker);
+    delayed_node_does_not_make_a_late_pass(
+        (&a, &da, &nodes_a),
+        (&b, &db, &nodes_b),
+        &hold_marker,
+        &forward,
+    );
 }
 
 /// Unix milliseconds now, the clock `vox computer status` dates exchanges and bindings with.
@@ -3017,7 +3036,14 @@ fn free_v6_udp_port() -> u16 {
 /// computers confirm each other again (staging). Returns beta's new daemon.
 fn a_restart_derives_nothing(
     (a, da): (&Account, &Daemon),
-    (b, db, nodes_b, listen_b, hold_spec): (&Account, Daemon, &[(&str, &str)], &str, &str),
+    (b, db, nodes_b, listen_b, hold_spec, reply_spec): (
+        &Account,
+        Daemon,
+        &[(&str, &str)],
+        &str,
+        &str,
+        &str,
+    ),
 ) -> Daemon {
     let names_b: Vec<&str> = nodes_b.iter().map(|(n, _)| *n).collect();
     let before = bindings_shown(&computer(b, &["status"]));
@@ -3033,6 +3059,7 @@ fn a_restart_derives_nothing(
         &[
             ("VOX_LISTEN", listen_b),
             ("VOX_TEST_HOLD_COMPUTER_POLICY", hold_spec),
+            ("VOX_TEST_HOLD_COMPUTER_POLICY_REPLY", reply_spec),
         ],
     );
     db.expect("node beta is Ready", RETURN_WITHIN, |l| {
@@ -3073,6 +3100,64 @@ fn a_restart_derives_nothing(
         db.said()
     );
     db
+}
+
+/// A reconciliation result belongs to one attachment generation. The old delta actor applies a
+/// change but its reply is held while a person detaches and re-attaches delta. When the old
+/// five-second waiter expires, the replacement must remain Ready and current.
+fn replacement_generation_survives(
+    (a, da): (&Account, &Daemon),
+    (b, db): (&Account, &Daemon),
+    reply_marker: &Path,
+) {
+    let zeta = a.make_node("zeta");
+    std::fs::write(reply_marker, b"hold the old generation's reply")
+        .unwrap_or_else(|e| panic!("APPARATUS: could not stage delayed old-generation reply: {e}"));
+    let (ok, out, err) = a.run(&["node", "attach", "zeta", "--passphrase-file", "-"], PASS);
+    assert!(
+        ok,
+        "APPARATUS: attach zeta to stage replacement race: {out}{err}"
+    );
+    assert!(
+        wait_until(RETURN_WITHIN, || !reply_marker.is_file()),
+        "APPARATUS: delta's old actor never accepted the policy event whose reply was to be held\n{}\n{}",
+        da.said(),
+        db.said()
+    );
+    let old_reply_held = Instant::now();
+    let (ok, out, err) = b.run(&["node", "detach", "delta"], "");
+    assert!(ok, "APPARATUS: detach old delta generation: {out}{err}");
+    let (ok, out, err) = b.run(&["node", "attach", "delta", "--passphrase-file", "-"], PASS);
+    assert!(
+        ok,
+        "APPARATUS: attach replacement delta generation: {out}{err}"
+    );
+    std::thread::sleep(
+        CHANGE_SHOWN_WITHIN
+            .saturating_add(Duration::from_secs(1))
+            .saturating_sub(old_reply_held.elapsed()),
+    );
+    let status = computer(b, &["status"]);
+    let (listed_ok, listed, listed_err) = b.run(&["node", "list"], "");
+    let delta_ready = listed_ok
+        && listed
+            .lines()
+            .any(|line| line.split_whitespace().next() == Some("delta") && line.contains("Ready"));
+    let delta_reads_zeta = grant_words(b, "delta", &zeta).as_deref() == Some("read");
+    let alive = daemon_alive(da.child.id()) && daemon_alive(db.child.id());
+    assert!(
+        delta_ready
+            && roster_current(&status, &["beta", "delta"])
+            && delta_reads_zeta
+            && alive,
+        "PRODUCT: after the old generation's reconciliation deadline, replacement delta did not remain Ready with current computer trust (ADR-038 FX-28, #1020): Ready {delta_ready}, current {}, zeta grant {:?}, daemons alive {alive}; node list error {listed_err}; nodes {}; applications {}\n{}\n{}",
+        roster_current(&status, &["beta", "delta"]),
+        grant_words(b, "delta", &zeta),
+        status["nodes"],
+        status["applications"],
+        da.said(),
+        db.said()
+    );
 }
 
 /// **A change made across a failed live path arrives on its authenticated restoration** (ADR-038
@@ -3155,7 +3240,7 @@ fn change_reaches_a_live_computer(
                 .as_u64()
                 .is_some_and(|n| n >= 6)
         }),
-        "PRODUCT (staging): with the live path closed, alpha's `vox computer status` counted no \
+        "APPARATUS: with the live path closed, alpha's `vox computer status` counted no \
          sixth failed exchange toward it within {:?}: {}\nits daemon said: {}",
         RETURN_WITHIN.saturating_mul(2),
         application_toward(a, &b_id),
@@ -3245,13 +3330,14 @@ fn delayed_node_does_not_make_a_late_pass(
     (a, da, _nodes_a): (&Account, &Daemon, &[(&str, &str)]),
     (b, db, _nodes_b): (&Account, &Daemon, &[(&str, &str)]),
     hold_marker: &Path,
+    forward: &port_forward::PortForward,
 ) {
     let epsilon = a.make_node("epsilon");
     let b_id = computer_id(b);
     let before_revision = computer(a, &["status"])["revision"].as_u64().unwrap_or(0);
     std::fs::write(hold_marker, b"hold delta's next policy message")
         .unwrap_or_else(|e| panic!("APPARATUS: could not stage the held delta marker: {e}"));
-    let staged = Instant::now();
+    forward.close();
     let (ok, out, err) = a.run(
         &["node", "attach", "epsilon", "--passphrase-file", "-"],
         PASS,
@@ -3260,6 +3346,19 @@ fn delayed_node_does_not_make_a_late_pass(
         ok,
         "APPARATUS: attach epsilon on alpha's computer: {out}{err}"
     );
+    assert!(
+        wait_until(RETURN_WITHIN.saturating_mul(2), || {
+            application_toward(a, &b_id)["exchange_failures"]
+                .as_u64()
+                .is_some_and(|n| n >= 6)
+        }),
+        "APPARATUS: the closed path did not saturate exchange backoff before the stuck-apply heal: {}\n{}",
+        application_toward(a, &b_id),
+        da.said()
+    );
+    forward.set_delay(Duration::from_secs(3));
+    let restored = Instant::now();
+    forward.open();
 
     let mut carried_at = None;
     loop {
@@ -3299,17 +3398,18 @@ fn delayed_node_does_not_make_a_late_pass(
         let seen = unix_ms();
         if let Some(at) = carried_at {
             let elapsed = Duration::from_millis(seen.saturating_sub(at));
-            if shown && elapsed <= CHANGE_SHOWN_WITHIN {
+            let returned = restored.elapsed();
+            if shown && elapsed <= CHANGE_SHOWN_WITHIN && returned <= RETURN_WITHIN {
                 println!(
-                    "[proof] after {elapsed:?}, beta applied epsilon on its healthy node and lists held delta non-attached ({delta_line:?}); bound {CHANGE_SHOWN_WITHIN:?}"
+                    "[proof] after {returned:?} from saturated-backoff heal and {elapsed:?} from exchange, beta applied epsilon on its healthy node and lists held delta non-attached ({delta_line:?}); bounds {RETURN_WITHIN:?}/{CHANGE_SHOWN_WITHIN:?}"
                 );
                 break;
             }
             assert!(
-                !shown && elapsed < CHANGE_SHOWN_WITHIN,
+                !shown && elapsed < CHANGE_SHOWN_WITHIN && returned < RETURN_WITHIN,
                 "PRODUCT: {CHANGE_SHOWN_WITHIN:?} after the exchange carrying epsilon completed, \
                  beta did not apply-or-detach every attached node (ADR-038 FX-28, #1020; shown \
-                 {shown} only after {elapsed:?}): alpha bindings current {local_current}; beta \
+                 {shown} only after {elapsed:?} from exchange/{returned:?} from heal): alpha bindings current {local_current}; beta \
                  binding current {beta_current}; beta's grant for epsilon {beta_grant:?}; delta \
                  line {delta_line:?}; daemons alive {alive}; alpha status nodes {}; beta status nodes {}\nalpha \
                  daemon:\n{}\nbeta daemon:\n{}",
@@ -3320,7 +3420,7 @@ fn delayed_node_does_not_make_a_late_pass(
             );
         } else {
             assert!(
-                staged.elapsed() < RETURN_WITHIN,
+                restored.elapsed() < RETURN_WITHIN,
                 "PRODUCT (staging): alpha completed no exchange carrying epsilon to beta within \
                  {RETURN_WITHIN:?}: {}\nalpha daemon:\n{}\nbeta daemon:\n{}",
                 application_toward(a, &b_id),
@@ -3330,6 +3430,7 @@ fn delayed_node_does_not_make_a_late_pass(
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+    forward.set_delay(Duration::ZERO);
 }
 
 fn daemon_alive(pid: u32) -> bool {

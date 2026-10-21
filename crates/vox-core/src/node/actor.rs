@@ -5971,7 +5971,6 @@ impl Node {
         loop {
             tokio::select! {
                 () = tokio::task::yield_now(), if self.governance_work.pending || self.room_preparation_work_ready() || (!self.legacy_cleanup_rooms.is_empty() && std::time::Instant::now() >= self.legacy_cleanup_due) || self.key_package_work_ready() => {
-                    if self.apply_computer_keyring().await.is_err() { continue; }
                     for _ in 0..4 {
                         let turn = maintenance_next;
                         maintenance_next = (maintenance_next + 1) % 4;
@@ -6234,7 +6233,6 @@ impl Node {
                     self.governance_work.pending = true;
                     self.publication_pending |= !self.publish_waiters.is_empty();
                     self.publication_again |= !self.publish_waiters.is_empty();
-                    if self.apply_computer_keyring().await.is_err() { continue; }
                     // A joined sparse room that is not yet settled owes its settlement one
                     // attempt every tick: nothing else reliably re-arms it. Sync session and
                     // head-completion events call it too, but a room whose remaining piece
@@ -10780,6 +10778,8 @@ impl Node {
             NetEvent::ComputerPolicy(reply) => {
                 #[cfg(feature = "test-knobs")]
                 self.hold_computer_policy_for_proof().await;
+                #[cfg(feature = "test-knobs")]
+                let reply_delay = self.hold_computer_policy_reply_for_proof();
                 let result = match self.prepare_computer_binding() {
                     Ok(()) => self.apply_computer_keyring().await,
                     Err(e) => Err(e),
@@ -10788,6 +10788,16 @@ impl Node {
                     self.refresh_reachers().await;
                     self.tend_drive_keys().await;
                 }
+                #[cfg(feature = "test-knobs")]
+                if let Some(delay) = reply_delay {
+                    tokio::spawn(async move {
+                        tokio::time::sleep(delay).await;
+                        let _ = reply.send(result);
+                    });
+                } else {
+                    let _ = reply.send(result);
+                }
+                #[cfg(not(feature = "test-knobs"))]
                 let _ = reply.send(result);
             }
             NetEvent::LocalTrustBlacklist(reply) => {
