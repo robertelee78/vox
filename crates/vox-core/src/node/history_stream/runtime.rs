@@ -1502,12 +1502,12 @@ impl Flow {
                         // the healthy room/peer port can strand a later fresh head behind it.
                         // Third-party heads route to their author below; dependency failures
                         // after a head was selected remain hard failures.
-                        // A peer that cannot serve the head of its own feed it advertised is not
-                        // asked for that hint again until its inventory names another (ADR-038
-                        // FX-29); the own-feed echo (`author == self.node`) is settlement's and
-                        // stays as it is.
+                        // A peer that cannot serve the head it advertised, its own feed's or
+                        // this node's own (the echo settlement asks for), is not asked for that
+                        // hint again until its inventory names another head of the author
+                        // (ADR-038 FX-29): the asking side stops, whatever the serving side does.
                         if let (Query::Head(author), Some(hint)) = (&query, self.hint) {
-                            if *author == self.peer && hint.author == *author {
+                            if hint.author == *author {
                                 inbox.decline(self.room, self.peer, *author, hint.head);
                             }
                         }
@@ -1556,14 +1556,7 @@ impl Flow {
                         // was hinted or required. The route to the author's port below still
                         // runs once for this exact query.
                         if let Some(dependency) = dependency {
-                            if dependency.author != self.node {
-                                inbox.decline(
-                                    self.room,
-                                    self.peer,
-                                    dependency.author,
-                                    dependency.head,
-                                );
-                            }
+                            inbox.decline(self.room, self.peer, dependency.author, dependency.head);
                         }
                         if dependency.is_some_and(|head| {
                             head.author != self.peer && head.author != self.node
