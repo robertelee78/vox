@@ -5,7 +5,7 @@
 //! buffer limits, not a claim about total process RSS or the separately bounded disk caches.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use tokio::sync::Notify;
@@ -164,6 +164,32 @@ impl State {
     }
 }
 
+/// One exact cleanup obligation. The actor registration and request ID distinguish a retired
+/// actor's work from a replacement using the same node fingerprint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct RetirementKey {
+    pub(crate) actor: Option<u64>,
+    pub(crate) request: [u8; 16],
+    pub(crate) node: Digest32,
+    pub(crate) room: Digest32,
+    pub(crate) peer: Digest32,
+    pub(crate) archive: bool,
+    pub(crate) instance: [u8; 16],
+    pub(crate) generation: Digest32,
+}
+
+pub(crate) struct RetirementEntry {
+    pub(crate) flow: Arc<tokio::sync::Mutex<Option<crate::node::history_stream::runtime::Flow>>>,
+    pub(crate) running: AtomicBool,
+    pub(crate) task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+#[derive(Default)]
+pub(crate) struct RetirementLedger {
+    pub(crate) entries: Mutex<BTreeMap<RetirementKey, Arc<RetirementEntry>>>,
+    pub(crate) errors: Mutex<BTreeMap<RetirementKey, String>>,
+}
+
 /// One instance belongs to the daemon and is shared by every hosted node.
 #[derive(Default)]
 pub struct Budget {
@@ -176,6 +202,10 @@ pub struct Budget {
     control_bytes: AtomicUsize,
     /// The daemon's flow-state pool, one record under one lock (ADR-038 FX-35).
     pool: Mutex<Pool>,
+    /// Owed retirement ownership belongs to the daemon, not one actor incarnation. An actor
+    /// panic therefore cannot lose a Flow or its visible failure, and a replacement resumes the
+    /// same exact request.
+    retirements: Arc<RetirementLedger>,
     foreground_bytes: AtomicUsize,
 }
 
@@ -184,6 +214,10 @@ impl Budget {
     #[must_use]
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    pub(crate) fn retirement_ledger(&self) -> Arc<RetirementLedger> {
+        Arc::clone(&self.retirements)
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -348,6 +382,10 @@ impl Drop for Worker {
 pub struct Job(Arc<Worker>);
 
 impl Job {
+    pub(crate) fn flow_owner(&self) -> Option<u64> {
+        self.0.flow_owner
+    }
+
     /// Subscribe before a shared byte reservation attempt so its exact release cannot be lost.
     pub(crate) fn bytes_wake(
         &self,
@@ -388,12 +426,12 @@ impl Job {
         peer: Digest32,
         bytes: BufferCharge,
     ) -> FlowStateTry {
-        let key = (self.0.node, room, peer);
         let budget = Arc::clone(&self.0.budget);
         let mut p = budget.pool.lock().unwrap_or_else(PoisonError::into_inner);
         let Some(owner) = self.0.flow_owner else {
             return FlowStateTry::PoolFull;
         };
+        let key = (owner, self.0.node, room, peer);
         if p.in_use >= p.limit || !p.owners.contains_key(&owner) {
             return FlowStateTry::PoolFull;
         }
@@ -403,7 +441,7 @@ impl Job {
         pool_owner.charges += 1;
         p.in_use += 1;
         *p.running.entry(key).or_insert(0) += 1;
-        *p.by_node.entry(key.0).or_insert(0) += 1;
+        *p.by_node.entry(key.1).or_insert(0) += 1;
         drop(p);
         FlowStateTry::Reserved(FlowStateCharge {
             budget,
@@ -659,7 +697,7 @@ struct Pool {
     in_use: usize,
     /// A port can run its live and archive slots together, so retain multiplicity here while
     /// status needs only the key to say that the port has a running round.
-    running: BTreeMap<(Digest32, Digest32, Digest32), usize>,
+    running: BTreeMap<(u64, Digest32, Digest32, Digest32), usize>,
     by_node: BTreeMap<Digest32, usize>,
     next_owner: u64,
     /// The current actor generation for each hosted fingerprint.
@@ -696,6 +734,12 @@ pub(crate) struct FlowPoolRegistration {
     budget: Arc<Budget>,
     node: Digest32,
     owner: u64,
+}
+
+impl FlowPoolRegistration {
+    pub(crate) fn actor_incarnation(&self) -> u64 {
+        self.owner
+    }
 }
 
 impl Drop for FlowPoolRegistration {
@@ -741,7 +785,7 @@ pub(crate) enum FlowStateTry {
 /// go back first, then the pool is told.
 pub(crate) struct FlowStateCharge {
     budget: Arc<Budget>,
-    key: (Digest32, Digest32, Digest32),
+    key: (u64, Digest32, Digest32, Digest32),
     owner: u64,
     charge: Option<BufferCharge>,
 }
@@ -760,7 +804,7 @@ impl Drop for FlowStateCharge {
                 p.running.remove(&self.key);
             }
         }
-        if let Some(n) = p.by_node.get_mut(&self.key.0) {
+        if let Some(n) = p.by_node.get_mut(&self.key.1) {
             *n = n.saturating_sub(1);
         }
         if let Some(owner) = p.owners.get_mut(&self.owner) {
@@ -772,10 +816,10 @@ impl Drop for FlowStateCharge {
         {
             p.owners.remove(&self.owner);
         }
-        if !p.owners.values().any(|owner| owner.node == self.key.0)
-            && p.by_node.get(&self.key.0) == Some(&0)
+        if !p.owners.values().any(|owner| owner.node == self.key.1)
+            && p.by_node.get(&self.key.1) == Some(&0)
         {
-            p.by_node.remove(&self.key.0);
+            p.by_node.remove(&self.key.1);
         }
         p.limit = FLOW_STATE_MIN_CAPACITY.max(BOUNDED_SYNC_RUNNING_SLOTS * p.owners.len());
     }
@@ -802,10 +846,12 @@ pub struct BudgetSnapshot {
     pub flow_state_limit: usize,
     /// Who holds them, by node: one member per hosted node, the count of its running rounds.
     pub flow_state_by_node: Vec<(Digest32, usize)>,
+    /// Every active or retiring actor generation and its exact charge count.
+    pub flow_state_actors: Vec<(u64, Digest32, bool, usize)>,
     /// Nodes whose actor registration ended while a running charge was still returning.
     pub flow_state_retiring_nodes: Vec<Digest32>,
     /// The running rounds holding a flow state (node, room, peer), from the same view.
-    pub flow_state_running: Vec<(Digest32, Digest32, Digest32)>,
+    pub flow_state_running: Vec<(u64, Digest32, Digest32, Digest32)>,
 }
 
 impl Budget {
@@ -814,8 +860,11 @@ impl Budget {
     /// grows to hold every hosted node's rounds before this node's first start attempt.
     pub(crate) fn register_node(self: &Arc<Self>, node: Digest32) -> FlowPoolRegistration {
         let mut p = self.pool.lock().unwrap_or_else(PoisonError::into_inner);
-        p.next_owner = p.next_owner.checked_add(1).unwrap_or(1);
-        let owner = p.next_owner;
+        let mut owner = p.next_owner.wrapping_add(1);
+        while p.owners.contains_key(&owner) {
+            owner = owner.wrapping_add(1);
+        }
+        p.next_owner = owner;
         if let Some(replaced) = p.active.insert(node, owner) {
             if let Some(replaced) = p.owners.get_mut(&replaced) {
                 replaced.registered = false;
@@ -863,6 +912,13 @@ impl Budget {
             flow_state_in_use: p.in_use,
             flow_state_limit: p.limit,
             flow_state_by_node: p.by_node.iter().map(|(n, c)| (*n, *c)).collect(),
+            flow_state_actors: p
+                .owners
+                .iter()
+                .map(|(generation, owner)| {
+                    (*generation, owner.node, owner.registered, owner.charges)
+                })
+                .collect(),
             flow_state_retiring_nodes: p
                 .owners
                 .values()

@@ -3,97 +3,112 @@
 use super::*;
 use crate::node::history_stream::{self as stream, runtime::Flow, Purpose};
 use crate::node::store::Store;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::Ordering;
 use std::sync::Mutex as StdMutex;
 
-type RetirementKey = (Digest32, Digest32, bool, [u8; 16], Digest32);
-pub(super) type RetirementErrors = Arc<StdMutex<BTreeMap<RetirementKey, String>>>;
+type RetirementKey = crate::node::history_budget::RetirementKey;
+type RetirementLedger = crate::node::history_budget::RetirementLedger;
+type RetirementEntry = crate::node::history_budget::RetirementEntry;
 
 fn retirement_key(flow: &Flow) -> RetirementKey {
-    (
-        flow.room,
-        flow.peer,
-        flow.archive,
-        flow.instance,
-        flow.generation,
-    )
+    RetirementKey {
+        actor: flow.actor_incarnation(),
+        request: flow.retirement_request(),
+        node: flow.node,
+        room: flow.room,
+        peer: flow.peer,
+        archive: flow.archive,
+        instance: flow.instance,
+        generation: flow.generation,
+    }
 }
 
-fn note_retirement_error(errors: &RetirementErrors, key: RetirementKey, error: &str) {
-    if let Ok(mut errors) = errors.lock() {
+fn note_retirement_error(ledger: &RetirementLedger, key: RetirementKey, error: &str) {
+    if let Ok(mut errors) = ledger.errors.lock() {
         errors.insert(key, error.to_owned());
     }
 }
 
-fn clear_retirement_error(errors: &RetirementErrors, key: RetirementKey) {
-    if let Ok(mut errors) = errors.lock() {
+fn clear_retirement_error(ledger: &RetirementLedger, key: RetirementKey) {
+    if let Ok(mut errors) = ledger.errors.lock() {
         errors.remove(&key);
     }
 }
 
-struct OwedRetirement {
-    flow: Option<Flow>,
-    errors: RetirementErrors,
+struct RetirementRunner {
+    entry: Arc<RetirementEntry>,
+    ledger: Arc<RetirementLedger>,
     key: RetirementKey,
+    complete: bool,
 }
 
-struct DroppedActorRetirements {
-    keys: BTreeSet<RetirementKey>,
-}
-
-impl Drop for DroppedActorRetirements {
+impl Drop for RetirementRunner {
     fn drop(&mut self) {
-        for key in &self.keys {
-            eprintln!(
-                "vox: actor retirement supervisor ended while cleanup remained owed for {}/{}/{}",
-                crate::node::link::b32_encode(&key.0),
-                crate::node::link::b32_encode(&key.1),
-                if key.2 { "archive" } else { "live" }
-            );
-        }
-    }
-}
-
-impl Drop for OwedRetirement {
-    fn drop(&mut self) {
-        if self.flow.is_some() {
+        self.entry.running.store(false, Ordering::Release);
+        if !self.complete {
             let message = "history retirement task ended before durable cleanup";
-            note_retirement_error(&self.errors, self.key, message);
+            note_retirement_error(&self.ledger, self.key, message);
             eprintln!(
                 "vox: {message} for {}/{}/{}",
-                crate::node::link::b32_encode(&self.key.0),
-                crate::node::link::b32_encode(&self.key.1),
-                if self.key.2 { "archive" } else { "live" }
+                crate::node::link::b32_encode(&self.key.room),
+                crate::node::link::b32_encode(&self.key.peer),
+                if self.key.archive { "archive" } else { "live" }
             );
         }
     }
 }
 
-async fn finish_owed_retirement(flow: Flow, errors: RetirementErrors) {
-    let key = retirement_key(&flow);
-    let mut owed = OwedRetirement {
-        flow: Some(flow),
-        errors,
+async fn finish_owed_retirement(
+    ledger: Arc<RetirementLedger>,
+    entry: Arc<RetirementEntry>,
+    key: RetirementKey,
+) {
+    let mut runner = RetirementRunner {
+        entry,
+        ledger,
         key,
+        complete: false,
     };
     loop {
-        let Some(flow) = owed.flow.as_mut() else {
-            return;
+        let outcome = {
+            let mut held = runner.entry.flow.lock().await;
+            let Some(flow) = held.as_mut() else {
+                runner.complete = true;
+                return;
+            };
+            // A worker panic can return ownership before its normal end-of-round park. Cleanup
+            // is not a running round and must release that charge before doing anything else.
+            flow.park();
+            flow.retire_slice().await
         };
-        match flow.retire_slice().await {
+        match outcome {
             Ok(true) => {
-                clear_retirement_error(&owed.errors, key);
-                owed.flow.take();
+                clear_retirement_error(&runner.ledger, key);
+                runner.entry.flow.lock().await.take();
+                if let Ok(mut entries) = runner.ledger.entries.lock() {
+                    if entries
+                        .get(&key)
+                        .is_some_and(|entry| Arc::ptr_eq(entry, &runner.entry))
+                    {
+                        entries.remove(&key);
+                    }
+                }
+                runner.complete = true;
                 return;
             }
-            Ok(false) => tokio::task::yield_now().await,
+            // A bounded durable slice made progress or awaits local reclamation. Retain exact
+            // ownership and retry forever under the named backoff; never spin on yield_now.
+            Ok(false) => {
+                tokio::time::sleep(crate::node::history_budget::RETIRE_RETRY_BACKOFF).await;
+            }
             Err(error) => {
-                note_retirement_error(&owed.errors, key, &error.to_string());
+                note_retirement_error(&runner.ledger, key, &error.to_string());
                 eprintln!(
                     "vox: history retirement for {}/{}/{} remains owed: {error}",
-                    crate::node::link::b32_encode(&key.0),
-                    crate::node::link::b32_encode(&key.1),
-                    if key.2 { "archive" } else { "live" }
+                    crate::node::link::b32_encode(&key.room),
+                    crate::node::link::b32_encode(&key.peer),
+                    if key.archive { "archive" } else { "live" }
                 );
                 tokio::time::sleep(crate::node::history_budget::RETIRE_RETRY_BACKOFF).await;
             }
@@ -101,17 +116,74 @@ async fn finish_owed_retirement(flow: Flow, errors: RetirementErrors) {
     }
 }
 
-fn spawn_owed_retirement(flow: Flow, errors: RetirementErrors) {
-    let key = retirement_key(&flow);
+fn start_retirement(
+    ledger: &Arc<RetirementLedger>,
+    key: RetirementKey,
+    entry: Arc<RetirementEntry>,
+) {
+    if entry.running.swap(true, Ordering::AcqRel) {
+        return;
+    }
     match tokio::runtime::Handle::try_current() {
         Ok(handle) => {
-            handle.spawn(finish_owed_retirement(flow, errors));
+            let task = handle.spawn(finish_owed_retirement(
+                Arc::clone(ledger),
+                Arc::clone(&entry),
+                key,
+            ));
+            if let Ok(mut retained) = entry.task.lock() {
+                *retained = Some(task);
+            }
         }
         Err(error) => {
             let message = format!("no runtime can finish owed history retirement: {error}");
-            note_retirement_error(&errors, key, &message);
+            entry.running.store(false, Ordering::Release);
+            note_retirement_error(ledger, key, &message);
             eprintln!("vox: {message}");
         }
+    }
+}
+
+fn adopt_retirement_cell(
+    ledger: &Arc<RetirementLedger>,
+    key: RetirementKey,
+    flow: Arc<tokio::sync::Mutex<Option<Flow>>>,
+) {
+    let entry = {
+        let mut entries = ledger
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(entries.entry(key).or_insert_with(|| {
+            Arc::new(RetirementEntry {
+                flow,
+                running: std::sync::atomic::AtomicBool::new(false),
+                task: StdMutex::new(None),
+            })
+        }))
+    };
+    start_retirement(ledger, key, entry);
+}
+
+fn spawn_owed_retirement(mut flow: Flow, ledger: Arc<RetirementLedger>) {
+    flow.park();
+    let key = retirement_key(&flow);
+    adopt_retirement_cell(&ledger, key, Arc::new(tokio::sync::Mutex::new(Some(flow))));
+}
+
+fn resume_owed_retirements(ledger: &Arc<RetirementLedger>) {
+    let entries = ledger
+        .entries
+        .lock()
+        .map(|entries| {
+            entries
+                .iter()
+                .map(|(key, entry)| (*key, Arc::clone(entry)))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    for (key, entry) in entries {
+        start_retirement(ledger, key, entry);
     }
 }
 
@@ -211,7 +283,7 @@ pub(super) struct Controller {
     cleanup_due: Option<std::time::Instant>,
     /// Per-flow retirement failures outlive controller replacement and remain visible until that
     /// exact flow reaches its durable end. An unrelated cleanup can never clear another's error.
-    retirement_errors: RetirementErrors,
+    retirement_ledger: Arc<RetirementLedger>,
     /// Workers publish their durable result before notifying this coalesced edge. `Notify`
     /// retains a permit while the actor is elsewhere; one wake audits every result slot, so no
     /// completion can be stranded behind the actor's bounded event queue.
@@ -230,11 +302,9 @@ impl Drop for Controller {
             .iter_mut()
             .filter_map(Option::take)
             .collect::<Vec<_>>();
-        if flows.is_empty() && cleanup.is_none() && running.is_empty() {
-            return;
-        }
-        for flow in &flows {
+        for flow in &mut flows {
             flow.cancel();
+            flow.park();
         }
         if let Some(cleanup) = &cleanup {
             for cancellation in &cleanup.cancellations {
@@ -244,81 +314,25 @@ impl Drop for Controller {
         for work in &running {
             work.fence.retire();
         }
-        let errors = Arc::clone(&self.retirement_errors);
+        let ledger = Arc::clone(&self.retirement_ledger);
         let message = "actor ended with durable history retirement still owed";
-        let mut owed_keys: BTreeSet<RetirementKey> = flows.iter().map(retirement_key).collect();
-        if let Some(cleanup) = &cleanup {
-            owed_keys.insert(cleanup.key);
+        for flow in flows {
+            let key = retirement_key(&flow);
+            note_retirement_error(&ledger, key, message);
+            spawn_owed_retirement(flow, Arc::clone(&ledger));
         }
-        for work in &running {
-            owed_keys.insert(work.retirement_key);
+        if let Some(cleanup) = cleanup {
+            note_retirement_error(&ledger, cleanup.key, message);
+            adopt_retirement_cell(&ledger, cleanup.key, cleanup.flow);
+            // Dropping the handle detaches an already-running bounded slice, but ownership is
+            // now in the daemon ledger; its runner waits on the same cell and cannot race it.
+            drop(cleanup.task);
         }
-        for key in &owed_keys {
-            note_retirement_error(&errors, *key, message);
+        for work in running {
+            note_retirement_error(&ledger, work.retirement_key, message);
+            adopt_retirement_cell(&ledger, work.retirement_key, work.flow);
+            drop(work.task);
         }
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            eprintln!(
-                "vox: actor ended with {} direct, {} running and {} cleanup history retirements \
-                 still owed; no runtime remained to finish them",
-                flows.len(),
-                running.len(),
-                usize::from(cleanup.is_some())
-            );
-            for key in &owed_keys {
-                eprintln!(
-                    "vox: history retirement remains owed for {}/{}/{}",
-                    crate::node::link::b32_encode(&key.0),
-                    crate::node::link::b32_encode(&key.1),
-                    if key.2 { "archive" } else { "live" }
-                );
-            }
-            return;
-        };
-        runtime.spawn(async move {
-            let mut owed = DroppedActorRetirements { keys: owed_keys };
-            if let Some(cleanup) = cleanup {
-                let cleanup_key = cleanup.key;
-                let joined = cleanup.task.await;
-                let outcome = cleanup
-                    .result
-                    .lock()
-                    .ok()
-                    .and_then(|mut result| result.take());
-                if let Some(flow) = cleanup.flow.lock().await.take() {
-                    match outcome {
-                        Some(Ok(true)) => {
-                            clear_retirement_error(&errors, retirement_key(&flow));
-                            owed.keys.remove(&cleanup_key);
-                        }
-                        Some(Ok(false) | Err(_)) | None => flows.push(flow),
-                    }
-                }
-                if joined.is_err() {
-                    eprintln!("vox: dropped actor's history cleanup worker panicked");
-                }
-            }
-            for work in running {
-                let work_key = work.retirement_key;
-                let joined = work.task.await;
-                if joined.is_err() {
-                    eprintln!("vox: dropped actor's bounded history supervisor panicked");
-                }
-                if let Some(flow) = work.flow.lock().await.take() {
-                    flows.push(flow);
-                } else {
-                    note_retirement_error(
-                        &errors,
-                        work_key,
-                        "bounded history worker returned no retirement owner",
-                    );
-                }
-            }
-            for flow in flows {
-                let key = retirement_key(&flow);
-                spawn_owed_retirement(flow, Arc::clone(&errors));
-                owed.keys.remove(&key);
-            }
-        });
     }
 }
 
@@ -327,8 +341,9 @@ impl Controller {
         self.completion_wake = wake;
     }
 
-    pub(super) fn set_retirement_errors(&mut self, errors: RetirementErrors) {
-        self.retirement_errors = errors;
+    pub(super) fn set_retirement_ledger(&mut self, ledger: Arc<RetirementLedger>) {
+        self.retirement_ledger = ledger;
+        resume_owed_retirements(&self.retirement_ledger);
     }
 
     pub(super) fn completion_wake(&self) -> Arc<tokio::sync::Notify> {
@@ -584,13 +599,13 @@ impl Controller {
                 match result.unwrap_or(Err(crate::error::Error::Profile(
                     "history retirement worker stopped",
                 ))) {
-                    Ok(true) => clear_retirement_error(&self.retirement_errors, key),
+                    Ok(true) => clear_retirement_error(&self.retirement_ledger, key),
                     Ok(false) => {
                         self.retiring.push_back(flow);
                     }
                     Err(error) => {
                         eprintln!("vox: history retirement is pending: {error}");
-                        note_retirement_error(&self.retirement_errors, key, &error.to_string());
+                        note_retirement_error(&self.retirement_ledger, key, &error.to_string());
                         self.retiring.push_back(flow);
                         self.cleanup_due = Some(
                             std::time::Instant::now()
@@ -606,7 +621,7 @@ impl Controller {
                 }
             } else {
                 note_retirement_error(
-                    &self.retirement_errors,
+                    &self.retirement_ledger,
                     cleanup.key,
                     "history retirement owner unavailable",
                 );
@@ -672,17 +687,17 @@ impl Controller {
                         "history retirement result vanished"
                     }))
                 }) {
-                    Ok(true) => clear_retirement_error(&self.retirement_errors, key),
+                    Ok(true) => clear_retirement_error(&self.retirement_ledger, key),
                     Ok(false) => self.retiring.push_back(flow),
                     Err(error) => {
-                        note_retirement_error(&self.retirement_errors, key, &error.to_string());
+                        note_retirement_error(&self.retirement_ledger, key, &error.to_string());
                         self.retiring.push_back(flow);
                         return Err(error);
                     }
                 }
             } else {
                 note_retirement_error(
-                    &self.retirement_errors,
+                    &self.retirement_ledger,
                     key,
                     "history retirement owner vanished",
                 );
@@ -771,7 +786,7 @@ impl Controller {
                 Ok(true) => {}
                 Ok(false) => {
                     self.retiring.push_back(flow);
-                    tokio::task::yield_now().await;
+                    tokio::time::sleep(crate::node::history_budget::RETIRE_RETRY_BACKOFF).await;
                 }
                 Err(error) => {
                     self.retiring.push_back(flow);
@@ -914,22 +929,22 @@ impl Controller {
             // Memory admission may still be held by a fenced actual worker. Keep this
             // owner until a later bounded slice observes the erased key.
             match flow.retire_slice().await {
-                Ok(true) => clear_retirement_error(&self.retirement_errors, retirement_key(&flow)),
+                Ok(true) => clear_retirement_error(&self.retirement_ledger, retirement_key(&flow)),
                 Ok(false) => {
                     self.retiring.push_back(flow);
-                    tokio::task::yield_now().await;
+                    tokio::time::sleep(crate::node::history_budget::RETIRE_RETRY_BACKOFF).await;
                 }
                 Err(error) => {
                     eprintln!("vox: history retirement is pending: {error}");
                     note_retirement_error(
-                        &self.retirement_errors,
+                        &self.retirement_ledger,
                         retirement_key(&flow),
                         &error.to_string(),
                     );
                     // A permanent local error must not hold lock/unlock or shutdown forever.
                     // Ownership moves to the daemon runtime, which keeps retrying under the
                     // named policy while the stable status ledger remains visible.
-                    spawn_owed_retirement(flow, Arc::clone(&self.retirement_errors));
+                    spawn_owed_retirement(flow, Arc::clone(&self.retirement_ledger));
                 }
             }
         }
@@ -2200,6 +2215,7 @@ impl Node {
         let flow = Arc::new(tokio::sync::Mutex::new(Some(flow)));
         let result = Arc::new(StdMutex::new(None));
         let worker_flow = Arc::clone(&flow);
+        let settlement_flow = Arc::clone(&flow);
         let output = result.clone();
         let worker_fence = fence.clone();
         let completion_wake = self.bounded_sync.completion_wake();
@@ -2250,6 +2266,11 @@ impl Node {
                 Ok(error) => (error, None),
                 Err(error) => (None, Some(error.to_string())),
             };
+            // The inner task can unwind before its normal `park`. Its supervisor owns the exact
+            // settlement edge and releases the running charge before publishing completion.
+            if let Some(flow) = settlement_flow.lock().await.as_mut() {
+                flow.park();
+            }
             if let Ok(mut result) = output.lock() {
                 *result = Some(Returned { error, panic });
             }
@@ -2281,17 +2302,24 @@ impl Controller {
     pub(super) fn lanes_json(&self) -> String {
         use crate::node::link::b32_encode;
         let retirement_errors = self
-            .retirement_errors
+            .retirement_ledger
+            .errors
             .lock()
             .map(|errors| errors.clone())
             .unwrap_or_default();
         let cleanup_errors = retirement_errors
             .iter()
-            .map(|((room, peer, archive, _, _), error)| {
+            .map(|(key, error)| {
                 format!(
-                    "{{\"room\":\"{}\",\"peer\":\"{}\",\"archive\":{archive},\"error\":{}}}",
-                    b32_encode(room),
-                    b32_encode(peer),
+                    "{{\"actor\":{},\"request\":\"{}\",\"room\":\"{}\",\"peer\":\"{}\",\"archive\":{},\"error\":{}}}",
+                    key.actor.map_or_else(|| "null".to_owned(), |actor| actor.to_string()),
+                    key.request
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<String>(),
+                    b32_encode(&key.room),
+                    b32_encode(&key.peer),
+                    key.archive,
                     serde_json::to_string(error).unwrap_or_else(|_| "null".to_owned())
                 )
             })

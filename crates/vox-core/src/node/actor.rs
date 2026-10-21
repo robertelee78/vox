@@ -4925,9 +4925,9 @@ pub struct Node {
     /// Stable across lock/unlock controller replacement, so every generation's completion wakes
     /// the one actor select that audits its durable result slots.
     bounded_completion_wake: Arc<tokio::sync::Notify>,
-    /// Per-flow retirement failures survive lock/unlock controller replacement until the exact
-    /// owed cleanup completes.
-    bounded_retirement_errors: bounded_sync::RetirementErrors,
+    /// Exact retirement ownership and failures live on the daemon budget, so they survive both
+    /// lock/unlock controller replacement and this actor unwinding until cleanup completes.
+    bounded_retirement_ledger: Arc<crate::node::history_budget::RetirementLedger>,
     history_hints: Arc<crate::node::history_stream::HintInbox>,
     /// Peers' acknowledgements of this node's own feed reported by lane rounds, applied on
     /// the next schedule (`note_held`).
@@ -5712,15 +5712,15 @@ impl Node {
                 Err(error) => (Vec::new(), Some(error.to_string())),
             };
         let bounded_completion_wake = Arc::new(tokio::sync::Notify::new());
-        let bounded_retirement_errors = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
+        let bounded_retirement_ledger = history_budget.retirement_ledger();
         let mut bounded_sync = bounded_sync::Controller::default();
         bounded_sync.set_completion_wake(Arc::clone(&bounded_completion_wake));
-        bounded_sync.set_retirement_errors(Arc::clone(&bounded_retirement_errors));
+        bounded_sync.set_retirement_ledger(Arc::clone(&bounded_retirement_ledger));
         let node = Self {
             history_demand: history_demand::Controller::default(),
             bounded_sync,
             bounded_completion_wake,
-            bounded_retirement_errors,
+            bounded_retirement_ledger,
             history_hints: crate::node::history_stream::HintInbox::new(),
             held_notes: Vec::new(),
             history_budget,
@@ -14928,6 +14928,10 @@ impl Node {
             u64::try_from(now.saturating_duration_since(t).as_millis()).unwrap_or(u64::MAX)
         };
         let (in_use, per_peer) = crate::node::ports::Slots::snapshot(&self.slots);
+        let actor_incarnation = self
+            .flow_pool_registration
+            .as_ref()
+            .map(crate::node::history_budget::FlowPoolRegistration::actor_incarnation);
         let per_peer: Vec<String> = per_peer
             .iter()
             .map(|(p, n)| format!("\"{}\":{n}", b32_encode(p)))
@@ -14974,13 +14978,16 @@ impl Node {
                     port.backing_off(now),
                     self.publishing.contains(&(*room, *peer)),
                     connected,
-                    me.is_some_and(|me| b.flow_state_running.contains(&(me, *room, *peer))),
+                    actor_incarnation.zip(me).is_some_and(|(actor, me)| {
+                        b.flow_state_running
+                            .contains(&(actor, me, *room, *peer))
+                    }),
                     last
                 )
             })
             .collect();
         format!(
-            "{{\"slots\":{{\"in_use\":{in_use},\"limit\":{},\"per_peer\":{{{}}}}},\"budget\":{{\"archive_nodes\":[{}],\"archive_jobs\":{},\"control\":{},\"foreground\":{},\"foreground_jobs\":{},\"queued\":[{},{},{},{}],\"flow_state\":{{\"in_use\":{},\"limit\":{},\"by_node\":{{{}}},\"retiring_nodes\":[{}]}}}},\"bounded\":{},\"history\":{},\"next_request_in_ms\":{},\"ports\":[{}]}}",
+            "{{\"slots\":{{\"in_use\":{in_use},\"limit\":{},\"per_peer\":{{{}}}}},\"budget\":{{\"archive_nodes\":[{}],\"archive_jobs\":{},\"control\":{},\"foreground\":{},\"foreground_jobs\":{},\"queued\":[{},{},{},{}],\"flow_state\":{{\"in_use\":{},\"limit\":{},\"by_node\":{{{}}},\"actors\":[{}],\"running\":[{}],\"retiring_nodes\":[{}]}}}},\"bounded\":{},\"history\":{},\"next_request_in_ms\":{},\"ports\":[{}]}}",
             crate::node::ports::OUTBOUND_SLOTS,
             per_peer.join(","),
             archive_nodes.join(","),
@@ -14997,6 +15004,24 @@ impl Node {
             b.flow_state_by_node
                 .iter()
                 .map(|(n, c)| format!("\"{}\":{c}", b32_encode(n)))
+                .collect::<Vec<_>>()
+                .join(","),
+            b.flow_state_actors
+                .iter()
+                .map(|(actor, node, registered, in_use)| format!(
+                    "{{\"actor\":{actor},\"node\":\"{}\",\"registered\":{registered},\"in_use\":{in_use}}}",
+                    b32_encode(node)
+                ))
+                .collect::<Vec<_>>()
+                .join(","),
+            b.flow_state_running
+                .iter()
+                .map(|(actor, node, room, peer)| format!(
+                    "{{\"actor\":{actor},\"node\":\"{}\",\"room\":\"{}\",\"peer\":\"{}\"}}",
+                    b32_encode(node),
+                    b32_encode(room),
+                    b32_encode(peer)
+                ))
                 .collect::<Vec<_>>()
                 .join(","),
             b.flow_state_retiring_nodes
@@ -17859,7 +17884,7 @@ impl Node {
         self.bounded_sync
             .set_completion_wake(Arc::clone(&self.bounded_completion_wake));
         self.bounded_sync
-            .set_retirement_errors(Arc::clone(&self.bounded_retirement_errors));
+            .set_retirement_ledger(Arc::clone(&self.bounded_retirement_ledger));
         bounded_sync.fence();
         self.history_hints.clear();
         let mut history_demand = std::mem::take(&mut self.history_demand);

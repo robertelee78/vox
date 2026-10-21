@@ -96,7 +96,9 @@ mod attach;
 mod typed;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
+#[cfg(feature = "optional-proofs")]
+use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};

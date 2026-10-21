@@ -422,9 +422,12 @@ The decider then answered twelve questions, one at a time. His answers are the d
   port runs. It MUST report the pool under `lanes.budget.flow_state` as the integers `in_use`
   and `limit` and, under `by_node`, an object with exactly one member per hosted node, keyed by
   that node's node ID, whose value is that node's integer in-use count; the member values MUST
-  sum to `in_use`; a node's `round_running` values and its own `by_node` member MUST be taken
-  from one snapshot, and that member MUST equal the number of that node's ports whose
-  `round_running` is true. While at least one port in a room has an entry in the daemon-wide
+  sum to `in_use`. The same snapshot MUST list `actors`, with the unique actor incarnation,
+  node ID, registration state and in-use count for every active or retiring generation, and
+  `running`, with the incarnation/node/room/peer of every charge; old and replacement actors of
+  one fingerprint MUST NOT be collapsed. A node's `round_running` values and its active actor
+  member MUST be taken from that snapshot, and that member MUST equal the number of that node's
+  ports whose `round_running` is true. While at least one port in a room has an entry in the daemon-wide
   flow-state wait queue, any "no completed sync" text shown for that room in `vox status` or in
   the app MUST contain the literal text `flow-state pool`; when no port in the room has such an
   entry, that text MUST NOT identify the flow-state pool as the cause. Measured cause,

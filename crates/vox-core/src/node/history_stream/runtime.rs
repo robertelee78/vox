@@ -206,6 +206,14 @@ pub(crate) enum Resumed {
 }
 
 impl Flow {
+    pub(crate) fn retirement_request(&self) -> RequestId {
+        self.request
+    }
+
+    pub(crate) fn actor_incarnation(&self) -> Option<u64> {
+        self.cleanup_job.flow_owner()
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn foreground(
         room: Digest32,
