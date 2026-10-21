@@ -928,7 +928,7 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         member_held_through_state(&alice, &room, &fps[1]).unwrap_or_else(|| {
             panic!(
                 "PRODUCT: while Bob's role-complete receipt path was held, Alice's shipped \
-                 status did not name Bob as a room member"
+                 status did not name Bob with a null or numeric held_through receipt"
             )
         });
     assert_ne!(
@@ -2032,22 +2032,26 @@ fn member_held_through(dir: &Path, room: &str, member: &str) -> Option<u64> {
 }
 
 /// The shipped status observation for one member's receipt of this node's feed. Outer `None`
-/// means the command, room, or member was absent; inner `None` is the valid no-receipt state.
+/// means the command, room, member, or receipt field was absent or malformed; inner `None` is
+/// exclusively the valid JSON-null no-receipt state.
 fn member_held_through_state(dir: &Path, room: &str, member: &str) -> Option<Option<u64>> {
     let (ok, out, _) = vox(dir, &["status", "--json"], None);
     if !ok {
         return None;
     }
     let value: serde_json::Value = serde_json::from_str(&out).ok()?;
-    let held = value["rooms"]
+    let row = value["rooms"]
         .as_array()?
         .iter()
         .find(|row| row["id"].as_str().is_some_and(|id| id.starts_with(room)))?["members"]
         .as_array()?
         .iter()
-        .find(|row| row["id"].as_str() == Some(member))?["held_through"]
-        .as_u64();
-    Some(held)
+        .find(|row| row["id"].as_str() == Some(member))?;
+    match row.get("held_through")? {
+        serde_json::Value::Null => Some(None),
+        serde_json::Value::Number(value) => value.as_u64().map(Some),
+        _ => None,
+    }
 }
 
 /// The local role-complete cursor for `member` as the shipped status command reports it.
