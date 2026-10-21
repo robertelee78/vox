@@ -720,6 +720,54 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         );
         std::thread::sleep(Duration::from_millis(200));
     }
+
+    // Alice must trust Carol before Carol builds the competing-author suffix.  The key from an
+    // author this owner has not trusted is correctly refused, so asking Carol's status whether
+    // Alice held that suffix before this decision would be impossible staging, not a slow
+    // machine.  Put Alice's row and the private package on her feed first while Carol's package
+    // installer is causally held; that preserves the later non-recipient header/body boundary.
+    let before_package_text = "alice row before carol's package";
+    let (ok, out, err) = vox(&alice, &["room", "post", &room, before_package_text], None);
+    assert!(
+        ok,
+        "PRODUCT: alice's row before the private package was refused: {out}{err}"
+    );
+    let before_package_hash = read_hash(&alice, &room, before_package_text).unwrap_or_else(|| {
+        panic!(
+            "PRODUCT: alice's shipped JSON read omitted the accepted row before the private package"
+        )
+    });
+    let before_package = status_rows(&alice, &room).unwrap_or_else(|| {
+        panic!(
+            "PRODUCT: alice's `vox status --json` did not report the room before the private \
+             package was staged"
+        )
+    });
+    let (ok, _, err) = vox(&alice, &["trust", "add", &fps[2], "--name", "carol"], None);
+    assert!(
+        ok,
+        "PRODUCT: alice's `vox trust add` of carol failed: {err}"
+    );
+    // The shipped status observations establish both sides of the apparatus boundary: Alice
+    // durably appended and finished offering the recipient-scoped package, while Carol retained
+    // package work because the explicit hold file still exists.  Releasing that same file near
+    // the end of the journey is what permits installation; elapsed time is only its watchdog.
+    let package_deadline = Instant::now() + READY_WITHIN;
+    while status_rows(&alice, &room).is_none_or(|entries| entries <= before_package)
+        || member_key_waits(&alice, &fps[2]) != Some(None)
+        || key_packages_pending(&carol, &room) != Some(true)
+    {
+        assert!(
+            Instant::now() < package_deadline,
+            "APPARATUS: Alice did not durably append/offer Carol's package and Carol did not \
+             report its retained installation work within {READY_WITHIN:?}; the held private \
+             package was not staged\nalice said: {}\ncarol said: {}",
+            said(&alice, "alice"),
+            said(&carol, "carol")
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
     let carol_successors = vox_core::log::history::MAX_PAGE_ENTRIES + 1;
     for n in 0..carol_successors {
         let text = format!("carol settled successor {n}");
@@ -746,45 +794,6 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
     }
     let carol_bob_sync_before = member_last_sync(&carol, &room, &fps[1]);
     carol_daemon.stop();
-    let before_package_text = "alice row before carol's package";
-    let (ok, out, err) = vox(&alice, &["room", "post", &room, before_package_text], None);
-    assert!(
-        ok,
-        "PRODUCT: alice's row before the private package was refused: {out}{err}"
-    );
-    let before_package_hash = read_hash(&alice, &room, before_package_text).unwrap_or_else(|| {
-        panic!(
-            "PRODUCT: alice's shipped JSON read omitted the accepted row before the private package"
-        )
-    });
-    let before_package = status_rows(&alice, &room).unwrap_or_else(|| {
-        panic!(
-            "PRODUCT: alice's `vox status --json` did not report the room before the private \
-             package was staged"
-        )
-    });
-    let (ok, _, err) = vox(&alice, &["trust", "add", &fps[2], "--name", "carol"], None);
-    assert!(
-        ok,
-        "PRODUCT: alice's `vox trust add` of carol failed: {err}"
-    );
-    // With the recipient offline, the shipped daemon's store-and-forward path appends the
-    // recipient-scoped package. `entries` is the operator-visible durable log count, and the
-    // member's `key_waits` clearing says that the offline delivery finished; together they rule
-    // out mistaking only the public consent record for the package.
-    let package_deadline = Instant::now() + READY_WITHIN;
-    while status_rows(&alice, &room).is_none_or(|entries| entries <= before_package)
-        || member_key_waits(&alice, &fps[2]) != Some(None)
-    {
-        assert!(
-            Instant::now() < package_deadline,
-            "APPARATUS: alice's visible room entry count did not advance within \
-             {READY_WITHIN:?} while carol was offline; the key-package was not staged\n\
-             alice's daemon said: {}",
-            said(&alice, "alice")
-        );
-        std::thread::sleep(Duration::from_millis(200));
-    }
     let before_private_suffix = room_own_feed_through(&alice, &room).unwrap_or_else(|| {
         panic!(
             "PRODUCT: alice's `vox status --json` did not name her feed before the private \
