@@ -19,8 +19,8 @@ struct Pending {
 }
 /// A hint a peer answered for already: it said it does not hold the missing bodies of this
 /// author's newest window (ADR-038 FX-29). The peer is not asked for that hint again until its
-/// inventory names another head for the author; a restart forgets it, so the first period after
-/// one asks once more.
+/// inventory names another head for the author. The durable room record reconstructs this
+/// process-local index after a restart before the same inventory can be offered.
 #[derive(Clone, Copy)]
 struct Declined {
     room: Digest32,

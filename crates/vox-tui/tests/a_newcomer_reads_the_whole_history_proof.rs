@@ -506,6 +506,8 @@ const ASK_EVERY: Duration = Duration::from_secs(5);
 /// this staging), the host's daemon moved 13.2 MB in and 13.2 MB out in the idle minute, about
 /// 200 KiB per allowed round: the idle re-pull of a sparse author's hint (ADR-038 FX-29).
 const ROUND_BYTES: u64 = 64 * 1024;
+const INVENTORY_REARM_WITHIN: Duration =
+    Duration::from_secs(2 * vox_core::node::syncstream::SYNC_INTERVAL_SECS);
 /// A fifth node hosted by the same daemon. It is trusted before anyone posts, but joins only
 /// after every holder has pruned those post bodies, leaving a real sparse history window.
 const SPARSE: &str = "late";
@@ -5236,4 +5238,5 @@ fn newcomer_reads_the_whole_history(
     drop(alice_daemon);
     (to_alice, to_bob)
 }
+
 

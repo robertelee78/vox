@@ -29,6 +29,112 @@ pub(crate) enum HistoryPayload {
 }
 
 impl ChannelState {
+    /// The current membership incarnation whose inventory a refusal describes. A leave makes
+    /// this absent; a readmission uses the leave position until the member's signed `back`
+    /// statement supplies its newer position. Thus the same scalar head after a real scope
+    /// removal is a changed inventory lifetime, while a socket reconnect is not.
+    pub(crate) fn history_inventory_incarnation(&self, member: &Digest32) -> Option<u64> {
+        if !self.is_member(member) {
+            return None;
+        }
+        if let Some(left) = self.left_at(member) {
+            if self.readmitted.get(member) == Some(&left) {
+                return Some(left);
+            }
+        }
+        Some(
+            self.presence
+                .get(member)
+                .and_then(|presence| presence.back)
+                .map_or(0, |(seq, _)| seq),
+        )
+    }
+
+    /// The admitted author's inventory lifetime, including a historical author who has left.
+    /// Peers may still advertise that author's terminal head after the departure. The departure
+    /// itself clears prior refusals; if the same historical head is subsequently advertised, it
+    /// becomes one new exact decision scoped to the departed author's terminal position.
+    pub(crate) fn history_author_inventory_incarnation(&self, author: &Digest32) -> Option<u64> {
+        if !self.is_author(author) {
+            return None;
+        }
+        if let Some(left) = self.left_at(author) {
+            return Some(left);
+        }
+        Some(
+            self.presence
+                .get(author)
+                .and_then(|presence| presence.back)
+                .map_or(0, |(seq, _)| seq),
+        )
+    }
+
+    /// Persist one exact refusal before the flow treats it as settled. Repeating the same
+    /// decision is write-free; a successor replaces it under the same real relationship key.
+    pub(crate) fn remember_history_decline(
+        &self,
+        store: &Store,
+        peer: Digest32,
+        author: Digest32,
+        head: Digest32,
+    ) -> Result<()> {
+        let peer_incarnation =
+            self.history_inventory_incarnation(&peer)
+                .ok_or(Error::MalformedGovernance(
+                    "declined history source is not a member",
+                ))?;
+        let author_incarnation = self.history_author_inventory_incarnation(&author).ok_or(
+            Error::MalformedGovernance("declined history author is not admitted"),
+        )?;
+        let read = self.history_read(store)?;
+        if read.history_declined_head(&peer, &author)?
+            == Some((head, peer_incarnation, author_incarnation))
+        {
+            return Ok(());
+        }
+        drop(read);
+        self.history_write(store, |index| {
+            index.keep_history_declined_head(
+                peer,
+                author,
+                head,
+                peer_incarnation,
+                author_incarnation,
+            )
+        })
+    }
+
+    /// A relevant advertised successor or an ended membership scope removes the durable
+    /// refusal. The in-memory inbox mirrors this same lifecycle.
+    pub(crate) fn forget_history_decline(
+        &self,
+        store: &Store,
+        peer: Digest32,
+        author: Digest32,
+    ) -> Result<()> {
+        let read = self.history_read(store)?;
+        if read.history_declined_head(&peer, &author)?.is_none() {
+            return Ok(());
+        }
+        drop(read);
+        self.history_write(store, |index| {
+            index.forget_history_declined_head(peer, author)
+        })
+    }
+
+    pub(crate) fn forget_history_declines_for_member(
+        &self,
+        store: &Store,
+        member: Digest32,
+    ) -> Result<()> {
+        let read = self.history_read(store)?;
+        if !read.history_declined_member_exists(member)? {
+            return Ok(());
+        }
+        drop(read);
+        self.history_write(store, |index| index.forget_history_declined_member(member))
+    }
+
     pub(crate) fn uses_sparse_history(&self, store: &Store) -> Result<bool> {
         if self.poisoned {
             return Err(self.save_failure());

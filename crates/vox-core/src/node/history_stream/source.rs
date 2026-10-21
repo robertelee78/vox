@@ -50,6 +50,29 @@ pub(super) struct Source {
 }
 
 impl Source {
+    /// Durably remember that this exact source refused this author's advertised head before the
+    /// live flow treats the refusal as complete. A restart reconstructs the inbox from it.
+    pub(super) async fn remember_decline(
+        &self,
+        job: &Job,
+        author: Digest32,
+        head: Digest32,
+    ) -> Result<()> {
+        let peer = self.peer;
+        match self
+            .read_charged(job, 0, 0, move |room, store| {
+                room.remember_history_decline(store, peer, author, head)?;
+                Ok(Some(()))
+            })
+            .await?
+        {
+            Lookup::Found(_) => Ok(()),
+            Lookup::Busy | Lookup::Missing => {
+                Err(Error::Unreachable("history refusal was not persisted"))
+            }
+        }
+    }
+
     pub(super) fn new(
         room: Arc<Mutex<ChannelState>>,
         store: Arc<Store>,
@@ -463,99 +486,139 @@ impl Source {
         };
         let peer = self.peer;
         let slice = hints.to_vec();
+        let peer = self.peer;
+        let output_envelope = 64
+            * (std::mem::size_of::<super::HeadHint>()
+                + std::mem::size_of::<(Digest32, Digest32)>()
+                + std::mem::size_of::<Digest32>());
         let filtered = self
-            .read(
-                job,
-                64 * std::mem::size_of::<super::HeadHint>(),
-                move |room, store| {
-                    let _input_charge = input_charge;
-                    if room.channel_id() != room_id {
-                        return Err(Error::MalformedBundle("inventory room binding"));
-                    }
-                    let read = room.history_read(store)?;
-                    let mut missing = Vec::with_capacity(slice.len());
-                    for hint in slice {
-                        if hint.author == room.me() {
-                            // Inventory is only an unauthoritative scalar hint. Even when its
-                            // signed head is already accepted locally, it does not prove the peer
-                            // completed every effect it owes through that position. Keep the hint
-                            // until Query::Head asks the peer for the authenticated role-complete
-                            // receipt. A previously recorded later receipt makes an older echo
-                            // redundant; no scalar echo itself may advance held_through.
-                            if room.held_through(&peer).is_none_or(|held| held < hint.size) {
-                                missing.push(hint);
-                            }
-                            continue;
+            .read(job, output_envelope, move |room, store| {
+                let _input_charge = input_charge;
+                if room.channel_id() != room_id {
+                    return Err(Error::MalformedBundle("inventory room binding"));
+                }
+                let read = room.history_read(store)?;
+                let mut missing = Vec::with_capacity(slice.len());
+                let mut remembered = Vec::new();
+                let mut changed = Vec::new();
+                let mut mine: Option<u64> = None;
+                let own_contiguous = room.own_verified_head();
+                for hint in slice {
+                    if let Some((declined, peer_incarnation, author_incarnation)) =
+                        read.history_declined_head(&peer, &hint.author)?
+                    {
+                        let current = room
+                            .history_inventory_incarnation(&peer)
+                            .zip(room.history_author_inventory_incarnation(&hint.author));
+                        if declined == hint.head
+                            && current == Some((peer_incarnation, author_incarnation))
+                        {
+                            remembered.push((hint.author, hint.head));
+                        } else {
+                            changed.push(hint.author);
                         }
-                        let state = read
-                            .sparse_author(&hint.author, crate::log::history::LogScope::Public)?;
-                        // An inventory scalar is redundant only when its exact signed head is
-                        // already in this author's accepted consistency chain, its selected
-                        // current live window is complete and its exact control receipt is
-                        // durable. Size alone never suppresses an unknown or same-size conflicting
-                        // head. The live window may omit ordinary archive bodies; the separate
-                        // bounded control closure proves those omitted positions contain no
-                        // unapplied control and is what makes this state restart-complete.
-                        let held = match (state, read.history_head(&hint.head)?) {
-                            (Some(state), Some(advertised))
-                                if advertised.binding.author == hint.author
-                                    && advertised.binding.scope
-                                        == crate::log::history::LogScope::Public
-                                    && advertised.root.leaves == hint.size
-                                    && read.history_head_accepted(
-                                        &hint.head,
-                                        advertised.binding,
-                                    )? =>
+                    }
+                    if hint.author == room.me() {
+                        // The peer names a head of this node's own feed that this node holds
+                        // and accepted: its word that it holds the feed through there.
+                        if let Some(adv) = read.history_head(&hint.head)? {
+                            if adv.binding.author == hint.author
+                                && adv.binding.scope == crate::log::history::LogScope::Public
+                                && adv.root.leaves == hint.size
+                                && read.history_head_accepted(&hint.head, adv.binding)?
                             {
-                                match (state.committed, state.live) {
-                                    (Some(current_id), Some(window))
-                                        if state.control_ready == Some(current_id)
-                                            && window.head == current_id
-                                            && window.complete() =>
-                                    {
-                                        read.history_head(&current_id)?.is_some_and(|current| {
-                                            current.binding == advertised.binding
-                                                && window.through == current.root.leaves
-                                        })
-                                    }
-                                    _ => false,
+                                mine = Some(mine.map_or(hint.size, |m| m.max(hint.size)));
+                                // The own feed is this node's durable fact (ADR-037 R5), and
+                                // R10 never visits the own live window, so the window test
+                                // below would keep every own-head echo as a probe forever:
+                                // a hinted round per peer per inventory that fetched
+                                // nothing. A known, accepted own head within the contiguous
+                                // own feed is held; only a longer own feed elsewhere stays a
+                                // probe, for the own-history conflict detector (R5).
+                                if hint.size <= own_contiguous {
+                                    continue;
                                 }
                             }
-                            _ => false,
-                        };
-                        // One indexed successor lookup, not a scan of older missing bodies.
-                        // Normal retention cleanup removes expired missing positions.
-                        let retry_missing = if held && hint.size != 0 {
-                            let floor = hint
-                                .size
-                                .saturating_sub(crate::log::history::MAX_PAGE_ENTRIES as u64 - 1)
-                                .max(1);
-                            let (positions, _) =
-                                read.missing_page(Some((hint.author, floor - 1)), 1)?;
-                            positions.first().is_some_and(|(author, seq)| {
-                                *author == hint.author && *seq <= hint.size
-                            })
-                        } else {
-                            false
-                        };
-                        if !held
-                            || retry_missing
-                            || (hint.author == room.me()
-                                && room.history_departure_matches(store, hint)?)
-                        {
-                            // Keep this hint as a bounded signed-head receipt probe. It is not
-                            // itself acknowledgement and grants no source or authority.
-                            missing.push(hint);
                         }
                     }
-                    Ok(Some(missing))
-                },
-            )
+                    let state =
+                        read.sparse_author(&hint.author, crate::log::history::LogScope::Public)?;
+                    // An inventory scalar is redundant only when its exact signed head is
+                    // already in this author's accepted consistency chain, its selected
+                    // current live window is complete and its exact control receipt is
+                    // durable. Size alone never suppresses an unknown or same-size conflicting
+                    // head. The live window may omit ordinary archive bodies; the separate
+                    // bounded control closure proves those omitted positions contain no
+                    // unapplied control and is what makes this state restart-complete.
+                    let held = match (state, read.history_head(&hint.head)?) {
+                        (Some(state), Some(advertised))
+                            if advertised.binding.author == hint.author
+                                && advertised.binding.scope
+                                    == crate::log::history::LogScope::Public
+                                && advertised.root.leaves == hint.size
+                                && read
+                                    .history_head_accepted(&hint.head, advertised.binding)? =>
+                        {
+                            match (state.committed, state.live) {
+                                (Some(current_id), Some(window))
+                                    if state.control_ready == Some(current_id)
+                                        && window.head == current_id
+                                        && window.complete() =>
+                                {
+                                    read.history_head(&current_id)?.is_some_and(|current| {
+                                        current.binding == advertised.binding
+                                            && window.through == current.root.leaves
+                                    })
+                                }
+                                _ => false,
+                            }
+                        }
+                        _ => false,
+                    };
+                    // One indexed successor lookup, not a scan of older missing bodies.
+                    // Normal retention cleanup removes expired missing positions.
+                    let retry_missing = if held && hint.size != 0 {
+                        let floor = hint
+                            .size
+                            .saturating_sub(crate::log::history::MAX_PAGE_ENTRIES as u64 - 1)
+                            .max(1);
+                        let (positions, _) =
+                            read.missing_page(Some((hint.author, floor - 1)), 1)?;
+                        positions.first().is_some_and(|(author, seq)| {
+                            *author == hint.author && *seq <= hint.size
+                        })
+                    } else {
+                        false
+                    };
+                    if !held
+                        || retry_missing
+                        || (hint.author == room.me()
+                            && room.history_departure_matches(store, hint)?)
+                    {
+                        // Keep this hint as a bounded signed-head receipt probe. It is not
+                        // itself acknowledgement and grants no source or authority.
+                        missing.push(hint);
+                    }
+                }
+                drop(read);
+                changed.sort_unstable();
+                changed.dedup();
+                for author in changed {
+                    room.forget_history_decline(store, peer, author)?;
+                }
+                Ok(Some((missing, mine, remembered)))
+            })
             .await?;
         match filtered {
             Lookup::Found(filtered) => {
                 self.current()?;
-                inbox.offer(job, generation, room_id, self.peer, &filtered.value)
+                let (missing, mine, remembered) = filtered.value;
+                for (author, head) in remembered {
+                    inbox.decline(room_id, self.peer, author, head);
+                }
+                let mut offer = inbox.offer(job, generation, room_id, self.peer, &missing)?;
+                offer.mine_held = mine;
+                Ok(offer)
             }
             Lookup::Busy | Lookup::Missing => Ok(super::hints::Offer {
                 added: 0,
@@ -564,3 +627,4 @@ impl Source {
         }
     }
 }
+

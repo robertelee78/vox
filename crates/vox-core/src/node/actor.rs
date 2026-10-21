@@ -20068,6 +20068,23 @@ impl Node {
                 .filter(|d| !seen.contains(*d))
                 .copied()
                 .collect();
+            // A refusal is scoped to real source/author membership, so a departure ends it.
+            // Clear it on this once-per-departure edge, not in the per-tick port retirement.
+            if let Some(store) = store.as_ref() {
+                for member in &newly {
+                    let cleared = ch.uses_sparse_history(store).and_then(|sparse| {
+                        if sparse {
+                            ch.forget_history_declines_for_member(store, *member)
+                        } else {
+                            Ok(())
+                        }
+                    });
+                    if let Err(error) = cleared {
+                        ch.poison(&error);
+                        break;
+                    }
+                }
+            }
             let ended_here = ch.ended(now_ms).is_some();
             *seen = departed.iter().copied().collect();
             for b in back {

@@ -1798,6 +1798,12 @@ impl Node {
                     |counts| {
                         counts.completed += 1;
                         counts.reasons.count(reason);
+                        // Returning one dependency turn to its advertising source is a lane
+                        // completion too. If the whole retained flow has brought nothing, this
+                        // completion is empty by the same user-visible accounting rule.
+                        if !flow.brought {
+                            counts.empty += 1;
+                        }
                         counts.backoff = None;
                     },
                 );

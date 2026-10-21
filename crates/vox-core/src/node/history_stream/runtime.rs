@@ -572,6 +572,18 @@ impl Flow {
             Lookup::Busy | Lookup::Missing => None,
         })
     }
+    async fn decline(
+        &self,
+        source: &super::source::Source,
+        job: &Job,
+        inbox: &super::hints::HintInbox,
+        author: Digest32,
+        head: Digest32,
+    ) -> Result<()> {
+        source.remember_decline(job, author, head).await?;
+        inbox.decline(self.room, source.peer, author, head);
+        Ok(())
+    }
     pub(crate) fn done(&self) -> bool {
         self.tasks.is_empty() && self.replay.is_none()
     }
@@ -1431,10 +1443,11 @@ impl Flow {
                             _ => None,
                         });
                     if let Some(author) = author {
-                        inbox.decline(self.room, self.peer, author, head);
+                        self.decline(&source, job, inbox, author, head).await?;
                     }
                     if let Some(hint) = self.hint {
-                        inbox.decline(self.room, self.peer, hint.author, hint.head);
+                        self.decline(&source, job, inbox, hint.author, hint.head)
+                            .await?;
                     }
                     if !self.tasks.iter().any(|pending| matches!(pending.operation,
                         Operation::LiveAdvance { window, .. } if window.head == head && window.next == seq)) {
@@ -1482,7 +1495,7 @@ impl Flow {
                         if let Query::Entry { head, .. } | Query::Page { head, .. } = &query {
                             let head = *head;
                             if let Some(author) = self.head_author(&source, job, head).await? {
-                                inbox.decline(self.room, self.peer, author, head);
+                                self.decline(&source, job, inbox, author, head).await?;
                             }
                         }
                     }
@@ -1508,7 +1521,8 @@ impl Flow {
                         // (ADR-038 FX-29): the asking side stops, whatever the serving side does.
                         if let (Query::Head(author), Some(hint)) = (&query, self.hint) {
                             if hint.author == *author {
-                                inbox.decline(self.room, self.peer, *author, hint.head);
+                                self.decline(&source, job, inbox, *author, hint.head)
+                                    .await?;
                             }
                         }
                         self.tasks.clear();
@@ -1556,7 +1570,8 @@ impl Flow {
                         // was hinted or required. The route to the author's port below still
                         // runs once for this exact query.
                         if let Some(dependency) = dependency {
-                            inbox.decline(self.room, self.peer, dependency.author, dependency.head);
+                            self.decline(&source, job, inbox, dependency.author, dependency.head)
+                                .await?;
                         }
                         if dependency.is_some_and(|head| {
                             head.author != self.peer && head.author != self.node

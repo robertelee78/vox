@@ -291,11 +291,10 @@ fn stage_header(
     })
 }
 
-/// Contexts a verifier generated in this turn, readable by its next joins before they are
-/// committed. The verifier runs to its proof's end, or to the turn's budget, and the turn
-/// commits once (ADR-038 FX-29): committing the context and the cursor after every Merkle join
-/// was ~64% of the idle daemon's commit time. A proof is bounded, and after a crash it is
-/// verified again from its bytes, so progress between joins needs no durability.
+/// Contexts generated while a structurally bounded proof runs to its end. Committing a context
+/// and cursor after every Merkle join was ~64% of the idle daemon's commit time (ADR-038 FX-29).
+/// The original proof bytes stay in the sealed verifier record, so a crash re-verifies from them;
+/// incomplete progress is never durable.
 struct Overlay<'a> {
     inner: &'a entry_store::Read<'a>,
     generated: std::cell::RefCell<Vec<(Digest32, ControlContext)>>,
@@ -313,10 +312,6 @@ impl crate::log::history::ContextSource for Overlay<'_> {
         self.inner.history_context(hash)
     }
 }
-/// Generated contexts a turn holds uncommitted at most, in coordinates: past this the turn
-/// commits them and yields, inside the verifier envelope the caller reserved.
-const TURN_CONTEXT_COORDINATES: usize = 4 * crate::log::history::MAX_CONTEXT_AUTHORS;
-
 pub(super) enum Advanced {
     Progress,
     MissingContext(Digest32),
@@ -325,9 +320,11 @@ pub(super) enum Advanced {
     Busy,
 }
 
-/// One verifier turn: the proof's steps run to its end, or until the turn's work budget is
-/// spent or a context is missing, and what they generated commits once with the cursor (or the
-/// receipt). A missing proof is never fork evidence.
+/// One verifier turn runs the bounded proof to its end. Primitive cooperative slices replenish
+/// their work credit in memory; neither a slice boundary nor a missing context writes generated
+/// nodes or an advanced cursor. Only a completed proof commits its generated contexts with its
+/// receipt/final cursor. A crash or missing-context retry starts from the retained original proof
+/// bytes. A missing proof is never fork evidence.
 pub(super) fn advance(
     room: &ChannelState,
     store: &Store,
@@ -348,7 +345,6 @@ pub(super) fn advance(
     #[allow(clippy::large_enum_variant)]
     enum ResultStep {
         Missing(Digest32),
-        Yielded,
         Included(crate::log::history::IncludedHeader),
         Prefix(crate::log::history::ConsistentPrefix),
         Controls(crate::log::history::VerifiedControlRange),
@@ -357,38 +353,42 @@ pub(super) fn advance(
         inner: &input,
         generated: std::cell::RefCell::new(Vec::new()),
     };
-    let mut held_coordinates = 0usize;
     let result = loop {
         let step = match &mut cursor {
             HistoryVerifier::Inclusion(value) => match value.advance(&overlay, &mut work)? {
                 HistoryStep::Complete(value) => break ResultStep::Included(value),
                 HistoryStep::Progress(value) => value,
                 HistoryStep::MissingContext(hash) => break ResultStep::Missing(hash),
-                HistoryStep::Yielded => break ResultStep::Yielded,
+                HistoryStep::Yielded => {
+                    work = WorkBudget::default();
+                    continue;
+                }
             },
             HistoryVerifier::Consistency(value) => match value.advance(&overlay, &mut work)? {
                 HistoryStep::Complete(value) => break ResultStep::Prefix(value),
                 HistoryStep::Progress(value) => value,
                 HistoryStep::MissingContext(hash) => break ResultStep::Missing(hash),
-                HistoryStep::Yielded => break ResultStep::Yielded,
+                HistoryStep::Yielded => {
+                    work = WorkBudget::default();
+                    continue;
+                }
             },
             HistoryVerifier::ControlRange(value) => {
                 match value.advance(&key, &overlay, &mut work)? {
                     HistoryStep::Complete(value) => break ResultStep::Controls(value),
                     HistoryStep::Progress(value) => value,
                     HistoryStep::MissingContext(hash) => break ResultStep::Missing(hash),
-                    HistoryStep::Yielded => break ResultStep::Yielded,
+                    HistoryStep::Yielded => {
+                        work = WorkBudget::default();
+                        continue;
+                    }
                 }
             }
             HistoryVerifier::Validation(_) => {
                 return Err(invalid("entry closure requires the admission driver"))
             }
         };
-        held_coordinates += step.coordinates.len() + 1;
         overlay.generated.borrow_mut().push((step.hash(), step));
-        if held_coordinates > TURN_CONTEXT_COORDINATES {
-            break ResultStep::Yielded;
-        }
     };
     let generated = overlay.generated.into_inner();
     drop(input);
@@ -399,23 +399,7 @@ pub(super) fn advance(
         Ok(())
     };
     match result {
-        ResultStep::Yielded => {
-            room.history_write(store, |index| {
-                keep_generated(index)?;
-                if !index.keep_history_verifier_cursor(*binding, &cursor)? {
-                    return Err(invalid("existing verifier capacity vanished"));
-                }
-                Ok(())
-            })?;
-            Ok(Advanced::Progress)
-        }
-        ResultStep::Missing(hash) => {
-            room.history_write(store, |index| {
-                keep_generated(index)?;
-                index.keep_history_verifier_cursor(*binding, &cursor)
-            })?;
-            Ok(Advanced::MissingContext(hash))
-        }
+        ResultStep::Missing(hash) => Ok(Advanced::MissingContext(hash)),
         ResultStep::Included(included) => {
             room.history_write(store, |index| {
                 keep_generated(index)?;

@@ -82,6 +82,8 @@ pub(super) struct Roots {
     terminations: u64,
     settled_tips: u64,
     prior_heads: u64,
+    /// One current refused inventory head per `(source peer, author)`.
+    declined_heads: u64,
     author_count: u64,
     obligation_count: u64,
     pub(super) enabled: bool,
@@ -89,7 +91,7 @@ pub(super) struct Roots {
 
 impl Roots {
     pub(super) fn write(self, e: &mut Encoder) {
-        e.array(20)
+        e.array(21)
             .uint(self.objects)
             .uint(self.authors)
             .uint(self.validated_positions)
@@ -107,15 +109,17 @@ impl Roots {
             .uint(self.terminations)
             .uint(self.settled_tips)
             .uint(self.prior_heads)
+            .uint(self.declined_heads)
             .uint(self.author_count)
             .uint(self.obligation_count)
             .uint(u64::from(self.enabled));
     }
     pub(super) fn read(d: &mut Decoder<'_>) -> Result<Self> {
-        if d.array()? != 20 {
+        let arity = d.array()?;
+        if !matches!(arity, 20 | 21) {
             return Err(invalid("sparse roots arity"));
         }
-        Ok(Self {
+        let mut result = Self {
             objects: d.uint()?,
             authors: d.uint()?,
             validated_positions: d.uint()?,
@@ -133,10 +137,18 @@ impl Roots {
             terminations: d.uint()?,
             settled_tips: d.uint()?,
             prior_heads: d.uint()?,
-            author_count: d.uint()?,
-            obligation_count: d.uint()?,
-            enabled: flag(d)?,
-        })
+            declined_heads: 0,
+            author_count: 0,
+            obligation_count: 0,
+            enabled: false,
+        };
+        if arity == 21 {
+            result.declined_heads = d.uint()?;
+        }
+        result.author_count = d.uint()?;
+        result.obligation_count = d.uint()?;
+        result.enabled = flag(d)?;
+        Ok(result)
     }
     pub(super) fn valid_for(self, next: u64) -> bool {
         [
@@ -157,6 +169,7 @@ impl Roots {
             self.terminations,
             self.settled_tips,
             self.prior_heads,
+            self.declined_heads,
         ]
         .iter()
         .all(|root| *root < next)
@@ -192,6 +205,12 @@ impl ObjectKind {
 fn object_key(kind: ObjectKind, hash: &Digest32) -> Key {
     let mut key = hashed(hash);
     key[32] = kind as u8;
+    key
+}
+fn declined_head_key(peer: &Digest32, author: &Digest32) -> Key {
+    let mut key = [0; 64];
+    key[..32].copy_from_slice(peer);
+    key[32..].copy_from_slice(author);
     key
 }
 fn author_key(author: &Digest32, scope: LogScope) -> Key {
@@ -680,6 +699,67 @@ impl Source<'_> {
 }
 
 impl Read<'_> {
+    /// The exact inventory head this source refused for this author, and the two membership
+    /// incarnations that scope that decision. One indexed scalar exists per real relationship.
+    pub(crate) fn history_declined_head(
+        &self,
+        peer: &Digest32,
+        author: &Digest32,
+    ) -> Result<Option<(Digest32, u64, u64)>> {
+        let key = declined_head_key(peer, author);
+        let Some(id) = self.source().number(
+            self.sek,
+            self.channel,
+            self.directory.active.sparse.declined_heads,
+            &key,
+        )?
+        else {
+            return Ok(None);
+        };
+        let bytes = self
+            .source()
+            .sparse_record(self.sek, self.channel, id, STATE_BYTES)?;
+        let mut d = Decoder::new(&bytes);
+        if d.array()? != 6 || d.uint()? != 1 || d.bytes()? != peer || d.bytes()? != author {
+            return Err(invalid("declined history head binding"));
+        }
+        let head = d
+            .bytes()?
+            .try_into()
+            .map_err(|_| invalid("declined history head"))?;
+        let peer_incarnation = d.uint()?;
+        let author_incarnation = d.uint()?;
+        d.finish()?;
+        Ok(Some((head, peer_incarnation, author_incarnation)))
+    }
+
+    pub(crate) fn history_declined_member_exists(&self, member: Digest32) -> Result<bool> {
+        let mut after = None;
+        loop {
+            let seek = match after {
+                Some(key) => match dag_facts::successor(key) {
+                    Some(next) => next,
+                    None => return Ok(false),
+                },
+                None => [0; 64],
+            };
+            let Some((key, _)) = self.source().first(
+                self.sek,
+                self.channel,
+                self.directory.active.sparse.declined_heads,
+                &seek,
+                0,
+            )?
+            else {
+                return Ok(false);
+            };
+            after = Some(key);
+            if key[..32] == member || key[32..] == member {
+                return Ok(true);
+            }
+        }
+    }
+
     pub(crate) fn history_settled_tip(&self, author: &Digest32) -> Result<Option<Entry>> {
         let source = self.source();
         let Some(id) = source.number(
@@ -1059,6 +1139,79 @@ pub(crate) enum SourceProgress {
 }
 
 impl Write<'_, '_> {
+    pub(crate) fn keep_history_declined_head(
+        &mut self,
+        peer: Digest32,
+        author: Digest32,
+        head: Digest32,
+        peer_incarnation: u64,
+        author_incarnation: u64,
+    ) -> Result<()> {
+        self.require_sparse_idle()?;
+        let key = declined_head_key(&peer, &author);
+        let root = self.directory.active.sparse.declined_heads;
+        let old = Source::Batch(self.batch).number(self.sek, self.channel, root, &key)?;
+        let mut e = Encoder::new();
+        e.array(6)
+            .uint(1)
+            .bytes(&peer)
+            .bytes(&author)
+            .bytes(&head)
+            .uint(peer_incarnation)
+            .uint(author_incarnation);
+        let id = self.save_sparse_record(old, &e.finish(), STATE_BYTES)?;
+        self.directory.active.sparse.declined_heads =
+            self.change_value(root, key, Some(Value::Number(id)))?;
+        Ok(())
+    }
+
+    pub(crate) fn forget_history_declined_head(
+        &mut self,
+        peer: Digest32,
+        author: Digest32,
+    ) -> Result<()> {
+        self.require_sparse_idle()?;
+        let key = declined_head_key(&peer, &author);
+        let root = self.directory.active.sparse.declined_heads;
+        if let Some(id) = Source::Batch(self.batch).number(self.sek, self.channel, root, &key)? {
+            self.retire(id)?;
+            self.directory.active.sparse.declined_heads = self.change_value(root, key, None)?;
+        }
+        Ok(())
+    }
+
+    /// Remove every decision whose source or author membership scope ended. The tree contains
+    /// only one row per live relationship, so this is bounded by actual inventory, not a cap.
+    pub(crate) fn forget_history_declined_member(&mut self, member: Digest32) -> Result<()> {
+        self.require_sparse_idle()?;
+        let mut after = None;
+        loop {
+            let seek = match after {
+                Some(key) => match dag_facts::successor(key) {
+                    Some(next) => next,
+                    None => break,
+                },
+                None => [0; 64],
+            };
+            let root = self.directory.active.sparse.declined_heads;
+            let Some((key, value)) =
+                Source::Batch(self.batch).first(self.sek, self.channel, root, &seek, 0)?
+            else {
+                break;
+            };
+            after = Some(key);
+            if key[..32] != member && key[32..] != member {
+                continue;
+            }
+            let Value::Number(id) = value else {
+                return Err(invalid("declined history head locator"));
+            };
+            self.retire(id)?;
+            self.directory.active.sparse.declined_heads = self.change_value(root, key, None)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn publish_local_history(
         &mut self,
         publication: LocalHistoryPublication<'_>,
