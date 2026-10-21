@@ -569,8 +569,9 @@ const IDLE: Duration = Duration::from_secs(60);
 ///
 /// Mutants: the own-head hint offered to every peer on every tick again (`offer_own_head`
 /// ignoring who acknowledged) turns the round-count claim red; undoing role-aware settlement for
-/// the non-recipient package turns the exact held-through assertion red even though Bob still
-/// echoes its merely committed head in inventory; granting body credit persists the hostile
+/// the non-recipient package turns the exact held-through assertion red; restoring direct
+/// inventory credit turns the pre-release no-credit assertion red when Bob echoes Alice's merely
+/// committed head; granting body credit persists the hostile
 /// ciphertext and turns the Bob-only privacy assertion red; moving the archive cursor
 /// below the role-only header before its effect makes the interrupted request finish with debt;
 /// skipping the already-settled callback or rejecting its terminal replay strands the resumed
@@ -606,7 +607,6 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
     for (dir, fp, name) in [
         (&alice, &fps[1], "bob"),
         (&bob, &fps[0], "alice"),
-        (&bob, &fps[2], "carol"),
         (&carol, &fps[0], "alice"),
         (&carol, &fps[1], "bob"),
     ] {
@@ -924,6 +924,21 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
             "APPARATUS: Bob's receiver marker did not match Alice's exact hostile entry"
         );
     }
+    let bob_held_before_receipt =
+        member_held_through_state(&alice, &room, &fps[1]).unwrap_or_else(|| {
+            panic!(
+                "PRODUCT: while Bob's role-complete receipt path was held, Alice's shipped \
+                 status did not name Bob as a room member"
+            )
+        });
+    assert_ne!(
+        bob_held_before_receipt,
+        Some(marker_through),
+        "PRODUCT: while Bob's role-complete receipt path was held before settlement, Alice's \
+         shipped status credited Bob through her exact current feed position {marker_through}; \
+         his echoed inventory scalar was treated as a catch-up receipt (reported \
+         {bob_held_before_receipt:?})"
+    );
     // Stop at the exact durable boundary, then resume through the shipped command. The healthy
     // product parked the refused body at its header; the grant-credit mutant parked the exact
     // forbidden body after append. Either restart must continue this request rather than invent an
@@ -1227,6 +1242,12 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         );
         std::thread::sleep(Duration::from_millis(200));
     }
+    let (ok, out, err) = vox(&bob, &["trust", "add", &fps[2], "--name", "carol"], None);
+    assert!(
+        ok,
+        "PRODUCT: Bob could not trust Carol immediately before their final healthy post: \
+         {out}{err}"
+    );
     let carol_reply = "carol sees the room";
     let (ok, out, err) = vox(&carol, &["room", "post", &room, carol_reply], None);
     assert!(ok, "PRODUCT: carol's post was refused: {out}{err}");
@@ -2007,19 +2028,26 @@ fn room_own_feed_through(dir: &Path, room: &str) -> Option<u64> {
 }
 
 fn member_held_through(dir: &Path, room: &str, member: &str) -> Option<u64> {
+    member_held_through_state(dir, room, member).flatten()
+}
+
+/// The shipped status observation for one member's receipt of this node's feed. Outer `None`
+/// means the command, room, or member was absent; inner `None` is the valid no-receipt state.
+fn member_held_through_state(dir: &Path, room: &str, member: &str) -> Option<Option<u64>> {
     let (ok, out, _) = vox(dir, &["status", "--json"], None);
     if !ok {
         return None;
     }
     let value: serde_json::Value = serde_json::from_str(&out).ok()?;
-    value["rooms"]
+    let held = value["rooms"]
         .as_array()?
         .iter()
         .find(|row| row["id"].as_str().is_some_and(|id| id.starts_with(room)))?["members"]
         .as_array()?
         .iter()
         .find(|row| row["id"].as_str() == Some(member))?["held_through"]
-        .as_u64()
+        .as_u64();
+    Some(held)
 }
 
 /// The local role-complete cursor for `member` as the shipped status command reports it.
