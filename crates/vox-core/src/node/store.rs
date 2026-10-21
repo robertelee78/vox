@@ -27,7 +27,7 @@
 //! the node schedules it after pruning (ADR-016 §Consequences).
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
 
 use redb::{Database, ReadOnlyDatabase, ReadableDatabase, ReadableTable, TableDefinition};
@@ -213,13 +213,19 @@ pub struct StoreCounts {
     pub flushes: u64,
 }
 
-/// The store's running counts and its one pending fact: a received entry committed without a
-/// flush that no peer has been told this node holds yet (ADR-038 FX-30).
+/// The store's running counts and its one pending fact: whether a received entry committed
+/// without a flush is still waiting for one (ADR-038 FX-30), kept as two epochs. Every
+/// Received commit takes the next `received` epoch before its transaction becomes visible, and
+/// every flushed commit records, after it is durable, the `received` epoch it read while it
+/// held redb's one writer; a flush covers exactly the Received commits before it in writer
+/// order. A pending flag stored after the commit was a lost wakeup (a responder saw the entry
+/// and no flag) and an older flush's `false` could overwrite a newer commit's `true`.
 #[derive(Default)]
 struct Counting {
     commits: AtomicU64,
     flushes: AtomicU64,
-    received_pending: AtomicBool,
+    received: AtomicU64,
+    flushed: AtomicU64,
 }
 
 /// What a [`Batch`] holds, which decides how it commits (ADR-038 FX-30). Only what a person
@@ -860,9 +866,12 @@ impl Store {
     /// One flushed, empty write transaction: it carries every commit made without a flush since
     /// the last one to disk (redb persists its pending `Durability::None` commits with the next
     /// `Immediate` one; measured 2026-10-21 on redb 4.3.0: 2,000 unflushed commits then one
-    /// flush, every row on disk after a SIGKILL). Nothing to flush costs one `F_FULLFSYNC` all
-    /// the same, so callers ask [`Self::flush_if_received_pending`] (ADR-038 FX-30). A store
-    /// that is read-only or closed has nothing pending and flushes nothing.
+    /// flush, every row on disk after a SIGKILL; one flush 4 ms on the decider's Mac). It holds
+    /// redb's one writer for that long, so a post begun meanwhile waits in `begin_write` at
+    /// most one flush, as it waited behind any one commit before this, all of which flushed;
+    /// FX-17's bound is a hundred times that. Nothing to flush costs one `F_FULLFSYNC` all the
+    /// same, so callers ask [`Self::flush_if_received_pending`] (ADR-038 FX-30). A store that
+    /// is read-only or closed has nothing pending and flushes nothing.
     ///
     /// # Errors
     /// The transaction cannot be begun or committed.
@@ -876,8 +885,10 @@ impl Store {
 
     /// Flush, if a received entry committed without a flush is still waiting for one: the
     /// moment before this node tells a peer what it holds (its inventory, its answer to a head
-    /// probe), and the end of a sync round that received something (ADR-038 FX-30). Returns
-    /// whether it flushed.
+    /// probe), and the end of a sync round that received something (ADR-038 FX-30). One flush
+    /// per pending epoch: a caller that finds, once it holds redb's writer, that a flush since
+    /// its look covered every Received commit, gives the writer back and flushes nothing.
+    /// Returns whether it flushed.
     ///
     /// # Errors
     /// As [`Self::flush`].
@@ -885,14 +896,25 @@ impl Store {
         if !self.received_pending() {
             return Ok(false);
         }
-        self.flush()?;
+        let txn = match &*self.db.read().unwrap_or_else(PoisonError::into_inner) {
+            Backing::Writable(db) => db.begin_write().map_err(storage("begin flush"))?,
+            Backing::ReadOnly(_) | Backing::Closed => return Ok(false),
+        };
+        // Holding the writer: every Received commit so far has taken its epoch, and every
+        // flush so far has recorded what it covered.
+        if !self.received_pending() {
+            drop(txn);
+            return Ok(false);
+        }
+        self.commit_flushed(txn, "flush")?;
         Ok(true)
     }
 
-    /// Whether a received entry committed without a flush is still waiting for one.
+    /// Whether a received entry committed without a flush is still waiting for one: a Received
+    /// commit took an epoch no flush has covered.
     #[must_use]
     pub fn received_pending(&self) -> bool {
-        self.counts.received_pending.load(Ordering::Acquire)
+        self.counts.received.load(Ordering::Acquire) > self.counts.flushed.load(Ordering::Acquire)
     }
 
     /// What this store has committed since it was opened (ADR-038 FX-30).
@@ -904,12 +926,14 @@ impl Store {
         }
     }
 
-    /// Commit a raw transaction flushed to disk, counted.
+    /// Commit a raw transaction flushed to disk, counted; it covers every Received commit
+    /// before it in writer order (`covered`, read while `txn` holds the writer).
     fn commit_flushed(&self, txn: Cached<redb::WriteTransaction>, op: &'static str) -> Result<()> {
+        let covered = self.counts.received.load(Ordering::Acquire);
         txn.commit().map_err(storage(op))?;
         self.counts.commits.fetch_add(1, Ordering::Relaxed);
         self.counts.flushes.fetch_add(1, Ordering::Relaxed);
-        self.counts.received_pending.store(false, Ordering::Release);
+        self.counts.flushed.fetch_max(covered, Ordering::AcqRel);
         Ok(())
     }
 
@@ -1348,16 +1372,19 @@ impl Batch<'_> {
             txn.set_durability(redb::Durability::None)
                 .map_err(storage("set durability"))?;
         }
+        // This transaction holds redb's one writer: a Received commit takes its epoch before it
+        // becomes visible, and a flushed commit reads the epoch it will cover before it is
+        // durable, so what a reader sees is always owed a flush, and a flush never covers a
+        // commit that came after it (see `Counting`).
+        if matches!(class, Class::Received) {
+            store.counts.received.fetch_add(1, Ordering::AcqRel);
+        }
+        let covered = store.counts.received.load(Ordering::Acquire);
         txn.commit().map_err(storage("commit"))?;
         store.counts.commits.fetch_add(1, Ordering::Relaxed);
         if flushed {
             store.counts.flushes.fetch_add(1, Ordering::Relaxed);
-            store
-                .counts
-                .received_pending
-                .store(false, Ordering::Release);
-        } else if matches!(class, Class::Received) {
-            store.counts.received_pending.store(true, Ordering::Release);
+            store.counts.flushed.fetch_max(covered, Ordering::AcqRel);
         }
         Ok(())
     }
