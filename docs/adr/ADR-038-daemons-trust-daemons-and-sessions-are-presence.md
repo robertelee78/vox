@@ -375,28 +375,39 @@ The decider then answered twelve questions, one at a time. His answers are the d
   persistent file", while the status line said "Unlock with vox node unlock …": the product's
   advice looped into its refusal. Introduced by 6d9f286fa (2026-10-13), shipped in v0.4.5
   through v0.4.9; the Keychain path hid it on macOS.
-- **FX-35.** A flow a node keeps between turns MUST NOT starve a lane: a port with a need
-  MUST start its round even when every parked flow of the daemon holds flow state, so the
-  daemon-wide flow-state pool (`RETAINED_FLOWS`, 16 per daemon today, each 128 KiB) is never
-  held indefinitely by flows that are not running. Decision: a bounded flow that is ready but
-  not running, deferred, retiring or awaiting cleanup holds the pool for at most one period;
-  when a port with a need finds the pool full, the pool is reclaimed from the parked flows,
-  oldest first, of ports with nothing due (a reclaimed flow is disposed and its hint re-arms),
-  and a flow that cannot reserve the pool again when it resumes is disposed, never left to hold
-  its port. No cap is raised and nothing is paced (FX-27). A round that cannot start MUST say
-  why: `vox status --json` names, for every port, the reason its last start ended as it did
-  and the flow-state pool as it stands (in use, limit, by node), and a room's "no completed
-  sync" line names the pool when the pool is the reason, so a person can tell a quiet room from
-  a stuck one. Measured cause, 2026-10-21: on the decider's daemon (four hosted nodes, three
-  rooms, restarted 02:32Z) every port of every node had opened no session, `queued` froze,
-  every room said "no completed sync in 10 minutes", and posts moved neither between the two
-  Macs nor between two nodes of one daemon while the daemons were connected; in the #986
-  staging on main bb4062651, instrumented, every port was eligible, popped and re-queued each
-  pass with `start_bounded_outbound` returning false at `reserve_flow_state` 370,156 times in
-  one run, the pool full (16 of 16) by the first fifth of the run with 1,951 flows started
-  before and none after, the outbound slots 0 of 16 in use and the archive lane empty
-  throughout. The product said only the symptom. "please make vox work"; "be methodical" (the
-  decider, 2026-10-21).
+- **FX-35.** A full daemon-wide flow-state pool MUST NOT keep an eligible port from starting
+  a bounded-sync round while any charge of that pool is held by a parked flow. Terms: a port is
+  eligible when it has a need (ADR-037 R7: a raised request or a head newer than it served), a
+  connection to its peer and no round running; a flow is parked while it sits in `ready`,
+  `deferred`, `retiring` or `cleanup` and no task runs it; the flow-state pool is
+  `RETAINED_FLOWS` charges per daemon (16 today, each 128 KiB), shared by every hosted node.
+  When an eligible port cannot reserve flow state solely because the pool is full, the daemon
+  MUST, before re-queuing the port, dispose enough parked flows to satisfy the reservation,
+  release their charges and retry that port's reservation. Parked flows of ports without a need
+  MUST be chosen first; if they do not suffice, other parked flows MUST be chosen; within either
+  group the flow parked longest MUST be chosen first, ties broken arbitrarily. Reclamation MUST
+  be demand-triggered: the daemon MUST NOT expire or defer a flow by a count of periods or
+  turns, by elapsed time or by CPU time (FX-27). Disposing a flow MUST re-arm only work still
+  outstanding under FX-29; a hint already held MUST NOT become eligible because its flow was
+  reclaimed. `vox status --json` MUST report, for every port, the outcome of its most recent
+  start attempt as `started`, `not_started` or `never_attempted`, with a stable reason code
+  when `not_started` (`flow_state_pool_full` after the reclamation above still fails,
+  `live_lane_busy`, `room_busy`, `control_budget_busy`, `archive_budget_busy`,
+  `no_outbound_slot`), each later attempt replacing the earlier outcome, and MUST report the
+  pool's integer `in_use` and `limit` with an integer in-use count per hosted node whose sum
+  equals `in_use`. If a room's most recent eligible start attempt ended `flow_state_pool_full`
+  and no later attempt for that room started, the room's "no completed sync" text in `vox
+  status` and in the app MUST name the flow-state pool. Measured cause, 2026-10-21 (UTC, as
+  every date in this record): on the decider's daemon (four hosted nodes, three rooms,
+  restarted 02:32Z) every port of every node had started no round, `queued` froze, every room
+  said "no completed sync in 10 minutes", and posts moved neither between the two Macs nor
+  between two nodes of one daemon while the daemons were connected; in the #986 staging on
+  main bb4062651, instrumented, every port was eligible, popped and re-queued each pass with
+  `start_bounded_outbound` returning false at `reserve_flow_state` 370,156 times in one run,
+  the pool full (16 of 16) by the first fifth of the run with 1,951 flows started before and
+  none after, the outbound slots 0 of 16 in use and the archive lane empty throughout. The
+  product said only the symptom. "please make vox work"; "be methodical" (the decider,
+  2026-10-21).
 
 ## Unchanged rulings
 
@@ -424,7 +435,7 @@ Narrow successor amendments. Requirements not named here remain in force.
 | No predecessor: no ADR names a durability class for the store or a flush under a room's lock | FX-30 and FX-31 are new rules |
 | PRD-001 R7, R8; ADR-023 M23.1: the admin sets the room's retention; it applies to what is stored at the next sweep | Preserved; FX-33 adds that the sweep never stops the room |
 | ADR-028 K-10, ADR-031 CW-2, CW-7: a node unlocked at a terminal is remembered in the Keychain so the daemon makes it Ready at each start | Preserved where a credential store exists (the Keychain); FX-34 adds that unlocking never depends on remembering, that Linux remembers nothing for now, and that Vox never writes a passphrase file on its own |
-| ADR-037 R7, R11; ADR-026: a bounded flow keeps its state between turns, within a daemon-wide pool | FX-35 adds that a parked flow never holds the pool against a port with a need, and that a round which cannot start says why |
+| ADR-037 R7, R11; ADR-026: a bounded flow keeps its state between turns, within a daemon-wide pool | FX-35 adds that a full pool never keeps an eligible port from starting (parked flows are disposed on demand, never by time), and that every start attempt's outcome is reported |
 | ADR-034 §5 "Health is true" (HL-1, HL-2), PRD-001 R35 | The lane's completed rounds are completed syncs (FX-16); the control socket answers under sync load (FX-17) |
 
 ## Implementation order and related work
@@ -441,8 +452,8 @@ Narrow successor amendments. Requirements not named here remain in force.
    symbols); one cut (v0.4.8).
 8. FX-28, FX-29, FX-30, FX-31: the idle daemon's disk and CPU, measured on the decider's
    daemon (v0.4.9) on 2026-10-20, in that order (the tick, the re-pull, the flush, the lock);
-   FX-32 under #934; FX-33 and FX-34 with them; FX-35 first among them, since until it lands a
-   daemon hosting four nodes syncs nothing; one cut (v0.4.10).
+   FX-32 under #934; FX-33 and FX-34 with them; FX-35 first among them, since until it lands
+   the reproduced four-node daemon syncs nothing; one cut (v0.4.10).
 
 Each ADR change under this record is reviewed by an independent session (opencode-work) before
 its stories are extracted.
