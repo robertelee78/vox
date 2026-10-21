@@ -401,12 +401,13 @@ The decider then answered twelve questions, one at a time. His answers are the d
   the current daemon process ends and thereafter equal to `started` or `not_started` for the
   most recently ended attempt (an in-progress attempt does not replace that value, and a daemon
   restart resets it to `never_attempted`), and
-  `start_reason`, present if and only if `start_outcome` is `not_started`, the gates MUST be tested in the following order, and `start_reason` MUST equal the first gate that fails: `room_busy` (the room's state could not be
-  taken without waiting), `live_lane_busy` (the node's live flow slot holds another flow),
-  `control_budget_busy` (the control-lane job could not be reserved), `flow_state_pool_full`
-  (every charge of the pool is held by a running round),
-  `archive_budget_busy` (the archive-lane job could not be reserved) and `no_outbound_slot`
-  (the outbound slot could not be taken); and MUST report the pool under
+  `start_reason`, present if and only if `start_outcome` is `not_started`; the gates MUST be
+  tested in the following order and `start_reason` MUST equal the first gate that fails:
+  `room_busy` (the room's state could not be taken without waiting), `archive_budget_busy`
+  (an archive port only: the archive-lane job could not be reserved), `control_budget_busy`
+  (the control-lane job could not be reserved), `flow_state_pool_full` (every charge of the
+  pool is held by a running round), `live_lane_busy` (the node's live flow slot holds another
+  flow) and `no_outbound_slot` (the outbound slot could not be taken); and MUST report the pool under
   `lanes.budget.flow_state` as the integers
   `in_use` and `limit` and, under `by_node`, an object with exactly one member per hosted node, keyed by that node's node ID, whose value is that node's integer in-use count; the member values MUST sum to `in_use`. After a start attempt for any port in a room ends `not_started` with `start_reason` equal to `flow_state_pool_full`,
   and until a later start attempt in the same daemon process for any port in that room ends
