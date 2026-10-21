@@ -113,6 +113,10 @@ pub(crate) struct Flow {
     pub(crate) shared: Arc<Mutex<ChannelState>>,
     pub(crate) archive: bool,
     pub(crate) inventory: bool,
+    /// This node has a key delivery to the peer waiting on its prekey bundle (ADR-038 FX-35):
+    /// the round reads the peer's board whatever kind of flow this is, until the bundle is
+    /// held. Set by the actor at each start from the fact `vox status` reports as `key_waits`.
+    pub(crate) wants_board: bool,
     departure_probe: bool,
     pub(crate) archive_request: Option<RequestId>,
     pub(crate) hint: Option<super::HeadHint>,
@@ -181,7 +185,9 @@ pub(crate) struct Flow {
     // authenticated successor schedules its own closure without mutating the in-flight work.
     control_head: Option<Digest32>,
     // Declared last: actual state/capabilities die before the shared admission is returned.
-    _state_charge: crate::node::history_budget::FlowStateCharge,
+    // `None` while the flow is parked (ADR-038 FX-35): a flow that is not running holds no
+    // daemon-wide flow state; [`Flow::resume`] reserves it again before a round.
+    state_charge: Option<crate::node::history_budget::FlowStateCharge>,
 }
 // The retained-flow permit includes the exact Vec allocation, the scalar replay root,
 // and conservative room for the one-object receiver handoff and small staging handles.
@@ -190,6 +196,15 @@ const _: () = assert!(
     std::mem::size_of::<Flow>() + MAX_TASKS * std::mem::size_of::<Task>() + 4096
         <= crate::node::history_budget::FLOW_STATE_BYTES
 );
+/// What [`Flow::resume`] came to (ADR-038 FX-35).
+pub(crate) enum Resumed {
+    /// The round holds its flow state.
+    Held,
+    /// Every charge is held by a running round: unreachable while every held charge is a
+    /// running round's (the pool is sized to every hosted node's rounds).
+    PoolFull,
+}
+
 impl Flow {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn foreground(
@@ -203,7 +218,6 @@ impl Flow {
         hint: Option<super::HeadHint>,
         departure_probe: bool,
         required: Option<(Digest32, u64)>,
-        state_charge: crate::node::history_budget::FlowStateCharge,
         slots: Arc<BodySlots>,
         cleanup_store: Arc<Store>,
         cleanup_job: Job,
@@ -219,9 +233,10 @@ impl Flow {
             shared,
             archive: false,
             inventory: hint.is_none() && required.is_none(),
+            wants_board: false,
             departure_probe,
             archive_request: None,
-            _state_charge: state_charge,
+            state_charge: None,
             hint,
             hint_peer: peer,
             authenticated_head: None,
@@ -314,7 +329,6 @@ impl Flow {
         query: Query,
         request: RequestId,
         fence: Arc<Fence>,
-        state_charge: crate::node::history_budget::FlowStateCharge,
         slots: Arc<BodySlots>,
         cleanup_store: Arc<Store>,
         cleanup_job: Job,
@@ -329,9 +343,10 @@ impl Flow {
             shared,
             archive: true,
             inventory: false,
+            wants_board: false,
             departure_probe: false,
             archive_request: Some(request),
-            _state_charge: state_charge,
+            state_charge: None,
             hint: None,
             hint_peer: peer,
             authenticated_head: None,
@@ -417,8 +432,53 @@ impl Flow {
         self.control_head = Some(window.head);
         Ok(())
     }
+    /// Park (ADR-038 FX-35): a flow that is ready but not running, deferred, retiring or
+    /// awaiting cleanup holds none of the daemon's flow-state pool. Measured before this: four
+    /// hosted nodes' parked hinted flows held all sixteen, and the inventory round that would
+    /// have let them resume could never be started.
+    pub(crate) fn park(&mut self) {
+        self.state_charge = None;
+    }
+
+    /// The Control bytes one flow state costs, reserved on this flow's own control job before
+    /// the pool is asked (ADR-038 FX-35): `None` is the control budget's refusal, never the
+    /// pool's, and the caller names it so.
+    pub(crate) fn reserve_state_bytes(&self) -> Option<crate::node::history_budget::BufferCharge> {
+        self.cleanup_job
+            .reserve(crate::node::history_budget::FLOW_STATE_BYTES)
+    }
+
+    pub(crate) fn state_bytes_wake(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        self.cleanup_job.bytes_wake()
+    }
+
+    /// Reserve the flow state as the round begins, its bytes already held: the last gate before
+    /// running, so a held charge always belongs to a running round. [`Resumed::PoolFull`] when
+    /// every charge is held by a running round, which the pool's size rules out. A flow already
+    /// holding its state keeps it, and the bytes go back.
+    pub(crate) fn resume(&mut self, bytes: crate::node::history_budget::BufferCharge) -> Resumed {
+        if self.state_charge.is_some() {
+            return Resumed::Held;
+        }
+        match self
+            .cleanup_job
+            .reserve_flow_state(self.room, self.peer, bytes)
+        {
+            crate::node::history_budget::FlowStateTry::Reserved(charge) => {
+                self.state_charge = Some(charge);
+                Resumed::Held
+            }
+            crate::node::history_budget::FlowStateTry::PoolFull => Resumed::PoolFull,
+        }
+    }
+
+    /// Whether this round begins by exchanging boards with the peer: a fresh inventory flow's
+    /// first round, or any round while a key to the peer waits on its bundle (ADR-038 FX-35):
+    /// the bundle a key delivery opens its session against travels only on that exchange.
     pub(crate) fn needs_board(&self) -> bool {
-        self.inventory && !self.initialized
+        (self.inventory && !self.initialized) || self.wants_board
     }
     pub(crate) fn done(&self) -> bool {
         self.tasks.is_empty() && self.replay.is_none()
@@ -528,7 +588,7 @@ impl Flow {
         // Cleanup must not need that same pool to free it: several hosted nodes can fill
         // its headroom. Use an independently admitted foreground-control envelope instead.
         const CLEANUP_ENVELOPE: usize = 6 * 1024 * 1024;
-        let Some(cleanup_job) = self.cleanup_job.record_job(CLEANUP_ENVELOPE) else {
+        let Some(cleanup_job) = self.cleanup_job.record_job(CLEANUP_ENVELOPE).await else {
             return Ok(false);
         };
         let Some(charge) = cleanup_job.reserve(CLEANUP_ENVELOPE) else {

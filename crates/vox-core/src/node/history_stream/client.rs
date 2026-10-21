@@ -123,7 +123,7 @@ impl Receiver {
         // Head, proof construction and verifier staging temporarily overlap. Admit that bounded
         // envelope on the existing large-control lane instead of repeatedly exhausting the
         // ordinary 8-MiB control slice before admission can persist the verifier.
-        let Some(work_job) = job.record_job(12 * 1024 * 1024) else {
+        let Some(work_job) = job.record_job(12 * 1024 * 1024).await else {
             return Ok(LocalProof::Busy);
         };
         let Query::Proof {
@@ -256,7 +256,7 @@ impl Receiver {
                 Action::Meta => {
                     let generation = self.generation;
                     let selected = query.clone();
-                    let Some(work_job) = io.job().record_job(12 * 1024 * 1024) else {
+                    let Some(work_job) = io.job().record_job(12 * 1024 * 1024).await else {
                         io.abort(WireError::SessionBusy);
                         result.status = Status::Busy;
                         return Ok(result);
@@ -524,7 +524,7 @@ impl Receiver {
         if binding.generation != self.generation || binding.room == [0; 32] {
             return Err(Error::Profile("history verifier activation changed"));
         }
-        let Some(work_job) = job.record_job(12 * 1024 * 1024) else {
+        let Some(work_job) = job.record_job(12 * 1024 * 1024).await else {
             return Ok(Lookup::Busy);
         };
         self.read(&work_job, VERIFY_ENVELOPE, move |room, store| {
@@ -593,7 +593,9 @@ impl Receiver {
             }
             let envelope = 5 * (body.length as usize + crate::log::history::MAX_HEADER_BYTES + 9)
                 + VERIFY_ENVELOPE;
-            let Some(record_job) = job.record_job(envelope) else {
+            let Some(record_job) =
+                tokio::runtime::Handle::current().block_on(job.record_job(envelope))
+            else {
                 return Ok(Assembly::Busy);
             };
             let Some(charge) = record_job.reserve(envelope) else {
@@ -792,7 +794,7 @@ impl Receiver {
         head: Digest32,
         seq: u64,
     ) -> Result<Assembly> {
-        let Some(work_job) = job.record_job(12 * 1024 * 1024) else {
+        let Some(work_job) = job.record_job(12 * 1024 * 1024).await else {
             return Ok(Assembly::Busy);
         };
         let header = self
@@ -814,7 +816,7 @@ impl Receiver {
             + VERIFY_ENVELOPE;
         // Release the metadata job before attempting a large body job. The small header itself
         // stays charged until its replacement reservation has been acquired.
-        let Some(record_job) = job.record_job(envelope) else {
+        let Some(record_job) = job.record_job(envelope).await else {
             return Ok(Assembly::Busy);
         };
         let Some(charge) = record_job.reserve(envelope) else {
@@ -1466,7 +1468,7 @@ impl Receiver {
         effects: bool,
     ) -> Result<LocalResult> {
         use crate::node::channel::entry_store::sparse::SourceProgress;
-        let Some(work_job) = job.record_job(12 * 1024 * 1024) else {
+        let Some(work_job) = job.record_job(12 * 1024 * 1024).await else {
             return Ok(LocalResult::busy(step));
         };
         let value = self

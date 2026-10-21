@@ -13,15 +13,43 @@ use tokio::sync::Notify;
 use crate::hash::Digest32;
 
 const MIB: usize = 1024 * 1024;
-const QUEUED_PER_LANE: usize = 64;
 const ARCHIVE_JOBS: usize = 2;
 const FOREGROUND_JOBS: usize = 64;
-const RETAINED_FLOWS: usize = 16;
+#[cfg(feature = "test-knobs")]
+/// Proof-only foreground capacity override; absent from a production build.
+pub const TEST_FOREGROUND_JOBS_ENV: &str = "VOX_TEST_FOREGROUND_JOBS";
+#[cfg(feature = "test-knobs")]
+/// Proof-only file whose presence holds an admitted Live job; absent from production.
+pub const TEST_HOLD_LIVE_JOB_ENV: &str = "VOX_TEST_HOLD_LIVE_JOB_FILE";
+/// The floor for the daemon's running bounded-sync flow-state capacity (ADR-038 FX-35).
+pub const FLOW_STATE_MIN_CAPACITY: usize = 16;
+/// The running bounded-sync slots one hosted node owns. This is the source of truth for both
+/// the controller's array and the daemon pool's per-node capacity (ADR-038 FX-35).
+pub const BOUNDED_SYNC_RUNNING_SLOTS: usize = 2;
+/// One running bounded-sync quantum's product contract; proofs wait on this source-owned edge,
+/// never a copied timeout.
+pub const BOUNDED_ROUND_PATIENCE: std::time::Duration = std::time::Duration::from_secs(30);
+/// A failed bounded retirement slice remains owned and retries from its exact timer event.
+pub const RETIRE_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
 pub(crate) const FLOW_STATE_BYTES: usize = 128 * 1024;
 const CONTROL_TURNS_BEFORE_LIVE: usize = 3;
 const LIVE_GRANTS: usize = 64;
 const LIVE_GRANT_LIFETIME: std::time::Duration = std::time::Duration::from_secs(300);
 const LIVE_GRANT_IDLE: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[cfg(feature = "test-knobs")]
+fn foreground_jobs() -> usize {
+    std::env::var(TEST_FOREGROUND_JOBS_ENV)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(FOREGROUND_JOBS)
+}
+
+#[cfg(not(feature = "test-knobs"))]
+const fn foreground_jobs() -> usize {
+    FOREGROUND_JOBS
+}
 
 /// Exact body selected within a bounded newest window. A later tip cannot widen it.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -61,7 +89,7 @@ pub enum Lane {
 }
 
 impl Lane {
-    const fn index(self) -> usize {
+    pub(crate) const fn index(self) -> usize {
         match self {
             Self::Archive => 0,
             Self::Control => 1,
@@ -87,7 +115,6 @@ struct Waiting {
     node: Digest32,
 }
 
-#[derive(Default)]
 struct State {
     queues: [VecDeque<Waiting>; 4],
     archive_nodes: BTreeSet<Digest32>,
@@ -96,6 +123,22 @@ struct State {
     foreground_control_turns: usize,
     next_ticket: u64,
     live_grants: BTreeMap<LiveKey, LiveGrant>,
+    foreground_jobs: usize,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            queues: Default::default(),
+            archive_nodes: Default::default(),
+            control: 0,
+            foreground: 0,
+            foreground_control_turns: 0,
+            next_ticket: 0,
+            live_grants: Default::default(),
+            foreground_jobs: foreground_jobs(),
+        }
+    }
 }
 
 impl State {
@@ -106,12 +149,12 @@ impl State {
             }
             Lane::Control => self.control < FOREGROUND_JOBS,
             Lane::LargeControl => {
-                self.foreground < FOREGROUND_JOBS
+                self.foreground < self.foreground_jobs
                     && (self.queues[Lane::Live.index()].is_empty()
                         || self.foreground_control_turns < CONTROL_TURNS_BEFORE_LIVE)
             }
             Lane::Live => {
-                self.foreground < FOREGROUND_JOBS
+                self.foreground < self.foreground_jobs
                     && (self.queues[Lane::LargeControl.index()].is_empty()
                         || self.foreground_control_turns >= CONTROL_TURNS_BEFORE_LIVE)
             }
@@ -123,9 +166,14 @@ impl State {
 #[derive(Default)]
 pub struct Budget {
     state: Mutex<State>,
-    changed: Arc<Notify>,
+    /// Capacity-change notifications are scoped to the reservation they can unblock. Archive
+    /// and Control are independent; LargeControl and Live notify each other because they share
+    /// the foreground reservation and alternate priority.
+    changed: [Arc<Notify>; 4],
+    bytes_changed: [Arc<Notify>; 2],
     control_bytes: AtomicUsize,
-    retained_flows: AtomicUsize,
+    /// The daemon's flow-state pool, one record under one lock (ADR-038 FX-35).
+    pool: Mutex<Pool>,
     foreground_bytes: AtomicUsize,
 }
 
@@ -140,20 +188,26 @@ impl Budget {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Queue one bounded operation. The caller coalesces repeated requests for the same node;
-    /// refusal means busy, never permission to start an unaccounted worker. No actor lock may
-    /// be held while awaiting the returned ticket. Dropping it cancels the queued operation.
+    fn notify_lane(&self, lane: Lane) {
+        match lane {
+            Lane::Archive | Lane::Control => self.changed[lane.index()].notify_waiters(),
+            Lane::LargeControl | Lane::Live => {
+                self.changed[Lane::LargeControl.index()].notify_waiters();
+                self.changed[Lane::Live.index()].notify_waiters();
+            }
+        }
+    }
+
+    /// Queue one bounded operation. Refusal is only ticket-id exhaustion, never permission to
+    /// start an unaccounted worker. No actor lock may be held while awaiting the returned ticket.
+    /// Dropping it cancels the queued operation.
     pub fn enqueue(self: &Arc<Self>, node: Digest32, lane: Lane) -> Option<Ticket> {
         let mut state = self.state();
-        let queue = &state.queues[lane.index()];
-        if queue.len() >= QUEUED_PER_LANE || queue.iter().any(|entry| entry.node == node) {
-            return None;
-        }
         let ticket = state.next_ticket.checked_add(1)?;
         state.next_ticket = ticket;
         state.queues[lane.index()].push_back(Waiting { ticket, node });
         drop(state);
-        self.changed.notify_waiters();
+        self.notify_lane(lane);
         Some(Ticket {
             budget: Arc::clone(self),
             node,
@@ -183,7 +237,8 @@ impl Ticket {
     /// actor's wake task cannot be missed. This future owns only the notification subscription;
     /// the controller retains the queue ticket and can cancel it synchronously.
     pub(crate) fn wake(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
-        let mut wake = Box::pin(Arc::clone(&self.budget.changed).notified_owned());
+        let mut wake =
+            Box::pin(Arc::clone(&self.budget.changed[self.lane.index()]).notified_owned());
         wake.as_mut().enable();
         wake
     }
@@ -221,7 +276,7 @@ impl Ticket {
         self.queued = false;
         drop(state);
         // A second archive slot or another reserved lane may also be available.
-        self.budget.changed.notify_waiters();
+        self.budget.notify_lane(self.lane);
         Some(Job(Arc::new(Worker {
             budget: Arc::clone(&self.budget),
             node: self.node,
@@ -236,7 +291,7 @@ impl Drop for Ticket {
         if self.queued {
             self.budget.state().queues[self.lane.index()]
                 .retain(|entry| entry.ticket != self.ticket);
-            self.budget.changed.notify_waiters();
+            self.budget.notify_lane(self.lane);
         }
     }
 }
@@ -269,7 +324,7 @@ impl Drop for Worker {
             Lane::LargeControl | Lane::Live => state.foreground -= 1,
         }
         drop(state);
-        self.budget.changed.notify_waiters();
+        self.budget.notify_lane(self.lane);
     }
 }
 
@@ -278,27 +333,60 @@ impl Drop for Worker {
 pub struct Job(Arc<Worker>);
 
 impl Job {
-    /// Persistent flow metadata may occupy at most two MiB and sixteen small-control
-    /// worker slots across the whole daemon. Leave the remaining control capacity available
-    /// for current requests that free or advance this retained work.
-    pub(crate) fn reserve_flow_state(&self) -> Option<FlowStateCharge> {
-        if self.0.lane != Lane::Control {
-            return None;
+    /// Subscribe before a shared byte reservation attempt so its exact release cannot be lost.
+    pub(crate) fn bytes_wake(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        let index = usize::from(matches!(self.0.lane, Lane::LargeControl | Lane::Live));
+        let mut wake = Box::pin(Arc::clone(&self.0.budget.bytes_changed[index]).notified_owned());
+        wake.as_mut().enable();
+        wake
+    }
+
+    /// Proof-only: keep one admitted live job until apparatus removes its named file. Production
+    /// builds contain neither the variable nor this pause.
+    #[cfg(feature = "test-knobs")]
+    pub(crate) async fn hold_live_for_proof(&self) {
+        if self.0.lane != Lane::Live {
+            return;
         }
-        self.0
-            .budget
-            .retained_flows
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
-                held.checked_add(1).filter(|next| *next <= RETAINED_FLOWS)
-            })
-            .ok()?;
-        let Some(charge) = self.reserve(FLOW_STATE_BYTES) else {
-            self.0.budget.retained_flows.fetch_sub(1, Ordering::AcqRel);
-            return None;
+        let Some(path) = std::env::var_os(TEST_HOLD_LIVE_JOB_ENV) else {
+            return;
         };
-        Some(FlowStateCharge {
-            budget: self.0.budget.clone(),
-            _charge: charge,
+        while std::path::Path::new(&path).exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    #[cfg(not(feature = "test-knobs"))]
+    pub(crate) async fn hold_live_for_proof(&self) {}
+
+    /// Reserve flow state for a port's round (ADR-038 FX-35), the Control bytes it costs already
+    /// reserved by the caller (the control budget's refusal is its own gate, never the pool's).
+    /// The charge is the round's: it is recorded as running in the same step, under the one
+    /// lock, and is given back when the charge drops. `PoolFull` when every charge is held by a
+    /// running round, which the pool's size rules out while every held charge is a running
+    /// round's; the bytes go back then.
+    pub(crate) fn reserve_flow_state(
+        &self,
+        room: Digest32,
+        peer: Digest32,
+        bytes: BufferCharge,
+    ) -> FlowStateTry {
+        let key = (self.0.node, room, peer);
+        let budget = Arc::clone(&self.0.budget);
+        let mut p = budget.pool.lock().unwrap_or_else(PoisonError::into_inner);
+        if p.in_use >= p.limit {
+            return FlowStateTry::PoolFull;
+        }
+        p.in_use += 1;
+        *p.running.entry(key).or_insert(0) += 1;
+        *p.by_node.entry(key.0).or_insert(0) += 1;
+        drop(p);
+        FlowStateTry::Reserved(FlowStateCharge {
+            budget,
+            key,
+            charge: Some(bytes),
         })
     }
 
@@ -434,9 +522,19 @@ impl Job {
     /// the small control pool for fixed wire metadata and staging state. This admits a separately
     /// accounted worker; it never widens a charge on the existing worker. The caller drops it
     /// with the last actual buffer.
-    pub(crate) fn record_job(&self, envelope: usize) -> Option<Self> {
+    pub(crate) async fn record_job(&self, envelope: usize) -> Option<Self> {
         if self.0.lane == Lane::Control && envelope > MIB {
-            self.0.budget.try_start(self.0.node, Lane::LargeControl)
+            let mut ticket = self.0.budget.enqueue(self.0.node, Lane::LargeControl)?;
+            loop {
+                // Subscribe first: a release between the failed admission and the await cannot
+                // be lost. The retained ticket keeps its fair position; no periodic retry is
+                // part of this admission path.
+                let wake = ticket.wake();
+                if let Some(job) = ticket.try_admit() {
+                    return Some(job);
+                }
+                wake.await;
+            }
         } else {
             Some(self.clone())
         }
@@ -518,18 +616,154 @@ impl Drop for BufferCharge {
         self.worker.bytes.fetch_sub(self.bytes, Ordering::AcqRel);
         if let Some(shared) = self.worker.shared_bytes() {
             shared.fetch_sub(self.bytes, Ordering::AcqRel);
+            let index = usize::from(matches!(self.worker.lane, Lane::LargeControl | Lane::Live));
+            self.worker.budget.bytes_changed[index].notify_waiters();
         }
     }
 }
 
-/// One daemon-wide retained-flow admission, inseparable from its real Control byte charge.
-/// The Flow stores it after its state fields so allocations die before capacity is returned.
+/// The daemon's flow-state pool (ADR-038 FX-35), one record under one lock, so that what
+/// `vox status --json` shows of it is one coordinated view: how many flow states it allows;
+/// which running rounds hold one (node, room, peer); and the count per hosted node (one member
+/// per hosted node, 0 until it holds one; always the count of that node's running rounds). The
+/// limit is [`FLOW_STATE_MIN_CAPACITY`] or [`BOUNDED_SYNC_RUNNING_SLOTS`] per hosted node,
+/// whichever is more,
+/// raised as nodes register: a charge is held only by a running round and a node runs at most
+/// [`BOUNDED_SYNC_RUNNING_SLOTS`], so the pool is never full and no eligible port ever waits for
+/// it.
+struct Pool {
+    limit: usize,
+    in_use: usize,
+    /// A port can run its live and archive slots together, so retain multiplicity here while
+    /// status needs only the key to say that the port has a running round.
+    running: BTreeMap<(Digest32, Digest32, Digest32), usize>,
+    by_node: BTreeMap<Digest32, usize>,
+}
+
+impl Default for Pool {
+    fn default() -> Self {
+        Self {
+            limit: FLOW_STATE_MIN_CAPACITY,
+            in_use: 0,
+            running: BTreeMap::new(),
+            by_node: BTreeMap::new(),
+        }
+    }
+}
+
+/// What a port's reservation of flow state came to (ADR-038 FX-35).
+pub(crate) enum FlowStateTry {
+    /// The round holds its flow state.
+    Reserved(FlowStateCharge),
+    /// Every charge is held by a running round. Unreachable by construction (the pool is sized
+    /// to every hosted node's rounds); kept so the gate has its word if a charge is ever held
+    /// by anything but a running round.
+    PoolFull,
+}
+
+/// One running round's flow state, inseparable from its real Control byte charge. The Flow
+/// stores it after its state fields so allocations die before capacity is returned; the bytes
+/// go back first, then the pool is told.
 pub(crate) struct FlowStateCharge {
     budget: Arc<Budget>,
-    _charge: BufferCharge,
+    key: (Digest32, Digest32, Digest32),
+    charge: Option<BufferCharge>,
 }
 impl Drop for FlowStateCharge {
     fn drop(&mut self) {
-        self.budget.retained_flows.fetch_sub(1, Ordering::AcqRel);
+        drop(self.charge.take());
+        let mut p = self
+            .budget
+            .pool
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        p.in_use = p.in_use.saturating_sub(1);
+        if let Some(count) = p.running.get_mut(&self.key) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                p.running.remove(&self.key);
+            }
+        }
+        if let Some(n) = p.by_node.get_mut(&self.key.0) {
+            *n = n.saturating_sub(1);
+        }
+    }
+}
+
+/// The budget's lanes as they stand, for `vox status --json` (`lanes.budget`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BudgetSnapshot {
+    /// The nodes holding an archive job now (at most `ARCHIVE_JOBS`).
+    pub archive_nodes: Vec<Digest32>,
+    /// The archive jobs the daemon allows at once.
+    pub archive_jobs: usize,
+    /// Control jobs in flight.
+    pub control: usize,
+    /// Foreground (large control and live) jobs in flight.
+    pub foreground: usize,
+    /// The foreground jobs the daemon allows at once.
+    pub foreground_jobs: usize,
+    /// Tickets waiting per lane, in `Lane::index` order: archive, control, large control, live.
+    pub queued: [usize; 4],
+    /// Flow states held now, each by one running round (ADR-038 FX-35).
+    pub flow_state_in_use: usize,
+    /// The flow states the daemon allows at once: enough for every hosted node's rounds.
+    pub flow_state_limit: usize,
+    /// Who holds them, by node: one member per hosted node, the count of its running rounds.
+    pub flow_state_by_node: Vec<(Digest32, usize)>,
+    /// The running rounds holding a flow state (node, room, peer), from the same view.
+    pub flow_state_running: Vec<(Digest32, Digest32, Digest32)>,
+}
+
+impl Budget {
+    /// A hosted node lists itself in the flow-state pool when it starts networking, at 0 until
+    /// it holds one (`by_node` has one member per hosted node, ADR-038 FX-35), and the pool
+    /// grows to hold every hosted node's rounds before this node's first start attempt.
+    pub fn register_node(&self, node: Digest32) {
+        let mut p = self.pool.lock().unwrap_or_else(PoisonError::into_inner);
+        p.by_node.entry(node).or_insert(0);
+        p.limit = FLOW_STATE_MIN_CAPACITY.max(BOUNDED_SYNC_RUNNING_SLOTS * p.by_node.len());
+    }
+
+    /// A node that stopped networking leaves the listing at once. Its bounded rounds have
+    /// ended by then, each releasing its charge as it ended (the node's controller is retired
+    /// before this is called), so the listing names only nodes the daemon hosts and no charge
+    /// is ever unaccounted for. Only a zero-count node with no running key can leave; then the
+    /// exact current-host count safely lowers the limit as well as raising it.
+    pub fn unregister_node(&self, node: Digest32) {
+        let mut p = self.pool.lock().unwrap_or_else(PoisonError::into_inner);
+        if p.by_node.get(&node) != Some(&0)
+            || p.running.keys().any(|(running, _, _)| *running == node)
+        {
+            return;
+        }
+        p.by_node.remove(&node);
+        p.limit = FLOW_STATE_MIN_CAPACITY.max(BOUNDED_SYNC_RUNNING_SLOTS * p.by_node.len());
+    }
+
+    /// The lanes as they stand now.
+    #[must_use]
+    pub fn snapshot(&self) -> BudgetSnapshot {
+        let state = self.state();
+        let p = self.pool.lock().unwrap_or_else(PoisonError::into_inner);
+        BudgetSnapshot {
+            archive_nodes: state.archive_nodes.iter().copied().collect(),
+            archive_jobs: ARCHIVE_JOBS,
+            control: state.control,
+            foreground: state.foreground,
+            foreground_jobs: state.foreground_jobs,
+            queued: [
+                state.queues[0].len(),
+                state.queues[1].len(),
+                state.queues[2].len(),
+                state.queues[3].len(),
+            ],
+            // One locked view of the pool: the running rounds and their count per node, as
+            // they stand together.
+            flow_state_in_use: p.in_use,
+            flow_state_limit: p.limit,
+            flow_state_by_node: p.by_node.iter().map(|(n, c)| (*n, *c)).collect(),
+            flow_state_running: p.running.keys().copied().collect(),
+        }
     }
 }

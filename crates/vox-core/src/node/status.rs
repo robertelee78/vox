@@ -64,6 +64,15 @@ use crate::transport::router::DatagramStats;
 /// A room with other members and no completed sync for this long is flagged.
 pub const STALE_SYNC_MS: u64 = 10 * 60 * 1_000;
 
+/// The stale threshold in the unit a person reads: minutes, or seconds under a minute.
+fn stale_words(ms: u64) -> String {
+    if ms >= 60_000 {
+        format!("{} minutes", ms / 60_000)
+    } else {
+        format!("{} seconds", ms.div_ceil(1_000))
+    }
+}
+
 /// An anchor this node keeps and has not reached for this long is flagged (PRD-001 R37). Long
 /// enough that an anchor restarting, which members are back from within seconds (V210-86), never
 /// interrupts anyone.
@@ -255,6 +264,9 @@ impl GatewayFamily {
 /// Everything `vox status` shows.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StatusReport {
+    /// Why the sync lanes stand as they do, pre-rendered JSON (ADR-038 FX-16): slots, budget
+    /// lanes, the bounded lane's flow slots, the history request and each port's last start.
+    pub lanes: String,
     /// The account daemon's bounded diagnostic log (ADR-034 LG-3).
     pub log_path: String,
     /// When this was taken, unix milliseconds.
@@ -349,10 +361,10 @@ impl StatusReport {
                 out.push(Unhealthy {
                     key: format!("room-stale:{}", b32_encode(&room.id)),
                     message: format!(
-                        "room {} ({}): no completed sync in {} minutes",
+                        "room {} ({}): no completed sync in {}",
                         short(&room.id),
                         room.name,
-                        STALE_SYNC_MS / 60_000
+                        stale_words(STALE_SYNC_MS)
                     ),
                 });
             }
@@ -576,6 +588,15 @@ impl StatusReport {
                 a.reached,
                 opt(a.unreached_since)
             )))
+        );
+        let _ = write!(
+            j,
+            "\"lanes\":{},",
+            if self.lanes.is_empty() {
+                "{}"
+            } else {
+                self.lanes.as_str()
+            }
         );
         let _ = write!(
             j,

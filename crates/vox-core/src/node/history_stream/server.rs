@@ -478,7 +478,7 @@ async fn entry(
     // Five worst-case record/sealing copies plus fixed work space, scaled to the signed length.
     // A small control uses the small pool; a large record must have the foreground/archive job.
     let envelope = 5 * (length as usize + MAX_HEADER_BYTES + 9) + 4 * MIB;
-    let Some(record_job) = job.record_job(envelope) else {
+    let Some(record_job) = job.record_job(envelope).await else {
         result.status = Status::Busy;
         return Ok(result);
     };

@@ -133,6 +133,19 @@ type SharedChannel = Arc<tokio::sync::Mutex<ChannelState>>;
 /// every event that can change what it needs (ADR-025 D6a); the tick retires attempts whose
 /// connection died and raises the periodic request (D7).
 const TICK: Duration = Duration::from_secs(1);
+#[cfg(feature = "test-knobs")]
+/// Proof-only: omit the periodic call to the bounded scheduler so exact wakes stand alone.
+pub const TEST_DISABLE_TICK_SCHEDULE_ENV: &str = "VOX_TEST_DISABLE_TICK_SCHEDULE";
+
+#[cfg(feature = "test-knobs")]
+fn schedule_on_tick() -> bool {
+    std::env::var_os(TEST_DISABLE_TICK_SCHEDULE_ENV).is_none()
+}
+
+#[cfg(not(feature = "test-knobs"))]
+const fn schedule_on_tick() -> bool {
+    true
+}
 /// A preparing room's bounded step that waited on the fold or on a peer is tried again after
 /// this, not at once: unpaced, a reopened room ran 74,000 preparation turns in 12 s at full CPU
 /// while its control socket went unanswered.
@@ -640,6 +653,12 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::RoomStored { .. } => "evaluating a room whose log grew",
         NetEvent::SlotFreed => "starting a queued sync",
         NetEvent::ArchiveAdmissionReady { .. } => "starting admitted archive work",
+        NetEvent::ForegroundAdmissionReady { .. } => "starting admitted foreground work",
+        NetEvent::BoundedRoomReady { .. } => "retrying work after its room was released",
+        NetEvent::BoundedSecretReady { .. } => "retrying work after secret access was released",
+        NetEvent::BoundedBytesReady { .. } => "retrying work after bounded bytes were released",
+        NetEvent::BoundedCleanupProgress => "advancing bounded cleanup that completed",
+        NetEvent::BoundedCleanupRetry => "retrying bounded cleanup after its named backoff",
         NetEvent::BackoffExpired { .. } => "retrying a sync whose backoff is due",
         NetEvent::SkdmRefused { .. } => "re-owing a key the recipient did not take",
         NetEvent::PublishDone { .. } => "filing what a board said to a publish",
@@ -1338,6 +1357,34 @@ enum NetEvent {
         room: Digest32,
         peer: Digest32,
     },
+    /// This node's retained Control or Live ticket observed a relevant capacity release.
+    ForegroundAdmissionReady {
+        token: u64,
+        room: Digest32,
+        peer: Digest32,
+    },
+    /// The exact room mutex a bounded port met busy was released.
+    BoundedRoomReady {
+        token: u64,
+        room: Digest32,
+        peer: Digest32,
+    },
+    /// The exact identity-secret writer a bounded port met was released.
+    BoundedSecretReady {
+        token: u64,
+        room: Digest32,
+        peer: Digest32,
+    },
+    /// The exact shared byte reservation a bounded port met was released.
+    BoundedBytesReady {
+        token: u64,
+        room: Digest32,
+        peer: Digest32,
+    },
+    /// One bounded retirement slice completed and may have released retained-flow capacity.
+    BoundedCleanupProgress,
+    /// A failed bounded retirement slice's source-owned retry policy became due.
+    BoundedCleanupRetry,
     /// A port's backoff is due (ADR-025 D5).
     BackoffExpired {
         /// The room.
@@ -6243,12 +6290,9 @@ impl Node {
                     for room in self.channels.keys().copied().collect::<Vec<_>>() {
                         self.settle_room(&room).await;
                     }
-                    // A finished bounded round reports through a `try_send` wake that a full
-                    // net queue can drop; its durable result slot stays pollable. The wake
-                    // dropped at the join burst's peak leaked its port's one attempt slot
-                    // (`out`) for the rest of the run: no round could start again, and the
-                    // room's late joiner never converged within its bounds. Poll the slots
-                    // here so a dropped wake costs at most this one second, never the port.
+                    // Audit durable bounded result slots as maintenance. Completion now sends a
+                    // reliable event and admission release has its own exact wake, so progress
+                    // does not depend on reaching this periodic audit.
                     self.accept_bounded_sync();
                     if let Some(net) = self.net.as_ref() {
                         // Connections a better path displaced are closed once their
@@ -6296,7 +6340,11 @@ impl Node {
                     // ADR-025: the tick is a safety net for sync. It retires attempts whose
                     // connection died (D1a) and raises the periodic request (D7).
                     self.sync_tick().await;
-                    let ran = self.schedule().await;
+                    let ran = if schedule_on_tick() {
+                        self.schedule().await
+                    } else {
+                        false
+                    };
                     if ran || tended || pruned || sessions_changed || self.paths_moved() {
                         self.publish().await;
                     }
@@ -7127,6 +7175,8 @@ impl Node {
                 note: format!("{moved}; {who}"),
             });
         }
+        // Networked: a hosted node of the daemon's flow-state pool from here on (ADR-038 FX-35).
+        self.register_in_flow_pool();
         Ok(())
     }
 
@@ -7216,7 +7266,9 @@ impl Node {
             }
         }
         self.stream_loops.clear();
-        // Every session stops with the network (ADR-025 D1a: the node shuts down).
+        // Every session stops with the network (ADR-025 D1a: the node shuts down). The node
+        // leaves the daemon's flow-state pool once its bounded rounds have ended, in `lock_all`
+        // (ADR-038 FX-35).
         self.retire_all_ports();
     }
 
@@ -10232,6 +10284,42 @@ impl Node {
                     self.bounded_sync
                         .release_archive_admission(token, room, peer);
                 }
+            }
+            NetEvent::ForegroundAdmissionReady { token, room, peer } => {
+                if self.port_eligible(&(room, peer), std::time::Instant::now()) {
+                    self.sched_rooms.insert(room);
+                } else {
+                    // The exact port disappeared or stopped needing a round before its lane
+                    // changed. Cancel the retained queue position; a later need queues anew.
+                    self.bounded_sync
+                        .release_foreground_admission(token, room, peer);
+                }
+            }
+            NetEvent::BoundedRoomReady { token, room, peer } => {
+                if self.bounded_sync.release_room_admission(token, room, peer)
+                    && self.port_eligible(&(room, peer), std::time::Instant::now())
+                {
+                    self.sched_rooms.insert(room);
+                }
+            }
+            NetEvent::BoundedSecretReady { token, room, peer } => {
+                if self
+                    .bounded_sync
+                    .release_secret_admission(token, room, peer)
+                    && self.port_eligible(&(room, peer), std::time::Instant::now())
+                {
+                    self.sched_rooms.insert(room);
+                }
+            }
+            NetEvent::BoundedBytesReady { token, room, peer } => {
+                if self.bounded_sync.release_byte_admission(token, room, peer)
+                    && self.port_eligible(&(room, peer), std::time::Instant::now())
+                {
+                    self.sched_rooms.insert(room);
+                }
+            }
+            NetEvent::BoundedCleanupProgress | NetEvent::BoundedCleanupRetry => {
+                self.accept_bounded_sync();
             }
             NetEvent::BackoffExpired {
                 channel_id,
@@ -13858,6 +13946,12 @@ impl Node {
         target: Digest32,
         wait: Option<prekeys::BundleWait>,
     ) {
+        // A key that waits for the peer's bundle, or for a fresh one-time prekey of it, is read
+        // from the peer's board by the next round with it (ADR-038 FX-35).
+        let bundle_wanted = matches!(
+            wait,
+            Some(prekeys::BundleWait::NoBundle | prekeys::BundleWait::OneTimeSpent { .. })
+        );
         let why = match wait {
             Some(wait) => wait.why(),
             None => "no pairwise session with it could be opened from its prekey bundle; it is \
@@ -13870,6 +13964,15 @@ impl Node {
         );
         if !self.key_waits_said.insert((*channel_id, target)) {
             return;
+        }
+        // Its first landing is an event: the port to that peer is raised as a hint would raise
+        // it, so the round that reads the board starts now, not at the next periodic request.
+        // Nothing counts or times.
+        if bundle_wanted {
+            if let Some(port) = self.ports.get_mut(&(*channel_id, target)) {
+                port.raise();
+            }
+            self.sched_rooms.insert(*channel_id);
         }
         if let Some(net) = self.net.as_ref() {
             net.manager().note(
@@ -14787,6 +14890,110 @@ impl Node {
     ///
     /// Not awaited — see [`NetEvent::SyncDone`] for why awaiting deadlocks two nodes that start
     /// at the same moment.
+    /// Note why `start_outbound` for the port ended as it did (`vox status --json`, `lanes`).
+    fn note_start(&mut self, room: Digest32, peer: Digest32, why: &'static str) {
+        if let Some(port) = self.ports.get_mut(&(room, peer)) {
+            port.last_start = Some((why, std::time::Instant::now()));
+        }
+    }
+
+    /// This node lists itself in the daemon's flow-state pool, which grows to hold its rounds
+    /// (ADR-038 FX-35).
+    fn register_in_flow_pool(&self) {
+        if let Some(me) = self.profile.as_ref().map(Profile::fingerprint) {
+            self.history_budget.register_node(me);
+        }
+    }
+
+    /// The sync lanes as they stand, for `vox status --json` (ADR-038 FX-16): what holds a
+    /// lane still is otherwise invisible, and a person then cannot tell a quiet room from a
+    /// stuck one. The pool is read from `b`, the one budget snapshot the whole status document
+    /// is built from (ADR-038 FX-35).
+    fn lanes_json(&self, b: &crate::node::history_budget::BudgetSnapshot) -> String {
+        use crate::node::link::b32_encode;
+        let now = std::time::Instant::now();
+        let age = |t: std::time::Instant| {
+            u64::try_from(now.saturating_duration_since(t).as_millis()).unwrap_or(u64::MAX)
+        };
+        let (in_use, per_peer) = crate::node::ports::Slots::snapshot(&self.slots);
+        let per_peer: Vec<String> = per_peer
+            .iter()
+            .map(|(p, n)| format!("\"{}\":{n}", b32_encode(p)))
+            .collect();
+        let me = self.profile.as_ref().map(Profile::fingerprint);
+        let archive_nodes: Vec<String> = b
+            .archive_nodes
+            .iter()
+            .map(|p| format!("\"{}\"", b32_encode(p)))
+            .collect();
+        let ports: Vec<String> = self
+            .ports
+            .iter()
+            .map(|((room, peer), port)| {
+                let connected = self
+                    .net
+                    .as_ref()
+                    .is_some_and(|n| n.manager().existing(peer).is_some());
+                // The port's last start: never attempted, started, or not started and why
+                // (ADR-038 FX-35); a later attempt replaces the earlier.
+                let last = port.last_start.map_or_else(
+                    || "\"start_outcome\":\"never_attempted\"".to_owned(),
+                    |(why, at)| {
+                        if why == "started" {
+                            format!("\"start_outcome\":\"started\",\"start_age_ms\":{}", age(at))
+                        } else {
+                            format!(
+                                "\"start_outcome\":\"not_started\",\"start_reason\":\"{why}\",\"start_age_ms\":{}",
+                                age(at)
+                            )
+                        }
+                    },
+                );
+                format!(
+                    "{{\"room\":\"{}\",\"peer\":\"{}\",\"needs\":{},\"queued\":{},\"out_age_ms\":{},\"inbound\":{},\"backing_off\":{},\"publishing\":{},\"connected\":{},\"round_running\":{},{}}}",
+                    b32_encode(room),
+                    b32_encode(peer),
+                    port.needs(),
+                    port.queued,
+                    port.out
+                        .as_ref()
+                        .map_or_else(|| "null".to_owned(), |a| age(a.started).to_string()),
+                    port.inbound.len(),
+                    port.backing_off(now),
+                    self.publishing.contains(&(*room, *peer)),
+                    connected,
+                    me.is_some_and(|me| b.flow_state_running.contains(&(me, *room, *peer))),
+                    last
+                )
+            })
+            .collect();
+        format!(
+            "{{\"slots\":{{\"in_use\":{in_use},\"limit\":{},\"per_peer\":{{{}}}}},\"budget\":{{\"archive_nodes\":[{}],\"archive_jobs\":{},\"control\":{},\"foreground\":{},\"foreground_jobs\":{},\"queued\":[{},{},{},{}],\"flow_state\":{{\"in_use\":{},\"limit\":{},\"by_node\":{{{}}}}}}},\"bounded\":{},\"history\":{},\"next_request_in_ms\":{},\"ports\":[{}]}}",
+            crate::node::ports::OUTBOUND_SLOTS,
+            per_peer.join(","),
+            archive_nodes.join(","),
+            b.archive_jobs,
+            b.control,
+            b.foreground,
+            b.foreground_jobs,
+            b.queued[0],
+            b.queued[1],
+            b.queued[2],
+            b.queued[3],
+            b.flow_state_in_use,
+            b.flow_state_limit,
+            b.flow_state_by_node
+                .iter()
+                .map(|(n, c)| format!("\"{}\":{c}", b32_encode(n)))
+                .collect::<Vec<_>>()
+                .join(","),
+            self.bounded_sync.lanes_json(),
+            self.history_demand.lanes_json(),
+            self.next_request_at.saturating_sub(self.now_ms().get()),
+            ports.join(",")
+        )
+    }
+
     async fn start_outbound(&mut self, channel_id: Digest32, peer: Digest32) -> bool {
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
             return false;
@@ -14803,21 +15010,34 @@ impl Node {
         // **Not with a member that left** (V210-164): it holds no room to sync, and refused every
         // session for it. Its port is marked served; a member that joins again syncs from its own
         // side, and is synced with again once it says it is back.
-        if shared.lock().await.has_left(&peer) {
+        // The first gate takes the room without waiting (ADR-038 FX-35): a start that waited on
+        // a held room would hold the scheduler and the selected waiter with it.
+        let (left, sparse) = match shared.try_lock() {
+            Ok(channel) => (channel.has_left(&peer), channel.uses_sparse_history(&store)),
+            Err(_) => {
+                self.note_start(channel_id, peer, "room_busy");
+                return false;
+            }
+        };
+        if left {
             if let Some(port) = self.ports.get_mut(&(channel_id, peer)) {
                 port.req_done = port.req_gen;
                 port.done_gen = port.gen.load(std::sync::atomic::Ordering::Relaxed);
             }
             return false;
         }
-        let sparse = shared.lock().await.uses_sparse_history(&store);
         match sparse {
             Ok(true) => {
+                // The bounded starter notes the attempt's own end.
                 return self
                     .start_bounded_outbound(channel_id, peer, shared, store, conn)
-                    .await
+                    .await;
             }
-            Err(_) => return false,
+            Err(_) => {
+                // The room's store could not be read at this moment.
+                self.note_start(channel_id, peer, "room_busy");
+                return false;
+            }
             Ok(false) => {}
         }
         let Some(node) = self.profile.as_ref().map(Profile::fingerprint) else {
@@ -14827,9 +15047,11 @@ impl Node {
             .history_budget
             .try_start(node, crate::node::history_budget::Lane::Archive)
         else {
+            self.note_start(channel_id, peer, "archive_budget_busy");
             return false;
         };
         let Some(buffers) = job.reserve(crate::log::sync::LEGACY_BUFFER_ENVELOPE) else {
+            self.note_start(channel_id, peer, "archive_budget_busy");
             return false;
         };
         let target = SessionTarget::Channel(shared);
@@ -14843,11 +15065,13 @@ impl Node {
                 let _ = wake.try_send(NetEvent::SlotFreed);
             }),
         ) else {
+            self.note_start(channel_id, peer, "no_outbound_slot");
             return false;
         };
         let Some(port) = self.ports.get_mut(&(channel_id, peer)) else {
             return false;
         };
+        port.last_start = Some(("started", std::time::Instant::now()));
         let token = self.next_token;
         self.next_token += 1;
         let fence = crate::transport::stream_transport::Fence::new();
@@ -17754,10 +17978,18 @@ impl Node {
         let (settled, on_settled) = oneshot::channel();
         let secret_work = Arc::clone(&self.secret_work);
         let tx = self.net_tx.clone();
+        let me = self.profile.as_ref().map(Profile::fingerprint);
+        let budget = Arc::clone(&self.history_budget);
         tokio::spawn(async move {
             let mut aborted = aborted;
             history_demand.retire().await;
             bounded_sync.retire().await;
+            // Every bounded round of this node has ended and released its flow state: off the
+            // daemon's pool now, so its listing names only nodes the daemon hosts (ADR-038
+            // FX-35). An unlock waits for this task, so the node registers again only after.
+            if let Some(me) = me {
+                budget.unregister_node(me);
+            }
             if let Some(task) = reopening {
                 let _ = task.await;
             }
@@ -20247,6 +20479,10 @@ impl Node {
             },
             ..StatusReport::default()
         };
+        // One snapshot of the daemon's budget for the whole document (ADR-038 FX-35): every
+        // port's `round_running` and the pool's numbers agree with each other, whatever another
+        // hosted node does meanwhile.
+        report.lanes = self.lanes_json(&self.history_budget.snapshot());
         report.preparing = view
             .channels
             .iter()

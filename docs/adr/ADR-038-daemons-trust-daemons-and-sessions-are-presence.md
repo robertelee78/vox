@@ -437,6 +437,8 @@ The decider then answered twelve questions, one at a time. His answers are the d
   pool full (16 of 16) by the first fifth of the run with 1,951 flows started before and none
   after, the outbound slots 0 of 16 in use and the archive lane empty throughout. The product
   said only the symptom. "please make vox work"; "be methodical" (the decider, 2026-10-21).
+- **FX-35. Decision (2026-10-21).** The daemon flow-state pool has no wait queue: its limit is exactly `max(16, bounded-sync running slots per node × currently hosted nodes)`, so registration precedes starts, unregister follows retired rounds, and the shared slots invariant makes pool-full unreachable without a timeout or periodic retry.
+
 - **FX-37.** A software root signer MUST retain the ML-DSA signing key constructed from its
   seed and MUST reuse that key's cached public and expanded signing material. Asking the signer
   for its public key or a signature MUST NOT reconstruct the signing key from its seed. The
@@ -463,7 +465,6 @@ The decider then answered twelve questions, one at a time. His answers are the d
   room, post, read the post and remain running. An isolated mutant that restores per-sign key
   reconstruction MUST turn that room-create claim PRODUCT red with the reproduced worker-stack
   overflow.
-
 ## Unchanged rulings
 
 The decider confirmed these on 2026-10-19 ("that still sounds right to me"): no human/agent

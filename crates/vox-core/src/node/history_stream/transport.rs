@@ -117,7 +117,7 @@ impl Transport {
         let envelope = maximum
             .checked_add(decode_envelope)
             .ok_or(Error::SizeLimitExceeded("history frame envelope"))?;
-        let Some(work_job) = self.job.record_job(envelope) else {
+        let Some(work_job) = self.job.record_job(envelope).await else {
             return Ok(Read::Busy);
         };
         let Some(charge) = work_job.reserve(envelope) else {

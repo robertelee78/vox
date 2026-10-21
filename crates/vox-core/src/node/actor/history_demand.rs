@@ -1548,3 +1548,34 @@ fn select(
         more: next.is_some(),
     })
 }
+
+impl Controller {
+    /// The history request as it stands, for `vox status --json` (`lanes.history`).
+    pub(super) fn lanes_json(&self) -> String {
+        fn js(s: &str) -> String {
+            let mut o = String::from("\"");
+            for c in s.chars() {
+                match c {
+                    '"' => o.push_str("\\\""),
+                    '\\' => o.push_str("\\\\"),
+                    '\n' => o.push_str("\\n"),
+                    c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
+                    c => o.push(c),
+                }
+            }
+            o.push('"');
+            o
+        }
+        let (phase, detail) = self.status.as_ref().map_or_else(
+            || ("null".to_owned(), "null".to_owned()),
+            |s| (js(&format!("{:?}", s.phase)), js(&s.detail)),
+        );
+        format!(
+            "{{\"phase\":{phase},\"detail\":{detail},\"preparing\":{},\"ready\":{},\"running\":{},\"private_work\":{}}}",
+            self.preparing.is_some(),
+            self.ready.is_some(),
+            self.running.is_some(),
+            self.private_work.is_some()
+        )
+    }
+}
