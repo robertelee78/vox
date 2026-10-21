@@ -650,6 +650,11 @@ async fn entry(
         {
             Sent::Yes => {
                 if let Some((trigger, engaged)) = hostile_private_body.take() {
+                    // The apparatus records the exact authenticated entry whose chunk crossed the
+                    // sender boundary. The receiver's independent durable marker must match it.
+                    std::fs::write(&trigger, hash).map_err(|_| {
+                        Error::Profile("test hostile-body marker could not record the entry")
+                    })?;
                     std::fs::rename(trigger, engaged).map_err(|_| {
                         Error::Profile("test hostile-body marker could not record engagement")
                     })?;

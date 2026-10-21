@@ -584,6 +584,7 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         "VOX_TEST_HOLD_PACKAGES_FILE",
         "VOX_TEST_SERVE_NONRECIPIENT_HISTORY_BODY_FILE",
         "VOX_TEST_HOLD_ROLE_HEADER_SETTLEMENT_FILE",
+        "VOX_TEST_HISTORY_BODY_DURABLE_FILE",
     ]);
     watchdog::arm();
     let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("APPARATUS: no temp dir: {e}"));
@@ -605,6 +606,7 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         (&alice, &fps[1], "bob"),
         (&bob, &fps[0], "alice"),
         (&carol, &fps[0], "alice"),
+        (&carol, &fps[1], "bob"),
     ] {
         let (ok, _, err) = vox(dir, &["trust", "add", fp, "--name", name], None);
         assert!(ok, "PRODUCT: `vox trust add` of {name} failed: {err}");
@@ -625,6 +627,11 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         .to_owned();
     let settlement_engaged =
         std::path::PathBuf::from(format!("{}.engaged", settlement_hold.display()));
+    let body_durable = root.join("history-body-durable");
+    let body_durable_path = body_durable
+        .to_str()
+        .expect("APPARATUS: a UTF-8 durable-body marker path")
+        .to_owned();
     let alice_daemon = daemon_env(&alice, "alice", &alice_knob);
     attached(&alice, "alice");
     let (ok, _, err) = vox(
@@ -816,10 +823,16 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         )
     });
     let hostile_engaged = std::path::PathBuf::from(format!("{}.engaged", hostile.display()));
-    let bob_settlement_knob = [(
-        "VOX_TEST_HOLD_ROLE_HEADER_SETTLEMENT_FILE",
-        settlement_hold_path.as_str(),
-    )];
+    let bob_settlement_knob = [
+        (
+            "VOX_TEST_HOLD_ROLE_HEADER_SETTLEMENT_FILE",
+            settlement_hold_path.as_str(),
+        ),
+        (
+            "VOX_TEST_HISTORY_BODY_DURABLE_FILE",
+            body_durable_path.as_str(),
+        ),
+    ];
     let bob_after_gap = daemon_env(&bob, "bob-after-gap", &bob_settlement_knob);
     attached(&bob, "bob-after-gap");
     let marker_deadline = Instant::now() + READY_WITHIN;
@@ -869,31 +882,60 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         );
         std::thread::sleep(Duration::from_millis(200));
     }
+    let hostile_hash = std::fs::read(&hostile_engaged).unwrap_or_else(|e| {
+        panic!(
+            "APPARATUS: could not read the exact hostile entry from {}: {e}",
+            hostile_engaged.display()
+        )
+    });
+    assert_eq!(
+        hostile_hash.len(),
+        32,
+        "APPARATUS: {} did not name one exact authenticated entry",
+        hostile_engaged.display()
+    );
     let settlement_deadline = Instant::now() + READY_WITHIN;
-    while !settlement_engaged.is_file() {
+    while !settlement_engaged.is_file()
+        && std::fs::read(&body_durable).ok().as_deref() != Some(hostile_hash.as_slice())
+    {
         assert!(
             Instant::now() < settlement_deadline,
-            "APPARATUS: Bob did not durably park the archive cursor on Carol's role-only header \
-             within {READY_WITHIN:?}; the checkpoint/effect interruption was not staged\n\
+            "APPARATUS: Bob neither durably parked Carol's role-only header nor durably stored the \
+             exact hostile body within {READY_WITHIN:?}; the interruption was not staged\n\
              bob said: {}",
             said(&bob, "bob-after-gap")
         );
         std::thread::sleep(Duration::from_millis(200));
     }
-    let held_status = history_status(&bob, &room);
-    assert!(
-        held_status.0 != "complete" && held_status.1 != 0,
-        "PRODUCT: before Carol's role-only header was semantically settled, Bob reported the \
-         archive request complete with no remaining debt: {held_status:?}"
-    );
-    // Stop at the exact durable boundary, then resume through the shipped command. The source's
-    // private body is never accepted, and restart must retry this header rather than an older
-    // cursor or a false terminal state.
+    let refused_body = settlement_engaged.is_file();
+    if refused_body {
+        let held_status = history_status(&bob, &room);
+        assert!(
+            held_status.0 != "complete" && held_status.1 != 0,
+            "PRODUCT: before Carol's role-only header was semantically settled, Bob reported the \
+             archive request complete with no remaining debt: {held_status:?}"
+        );
+    } else {
+        assert_eq!(
+            std::fs::read(&body_durable).ok().as_deref(),
+            Some(hostile_hash.as_slice()),
+            "APPARATUS: Bob's receiver marker did not match Alice's exact hostile entry"
+        );
+    }
+    // Stop at the exact durable boundary, then resume through the shipped command. The healthy
+    // product parked the refused body at its header; the grant-credit mutant parked the exact
+    // forbidden body after append. Either restart must continue this request rather than invent an
+    // older cursor or a false terminal state.
     bob_after_gap.stop();
-    std::fs::remove_file(&settlement_engaged).unwrap_or_else(|e| {
+    let interruption = if refused_body {
+        &settlement_engaged
+    } else {
+        &body_durable
+    };
+    std::fs::remove_file(interruption).unwrap_or_else(|e| {
         panic!(
             "APPARATUS: could not release {} after Bob stopped: {e}",
-            settlement_engaged.display()
+            interruption.display()
         )
     });
     let bob_after_interruption = daemon(&bob, "bob-after-interruption");

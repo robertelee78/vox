@@ -27,6 +27,12 @@ const MAX_NEEDS: usize = 1;
 #[cfg(feature = "test-knobs")]
 pub const TEST_HOLD_ROLE_SETTLEMENT_ENV: &str = "VOX_TEST_HOLD_ROLE_HEADER_SETTLEMENT_FILE";
 
+/// Proof-only interruption after a body which its authenticated header says belongs to another
+/// member is nevertheless durably appended by a mutant. The marker's exact 32 bytes are the entry
+/// hash; removing it releases the worker.
+#[cfg(feature = "test-knobs")]
+pub const TEST_BODY_DURABLE_ENV: &str = "VOX_TEST_HISTORY_BODY_DURABLE_FILE";
+
 /// Owned activation supplied by the actor after explicit archive demand or current live/control
 /// scheduling. Constructing a receiver never starts, resumes or replaces that activation.
 #[derive(Clone)]
@@ -212,6 +218,8 @@ impl Receiver {
         let mut credit = Response::new(request, query.clone())?;
         credit.charge_handshake(handshake_bytes)?;
         let mut result = Received::pending(Status::ControlPending);
+        #[cfg(feature = "test-knobs")]
+        let mut unexpected_body = None;
         loop {
             let incoming = match io.read(credit.remaining_wire()).await? {
                 Read::Frame(frame) => frame,
@@ -412,6 +420,10 @@ impl Receiver {
                             // chunk credit.  An honest peer completes the role-visible entry
                             // header-only; an unexpected body frame is refused by credit.accept
                             // before Action::Chunk can persist a byte.
+                            #[cfg(feature = "test-knobs")]
+                            if !body_allowed {
+                                unexpected_body = Some(entry.entry_hash());
+                            }
                             if !body_allowed {
                                 if result
                                     .role_ready
@@ -547,6 +559,10 @@ impl Receiver {
                     if persisted != next {
                         return Err(Error::MalformedAtRest("history persisted offset differs"));
                     }
+                    #[cfg(feature = "test-knobs")]
+                    if complete && unexpected_body == Some(entry) {
+                        self.hold_unexpected_body_durable(&entry).await?;
+                    }
                     // Durable nonempty chunk progress remains progress even if later metadata
                     // or ACK allocation is Busy within this same bounded response.
                     result.body_progress = true;
@@ -623,6 +639,22 @@ impl Receiver {
                 current(&self.source.fence, self.source.deadline)?;
                 // Apparatus polling only: removing the marker is the causal release; elapsed
                 // time never changes product state or makes the proof pass.
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "test-knobs")]
+    async fn hold_unexpected_body_durable(&self, entry: &Digest32) -> Result<()> {
+        if let Some(path) = std::env::var_os(TEST_BODY_DURABLE_ENV)
+            .filter(|path| !path.is_empty())
+            .map(std::path::PathBuf::from)
+        {
+            std::fs::write(&path, entry)
+                .map_err(|_| Error::Profile("test durable-body marker could not be written"))?;
+            while path.is_file() {
+                current(&self.source.fence, self.source.deadline)?;
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         }
