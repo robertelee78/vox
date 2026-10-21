@@ -95,8 +95,14 @@ impl ChannelState {
     }
 
     /// Current governance revision, requiring authority to be ready at the room's latest time.
-    pub fn governance_revision(&self, store: &Store) -> Result<u64> {
-        Ok(self.checked_governance(store, self.now_hint)?.revision())
+    pub fn governance_revision(&self, now: crate::time::Ms) -> Result<u64> {
+        if self.poisoned {
+            return Err(self.save_failure());
+        }
+        if !self.governance_display_current(now.get()) {
+            return Err(crate::error::Error::Profile(super::view::REFRESHING));
+        }
+        Ok(self.governance_display.revision)
     }
 
     /// Resolve an exact service name or base32 service fingerprint from current source facts.
@@ -364,13 +370,13 @@ impl ChannelState {
     /// the bounded in-memory display. A ready disk fold alone is not publication.
     pub(crate) fn require_governance_display(
         &self,
-        store: &Store,
+        _store: &Store,
         now: crate::time::Ms,
     ) -> Result<()> {
-        let view = self.checked_governance(store, now.get())?;
-        if !self.governance_display_current(now.get())
-            || self.governance_display.revision != view.revision()
-        {
+        if self.poisoned {
+            return Err(self.save_failure());
+        }
+        if !self.governance_display_current(now.get()) {
             return Err(crate::error::Error::Profile(super::view::REFRESHING));
         }
         Ok(())
@@ -500,7 +506,7 @@ impl ChannelState {
             .read(store, &self.sek, &self.channel_id)?
             .child_after(&entry.entry_hash(), None)?
             .is_some();
-        super::accepted_into(
+        let governance_changed = super::accepted_into(
             batch,
             &self.entries,
             &self.sek,
@@ -515,34 +521,36 @@ impl ChannelState {
         // The Batch failure path poisons this ChannelState, so it is safe to advance the
         // in-memory mirror here with the same accepted input: no usable state can outlive a
         // failed commit. This covers every publication path without polling a sealed header.
-        self.note_committed_consent(entry)?;
-        if late {
+        if governance_changed {
+            self.note_committed_consent(entry)?;
             self.governance_ready = false;
         }
-        if let Ok(body) = GovEntry::body_bound_to(entry) {
-            if let Some(key) = self.authors.get(&entry.skeleton.author_id) {
-                if body.verify(key).is_ok() {
-                    self.governance_ready = false;
-                    if let GovBody::Presence(presence) = &body {
-                        let held =
-                            self.presence
-                                .entry(entry.skeleton.author_id)
-                                .or_insert(Presence {
-                                    last: (entry.skeleton.seq, presence.body.here),
-                                    back: None,
-                                });
-                        if entry.skeleton.seq >= held.last.0 {
-                            held.last = (entry.skeleton.seq, presence.body.here);
+        if governance_changed {
+            if let Ok(body) = GovEntry::body_bound_to(entry) {
+                if let Some(key) = self.authors.get(&entry.skeleton.author_id) {
+                    if body.verify(key).is_ok() {
+                        if let GovBody::Presence(presence) = &body {
+                            let held =
+                                self.presence
+                                    .entry(entry.skeleton.author_id)
+                                    .or_insert(Presence {
+                                        last: (entry.skeleton.seq, presence.body.here),
+                                        back: None,
+                                    });
+                            if entry.skeleton.seq >= held.last.0 {
+                                held.last = (entry.skeleton.seq, presence.body.here);
+                            }
+                            if presence.body.here
+                                && held.back.is_none_or(|(seq, _)| seq < entry.skeleton.seq)
+                            {
+                                held.back = Some((entry.skeleton.seq, entry.skeleton.claimed_ms));
+                            }
+                            let state = *held;
+                            let mut index =
+                                self.entries.write(batch, &self.sek, &self.channel_id)?;
+                            index.note_presence(entry.skeleton.author_id, state)?;
+                            index.seal()?;
                         }
-                        if presence.body.here
-                            && held.back.is_none_or(|(seq, _)| seq < entry.skeleton.seq)
-                        {
-                            held.back = Some((entry.skeleton.seq, entry.skeleton.claimed_ms));
-                        }
-                        let state = *held;
-                        let mut index = self.entries.write(batch, &self.sek, &self.channel_id)?;
-                        index.note_presence(entry.skeleton.author_id, state)?;
-                        index.seal()?;
                     }
                 }
             }

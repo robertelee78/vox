@@ -324,7 +324,7 @@ fn detail_of(
     ch: &ChannelState,
     store: &crate::node::store::Store,
     prev: Option<&ChannelDetail>,
-    _now: crate::time::Ms,
+    now: crate::time::Ms,
     sequence: &std::sync::atomic::AtomicU64,
 ) -> crate::error::Result<ChannelDetail> {
     if ch.is_poisoned() {
@@ -357,7 +357,7 @@ fn detail_of(
     // is derived again. Measured before this (ADR-038 FX-15, #990): every status publication
     // derived it afresh for every open room, and a daemon with four working agent nodes spent
     // ~180% of a core doing so while its control socket answered in 0.5 s.
-    let governance_revision = ch.governance_revision(store)?;
+    let governance_revision = ch.governance_revision(now)?;
     let members = ch.members();
     let epoch = ch.epoch();
     let session_revision = ch.sessions_revision(store)?;
@@ -7713,8 +7713,7 @@ impl Node {
             // room must have this incarnation and current policy/drive authority.
             Ok(Some(
                 detail.history_instance == channel.history_instance(profile.store())?
-                    && detail.governance_revision
-                        == channel.governance_revision(profile.store())?
+                    && detail.governance_revision == channel.governance_revision(self.now_ms())?
                     && detail.drive_from == channel.drive_from_known(profile.store())?.0,
             ))
         })();

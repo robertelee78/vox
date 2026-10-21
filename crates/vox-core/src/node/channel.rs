@@ -1055,7 +1055,8 @@ pub struct ChannelState {
     /// How many of the DAG's fork proofs are kept in `SEG_FORKS` (V210-63). A sync that records
     /// another makes the DAG hold more than this, and the room keeps them all again.
     forks_kept: usize,
-    /// Last published scalar display only. Live authority is read from sealed facts.
+    /// Last published scalar display. Unchanged user-visible queries read this in memory;
+    /// irreversible authority decisions still require the sealed checked view.
     governance_display: governance::Display,
     governance_ready: bool,
     /// This room's admitted-member consent facts in memory (ADR-038 FX-22). Unchanged questions
@@ -4616,8 +4617,10 @@ impl ChannelState {
         }
     }
 
-    /// Apply one committed current-input fact to a ready projection. If a restart build is in
-    /// flight, restart it so no already-inspected pair can retain a stale answer.
+    /// Apply one newly indexed current-input fact to the in-memory projection. During a restart
+    /// build, fold it into the partial result instead of resetting the cursor: pairs not yet
+    /// inspected will read the committed slot later, while already-inspected pairs retain the
+    /// newer authenticated sequence observed here.
     fn note_committed_consent(&self, entry: &Entry) -> Result<()> {
         let Ok(fact) = GovEntry::body_bound_to(entry) else {
             return Ok(());
@@ -4658,8 +4661,10 @@ impl ChannelState {
                     &fact,
                 );
             }
-            ConsentFactsState::Building(_) => {
-                *held = ConsentFactsState::Building(ConsentFactsBuild::new(&self.authors));
+            ConsentFactsState::Building(build) => {
+                build
+                    .facts
+                    .observe(entry.skeleton.author_id, entry.skeleton.seq, &fact);
             }
         }
         Ok(())
@@ -8943,7 +8948,7 @@ impl ChannelState {
         if self.poisoned {
             return Err(self.save_failure());
         }
-        self.require_governance_ready(profile.store(), crate::time::Ms(now_ms))?;
+        self.require_governance_display(profile.store(), crate::time::Ms(now_ms))?;
         let me = profile.fingerprint();
         if !self.authors.contains_key(&me) || self.has_left(&me) {
             return Err(Error::Profile("this identity has left the room"));
@@ -8955,7 +8960,6 @@ impl ChannelState {
             let rendered =
                 self.entries
                     .render_view(profile.store(), &self.sek, &self.channel_id)?;
-            let governance = self.current_governance(profile.store())?;
             let facts = self.consent_facts()?;
             let mut marks = BTreeSet::new();
             for hash in shown {
@@ -8987,7 +8991,6 @@ impl ChannelState {
                 }
                 marks.insert(*hash);
             }
-            drop(governance);
             drop(rendered);
             if marks.is_empty() {
                 return Ok(());
@@ -9036,7 +9039,7 @@ impl ChannelState {
             return Err(Error::RoomNotSynced);
         }
         self.require_own_history_current()?;
-        self.require_governance_ready(profile.store(), crate::time::Ms(now_ms))?;
+        self.require_governance_display(profile.store(), crate::time::Ms(now_ms))?;
         let me = profile.fingerprint();
         if self.has_left(&me) || self.ended(now_ms).is_some() {
             return Ok(false);
@@ -9049,13 +9052,12 @@ impl ChannelState {
             if last != 0 && now_ms < last.saturating_add(interval_ms) {
                 return Ok(None);
             }
-            let governance = self.current_governance(profile.store())?;
             let facts = self.consent_facts()?;
             let eligibility = ReadMarkEligibility {
                 reader: me,
                 pending: rendered.pending_reads_root()?,
                 rendered: rendered.display_roots(),
-                governance: governance.revision(),
+                governance: self.governance_revision(crate::time::Ms(now_ms))?,
                 retention: (self.effective_retention(), self.effective_step_retention()),
             };
             if self.read_mark_scan.is_none() && self.read_mark_complete == Some(eligibility) {

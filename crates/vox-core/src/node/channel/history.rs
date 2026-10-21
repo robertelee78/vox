@@ -277,11 +277,11 @@ impl View<'_> {
         ) {
             return Err(Failure::Request(LEGACY_HISTORY_REQUIRED));
         }
-        // The completed current authority is still required here; who may read whom is
-        // answered from the room's facts in memory (ADR-038 FX-22). The requester renders a row
-        // that arrives before its key, or before its author's consent folds, when they land
-        // (#1007), so the faster answer costs it nothing.
-        self.ch.checked_governance(self.store, self.ch.now_hint)?;
+        // The completed current authority and consent projection are held by the open room.
+        // This unchanged read must not open even the governance header: acceptance invalidates
+        // readiness and the bounded governance turn publishes the next in-memory revision.
+        self.ch
+            .require_governance_display(self.store, crate::time::Ms(self.ch.now_hint))?;
         let me = self.ch.me();
         let answer = self.answer(query, bytes)?;
         let facts = self.ch.consent_facts()?;
@@ -1647,11 +1647,10 @@ impl ChannelState {
             // gate above (`legacy_cache_only`) stays. Measured before this: a newcomer's
             // `vox room read --json --limit 25` was refused "room governance is refreshing"
             // while the control entries of the room he had just joined were still folding.
-            let provisional = match self.checked_governance(store, now_ms) {
-                Ok(_) => false,
-                Err(e) if super::governance::refreshing(&e) => true,
-                Err(e) => return Err(Failure::Storage(e)),
-            };
+            // Acceptance invalidates the in-memory publication before the source Batch can be
+            // used. The bounded governance turn restores it after publishing the new revision,
+            // so an unchanged read neither opens nor decrypts the governance header.
+            let provisional = !self.governance_display_current(now_ms);
             self.prune_retention_page(store)?;
             if self.retention_due(store, 0)?.1 {
                 return Err(Failure::Request(

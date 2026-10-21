@@ -482,24 +482,68 @@ fn assert_exact_read_rows(
     );
 }
 
+/// Observe the competing author's exact retained object before a long author's durable
+/// continuation is exhausted. This is the user-visible fairness boundary: eventual visibility
+/// after the long queue drains cannot prove that the competing author received a turn.
+fn wait_for_competing_author_turn(
+    dir: &Path,
+    room: &str,
+    long_hashes: &[String],
+    competing_hash: &str,
+) {
+    loop {
+        let rows = room_rows(dir, room);
+        let readable_long = rows
+            .iter()
+            .filter(|row| {
+                row["entry_hash"].as_str().is_some_and(|hash| {
+                    long_hashes.iter().any(|expected| expected == hash)
+                        && row["text"].as_str().is_some()
+                })
+            })
+            .count();
+        let competing = rows.iter().find(|row| row["entry_hash"] == competing_hash);
+        if let Some(competing) = competing.filter(|row| row["text"].as_str().is_some()) {
+            assert!(
+                readable_long < long_hashes.len(),
+                "PRODUCT: the competing author's exact retained row {competing_hash} became \
+                 readable only after all {} rows of the long author's continuation; the \
+                 bounded backfill did not give the competing author a fair turn in room \
+                 {room}; competing row: {competing}",
+                long_hashes.len()
+            );
+            return;
+        }
+        assert!(
+            readable_long < long_hashes.len(),
+            "PRODUCT: all {} rows of one author's durable continuation became readable while \
+             the competing author's exact retained row {competing_hash} was still parked in \
+             room {room}; all rows: {rows:?}",
+            long_hashes.len()
+        );
+        std::thread::yield_now();
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct RoomStatus {
     log_entries: u64,
     received_key_generations: u64,
 }
 
-/// What the shipped status command says about one room. A refused or malformed observation is an
-/// apparatus fault while the proof is arranging its two deliberate holds.
+/// What the shipped status command says about one room. Refused or malformed output is a product
+/// red even while the proof is arranging its deliberate holds: it is still the shipped command's
+/// user-visible answer.
 fn room_status(dir: &Path, reader: &str, room: &str) -> RoomStatus {
     let (ok, out, err) = vox(dir, &["status", "--json"], None);
     assert!(
         ok,
-        "APPARATUS: {reader}'s `vox status --json` was unavailable while staging room {room}: \
+        "PRODUCT: {reader}'s `vox status --json` was unavailable while staging room {room}: \
          {out}{err}"
     );
     let value: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|error| {
         panic!(
-            "APPARATUS: {reader}'s `vox status --json` was malformed while staging room {room} \
+            "PRODUCT: {reader}'s `vox status --json` was malformed while staging room {room} \
              ({error}): {out}"
         )
     });
@@ -512,7 +556,7 @@ fn room_status(dir: &Path, reader: &str, room: &str) -> RoomStatus {
         })
         .unwrap_or_else(|| {
             panic!(
-                "APPARATUS: {reader}'s `vox status --json` did not contain staged room {room}: \
+                "PRODUCT: {reader}'s `vox status --json` did not contain staged room {room}: \
                  {out}"
             )
         });
@@ -551,7 +595,7 @@ fn trust_detail(dir: &Path, reader: &str, room: &str, member: &str) -> String {
     let (_, out, err) = vox(dir, &["agent", "doctor", "--room", room, "--json"], None);
     let report: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|error| {
         panic!(
-            "APPARATUS: {reader}'s `vox agent doctor --json` was malformed while staging room \
+            "PRODUCT: {reader}'s `vox agent doctor --json` was malformed while staging room \
              {room} ({error}): {out}{err}"
         )
     });
@@ -566,7 +610,7 @@ fn trust_detail(dir: &Path, reader: &str, room: &str, member: &str) -> String {
         .and_then(|check| check["detail"].as_str())
         .unwrap_or_else(|| {
             panic!(
-                "APPARATUS: {reader}'s doctor reported no `trust {member}` detail for staged \
+                "PRODUCT: {reader}'s doctor reported no `trust {member}` detail for staged \
                  room {room}: {report}"
             )
         })
@@ -827,7 +871,7 @@ const AT_WORK: Duration = Duration::from_secs(60);
 const WORK_ROOMS: usize = 3;
 /// Rows Alice seals in each work room before Bob joins it. The fold and package marker holds below
 /// make Bob accept these rows before their author's consent and sender key, respectively.
-const BEFORE_KEY: usize = 2 * vox_core::node::channel::RENDER_BACKFILL_ROWS_PER_TURN + 1;
+const BEFORE_KEY: usize = 4 * vox_core::node::channel::RENDER_BACKFILL_ROWS_PER_TURN + 1;
 /// Apparatus sampling cadence while the absent-fact state idles. It is no deadline or product
 /// threshold; each status command is judged only by the shipped control socket's own contract.
 const IDLE_STATUS_PACE: Duration = Duration::from_secs(1);
@@ -1224,7 +1268,7 @@ fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
     // Bob now receives Alice's consent and the sealed package row, but the package marker keeps
     // the shipped daemon from opening it. Doctor says consent is mutual while status still says
     // zero received generations: the second hold is visibly engaged.
-    let _bob_daemon = daemon_env(&bob, "bob", &package_knob);
+    let bob_daemon = daemon_env(&bob, "bob", &package_knob);
     attached(&bob, "bob");
     for (i, room) in rooms.iter().enumerate() {
         wait_trust_detail(&bob, "bob", room, "alice", "you trust each other");
@@ -1247,6 +1291,7 @@ fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
     carol_daemon.stop();
     std::fs::remove_file(&package_hold)
         .unwrap_or_else(|error| panic!("APPARATUS: could not release the package hold: {error}"));
+    wait_for_competing_author_turn(&bob, &rooms[0], &late_hashes[0], &competing_hashes[0][0]);
     for (index, room) in rooms.iter().enumerate() {
         let ready = wait_room_status(&bob, "bob", room, false, |status| {
             status.received_key_generations >= 2
@@ -1270,6 +1315,40 @@ fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
              unavailable",
         );
     }
+
+    // An idempotent trust command asks the daemon to retry retained logged key packages. Both
+    // exact authors' generations are already held and both sources are offline, so every replay
+    // here is an unchanged SKDM. Over the established waiting-room interval these causal replay
+    // triggers must remain within that same idle CPU contract; a duplicate that requeues the
+    // long author from sequence one turns this assertion red on its own work.
+    let duplicate_cpu0 = cpu_time(bob_daemon.0.id());
+    let duplicate_started = Instant::now();
+    let mut duplicate_triggers = 0usize;
+    while duplicate_started.elapsed() < PREPARING_IDLE {
+        let (ok, out, err) = vox(&bob, &["trust", "add", &fps[0], "--name", "alice"], None);
+        assert!(
+            ok,
+            "PRODUCT: Bob's idempotent `vox trust add alice` could not replay retained key \
+             packages: {out}{err}"
+        );
+        duplicate_triggers += 1;
+        std::thread::sleep(IDLE_STATUS_PACE);
+    }
+    let duplicate_elapsed = duplicate_started.elapsed();
+    let duplicate_cpu = cpu_time(bob_daemon.0.id()).saturating_sub(duplicate_cpu0);
+    let duplicate_allowed_nanos = PREPARING_CPU
+        .as_nanos()
+        .saturating_mul(duplicate_elapsed.as_nanos())
+        / PREPARING_IDLE.as_nanos();
+    let duplicate_allowed =
+        Duration::from_nanos(u64::try_from(duplicate_allowed_nanos).unwrap_or(u64::MAX));
+    assert!(
+        duplicate_cpu <= duplicate_allowed,
+        "PRODUCT: {duplicate_triggers} shipped trust commands replaying retained, unchanged \
+         sender-key packages made Bob's otherwise idle daemon consume +{duplicate_cpu:?} CPU \
+         over {duplicate_elapsed:?}; the established waiting-room allowance is \
+         {duplicate_allowed:?} (ADR-038 FX-22, #1007)"
+    );
     let _alice_daemon = daemon(&alice, "alice");
     attached(&alice, "alice");
 
@@ -2179,28 +2258,28 @@ fn a_room_that_cannot_finish_preparing_says_why_and_costs_nothing() {
     drop(second);
 }
 
-/// Completed sync rounds per peer, from `vox status --json`'s lanes; an unreadable status is
-/// an apparatus fault, never a zero that reads as quiet.
+/// Completed sync rounds per peer, from `vox status --json`'s lanes; an unreadable or malformed
+/// shipped answer is a product red, never a zero that reads as quiet.
 fn completed_rounds(dir: &Path) -> std::collections::BTreeMap<String, u64> {
     let (ok, out, err) = vox(dir, &["status", "--json"], None);
     assert!(
         ok,
-        "APPARATUS: `vox status --json` failed while counting rounds: {err}"
+        "PRODUCT: `vox status --json` failed while counting rounds: {err}"
     );
     let v: serde_json::Value = serde_json::from_str(&out)
-        .unwrap_or_else(|e| panic!("APPARATUS: `vox status --json` is not JSON: {e}: {out}"));
+        .unwrap_or_else(|e| panic!("PRODUCT: `vox status --json` is not JSON: {e}: {out}"));
     let lanes = v["sync"]
         .as_array()
-        .unwrap_or_else(|| panic!("APPARATUS: `vox status --json` has no `sync` lanes: {out}"));
+        .unwrap_or_else(|| panic!("PRODUCT: `vox status --json` has no `sync` lanes: {out}"));
     let mut rounds = std::collections::BTreeMap::new();
     for lane in lanes {
         let peer = lane["peer"]
             .as_str()
-            .unwrap_or_else(|| panic!("APPARATUS: a lane names no peer: {lane}"))
+            .unwrap_or_else(|| panic!("PRODUCT: a status lane names no peer: {lane}"))
             .to_owned();
         let completed = lane["completed"]
             .as_u64()
-            .unwrap_or_else(|| panic!("APPARATUS: a lane counts no completed rounds: {lane}"));
+            .unwrap_or_else(|| panic!("PRODUCT: a status lane counts no completed rounds: {lane}"));
         *rounds.entry(peer).or_insert(0) += completed;
     }
     rounds
