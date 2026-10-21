@@ -681,9 +681,12 @@ impl ChannelState {
             // Feed restoration is local accepted-header maintenance. Advance at most one
             // successor in this bounded turn, including while the exact staged body continues
             // through refill below.
-            self.advance_history_contiguous(store, &author)?;
+            let contiguous_pending = self.advance_history_contiguous(store, &author)?;
             if refill_pending {
                 return Ok(HistoryEffectProgress::RefillPending { governance: false });
+            }
+            if contiguous_pending {
+                return Ok(HistoryEffectProgress::Progress);
             }
             return Ok(HistoryEffectProgress::Complete {
                 rendered: cursor.rendered,
@@ -781,7 +784,13 @@ impl ChannelState {
         // A changed grant is an ordinary cancellation before projection/index mutation.
         // The held Batch serializes trust writes through the final publication.
         check_binding(&batch)?;
-        let applied = (|| -> Result<(bool, bool, bool, bool)> {
+        let applied = (|| -> Result<(
+            bool,
+            bool,
+            bool,
+            bool,
+            entry_store::sparse::ContiguousAdvance,
+        )> {
             let finished = FinishedHistoryEffect { hash: *hash };
             let mut index = self
                 .entries
@@ -832,6 +841,18 @@ impl ChannelState {
             if !(refill_pending || staged_deferred || body_unavailable) {
                 on_admitted(&mut batch, *hash)?;
             }
+            // Settlement, obligation retirement, and the restart receipt cursor are one
+            // transaction. A crash can expose all of them or none of them, never a settled
+            // position whose receipt cursor still waits for an unrelated event.
+            let contiguous = {
+                let mut index = self
+                    .entries
+                    .write(&mut batch, &self.sek, &self.channel_id)?;
+                let progress =
+                    index.advance_sparse_contiguous(&entry.skeleton.author_id, &self.me())?;
+                index.seal()?;
+                progress
+            };
             batch.commit()?;
             self.entries.committed();
             // The settled-tip index and presence update are now durable in the same Batch.
@@ -853,15 +874,27 @@ impl ChannelState {
             let rendered = !rows.is_empty();
             self.place_committed(store, rows, &expired)?;
             self.settle_display_order(store)?;
-            Ok((rendered, refill_pending, staged_deferred, body_unavailable))
+            Ok((
+                rendered,
+                refill_pending,
+                staged_deferred,
+                body_unavailable,
+                contiguous,
+            ))
         })();
-        let (rendered, refill_pending, projection_deferred, body_unavailable) = match applied {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                self.poison(&error);
-                return Err(error);
-            }
-        };
+        let (rendered, refill_pending, projection_deferred, body_unavailable, contiguous) =
+            match applied {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    self.poison(&error);
+                    return Err(error);
+                }
+            };
+        let contiguous_more = contiguous.more;
+        if let Err(error) = self.note_contiguous_advance(entry.skeleton.author_id, contiguous) {
+            self.poison(&error);
+            return Err(error);
+        }
         cursor.rendered |= rendered;
         if body_unavailable {
             return Ok(HistoryEffectProgress::BodyUnavailable);
@@ -871,21 +904,18 @@ impl ChannelState {
                 governance: projection_deferred,
             });
         }
-        match self.advance_history_contiguous(store, &entry.skeleton.author_id) {
-            Ok(_) => Ok(HistoryEffectProgress::Complete {
-                rendered: cursor.rendered,
-            }),
-            Err(error) => {
-                self.poison(&error);
-                Err(error)
-            }
+        if contiguous_more {
+            return Ok(HistoryEffectProgress::Progress);
         }
+        Ok(HistoryEffectProgress::Complete {
+            rendered: cursor.rendered,
+        })
     }
 }
 
 impl ChannelState {
-    /// One real Feed successor, after its semantic publication. The actor may schedule
-    /// another bounded turn only when this reports progress; sparse holes stop immediately.
+    /// One bounded page of role-complete successors after semantic publication. A full page
+    /// remains explicitly pending; a real sparse hole parks until its own arrival wakes it.
     pub(crate) fn advance_history_contiguous(
         &mut self,
         store: &Store,
@@ -895,23 +925,55 @@ impl ChannelState {
             return Err(self.save_failure());
         }
         if self.history_publication_busy(store)? {
-            return Ok(false);
+            return Ok(!self.sparse_contiguous_pending.is_empty());
         }
         let mut batch = store.batch()?;
         let mut index = self
             .entries
             .write(&mut batch, &self.sek, &self.channel_id)?;
-        let Some(state) = index.advance_sparse_contiguous(author, &self.me())? else {
-            return Ok(false);
-        };
+        let progress = index.advance_sparse_contiguous(author, &self.me())?;
         index.seal()?;
         batch.commit()?;
         self.entries.committed();
-        if let Err(error) = self.dag.restore_contiguous_author(*author, &state) {
-            self.poison(&error);
-            return Err(error);
+        self.note_contiguous_advance(*author, progress)?;
+        Ok(!self.sparse_contiguous_pending.is_empty())
+    }
+
+    fn note_contiguous_advance(
+        &mut self,
+        author: Digest32,
+        progress: entry_store::sparse::ContiguousAdvance,
+    ) -> Result<()> {
+        if let Some(state) = progress.state {
+            self.dag.restore_contiguous_author(author, &state)?;
         }
-        Ok(true)
+        if progress.more {
+            self.sparse_contiguous_pending.insert(author);
+        } else {
+            self.sparse_contiguous_pending.remove(&author);
+        }
+        Ok(())
+    }
+
+    /// Advance one author per room turn, rotating after the last author examined. The set is
+    /// reconstructed from settled tips on restart, so continuation is durable without a timer.
+    pub(crate) fn advance_pending_sparse_contiguous(&mut self, store: &Store) -> Result<bool> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let next = self
+            .sparse_contiguous_after
+            .and_then(|after| {
+                self.sparse_contiguous_pending
+                    .range((Excluded(after), Unbounded))
+                    .next()
+                    .copied()
+            })
+            .or_else(|| self.sparse_contiguous_pending.first().copied());
+        let Some(author) = next else {
+            self.sparse_contiguous_after = None;
+            return Ok(false);
+        };
+        self.sparse_contiguous_after = Some(author);
+        self.advance_history_contiguous(store, &author)
     }
 }
 
@@ -1023,6 +1085,17 @@ impl ChannelState {
             if settled && !deferred && !unavailable {
                 on_admitted(&mut batch, hash)?;
             }
+            let contiguous = if settled && !deferred && !unavailable {
+                let mut index = self
+                    .entries
+                    .write(&mut batch, &self.sek, &self.channel_id)?;
+                let progress =
+                    index.advance_sparse_contiguous(&entry.skeleton.author_id, &self.me())?;
+                index.seal()?;
+                Some(progress)
+            } else {
+                None
+            };
             batch.commit()?;
             self.entries.committed();
             if settled && kind == SignedEntryKind::KeyPackage && key_package_for(entry, &self.me())
@@ -1033,16 +1106,16 @@ impl ChannelState {
             self.gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let rendered = !rows.is_empty();
             self.place_committed(store, rows, &expired)?;
-            if settled && !deferred && !unavailable {
-                // The source effect may have completed before its owed body arrived. Receipt is
-                // role-contiguous, so the durable feed prefix advances only after this refill's
-                // body/projection transaction has made that position complete.
-                self.advance_history_contiguous(store, &entry.skeleton.author_id)?;
+            let contiguous_more = contiguous.as_ref().is_some_and(|progress| progress.more);
+            if let Some(progress) = contiguous {
+                self.note_contiguous_advance(entry.skeleton.author_id, progress)?;
             }
             Ok(if unavailable {
                 HistoryEffectProgress::BodyUnavailable
             } else if deferred {
                 HistoryEffectProgress::RefillPending { governance: true }
+            } else if contiguous_more {
+                HistoryEffectProgress::Progress
             } else if settled {
                 HistoryEffectProgress::Complete { rendered }
             } else {

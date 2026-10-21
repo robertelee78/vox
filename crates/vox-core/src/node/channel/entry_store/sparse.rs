@@ -2501,7 +2501,7 @@ impl Write<'_, '_> {
         &mut self,
         author: &Digest32,
         local_id: &Digest32,
-    ) -> Result<Option<crate::log::dag::PublishedFeed>> {
+    ) -> Result<ContiguousAdvance> {
         self.require_sparse_idle()?;
         let restart = self
             .directory
@@ -2509,7 +2509,7 @@ impl Write<'_, '_> {
             .as_ref()
             .ok_or(invalid("sparse restart state absent"))?;
         let mut state = restart.feeds.get(author).cloned().unwrap_or_default();
-        let mut advanced = false;
+        let mut advanced = 0usize;
         for _ in 0..crate::log::history::MAX_PAGE_ENTRIES {
             if state.ended {
                 break;
@@ -2572,10 +2572,21 @@ impl Write<'_, '_> {
                 .ok_or(invalid("sparse restart state vanished"))?
                 .feeds
                 .insert(*author, state.clone());
-            advanced = true;
+            advanced += 1;
         }
-        Ok(advanced.then_some(state))
+        Ok(ContiguousAdvance {
+            state: (advanced != 0).then_some(state.clone()),
+            // This is deliberately conservative: an exact full page schedules one bounded
+            // successor turn. That turn either advances another page or observes the first
+            // real hole and parks. No timer or unrelated peer event is needed for continuation.
+            more: advanced == crate::log::history::MAX_PAGE_ENTRIES && !state.ended,
+        })
     }
+}
+
+pub(crate) struct ContiguousAdvance {
+    pub(crate) state: Option<crate::log::dag::PublishedFeed>,
+    pub(crate) more: bool,
 }
 
 impl crate::log::history::ContextSource for Read<'_> {

@@ -403,6 +403,10 @@ fn detail_of(
         Some(p) => p.drive_from.clone(),
         None => ch.drive_from_known(store)?.0,
     };
+    let held_through = members
+        .iter()
+        .filter_map(|member| ch.held_through(member).map(|seq| (*member, seq)))
+        .collect();
     Ok(ChannelDetail {
         pause: ch.room_pause(),
         pause_resume_after: ch.pause_resume_after(),
@@ -421,6 +425,7 @@ fn detail_of(
             .map(|(tag, addr)| (tag.clone(), *addr))
             .collect(),
         synced: ch.is_settled(),
+        own_feed_through: ch.own_verified_head(),
         equivocations: ch.equivocations(),
         creator: ch.genesis().creator_pubkey().fingerprint(),
         member_consent,
@@ -440,6 +445,7 @@ fn detail_of(
         refused_below_checkpoint,
         read_by,
         held,
+        held_through,
         unread,
         // The authors this node can answer for now; a refreshing author is named in each
         // listing's revision rather than holding the whole room's detail back (ADR-037 R4).
@@ -20294,6 +20300,10 @@ impl Node {
                     last_seen: self.status.last_seen.get(m).copied(),
                     last_sync: self.status.member_synced.get(m).copied(),
                     key_waits: self.said_of(&room.channel_id, m),
+                    held_through: room
+                        .held_through
+                        .iter()
+                        .find_map(|(member, seq)| (*member == *m).then_some(*seq)),
                 })
                 .collect();
             // From the room as last published, never its lock: a sync session holds that lock
@@ -20319,6 +20329,7 @@ impl Node {
                 refused_below_checkpoint: room.refused_below_checkpoint,
                 entries: summary.map_or(0, |c| c.entries),
                 log_entries: summary.map_or(0, |c| c.log_entries),
+                own_feed_through: room.own_feed_through,
                 members,
             });
         }

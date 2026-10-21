@@ -641,6 +641,8 @@ pub struct ChannelDetail {
     /// Whether this node has completed the room's first sync since joining it (V210-164): until
     /// then its log may not yet hold what the room's members have written, shares included.
     pub synced: bool,
+    /// Last contiguous authenticated position in this node's own room feed.
+    pub own_feed_through: u64,
     /// The members this node holds back for equivocating in this room (V210-63): each
     /// `(author, seq)` at which two different messages signed by that author were seen.
     pub equivocations: Vec<(Digest32, u64)>,
@@ -698,6 +700,8 @@ pub struct ChannelDetail {
     /// other members' nodes said they hold it)`, oldest first, for the same messages as
     /// [`Self::read_by`] looks at.
     pub held: Vec<(Digest32, u64)>,
+    /// Last authenticated position each member said it holds in this node's feed.
+    pub held_through: Vec<(Digest32, u64)>,
     /// What this node's person has not read here, oldest first
     /// ([`crate::node::channel::ChannelState::unread`]): what a client counts at its start.
     pub unread: Vec<Digest32>,

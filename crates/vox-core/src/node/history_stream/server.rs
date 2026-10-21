@@ -479,26 +479,40 @@ async fn entry(
         result.status = Status::Busy;
         return Ok(result);
     };
-    let payload = match source
-        .read_body(
-            &record_job,
-            envelope,
-            length as usize + MAX_HEADER_BYTES + 9,
-            move |room, store| Ok(Some(room.history_payload(store, &hash)?)),
+    // Membership grants the public authenticated header, not another member's private key.
+    // Decide this from the verified signed header before even opening the retained body. Page
+    // and Entry share this path, so an archive request cannot override recipient privacy.
+    let private_for_another = parsed.skeleton.v2.as_ref().is_some_and(|v2| {
+        v2.kind == crate::log::history::SignedEntryKind::KeyPackage
+            && v2.recipient != Some(source.peer)
+    });
+    let payload = if private_for_another {
+        None
+    } else {
+        Some(
+            match source
+                .read_body(
+                    &record_job,
+                    envelope,
+                    length as usize + MAX_HEADER_BYTES + 9,
+                    move |room, store| Ok(Some(room.history_payload(store, &hash)?)),
+                )
+                .await?
+            {
+                Lookup::Found(held) => held,
+                Lookup::Busy => {
+                    result.status = Status::Busy;
+                    return Ok(result);
+                }
+                Lookup::Missing => return Ok(result),
+            },
         )
-        .await?
-    {
-        Lookup::Found(held) => held,
-        Lookup::Busy => {
-            result.status = Status::Busy;
-            return Ok(result);
-        }
-        Lookup::Missing => return Ok(result),
     };
-    let bytes = match &payload.value {
-        HistoryPayload::Held { payload_len, bytes } if *payload_len == length => Some(bytes),
-        HistoryPayload::BodyNotHeld { payload_len } if *payload_len == length => None,
-        HistoryPayload::Missing => return Ok(result),
+    let bytes = match payload.as_ref().map(|payload| &payload.value) {
+        None => None,
+        Some(HistoryPayload::Held { payload_len, bytes }) if *payload_len == length => Some(bytes),
+        Some(HistoryPayload::BodyNotHeld { payload_len }) if *payload_len == length => None,
+        Some(HistoryPayload::Missing) => return Ok(result),
         _ => return Err(Error::MalformedAtRest("history body/header length differs")),
     };
     match send(

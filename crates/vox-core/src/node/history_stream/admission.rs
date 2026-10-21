@@ -608,7 +608,9 @@ pub(super) fn start_entry(
     // members retain only its authenticated public header.
     let addressed_key = v2.kind == crate::log::history::SignedEntryKind::KeyPackage
         && v2.recipient == Some(room.me());
-    if (require_body || addressed_key) && entry.payload.is_none() {
+    let private_for_another = v2.kind == crate::log::history::SignedEntryKind::KeyPackage
+        && v2.recipient != Some(room.me());
+    if (addressed_key || (require_body && !private_for_another)) && entry.payload.is_none() {
         return Ok(EntryStart::BodyNeeded);
     }
     let body = match governance::TypedSparseBody::verify(entry, &key, &mut WorkBudget::default())? {

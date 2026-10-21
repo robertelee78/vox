@@ -1029,6 +1029,10 @@ pub struct ChannelState {
     /// Highest semantically applied sparse entry per admitted author. Rebuilt from the
     /// sealed settled-tip index on open; signed/source-only heads never enter this map.
     sparse_applied_tips: BTreeMap<Digest32, u64>,
+    /// Authors whose durable settled suffix still extends beyond the role-complete restart
+    /// cursor. One bounded page is advanced per governance turn, fairly across authors.
+    sparse_contiguous_pending: BTreeSet<Digest32>,
+    sparse_contiguous_after: Option<Digest32>,
     sender: SenderChain,
     /// The next `LogDb` / `PlaintextCache` segment id.
     next_log_id: u64,
@@ -1929,6 +1933,8 @@ impl ChannelState {
             own_behind: false,
             presence: BTreeMap::new(),
             sparse_applied_tips: BTreeMap::new(),
+            sparse_contiguous_pending: BTreeSet::new(),
+            sparse_contiguous_after: None,
             sender,
             next_log_id: 1,
             read_mark_scan: None,
@@ -2359,11 +2365,19 @@ impl ChannelState {
         // prefix. Read at most one persistent, effect-checked tip per admitted author;
         // reopening never enumerates retained entries or promotes an observed/source head.
         let mut sparse_applied_tips = BTreeMap::new();
+        let mut sparse_contiguous_pending = BTreeSet::new();
         if entry_read.sparse_enabled() {
             for (author, key) in &authors {
                 if let Some(tip) = entry_read.history_settled_tip(author)? {
                     tip.verify(key)?;
                     sparse_applied_tips.insert(*author, tip.skeleton.seq);
+                    let held = entry_read
+                        .restart_state()
+                        .and_then(|state| state.feeds.get(author))
+                        .map_or(0, |feed| feed.seq);
+                    if tip.skeleton.seq > held {
+                        sparse_contiguous_pending.insert(*author);
+                    }
                 }
             }
             // This node applied its own authored operation in the same Batch that advanced
@@ -2618,6 +2632,8 @@ impl ChannelState {
             own_behind,
             presence,
             sparse_applied_tips,
+            sparse_contiguous_pending,
+            sparse_contiguous_after: None,
             sender,
             next_log_id,
             read_mark_scan: None,
@@ -2881,6 +2897,8 @@ impl ChannelState {
             own_behind: false,
             presence: BTreeMap::new(),
             sparse_applied_tips: BTreeMap::new(),
+            sparse_contiguous_pending: BTreeSet::new(),
+            sparse_contiguous_after: None,
             sender,
             next_log_id: 1,
             read_mark_scan: None,

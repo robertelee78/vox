@@ -81,6 +81,7 @@ mod optional_proof;
 optional_proof::not_run!(
     a_newcomer_trusted_before_every_post_reads_all_of_them,
     a_newcomer_talks_both_ways_at_one_wait_fresh_or_behind_a_backlog,
+    a_quiet_room_costs_no_rounds_and_says_when_it_last_synced,
 );
 
 #[path = "support/test_knobs.rs"]
@@ -623,17 +624,34 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         ok,
         "PRODUCT: alice's package marker was refused: {out}{err}"
     );
+    let marker_through = room_own_feed_through(&alice, &room).unwrap_or_else(|| {
+        panic!(
+            "PRODUCT: alice's `vox status --json` did not name her authenticated room-feed \
+             position after the package marker"
+        )
+    });
+    // Reading a fresh later row is not proof of crossing a sparse gap: it can arrive and render
+    // independently. Alice must instead report Bob's authenticated receipt through the exact
+    // feed position after the package. That role-contiguous cursor cannot jump over Carol's
+    // package header, even though Bob must never receive its private body.
     let crossed_deadline = Instant::now() + READY_WITHIN;
-    while !reads(&bob, &room, package_marker) {
+    while member_held_through(&alice, &room, &fps[1]).is_none_or(|held| held < marker_through) {
         assert!(
             Instant::now() < crossed_deadline,
-            "APPARATUS: bob did not read alice's later marker within {READY_WITHIN:?}, so the \
-             proof did not establish that his authenticated feed crossed carol's package\n\
+            "PRODUCT: within {READY_WITHIN:?}, alice did not report Bob holding her authenticated \
+             room feed through {marker_through}; Carol's header-only package did not settle \
+             contiguously for Bob's role\n\
              bob's daemon said: {}",
             said(&bob, "bob")
         );
         std::thread::sleep(Duration::from_millis(200));
     }
+    assert!(
+        reads(&bob, &room, package_marker),
+        "PRODUCT: Bob acknowledged Alice's feed through {marker_through}, but `vox room read` did \
+         not show its later marker\nbob's daemon said: {}",
+        said(&bob, "bob")
+    );
 
     // ---- the room is quiet: acknowledgements settle, then the rounds are counted ----------
     let before = [synced(&alice), synced(&bob)];
@@ -1469,6 +1487,34 @@ fn member_key_waits(dir: &Path, member: &str) -> Option<Option<String>> {
             })
         })
     })
+}
+
+fn room_own_feed_through(dir: &Path, room: &str) -> Option<u64> {
+    let (ok, out, _) = vox(dir, &["status", "--json"], None);
+    if !ok {
+        return None;
+    }
+    serde_json::from_str::<serde_json::Value>(&out).ok()?["rooms"]
+        .as_array()?
+        .iter()
+        .find(|row| row["id"].as_str().is_some_and(|id| id.starts_with(room)))?["own_feed_through"]
+        .as_u64()
+}
+
+fn member_held_through(dir: &Path, room: &str, member: &str) -> Option<u64> {
+    let (ok, out, _) = vox(dir, &["status", "--json"], None);
+    if !ok {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(&out).ok()?;
+    value["rooms"]
+        .as_array()?
+        .iter()
+        .find(|row| row["id"].as_str().is_some_and(|id| id.starts_with(room)))?["members"]
+        .as_array()?
+        .iter()
+        .find(|row| row["id"].as_str() == Some(member))?["held_through"]
+        .as_u64()
 }
 
 /// `vox room list` MUST name what a preparing room waits for within this of the daemon's start.

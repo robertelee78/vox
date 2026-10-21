@@ -102,6 +102,8 @@ pub struct MemberStatus {
     /// What is said of it about this identity's key in this room, after its name, if anything
     /// (ADR-030 D-5, W-4): that the key waits, and why, or that it runs an older Vox.
     pub key_waits: Option<String>,
+    /// Last authenticated position this member said it holds in this node's room feed.
+    pub held_through: Option<u64>,
 }
 
 /// One room that is still preparing: not open, not closed, and saying what it waits for.
@@ -156,6 +158,8 @@ pub struct RoomStatus {
     /// and what no person is shown, such as read records (ADR-028 §6). What the room costs this
     /// node in storage and every sync in traffic, which a count of rows does not say.
     pub log_entries: u64,
+    /// Last contiguous authenticated position in this node's own room feed.
+    pub own_feed_through: u64,
     /// Its members.
     pub members: Vec<MemberStatus>,
 }
@@ -455,19 +459,20 @@ impl StatusReport {
         let rooms = self.rooms.iter().map(|r| {
             let members = r.members.iter().map(|m| {
                 format!(
-                    "{{\"id\":{},\"me\":{},\"trusted\":{},\"connected\":{},\"last_seen_ms\":{},\"last_sync_ms\":{},\"key_waits\":{}}}",
+                    "{{\"id\":{},\"me\":{},\"trusted\":{},\"connected\":{},\"last_seen_ms\":{},\"last_sync_ms\":{},\"key_waits\":{},\"held_through\":{}}}",
                     q(&b32_encode(&m.id)),
                     m.me,
                     m.trusted,
                     m.connected,
                     opt(m.last_seen),
                     opt(m.last_sync),
-                    m.key_waits.as_deref().map_or_else(|| "null".to_owned(), q)
+                    m.key_waits.as_deref().map_or_else(|| "null".to_owned(), q),
+                    opt(m.held_through)
                 )
             });
             let frozen = list(r.frozen.iter().map(|d| q(&b32_encode(d))));
             format!(
-                "{{\"id\":{},\"name\":{},\"epoch\":{},\"last_sync_ms\":{},\"retention\":{},\"step_retention\":{},\"key_generations\":{},\"received_key_generations\":{},\"frozen\":[{}],\"refused_below_checkpoint\":{},\"entries\":{},\"log_entries\":{},\"members\":[{}]}}",
+                "{{\"id\":{},\"name\":{},\"epoch\":{},\"last_sync_ms\":{},\"retention\":{},\"step_retention\":{},\"key_generations\":{},\"received_key_generations\":{},\"frozen\":[{}],\"refused_below_checkpoint\":{},\"entries\":{},\"log_entries\":{},\"own_feed_through\":{},\"members\":[{}]}}",
                 q(&b32_encode(&r.id)),
                 q(&r.name),
                 r.epoch,
@@ -480,6 +485,7 @@ impl StatusReport {
                 r.refused_below_checkpoint,
                 r.entries,
                 r.log_entries,
+                r.own_feed_through,
                 list(members)
             )
         });

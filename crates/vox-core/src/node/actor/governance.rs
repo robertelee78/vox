@@ -237,6 +237,13 @@ impl Node {
             Ok(pending) => self.governance_work.again |= pending,
             Err(error) => channel.poison(&error),
         }
+        // A settled suffix may span several bounded receipt-cursor pages. Continue it as
+        // durable room work, reconstructed on restart, rather than waiting for a timer or a
+        // fresh peer event. The channel rotates authors so one long suffix cannot starve another.
+        match channel.advance_pending_sparse_contiguous(&store) {
+            Ok(pending) => self.governance_work.again |= pending,
+            Err(error) => channel.poison(&error),
+        }
         // Classification has no authority until governance is current. Continue its
         // bounded sealed scan in this same round-robin room turn; a quiet room must not
         // need another sync to finish, and an unresolved absent target is not busy work.

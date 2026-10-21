@@ -261,6 +261,9 @@ fn render(v: &Value) -> String {
             if let Some(said) = m.get("key_waits").and_then(Value::as_str) {
                 let _ = writeln!(o, "      {said}");
             }
+            if let Some(through) = m.get("held_through").and_then(Value::as_u64) {
+                let _ = writeln!(o, "      holds this node's room feed through {through}");
+            }
         }
     }
     let _ = writeln!(o, "  always-on member: {}", s(v, "always_on_member"));
