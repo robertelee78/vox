@@ -275,6 +275,9 @@ struct Held {
     oldest: Option<String>,
     /// The pages read.
     pages: usize,
+    /// Every row paged, whatever its text, as a person is shown them: the `post <i>` rows,
+    /// alice's live rows, and the placeholder for a body not received yet.
+    rows: usize,
 }
 
 fn held(dir: &Path, room: &str, page: usize) -> Held {
@@ -327,6 +330,7 @@ fn held(dir: &Path, room: &str, page: usize) -> Held {
         }
     }
     let pages = pages_newest_first.len();
+    let rows = pages_newest_first.iter().map(Vec::len).sum();
     let order = pages_newest_first
         .iter()
         .rev()
@@ -342,6 +346,7 @@ fn held(dir: &Path, room: &str, page: usize) -> Held {
         order,
         oldest: before,
         pages,
+        rows,
     }
 }
 
@@ -813,6 +818,10 @@ const HOOK_UNANSWERED: &str = "did not answer promptly";
 /// Hook runs during the load, a quarter second apart: about a minute of a harness at work, the
 /// time a late joiner's live window and the pages below it take to arrive (ADR-037 R1).
 const HOOK_RUNS: usize = 200;
+/// How long `vox status --json` is given to count rows `vox room read --json` already paged: the
+/// room is published a moment after its rows land, and a page may land between the two reads.
+/// Apparatus only: the count is read from the status, never waited into existence.
+const STATUS_AGREES_WITHIN: Duration = Duration::from_secs(3);
 
 /// **The daemon answers the harness hook while it syncs** (ADR-038 FX-17; #981): alice holds a
 /// room with a [`BACKLOG`] of posts; bob joins, asks for the pages below his window as a reader
@@ -825,8 +834,16 @@ const HOOK_RUNS: usize = 200;
 /// (v0.4.7, four nodes working): `vox status` answered in 0.5 s and the hook said "did not
 /// answer promptly" twice in one session.
 ///
-/// Mutant: the control acceptor made to wait on the actor's turn (a sleep past 500 ms in the
-/// hook's greeting path) turns the first assertion red on the hook's own sentence.
+/// **`vox status` counts the rows bob reads** (ADR-038 FX-16; #995): once the runs are over,
+/// `rooms[].entries` in bob's `vox status --json`, read before and after one paged `vox room
+/// read --json` of the room, MUST bound the rows that read paged. Found 2026-10-20 in this
+/// staging: bob read 14, 32, …, 115 rows as the minute went on while `vox status` said 2, then
+/// 5: the length of his contiguous feed, which a late joiner's rows lie below.
+///
+/// Mutants: the control acceptor made to wait on the actor's turn (a sleep past 500 ms in the
+/// hook's greeting path) turns the first assertion red on the hook's own sentence; the
+/// contiguous feed's length restored as the room's count (`entry_count()` in `summary_of`)
+/// turns the FX-16 claim red on its two numbers.
 #[cfg(feature = "optional-proofs")]
 #[test]
 #[ignore = "a timing bound a person feels; two real vox daemons; optional, run it in release"]
@@ -1039,15 +1056,15 @@ fn a_daemon_answers_the_hook_while_syncing() {
         // Not the claim under test, but the red must say whose fault: what each daemon's lanes
         // did meanwhile, and whether bob's room is still preparing.
         let (_, bob_rooms, _) = vox(&bob, &["room", "list"], None);
-        let status_entries = held_entries(&bob);
+        let status_rows = status_rows(&bob, &room);
         let (_, bob_status, _) = vox(&bob, &["status", "--json"], None);
         let (_, alice_status, _) = vox(&alice, &["status", "--json"], None);
         panic!(
             "PRODUCT: a late joiner's fetch did not run while the harness hook ran: bob held \
              {held_at_join} rows at his join and {held_after} after {HOOK_RUNS} hook runs over \
              {:?}, with {pages_asked} pages asked for and alice's 40 live posts accepted (needs 32 \
-             more rows for the fetch to count as under way); `vox status` counts {status_entries} \
-             entries\nbob's rooms: {}\nbob's lanes: {}\n\
+             more rows for the fetch to count as under way); `vox status` counts {status_rows:?} \
+             rows\nbob's rooms: {}\nbob's lanes: {}\n\
              alice's lanes: {}\nbob's daemon said: {}\nalice's daemon said: {}",
             runs.iter().map(|(d, _, _)| *d).sum::<Duration>(),
             bob_rooms.trim(),
@@ -1092,25 +1109,52 @@ fn a_daemon_answers_the_hook_while_syncing() {
         runs.iter().map(|(d, _, _)| *d).collect::<Vec<_>>(),
         said(&bob, "bob")
     );
+
+    // ---- `vox status` counts the rows bob reads (ADR-038 FX-16; #995) ------------------------
+    // Status, then the rows, then status again: a page bob asked for may still land between
+    // two reads, and the room is published a moment after its rows land, so the rows paged are
+    // bounded by the two counts, the second read again until it has caught up or
+    // [`STATUS_AGREES_WITHIN`] passed. The old count never over-counted, so the lower bound
+    // holds either way; the upper bound is the claim.
+    let counted_before = status_rows(&bob, &room);
+    let paged = held(&bob, &room, PAGE).rows as u64;
+    let asked = Instant::now();
+    let mut counted_after = status_rows(&bob, &room);
+    while counted_after.is_some_and(|n| n < paged) && asked.elapsed() < STATUS_AGREES_WITHIN {
+        std::thread::sleep(Duration::from_millis(200));
+        counted_after = status_rows(&bob, &room);
+    }
+    let (Some(counted_before), Some(counted_after)) = (counted_before, counted_after) else {
+        let (_, status, err) = vox(&bob, &["status", "--json"], None);
+        panic!(
+            "PRODUCT: bob's `vox status --json` does not count the room's rows under \
+             rooms[].entries (ADR-038 FX-16, #995); it said: {status}{err}"
+        );
+    };
+    println!(
+        "[proof] ADR-038 FX-16 / #995: bob's `vox status --json` counted {counted_before} rows \
+         for the room before `vox room read --json` paged {paged}, and {counted_after} after"
+    );
+    assert!(
+        counted_before <= paged && paged <= counted_after,
+        "PRODUCT: `vox status --json` does not count the rows bob reads (ADR-038 FX-16, #995): \
+         rooms[].entries said {counted_before} before and {counted_after} after `vox room read \
+         --json` paged {paged} rows of the room"
+    );
 }
 
-/// How many rows of the room a profile holds, from `vox status --json` (0 when unreadable).
-fn held_entries(dir: &Path) -> u64 {
+/// What `vox status --json` counts for the room under `rooms[].entries`: the rows the node shows
+/// of it (ADR-038 FX-16, #995). `None` when the status cannot be read or does not list the room.
+fn status_rows(dir: &Path, room: &str) -> Option<u64> {
     let (ok, out, _) = vox(dir, &["status", "--json"], None);
     if !ok {
-        return 0;
+        return None;
     }
-    serde_json::from_str::<serde_json::Value>(&out)
-        .ok()
-        .and_then(|v| {
-            v["rooms"].as_array().map(|rooms| {
-                rooms
-                    .iter()
-                    .map(|r| r["entries"].as_u64().unwrap_or(0))
-                    .sum()
-            })
-        })
-        .unwrap_or(0)
+    serde_json::from_str::<serde_json::Value>(&out).ok()?["rooms"]
+        .as_array()?
+        .iter()
+        .find(|r| r["id"].as_str().is_some_and(|id| id.starts_with(room)))?["entries"]
+        .as_u64()
 }
 
 /// `vox room list` MUST name what a preparing room waits for within this of the daemon's start.

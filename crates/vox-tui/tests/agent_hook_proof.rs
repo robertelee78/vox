@@ -1966,8 +1966,10 @@ fn a_structured_post_reads_alike_for_a_person_and_an_agent() {
     );
 }
 
-/// What `d` holds of its room that nobody is shown, by what a person can read: the entries `vox
-/// status --json` says the node holds there, less the messages `vox room board --json` counts.
+/// What `d` holds of its room that nobody is shown, by what a person can read: the log entries
+/// `vox status --json` says the node holds there (`rooms[].log_entries`: read records among
+/// them, which `rooms[].entries`, the rows shown, leaves out; #995), less the messages `vox room
+/// board --json` counts.
 fn unshown(d: &Daemon) -> u64 {
     let label: String = d.room_key.chars().take(12).collect();
     let (ok, status, err) = hook(&d.data, &d.cfg, &["status", "--json"], "");
@@ -1978,11 +1980,11 @@ fn unshown(d: &Daemon) -> u64 {
             v["rooms"]
                 .as_array()?
                 .iter()
-                .find(|r| r["id"].as_str().is_some_and(|id| id.starts_with(&label)))?["entries"]
+                .find(|r| r["id"].as_str().is_some_and(|id| id.starts_with(&label)))?["log_entries"]
                 .as_u64()
         })
         .unwrap_or_else(|| {
-            panic!("PRODUCT: `vox status --json` says no entries held for the room: {status}")
+            panic!("PRODUCT: `vox status --json` says no log entries held for the room: {status}")
         });
     let (ok, board, err) = hook(&d.data, &d.cfg, &["room", "board", &label, "--json"], "");
     assert!(ok, "PRODUCT (staging): vox room board --json failed: {err}");

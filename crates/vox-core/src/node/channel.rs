@@ -809,7 +809,20 @@ pub(crate) struct DisplayStamp {
     session_revision: u64,
     retention: (u64, u64),
     expires_at: Option<u64>,
+    /// How many of the rows shown stand for a body not received yet (V030-10).
+    owed_count: u64,
     pub(crate) owed: bool,
+}
+
+impl DisplayStamp {
+    /// The rows a person is shown of the room: every row `vox room read` pages through, a body
+    /// not received yet counting as the placeholder shown for it. Read from the stamp, which is
+    /// taken on every publication anyway: no store read is added for the count (ADR-038 FX-16,
+    /// FX-22; #995).
+    #[must_use]
+    pub(crate) fn rows(&self) -> u64 {
+        self.rendered_count.saturating_add(self.owed_count)
+    }
 }
 
 impl PartialEq for DisplayStamp {
@@ -823,6 +836,7 @@ impl PartialEq for DisplayStamp {
             && self.session_revision == other.session_revision
             && self.retention == other.retention
             && self.expires_at == other.expires_at
+            && self.owed_count == other.owed_count
             && self.owed == other.owed
     }
 }
@@ -5507,6 +5521,7 @@ impl ChannelState {
         let rendered = self
             .entries
             .render_view(store, &self.sek, &self.channel_id)?;
+        let owed_count = rendered.owed_before(None)?;
         Ok(DisplayStamp {
             incarnation: self.gen.clone(),
             rewrite: self.display_rewrite,
@@ -5517,7 +5532,8 @@ impl ChannelState {
             session_revision: self.legacy_sessions.display_revision(),
             retention: (self.effective_retention(), self.effective_step_retention()),
             expires_at: rendered.next_owed_expiry()?,
-            owed: rendered.owed_before(None)? != 0,
+            owed_count,
+            owed: owed_count != 0,
         })
     }
 

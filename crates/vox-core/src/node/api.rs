@@ -46,8 +46,16 @@ pub struct ChannelSummary {
     /// While preparing: what the room waits for, in words, and since when (unix ms), so a
     /// person can tell a stuck room from a slow one (ADR-038 FX-16, #991).
     pub waiting: Option<(String, u64)>,
-    /// Number of accepted log entries (0 while closed).
+    /// The rows this node shows of the room (0 while closed): every row `vox room read` pages
+    /// through, as the room was last published, a body not received yet counting as the
+    /// placeholder a person sees for it (ADR-038 FX-16, #995). A late joiner holds its rows
+    /// below its contiguous feed, so this is not [`Self::log_entries`]: measured 2026-10-20, a
+    /// member reading 115 rows was counted as holding 5.
     pub entries: u64,
+    /// Accepted log entries in the contiguous feed (0 while closed): messages, and what no
+    /// person is shown, such as read records (ADR-028 §6). What the room costs this node in
+    /// storage and every sync in traffic, which a count of rows does not say.
+    pub log_entries: u64,
     /// Whether the room is over for this node, in plain words (V030-08): this identity left it,
     /// or it ended. `None` while it is going on, and while it is closed.
     pub over: Option<String>,
