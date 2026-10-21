@@ -5319,11 +5319,14 @@ impl ChannelState {
             is_step_body(&self.channel_id, body)
         } else {
             // Retention removes its own row but keeps this sealed first-seen subtype fact
-            // beside the log. A never-received body may have no such fact; a disk error is
-            // still an error, never evidence that this was ordinary room content.
-            let log = index
-                .log_id(&hash)?
-                .ok_or(Error::MalformedAtRest("retention entry missing"))?;
+            // beside the log. A body never received has no log page and no such fact: it is
+            // not a Session step this node knows of, and the message lifetime (the longer one)
+            // applies; a disk error below is still an error. Measured 2026-10-20 on the
+            // decider's node (ADR-038 FX-33): a sweep poisoned the room with "retention entry
+            // missing" over an owed entry of a sparse room.
+            let Some(log) = index.log_id(&hash)? else {
+                return Ok(false);
+            };
             let segment = match transaction {
                 Transaction::Snapshot(snapshot) => {
                     snapshot.get_segment(&self.channel_id, SegmentKind::Index, log)?
