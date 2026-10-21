@@ -68,7 +68,7 @@ impl Node {
             }
             tokio::spawn(async move {
                 let opened = secret_blocking(&secret_work, move || {
-                    store.reopen_after_write_failure(&id)?;
+                    store.resave_room_after_write_failure(&id)?;
                     ChannelState::open_with_sek_owned(
                         &store,
                         &id,

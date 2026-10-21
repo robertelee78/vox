@@ -403,11 +403,25 @@ impl ChannelState {
                 "Session classification source missing",
             ));
         };
-        let author = entry.skeleton.author_id;
-        if self.legacy_target(transaction, hash, &author)?.is_none() {
+        // A signed-format entry cannot carry the legacy private Session namespace, as
+        // `available_legacy_kind` and `inspect_legacy_body_into` already say; and an entry held
+        // past its author's verified head is not classified yet, not malformed. Measured
+        // 2026-10-20 on the decider's node (ADR-038 FX-33): a retention change's sweep walked a
+        // declaration's steps onto a format-2 entry, refused it as "Session classification
+        // source unverified", and poisoned the room on every tick.
+        // An entry of another room under this hash is a real integrity failure and stays one;
+        // only an entry that belongs here is then deferred or classified.
+        if entry.skeleton.channel_id != self.channel_id {
             return Err(Error::MalformedAtRest(
                 "Session classification source unverified",
             ));
+        }
+        if entry.skeleton.v2.is_some() {
+            return Ok(Some(false));
+        }
+        let author = entry.skeleton.author_id;
+        if entry.skeleton.seq > self.dag.verified_head(&author) {
+            return Ok(None);
         }
         let saved = match self.legacy_page(transaction, page_id(log, false)?)? {
             Some(Page::Target {
@@ -478,10 +492,22 @@ impl ChannelState {
             .ok_or(Error::MalformedAtRest(
                 "Session classification source unpublished",
             ))?;
-        if self.legacy_target(transaction, &hash, &author)?.is_none() {
+        let Some(entry) = self.entry_at(transaction, &hash)? else {
             return Err(Error::MalformedAtRest(
                 "Session classification target unverified",
             ));
+        };
+        // An entry of another room or author is a real integrity failure and stays one; for
+        // an entry that belongs here there is nothing to remember when it is signed-format, and
+        // nothing yet when it is past its author's verified head (ADR-038 FX-33): the next pass
+        // classifies what it can.
+        if entry.skeleton.channel_id != self.channel_id || entry.skeleton.author_id != author {
+            return Err(Error::MalformedAtRest(
+                "Session classification target unverified",
+            ));
+        }
+        if entry.skeleton.v2.is_some() || entry.skeleton.seq > self.dag.verified_head(&author) {
+            return Ok(());
         }
         let id = page_id(log, false)?;
         let page = Page::Target {
@@ -831,6 +857,12 @@ impl ChannelState {
                         if entry.skeleton.channel_id != self.channel_id
                             || entry.skeleton.author_id != author
                         {
+                            continue;
+                        }
+                        // A signed-format entry cannot be a step of the legacy private Session
+                        // namespace: it is dropped from the declaration's steps, never
+                        // classified (ADR-038 FX-33).
+                        if entry.skeleton.v2.is_some() {
                             continue;
                         }
                         let session = self.legacy_kind_in(transaction, target)?.unwrap_or(true);
