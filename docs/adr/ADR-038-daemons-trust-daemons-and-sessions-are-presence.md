@@ -382,8 +382,7 @@ The decider then answered twelve questions, one at a time. His answers are the d
   port; a flow is parked while it sits in `ready`, `deferred`, `retiring` or `cleanup` and no
   task runs it; the flow-state pool is `RETAINED_FLOWS` charges per daemon (16 today, each 128
   KiB), shared by every hosted node. Decision: each running bounded-sync round MUST hold exactly
-  one flow-state charge, and every flow-state charge MUST be held by exactly one running
-  bounded-sync round; acquisition of the charge and the round's transition to running MUST be
+  one flow-state charge, and each flow-state charge that is held MUST be held by exactly one running bounded-sync round; acquisition of the charge and the round's transition to running MUST be
   one atomic state transition for accounting and status; every transition out of running, by
   completion, failure or cancellation, MUST release the charge; a flow in `ready`, `deferred`,
   `retiring` or `cleanup`, and a flow shelved without starting a round, MUST hold no charge. So
