@@ -197,7 +197,7 @@ fn render(v: &Value) -> String {
     for r in arr("rooms") {
         let _ = writeln!(
             o,
-            "  {} {}  epoch {}  last sync {}  rows {}  log entries {}  sender keys held {}, received {}",
+            "  {} {}  epoch {}  last sync {}  rows {}  log entries {}  sender keys held {}, received {}; governance revision {}, render backfill {}",
             short(s(r, "id")),
             s(r, "name"),
             r.get("epoch").and_then(Value::as_u64).unwrap_or(0),
@@ -209,7 +209,19 @@ fn render(v: &Value) -> String {
                 .unwrap_or(0),
             r.get("received_key_generations")
                 .and_then(Value::as_u64)
-                .unwrap_or(0)
+                .unwrap_or(0),
+            r.get("governance_revision")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            if r
+                .get("render_backfill_pending")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                "pending"
+            } else {
+                "idle"
+            }
         );
         let _ = writeln!(
             o,

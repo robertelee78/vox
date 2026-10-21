@@ -116,7 +116,7 @@ impl Node {
             Ok((count, next)) => {
                 work.count = work.count.saturating_add(count);
                 if count > 0 {
-                    self.note_local_append(&work.room);
+                    self.note_local_governance_append(&work.room);
                     self.governance_work.again = true;
                 }
                 if let Some(next) = next {

@@ -880,6 +880,8 @@ impl<'a, 'store> Write<'a, 'store> {
         author: &Digest32,
         seq: u64,
         log: u64,
+        changes_projection: bool,
+        changes_order: bool,
     ) -> Result<()> {
         if seq == 0 || log == 0 {
             return Err(invalid("governance locator is zero"));
@@ -913,8 +915,17 @@ impl<'a, 'store> Write<'a, 'store> {
             position(author, seq),
             Some(log),
         )?;
-        self.put(Table::Dirty, hash_key(hash), Some(log))?;
-        self.changed()?;
+        // Keep the immutable locator for every authenticated governance row, including a
+        // superseded single-writer statement. Only a row that can change what a person sees
+        // enters canonical work or advances the published revision. Otherwise an older consent,
+        // presence or share arriving late invalidated the whole projection and restarted render
+        // backfill even though `latest` discarded its effect immediately below.
+        if changes_order {
+            self.put(Table::Dirty, hash_key(hash), Some(log))?;
+            self.changed()?;
+        } else if changes_projection {
+            self.display_changed()?;
+        }
         Ok(())
     }
 
@@ -960,6 +971,71 @@ impl<'a, 'store> Write<'a, 'store> {
             }
         }
         self.put(table, key, Some(log))
+    }
+
+    fn latest_changes(&self, table: Table, key: &session_tree::Key, seq: u64) -> Result<bool> {
+        let Some(old) = self.get(table, key)? else {
+            return Ok(true);
+        };
+        Ok(self.entry(old)?.skeleton.seq < seq)
+    }
+
+    /// Whether this authenticated body can change the current projection. Consent, presence and
+    /// service-share statements are single-writer registers, so a newly discovered older row is
+    /// still retained and authenticated but is not a display revision, canonical-fold input or
+    /// render-backfill trigger. Other governance bodies retain their canonical-history semantics.
+    pub(super) fn input_changes(
+        &self,
+        author: &Digest32,
+        seq: u64,
+        body: &crate::governance::entry::GovBody,
+    ) -> Result<bool> {
+        use crate::governance::entry::GovBody;
+        match body {
+            GovBody::ConsentGrant(c) if c.body.epoch == 0 => {
+                self.latest_changes(Table::Consent, &frontier(author, &c.body.target_id), seq)
+            }
+            // A grant for another epoch has no current or historical effect in this index.
+            GovBody::ConsentGrant(_) => Ok(false),
+            GovBody::ConsentRevocation(c) => {
+                let target = frontier(author, &c.body.target_id);
+                Ok(self.latest_changes(Table::EverRevoked, &target, seq)?
+                    || (c.body.epoch == 0 && self.latest_changes(Table::Consent, &target, seq)?))
+            }
+            GovBody::Presence(p) => {
+                let author_key = hash_key(author);
+                Ok(self.latest_changes(Table::Presence, &author_key, seq)?
+                    || (p.body.here
+                        && (self.latest_changes(Table::Back, &author_key, seq)?
+                            || (p.body.epoch == 0
+                                && self.latest_changes(Table::ConsentReset, &author_key, seq)?))))
+            }
+            GovBody::ServiceShare(s) => {
+                let name = crate::hash::sha256(s.body.name.as_bytes());
+                let fingerprint =
+                    crate::governance::share::service_fingerprint(self.room, author, &s.body.name);
+                Ok(
+                    self.latest_changes(Table::Shares, &frontier(author, &name), seq)?
+                        || self.latest_changes(
+                            Table::ShareFingerprints,
+                            &frontier(author, &fingerprint),
+                            seq,
+                        )?,
+                )
+            }
+            _ => Ok(true),
+        }
+    }
+
+    pub(super) fn current_input_kind(body: &crate::governance::entry::GovBody) -> bool {
+        use crate::governance::entry::GovBody;
+        matches!(
+            body,
+            GovBody::ConsentGrant(_)
+                | GovBody::ConsentRevocation(_)
+                | GovBody::Presence(_)
+                | GovBody::ServiceShare(_)
+        )
     }
 
     /// Single-writer current facts do not need a canonical-history replay. Old
@@ -1296,13 +1372,20 @@ impl<'a, 'store> Write<'a, 'store> {
             self.set_root(self.header.roots[Table::Frontiers as usize], key, Some(seq))?;
         self.header.work.changed = true;
         if let Some(log) = self.get(Table::Hashes, &hash_key(entry))? {
-            self.changed()?;
-            self.put(Table::Dirty, hash_key(entry), Some(log))?;
-            if self
-                .get(Table::AuthorityHashes, &hash_key(entry))?
-                .is_some()
-            {
-                self.authority_changed()?;
+            let source = self.entry(log)?;
+            let body = crate::governance::entry::GovEntry::body_bound_to(&source)?;
+            // Single-writer current facts never participate in canonical-history ordering.
+            // Their latest register was published at acceptance, and a newly discovered older
+            // frontier cannot make that fact current or revise what a person sees.
+            if !Self::current_input_kind(&body) {
+                self.changed()?;
+                self.put(Table::Dirty, hash_key(entry), Some(log))?;
+                if self
+                    .get(Table::AuthorityHashes, &hash_key(entry))?
+                    .is_some()
+                {
+                    self.authority_changed()?;
+                }
             }
         }
         Ok(true)

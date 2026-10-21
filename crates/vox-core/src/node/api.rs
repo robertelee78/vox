@@ -651,6 +651,9 @@ pub struct ChannelDetail {
     pub member_consent: Vec<Digest32>,
     /// Revision of the checked governance projection used by this display.
     pub governance_revision: u64,
+    /// Whether retained ciphertext still has bounded rendering work queued. This is published
+    /// with the room view so status can distinguish parked missing-fact state from active work.
+    pub render_backfill_pending: bool,
     /// The other members that consent to this identity reading them here, in fingerprint order:
     /// the inbound half of `member_consent`, off the log the same way (V030-17).
     pub consenting: Vec<Digest32>,

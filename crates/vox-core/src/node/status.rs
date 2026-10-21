@@ -142,6 +142,10 @@ pub struct RoomStatus {
     /// How many generations of other members' sender keys it holds here (PRD-001 R14 on the
     /// receiving side: a generation read to the end is deleted).
     pub received_key_generations: usize,
+    /// Revision of the room's checked governance projection.
+    pub governance_revision: u64,
+    /// Whether retained ciphertext still has bounded rendering work queued.
+    pub render_backfill_pending: bool,
     /// Authors this node froze here for signing two entries at one position (ADR-008).
     pub frozen: Vec<Digest32>,
     /// Entries this node refused here as at or below their author's checkpoint since it opened
@@ -467,7 +471,7 @@ impl StatusReport {
             });
             let frozen = list(r.frozen.iter().map(|d| q(&b32_encode(d))));
             format!(
-                "{{\"id\":{},\"name\":{},\"epoch\":{},\"last_sync_ms\":{},\"retention\":{},\"step_retention\":{},\"key_generations\":{},\"received_key_generations\":{},\"frozen\":[{}],\"refused_below_checkpoint\":{},\"entries\":{},\"log_entries\":{},\"members\":[{}]}}",
+                "{{\"id\":{},\"name\":{},\"epoch\":{},\"last_sync_ms\":{},\"retention\":{},\"step_retention\":{},\"key_generations\":{},\"received_key_generations\":{},\"governance_revision\":{},\"render_backfill_pending\":{},\"frozen\":[{}],\"refused_below_checkpoint\":{},\"entries\":{},\"log_entries\":{},\"members\":[{}]}}",
                 q(&b32_encode(&r.id)),
                 q(&r.name),
                 r.epoch,
@@ -476,6 +480,8 @@ impl StatusReport {
                 r.step_retention,
                 r.key_generations,
                 r.received_key_generations,
+                r.governance_revision,
+                r.render_backfill_pending,
                 frozen,
                 r.refused_below_checkpoint,
                 r.entries,

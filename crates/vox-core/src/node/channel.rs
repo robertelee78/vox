@@ -6841,6 +6841,10 @@ impl ChannelState {
                         EntryKind::Content | EntryKind::Governance => None,
                     };
                     if gov.is_some() {
+                        // Every newly authenticated governance row is causal index work, even
+                        // when its single-writer semantic effect is superseded. The projection
+                        // observer separately declines to revise/invalidate/backfill for that
+                        // no-op, while this one wake settles its durable frontier obligation.
                         out.governance += 1;
                         return Ok(Ok(Vec::new()));
                     }

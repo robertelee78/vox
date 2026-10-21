@@ -529,6 +529,8 @@ fn wait_for_competing_author_turn(
 struct RoomStatus {
     log_entries: u64,
     received_key_generations: u64,
+    governance_revision: u64,
+    render_backfill_pending: bool,
 }
 
 /// What the shipped status command says about one room. Refused or malformed output is a product
@@ -561,8 +563,22 @@ fn room_status(dir: &Path, reader: &str, room: &str) -> RoomStatus {
             )
         });
     RoomStatus {
-        log_entries: row["log_entries"].as_u64().unwrap_or(0),
-        received_key_generations: row["received_key_generations"].as_u64().unwrap_or(0),
+        log_entries: row["log_entries"].as_u64().unwrap_or_else(|| {
+            panic!("PRODUCT: {reader}'s room status has no numeric `log_entries`: {row}")
+        }),
+        received_key_generations: row["received_key_generations"].as_u64().unwrap_or_else(|| {
+            panic!(
+                "PRODUCT: {reader}'s room status has no numeric `received_key_generations`: {row}"
+            )
+        }),
+        governance_revision: row["governance_revision"].as_u64().unwrap_or_else(|| {
+            panic!("PRODUCT: {reader}'s room status has no numeric `governance_revision`: {row}")
+        }),
+        render_backfill_pending: row["render_backfill_pending"].as_bool().unwrap_or_else(|| {
+            panic!(
+                "PRODUCT: {reader}'s room status has no boolean `render_backfill_pending`: {row}"
+            )
+        }),
     }
 }
 
@@ -1260,6 +1276,17 @@ fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
         .unwrap_or_else(|error| panic!("APPARATUS: could not release the fold hold: {error}"));
     std::fs::remove_file(&carol_fold_hold)
         .unwrap_or_else(|error| panic!("APPARATUS: could not release Carol's fold hold: {error}"));
+    // Marker removal is apparatus, not a product wake. Renaming each room to its current name
+    // appends a real authenticated governance fact through the shipped command; its acceptance is
+    // the causal event that resumes the released folds on Alice and, once synced, Carol.
+    for room in &rooms {
+        let (ok, out, err) = vox(&alice, &["room", "rename", room, room], None);
+        assert!(
+            ok,
+            "PRODUCT: Alice's causal same-name room rename was refused after the fold hold was \
+             released for {room}: {out}{err}"
+        );
+    }
     for room in &rooms {
         wait_trust_detail(&alice, "alice", room, "bob", "you trust each other");
         wait_trust_detail(&carol, "carol", room, "bob", "you trust each other");
@@ -1268,7 +1295,7 @@ fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
     // Bob now receives Alice's consent and the sealed package row, but the package marker keeps
     // the shipped daemon from opening it. Doctor says consent is mutual while status still says
     // zero received generations: the second hold is visibly engaged.
-    let bob_daemon = daemon_env(&bob, "bob", &package_knob);
+    let _bob_daemon = daemon_env(&bob, "bob", &package_knob);
     attached(&bob, "bob");
     for (i, room) in rooms.iter().enumerate() {
         wait_trust_detail(&bob, "bob", room, "alice", "you trust each other");
@@ -1316,38 +1343,42 @@ fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
         );
     }
 
-    // An idempotent trust command asks the daemon to retry retained logged key packages. Both
-    // exact authors' generations are already held and both sources are offline, so every replay
-    // here is an unchanged SKDM. Over the established waiting-room interval these causal replay
-    // triggers must remain within that same idle CPU contract; a duplicate that requeues the
-    // long author from sequence one turns this assertion red on its own work.
-    let duplicate_cpu0 = cpu_time(bob_daemon.0.id());
-    let duplicate_started = Instant::now();
-    let mut duplicate_triggers = 0usize;
-    while duplicate_started.elapsed() < PREPARING_IDLE {
-        let (ok, out, err) = vox(&bob, &["trust", "add", &fps[0], "--name", "alice"], None);
-        assert!(
-            ok,
-            "PRODUCT: Bob's idempotent `vox trust add alice` could not replay retained key \
-             packages: {out}{err}"
-        );
-        duplicate_triggers += 1;
-        std::thread::sleep(IDLE_STATUS_PACE);
-    }
-    let duplicate_elapsed = duplicate_started.elapsed();
-    let duplicate_cpu = cpu_time(bob_daemon.0.id()).saturating_sub(duplicate_cpu0);
-    let duplicate_allowed_nanos = PREPARING_CPU
-        .as_nanos()
-        .saturating_mul(duplicate_elapsed.as_nanos())
-        / PREPARING_IDLE.as_nanos();
-    let duplicate_allowed =
-        Duration::from_nanos(u64::try_from(duplicate_allowed_nanos).unwrap_or(u64::MAX));
+    // `trust add` completes only after applying that trust revision and retrying retained logged
+    // packages. Both exact authors' generations are already held and both sources are offline, so
+    // Alice's retained package presents an unchanged SKDM. The shipped status work observation is
+    // causal and exact: no new projection revision and no render continuation may appear. This
+    // replaces an aggregate CPU sample that could pass without observing the duplicate at all.
+    let duplicate_before = room_status(&bob, "bob", &rooms[0]);
     assert!(
-        duplicate_cpu <= duplicate_allowed,
-        "PRODUCT: {duplicate_triggers} shipped trust commands replaying retained, unchanged \
-         sender-key packages made Bob's otherwise idle daemon consume +{duplicate_cpu:?} CPU \
-         over {duplicate_elapsed:?}; the established waiting-room allowance is \
-         {duplicate_allowed:?} (ADR-038 FX-22, #1007)"
+        !duplicate_before.render_backfill_pending,
+        "PRODUCT: room {} still reported render backfill before the unchanged key replay: \
+         {duplicate_before:?}",
+        rooms[0]
+    );
+    let (ok, out, err) = vox(&bob, &["trust", "add", &fps[0], "--name", "alice"], None);
+    assert!(
+        ok,
+        "PRODUCT: Bob's idempotent `vox trust add alice` could not replay the retained key \
+         package: {out}{err}"
+    );
+    let duplicate_after = room_status(&bob, "bob", &rooms[0]);
+    assert_eq!(
+        duplicate_after.governance_revision, duplicate_before.governance_revision,
+        "PRODUCT: an unchanged retained sender key revised room {}'s governance projection: \
+         before {duplicate_before:?}, after {duplicate_after:?}",
+        rooms[0]
+    );
+    assert_eq!(
+        duplicate_after.received_key_generations, duplicate_before.received_key_generations,
+        "PRODUCT: an unchanged retained sender key changed room {}'s held generations: before \
+         {duplicate_before:?}, after {duplicate_after:?}",
+        rooms[0]
+    );
+    assert!(
+        !duplicate_after.render_backfill_pending,
+        "PRODUCT: an unchanged retained sender key requeued already-rendered history in room {}: \
+         before {duplicate_before:?}, after {duplicate_after:?} (ADR-038 FX-22, #1007)",
+        rooms[0]
     );
     let _alice_daemon = daemon(&alice, "alice");
     attached(&alice, "alice");
@@ -1497,12 +1528,17 @@ fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
         lanes_of(&bob_status)
     );
     assert!(
-        refused_a == 0 && refused_b == 0 && posted_a >= 30 && posted_b >= 30,
-        "APPARATUS: the agents did not work as staged: alice posted {posted_a} ({refused_a} \
-         refused), bob {posted_b} ({refused_b} refused)\nalice's daemon said: {}\nbob's daemon \
-         said: {}",
+        refused_a == 0 && refused_b == 0,
+        "PRODUCT: shipped post commands were refused while the agents worked: alice posted \
+         {posted_a} ({refused_a} refused), bob {posted_b} ({refused_b} refused)\nalice's daemon \
+         said: {}\nbob's daemon said: {}",
         said(&alice, "alice"),
         said(&bob, "bob")
+    );
+    assert!(
+        posted_a >= 30 && posted_b >= 30,
+        "APPARATUS: the runner did not issue enough successful work during {AT_WORK:?}: alice \
+         posted {posted_a}, bob {posted_b}"
     );
     assert!(
         to_alice.is_some() && to_bob.is_some(),

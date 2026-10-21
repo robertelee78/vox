@@ -497,7 +497,7 @@ impl ChannelState {
         batch: &mut crate::node::store::Batch<'_>,
         entry: &crate::log::entry::Entry,
         log: u64,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         // A read transaction sees the roots before this caller's publication Batch.
         // Descendants accepted in this same signed batch are ordinary forward progress;
         // only a previously published child makes this a late-parent/body repair.
@@ -555,6 +555,6 @@ impl ChannelState {
                 }
             }
         }
-        Ok(())
+        Ok(governance_changed)
     }
 }

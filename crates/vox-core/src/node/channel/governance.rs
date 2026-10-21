@@ -235,7 +235,7 @@ fn observe(
     // control closure, so a late content row changes nothing the order reads: it neither
     // raises the barrier nor holds the settlement (ADR-037 R2c). A legacy room's control
     // rows can have content parents, so there every late row still raises it.
-    let mut changed = late && (control || !writer.control_only());
+    let mut changed = late && !control && !writer.control_only();
     if changed {
         writer.barrier(log);
     }
@@ -279,19 +279,33 @@ fn observe(
             Ok(changed)
         };
     }
-    writer.barrier(log);
-    writer.verified(&hash, &entry.skeleton.author_id, entry.skeleton.seq, log)?;
-    changed = true;
-    writer.authority_input(
+    let changes_projection =
+        writer.input_changes(&entry.skeleton.author_id, entry.skeleton.seq, &body)?;
+    let changes_order = changes_projection && !facts::Write::current_input_kind(&body);
+    if changes_order {
+        writer.barrier(log);
+    }
+    writer.verified(
         &hash,
         &entry.skeleton.author_id,
         entry.skeleton.seq,
         log,
-        root,
-        &body,
+        changes_projection,
+        changes_order,
     )?;
-    writer.observe_clock(&hash, clock)?;
-    writer.current_input(&entry.skeleton.author_id, entry.skeleton.seq, log, &body)?;
+    changed |= changes_projection;
+    if changes_projection {
+        writer.authority_input(
+            &hash,
+            &entry.skeleton.author_id,
+            entry.skeleton.seq,
+            log,
+            root,
+            &body,
+        )?;
+        writer.observe_clock(&hash, clock)?;
+        writer.current_input(&entry.skeleton.author_id, entry.skeleton.seq, log, &body)?;
+    }
     Ok(changed)
 }
 
@@ -334,12 +348,8 @@ fn advance_source(
         if published {
             let clock = published_clock(input.log_id(&hash)?, input.clock(&hash)?, id)?;
             let late = input.child_after(&hash, None)?.is_some();
-            observe(&mut writer, id, clock, late, &entry, authors, root)?;
-            if writer
-                .get(facts::Table::Hashes, &facts::hash_key(&hash))?
-                .is_some()
-                && grants_this_reader(&entry, me)
-            {
+            let changed = observe(&mut writer, id, clock, late, &entry, authors, root)?;
+            if changed && grants_this_reader(&entry, me) {
                 backfill.insert(entry.skeleton.author_id);
             }
         }
@@ -503,8 +513,8 @@ pub(super) fn advance(
     #[cfg(feature = "test-knobs")]
     if fold_held() {
         // A proof holds the fold where it stands to stage "received but not yet folded"
-        // (ADR-037 R3's gates). Nothing re-arms a turn until the tick, so a held room does
-        // not spin the actor; the tick marks governance work pending again every second.
+        // (ADR-037 R3's gates). A held room does not spin the actor; after the apparatus releases
+        // the marker, the proof supplies a real governance fact whose acceptance wakes this work.
         return Ok(Progress {
             ready: current.ready,
             pending: false,

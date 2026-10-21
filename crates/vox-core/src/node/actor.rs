@@ -425,6 +425,7 @@ fn detail_of(
         creator: ch.genesis().creator_pubkey().fingerprint(),
         member_consent,
         governance_revision,
+        render_backfill_pending: ch.governance_backfill_pending(store)?,
         consenting,
         offer_bases,
         trusted_by,
@@ -6018,7 +6019,6 @@ impl Node {
                         let _ = reply.send(Outcome::Done);
                         continue;
                     }
-                    self.governance_work.pending = true;
                     self.publication_pending |= !self.publish_waiters.is_empty();
                     self.publication_again |= !self.publish_waiters.is_empty();
                     if let NodeCommand::SetAdmin { channel_id, member, admin: false } = command {
@@ -6207,7 +6207,6 @@ impl Node {
                     self.schedule().await;
                 }
                 Some(event) = net_rx.recv() => {
-                    self.governance_work.pending = true;
                     self.publication_pending |= !self.publish_waiters.is_empty();
                     self.publication_again |= !self.publish_waiters.is_empty();
                     if !matches!(&event, NetEvent::ComputerPolicy(_)) && self.apply_computer_keyring().await.is_err() { continue; }
@@ -6231,7 +6230,6 @@ impl Node {
                     }
                 }
                 _ = ticker.tick() => {
-                    self.governance_work.pending = true;
                     self.publication_pending |= !self.publish_waiters.is_empty();
                     self.publication_again |= !self.publish_waiters.is_empty();
                     if self.apply_computer_keyring().await.is_err() { continue; }
@@ -10568,6 +10566,11 @@ impl Node {
                     // behind. Records mirrored onto this board come through `BoardGrew`, which
                     // fires for news.
                     if o.governance > 0 {
+                        // The session accepted authenticated governance/index work. That causal
+                        // publication, rather than every network event or the one-second ticker,
+                        // wakes its bounded settlement. A superseded current fact still settles
+                        // its frontier but does not revise/invalidate the checked projection.
+                        self.governance_work.pending = true;
                         self.refresh_reachers().await;
                         self.publish_channel_to_anchors(&channel_id, PublishCause::Governance)
                             .await;
@@ -12925,7 +12928,7 @@ impl Node {
         };
         // The grant is on the log now, and a reader renders nothing without it: pushed at once,
         // as every local append is, not on the next tick (V210-78).
-        self.note_local_append(channel_id);
+        self.note_local_governance_append(channel_id);
         // The generation delivered is the key's own: a key taken before a rotation is the older
         // one, and a refusal must re-owe exactly that (V210-30).
         let chain_id = skdm.body.chain_id;
@@ -13421,7 +13424,7 @@ impl Node {
         self.delivery_reserved
             .retain(|(r, peer, _), _| r != room || *peer != target);
         self.key_waiting.remove(&(*room, target));
-        self.note_local_append(room);
+        self.note_local_governance_append(room);
         let _ = self.event_tx.send(NodeEvent::Revoked {
             channel_id: *room,
             target,
@@ -14161,7 +14164,7 @@ impl Node {
                 port.raise();
             }
         }
-        self.note_local_append(channel_id);
+        self.note_local_governance_append(channel_id);
     }
 
     /// Renew each open room's own records when half their lifetime has passed (V210-68, #258).
@@ -14292,6 +14295,14 @@ impl Node {
         }
         self.sched_rooms.insert(*channel_id);
         self.discover_rooms.insert(*channel_id);
+    }
+
+    /// A locally appended governance fact both needs ordinary propagation and causally wakes the
+    /// bounded governance projection. Content, status and unrelated network traffic never use
+    /// this path merely to poll sealed governance state.
+    fn note_local_governance_append(&mut self, channel_id: &Digest32) {
+        self.governance_work.pending = true;
+        self.note_local_append(channel_id);
     }
 
     /// The room instance `channel_id` names now, and its generation counter.
@@ -15918,7 +15929,7 @@ impl Node {
                                 .is_ok())
                 };
                 if issued {
-                    self.note_local_append(&channel_id);
+                    self.note_local_governance_append(&channel_id);
                     let _ = self.event_tx.send(NodeEvent::Consented {
                         channel_id,
                         target: peer,
@@ -18990,7 +19001,7 @@ impl Node {
         gen: u64,
         reply: Option<oneshot::Sender<Outcome>>,
     ) {
-        self.note_local_append(&channel_id);
+        self.note_local_governance_append(&channel_id);
         let _ = self.sync_channel(&channel_id).await;
         self.leave_serial += 1;
         let serial = self.leave_serial;
@@ -19265,7 +19276,7 @@ impl Node {
                 return Outcome::Failed(fault_of(&e));
             }
         }
-        self.note_local_append(channel_id);
+        self.note_local_governance_append(channel_id);
         self.withdraw_from_boards(channel_id, crate::nat::withdraw::WithdrawScope::Room)
             .await;
         // The checked local publication completes first; the regular lifecycle turn
@@ -19302,7 +19313,7 @@ impl Node {
                 return Outcome::Failed(fault_of(&e));
             }
         }
-        self.note_local_append(channel_id);
+        self.note_local_governance_append(channel_id);
         // Bounded governance maintenance publishes the checked roster (V030-14)
         // before the local completion is eligible to answer.
         Outcome::Done
@@ -19323,7 +19334,7 @@ impl Node {
                 return Outcome::Failed(fault_of(&e));
             }
         }
-        self.note_local_append(channel_id);
+        self.note_local_governance_append(channel_id);
         Outcome::Done
     }
 
@@ -19693,7 +19704,7 @@ impl Node {
             (back, own_hint, own_targets)
         };
         match back {
-            Ok(true) => self.note_local_append(channel_id),
+            Ok(true) => self.note_local_governance_append(channel_id),
             Ok(false) => {}
             Err(e) => {
                 let _ = self.event_tx.send(NodeEvent::JoinFailed {
@@ -19775,8 +19786,9 @@ impl Node {
             return Outcome::Failed(Fault::ChannelNotOpen);
         };
         let now_ms = self.now_ms();
-        let outcome = {
+        let (outcome, governance_appended) = {
             let mut channel = shared.lock().await;
+            let mut governance_appended = false;
             let outcome = channel
                 .add_service(profile.store(), profile, service_tag, local, kind, persist)
                 .and_then(|_| {
@@ -19794,18 +19806,21 @@ impl Node {
                             let _ = channel.remove_service(profile.store(), service_tag);
                             Err(e)
                         }
-                        Ok(()) => Ok(()),
+                        Ok(()) => {
+                            governance_appended = true;
+                            Ok(())
+                        }
                     }
                 });
             if outcome.is_ok() {
                 self.publish_service_offers(&channel);
             }
-            outcome
+            (outcome, governance_appended)
         };
         match outcome {
             Ok(()) => {
-                if persist {
-                    self.note_local_append(channel_id);
+                if governance_appended {
+                    self.note_local_governance_append(channel_id);
                 }
                 self.refresh_reachers().await;
                 Outcome::Done
@@ -19829,24 +19844,30 @@ impl Node {
             return Outcome::Failed(Fault::ChannelNotOpen);
         };
         let now_ms = self.now_ms();
-        let outcome = {
+        let (outcome, governance_appended) = {
             let mut channel = shared.lock().await;
             let was_shared = channel.is_shared(service_tag);
             let removed = channel.remove_service(profile.store(), service_tag);
             // The room is told it is no longer shared (V030-25). Not saying so leaves it listed
             // where nothing answers — a wrong listing, not a failed removal: the service is gone
             // either way.
-            if matches!(removed, Ok(true)) && was_shared {
-                let _ = channel.say_share(profile, service_tag, false, now_ms);
-            }
+            let governance_appended = matches!(removed, Ok(true))
+                && was_shared
+                && channel
+                    .say_share(profile, service_tag, false, now_ms)
+                    .is_ok();
             if matches!(removed, Ok(true)) {
                 self.publish_service_offers(&channel);
             }
-            removed
+            (removed, governance_appended)
         };
         match outcome {
             Ok(true) => {
-                self.note_local_append(channel_id);
+                if governance_appended {
+                    self.note_local_governance_append(channel_id);
+                } else {
+                    self.note_local_append(channel_id);
+                }
                 self.refresh_reachers().await;
                 Outcome::Done
             }
@@ -20311,6 +20332,8 @@ impl Node {
                 step_retention: room.step_retention,
                 key_generations: room.key_generations,
                 received_key_generations: room.received_key_generations,
+                governance_revision: room.governance_revision,
+                render_backfill_pending: room.render_backfill_pending,
                 frozen: room.frozen.clone(),
                 refused_below_checkpoint: room.refused_below_checkpoint,
                 entries: summary.map_or(0, |c| c.entries),
@@ -20502,7 +20525,7 @@ impl Node {
         if let Err(error) = changed {
             return Outcome::Failed(fault_of(&error));
         }
-        self.note_local_append(channel_id);
+        self.note_local_governance_append(channel_id);
         // Adoption and the background publish use the checked canonical set, after
         // bounded governance maintenance, through this command's local completion.
         Outcome::Done
@@ -20523,7 +20546,7 @@ impl Node {
         if let Err(e) = shared.lock().await.set_name(profile, name, now_ms) {
             return Outcome::Failed(fault_of(&e));
         }
-        self.note_local_append(channel_id);
+        self.note_local_governance_append(channel_id);
         Outcome::Done
     }
 
@@ -20578,7 +20601,7 @@ impl Node {
         if let Err(e) = shared.lock().await.set_retention(profile, ttl, now_ms) {
             return Outcome::Failed(fault_of(&e));
         }
-        self.note_local_append(channel_id);
+        self.note_local_governance_append(channel_id);
         self.retention_read_at = 0; // re-read the node's own file too: an explicit act
         self.sweep_retention().await;
         Outcome::Done
@@ -20634,7 +20657,7 @@ impl Node {
         if let Err(e) = shared.lock().await.set_step_retention(profile, ttl, now_ms) {
             return Outcome::Failed(fault_of(&e));
         }
-        self.note_local_append(channel_id);
+        self.note_local_governance_append(channel_id);
         self.retention_read_at = 0; // re-read the node's own file too: an explicit act
         self.sweep_retention().await;
         Outcome::Done
