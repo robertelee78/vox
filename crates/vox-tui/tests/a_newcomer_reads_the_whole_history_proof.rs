@@ -692,8 +692,6 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
 
     // ---- a private package Carol is owed is a header-only, role-complete row on Bob --------
     let hold = root.join("hold-carol-packages");
-    std::fs::write(&hold, b"")
-        .unwrap_or_else(|e| panic!("APPARATUS: could not create {}: {e}", hold.display()));
     let hold_path = hold
         .to_str()
         .expect("APPARATUS: a UTF-8 package-hold path")
@@ -721,11 +719,19 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         std::thread::sleep(Duration::from_millis(200));
     }
 
-    // Alice must trust Carol before Carol builds the competing-author suffix.  The key from an
-    // author this owner has not trusted is correctly refused, so asking Carol's status whether
-    // Alice held that suffix before this decision would be impossible staging, not a slow
-    // machine.  Put Alice's row and the private package on her feed first while Carol's package
-    // installer is causally held; that preserves the later non-recipient header/body boundary.
+    // Alice must trust Carol before Carol builds the competing-author suffix: an untrusted
+    // author's key is correctly refused.  Carol must also be offline at that exact decision:
+    // otherwise the key takes the direct pairwise path and no package exists in Alice's feed.
+    // Remember Carol's contiguous log before the offline append so her later increase proves she
+    // actually fetched the row, package and consent grant, rather than merely reporting an
+    // unscanned package queue after restart.
+    let carol_log_before_package = status_log_entries(&carol, &room).unwrap_or_else(|| {
+        panic!(
+            "APPARATUS: carol's shipped status did not name her contiguous log before the \
+             offline package was staged"
+        )
+    });
+    carol_daemon.stop();
     let before_package_text = "alice row before carol's package";
     let (ok, out, err) = vox(&alice, &["room", "post", &room, before_package_text], None);
     assert!(
@@ -737,10 +743,16 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
             "PRODUCT: alice's shipped JSON read omitted the accepted row before the private package"
         )
     });
-    let before_package = status_rows(&alice, &room).unwrap_or_else(|| {
+    let before_package_rows = status_rows(&alice, &room).unwrap_or_else(|| {
         panic!(
             "PRODUCT: alice's `vox status --json` did not report the room before the private \
              package was staged"
+        )
+    });
+    let before_package_through = room_own_feed_through(&alice, &room).unwrap_or_else(|| {
+        panic!(
+            "PRODUCT: alice's `vox status --json` did not name her authenticated feed before the \
+             private package was staged"
         )
     });
     let (ok, _, err) = vox(&alice, &["trust", "add", &fps[2], "--name", "carol"], None);
@@ -748,22 +760,55 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         ok,
         "PRODUCT: alice's `vox trust add` of carol failed: {err}"
     );
-    // The shipped status observations establish both sides of the apparatus boundary: Alice
-    // durably appended and finished offering the recipient-scoped package, while Carol retained
-    // package work because the explicit hold file still exists.  Releasing that same file near
-    // the end of the journey is what permits installation; elapsed time is only its watchdog.
+    // With Carol offline, a completed delivery must add two distinct rows after the visible
+    // pre-package row: the recipient-scoped package and its consent grant.  Requiring both the
+    // shipped row count and Alice's exact authenticated feed to advance twice cannot be satisfied
+    // by the consent row alone; `key_packages_pending` is deliberately not used for this append
+    // observation because a held initial scan makes that bit true without a package.
     let package_deadline = Instant::now() + READY_WITHIN;
-    while status_rows(&alice, &room).is_none_or(|entries| entries <= before_package)
+    while status_rows(&alice, &room)
+        .is_none_or(|entries| entries < before_package_rows.saturating_add(2))
+        || room_own_feed_through(&alice, &room)
+            .is_none_or(|through| through < before_package_through.saturating_add(2))
         || member_key_waits(&alice, &fps[2]) != Some(None)
-        || key_packages_pending(&carol, &room) != Some(true)
     {
         assert!(
             Instant::now() < package_deadline,
-            "APPARATUS: Alice did not durably append/offer Carol's package and Carol did not \
-             report its retained installation work within {READY_WITHIN:?}; the held private \
-             package was not staged\nalice said: {}\ncarol said: {}",
+            "APPARATUS: while carol was offline, Alice's shipped row count and authenticated feed \
+             did not each advance through the package and consent grant within {READY_WITHIN:?}; \
+             the private package was not staged\nalice said: {}",
+            said(&alice, "alice")
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let package_feed_through = room_own_feed_through(&alice, &room).unwrap_or_else(|| {
+        panic!(
+            "APPARATUS: alice's shipped status lost her authenticated feed after the offline \
+             package append"
+        )
+    });
+
+    // Restart Carol with the installer held only after the package exists.  Three new contiguous
+    // rows since her stop (the visible pre-package row, package, and consent grant) prove she
+    // fetched across that exact append.  Pending package work is no longer a vacuous held-scan
+    // observation: it is paired with the exact source-feed append and recipient-log increase.
+    std::fs::write(&hold, b"")
+        .unwrap_or_else(|e| panic!("APPARATUS: could not create {}: {e}", hold.display()));
+    let carol_daemon = daemon_env(&carol, "carol-package-held", &knob);
+    attached(&carol, "carol-package-held");
+    let retained_deadline = Instant::now() + READY_WITHIN;
+    while status_log_entries(&carol, &room)
+        .is_none_or(|entries| entries < carol_log_before_package.saturating_add(3))
+        || key_packages_pending(&carol, &room) != Some(true)
+    {
+        assert!(
+            Instant::now() < retained_deadline,
+            "APPARATUS: after Carol restarted with package installation held, her contiguous log \
+             did not cross Alice's exact pre-package row, package, and consent grant while \
+             package work remained pending; the private package was not retained (Alice's \
+             authenticated feed after delivery: {package_feed_through})\nalice said: {}\ncarol said: {}",
             said(&alice, "alice"),
-            said(&carol, "carol")
+            said(&carol, "carol-package-held")
         );
         std::thread::sleep(Duration::from_millis(200));
     }
@@ -1989,6 +2034,20 @@ fn status_rows(dir: &Path, room: &str) -> Option<u64> {
         .as_array()?
         .iter()
         .find(|r| r["id"].as_str().is_some_and(|id| id.starts_with(room)))?["entries"]
+        .as_u64()
+}
+
+/// What `vox status --json` reports under `rooms[].log_entries`: every contiguous authenticated
+/// log row, including the control rows a person does not see in `vox room read`.
+fn status_log_entries(dir: &Path, room: &str) -> Option<u64> {
+    let (ok, out, _) = vox(dir, &["status", "--json"], None);
+    if !ok {
+        return None;
+    }
+    serde_json::from_str::<serde_json::Value>(&out).ok()?["rooms"]
+        .as_array()?
+        .iter()
+        .find(|r| r["id"].as_str().is_some_and(|id| id.starts_with(room)))?["log_entries"]
         .as_u64()
 }
 
