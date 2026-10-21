@@ -375,55 +375,65 @@ The decider then answered twelve questions, one at a time. His answers are the d
   persistent file", while the status line said "Unlock with vox node unlock …": the product's
   advice looped into its refusal. Introduced by 6d9f286fa (2026-10-13), shipped in v0.4.5
   through v0.4.9; the Keychain path hid it on macOS.
-- **FX-35.** A full daemon-wide flow-state pool MUST NOT keep an eligible port from starting
-  a bounded-sync round while any charge of that pool is held by a flow that is not running a
-  round. Terms: a port is
-  eligible when it has a need (ADR-037 R7: a raised request or a head newer than it served), a
-  connection to its peer and no bounded-sync round running for that port; a flow is parked while it sits in `ready`,
-  `deferred`, `retiring` or `cleanup` and no task runs it; the flow-state pool is
-  `RETAINED_FLOWS` charges per daemon (16 today, each 128 KiB), shared by every hosted node.
-  Decision: a flow holds flow state only while its round runs. A flow back from a round, or
-  shelved before one, releases its charge; a flow reserves the charge again before its round,
-  after its outbound slot is taken; a flow that cannot is disposed with its outstanding hint
-  re-armed and is never left holding its port; so no parked flow holds a charge and the pool
-  bounds rounds running at once (two per node, sixteen per daemon), never flows at rest, while
-  flows at rest stay bounded per node by the controller's twelve-flow limit. When an eligible
-  port cannot reserve flow state because every charge is held by a running round, the daemon
-  MUST re-queue the port and MUST NOT dispose, expire or defer any flow for it. A period
-  count, turn count, elapsed-time threshold or CPU-time threshold MUST NOT trigger disposal,
-  expiry, deferral or release of flow state (FX-27); only a round's end releases it.
-  Disposing a flow MUST re-arm all and only work still
-  outstanding under FX-29 and MUST NOT create a need from a hint the node already holds. A start attempt
-  is one scheduler invocation for an eligible port, including its flow-state reservation; it
-  ends `started` only when it launches the bounded-sync
-  round, otherwise `not_started`. `vox status --json` MUST report, for every port under
-  `lanes.ports[]`, `start_outcome`, equal to `never_attempted` until the first start attempt in
-  the current daemon process ends and thereafter equal to `started` or `not_started` for the
-  most recently ended attempt (an in-progress attempt does not replace that value, and a daemon
-  restart resets it to `never_attempted`), and
-  `start_reason`, present if and only if `start_outcome` is `not_started`; the gates MUST be
-  tested in the following order and `start_reason` MUST equal the first gate that fails:
-  `room_busy` (the room's state could not be taken without waiting), `archive_budget_busy`
-  (an archive port only: the archive-lane job could not be reserved), `control_budget_busy`
-  (the control-lane job could not be reserved), `flow_state_pool_full` (every charge of the
-  pool is held by a running round), `live_lane_busy` (the node's live flow slot holds another
-  flow) and `no_outbound_slot` (the outbound slot could not be taken); and MUST report the pool under
-  `lanes.budget.flow_state` as the integers
-  `in_use` and `limit` and, under `by_node`, an object with exactly one member per hosted node, keyed by that node's node ID, whose value is that node's integer in-use count; the member values MUST sum to `in_use`. After a start attempt for any port in a room ends `not_started` with `start_reason` equal to `flow_state_pool_full`,
-  and until a later start attempt in the same daemon process for any port in that room ends
-  `started`, the room's "no completed sync" text in `vox status` and in the app MUST contain the literal text `flow-state pool`. Measured
-  cause, 2026-10-21 (UTC, as
-  every date in this record): on the decider's daemon (four hosted nodes, three rooms,
-  restarted 02:32Z) every port of every node had started no round, `queued` froze, every room
-  said "no completed sync in 10 minutes", and posts moved neither between the two Macs nor
-  between two nodes of one daemon while the daemons were connected; in the #986 staging on
-  main bb4062651, instrumented, every port was eligible, popped and re-queued each pass with
-  `start_bounded_outbound` returning false at `reserve_flow_state` 370,156 times in one run,
-  the pool full (16 of 16) by the first fifth of the run with 1,951 flows started before and
-  none after, the outbound slots 0 of 16 in use and the archive lane empty throughout. The
-  product said only the symptom. "please make vox work"; "be methodical" (the decider,
-  2026-10-21).
-
+- **FX-35.** A full daemon-wide flow-state pool MUST NOT keep an eligible port from starting a
+  bounded-sync round while any charge of that pool is held by a flow that is not running a
+  round. Terms: a port is eligible when it has a need (ADR-037 R7: a raised request or a head
+  newer than it served), a connection to its peer and no bounded-sync round running for that
+  port; a flow is parked while it sits in `ready`, `deferred`, `retiring` or `cleanup` and no
+  task runs it; the flow-state pool is `RETAINED_FLOWS` charges per daemon (16 today, each 128
+  KiB), shared by every hosted node. Decision: each running bounded-sync round MUST hold exactly
+  one flow-state charge, and every flow-state charge MUST be held by exactly one running
+  bounded-sync round; acquisition of the charge and the round's transition to running MUST be
+  one atomic state transition for accounting and status; every transition out of running, by
+  completion, failure or cancellation, MUST release the charge; a flow in `ready`, `deferred`,
+  `retiring` or `cleanup`, and a flow shelved without starting a round, MUST hold no charge. So
+  the pool bounds rounds running at once, never flows at rest. Each node's bounded controller
+  MUST retain at most twelve flows in all across `ready`, `running`, `deferred`, `retiring` and
+  `cleanup`, and MUST run at most two bounded-sync rounds at once; the daemon-wide number of
+  running rounds is therefore at most the smaller of `RETAINED_FLOWS` and twice the hosted
+  nodes. When an eligible port cannot reserve flow state because every charge is held by a
+  running round, the daemon MUST dispose that flow, MUST re-arm all and only work still
+  outstanding under FX-29 without creating a need from a hint the node already holds, MUST
+  release every room, lane-job, live-flow, outbound-slot and flow-state reservation the attempt
+  acquired, and MUST re-queue the port with its need preserved; the port MUST then hold a place
+  in a daemon-wide first-come queue for flow state, and when a charge is released the daemon
+  MUST offer it to the earliest-enqueued such port that is still eligible before any other
+  reservation of the pool, ties broken arbitrarily. No count or threshold of periods, turns,
+  elapsed time or CPU time MAY dispose, expire or defer a parked flow, or delay, skip or space a
+  start attempt (FX-27); flow-state release MUST be caused solely by a round's transition out of
+  running, which a timeout or a connection failure MAY cause. A start attempt is one scheduler
+  invocation for an eligible port, including its flow-state reservation; it ends `started` only
+  when it launches the bounded-sync round, otherwise `not_started`. `vox status --json` MUST
+  report, for every port under `lanes.ports[]`: `start_outcome`, equal to `never_attempted`
+  until the first start attempt in the current daemon process ends and thereafter equal to
+  `started` or `not_started` for the most recently ended attempt (an in-progress attempt does
+  not replace that value, and a daemon restart resets it to `never_attempted`); `start_reason`,
+  present if and only if `start_outcome` is `not_started`, where the gates MUST be tested in the
+  following order and `start_reason` MUST equal the first gate that fails: `room_busy` (the
+  room's state could not be taken without waiting), `archive_budget_busy` (an archive port only:
+  the archive-lane job could not be reserved), `control_budget_busy` (the control-lane job could
+  not be reserved), `live_lane_busy` (the node's live flow slot holds another flow),
+  `no_outbound_slot` (the outbound slot could not be taken) and `flow_state_pool_full` (every
+  charge of the pool is held by a running round); and the boolean `round_running`, true while a
+  bounded-sync round of that port runs. It MUST report the pool under `lanes.budget.flow_state`
+  as the integers `in_use` and `limit` and, under `by_node`, an object with exactly one member
+  per hosted node, keyed by that node's node ID, whose value is that node's integer in-use
+  count; the member values MUST sum to `in_use`; a node's `round_running` values and its own
+  `by_node` member MUST be taken from one snapshot, and that member MUST equal the number of
+  that node's ports whose `round_running` is true. After a start attempt for any port in a room
+  ends `not_started` with `start_reason` equal to `flow_state_pool_full`, and until a later
+  start attempt in the same daemon process for any port in that room ends `started`, the room's
+  "no completed sync" text in `vox status` and in the app MUST contain the literal text `flow-
+  state pool`. Measured cause, 2026-10-21 (UTC, as every date in this record): on the decider's
+  daemon (four hosted nodes, three rooms, restarted 02:32Z) every port of every node had started
+  no round, `queued` froze, every room said "no completed sync in 10 minutes", and posts moved
+  neither between the two Macs nor between two nodes of one daemon while the daemons were
+  connected; in the #986 staging on main bb4062651, instrumented, every port was eligible,
+  popped and re-queued each pass with `start_bounded_outbound` returning false at
+  `reserve_flow_state` 370,156 times in one run, the pool full (16 of 16) by the first fifth of
+  the run with 1,951 flows started before and none after, the outbound slots 0 of 16 in use and
+  the archive lane empty throughout. The product said only the symptom. "please make vox work";
+  "be methodical" (the decider, 2026-10-21).
 ## Unchanged rulings
 
 The decider confirmed these on 2026-10-19 ("that still sounds right to me"): no human/agent
