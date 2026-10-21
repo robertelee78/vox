@@ -705,7 +705,7 @@ fn a_full_keyring_names_its_cause() {
     // 1,100 distinct identities, eight at a time: more than the keyring holds. Enough must be
     // trusted to fill it, at least one must be refused, and every refusal must say the keyring is
     // full. Eight at a time is possible because a passphrase check no longer runs on the node's
-    // actor (V210-26); one at a time, it took longer than the test watchdog allows.
+    // actor (V210-26); one at a time, the staging was impractically slow.
     let tried = 1_100usize;
     let fill = Instant::now();
     let (refusals, mut took): (Vec<String>, Vec<Duration>) = std::thread::scope(|scope| {

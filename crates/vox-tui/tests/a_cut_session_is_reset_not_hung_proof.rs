@@ -58,7 +58,7 @@ use std::time::{Duration, Instant};
 use sync_pair::{Member, ID_PASS, VOX};
 
 /// Rounds: 30 in release; 3 in a debug build, whose hashing of each shared file and whose joins
-/// (a proof of work) otherwise take the run past the watchdog's budget.
+/// (a proof of work) otherwise make the diagnostic run impractically long.
 const ROUNDS: usize = if cfg!(debug_assertions) { 3 } else { 30 };
 /// Rounds of the raw-collector arm.
 const RAW_ROUNDS: usize = if cfg!(debug_assertions) { 2 } else { 10 };

@@ -81,8 +81,8 @@
 //! 90s in release. The member demands more work while 16 joins are in flight (two more bits, four
 //! times the solves), so this is the time of a join through a member under a flood, not through an
 //! idle one; measured 3–20s. The unoptimized build grinds far slower (V210-87 measured 22–194s at
-//! the base difficulty), so in debug the bound is the proof's watchdog, and what is asserted is
-//! that carol gets in at all.
+//! the base difficulty), so the debug arm asserts that carol gets in at all rather than imposing
+//! the release arm's elapsed bound.
 //!
 //! **And a joiner turned away at the cap is told so.** Every one of the stranger's joins that alice
 //! turns away while its slots are held (it is the heaviest source, so it is refused) must say the
@@ -156,11 +156,11 @@ use std::time::{Duration, Instant};
 
 /// The cases in this file, each a flood of its own.
 const CASES: u32 = 7;
-/// What one case may take, staging to verdict, before the watchdog calls the process hung. All
+/// Historical whole-case sizing retained for the compatibility arming call below. It is not a
+/// verdict or elapsed bound. All
 /// seven ran one after another in 456s in release at load 38 (65s each on average, carol's joins
-/// 6–33s); this is more than five times that average, for a slower runner. The watchdog bounds
-/// the whole run, `CASES` of these, and is only the backstop: a case that runs out one of its own
-/// patiences fails on it, with its own red.
+/// 6–33s); this is more than five times that average, for a slower runner. A case that runs out one
+/// of its own source-owned patiences fails on that product/structural assertion, with its own red.
 const CASE_BUDGET: Duration = Duration::from_secs(360);
 
 /// **One case at a time** (V210-124, #332). Each case stages a flood of its own: an anchor,
@@ -169,9 +169,9 @@ const CASE_BUDGET: Duration = Duration::from_secs(360);
 /// as there are cores, so CI's runners ran three or four floods at once, the proof loaded its
 /// own machine past anything it measures, and its joins starved: carol got in after 98–370s
 /// against a 90s bound on ubuntu, three cases could not even stage, and on macOS the four running
-/// ran past the process's 600s watchdog. Run one at a time, all seven passed with carol in
-/// 6–33s. So every case holds this lock for its whole run, whatever libtest's thread count, and
-/// the watchdog, which bounds the whole process, is given the cases' budgets in turn.
+/// took more than 600s. Run one at a time, all seven passed with carol in 6–33s. So every case
+/// holds this lock for its whole run, whatever libtest's thread count. The arming call retains the
+/// historical sizing only for source compatibility; it does not impose that elapsed limit.
 fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
     static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
     watchdog::arm_for(CASE_BUDGET * CASES);

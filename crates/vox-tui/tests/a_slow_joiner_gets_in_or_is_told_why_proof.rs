@@ -220,8 +220,8 @@ fn stage(tmp: &Path, grind_ms: u64) -> Staged {
     };
 
     let (alice, bob) = (Who::new(tmp, "alice"), Who::new(tmp, "bob"));
-    // Both identities, then both daemons, at once: each unlock is production Argon2id, and the
-    // too-slow case has to fit its 485s grind inside the watchdog after them.
+    // Both identities, then both daemons, at once: each unlock is production Argon2id, and doing
+    // them concurrently avoids adding needless staging time before the 485s grind.
     let alice_err = tmp.join("alice.daemon.err");
     let bob_err = tmp.join("bob.daemon.err");
     let (alice_proc, bob_proc) = std::thread::scope(|sc| {

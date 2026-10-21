@@ -259,7 +259,9 @@ by a speed arm (SP-4); both are review-checked.
   - any second ran more than `MAX_EMULATOR_LATENESS` (25 ms) late.
 
   Every arm MUST print its per-second late share.
-- **PR-10.** R41's watchdog budget is 1800 s.
+- **PR-10.** R41 has no elapsed-time verdict or default watchdog. An operator MAY choose an
+  emergency timebox for a run under ADR-018 §6; its expiry is only `NO RESULT` or
+  `CANNOT MEASURE`.
 - **PR-11 (M24.5 acceptance, the decider, 2026-10-02).**
   - LAN and WAN MUST stay at least 90% of raw.
   - Each lossy arm MUST be at least 2× the comparison flow.

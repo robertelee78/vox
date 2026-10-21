@@ -99,8 +99,8 @@ const NOTE_WITHIN: Duration = Duration::from_secs(20);
 /// How long the host may take to say the anchor took the room once it is back (arm C): its redial,
 /// the connection and the first publish round.
 const TAKEN_WITHIN: Duration = Duration::from_secs(120);
-/// The watchdog's bound on the whole binary: its four arms took 623 s in debug on 2026-10-01, which
-/// is past the default 600 s, so twice that, rounded up.
+/// Historical whole-binary sizing retained for the compatibility arming call: its four arms took
+/// 623 s in debug on 2026-10-01. It does not impose an elapsed verdict.
 const BUDGET: Duration = Duration::from_secs(1300);
 /// How long the host may take, past making its room, to withhold an address that would lead
 /// nowhere and say why (arm E): the node's `ADDRESS_PATIENCE` (30 s), and margin.
@@ -243,13 +243,13 @@ fn line_within(p: &mut VoxProc, within: Duration, pred: impl Fn(&str) -> bool) -
     None
 }
 
-/// Which a red about `host` is: `PRODUCT`, unless the host was killed by a signal — which no
-/// proof sends it, so it is the watchdog, past its budget, and nothing about the claim was measured.
+/// Which a red about `host` is: `PRODUCT`, unless the host was killed by a signal. The proof does
+/// not send one; an operator-enabled emergency cleanup may, and then nothing was measured.
 fn host_verdict(host: &mut VoxProc) -> String {
     use std::os::unix::process::ExitStatusExt as _;
     match host.child.try_wait() {
         Ok(Some(status)) if status.signal().is_some() => format!(
-            "APPARATUS: `vox serve` was killed by signal {:?} (the watchdog, past its budget), so \
+            "CANNOT MEASURE: `vox serve` was killed by signal {:?} during emergency cleanup, so \
              nothing was measured —",
             status.signal()
         ),
@@ -258,7 +258,7 @@ fn host_verdict(host: &mut VoxProc) -> String {
 }
 
 /// `vox` run to completion, as [`vox_once`] does, but a run killed by a signal — which no proof
-/// sends it, so the watchdog — is an apparatus red, never read as the product refusing.
+/// sends — measured no product outcome.
 fn vox_joined(data: &Path, args: &[String]) -> (bool, String, String) {
     use std::os::unix::process::ExitStatusExt as _;
     let out = std::process::Command::new(world::VOX)
@@ -276,7 +276,7 @@ fn vox_joined(data: &Path, args: &[String]) -> (bool, String, String) {
     );
     assert!(
         out.status.signal().is_none(),
-        "APPARATUS: `vox {}` was killed by signal {:?} (the watchdog, past its budget), so its \
+        "CANNOT MEASURE: `vox {}` was killed by signal {:?} during emergency cleanup, so its \
          outcome measures nothing.\nstdout:\n{stdout}\nstderr:\n{stderr}",
         args.first().map_or("", String::as_str),
         out.status.signal()

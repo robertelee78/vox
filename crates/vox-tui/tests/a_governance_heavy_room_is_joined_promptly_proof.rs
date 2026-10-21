@@ -77,9 +77,9 @@ const POST_BOUND: Duration = Duration::from_secs(2 * DEBUG_SCALE);
 /// release, and a post 4.03 s against 68 ms. Unscaled, a debug run of the fixed build failed
 /// every bound; the release bounds above are the measured ones and are unchanged.
 const DEBUG_SCALE: u64 = if cfg!(debug_assertions) { 8 } else { 1 };
-/// Staging in the unoptimized build (six joins, then 300 trust changes, each unlocking the
-/// identity with production Argon2id) took 816 s, and the whole test 1017 s: past the default
-/// watchdog, which stopped it mid-staging as `CANNOT MEASURE`. It gets this budget instead.
+/// Historical sizing for the compatibility arming call. Staging in the unoptimized build (six
+/// joins, then 300 trust changes, each unlocking the identity with production Argon2id) took
+/// 816 s, and the whole test 1017 s. It does not impose an elapsed verdict.
 const DEBUG_WATCHDOG: Duration = Duration::from_secs(2400);
 /// The cap on any one verb, so a stopped node is reported rather than waited on.
 const VERB_CAP: Duration = Duration::from_secs(120);

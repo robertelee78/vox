@@ -65,21 +65,27 @@ MUST be reproduced by the harness when its fix is reverted.
    only to serve one. *Status:* built; none exist on integrate/v0.3.0. (The suites §5 once retained are gone,
    and §5 is retired.)
 
-### §6 A hung proof is a failing proof
+### §6 A clock cannot decide that a proof is wedged
 
-1. Every gate and proof process MUST arm the wall-clock watchdog
-   (`crates/vox-core/tests/support/watchdog.rs`). The watchdog's bound is outside the async runtime, so
-   a spinning task cannot starve it.
-2. The watchdog MUST end the process by abort (`SIGABRT`), not by exit.
-3. Before it aborts, the watchdog MUST write to file descriptor 2 directly, not through libtest's
-   captured output. It MUST name the tests still running and put every thread's stack in the log:
-   `/usr/bin/sample` on macOS; on Linux, a `/proc` census of every thread with its state and recent CPU,
-   plus `gdb` backtraces where `gdb` can attach.
-4. The default budget MUST be 600 s. `VOX_TEST_WATCHDOG_SECS` MUST override it, and `=0` MUST
-   disable it.
-5. Every CI job MUST carry a `timeout-minutes`.
+1. Product and structural assertions MUST detect wedges. Whole-process elapsed time is not a
+   product observation: a legitimate progressing process MUST NOT become red because an arbitrary
+   wall-clock number elapsed.
+2. `crates/vox-core/tests/support/watchdog.rs` MUST impose no default elapsed bound. With
+   `VOX_TEST_WATCHDOG_SECS` unset or `0`, `arm`, `arm_for_setup`, and the compatibility arming calls
+   MUST NOT start a wall-clock abort thread. A source call MUST NOT silently choose a bound.
+3. A person MAY set a positive `VOX_TEST_WATCHDOG_SECS` as an emergency timebox for that one run.
+   Its expiry MUST say only `NO RESULT` or `CANNOT MEASURE`, never PRODUCT or APPARATUS: elapsed
+   silence cannot distinguish a wedge, legitimate waiting, or slow progress.
+4. An enabled emergency timebox MUST write directly to file descriptor 2, name the tests still
+   running, record process/thread/CPU diagnostics, clean every descendant it can still identify,
+   and then abort (`SIGABRT`). The diagnostics help a person investigate; they are not a verdict.
+5. Ordinary proof cancellation and scope exit MUST continue to clean children through their owned
+   handles. That lifecycle cleanup is independent of the emergency clock. A hard kill of the parent
+   runs no destructor; with no enabled emergency helper the dead parent cannot later find or reap a
+   daemonized orphan. An external runner MAY clean its process group, but its elapsed cancellation
+   is likewise no proof or release verdict.
 
-*Status:* built.
+*Decision amended 2026-10-21; implementation is to land with the v0.4.10 repair.*
 
 ### §7 A green gate is not evidence
 
@@ -94,8 +100,8 @@ MUST be reproduced by the harness when its fix is reverted.
 
 ### §8 A proof never restates a constant it depends on
 
-1. A test whose number stands in a required relation to a constant in the source (a patience window, a retry
-   deadline, a watchdog budget) MUST reference that constant, not repeat its value. The constant MUST
+1. A test whose number stands in a required relation to a constant in the source (a patience window or retry
+   deadline) MUST reference that constant, not repeat its value. The constant MUST
    be exported for that purpose (for example `node::up::HOST_PATIENCE`).
 
 ### §8a The six gates

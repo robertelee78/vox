@@ -818,8 +818,8 @@ fn r41_a_tunnel_does_not_throttle_the_link_it_runs_over() {
     test_knobs::require(&["VOX_TEST_ADVERTISE"]);
     let _alone = one_run();
     // The raw-TCP links take about 4 minutes; ADR-024's arms add about 10 (each runs a settle and a
-    // judged stretch, 60 s on the congested ones). The watchdog bounds a hung run, so it gets both
-    // and a margin: at 600 s it aborted a run that had measured every arm.
+    // judged stretch, 60 s on the congested ones). This legacy duration is deliberately ignored
+    // by the watchdog; only an operator-provided emergency timebox can abort the whole run.
     watchdog::arm_for(Duration::from_secs(1800));
     let min_ratio = std::env::var("VOX_PERF_MIN_RATIO")
         .ok()
