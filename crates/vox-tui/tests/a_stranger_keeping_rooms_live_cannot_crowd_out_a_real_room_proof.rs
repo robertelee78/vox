@@ -93,14 +93,6 @@ const JOIN_BOUND: Duration = Duration::from_secs(120);
 const PUBLISH_PATIENCE: Duration = Duration::from_secs(60);
 /// How long the victim is given to republish to a restarted anchor.
 const REPUBLISH_SETTLE: Duration = Duration::from_secs(45);
-/// The whole binary's time bound: the default, or longer in a debug build, where the anchor
-/// verifies tens of thousands of post-quantum signatures unoptimised.
-const BUDGET: Duration = if cfg!(debug_assertions) {
-    Duration::from_secs(2400)
-} else {
-    Duration::from_secs(900)
-};
-
 fn policy() -> ChannelPolicy {
     ChannelPolicy {
         history_mode: HistoryMode::ForwardOnly,
@@ -484,7 +476,7 @@ fn signal(proc: &VoxProc, sig: &str) {
 #[test]
 #[ignore = "real vox processes with production Argon2id, a flood and a real join; run in release"]
 fn a_stranger_keeping_its_rooms_live_does_not_crowd_out_a_new_room() {
-    watchdog::arm_for(BUDGET);
+    watchdog::arm();
     let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let (anchor_dir, victim_dir, joiner_dir) = (
         profile_dir(tmp.path(), "anchor"),
@@ -540,7 +532,7 @@ fn a_stranger_keeping_its_rooms_live_does_not_crowd_out_a_new_room() {
 #[ignore = "real vox processes with production Argon2id and a flood; run in release"]
 fn a_room_whose_members_are_away_is_not_crowded_out() {
     test_knobs::require(&["VOX_TEST_CLOCK_STEP_MS"]);
-    watchdog::arm_for(BUDGET);
+    watchdog::arm();
     let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let (anchor_dir, victim_dir) = (
         profile_dir(tmp.path(), "anchor"),
@@ -599,7 +591,7 @@ fn a_room_whose_members_are_away_is_not_crowded_out() {
 #[test]
 #[ignore = "real vox processes with production Argon2id, a flood and a real join; run in release"]
 fn a_stranger_resending_a_rooms_records_does_not_get_it_evicted() {
-    watchdog::arm_for(BUDGET);
+    watchdog::arm();
     let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let (anchor_dir, victim_dir, joiner_dir) = (
         profile_dir(tmp.path(), "anchor"),
@@ -652,7 +644,7 @@ fn a_stranger_resending_a_rooms_records_does_not_get_it_evicted() {
 #[test]
 #[ignore = "real vox processes with production Argon2id, an anchor restart, a flood and a real join; run in release"]
 fn a_stranger_reseeding_a_restarted_anchor_does_not_get_a_room_evicted() {
-    watchdog::arm_for(BUDGET);
+    watchdog::arm();
     let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let (anchor_dir, victim_dir, joiner_dir) = (
         profile_dir(tmp.path(), "anchor"),
@@ -752,7 +744,7 @@ fn a_non_creator_members_republish_keeps_a_room_credited() {
     // credits (the putter wrote it), the room is filed under the member's network and a flood
     // credited to no one leaves it; if a put must store something new to credit, the member's
     // re-send credits nothing, the room is credited to no one with the flood, and it is evicted.
-    watchdog::arm_for(BUDGET);
+    watchdog::arm();
     let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let (anchor_dir, creator_dir, member_dir, joiner_dir) = (
         profile_dir(tmp.path(), "anchor"),

@@ -253,7 +253,7 @@ MUST be reproduced by the harness when its fix is reverted.
 | The live-model sandbox (§10.3) | built on integrate/v0.2.10 (5c521a3a, #301); not on integrate/v0.3.0 until the sync (#226). Live-model proofs run only on the decider's request, through it |
 | §10.2 and §10.6 on integrate/v0.3.0: R40/R41 block in `transport-gates`, R41's WAN arm is report-only on macOS, and `scripts/release-gate.sh` requires the live-model proofs | built on integrate/v0.2.10 (#301); reaches v0.3.0 with #226 |
 | CI still accepts the `opencode` gap (§3) | the live-model proofs need OpenCode and a model account CI lacks |
-| The watchdog's Linux stack dump (§6.3) has not been run | open, V210-145 |
+| The enabled emergency timebox's Linux stack dump (§6.4) has not been run | open, V210-145 |
 | `cross_process_join_proof` has one red (`Unreachable` straight after an invite) whose cause is not named | open, V210-146 |
 | UPnP port mapping has no real-router validation (ADR-012) | open |
 | Claims left unmeasured by the deletion of the unit tests | tracked by #204 |

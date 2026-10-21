@@ -49,8 +49,8 @@
 //!    it), and a guest that joins [`JOINS`] of its rooms. Every join's session is set up with one
 //!    of the host's one-time prekeys when it offers one. After all of them the host has consumed
 //!    more than its whole first pool, and still has one-time prekeys to offer, having refilled
-//!    while running. The smaller pool keeps this to a dozen joins, well inside the watchdog on a
-//!    small CI runner and in a debug build; the 70 joins it took at 64 used 418 of 600 s.
+//!    while running. The smaller pool keeps this to a dozen joins; the 70 joins it took at 64 used
+//!    418 seconds in one measured run. That observation sizes no elapsed verdict.
 //!
 //! Mutations that must turn it red: the tick's maintenance leaves the ring as it is (1 never
 //! rotates; 3 consumes exactly [`POOL`]); a rotation drops the signed prekey it replaces at once
