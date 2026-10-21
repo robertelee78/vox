@@ -15073,6 +15073,15 @@ impl Node {
         let (left, sparse) = match shared.try_lock() {
             Ok(channel) => (channel.has_left(&peer), channel.uses_sparse_history(&store)),
             Err(_) => {
+                let work = self.bounded_pending_identity(channel_id, peer);
+                self.bounded_sync.wait_for_room(
+                    &self.net_tx,
+                    &mut self.next_token,
+                    channel_id,
+                    peer,
+                    work,
+                    Arc::clone(&shared),
+                );
                 self.note_start(channel_id, peer, "room_busy");
                 return false;
             }

@@ -869,6 +869,7 @@ impl Budget {
     /// grows to hold every hosted node's rounds before this node's first start attempt.
     pub(crate) fn register_node(self: &Arc<Self>, node: Digest32) -> FlowPoolRegistration {
         let mut p = self.pool.lock().unwrap_or_else(PoisonError::into_inner);
+        let previous_limit = p.limit;
         let mut owner = p.next_owner.wrapping_add(1);
         while p.owners.contains_key(&owner) {
             owner = owner.wrapping_add(1);
@@ -890,7 +891,14 @@ impl Budget {
         p.owners
             .retain(|_, owner| owner.registered || owner.charges > 0);
         resize_flow_pool(&mut p);
+        let capacity_increased = p.limit > previous_limit;
         drop(p);
+        // A retained pool admission waits on this exact capacity family. Registering another
+        // hosted node can make room without any running charge ending, so the resize itself is
+        // the release edge; waiting for a later round or scheduler tick would strand capacity.
+        if capacity_increased {
+            self.flow_changed.notify_waiters();
+        }
         FlowPoolRegistration {
             budget: Arc::clone(self),
             node,
