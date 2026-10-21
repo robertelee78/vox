@@ -472,6 +472,7 @@ const HOSTED: [&str; 4] = ["robert", "claude", "codex", "opencode"];
 const FX35_HOSTED: [&str; 9] = [
     "robert", "claude", "codex", "opencode", "kimi", "glm", "fable", "one", "two",
 ];
+const FX35_WAKE_HOSTED: [&str; 2] = ["wake-one", "wake-two"];
 /// The rooms every node is in; the first hosted node makes them.
 const QUIET_ROOMS: [&str; 2] = ["quiet-1", "quiet-2"];
 /// CPU time a daemon in quiet rooms may spend over [`IDLE`]: Activity Monitor's number, the
@@ -851,8 +852,9 @@ fn start_words(name: &str, v: &serde_json::Value) -> Vec<String> {
 /// everyone; or a post was refused for 60 s while the room applied its last change.
 ///
 /// Mutants, one per claim: `Flow::park` keeping its charge turns convergence PRODUCT red;
-/// `scratchpad/mutant_fx35_undersized.py` holds the pool at 16 and turns the exact 18-state
-/// status assertion PRODUCT red; dropping the retained foreground ticket or its release event
+/// `scratchpad/mutant_fx35_undersized.py` obstructs the seventeenth reservation while still
+/// reporting the right limit, turning the pool-full/over-sixteen PRODUCT assertion red; dropping
+/// the retained foreground ticket or its release event
 /// leaves `foreground_admissions` nonzero with periodic scheduling disabled; removing the
 /// post-quiet need re-arm leaves the waiting node short of the named `re-armed` posts.
 #[cfg(feature = "optional-proofs")]
@@ -865,92 +867,117 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
         "VOX_TEST_DISABLE_TICK_SCHEDULE",
     ]);
     watchdog::arm_for_setup(
-        u32::try_from(QUIET_ROOMS.len() * FX35_HOSTED.len())
+        u32::try_from(QUIET_ROOMS.len() * (FX35_HOSTED.len() + FX35_WAKE_HOSTED.len()))
             .expect("APPARATUS: join count does not fit the watchdog"),
-        u32::try_from(FX35_HOSTED.len() + 1)
+        u32::try_from(FX35_HOSTED.len() + FX35_WAKE_HOSTED.len() + 2)
             .expect("APPARATUS: unlock count does not fit the watchdog"),
     );
-    let staged = stage_hosted_nodes(&FX35_HOSTED, true);
+    let staged = stage_hosted_nodes(&FX35_HOSTED, false);
     converged(&staged);
     let converged_after = staged.posted.elapsed();
-    // After the initially quiet state, make new heads while one Live reservation is held. More
-    // than one hosted node must contend for the single proof-only foreground job. The waiting
-    // node is identified from the product's status before release; its exact admission event,
-    // not the disabled periodic scheduler, must consume the ticket within one source-owned round.
-    let hold = staged
-        .live_hold
-        .as_ref()
-        .expect("APPARATUS: exact-admission hold path was not staged");
-    std::fs::File::create(hold)
-        .unwrap_or_else(|e| panic!("APPARATUS: could not create {}: {e}", hold.display()));
-    let room = &staged.rooms[0];
-    for (dir, node, name, _) in &staged.everyone[..staged.hosted] {
-        let text = format!("{name} re-armed");
-        loop {
-            let (ok, out, err) = vox(dir, &as_node(&["room", "post", room, &text], *node), None);
-            if ok {
-                break;
+    // Two legal rounds per hosted node must actually overlap above the sixteen-state floor.
+    // Three different peers append a near-maximum legal body and then a small visible marker in
+    // both rooms. Each hosted node therefore has work for at least two peers, so its two running
+    // slots can overlap despite the separate per-peer outbound bound. This is ordinary shipped-
+    // product traffic: no pool-capacity or worker-hold test knob stages it.
+    let pressure_authors = [
+        &staged.everyone[0],
+        &staged.everyone[1],
+        &staged.everyone[staged.hosted],
+    ];
+    let pressure_body = "x".repeat(vox_core::log::history::MAX_PAYLOAD_BYTES - 4096);
+    std::thread::scope(|scope| {
+        let mut posts = Vec::new();
+        for (number, room) in staged.rooms.iter().enumerate() {
+            for (dir, node, name, _) in pressure_authors {
+                let body = &pressure_body;
+                posts.push((
+                    number,
+                    name,
+                    scope.spawn(move || {
+                        vox(
+                            dir,
+                            &as_node(&["room", "post", room, "-"], *node),
+                            Some(body),
+                        )
+                    }),
+                ));
             }
+        }
+        for (number, name, post) in posts {
+            let (ok, out, err) = post
+                .join()
+                .unwrap_or_else(|_| panic!("APPARATUS: {name}/{number} pressure client panicked"));
             assert!(
-                out.contains("still being applied") || err.contains("still being applied"),
-                "APPARATUS: {name}'s post-quiet staging post was refused: {out}{err}"
+                ok,
+                "APPARATUS: {name}/{number}'s legal pressure post was refused: {out}{err}"
             );
-            std::thread::sleep(Duration::from_millis(200));
+        }
+    });
+    for (number, room) in staged.rooms.iter().enumerate() {
+        for (dir, node, name, _) in pressure_authors {
+            let marker = format!("pool-pressure-{number}-{name}-landed");
+            let (ok, out, err) = vox(dir, &as_node(&["room", "post", room, &marker], *node), None);
+            assert!(
+                ok,
+                "APPARATUS: {name}/{number}'s pressure marker was refused: {out}{err}"
+            );
         }
     }
-    let (waiting_dir, waiting_node, waiting_name) = loop {
-        let mut found = None;
+    let pressure_started = Instant::now();
+    let observed = loop {
+        let shown = synced(&staged.host, Some(FX35_HOSTED[0]));
+        let v: serde_json::Value = serde_json::from_str(&shown.status).unwrap_or_default();
+        let in_use = v["lanes"]["budget"]["flow_state"]["in_use"]
+            .as_u64()
+            .unwrap_or(0);
+        let pool_full = v["lanes"]["ports"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|port| port["start_reason"] == "flow_state_pool_full");
+        assert!(
+            !pool_full,
+            "PRODUCT: a legal hosted-node round was obstructed by flow_state_pool_full before \
+             all node-owned slots could run: {}",
+            shown.status
+        );
+        if in_use > vox_core::node::history_budget::FLOW_STATE_MIN_CAPACITY as u64 {
+            break in_use;
+        }
+        assert!(
+            pressure_started.elapsed() < vox_core::node::history_budget::BOUNDED_ROUND_PATIENCE,
+            "PRODUCT: the daemon never ran more than the sixteen-floor flow states while nine \
+             hosted nodes had legal new-head rounds for multiple peers: {}",
+            shown.status
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let pressure_converged = Instant::now();
+    loop {
+        let mut missing = Vec::new();
         for (dir, node, name, _) in &staged.everyone[..staged.hosted] {
-            let shown = synced(dir, *node);
-            let v: serde_json::Value = serde_json::from_str(&shown.status).unwrap_or_default();
-            if v["lanes"]["bounded"]["foreground_admissions"]
-                .as_u64()
-                .is_some_and(|count| count > 0)
-            {
-                found = Some((dir.clone(), *node, *name));
-                break;
+            for (number, room) in staged.rooms.iter().enumerate() {
+                let (ok, out, err) = vox(
+                    dir,
+                    &as_node(&["room", "read", room, "--limit", "3"], *node),
+                    None,
+                );
+                assert!(ok, "PRODUCT: {name}'s pressure read refused: {out}{err}");
+                for (_, _, author, _) in pressure_authors {
+                    if !out.contains(&format!("pool-pressure-{number}-{author}-landed")) {
+                        missing.push(format!("{name}/{number}/{author}"));
+                    }
+                }
             }
         }
-        if let Some(found) = found {
-            break found;
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    };
-    std::fs::remove_file(hold)
-        .unwrap_or_else(|e| panic!("APPARATUS: could not release {}: {e}", hold.display()));
-    std::thread::sleep(vox_core::node::history_budget::BOUNDED_ROUND_PATIENCE);
-    let released = synced(&waiting_dir, waiting_node);
-    let released_json: serde_json::Value =
-        serde_json::from_str(&released.status).unwrap_or_default();
-    assert_eq!(
-        released_json["lanes"]["bounded"]["foreground_admissions"].as_u64(),
-        Some(0),
-        "PRODUCT: {waiting_name}'s port did not retry from the foreground release event while \
-         periodic scheduling was disabled: {}",
-        released.status
-    );
-
-    let rearmed_at = Instant::now();
-    loop {
-        let (ok, out, err) = vox(
-            &waiting_dir,
-            &as_node(&["room", "read", room], waiting_node),
-            None,
-        );
-        assert!(
-            ok,
-            "PRODUCT: {waiting_name}'s post-quiet read refused: {out}{err}"
-        );
-        if FX35_HOSTED
-            .iter()
-            .all(|name| out.contains(&format!("{name} re-armed")))
-        {
+        if missing.is_empty() {
             break;
         }
         assert!(
-            rearmed_at.elapsed() < BOUND,
-            "PRODUCT: post-quiet new heads did not re-arm and converge within {BOUND:?} while \
-             periodic scheduling was disabled; {waiting_name} read: {out}"
+            pressure_converged.elapsed() < BOUND,
+            "PRODUCT: after more than sixteen legal rounds ran together, not every hosted node \
+             converged on both visible markers within {BOUND:?}: {missing:?}"
         );
         std::thread::sleep(Duration::from_millis(200));
     }
@@ -971,7 +998,7 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
             .iter()
             .filter(|p| p["round_running"] == serde_json::Value::Bool(true))
             .count() as u64;
-        // The nodes this node's daemon hosts: the four on the host, bob alone on the peer.
+        // The nodes this node's daemon hosts: nine on the host, bob alone on the peer.
         let expected: BTreeSet<&str> = if hosted_fps.contains(fp.as_str()) {
             hosted_fps.clone()
         } else {
@@ -1024,7 +1051,8 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
     println!(
         "[proof] {} hosted nodes and a peer each read every other member within \
          {converged_after:?} of the posts (bound {BOUND:?}; a post waited at most {:?} for a room \
-         applying its last change); flow-state pool at most {most} of {} in use, one member per \
+         applying its last change); {observed} legal flow states overlapped; flow-state pool at \
+         most {most} of {} in use, one member per \
          hosted node; the pool's account or a port's last start said wrong: {}",
         staged.hosted,
         staged.waited,
@@ -1036,6 +1064,162 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
         "PRODUCT: `vox status --json` did not account for the flow-state pool or for a port's \
          last start, although every member read every other (ADR-038 FX-35): {broken:?}"
     );
+    drop(staged);
+    foreground_release_wakes_without_a_tick();
+}
+
+/// Stage the exact foreground-release claim separately from pool pressure. The product's tick
+/// scheduler is disabled and the foreground lane is one job only. Before the hold begins, every
+/// product status must show no running round and no retained admission, so the held job's release
+/// is the only event that can wake the named waiter.
+#[cfg(feature = "optional-proofs")]
+fn foreground_release_wakes_without_a_tick() {
+    let staged = stage_hosted_nodes(&FX35_WAKE_HOSTED, true);
+    converged(&staged);
+    let quiet_by = Instant::now() + vox_core::node::history_budget::BOUNDED_ROUND_PATIENCE;
+    loop {
+        let mut busy = Vec::new();
+        for (dir, node, name, _) in &staged.everyone[..staged.hosted] {
+            let shown = synced(dir, *node);
+            let v: serde_json::Value = serde_json::from_str(&shown.status).unwrap_or_default();
+            let bounded = &v["lanes"]["bounded"];
+            let running = bounded["running"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|slot| !slot.is_null())
+                .count();
+            let admissions = u64::from(bounded["archive_admission"] == true)
+                + [
+                    "foreground_admissions",
+                    "room_admissions",
+                    "secret_admissions",
+                    "byte_admissions",
+                ]
+                .into_iter()
+                .filter_map(|key| bounded[key].as_u64())
+                .sum::<u64>();
+            let pending = bounded["ready"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|slot| !slot.is_null())
+                .count() as u64
+                + ["deferred", "retiring", "required"]
+                    .into_iter()
+                    .filter_map(|key| bounded[key].as_u64())
+                    .sum::<u64>()
+                + u64::from(bounded["cleanup"] == true);
+            let in_use = v["lanes"]["budget"]["flow_state"]["in_use"]
+                .as_u64()
+                .unwrap_or(u64::MAX);
+            if running != 0 || admissions != 0 || pending != 0 || in_use != 0 {
+                busy.push(format!(
+                    "{name}: running {running}, admissions {admissions}, pending {pending}, pool {in_use}"
+                ));
+            }
+        }
+        if busy.is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < quiet_by,
+            "APPARATUS: could not establish the no-running/no-admission foreground-wake \
+             precondition within the source-owned round contract: {busy:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let hold = staged
+        .live_hold
+        .as_ref()
+        .expect("APPARATUS: exact-admission hold path was not staged");
+    std::fs::File::create(hold)
+        .unwrap_or_else(|e| panic!("APPARATUS: could not create {}: {e}", hold.display()));
+    let room = &staged.rooms[0];
+    for (dir, node, name, _) in &staged.everyone[..staged.hosted] {
+        let text = format!("{name} re-armed");
+        let (ok, out, err) = vox(dir, &as_node(&["room", "post", room, &text], *node), None);
+        assert!(
+            ok,
+            "APPARATUS: {name}'s post-quiet staging post was refused: {out}{err}"
+        );
+    }
+    let staged_by = Instant::now() + vox_core::node::history_budget::BOUNDED_ROUND_PATIENCE;
+    let (waiting_dir, waiting_node, waiting_name) = loop {
+        let mut found = None;
+        let mut running = 0u64;
+        for (dir, node, name, _) in &staged.everyone[..staged.hosted] {
+            let shown = synced(dir, *node);
+            let v: serde_json::Value = serde_json::from_str(&shown.status).unwrap_or_default();
+            running = running.max(
+                v["lanes"]["budget"]["flow_state"]["in_use"]
+                    .as_u64()
+                    .unwrap_or(0),
+            );
+            if v["lanes"]["bounded"]["foreground_admissions"]
+                .as_u64()
+                .is_some_and(|count| count > 0)
+            {
+                found = Some((dir.clone(), *node, *name));
+            }
+        }
+        let has_waiter = found.is_some();
+        if running == 1 {
+            if let Some(waiter) = found {
+                break waiter;
+            }
+        }
+        assert!(
+            Instant::now() < staged_by,
+            "APPARATUS: the source-owned round contract elapsed before exactly one held round \
+             and its foreground waiter were visible (running {running}, waiter {})",
+            has_waiter
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    std::fs::remove_file(hold)
+        .unwrap_or_else(|e| panic!("APPARATUS: could not release {}: {e}", hold.display()));
+
+    let released_by = Instant::now() + vox_core::node::history_budget::BOUNDED_ROUND_PATIENCE;
+    loop {
+        let released = synced(&waiting_dir, waiting_node);
+        let v: serde_json::Value = serde_json::from_str(&released.status).unwrap_or_default();
+        if v["lanes"]["bounded"]["foreground_admissions"].as_u64() == Some(0) {
+            break;
+        }
+        assert!(
+            Instant::now() < released_by,
+            "PRODUCT: {waiting_name}'s port did not retry from the foreground release event \
+             within the source-owned round contract while periodic scheduling was disabled: {}",
+            released.status
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let rearmed_at = Instant::now();
+    loop {
+        let (ok, out, err) = vox(
+            &waiting_dir,
+            &as_node(&["room", "read", room], waiting_node),
+            None,
+        );
+        assert!(
+            ok,
+            "PRODUCT: {waiting_name}'s post-quiet read refused: {out}{err}"
+        );
+        if FX35_WAKE_HOSTED
+            .iter()
+            .all(|name| out.contains(&format!("{name} re-armed")))
+        {
+            break;
+        }
+        assert!(
+            rearmed_at.elapsed() < BOUND,
+            "PRODUCT: post-quiet new heads did not converge within {BOUND:?} after the exact \
+             foreground release while periodic scheduling was disabled; {waiting_name}: {out}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }
 
 /// **Quiet rooms cost no rounds, no CPU and no bytes, answer at once, and say when they last

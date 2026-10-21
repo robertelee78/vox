@@ -22,13 +22,15 @@ struct Running {
     task: tokio::task::JoinHandle<()>,
     started: std::time::Instant,
 }
-type CleanupResult = (Flow, crate::error::Result<bool>);
 /// Retained flows are real bounded demand, not running pool charges. Once full, the exact port
 /// remains needed and is retried by the completion/release event that frees one.
 pub(crate) const RETAINED_FLOW_LIMIT: usize = 12;
 
 struct Cleanup {
-    result: Arc<StdMutex<Option<CleanupResult>>>,
+    /// The task borrows the flow through shared ownership. If that task panics, the controller
+    /// still owns the only durable cell and can retry instead of silently dropping the flow.
+    flow: Arc<tokio::sync::Mutex<Option<Flow>>>,
+    result: Arc<StdMutex<Option<crate::error::Result<bool>>>>,
     task: tokio::task::JoinHandle<()>,
     cancellations: Vec<crate::node::history_demand::Cancellation>,
 }
@@ -94,13 +96,18 @@ pub(super) struct Controller {
     cleanup: Option<Cleanup>,
     cleanup_due: Option<std::time::Instant>,
     cleanup_error: Option<String>,
-    event_tx: Option<mpsc::Sender<NetEvent>>,
+    /// Workers publish their durable result before notifying this coalesced edge. `Notify`
+    /// retains a permit while the actor is elsewhere; one wake audits every result slot, so no
+    /// completion can be stranded behind the actor's bounded event queue.
+    completion_wake: Arc<tokio::sync::Notify>,
 }
 impl Controller {
-    fn set_event_tx(&mut self, tx: &mpsc::Sender<NetEvent>) {
-        if self.event_tx.is_none() {
-            self.event_tx = Some(tx.clone());
-        }
+    pub(super) fn set_completion_wake(&mut self, wake: Arc<tokio::sync::Notify>) {
+        self.completion_wake = wake;
+    }
+
+    pub(super) fn completion_wake(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.completion_wake)
     }
     /// A retained current/archive continuation is itself demand on its exact room/peer port.
     /// Port request generations describe external wakes; an independent clean exchange may
@@ -339,9 +346,16 @@ impl Controller {
                 .lock()
                 .ok()
                 .and_then(|mut value| value.take());
-            if let Some((flow, result)) = result {
-                self.cleanup.take();
-                match result {
+            let flow = cleanup
+                .flow
+                .try_lock()
+                .ok()
+                .and_then(|mut flow| flow.take());
+            self.cleanup.take();
+            if let Some(flow) = flow {
+                match result.unwrap_or(Err(crate::error::Error::Profile(
+                    "history retirement worker stopped",
+                ))) {
                     Ok(true) => self.cleanup_error = None,
                     Ok(false) => {
                         self.cleanup_error = None;
@@ -355,17 +369,16 @@ impl Controller {
                             std::time::Instant::now()
                                 + crate::node::history_budget::RETIRE_RETRY_BACKOFF,
                         );
-                        if let Some(tx) = self.event_tx.clone() {
-                            tokio::spawn(async move {
-                                tokio::time::sleep(
-                                    crate::node::history_budget::RETIRE_RETRY_BACKOFF,
-                                )
+                        let wake = self.completion_wake();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(crate::node::history_budget::RETIRE_RETRY_BACKOFF)
                                 .await;
-                                let _ = tx.send(NetEvent::BoundedCleanupRetry).await;
-                            });
-                        }
+                            wake.notify_one();
+                        });
                     }
                 }
+            } else {
+                self.cleanup_error = Some("history retirement owner unavailable".to_owned());
             }
         }
         if self.cleanup.is_some()
@@ -376,23 +389,32 @@ impl Controller {
             return;
         }
         self.cleanup_due = None;
-        let Some(mut flow) = self.retiring.pop_front() else {
+        let Some(flow) = self.retiring.pop_front() else {
             return;
         };
         let cancellations = flow.cancellation_handles();
+        let flow = Arc::new(tokio::sync::Mutex::new(Some(flow)));
         let result = Arc::new(StdMutex::new(None));
+        let task_flow = Arc::clone(&flow);
         let output = result.clone();
-        let event_tx = self.event_tx.clone();
+        let wake = self.completion_wake();
         let task = tokio::spawn(async move {
-            let outcome = flow.retire_slice().await;
+            let outcome = {
+                let mut flow = task_flow.lock().await;
+                match flow.as_mut() {
+                    Some(flow) => flow.retire_slice().await,
+                    None => Err(crate::error::Error::Profile(
+                        "history retirement owner vanished",
+                    )),
+                }
+            };
             if let Ok(mut result) = output.lock() {
-                *result = Some((flow, outcome));
+                *result = Some(outcome);
             }
-            if let Some(tx) = event_tx {
-                let _ = tx.send(NetEvent::BoundedCleanupProgress).await;
-            }
+            wake.notify_one();
         });
         self.cleanup = Some(Cleanup {
+            flow,
             result,
             task,
             cancellations,
@@ -400,14 +422,21 @@ impl Controller {
     }
     async fn join_cleanup(&mut self) -> crate::error::Result<()> {
         if let Some(cleanup) = self.cleanup.take() {
-            let _ = cleanup.task.await;
+            let joined = cleanup.task.await;
             let result = cleanup
                 .result
                 .lock()
                 .ok()
                 .and_then(|mut value| value.take());
-            if let Some((flow, result)) = result {
-                match result {
+            let flow = cleanup.flow.lock().await.take();
+            if let Some(flow) = flow {
+                match result.unwrap_or_else(|| {
+                    Err(crate::error::Error::Profile(if joined.is_err() {
+                        "history retirement worker stopped"
+                    } else {
+                        "history retirement result vanished"
+                    }))
+                }) {
                     Ok(true) => {}
                     Ok(false) => self.retiring.push_back(flow),
                     Err(error) => {
@@ -415,6 +444,10 @@ impl Controller {
                         return Err(error);
                     }
                 }
+            } else {
+                return Err(crate::error::Error::Profile(
+                    "history retirement owner vanished",
+                ));
             }
         }
         Ok(())
@@ -632,15 +665,27 @@ impl Controller {
                 };
             }
         }
-        let _ = self.join_cleanup().await;
+        if let Err(error) = self.join_cleanup().await {
+            self.cleanup_error = Some(error.to_string());
+            eprintln!("vox: history retirement is pending: {error}");
+        }
         while let Some(mut flow) = self.retiring.pop_front() {
             // lock_all has already erased room SEK. Such work exits without writes;
             // bounded reopen recovery owns any durable cursor/publication still present.
             // Memory admission may still be held by a fenced actual worker. Keep this
             // owner until a later bounded slice observes the erased key.
-            if matches!(flow.retire_slice().await, Ok(false)) {
-                self.retiring.push_back(flow);
-                tokio::task::yield_now().await;
+            match flow.retire_slice().await {
+                Ok(true) => self.cleanup_error = None,
+                Ok(false) => {
+                    self.retiring.push_back(flow);
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => {
+                    self.cleanup_error = Some(error.to_string());
+                    eprintln!("vox: history retirement is pending: {error}");
+                    self.retiring.push_back(flow);
+                    tokio::time::sleep(crate::node::history_budget::RETIRE_RETRY_BACKOFF).await;
+                }
             }
         }
     }
@@ -1433,7 +1478,6 @@ impl Node {
         store: Arc<Store>,
         conn: Arc<VoxConnection>,
     ) -> bool {
-        self.bounded_sync.set_event_tx(&self.net_tx);
         self.accept_bounded_sync();
         let Some(profile) = self.profile.as_ref() else {
             return false;
@@ -1920,7 +1964,7 @@ impl Node {
         let result = Arc::new(StdMutex::new(None));
         let output = result.clone();
         let worker_fence = fence.clone();
-        let tx = self.net_tx.clone();
+        let completion_wake = self.bounded_sync.completion_wake();
         let inbox = self.history_hints.clone();
         let inbox_generation = inbox.generation();
         let now = self.now_ms().get();
@@ -1960,7 +2004,7 @@ impl Node {
             if let Ok(mut result) = output.lock() {
                 *result = Some(Returned { flow, error });
             }
-            let _ = tx.send(NetEvent::BoundedSyncProgress { token }).await;
+            completion_wake.notify_one();
         });
         self.bounded_sync.running[index] = Some(Running {
             room,

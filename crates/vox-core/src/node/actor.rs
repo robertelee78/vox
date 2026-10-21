@@ -646,7 +646,6 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::SyncDone { .. } => "filing a sync that finished",
         NetEvent::BoundedHeadCompleted { .. } => "finishing an authenticated current head",
         NetEvent::BoundedRoomAdvanced { .. } => "publishing accepted current room work",
-        NetEvent::BoundedSyncProgress { .. } => "advancing bounded current/history work",
         NetEvent::BoundedSyncDone { .. } => "filing a bounded history response",
         NetEvent::PrivateSessionAsk { .. } => "authorizing private Session records",
         NetEvent::PrivateSessionDone { .. } => "filing private Session records",
@@ -657,8 +656,6 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::BoundedRoomReady { .. } => "retrying work after its room was released",
         NetEvent::BoundedSecretReady { .. } => "retrying work after secret access was released",
         NetEvent::BoundedBytesReady { .. } => "retrying work after bounded bytes were released",
-        NetEvent::BoundedCleanupProgress => "advancing bounded cleanup that completed",
-        NetEvent::BoundedCleanupRetry => "retrying bounded cleanup after its named backoff",
         NetEvent::BackoffExpired { .. } => "retrying a sync whose backoff is due",
         NetEvent::SkdmRefused { .. } => "re-owing a key the recipient did not take",
         NetEvent::PublishDone { .. } => "filing what a board said to a publish",
@@ -1332,9 +1329,6 @@ enum NetEvent {
         room_instance: [u8; 16],
         generation: Digest32,
     },
-    BoundedSyncProgress {
-        token: u64,
-    },
     BoundedSyncDone {
         channel_id: Digest32,
         peer: Digest32,
@@ -1381,10 +1375,6 @@ enum NetEvent {
         room: Digest32,
         peer: Digest32,
     },
-    /// One bounded retirement slice completed and may have released retained-flow capacity.
-    BoundedCleanupProgress,
-    /// A failed bounded retirement slice's source-owned retry policy became due.
-    BoundedCleanupRetry,
     /// A port's backoff is due (ADR-025 D5).
     BackoffExpired {
         /// The room.
@@ -4932,11 +4922,17 @@ struct RoomPublication {
 pub struct Node {
     history_demand: history_demand::Controller,
     bounded_sync: bounded_sync::Controller,
+    /// Stable across lock/unlock controller replacement, so every generation's completion wakes
+    /// the one actor select that audits its durable result slots.
+    bounded_completion_wake: Arc<tokio::sync::Notify>,
     history_hints: Arc<crate::node::history_stream::HintInbox>,
     /// Peers' acknowledgements of this node's own feed reported by lane rounds, applied on
     /// the next schedule (`note_held`).
     held_notes: Vec<(Digest32, Digest32, u64)>,
     history_budget: Arc<crate::node::history_budget::Budget>,
+    /// Capacity ownership follows this actor through unwind. Graceful lock moves the guard to
+    /// the retirement task; a panic drops it here and the pool defers removal until charges end.
+    flow_pool_registration: Option<crate::node::history_budget::FlowPoolRegistration>,
     governance_work: governance::Maintenance,
     paths: Paths,
     store_recovery: BTreeMap<Digest32, recovery::Retry>,
@@ -5712,12 +5708,17 @@ impl Node {
                 Ok(rooms) => (rooms, None),
                 Err(error) => (Vec::new(), Some(error.to_string())),
             };
+        let bounded_completion_wake = Arc::new(tokio::sync::Notify::new());
+        let mut bounded_sync = bounded_sync::Controller::default();
+        bounded_sync.set_completion_wake(Arc::clone(&bounded_completion_wake));
         let node = Self {
             history_demand: history_demand::Controller::default(),
-            bounded_sync: bounded_sync::Controller::default(),
+            bounded_sync,
+            bounded_completion_wake,
             history_hints: crate::node::history_stream::HintInbox::new(),
             held_notes: Vec::new(),
             history_budget,
+            flow_pool_registration: None,
             paths,
             decisions,
             profile,
@@ -6008,6 +6009,7 @@ impl Node {
         // (ADR-016). The actor holds a `net_tx` clone, so `net_rx` never closes and
         // this select cannot spin on a dead branch.
         let ingress_wake = Arc::clone(&self.session_ingress_wake);
+        let bounded_completion_wake = Arc::clone(&self.bounded_completion_wake);
         let mut ticker = tokio::time::interval(TICK);
         // A `Shutdown`'s reply, held until the node is actually gone: see the end of this function.
         let mut shutdown_reply: Option<oneshot::Sender<Outcome>> = None;
@@ -6262,6 +6264,15 @@ impl Node {
                     let started = std::time::Instant::now();
                     self.handle_net(event).await;
                     self.note_if_stalled(name, started);
+                    self.publish().await;
+                    self.schedule().await;
+                }
+                _ = bounded_completion_wake.notified() => {
+                    // Results were stored before this retained/coalesced edge fired. Audit every
+                    // slot: one notification is sufficient for any number of completions, and
+                    // no bounded actor-queue send or unrelated policy gate stands between a
+                    // worker and its join.
+                    self.accept_bounded_sync();
                     self.publish().await;
                     self.schedule().await;
                 }
@@ -10318,9 +10329,6 @@ impl Node {
                     self.sched_rooms.insert(room);
                 }
             }
-            NetEvent::BoundedCleanupProgress | NetEvent::BoundedCleanupRetry => {
-                self.accept_bounded_sync();
-            }
             NetEvent::BackoffExpired {
                 channel_id,
                 peer,
@@ -10499,10 +10507,6 @@ impl Node {
                         }
                     }
                 }
-            }
-            NetEvent::BoundedSyncProgress { token } => {
-                let _ = token;
-                self.accept_bounded_sync();
             }
             NetEvent::BoundedSyncDone {
                 channel_id,
@@ -14899,9 +14903,11 @@ impl Node {
 
     /// This node lists itself in the daemon's flow-state pool, which grows to hold its rounds
     /// (ADR-038 FX-35).
-    fn register_in_flow_pool(&self) {
-        if let Some(me) = self.profile.as_ref().map(Profile::fingerprint) {
-            self.history_budget.register_node(me);
+    fn register_in_flow_pool(&mut self) {
+        if self.flow_pool_registration.is_none() {
+            if let Some(me) = self.profile.as_ref().map(Profile::fingerprint) {
+                self.flow_pool_registration = Some(self.history_budget.register_node(me));
+            }
         }
     }
 
@@ -14968,7 +14974,7 @@ impl Node {
             })
             .collect();
         format!(
-            "{{\"slots\":{{\"in_use\":{in_use},\"limit\":{},\"per_peer\":{{{}}}}},\"budget\":{{\"archive_nodes\":[{}],\"archive_jobs\":{},\"control\":{},\"foreground\":{},\"foreground_jobs\":{},\"queued\":[{},{},{},{}],\"flow_state\":{{\"in_use\":{},\"limit\":{},\"by_node\":{{{}}}}}}},\"bounded\":{},\"history\":{},\"next_request_in_ms\":{},\"ports\":[{}]}}",
+            "{{\"slots\":{{\"in_use\":{in_use},\"limit\":{},\"per_peer\":{{{}}}}},\"budget\":{{\"archive_nodes\":[{}],\"archive_jobs\":{},\"control\":{},\"foreground\":{},\"foreground_jobs\":{},\"queued\":[{},{},{},{}],\"flow_state\":{{\"in_use\":{},\"limit\":{},\"by_node\":{{{}}},\"retiring_nodes\":[{}]}}}},\"bounded\":{},\"history\":{},\"next_request_in_ms\":{},\"ports\":[{}]}}",
             crate::node::ports::OUTBOUND_SLOTS,
             per_peer.join(","),
             archive_nodes.join(","),
@@ -14985,6 +14991,11 @@ impl Node {
             b.flow_state_by_node
                 .iter()
                 .map(|(n, c)| format!("\"{}\":{c}", b32_encode(n)))
+                .collect::<Vec<_>>()
+                .join(","),
+            b.flow_state_retiring_nodes
+                .iter()
+                .map(|n| format!("\"{}\"", b32_encode(n)))
                 .collect::<Vec<_>>()
                 .join(","),
             self.bounded_sync.lanes_json(),
@@ -17839,6 +17850,8 @@ impl Node {
     /// node is *locking* ([`NodeView::locking`]). The returned receiver fires once it has settled.
     async fn lock_all(&mut self) -> oneshot::Receiver<()> {
         let mut bounded_sync = std::mem::take(&mut self.bounded_sync);
+        self.bounded_sync
+            .set_completion_wake(Arc::clone(&self.bounded_completion_wake));
         bounded_sync.fence();
         self.history_hints.clear();
         let mut history_demand = std::mem::take(&mut self.history_demand);
@@ -17978,18 +17991,15 @@ impl Node {
         let (settled, on_settled) = oneshot::channel();
         let secret_work = Arc::clone(&self.secret_work);
         let tx = self.net_tx.clone();
-        let me = self.profile.as_ref().map(Profile::fingerprint);
-        let budget = Arc::clone(&self.history_budget);
+        let flow_pool_registration = self.flow_pool_registration.take();
         tokio::spawn(async move {
             let mut aborted = aborted;
             history_demand.retire().await;
             bounded_sync.retire().await;
-            // Every bounded round of this node has ended and released its flow state: off the
-            // daemon's pool now, so its listing names only nodes the daemon hosts (ADR-038
-            // FX-35). An unlock waits for this task, so the node registers again only after.
-            if let Some(me) = me {
-                budget.unregister_node(me);
-            }
+            // Every bounded round has ended before this ownership guard drops. Actor panic drops
+            // the same guard during unwind; if a charge still lives, the pool truthfully reports
+            // the node as retiring and lowers capacity only when that charge returns.
+            drop(flow_pool_registration);
             if let Some(task) = reopening {
                 let _ = task.await;
             }

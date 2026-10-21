@@ -638,6 +638,9 @@ struct Pool {
     /// status needs only the key to say that the port has a running round.
     running: BTreeMap<(Digest32, Digest32, Digest32), usize>,
     by_node: BTreeMap<Digest32, usize>,
+    /// Live ownership guards. A node whose actor has ended remains in `by_node` until its last
+    /// charge goes back, so capacity can never shrink underneath work that still owns it.
+    registrations: BTreeMap<Digest32, usize>,
 }
 
 impl Default for Pool {
@@ -647,7 +650,36 @@ impl Default for Pool {
             in_use: 0,
             running: BTreeMap::new(),
             by_node: BTreeMap::new(),
+            registrations: BTreeMap::new(),
         }
+    }
+}
+
+/// One hosted node's ownership of its daemon flow-state capacity. Kept in the node actor, so
+/// unwinding an actor panic requests the same unregister as a graceful lock. If a worker charge
+/// outlives the actor, the pool defers removal until that charge's `Drop`.
+pub(crate) struct FlowPoolRegistration {
+    budget: Arc<Budget>,
+    node: Digest32,
+}
+
+impl Drop for FlowPoolRegistration {
+    fn drop(&mut self) {
+        let mut p = self
+            .budget
+            .pool
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(registrations) = p.registrations.get_mut(&self.node) {
+            *registrations = registrations.saturating_sub(1);
+            if *registrations == 0 {
+                p.registrations.remove(&self.node);
+            }
+        }
+        if !p.registrations.contains_key(&self.node) && p.by_node.get(&self.node) == Some(&0) {
+            p.by_node.remove(&self.node);
+        }
+        p.limit = FLOW_STATE_MIN_CAPACITY.max(BOUNDED_SYNC_RUNNING_SLOTS * p.by_node.len());
     }
 }
 
@@ -687,6 +719,10 @@ impl Drop for FlowStateCharge {
         if let Some(n) = p.by_node.get_mut(&self.key.0) {
             *n = n.saturating_sub(1);
         }
+        if !p.registrations.contains_key(&self.key.0) && p.by_node.get(&self.key.0) == Some(&0) {
+            p.by_node.remove(&self.key.0);
+            p.limit = FLOW_STATE_MIN_CAPACITY.max(BOUNDED_SYNC_RUNNING_SLOTS * p.by_node.len());
+        }
     }
 }
 
@@ -711,6 +747,8 @@ pub struct BudgetSnapshot {
     pub flow_state_limit: usize,
     /// Who holds them, by node: one member per hosted node, the count of its running rounds.
     pub flow_state_by_node: Vec<(Digest32, usize)>,
+    /// Nodes whose actor registration ended while a running charge was still returning.
+    pub flow_state_retiring_nodes: Vec<Digest32>,
     /// The running rounds holding a flow state (node, room, peer), from the same view.
     pub flow_state_running: Vec<(Digest32, Digest32, Digest32)>,
 }
@@ -719,26 +757,16 @@ impl Budget {
     /// A hosted node lists itself in the flow-state pool when it starts networking, at 0 until
     /// it holds one (`by_node` has one member per hosted node, ADR-038 FX-35), and the pool
     /// grows to hold every hosted node's rounds before this node's first start attempt.
-    pub fn register_node(&self, node: Digest32) {
+    pub(crate) fn register_node(self: &Arc<Self>, node: Digest32) -> FlowPoolRegistration {
         let mut p = self.pool.lock().unwrap_or_else(PoisonError::into_inner);
         p.by_node.entry(node).or_insert(0);
+        *p.registrations.entry(node).or_insert(0) += 1;
         p.limit = FLOW_STATE_MIN_CAPACITY.max(BOUNDED_SYNC_RUNNING_SLOTS * p.by_node.len());
-    }
-
-    /// A node that stopped networking leaves the listing at once. Its bounded rounds have
-    /// ended by then, each releasing its charge as it ended (the node's controller is retired
-    /// before this is called), so the listing names only nodes the daemon hosts and no charge
-    /// is ever unaccounted for. Only a zero-count node with no running key can leave; then the
-    /// exact current-host count safely lowers the limit as well as raising it.
-    pub fn unregister_node(&self, node: Digest32) {
-        let mut p = self.pool.lock().unwrap_or_else(PoisonError::into_inner);
-        if p.by_node.get(&node) != Some(&0)
-            || p.running.keys().any(|(running, _, _)| *running == node)
-        {
-            return;
+        drop(p);
+        FlowPoolRegistration {
+            budget: Arc::clone(self),
+            node,
         }
-        p.by_node.remove(&node);
-        p.limit = FLOW_STATE_MIN_CAPACITY.max(BOUNDED_SYNC_RUNNING_SLOTS * p.by_node.len());
     }
 
     /// The lanes as they stand now.
@@ -763,6 +791,12 @@ impl Budget {
             flow_state_in_use: p.in_use,
             flow_state_limit: p.limit,
             flow_state_by_node: p.by_node.iter().map(|(n, c)| (*n, *c)).collect(),
+            flow_state_retiring_nodes: p
+                .by_node
+                .keys()
+                .filter(|node| !p.registrations.contains_key(*node))
+                .copied()
+                .collect(),
             flow_state_running: p.running.keys().copied().collect(),
         }
     }
