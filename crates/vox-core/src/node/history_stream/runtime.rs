@@ -209,6 +209,20 @@ pub(crate) enum Resumed {
 }
 
 impl Flow {
+    pub(crate) fn root_name(&self) -> &'static str {
+        if self.archive {
+            "archive"
+        } else if self.hint.is_some() {
+            "hint"
+        } else if self.departure_probe {
+            "departure"
+        } else if self.inventory {
+            "inventory"
+        } else {
+            "required"
+        }
+    }
+
     pub(crate) fn retirement_request(&self) -> RequestId {
         self.retirement_request
     }

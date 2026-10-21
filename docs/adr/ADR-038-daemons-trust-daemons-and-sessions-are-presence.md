@@ -410,15 +410,19 @@ The decider then answered twelve questions, one at a time. His answers are the d
   restart resets it to `never_attempted`); `start_reason`, present if and only if
   `start_outcome` is `not_started`, where the gates MUST be tested in the following order and
   `start_reason` MUST equal the first gate that fails: `room_busy` (the room's state could not
-  be taken without waiting), `archive_budget_busy` (an archive port only: the archive-lane job
-  could not be reserved), `control_budget_busy` (the control-lane job could not be reserved),
+  be taken without waiting), `retained_flow_limit` (this node's bounded retained-flow envelope is
+  occupied), `archive_budget_busy` (an archive port only: the archive-lane job could not be
+  reserved), `identity_busy` (the node's identity secret is exclusively held),
+  `control_budget_busy` (the control/live-lane job or its byte envelope could not be reserved),
   `live_lane_busy` (the node's live flow slot holds another flow), `no_outbound_slot` (the
   outbound slot could not be taken) and `flow_state_pool_full` (every charge of the pool is held
-  by a running round); and the boolean `round_running`, true while a bounded-sync round of that
-  port runs. It MUST report the pool under `lanes.budget.flow_state` as the integers `in_use`
-  and `limit` and, under `by_node`, an object with exactly one member per currently hosted node,
-  keyed by that node's node ID, whose value is the current actor generation's integer in-use
-  count. The same snapshot MUST list `actors`, with the unique actor incarnation,
+  by a running round). Gates that do not apply to that exact work are skipped, without changing
+  the order of the remaining gates. The boolean `round_running` is true while a bounded-sync
+  round of that port runs. It MUST report the pool under `lanes.budget.flow_state` as the
+  integers `in_use` and `limit` and, under `by_node`, an object with exactly one member per
+  currently hosted node, keyed by that node's node ID, whose value is the current actor
+  generation's integer in-use count. The same snapshot MUST list `actors`, with the unique actor
+  incarnation,
   node ID, registration state and in-use count for every active or retiring generation, and
   `running`, with the incarnation/node/room/peer of every charge; old and replacement actors of
   one fingerprint MUST NOT be collapsed. A node's `round_running` values and its active actor

@@ -233,6 +233,7 @@ struct Running {
     generation: u64,
     request: u64,
     archive: Option<(stream::RequestId, Digest32)>,
+    lane: crate::node::history_budget::Lane,
     retirement_key: RetirementKey,
     fence: Arc<crate::transport::stream_transport::Fence>,
     /// Exclusive ownership stays outside the fallible worker future. The supervised outer task
@@ -1324,22 +1325,19 @@ impl Node {
         result
     }
 
+    /// A flow whose start ended before its round retains the exact work already consumed while
+    /// constructing it: an archive dispatch, required dependency, or scalar hint. Park it in its
+    /// lane so the relevant admission/release event retries that same work; reconstructing only a
+    /// hint loses the other two forms and can leave a shipped archive request marked running.
+    fn shelve_exact(&mut self, mut flow: Flow, index: usize) {
+        flow.park();
+        debug_assert!(self.bounded_sync.ready[index].is_none());
+        self.bounded_sync.ready[index] = Some(flow);
+    }
+
     /// Abandoning a flow retires its local capabilities, not the unauthoritative scalar hint it
     /// selected. Re-arm that exact hint while its inbox scope is still live; room/peer retirement
     /// removes it first, making this a no-op for teardown rather than leaving an in-flight orphan.
-    /// A flow whose start ended before its round: back into the ready slot it was taken from,
-    /// parked, if it has run before; let go with its outstanding work re-armed if it is fresh
-    /// (ADR-038 FX-35: the ready slot holds only flows that have run, so a flow waiting for a
-    /// slot, a budget or the pool never holds the node's live lane against its other ports).
-    fn shelve_or_let_go(&mut self, mut flow: Flow, index: usize, fresh: bool) {
-        if fresh {
-            self.dispose_rearming_hint(flow);
-        } else {
-            flow.park();
-            self.bounded_sync.ready[index] = Some(flow);
-        }
-    }
-
     fn dispose_rearming_hint(&mut self, mut flow: Flow) {
         if let Some(hint) = flow.hint.take() {
             self.history_hints
@@ -2078,16 +2076,17 @@ impl Node {
                             Ok(value) => Arc::new(value),
                             Err(_) => return false,
                         };
-                        let required = if announce_first {
-                            None
-                        } else {
-                            self.bounded_sync
-                                .required
-                                .iter()
-                                .position(|(r, p, _, _)| *r == room && *p == peer)
-                                .and_then(|at| self.bounded_sync.required.remove(at))
-                                .map(|(_, _, head, seq)| (head, seq))
-                        };
+                        let required_at = (!announce_first)
+                            .then(|| {
+                                self.bounded_sync
+                                    .required
+                                    .iter()
+                                    .position(|(r, p, _, _)| *r == room && *p == peer)
+                            })
+                            .flatten();
+                        let required = required_at
+                            .and_then(|at| self.bounded_sync.required.get(at))
+                            .map(|(_, _, head, seq)| (*head, *seq));
                         let hint = if announce_first || required.is_some() {
                             None
                         } else {
@@ -2108,11 +2107,15 @@ impl Node {
                             store.clone(),
                             state_job.clone(),
                         ) {
-                            Ok(flow) => flow,
+                            Ok(flow) => {
+                                if let Some(at) = required_at {
+                                    let _ = self.bounded_sync.required.remove(at);
+                                }
+                                flow
+                            }
                             Err(_) => {
                                 if let Some(hint) = hint {
-                                    self.history_hints
-                                        .finish(room, peer, hint.author, hint.head);
+                                    self.history_hints.retry(room, peer, hint.author, hint.head);
                                 }
                                 return false;
                             }
@@ -2133,16 +2136,17 @@ impl Node {
                         Ok(value) => Arc::new(value),
                         Err(_) => return false,
                     };
-                    let required = if announce_first {
-                        None
-                    } else {
-                        self.bounded_sync
-                            .required
-                            .iter()
-                            .position(|(r, p, _, _)| *r == room && *p == peer)
-                            .and_then(|at| self.bounded_sync.required.remove(at))
-                            .map(|(_, _, head, seq)| (head, seq))
-                    };
+                    let required_at = (!announce_first)
+                        .then(|| {
+                            self.bounded_sync
+                                .required
+                                .iter()
+                                .position(|(r, p, _, _)| *r == room && *p == peer)
+                        })
+                        .flatten();
+                    let required = required_at
+                        .and_then(|at| self.bounded_sync.required.get(at))
+                        .map(|(_, _, head, seq)| (*head, *seq));
                     let hint = if announce_first || required.is_some() {
                         None
                     } else {
@@ -2163,11 +2167,15 @@ impl Node {
                         store.clone(),
                         state_job.clone(),
                     ) {
-                        Ok(flow) => flow,
+                        Ok(flow) => {
+                            if let Some(at) = required_at {
+                                let _ = self.bounded_sync.required.remove(at);
+                            }
+                            flow
+                        }
                         Err(_) => {
                             if let Some(hint) = hint {
-                                self.history_hints
-                                    .finish(room, peer, hint.author, hint.head);
+                                self.history_hints.retry(room, peer, hint.author, hint.head);
                             }
                             return false;
                         }
@@ -2177,11 +2185,8 @@ impl Node {
         };
         let index = usize::from(flow.archive);
         let lane = flow.lane();
-        // A flow that has never run has nothing to resume: the ready slot is for flows that have
-        // run, and only those (ADR-038 FX-35). A fresh flow that cannot start is let go, its
-        // outstanding work re-armed, and the port keeps its need; one taken from the ready slot
-        // goes back where it was.
-        let fresh = existing.is_none();
+        // From here on this Flow is the sole owner of any consumed archive dispatch, required
+        // dependency or hint. Every refusal parks this exact owner until its admission edge.
         let job = if lane == crate::node::history_budget::Lane::Archive {
             if let Some(job) = admitted_archive.take() {
                 job
@@ -2204,7 +2209,7 @@ impl Node {
                     ArchiveTurn::Ready(job) => job,
                     ArchiveTurn::Waiting => {
                         self.note_start(room, peer, "archive_budget_busy");
-                        self.shelve_or_let_go(flow, index, fresh);
+                        self.shelve_exact(flow, index);
                         return false;
                     }
                     ArchiveTurn::Full => {
@@ -2233,7 +2238,7 @@ impl Node {
                 ForegroundTurn::Waiting | ForegroundTurn::Full => {
                     // The retained lane ticket wakes this exact port on a relevant release.
                     self.note_start(room, peer, "control_budget_busy");
-                    self.shelve_or_let_go(flow, index, fresh);
+                    self.shelve_exact(flow, index);
                     return false;
                 }
             }
@@ -2251,7 +2256,7 @@ impl Node {
                 bytes_wake,
             );
             self.note_start(room, peer, "control_budget_busy");
-            self.shelve_or_let_go(flow, index, fresh);
+            self.shelve_exact(flow, index);
             return false;
         };
         let wake = self.net_tx.clone();
@@ -2265,15 +2270,15 @@ impl Node {
             }),
         ) else {
             self.note_start(room, peer, "no_outbound_slot");
-            self.shelve_or_let_go(flow, index, fresh);
+            self.shelve_exact(flow, index);
             return false;
         };
         // The last gate (ADR-038 FX-35): a flow holds the daemon's flow state only while its
         // round runs, and takes it here, in the step that makes the round run. The pool is
         // sized to every hosted node's rounds, so this gate never fails while every held charge
         // is a running round's; if it ever does, the attempt ends like any other gate's: the
-        // flow shelved or let go with its work re-armed, the lane job and the slot taken above
-        // given back on return, and the port keeps its need.
+        // exact flow parked, the lane job and the slot taken above given back on return, and the
+        // port keeps its need.
         let flow_state_wake = flow.flow_state_wake();
         match flow.resume(state_bytes) {
             crate::node::history_stream::runtime::Resumed::Held => {}
@@ -2414,6 +2419,7 @@ impl Node {
             generation,
             request,
             archive,
+            lane,
             retirement_key: running_retirement_key,
             fence,
             flow,
@@ -2458,9 +2464,10 @@ impl Controller {
         let cleanup_error = retirement_errors.values().next().cloned();
         let flow = |f: &Flow| {
             format!(
-                "{{\"room\":\"{}\",\"peer\":\"{}\",\"archive\":{},\"waiting\":{},\"inventory\":{}}}",
+                "{{\"room\":\"{}\",\"peer\":\"{}\",\"root\":\"{}\",\"archive\":{},\"waiting\":{},\"inventory\":{}}}",
                 b32_encode(&f.room),
                 b32_encode(&f.peer),
+                f.root_name(),
                 f.archive,
                 f.waiting,
                 f.inventory
@@ -2479,11 +2486,17 @@ impl Controller {
                     || "null".to_owned(),
                     |r| {
                         format!(
-                            "{{\"room\":\"{}\",\"peer\":\"{}\",\"token\":{},\"archive\":{},\"age_ms\":{},\"finished\":{}}}",
+                            "{{\"room\":\"{}\",\"peer\":\"{}\",\"token\":{},\"archive\":{},\"lane\":\"{}\",\"age_ms\":{},\"finished\":{}}}",
                             b32_encode(&r.room),
                             b32_encode(&r.peer),
                             r.token,
                             r.archive.is_some(),
+                            match r.lane {
+                                crate::node::history_budget::Lane::Archive => "archive",
+                                crate::node::history_budget::Lane::Control => "control",
+                                crate::node::history_budget::Lane::LargeControl => "large_control",
+                                crate::node::history_budget::Lane::Live => "live",
+                            },
                             u64::try_from(r.started.elapsed().as_millis()).unwrap_or(u64::MAX),
                             r.task.is_finished()
                         )
