@@ -365,6 +365,10 @@ struct Flight {
     serial: u64,
     revision: u64,
     involved: bool,
+    /// Earliest causal return deadline among the changes this flight is responsible for. A
+    /// superseding revision inherits it before this task is cut, so coalescing never restarts the
+    /// user's convergence clock.
+    deadline: std::time::Instant,
     /// Who started it: the retry, or the operator's pairing command.
     origin: Origin,
     abort: Option<tokio::task::AbortHandle>,
@@ -465,7 +469,13 @@ impl Management {
             loop {
                 let Some(me) = weak.upgrade() else { return };
                 // An optional unreachable anchor never holds up direct pairing, status or retry.
-                let next = me.refresh_transport().await.ok().flatten();
+                let next = match me.refresh_transport().await {
+                    Ok(next) => next,
+                    // A failed transport registration or cancellation is unfinished durable
+                    // work. Retry from that failure itself; it must not wait for unrelated
+                    // policy or network traffic.
+                    Err(_) => Some(std::time::Instant::now() + COMPUTER_CHANGE_SHOWN_WITHIN),
+                };
                 drop(me);
                 let deadline = async {
                     match next {
@@ -634,9 +644,6 @@ impl Management {
                     return;
                 };
                 let filed = me.net.manager().take_inbound(c).await;
-                // The identity exchange completed before `take_inbound`: no unauthenticated
-                // packet can wake a computer exchange.
-                me.retry_peer_now(filed.kept.peer_id());
                 me.serve(filed.kept);
                 if let Some(c) = filed.also_serve {
                     me.serve(c);
@@ -693,7 +700,10 @@ impl Management {
                             return;
                         }
                         if let Some(me) = weak.upgrade() {
-                            me.retry_failed_now();
+                            // Presence is not authenticated proof that a computer-management
+                            // exchange can succeed. Re-evaluate due work without bypassing its
+                            // backoff; the transport loop receives the same network event.
+                            me.retry_wake.notify_one();
                         }
                     }
                 }
@@ -731,7 +741,7 @@ impl Management {
                     tokio::spawn(async move {
                         let _slot = slot;
                         let _ = tokio::time::timeout(
-                            Duration::from_secs(45),
+                            COMPUTER_RETURN_SHOWN_WITHIN,
                             me.transport_incoming(&c, kind, send, recv),
                         )
                         .await;
@@ -742,9 +752,6 @@ impl Management {
                     streams::refuse(&mut send, &mut recv);
                     continue;
                 }
-                // Reaching this point required the authenticated QUIC connection and a typed
-                // computer stream. Coalesce the wake; the request below is answered separately.
-                me.retry_peer_now(conn.peer_id());
                 let Ok(slot) = Arc::clone(&me.slots).try_acquire_owned() else {
                     streams::refuse(&mut send, &mut recv);
                     continue;
@@ -753,10 +760,16 @@ impl Management {
                 tokio::spawn(async move {
                     let _slot = slot;
                     let result = tokio::time::timeout(
-                        Duration::from_secs(45),
+                        COMPUTER_RETURN_SHOWN_WITHIN,
                         me.answer(&c, &mut send, &mut recv),
                     )
                     .await;
+                    // Only a fully parsed and meaningfully answered request on this
+                    // authenticated computer stream proves the path is usable. A typed but
+                    // malformed/refused/timed-out stream cannot bypass retry backoff.
+                    if matches!(result, Ok(Ok(()))) {
+                        me.retry_peer_now(c.peer_id());
+                    }
                     if let Ok(Err(e)) = result {
                         let mut f = Encoder::new();
                         f.array(2).uint(0).text(&e.to_string());
@@ -957,6 +970,7 @@ impl Management {
         // is cut (as no failure) and its reservation waited for, briefly; another operator
         // pairing in flight is reported.
         let waited = std::time::Instant::now();
+        let mut causal_deadline = waited + PAIR_WITHIN;
         let serial = next_flight();
         loop {
             {
@@ -969,6 +983,7 @@ impl Management {
                                 serial,
                                 revision,
                                 involved: true,
+                                deadline: causal_deadline,
                                 origin: Origin::Operator,
                                 abort: None,
                                 superseded: false,
@@ -988,6 +1003,7 @@ impl Management {
                     Some(flight) => {
                         if !flight.superseded {
                             if let Some(abort) = &flight.abort {
+                                causal_deadline = causal_deadline.min(flight.deadline);
                                 flight.superseded = true;
                                 abort.abort();
                             }
@@ -1062,7 +1078,7 @@ impl Management {
                 target,
                 revision,
                 true,
-                std::time::Instant::now() + COMPUTER_RETURN_SHOWN_WITHIN,
+                causal_deadline.min(std::time::Instant::now() + COMPUTER_RETURN_SHOWN_WITHIN),
                 outcome,
             );
         }
@@ -1608,22 +1624,9 @@ impl Management {
         }
         if redeem {
             if let Some(peer) = lease.peer {
-                let until = tokio::time::Instant::now() + Duration::from_secs(5);
-                loop {
-                    match self
-                        .net
-                        .redeem_computer_transport(&conn, peer, lease.registration, &lease.token)
-                        .await
-                    {
-                        Ok(()) => break,
-                        Err(Error::RendezvousRejected(_))
-                            if tokio::time::Instant::now() < until =>
-                        {
-                            tokio::time::sleep(Duration::from_millis(200)).await
-                        }
-                        Err(e) => return Err(e),
-                    }
-                }
+                self.net
+                    .redeem_computer_transport(&conn, peer, lease.registration, &lease.token)
+                    .await?;
             }
         }
         Ok(conn)
@@ -1687,10 +1690,15 @@ impl Management {
                 });
             }
         }
-        while work.join_next().await.is_some() {}
+        let mut failed = false;
+        while let Some(result) = work.join_next().await {
+            if !matches!(result, Ok(Ok(()))) {
+                failed = true;
+            }
+        }
 
-        // The cached registration is the source of truth for an established lease's expiry.
-        // A failed registration has no lease deadline and waits for a real network/policy event;
+        // The cached registration is the source of truth for an established lease's expiry. A
+        // failed registration/cancellation remains causal work and supplies the retry boundary;
         // a successful renewable registration wakes at its exact renewal boundary.
         let cached = lock(&self.transport_cache);
         let renewal_margin = crate::nat::service::COMPUTER_TRANSPORT_TTL_MS / 10;
@@ -1706,8 +1714,13 @@ impl Management {
                 })
             })
             .min();
-        Ok(next_ms
-            .map(|at| std::time::Instant::now() + Duration::from_millis(at.saturating_sub(now()))))
+        let renewal = next_ms
+            .map(|at| std::time::Instant::now() + Duration::from_millis(at.saturating_sub(now())));
+        let retry = failed.then(|| std::time::Instant::now() + COMPUTER_CHANGE_SHOWN_WITHIN);
+        Ok(match (renewal, retry) {
+            (Some(renewal), Some(retry)) => Some(renewal.min(retry)),
+            (renewal, retry) => renewal.or(retry),
+        })
     }
 
     async fn transport_incoming(
@@ -1825,10 +1838,10 @@ impl Management {
         let (mut send, mut recv) = streams::open_typed(&conn, StreamKind::Computer).await?;
         write_frame(
             &mut send,
-            &hello(1, &self.computer.description(), &link.invite),
+            &hello(1, &self.computer.description(), &link.invite, 0),
         )
         .await?;
-        let (_, peer, _) = read_hello(&mut recv, &conn).await?;
+        let (_, peer, _, _) = read_hello(&mut recv, &conn).await?;
         let f = frame(&mut recv).await?;
         let mut d = Decoder::new(&f);
         arity(&mut d, 3)?;
@@ -1905,17 +1918,25 @@ impl Management {
         send: &mut SendStream,
         recv: &mut RecvStream,
     ) -> Result<()> {
-        let (op, peer, id) = read_hello(recv, conn).await?;
-        write_frame(send, &hello(op, &self.computer.description(), &id)).await?;
+        let (op, peer, id, return_by_ms) = read_hello(recv, conn).await?;
+        write_frame(
+            send,
+            &hello(op, &self.computer.description(), &id, return_by_ms),
+        )
+        .await?;
         if op == REACHABILITY_WAKE_OP {
             return Ok(());
         }
         if op == 2 {
+            if return_by_ms == 0 {
+                return Err(bad());
+            }
             let payload = frame(recv).await?;
             // A merge that moves this daemon's revision is a change here (ADR-038 FX-28). The
             // reply is the merged state, encoded under the same lock, so the revision the
             // record names is the revision the reply carries.
-            let (merged, reply) = self.computer.change(|s| {
+            let deadline = causal_deadline(return_by_ms);
+            let (merged, reply) = self.computer.change_until(deadline, |s| {
                 merge(s, &payload, conn.peer_id(), self.computer.signer.as_ref())?;
                 Ok((s.revision, exchange(s)?))
             })?;
@@ -2019,14 +2040,15 @@ impl Management {
     /// Wake one failed peer from authenticated connection/application activity. A peer that has
     /// no failed exchange cannot spend work by sending streams: it is not put on this set.
     fn retry_peer_now(&self, peer: Digest32) {
-        if lock(&self.exchanged)
-            .get(&peer)
-            .is_some_and(|record| record.failures > 0)
-        {
-            self.mark_retry(
-                peer,
-                std::time::Instant::now() + COMPUTER_RETURN_SHOWN_WITHIN,
-            );
+        let deadline = lock(&self.exchanged).get(&peer).and_then(|record| {
+            (record.failures > 0).then(|| {
+                record
+                    .deadline
+                    .unwrap_or(std::time::Instant::now() + COMPUTER_RETURN_SHOWN_WITHIN)
+            })
+        });
+        if let Some(deadline) = deadline {
+            self.mark_retry(peer, deadline);
             self.retry_wake.notify_one();
         }
     }
@@ -2049,21 +2071,6 @@ impl Management {
                 });
             }
             std::collections::btree_map::Entry::Occupied(_) => {}
-        }
-    }
-
-    /// A real machine network transition may restore any failed peer's path.
-    fn retry_failed_now(&self) {
-        let failed: Vec<_> = lock(&self.exchanged)
-            .iter()
-            .filter_map(|(peer, record)| (record.failures > 0).then_some(*peer))
-            .collect();
-        if !failed.is_empty() {
-            let deadline = std::time::Instant::now() + COMPUTER_RETURN_SHOWN_WITHIN;
-            for peer in failed {
-                self.mark_retry(peer, deadline);
-            }
-            self.retry_wake.notify_one();
         }
     }
 
@@ -2150,6 +2157,13 @@ impl Management {
                 let record = exchanged.get(peer).cloned().unwrap_or_default();
                 let causal_mark = retry_ready.get(peer).copied();
                 let reachability_restored = causal_mark.is_some();
+                let causal_deadline = match (causal_mark.map(|mark| mark.deadline), record.deadline)
+                {
+                    (Some(mark), Some(failure)) => mark.min(failure),
+                    (Some(deadline), None) | (None, Some(deadline)) => deadline,
+                    (None, None) => now + COMPUTER_RETURN_SHOWN_WITHIN,
+                };
+                selected_deadlines.insert(*peer, causal_deadline);
                 if let Some(last) = record.last {
                     if record.failures > 0 {
                         // The backoff is inside the return contract begun by the failure. Leave
@@ -2163,8 +2177,24 @@ impl Management {
                             );
                         let unchanged = record.revision == revision
                             && record.involved == (involved == Some(*peer));
-                        if unchanged && !reachability_restored && now.duration_since(last) < wait {
-                            let due = last + wait;
+                        if unchanged && !reachability_restored {
+                            // Leave the apply interval before the causal return deadline. When
+                            // exponential backoff would pass that boundary, the deadline wins;
+                            // a reachable peer is actually dialled rather than merely timing out.
+                            let due = if causal_deadline > now {
+                                let backstop = causal_deadline
+                                    .checked_sub(COMPUTER_CHANGE_SHOWN_WITHIN)
+                                    .unwrap_or(now);
+                                (last + wait).min(backstop)
+                            } else {
+                                // The product already missed this cause's return contract. Keep
+                                // repairing it at bounded backoff without spinning or pretending
+                                // a later retry started a new user-visible clock.
+                                last + wait
+                            };
+                            if now >= due {
+                                return true;
+                            }
                             next = Some(next.map_or(due, |held| held.min(due)));
                             return false;
                         }
@@ -2183,13 +2213,6 @@ impl Management {
                         }
                     }
                 }
-                selected_deadlines.insert(
-                    *peer,
-                    causal_mark
-                        .map(|mark| mark.deadline)
-                        .or(record.deadline)
-                        .unwrap_or(now + COMPUTER_RETURN_SHOWN_WITHIN),
-                );
                 if let Some(mark) = causal_mark {
                     selected_tokens.insert(*peer, mark.token);
                 }
@@ -2211,8 +2234,12 @@ impl Management {
                         || (flight.origin == Origin::Retry
                             && flight.involved != (involved == Some(*peer)));
                     if stale && !flight.superseded {
+                        // Transfer the first unfinished change's end before cutting the stale
+                        // work. The replacement may carry newer state, but never gets a newer
+                        // convergence clock.
+                        self.mark_retry(*peer, flight.deadline);
+                        flight.superseded = true;
                         if let Some(abort) = &flight.abort {
-                            flight.superseded = true;
                             abort.abort();
                         }
                     }
@@ -2227,6 +2254,10 @@ impl Management {
                             serial: next_flight(),
                             revision,
                             involved: involved == Some(*peer),
+                            deadline: selected_deadlines
+                                .get(peer)
+                                .copied()
+                                .unwrap_or(now + COMPUTER_RETURN_SHOWN_WITHIN),
                             origin: Origin::Retry,
                             abort: None,
                             superseded: false,
@@ -2312,17 +2343,26 @@ impl Management {
                 // dated then: a slow computer never delays another's record, status or next
                 // attempt. Exchange and reconciliation share the causal return deadline; this
                 // stage neither subtracts a private budget nor starts a new one.
-                let outcome = match tokio::time::timeout_at(
-                    tokio::time::Instant::from_std(deadline),
-                    me.sync_peer(peer, endpoints, url, deadline),
-                )
-                .await
-                {
-                    Ok(Ok(revisions)) => Ok(revisions),
-                    Ok(Err(e)) => Err(e.to_string()),
-                    Err(_) => Err(
-                        "the exchange did not finish before its causal convergence deadline".into(),
-                    ),
+                let outcome = if deadline <= std::time::Instant::now() {
+                    // The product already missed the causal contract, but repair must continue.
+                    // Transport operations carry their own source-owned bounds; do not let an
+                    // expired reporting deadline prevent a reachable peer from being dialled.
+                    me.sync_peer(peer, endpoints, url, deadline)
+                        .await
+                        .map_err(|e| e.to_string())
+                } else {
+                    let exchange = me.sync_peer(peer, endpoints, url, deadline);
+                    tokio::pin!(exchange);
+                    tokio::select! {
+                        // Poll the exchange first at the boundary. This starts the real dial;
+                        // an already-ready timer must not manufacture a timeout without touching
+                        // a reachable peer.
+                        biased;
+                        result = &mut exchange => result.map_err(|e| e.to_string()),
+                        () = tokio::time::sleep_until(deadline.into()) => Err(
+                            "the exchange did not finish before its causal convergence deadline".into(),
+                        ),
+                    }
                 };
                 guard.done(outcome);
             });
@@ -2331,6 +2371,9 @@ impl Management {
             if let Some(flight) = lock(&self.inflight).get_mut(&peer) {
                 if flight.serial == serial {
                     flight.abort = Some(task.abort_handle());
+                    if flight.superseded {
+                        task.abort();
+                    }
                 }
             }
         }
@@ -2415,7 +2458,7 @@ impl Management {
                 let (mut send, mut recv) = streams::open_typed(&conn, StreamKind::Computer).await?;
                 write_frame(
                     &mut send,
-                    &hello(REACHABILITY_WAKE_OP, &description, &[0; 32]),
+                    &hello(REACHABILITY_WAKE_OP, &description, &[0; 32], 0),
                 )
                 .await?;
                 let response = read_frame(&mut recv, MAX_FRAME)
@@ -2423,7 +2466,7 @@ impl Management {
                     .ok_or(Error::Profile(
                         "computer reachability peer closed before answering",
                     ))?;
-                let (op, _, _) = parse_hello(&response, &conn)?;
+                let (op, _, _, _) = parse_hello(&response, &conn)?;
                 if op != REACHABILITY_WAKE_OP {
                     return Err(bad());
                 }
@@ -2465,9 +2508,14 @@ impl Management {
             (exchange(&s)?, s.revision)
         };
         let (mut send, mut recv) = streams::open_typed(&conn, StreamKind::Computer).await?;
-        write_frame(&mut send, &hello(2, &self.computer.description(), &[0; 32])).await?;
-        let (op, _, _) = read_hello(&mut recv, &conn).await?;
-        if op != 2 {
+        let return_by_ms = wire_deadline(deadline);
+        write_frame(
+            &mut send,
+            &hello(2, &self.computer.description(), &[0; 32], return_by_ms),
+        )
+        .await?;
+        let (op, _, _, echoed_return_by_ms) = read_hello(&mut recv, &conn).await?;
+        if op != 2 || echoed_return_by_ms != return_by_ms {
             return Err(bad());
         }
         write_frame(&mut send, &payload).await?;
@@ -2508,26 +2556,38 @@ fn context(invite: &Digest32, transport: &Digest32, g: &Enrollment) -> Vec<u8> {
         .uint(PROTOCOL);
     [PAIR_DOMAIN, &sha256(&e.finish())].concat()
 }
-fn hello(op: u64, d: &Description, id: &Digest32) -> Vec<u8> {
+/// Convert this process's monotonic causal deadline once to an absolute wire value. The answerer
+/// reconstructs the same end rather than starting another return interval after network delay.
+fn wire_deadline(deadline: std::time::Instant) -> u64 {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    now().saturating_add(u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX))
+}
+
+fn causal_deadline(return_by_ms: u64) -> std::time::Instant {
+    std::time::Instant::now() + Duration::from_millis(return_by_ms.saturating_sub(now()))
+}
+
+fn hello(op: u64, d: &Description, id: &Digest32, return_by_ms: u64) -> Vec<u8> {
     let mut e = Encoder::new();
-    e.array(5)
+    e.array(6)
         .uint(PROTOCOL)
         .uint(u64::from(crate::suite::VOX_SUITE_1.id))
         .uint(op)
         .bytes(&d.encode())
-        .bytes(id);
+        .bytes(id)
+        .uint(return_by_ms);
     e.finish()
 }
 async fn read_hello(
     recv: &mut RecvStream,
     conn: &VoxConnection,
-) -> Result<(u64, Description, Digest32)> {
+) -> Result<(u64, Description, Digest32, u64)> {
     let f = frame(recv).await?;
     parse_hello(&f, conn)
 }
-fn parse_hello(f: &[u8], conn: &VoxConnection) -> Result<(u64, Description, Digest32)> {
+fn parse_hello(f: &[u8], conn: &VoxConnection) -> Result<(u64, Description, Digest32, u64)> {
     let mut d = Decoder::new(f);
-    arity(&mut d, 5)?;
+    arity(&mut d, 6)?;
     if d.uint()? != PROTOCOL || d.uint()? != u64::from(conn.session().suite_id) {
         return Err(Error::Profile(
             "computer management protocol or suite is unsupported",
@@ -2536,11 +2596,12 @@ fn parse_hello(f: &[u8], conn: &VoxConnection) -> Result<(u64, Description, Dige
     let op = d.uint()?;
     let desc = Description::decode(d.bytes()?)?;
     let id = digest(&mut d)?;
+    let return_by_ms = d.uint()?;
     d.finish()?;
     if desc.fingerprint()? != conn.peer_id() {
         return Err(Error::SignatureInvalid);
     }
-    Ok((op, desc, id))
+    Ok((op, desc, id, return_by_ms))
 }
 async fn frame(recv: &mut RecvStream) -> Result<Vec<u8>> {
     let f = read_frame_within(recv, MAX_FRAME, PATIENCE)

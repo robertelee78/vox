@@ -232,6 +232,15 @@ impl Daemon {
         );
     }
 
+    /// Wait for a condition that only establishes this proof's process/network setup.
+    fn expect_apparatus(&self, what: &str, within: Duration, f: impl Fn(&str) -> bool) {
+        assert!(
+            wait_until(within, || self.said().lines().any(&f)),
+            "APPARATUS: the daemon never said {what}:\n{}",
+            self.said()
+        );
+    }
+
     fn stop(mut self) -> String {
         stop_pid(self.child.id());
         let _ = self.child.wait();
@@ -1229,9 +1238,18 @@ fn close_expired_pairing() {
     drop(stepped);
 }
 
-/// CT-11 and CT-9: two zero-node installations on opposite address families pair through a
-/// public anchor, then still exchange approved roster changes after all three daemons restart.
-/// The existing split-family staging makes direct packets impossible without firewall/root.
+/// CT-11, CT-9 and FX-28: two installations on opposite address families pair through a public
+/// anchor. With the remote daemon and anchor gone there is no retained computer connection; two
+/// local policy revisions overlap the failed exchange. The remote daemon returns while the anchor
+/// remains gone, then only the remote anchor returns. Both revisions still cross within the first
+/// revision's causal return contract. The split-family staging makes direct packets impossible
+/// without firewall/root.
+///
+/// Independent mutants: removing the stale-flight deadline handoff makes the first revision's
+/// deadline move; requiring a retained peer connection strands the repair; discarding failed
+/// transport work means the remote anchor's return never causes registration. Each reaches the
+/// final PRODUCT roster assertion, while inability to stage the in-flight first exchange is
+/// APPARATUS.
 #[test]
 #[ignore = "real binaries with production Argon2id; run in release"]
 fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
@@ -1250,11 +1268,9 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
             .spawn()
             .expect("APPARATUS: start scratch anchor");
         let process = Daemon { child, out };
-        process.expect(
-            "its advertised anchor address",
-            Duration::from_secs(30),
-            |line| line.contains('@') && line.contains("/udp/"),
-        );
+        process.expect_apparatus("its advertised anchor address", RETURN_WITHIN, |line| {
+            line.contains('@') && line.contains("/udp/")
+        });
         process
     };
     let mut relay = start_anchor("[::]:0");
@@ -1275,7 +1291,7 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
             &["--no-node", "--listen", listen, "--anchor", anchor],
             &[],
         );
-        daemon.expect("its control socket", Duration::from_secs(30), |line| {
+        daemon.expect_apparatus("its control socket", RETURN_WITHIN, |line| {
             line.contains("control socket")
         });
         daemon
@@ -1290,7 +1306,7 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
     let op = preview["pairing"]["operation_id"].as_str().unwrap();
     computer(&a, &["approve", op]);
     computer(&b, &["approve", op]);
-    assert!(wait_until(Duration::from_secs(60), || computer(&a, &["status"])["state"] == "confirmed" && computer(&b, &["status"])["state"] == "confirmed"), "PRODUCT: two computers with only an anchor path did not confirm their pairing: {}; {}; anchor: {}", computer(&a, &["status"]), computer(&b, &["status"]), relay.said());
+    assert!(wait_until(RETURN_WITHIN, || computer(&a, &["status"])["state"] == "confirmed" && computer(&b, &["status"])["state"] == "confirmed"), "PRODUCT: two computers with only an anchor path did not confirm their pairing: {}; {}; anchor: {}", computer(&a, &["status"]), computer(&b, &["status"]), relay.said());
     assert!(
         relay
             .said()
@@ -1304,35 +1320,151 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         "PRODUCT: pairing fabricated room membership on its anchor: {}",
         relay.said()
     );
-    // Restart both managers and the anchor: ephemeral relay registrations are gone. An actual
-    // new managed node, not a cached status receipt, demonstrates re-registration/reconnection.
+    // Give the returning computer one attached node while the anchor path is healthy. Its shipped
+    // trust listing is the eventual observation of both revisions from the other computer.
+    let _bob = b.make_node("after-remote-anchor-b");
+    let (ok, out, err) = b.run(
+        &[
+            "node",
+            "attach",
+            "after-remote-anchor-b",
+            "--passphrase-file",
+            "-",
+        ],
+        PASS,
+    );
+    assert!(ok, "APPARATUS: attach the remote observer: {out}{err}");
+    assert!(
+        wait_until(RETURN_WITHIN, || computer(&a, &["status"])["state"]
+            == "confirmed"
+            && computer(&b, &["status"])["state"] == "confirmed"),
+        "PRODUCT: the remote observer's policy revision did not settle before the outage: {}; {}",
+        computer(&a, &["status"]),
+        computer(&b, &["status"])
+    );
+
+    // Stop the remote daemon and the only bridge, then bring only the remote daemon back. There
+    // is no retained peer connection and no direct path between address families.
+    stop_pid(b.lock_pid().expect("APPARATUS: right scratch daemon"));
+    stop_pid(anchor.lock_pid().expect("APPARATUS: scratch anchor daemon"));
+    right
+        .child
+        .wait()
+        .expect("APPARATUS: stopped remote daemon did not exit");
+    relay
+        .child
+        .wait()
+        .expect("APPARATUS: stopped anchor did not exit");
+    right = start(&b, "[::1]:0", &v6);
+
+    let b_id = computer_id(&b);
+    let before = application_toward(&a, &b_id);
+    let attempts_before = before["exchange_attempts"].as_u64().unwrap_or(0);
+    let failures_before = before["exchange_failures"].as_u64().unwrap_or(0);
+    let revision_before = computer(&a, &["status"])["revision"].as_u64().unwrap_or(0);
+    let first = a.make_node("anchor-return-first");
+    let second = a.make_node("anchor-return-second");
+    let first_changed = Instant::now();
+    let (ok, out, err) = a.run(
+        &[
+            "node",
+            "attach",
+            "anchor-return-first",
+            "--passphrase-file",
+            "-",
+        ],
+        PASS,
+    );
+    assert!(ok, "APPARATUS: attach the first outage node: {out}{err}");
+    assert!(
+        wait_until(CHANGE_SHOWN_WITHIN, || {
+            let toward = application_toward(&a, &b_id);
+            computer(&a, &["status"])["revision"]
+                .as_u64()
+                .is_some_and(|revision| revision > revision_before)
+                && toward["exchange_attempts"]
+                    .as_u64()
+                    .is_some_and(|attempts| attempts > attempts_before)
+                && toward["exchange_failures"].as_u64() == Some(failures_before)
+        }),
+        "APPARATUS: the first revision was not observed in an in-flight exchange before it could be superseded: before {before}; after {}",
+        application_toward(&a, &b_id)
+    );
+    let first_revision = computer(&a, &["status"])["revision"].as_u64().unwrap_or(0);
+    let (ok, out, err) = a.run(
+        &[
+            "node",
+            "attach",
+            "anchor-return-second",
+            "--passphrase-file",
+            "-",
+        ],
+        PASS,
+    );
+    assert!(
+        ok,
+        "APPARATUS: attach the superseding outage node: {out}{err}"
+    );
+    assert!(
+        wait_until(CHANGE_SHOWN_WITHIN, || computer(&a, &["status"])["revision"]
+            .as_u64()
+            .is_some_and(|revision| revision > first_revision)),
+        "APPARATUS: the second attached node did not create a later policy revision than {first_revision}: {}",
+        computer(&a, &["status"])
+    );
+
+    // No local command, daemon restart or network transition follows: the anchor process alone
+    // returns. Failed registration is durable work and must cause its own retry.
+    relay = start_anchor(&anchor_listen);
+    let converged = wait_until(RETURN_WITHIN, || {
+        let (_, trust, _) = b.run(&["trust", "list", "--node", "after-remote-anchor-b"], "");
+        let status = computer(&b, &["status"]);
+        let names_both = status["nodes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|node| node["name"] == "anchor-return-first")
+            && status["nodes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|node| node["name"] == "anchor-return-second");
+        trust.contains(&first)
+            && trust.contains(&second)
+            && names_both
+            && computer(&a, &["status"])["state"] == "confirmed"
+            && status["state"] == "confirmed"
+    });
+    let returned_after = first_changed.elapsed();
+    assert!(
+        converged && returned_after <= RETURN_WITHIN,
+        "PRODUCT: after only the remote anchor returned, the computer with no retained connection did not show both superseding policy revisions within the first revision's {RETURN_WITHIN:?} causal deadline (observed after {returned_after:?}); left: {}; right: {}; anchor: {}",
+        computer(&a, &["status"]),
+        computer(&b, &["status"]),
+        relay.said()
+    );
+    println!(
+        "[proof] after {returned_after:?}, remote-anchor-only recovery carried both revisions through a new peer connection before the first revision's {RETURN_WITHIN:?} deadline"
+    );
+
+    // Persistence remains part of the same journey: restart both managers and the anchor, then
+    // read the exact already-applied identities rather than manufacturing a fresh revision.
     stop_pid(a.lock_pid().expect("APPARATUS: left scratch daemon"));
     stop_pid(b.lock_pid().expect("APPARATUS: right scratch daemon"));
     stop_pid(anchor.lock_pid().expect("APPARATUS: scratch anchor daemon"));
-    let _ = left.child.wait();
-    let _ = right.child.wait();
-    let _ = relay.child.wait();
+    left.child
+        .wait()
+        .expect("APPARATUS: left daemon did not exit");
+    right
+        .child
+        .wait()
+        .expect("APPARATUS: right daemon did not exit");
+    relay.child.wait().expect("APPARATUS: anchor did not exit");
     relay = start_anchor(&anchor_listen);
     left = start(&a, "127.0.0.1:0", &v4);
     right = start(&b, "[::1]:0", &v6);
-    let alice = a.make_node("after-restart-a");
-    let bob = b.make_node("after-restart-b");
-    for (account, name) in [(&a, "after-restart-a"), (&b, "after-restart-b")] {
-        let (ok, out, err) = account.run(&["node", "attach", name, "--passphrase-file", "-"], PASS);
-        assert!(
-            ok,
-            "PRODUCT: post-restart managed node could not attach: {out}{err}"
-        );
-    }
-    assert!(wait_until(Duration::from_secs(60), || a.run(&["trust", "list", "--node", "after-restart-a"], "").1.contains(&bob) && b.run(&["trust", "list", "--node", "after-restart-b"], "").1.contains(&alice)), "PRODUCT: computer trust roster did not cross the anchor after all three daemons restarted; left: {}; right: {}; anchor: {}", a.log(), b.log(), relay.said());
-    assert!(
-        wait_until(Duration::from_secs(30), || computer(&a, &["status"])
-            ["state"]
-            == "confirmed"
-            && computer(&b, &["status"])["state"] == "confirmed"),
-        "PRODUCT: restarted computers did not acknowledge the newly applied roster"
-    );
-    for (account, node) in [(&a, "after-restart-a"), (&b, "after-restart-b")] {
+    assert!(wait_until(RETURN_WITHIN, || b.run(&["trust", "list", "--node", "after-remote-anchor-b"], "").1.contains(&first) && b.run(&["trust", "list", "--node", "after-remote-anchor-b"], "").1.contains(&second)), "PRODUCT: the exact recovered roster did not survive all three process restarts; left: {}; right: {}; anchor: {}", a.log(), b.log(), relay.said());
+    for (account, node) in [(&a, "anchor-return-first"), (&b, "after-remote-anchor-b")] {
         let (ok, out, err) = account.run(&["room", "list", "--node", node], "");
         assert!(
             ok && out.trim() == "no rooms",
@@ -2494,7 +2626,7 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
             a.run(&["computer", "status", "--json"], "").0
                 && b.run(&["computer", "status", "--json"], "").0
         }),
-        "PRODUCT (staging): a daemon never answered `vox computer status`:\n{}\n{}",
+        "APPARATUS: a daemon never answered `vox computer status` while staging the paired-computer journey:\n{}\n{}",
         da.said(),
         db.said()
     );
@@ -2993,7 +3125,7 @@ fn change_shows_on_both(
         }
         assert!(
             started.elapsed() < RETURN_WITHIN,
-            "PRODUCT (staging): within {RETURN_WITHIN:?} of {new_node} attaching, {}'s daemon \
+            "APPARATUS: within {RETURN_WITHIN:?} of {new_node} attaching, {}'s daemon \
              completed no exchange it started toward {}'s computer with revision {revision_here} \
              sent: {}\nits daemon said: {}",
             names_here[0],
@@ -3049,7 +3181,7 @@ fn a_restart_derives_nothing(
     let before = bindings_shown(&computer(b, &["status"]));
     assert!(
         roster_current(&computer(b, &["status"]), &names_b),
-        "PRODUCT (staging): before the restart beta's bindings are not all current: {before:?}"
+        "APPARATUS: before the restart beta's bindings are not all current: {before:?}"
     );
     let _stopped_said = db.stop();
     let restarted = Instant::now();
@@ -3187,7 +3319,7 @@ fn change_reaches_a_live_computer(
     forward.close();
     assert!(
         daemon_alive(da.child.id()) && daemon_alive(db.child.id()),
-        "PRODUCT (staging): closing the userspace path stopped a daemon: alpha pid {}, beta pid {}",
+        "APPARATUS: closing the userspace path stopped a daemon: alpha pid {}, beta pid {}",
         da.child.id(),
         db.child.id()
     );
@@ -3256,7 +3388,7 @@ fn change_reaches_a_live_computer(
     );
     assert!(
         daemon_alive(da.child.id()) && daemon_alive(db.child.id()),
-        "PRODUCT (staging): a daemon stopped during the live path outage: alpha pid {}, beta pid {}",
+        "APPARATUS: a daemon stopped during the live path outage: alpha pid {}, beta pid {}",
         da.child.id(),
         db.child.id()
     );
@@ -3421,7 +3553,7 @@ fn delayed_node_does_not_make_a_late_pass(
         } else {
             assert!(
                 restored.elapsed() < RETURN_WITHIN,
-                "PRODUCT (staging): alpha completed no exchange carrying epsilon to beta within \
+                "APPARATUS: alpha completed no exchange carrying epsilon to beta within \
                  {RETURN_WITHIN:?}: {}\nalpha daemon:\n{}\nbeta daemon:\n{}",
                 application_toward(a, &b_id),
                 da.said(),
