@@ -242,7 +242,7 @@ const MIN_KILLS: u64 = 3;
 #[test]
 #[ignore = "real vox daemons under the syscall interposer, production Argon2id; CI runs it in release"]
 fn a_crash_inside_a_join_never_costs_the_member_the_room() {
-    watchdog::arm_for_debug_total(Duration::from_millis(1_270_000), 2);
+    watchdog::arm();
     let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let root = tmp.path();
     let alice = root.join("alice");
@@ -489,7 +489,7 @@ fn a_crash_inside_a_join_never_costs_the_member_the_room() {
 #[test]
 #[ignore = "real vox daemons, production Argon2id; CI runs it in release"]
 fn a_room_held_closed_is_opened_by_joining_it_again() {
-    watchdog::arm_for_debug_total(Duration::from_millis(600_000), 2);
+    watchdog::arm();
     let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let root = tmp.path();
     let (alice, host) = (root.join("alice"), root.join("host"));
@@ -712,7 +712,7 @@ fn a_room_held_closed_is_opened_by_joining_it_again() {
 #[ignore = "a real vox daemon, production Argon2id; CI runs it in release"]
 fn a_room_that_does_not_reopen_says_why() {
     test_knobs::require(&["VOX_TEST_REOPEN_FAILS", "VOX_TEST_ANSWER_FIRST"]);
-    watchdog::arm_for_debug_total(Duration::from_millis(300_000), 2);
+    watchdog::arm();
     let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let alice = tmp.path().join("alice");
     std::fs::create_dir_all(alice.join("cfg")).expect("APPARATUS: create a staging directory");

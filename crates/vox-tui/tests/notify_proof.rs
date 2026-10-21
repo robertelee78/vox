@@ -558,7 +558,7 @@ const UNNEEDED_WATCH: Duration = Duration::from_secs(80);
 #[ignore = "an anchor and two real daemons, the anchor killed for over two minutes; run on demand"]
 fn an_unreachable_anchor_notifies_once_and_once_when_it_is_back() {
     // Setup, 80 s of an unneeded anchor, up to 150 s for the needed one, then its return.
-    watchdog::arm_for(Duration::from_secs(900));
+    watchdog::arm();
     let tmp = tempfile::tempdir().expect("APPARATUS: a tempdir");
     let file = tmp.path().join("notifications.log");
     // The desktop's own notifier, not `VOX_NOTIFY_COMMAND`: a recording `osascript` (macOS) or
@@ -748,7 +748,7 @@ optional_proof::not_run!(a_room_that_cannot_sync_notifies_once_and_once_when_it_
 #[test]
 #[ignore = "optional: an anchor and two daemons, one killed for over ten minutes; run in release"]
 fn a_room_that_cannot_sync_notifies_once_and_once_when_it_syncs_again() {
-    watchdog::arm_for(Duration::from_secs(1_800));
+    watchdog::arm();
     let tmp = tempfile::tempdir().expect("APPARATUS: a tempdir");
     let file = tmp.path().join("notifications.log");
     let script = notify_script(&tmp, &file);

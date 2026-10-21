@@ -817,10 +817,7 @@ fn median(mut v: Vec<f64>) -> f64 {
 fn r41_a_tunnel_does_not_throttle_the_link_it_runs_over() {
     test_knobs::require(&["VOX_TEST_ADVERTISE"]);
     let _alone = one_run();
-    // The raw-TCP links take about 4 minutes; ADR-024's arms add about 10 (each runs a settle and a
-    // judged stretch, 60 s on the congested ones). This legacy duration is deliberately ignored
-    // by the watchdog; only an operator-provided emergency timebox can abort the whole run.
-    watchdog::arm_for(Duration::from_secs(1800));
+    watchdog::arm();
     let min_ratio = std::env::var("VOX_PERF_MIN_RATIO")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -1268,7 +1265,7 @@ fn overflow_of(dir: &std::path::Path) -> String {
 fn r41a_a_stalled_receiver_behind_a_short_buffer_keeps_its_speed() {
     test_knobs::require(&["VOX_TEST_ADVERTISE", "VOX_TEST_UDP_RCVBUF_CAP"]);
     let _alone = one_run();
-    watchdog::arm_for(Duration::from_secs(900));
+    watchdog::arm();
     if !cfg!(any(target_os = "linux", target_os = "android")) {
         panic!(
             "CANNOT MEASURE R41a (APPARATUS): this OS keeps no per-socket drop count, so a \

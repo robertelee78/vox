@@ -77,10 +77,6 @@ const POST_BOUND: Duration = Duration::from_secs(2 * DEBUG_SCALE);
 /// release, and a post 4.03 s against 68 ms. Unscaled, a debug run of the fixed build failed
 /// every bound; the release bounds above are the measured ones and are unchanged.
 const DEBUG_SCALE: u64 = if cfg!(debug_assertions) { 8 } else { 1 };
-/// Historical sizing for the compatibility arming call. Staging in the unoptimized build (six
-/// joins, then 300 trust changes, each unlocking the identity with production Argon2id) took
-/// 816 s, and the whole test 1017 s. It does not impose an elapsed verdict.
-const DEBUG_WATCHDOG: Duration = Duration::from_secs(2400);
 /// The cap on any one verb, so a stopped node is reported rather than waited on.
 const VERB_CAP: Duration = Duration::from_secs(120);
 /// How long the read is polled for before the verdict, so a red says how slow it was.
@@ -201,11 +197,7 @@ fn trust(data: &Path, verb: &str, fp: &str, name: &str) -> bool {
 #[test]
 #[ignore = "real vox processes, production Argon2id and hundreds of trust changes; run in release"]
 fn a_room_with_hundreds_of_consents_is_joined_promptly() {
-    if cfg!(debug_assertions) {
-        watchdog::arm_for(DEBUG_WATCHDOG);
-    } else {
-        watchdog::arm();
-    }
+    watchdog::arm();
     let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let dir = |n: &str| {
         let d = tmp.path().join(n);

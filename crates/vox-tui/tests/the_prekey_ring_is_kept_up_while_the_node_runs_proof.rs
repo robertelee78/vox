@@ -554,9 +554,7 @@ fn a_running_node_rotates_its_signed_prekey() {
 #[ignore = "real binaries, a clock knob, production Argon2id and a PoW; the release gate runs it"]
 fn a_session_started_before_a_rotation_completes_after_it() {
     test_knobs::require(&["VOX_TEST_CLOCK_STEP_MS"]);
-    // A join per attempt; 14 unlocks: the guest's `vox id` and daemon, and per attempt the host's
-    // `vox id`, daemon and room.
-    watchdog::arm_for_setup(WINDOW_TRIES as u32, 2 + 3 * WINDOW_TRIES as u32);
+    watchdog::arm();
     let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let (_anchor, spec) = anchor(tmp.path());
     let guest = Profile::new(tmp.path(), "guest", None, None);
@@ -671,8 +669,7 @@ fn a_session_started_before_a_rotation_completes_after_it() {
 #[ignore = "real binaries, a pool knob, production Argon2id and a PoW per join; the release gate runs it"]
 fn sessions_get_one_time_prekeys_past_the_whole_pool() {
     test_knobs::require(&["VOX_TEST_ONE_TIME_PREKEYS"]);
-    // JOINS joins; 16 unlocks: two `vox id`s, two daemon starts, and a room created per join.
-    watchdog::arm_for_setup(JOINS as u32, 16);
+    watchdog::arm();
     let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let (_anchor, spec) = anchor(tmp.path());
     let host = Profile::new(tmp.path(), "host", None, Some(POOL));

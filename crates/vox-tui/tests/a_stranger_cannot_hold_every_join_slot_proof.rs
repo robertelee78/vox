@@ -154,15 +154,6 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-/// The cases in this file, each a flood of its own.
-const CASES: u32 = 7;
-/// Historical whole-case sizing retained for the compatibility arming call below. It is not a
-/// verdict or elapsed bound. All
-/// seven ran one after another in 456s in release at load 38 (65s each on average, carol's joins
-/// 6–33s); this is more than five times that average, for a slower runner. A case that runs out one
-/// of its own source-owned patiences fails on that product/structural assertion, with its own red.
-const CASE_BUDGET: Duration = Duration::from_secs(360);
-
 /// **One case at a time** (V210-124, #332). Each case stages a flood of its own: an anchor,
 /// alice, carol and up to sixteen strangers' daemons grinding their proof of work, which alice
 /// makes four times harder while the flood lasts. libtest runs a file's tests on as many threads
@@ -170,11 +161,10 @@ const CASE_BUDGET: Duration = Duration::from_secs(360);
 /// own machine past anything it measures, and its joins starved: carol got in after 98–370s
 /// against a 90s bound on ubuntu, three cases could not even stage, and on macOS the four running
 /// took more than 600s. Run one at a time, all seven passed with carol in 6–33s. So every case
-/// holds this lock for its whole run, whatever libtest's thread count. The arming call retains the
-/// historical sizing only for source compatibility; it does not impose that elapsed limit.
+/// holds this lock for its whole run, whatever libtest's thread count.
 fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
     static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    watchdog::arm_for(CASE_BUDGET * CASES);
+    watchdog::arm();
     // A case that failed panicked holding the lock; the next case still runs.
     ONE.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)

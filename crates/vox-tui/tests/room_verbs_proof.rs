@@ -843,8 +843,7 @@ fn vox_room_speaks_to_a_node_it_did_not_start() {
 /// is PRODUCT and quotes the daemon's own stderr (an abort there says "has overflowed its stack").
 #[test]
 fn a_debug_daemon_makes_a_room_takes_a_post_and_keeps_running() {
-    // `vox id` and the daemon's unlock, and the room key's seal: three Argon2id runs.
-    watchdog::arm_for_setup(0, 3);
+    watchdog::arm();
     let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let data = tmp.path().join("data");
     let cfg = tmp.path().join("cfg");

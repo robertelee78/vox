@@ -431,7 +431,7 @@ fn received(data: &Path, cfg: &Path, node: &str) -> Vec<(String, u64)> {
 #[test]
 #[ignore = "drives a real Claude Code model turn; optional, on the decider's request, in release"]
 fn a_live_claude_turn_reads_the_room_only_through_what_its_node_trusts() {
-    watchdog::arm_for(Duration::from_secs(900));
+    watchdog::arm();
     if !oc_sandbox::live_model_allowed(
         "claude_live_proof::a_live_claude_turn_reads_the_room_only_through_what_its_node_trusts",
     ) {
@@ -846,7 +846,7 @@ fn a_live_claude_session_is_followed_answered_and_interrupted_from_vox() {
     const AGENT: &str = "claude-a";
     const ROOM_PASS: &str = "channel passphrase";
     const MODEL: &str = "claude-haiku-4-5-20251001";
-    watchdog::arm_for(Duration::from_secs(1200));
+    watchdog::arm();
     if !oc_sandbox::live_model_allowed(
         "claude_live_proof::a_live_claude_session_is_followed_answered_and_interrupted_from_vox",
     ) {

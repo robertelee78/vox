@@ -334,8 +334,7 @@ fn opencode_turn(
 #[test]
 #[ignore = "drives a real model through a real harness; optional, run it in release"]
 fn a_real_model_reads_the_room_through_the_opencode_plugin() {
-    // Five or six real model turns, one of them a 45 s tool, plus the pty driver's own bound.
-    watchdog::arm_for(Duration::from_secs(900));
+    watchdog::arm();
 
     if !oc_sandbox::live_model_allowed(
         "opencode_plugin_proof::a_real_model_reads_the_room_through_the_opencode_plugin",

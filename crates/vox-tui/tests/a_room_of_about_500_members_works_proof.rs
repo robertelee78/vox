@@ -101,9 +101,7 @@ struct Arm {
 #[test]
 #[ignore = "real binaries and production Argon2id: the release gate runs it"]
 fn a_room_of_many_members_works() {
-    // A debug build's budget: a join per member; an unlock for each `vox id`, daemon and trust
-    // (the member's and the host's), the host's own three, and each restart.
-    watchdog::arm_for_setup(SMALL as u32, (4 * SMALL + 3 + RESTARTED) as u32);
+    watchdog::arm();
     a_room_of(&Arm {
         members: SMALL,
         deliver_within: Duration::from_secs(60),
@@ -115,8 +113,7 @@ fn a_room_of_many_members_works() {
 #[test]
 #[ignore = "500 daemons and production Argon2id; run by hand in release, never in CI"]
 fn a_room_of_about_500_members_works() {
-    // This historical suggestion is ignored; see the module docs for the measured staging time.
-    watchdog::arm_for(Duration::from_secs(4 * 3600));
+    watchdog::arm();
     a_room_of(&Arm {
         members: LARGE,
         deliver_within: Duration::from_secs(300),

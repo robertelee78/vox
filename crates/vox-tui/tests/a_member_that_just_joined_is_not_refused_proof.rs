@@ -178,9 +178,7 @@ fn daemon(name: &str, data: &Path, spec: &str, pass_file: &Path, env: &[(&str, &
 #[ignore = "real vox processes, production Argon2id and deliberate CPU load; run alone, in release"]
 fn a_member_that_just_joined_is_not_refused_by_its_anchor() {
     test_knobs::require(&["VOX_TEST_HOLD_ADDRESS_MS"]);
-    // A join per joiner; unlocks: a `vox id` and a daemon per member, two `trust add`s per joiner,
-    // and the room created.
-    watchdog::arm_for_setup(JOINERS.len() as u32, 4 * JOINERS.len() as u32 + 3);
+    watchdog::arm();
     let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let dir = |n: &str| {
         let d = tmp.path().join(n);

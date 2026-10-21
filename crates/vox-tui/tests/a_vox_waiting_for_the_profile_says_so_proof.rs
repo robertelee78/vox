@@ -470,11 +470,7 @@ fn tui_arm(label: &str, data: &Path, mode: &str, a_args: &[&str], answer: &[&str
 #[test]
 #[ignore = "real vox processes and `vox tui` in a pty, with production Argon2id; needs pyte (VOX_PYTE_PATH); CI runs it in release"]
 fn a_vox_waiting_for_the_profile_says_so() {
-    watchdog::arm_for(Duration::from_secs(if cfg!(debug_assertions) {
-        2400
-    } else {
-        900
-    }));
+    watchdog::arm();
     let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let dir = |n: &str| {
         let d = tmp.path().join(n);

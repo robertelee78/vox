@@ -135,10 +135,7 @@ fn backoffs(status: &serde_json::Value, peer: &str) -> Vec<String> {
 #[test]
 #[ignore = "two real daemons with production Argon2id and 40 rooms; CI runs it in release"]
 fn a_burst_past_the_slot_cap_is_queued() {
-    // Sized on the whole debug run (#295): its 19 joins and 51 unlocks, each at twice its most
-    // measured, would ask for 7,434 s, past what any run is given. Three debug runs of this proof
-    // took 1,317.9 s, 1,696.9 s and 2,001.2 s.
-    watchdog::arm_for_debug_total(Duration::from_millis(2_001_200), 3);
+    watchdog::arm();
     shown(&format!(
         "[proof] {PROFILE} build: bounds {BOUND:?} for the burst, {LATE_BOUND:?} for the late join"
     ));

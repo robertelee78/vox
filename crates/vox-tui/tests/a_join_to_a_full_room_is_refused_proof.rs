@@ -102,8 +102,7 @@ const PAST_CAP: &str = "past its cap of 3, now 4 members: another member admitte
 #[test]
 #[ignore = "real binaries and production Argon2id: the release gate runs it"]
 fn a_join_to_a_full_room_is_refused() {
-    // A debug build's budget: three joins; an unlock for each `vox id` and daemon.
-    watchdog::arm_for_setup(CAP as u32, (2 * CAP + 2) as u32);
+    watchdog::arm();
     test_knobs::require(&[KNOB]);
     let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let root = tmp.path();
@@ -188,8 +187,7 @@ fn a_join_to_a_full_room_is_refused() {
 #[test]
 #[ignore = "real binaries and production Argon2id: the release gate runs it"]
 fn a_join_a_member_cannot_admit_says_why() {
-    // A debug build's budget: one join; an unlock for each `vox id` and daemon.
-    watchdog::arm_for_setup(1, 4);
+    watchdog::arm();
     test_knobs::require(&[FAILS]);
     let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let root = tmp.path();
@@ -299,8 +297,7 @@ fn all_know(members: &[&Member], room: &str, want: usize) {
 #[test]
 #[ignore = "real binaries and production Argon2id: the release gate runs it"]
 fn three_members_answering_at_once_never_take_the_room_past_its_cap() {
-    // A debug build's budget: six joins; an unlock for each `vox id` and daemon.
-    watchdog::arm_for_setup(6, 14);
+    watchdog::arm();
     test_knobs::require(&[KNOB, GATE]);
     let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let root = tmp.path();
@@ -455,7 +452,7 @@ fn three_members_answering_at_once_never_take_the_room_past_its_cap() {
 #[test]
 #[ignore = "real binaries and production Argon2id: the release gate runs it"]
 fn a_member_online_that_does_not_answer_fails_the_join_and_is_named() {
-    watchdog::arm_for_setup(2, 8);
+    watchdog::arm();
     test_knobs::require(&[KNOB, SILENT]);
     let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let root = tmp.path();
@@ -512,7 +509,7 @@ fn a_member_online_that_does_not_answer_fails_the_join_and_is_named() {
 #[test]
 #[ignore = "real binaries and production Argon2id: the release gate runs it"]
 fn a_split_room_keeps_both_newcomers_and_says_it_passed_its_cap() {
-    watchdog::arm_for_setup(3, 10);
+    watchdog::arm();
     test_knobs::require(&[KNOB]);
     let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let root = tmp.path();

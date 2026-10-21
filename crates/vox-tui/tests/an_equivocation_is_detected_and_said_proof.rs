@@ -216,9 +216,7 @@ fn names(list: &[(String, u64)], fp: &str) -> bool {
 #[test]
 #[ignore = "real vox processes, five members and two copied profiles; CI runs it in release"]
 fn an_equivocation_is_caught_said_held_back_and_kept() {
-    // Four joins; 36 unlocks: five `vox id`s, twenty `trust add`s, nine daemon starts, the room
-    // created, and carol's TUI.
-    watchdog::arm_for_setup(4, 36);
+    watchdog::arm();
     let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let dir = |n: &str| {
         let d = tmp.path().join(n);

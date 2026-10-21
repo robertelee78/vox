@@ -456,7 +456,7 @@ struct Turn {
 #[test]
 #[ignore = "drives a real Codex model turn; optional, on the decider's request, in release"]
 fn a_live_codex_turn_reads_the_room_only_through_a_trusted_hook() {
-    watchdog::arm_for(Duration::from_secs(900));
+    watchdog::arm();
     if !oc_sandbox::live_model_allowed(
         "codex_live_proof::a_live_codex_turn_reads_the_room_only_through_a_trusted_hook",
     ) {
@@ -997,7 +997,7 @@ fn session_until(
 #[test]
 #[ignore = "drives a live Codex session's model turns; optional, on the decider's request, in release"]
 fn a_live_codex_session_is_mirrored_and_driven() {
-    watchdog::arm_for(Duration::from_secs(1200));
+    watchdog::arm();
     if !oc_sandbox::live_model_allowed(
         "codex_live_proof::a_live_codex_session_is_mirrored_and_driven",
     ) {

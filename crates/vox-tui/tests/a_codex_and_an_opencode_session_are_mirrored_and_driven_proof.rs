@@ -585,7 +585,7 @@ fn item(kind: &str, id: &str, extra: Value) -> Value {
 #[test]
 #[ignore = "real binary; run in release"]
 fn a_codex_session_is_mirrored_and_driven() {
-    watchdog::arm_for(Duration::from_secs(600));
+    watchdog::arm();
     let (w, _daemon) = world(&[CODEX]);
     let app = AppServer::start(&w.root.join("cx"));
     let within = Duration::from_secs(60);
@@ -839,7 +839,7 @@ fn which(bin: &str) -> Option<PathBuf> {
 #[test]
 #[ignore = "real binary and the shipped plugin under node; run in release"]
 fn an_opencode_session_is_mirrored_and_driven() {
-    watchdog::arm_for(Duration::from_secs(600));
+    watchdog::arm();
     let Some(node) = which("node") else {
         panic!(
             "CANNOT MEASURE: `node` is not installed, so the shipped OpenCode plugin cannot be \

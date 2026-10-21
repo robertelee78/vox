@@ -99,9 +99,6 @@ const NOTE_WITHIN: Duration = Duration::from_secs(20);
 /// How long the host may take to say the anchor took the room once it is back (arm C): its redial,
 /// the connection and the first publish round.
 const TAKEN_WITHIN: Duration = Duration::from_secs(120);
-/// Historical whole-binary sizing retained for the compatibility arming call: its four arms took
-/// 623 s in debug on 2026-10-01. It does not impose an elapsed verdict.
-const BUDGET: Duration = Duration::from_secs(1300);
 /// How long the host may take, past making its room, to withhold an address that would lead
 /// nowhere and say why (arm E): the node's `ADDRESS_PATIENCE` (30 s), and margin.
 const WITHHELD_WITHIN: Duration = Duration::from_secs(60);
@@ -304,7 +301,7 @@ fn passphrase_of(host: &mut VoxProc) -> String {
 #[test]
 #[ignore = "real host and guest, production Argon2id and a real PoW; CI runs it in release"]
 fn a_a_host_with_no_anchor_prints_its_address_and_a_guest_joins() {
-    watchdog::arm_for(BUDGET);
+    watchdog::arm();
     let tmp = tempfile::tempdir()
         .unwrap_or_else(|e| panic!("APPARATUS: could not make a temporary directory: {e}"));
     let (host_dir, guest_dir) = (tmp.path().join("host"), tmp.path().join("guest"));
@@ -357,7 +354,7 @@ fn a_a_host_with_no_anchor_prints_its_address_and_a_guest_joins() {
 #[test]
 #[ignore = "real anchors, host and guest, production Argon2id and a real PoW; CI runs it in release"]
 fn b_anchors_that_are_down_do_not_hold_back_the_address() {
-    watchdog::arm_for(BUDGET);
+    watchdog::arm();
     let tmp = tempfile::tempdir()
         .unwrap_or_else(|e| panic!("APPARATUS: could not make a temporary directory: {e}"));
     let (host_dir, guest_dir) = (tmp.path().join("host"), tmp.path().join("guest"));
@@ -456,7 +453,7 @@ fn b_anchors_that_are_down_do_not_hold_back_the_address() {
 #[test]
 #[ignore = "a real anchor, host and guest, production Argon2id and a real PoW; CI runs it in release"]
 fn c_a_guest_who_needs_the_anchor_joins_once_the_host_says_it_took_the_room() {
-    watchdog::arm_for(BUDGET);
+    watchdog::arm();
     let tmp = tempfile::tempdir()
         .unwrap_or_else(|e| panic!("APPARATUS: could not make a temporary directory: {e}"));
     let (anchor_dir, host_dir, guest_dir) = (
@@ -562,7 +559,7 @@ fn c_a_guest_who_needs_the_anchor_joins_once_the_host_says_it_took_the_room() {
 #[ignore = "real anchors, host and guest, production Argon2id and a real PoW; CI runs it in release"]
 fn d_a_join_asks_every_board_the_address_names() {
     test_knobs::require(&["VOX_TEST_ADVERTISE"]);
-    watchdog::arm_for(BUDGET);
+    watchdog::arm();
     let tmp = tempfile::tempdir()
         .unwrap_or_else(|e| panic!("APPARATUS: could not make a temporary directory: {e}"));
     let (a4_dir, a6_dir, host_dir, guest_dir) = (
@@ -691,7 +688,7 @@ fn d_a_join_asks_every_board_the_address_names() {
 #[ignore = "a real host, production Argon2id; CI runs it in release"]
 fn e_an_address_that_would_lead_nowhere_is_withheld_and_why_is_said() {
     test_knobs::require(&["VOX_TEST_ADVERTISE"]);
-    watchdog::arm_for(BUDGET);
+    watchdog::arm();
     let tmp = tempfile::tempdir()
         .unwrap_or_else(|e| panic!("APPARATUS: could not make a temporary directory: {e}"));
     let (host_dir, guest_dir) = (tmp.path().join("host"), tmp.path().join("guest"));
@@ -774,7 +771,7 @@ fn signal(pid: u32, signal: &str) {
 #[ignore = "a real anchor, host and guest, production Argon2id and a real PoW; CI runs it in release"]
 fn f_a_join_dials_the_host_at_the_links_address_when_the_board_has_none() {
     test_knobs::require(&["VOX_TEST_RECORD_TTL_MS"]);
-    watchdog::arm_for(BUDGET);
+    watchdog::arm();
     let tmp = tempfile::tempdir()
         .unwrap_or_else(|e| panic!("APPARATUS: could not make a temporary directory: {e}"));
     let (anchor_dir, host_dir, guest_dir) = (

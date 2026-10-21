@@ -80,20 +80,6 @@ const SMALL_TRIES: usize = SMALL_CAP + 2;
 /// 20.54 s, most 56.50 s and 74.33 s, the whole fill 2,980.5 s and 3,792.7 s. Release: not counted.
 #[cfg(feature = "optional-proofs")]
 const DEBUG_FILL_ADD: Duration = Duration::from_millis(2 * 74_330);
-/// The joins (three `room join`s and `vox connect`) and the other unlocks (four `vox id`s, `serve`,
-/// two daemons, `trust remove`, `room post`, `connect`, `up`, two `forward`s and case (9)'s
-/// `trust add`s) the blocking test makes.
-const JOINS: u32 = 4;
-const UNLOCKS: u32 = 13 + SMALL_TRIES as u32;
-/// The slowest of four whole debug runs of the heavy fill with the rest of this proof: 3,265.6 s,
-/// 3,408.0 s, 3,566.5 s and 4,225.4 s (#295).
-#[cfg(feature = "optional-proofs")]
-const SLOWEST_DEBUG_RUN: Duration = Duration::from_millis(4_225_400);
-/// A release build's budget for the heavy fill. Whole release runs with it took 311.6 s and 439 s
-/// at ordinary load, and one at load 77 was still filling when 600 s ran out (#295); twice that.
-#[cfg(feature = "optional-proofs")]
-const RELEASE_BUDGET: Duration = Duration::from_secs(2 * 600);
-
 /// A long-running `vox`, killed by its own PID however the test ends; stdout and stderr
 /// collected separately.
 struct Proc {
@@ -303,7 +289,7 @@ fn filler(n: usize) -> String {
 #[test]
 #[ignore = "four real vox processes, production Argon2id and a real PoW; CI runs it in release"]
 fn every_common_failure_names_its_cause() {
-    watchdog::arm_for_setup(JOINS, UNLOCKS);
+    watchdog::arm();
     test_knobs::require(&["VOX_TEST_KEYRING_CAP"]);
     let tmp = tempfile::tempdir().expect("APPARATUS: a temporary directory");
     let dir = |n: &str| {
@@ -677,11 +663,7 @@ fn every_common_failure_names_its_cause() {
 #[test]
 #[ignore = "1,100 production-Argon2id `vox trust add`s; optional, run it in release"]
 fn a_full_keyring_names_its_cause() {
-    if cfg!(debug_assertions) {
-        watchdog::arm_for_debug_total(SLOWEST_DEBUG_RUN, 4);
-    } else {
-        watchdog::arm_for(RELEASE_BUDGET);
-    }
+    watchdog::arm();
     let tmp = tempfile::tempdir().expect("APPARATUS: a temporary directory");
     let dir = tmp.path().join("keyring");
     std::fs::create_dir_all(dir.join("cfg")).expect("APPARATUS: a profile directory");

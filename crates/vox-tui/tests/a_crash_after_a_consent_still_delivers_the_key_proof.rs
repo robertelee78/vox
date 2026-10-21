@@ -256,10 +256,7 @@ fn alive(p: &mut Proc) -> bool {
 #[test]
 #[ignore = "real vox daemons under the syscall interposer, production Argon2id; CI runs it in release"]
 fn a_crash_at_any_point_of_a_consent_still_delivers_the_key() {
-    // Sized on the whole debug run (#295): its up to 16 joins and 131 unlocks, each at twice its
-    // most measured, would ask for 8,838 s, past what any run is given. Two debug runs of this
-    // proof took 1,041.7 s and 1,270.0 s.
-    watchdog::arm_for_debug_total(Duration::from_millis(1_270_000), 2);
+    watchdog::arm();
     let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let root = tmp.path();
     let alice = root.join("alice");
@@ -541,7 +538,7 @@ fn a_crash_at_any_point_of_a_consent_still_delivers_the_key() {
 #[test]
 #[ignore = "real vox daemons under the syscall interposer, production Argon2id; CI runs it in release"]
 fn a_crash_in_a_consent_whose_member_key_is_held_still_delivers_it() {
-    watchdog::arm_for_debug_total(Duration::from_millis(1_270_000), 2);
+    watchdog::arm();
     let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let root = tmp.path();
     let alice = root.join("alice");
