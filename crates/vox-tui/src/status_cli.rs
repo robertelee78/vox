@@ -197,12 +197,13 @@ fn render(v: &Value) -> String {
     for r in arr("rooms") {
         let _ = writeln!(
             o,
-            "  {} {}  epoch {}  last sync {}  entries held {}  sender keys held {}, received {}",
+            "  {} {}  epoch {}  last sync {}  rows {}  log entries {}  sender keys held {}, received {}",
             short(s(r, "id")),
             s(r, "name"),
             r.get("epoch").and_then(Value::as_u64).unwrap_or(0),
             ago(now, &r["last_sync_ms"]),
             r.get("entries").and_then(Value::as_u64).unwrap_or(0),
+            r.get("log_entries").and_then(Value::as_u64).unwrap_or(0),
             r.get("key_generations")
                 .and_then(Value::as_u64)
                 .unwrap_or(0),

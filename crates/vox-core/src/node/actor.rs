@@ -290,15 +290,19 @@ const VIEW_LOCK_PATIENCE: Duration = Duration::from_millis(250);
 /// How long [`NodeHandle::open_detail`] waits for an open room's detail to reach the view.
 const OPEN_DETAIL_PATIENCE: Duration = Duration::from_secs(2);
 
-/// A room's summary for the view, from its state.
-fn summary_of(ch: &ChannelState) -> ChannelSummary {
+/// A room's summary for the view, from its state and `rows`, the rows the detail published
+/// with it shows ([`crate::node::channel::DisplayStamp::rows`]): what `vox status` counts for
+/// the room is what `vox room read` pages (ADR-038 FX-16, #995), never the contiguous feed's
+/// length, which a late joiner's rows lie below.
+fn summary_of(ch: &ChannelState, rows: u64) -> ChannelSummary {
     ChannelSummary {
         channel_id: ch.channel_id(),
         name: ch.name().map(str::to_owned),
         open: true,
         preparing: false,
         waiting: None,
-        entries: ch.entry_count() as u64,
+        entries: rows,
+        log_entries: ch.entry_count() as u64,
         over: over_of(ch),
     }
 }
@@ -7639,7 +7643,10 @@ impl Node {
                 self.now_ms(),
                 &self.display_sequence,
             ) {
-                Ok(detail) => Ok(Some((summary_of(&channel), detail))),
+                Ok(detail) => {
+                    let rows = detail.display_stamp.rows();
+                    Ok(Some((summary_of(&channel, rows), detail)))
+                }
                 Err(error) => {
                     detail_failed(&mut channel, &error);
                     Err(error)
@@ -18929,8 +18936,9 @@ impl Node {
                     &self.display_sequence,
                 ) {
                     Ok(detail) => {
+                        let rows = detail.display_stamp.rows();
                         self.fresh_details
-                            .insert(channel_id, (summary_of(&ch), detail));
+                            .insert(channel_id, (summary_of(&ch, rows), detail));
                     }
                     Err(error) => detail_failed(&mut ch, &error),
                 }
@@ -20265,6 +20273,10 @@ impl Node {
                 .collect();
             // From the room as last published, never its lock: a sync session holds that lock
             // while it runs, and a status read must not wait on it or come back blank (#58).
+            let summary = view
+                .channels
+                .iter()
+                .find(|c| c.channel_id == room.channel_id);
             report.rooms.push(RoomStatus {
                 id: room.channel_id,
                 name: crate::node::resolver::room_shown_here(
@@ -20280,11 +20292,8 @@ impl Node {
                 received_key_generations: room.received_key_generations,
                 frozen: room.frozen.clone(),
                 refused_below_checkpoint: room.refused_below_checkpoint,
-                entries: view
-                    .channels
-                    .iter()
-                    .find(|c| c.channel_id == room.channel_id)
-                    .map_or(0, |c| c.entries),
+                entries: summary.map_or(0, |c| c.entries),
+                log_entries: summary.map_or(0, |c| c.log_entries),
                 members,
             });
         }
@@ -21551,8 +21560,9 @@ impl Node {
         };
         match detail {
             Ok(detail) => {
+                let rows = detail.display_stamp.rows();
                 self.fresh_details
-                    .insert(*channel_id, (summary_of(&ch), detail));
+                    .insert(*channel_id, (summary_of(&ch, rows), detail));
             }
             Err(error) => detail_failed(&mut ch, &error),
         }
@@ -21594,6 +21604,7 @@ impl Node {
                 preparing: false,
                 waiting: None,
                 entries: 0,
+                log_entries: 0,
                 over: None,
             })
             .collect();
@@ -21837,7 +21848,6 @@ impl Node {
                     observed_at,
                 },
             );
-            summaries.insert(*id, summary_of(&ch));
             mlock_active &= ch.mlock_active();
             let detail = self
                 .profile
@@ -21858,18 +21868,30 @@ impl Node {
             match detail {
                 Ok(detail) => {
                     read.insert(*id);
+                    summaries.insert(*id, summary_of(&ch, detail.display_stamp.rows()));
                     open_channels.push(detail);
                 }
                 Err(error) => {
                     // Preserve the last successful view during bounded Session catch-up.
                     // Actual I/O failure still poisons and follows existing recovery.
                     detail_failed(&mut ch, &error);
-                    if let Some(detail) = self
+                    let kept = self
                         .fresh_details
                         .get(id)
                         .map(|(_, detail)| detail)
-                        .or_else(|| prev.open_channels.iter().find(|d| d.channel_id == *id))
-                    {
+                        .or_else(|| prev.open_channels.iter().find(|d| d.channel_id == *id));
+                    // The rows as last published, with the detail kept or the summary kept.
+                    let rows = kept
+                        .map(|detail| detail.display_stamp.rows())
+                        .or_else(|| {
+                            prev.channels
+                                .iter()
+                                .find(|c| c.channel_id == *id)
+                                .map(|c| c.entries)
+                        })
+                        .unwrap_or(0);
+                    summaries.insert(*id, summary_of(&ch, rows));
+                    if let Some(detail) = kept {
                         open_channels.push(detail.clone());
                     }
                 }
@@ -21892,6 +21914,7 @@ impl Node {
                             preparing: false,
                             waiting: None,
                             entries: 0,
+                            log_entries: 0,
                             over: None,
                         }),
                 },
@@ -21907,6 +21930,7 @@ impl Node {
                         .get(id)
                         .and_then(|prepared| prepared.waiting.clone()),
                     entries: 0,
+                    log_entries: 0,
                     over: None,
                 },
             });

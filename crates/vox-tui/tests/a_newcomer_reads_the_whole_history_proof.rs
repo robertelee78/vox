@@ -275,6 +275,9 @@ struct Held {
     oldest: Option<String>,
     /// The pages read.
     pages: usize,
+    /// Every row paged, whatever its text, as a person is shown them: the `post <i>` rows,
+    /// alice's live rows, and the placeholder for a body not received yet.
+    rows: usize,
 }
 
 fn held(dir: &Path, room: &str, page: usize) -> Held {
@@ -327,6 +330,7 @@ fn held(dir: &Path, room: &str, page: usize) -> Held {
         }
     }
     let pages = pages_newest_first.len();
+    let rows = pages_newest_first.iter().map(Vec::len).sum();
     let order = pages_newest_first
         .iter()
         .rev()
@@ -342,6 +346,7 @@ fn held(dir: &Path, room: &str, page: usize) -> Held {
         order,
         oldest: before,
         pages,
+        rows,
     }
 }
 
@@ -813,6 +818,13 @@ const HOOK_UNANSWERED: &str = "did not answer promptly";
 /// Hook runs during the load, a quarter second apart: about a minute of a harness at work, the
 /// time a late joiner's live window and the pages below it take to arrive (ADR-037 R1).
 const HOOK_RUNS: usize = 200;
+/// How long the room's count in `vox status --json` must have held still (every reading the same)
+/// before it is compared with a paged read: the pages bob asked for last are let land. Apparatus
+/// only: the count is read from the status, never waited into agreement with the rows.
+const COUNT_STILL_FOR: Duration = Duration::from_secs(1);
+/// Within this of the hook runs' end the count MUST have held still for [`COUNT_STILL_FOR`]; a
+/// count that never holds still is staging not achieved, not a verdict.
+const COUNT_STILL_WITHIN: Duration = Duration::from_secs(10);
 
 /// **The daemon answers the harness hook while it syncs** (ADR-038 FX-17; #981): alice holds a
 /// room with a [`BACKLOG`] of posts; bob joins, asks for the pages below his window as a reader
@@ -825,8 +837,17 @@ const HOOK_RUNS: usize = 200;
 /// (v0.4.7, four nodes working): `vox status` answered in 0.5 s and the hook said "did not
 /// answer promptly" twice in one session.
 ///
-/// Mutant: the control acceptor made to wait on the actor's turn (a sleep past 500 ms in the
-/// hook's greeting path) turns the first assertion red on the hook's own sentence.
+/// **`vox status` counts the rows bob reads** (ADR-038 FX-16; #995): once the runs are over and
+/// the room's count in bob's `vox status --json` has held still for [`COUNT_STILL_FOR`],
+/// `rooms[].entries` MUST equal, exactly, the rows one paged `vox room read --json` of the room
+/// then pages. Found 2026-10-20 in this staging: bob read 14, 32, …, 115 rows as the minute went
+/// on while `vox status` said 2, then 5: the length of his contiguous feed, which a late
+/// joiner's rows lie below.
+///
+/// Mutants: the control acceptor made to wait on the actor's turn (a sleep past 500 ms in the
+/// hook's greeting path) turns the first assertion red on the hook's own sentence; the
+/// contiguous feed's length restored as the room's count (`entry_count()` in `summary_of`)
+/// turns the FX-16 claim red on its two numbers.
 #[cfg(feature = "optional-proofs")]
 #[test]
 #[ignore = "a timing bound a person feels; two real vox daemons; optional, run it in release"]
@@ -1039,15 +1060,15 @@ fn a_daemon_answers_the_hook_while_syncing() {
         // Not the claim under test, but the red must say whose fault: what each daemon's lanes
         // did meanwhile, and whether bob's room is still preparing.
         let (_, bob_rooms, _) = vox(&bob, &["room", "list"], None);
-        let status_entries = held_entries(&bob);
+        let status_rows = status_rows(&bob, &room);
         let (_, bob_status, _) = vox(&bob, &["status", "--json"], None);
         let (_, alice_status, _) = vox(&alice, &["status", "--json"], None);
         panic!(
             "PRODUCT: a late joiner's fetch did not run while the harness hook ran: bob held \
              {held_at_join} rows at his join and {held_after} after {HOOK_RUNS} hook runs over \
              {:?}, with {pages_asked} pages asked for and alice's 40 live posts accepted (needs 32 \
-             more rows for the fetch to count as under way); `vox status` counts {status_entries} \
-             entries\nbob's rooms: {}\nbob's lanes: {}\n\
+             more rows for the fetch to count as under way); `vox status` counts {status_rows:?} \
+             rows\nbob's rooms: {}\nbob's lanes: {}\n\
              alice's lanes: {}\nbob's daemon said: {}\nalice's daemon said: {}",
             runs.iter().map(|(d, _, _)| *d).sum::<Duration>(),
             bob_rooms.trim(),
@@ -1092,25 +1113,75 @@ fn a_daemon_answers_the_hook_while_syncing() {
         runs.iter().map(|(d, _, _)| *d).collect::<Vec<_>>(),
         said(&bob, "bob")
     );
+
+    // ---- `vox status` counts the rows bob reads (ADR-038 FX-16; #995) ------------------------
+    // The fetch is let settle first: the room's count is read until every reading over
+    // [`COUNT_STILL_FOR`] is the same, within [`COUNT_STILL_WITHIN`] (else staging not
+    // achieved). Then the room is paged once, and the still count MUST equal the rows paged,
+    // exactly. One more reading after the page tells a page that landed between the still count
+    // and the read (apparatus) from a count that is not the rows (product).
+    let settling = Instant::now();
+    let mut still_since = Instant::now();
+    let mut counted = status_rows(&bob, &room);
+    loop {
+        let Some(count) = counted else {
+            let (_, status, err) = vox(&bob, &["status", "--json"], None);
+            panic!(
+                "PRODUCT: bob's `vox status --json` does not count the room's rows under \
+                 rooms[].entries (ADR-038 FX-16, #995); it said: {status}{err}"
+            );
+        };
+        if still_since.elapsed() >= COUNT_STILL_FOR {
+            break;
+        }
+        assert!(
+            settling.elapsed() < COUNT_STILL_WITHIN,
+            "APPARATUS: staging not achieved: bob's `vox status --json` count for the room did \
+             not hold still for {COUNT_STILL_FOR:?} within {COUNT_STILL_WITHIN:?} of the hook \
+             runs' end; it last said {count}"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+        let again = status_rows(&bob, &room);
+        if again != counted {
+            counted = again;
+            still_since = Instant::now();
+        }
+    }
+    let counted = counted.unwrap_or(0);
+    let paged = held(&bob, &room, PAGE).rows as u64;
+    let counted_after = status_rows(&bob, &room);
+    println!(
+        "[proof] ADR-038 FX-16 / #995: bob's `vox status --json` counted {counted} rows for the \
+         room, still for {COUNT_STILL_FOR:?}; `vox room read --json` then paged {paged}; the \
+         count read again: {counted_after:?}"
+    );
+    if paged != counted && counted_after == Some(paged) {
+        panic!(
+            "APPARATUS: staging not achieved: a page landed between the still count and the \
+             read: bob's `vox status --json` counted {counted} rows, `vox room read --json` paged \
+             {paged}, and the count read again was {paged}"
+        );
+    }
+    assert!(
+        paged == counted,
+        "PRODUCT: `vox status --json` does not count the rows bob reads (ADR-038 FX-16, #995): \
+         rooms[].entries said {counted} (still for {COUNT_STILL_FOR:?}) and {counted_after:?} \
+         after, while `vox room read --json` paged {paged} rows of the room"
+    );
 }
 
-/// How many rows of the room a profile holds, from `vox status --json` (0 when unreadable).
-fn held_entries(dir: &Path) -> u64 {
+/// What `vox status --json` counts for the room under `rooms[].entries`: the rows the node shows
+/// of it (ADR-038 FX-16, #995). `None` when the status cannot be read or does not list the room.
+fn status_rows(dir: &Path, room: &str) -> Option<u64> {
     let (ok, out, _) = vox(dir, &["status", "--json"], None);
     if !ok {
-        return 0;
+        return None;
     }
-    serde_json::from_str::<serde_json::Value>(&out)
-        .ok()
-        .and_then(|v| {
-            v["rooms"].as_array().map(|rooms| {
-                rooms
-                    .iter()
-                    .map(|r| r["entries"].as_u64().unwrap_or(0))
-                    .sum()
-            })
-        })
-        .unwrap_or(0)
+    serde_json::from_str::<serde_json::Value>(&out).ok()?["rooms"]
+        .as_array()?
+        .iter()
+        .find(|r| r["id"].as_str().is_some_and(|id| id.starts_with(room)))?["entries"]
+        .as_u64()
 }
 
 /// `vox room list` MUST name what a preparing room waits for within this of the daemon's start.
