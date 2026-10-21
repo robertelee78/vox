@@ -1651,6 +1651,133 @@ pub(crate) fn shown_tags(tags: &[String]) -> String {
         .join(" ")
 }
 
+/// Test-only: hold reply-prefix resolution after its first bounded page while this file exists;
+/// write a sibling `.reached` marker first. A proof changes the real room during that hold and
+/// requires the shipped CLI to refuse the stale scan. Absent from packaged builds.
+#[cfg(feature = "test-knobs")]
+const TEST_REPLY_PREFIX_HOLD_ENV: &str = "VOX_TEST_REPLY_PREFIX_HOLD_FILE";
+#[cfg(feature = "test-knobs")]
+const TEST_REPLY_PREFIX_HOLD_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+
+#[cfg(feature = "test-knobs")]
+async fn hold_reply_prefix_after_first_page(before: Option<Digest32>) -> Result<(), AppError> {
+    if before.is_some() {
+        return Ok(());
+    }
+    let Some(hold) = std::env::var_os(TEST_REPLY_PREFIX_HOLD_ENV).filter(|path| !path.is_empty())
+    else {
+        return Ok(());
+    };
+    let hold = std::path::PathBuf::from(hold);
+    let reached = hold.with_extension("reached");
+    std::fs::write(&reached, b"reached").map_err(|error| {
+        AppError::Usage(format!(
+            "reply-prefix proof could not mark {}: {error}",
+            reached.display()
+        ))
+    })?;
+    while hold.exists() {
+        tokio::time::sleep(TEST_REPLY_PREFIX_HOLD_POLL).await;
+    }
+    Ok(())
+}
+
+/// Resolve a shortened reply selector among readable room messages. Exact hashes keep the
+/// direct lookup path; prefixes scan bounded pages and name every matching id when ambiguous.
+async fn reply_entry(
+    client: &mut IpcClient,
+    cid: Digest32,
+    typed: &str,
+) -> Result<String, AppError> {
+    let prefix = typed.trim().to_ascii_lowercase();
+    if prefix.len() == B32_DIGEST_LEN {
+        return Ok(prefix);
+    }
+    if prefix.is_empty()
+        || prefix.len() > B32_DIGEST_LEN
+        || !prefix
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b))
+    {
+        return Err(AppError::Usage(format!(
+            "cannot reply to {typed}: expected an entry hash or its unique base32 prefix"
+        )));
+    }
+    let display_revision = match client
+        .request(&Request::RoomDisplayRevision { channel_id: cid })
+        .await?
+    {
+        Frame::RoomDisplayRevision { revision } => revision,
+        Frame::Error { reason } => return Err(AppError::Usage(reason)),
+        other => return Err(crate::client::unexpected(&other)),
+    };
+    let mut before = None;
+    let mut found = std::collections::BTreeSet::new();
+    loop {
+        let (rows, older, provisional) = match client
+            .request(&Request::RoomPage {
+                channel_id: cid,
+                before,
+                limit: 0,
+            })
+            .await?
+        {
+            Frame::RoomPage {
+                rows,
+                older,
+                provisional,
+            } => (rows, older, provisional),
+            Frame::Error { reason } => return Err(AppError::Usage(reason)),
+            other => return Err(crate::client::unexpected(&other)),
+        };
+        #[cfg(feature = "test-knobs")]
+        hold_reply_prefix_after_first_page(before).await?;
+        let current_revision = match client
+            .request(&Request::RoomDisplayRevision { channel_id: cid })
+            .await?
+        {
+            Frame::RoomDisplayRevision { revision } => revision,
+            Frame::Error { reason } => return Err(AppError::Usage(reason)),
+            other => return Err(crate::client::unexpected(&other)),
+        };
+        if provisional || current_revision != display_revision {
+            return Err(AppError::Usage(
+                "cannot resolve reply prefix: the room changed while its entries were read; read the room and retry"
+                    .into(),
+            ));
+        }
+        for row in &rows {
+            let hash = b32_encode(&row.entry_hash);
+            if hash.starts_with(&prefix) {
+                found.insert(hash);
+            }
+        }
+        if older == 0 {
+            break;
+        }
+        let next = rows.first().map(|row| row.entry_hash);
+        if next.is_none() || next == before {
+            return Err(AppError::Usage(
+                "cannot resolve reply prefix: the room page changed; read the room and retry"
+                    .into(),
+            ));
+        }
+        before = next;
+    }
+    match found.len() {
+        0 => Err(AppError::Usage(format!(
+            "cannot reply to {typed}: no message printed by room read matches that entry prefix; nothing was posted"
+        ))),
+        1 => found.into_iter().next().ok_or_else(|| {
+            AppError::Usage("cannot resolve reply prefix; read the room and retry".into())
+        }),
+        _ => Err(AppError::Usage(format!(
+            "cannot reply to {typed}: entry prefix is ambiguous; it matches {}; use more characters",
+            found.into_iter().collect::<Vec<_>>().join(", ")
+        ))),
+    }
+}
+
 /// What a post answers, its hop budget and its known thread root, by the rule `vox room post` and
 /// `vox share` follow (V210-121, ADR-020 §9): `re` if given, else the one unanswered message that
 /// woke `session`; and that parent's budget less one.
@@ -1673,7 +1800,7 @@ pub(crate) async fn answers(
     // that way woke each other for ever. When exactly one wake is unanswered, that is the reply;
     // with several, the agent must say which.
     let re = match (re, session) {
-        (Some(re), _) => Some(re.to_owned()),
+        (Some(re), _) => Some(reply_entry(client, cid, re).await?),
         (None, None) => None,
         (None, Some(session)) => {
             // The wakes and what followed the oldest of them, read from there (V210-120).

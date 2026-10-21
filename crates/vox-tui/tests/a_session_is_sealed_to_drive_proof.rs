@@ -1790,7 +1790,11 @@ fn legacy_placeholder_journey(
         let (ok, out, err) = member.vox(&["room", "read", room, "--json"], None);
         assert!(ok, "PRODUCT: receiver room read failed: {out}{err}");
         out.lines()
-            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).unwrap_or_else(|error| {
+                    panic!("PRODUCT: room read returned invalid JSON row {line:?}: {error}")
+                })
+            })
             .any(|row| row["entry_hash"] == b32_encode(&hash) && row["owed"] == true)
     };
     offer(&skeleton(&legacy));
@@ -1798,6 +1802,67 @@ fn legacy_placeholder_journey(
     assert!(
         owed(bob, legacy.entry_hash()) && owed(bob, ordinary.entry_hash()),
         "APPARATUS: the receiver never showed both staged missing bodies before the index"
+    );
+    // FX-14: a row printed as not received yet still participates in prefix uniqueness. The
+    // selected body remains unavailable, so the existing reply rule refuses it for that exact
+    // reason. Mutant: skip `row.owed` while resolving reply prefixes; the command instead says no
+    // printed entry matched this prefix.
+    let owed_hashes = [legacy.entry_hash(), ordinary.entry_hash()];
+    let (ok, shown, err) = bob.vox(&["room", "read", room, "--json"], None);
+    assert!(
+        ok,
+        "PRODUCT: receiver could not read its staged missing-body rows: {shown}{err}"
+    );
+    let shown_hashes: Vec<String> = shown
+        .lines()
+        .map(|line| {
+            let row: serde_json::Value = serde_json::from_str(line).unwrap_or_else(|error| {
+                panic!("PRODUCT: room read returned invalid JSON row {line:?}: {error}")
+            });
+            row["entry_hash"]
+                .as_str()
+                .unwrap_or_else(|| {
+                    panic!("PRODUCT: room read row named no string entry_hash: {row}")
+                })
+                .to_owned()
+        })
+        .collect();
+    let (owed_full, owed_prefix) = owed_hashes
+        .iter()
+        .filter_map(|hash| {
+            let full = b32_encode(hash);
+            let prefix = full.get(..8)?.to_owned();
+            (shown_hashes
+                .iter()
+                .filter(|entry| entry.starts_with(&prefix))
+                .count()
+                == 1)
+                .then_some((full, prefix))
+        })
+        .next()
+        .expect(
+            "APPARATUS: neither printed missing-body entry had a unique eight-character prefix",
+        );
+    let (reply_ok, reply_out, reply_err) = bob.vox(
+        &[
+            "room",
+            "post",
+            room,
+            "--json",
+            "--re",
+            &owed_prefix,
+            "OWED-PREFIX-REPLY",
+        ],
+        None,
+    );
+    assert!(
+        !reply_ok && reply_err.contains("cannot read that message"),
+        "PRODUCT: printed owed prefix {owed_prefix} must resolve to {owed_full} before the unavailable-body refusal: {reply_out}{reply_err}"
+    );
+    let (ok, after_reply, err) = bob.vox(&["room", "read", room, "--json"], None);
+    assert!(
+        ok && !after_reply.contains("OWED-PREFIX-REPLY"),
+        "PRODUCT: refusing the owed parent still posted the reply: {after_reply}{err}"
     );
     offer(&declaration);
     assert!(
@@ -2071,6 +2136,104 @@ fn a_sessions_append_waits_for_the_fold_and_a_read_meanwhile_is_provisional() {
     println!(
         "[proof] (7a) alice's read while held:\n{}",
         shown.lines().take(3).collect::<Vec<_>>().join("\n")
+    );
+    // FX-14: a prefix is resolved only against a stable, non-provisional room view. The fold hold
+    // gives the real daemon a provisional page. Mutant: remove `provisional` from reply_entry's
+    // refusal; this command posts and the final absence assertion turns PRODUCT red.
+    let (ok, rows, err) = alice.vox(&["room", "read", &room, "--json"], None);
+    assert!(
+        ok,
+        "PRODUCT: alice could not read JSON while her room view was provisional: {rows}{err}"
+    );
+    let provisional_parent = rows
+        .lines()
+        .map(|line| {
+            let row: serde_json::Value = serde_json::from_str(line).unwrap_or_else(|error| {
+                panic!("PRODUCT: provisional room read returned invalid JSON row {line:?}: {error}")
+            });
+            row["entry_hash"]
+                .as_str()
+                .unwrap_or_else(|| {
+                    panic!("PRODUCT: provisional room row named no string entry_hash: {row}")
+                })
+                .to_owned()
+        })
+        .next()
+        .expect("PRODUCT: provisional room read printed no entry to reply to");
+    let provisional_prefix = provisional_parent.get(..8).unwrap_or_else(|| {
+        panic!(
+            "PRODUCT: provisional room read printed no eight-character ASCII selector: {provisional_parent:?}"
+        )
+    });
+    let (reply_ok, reply_out, reply_err) = alice.vox(
+        &[
+            "room",
+            "post",
+            &room,
+            "--re",
+            provisional_prefix,
+            "PROVISIONAL-PREFIX-REPLY",
+        ],
+        None,
+    );
+    assert!(
+        !reply_ok && reply_err.contains("room changed"),
+        "PRODUCT: reply prefix was resolved from a provisional room view: {reply_out}{reply_err}"
+    );
+    let (ok, after_reply, err) = alice.vox(&["room", "read", &room, "--json"], None);
+    assert!(
+        ok && !after_reply.contains("PROVISIONAL-PREFIX-REPLY"),
+        "PRODUCT: provisional reply-prefix refusal still posted the reply: {after_reply}{err}"
+    );
+    // A full hash is already unambiguous and keeps its direct path: it does not scan or depend on
+    // the page's provisional flag. Mutant: remove reply_entry's exact-hash fast path; this command
+    // is incorrectly refused by the provisional-prefix guard above.
+    assert!(
+        provisional_parent.len() == vox_core::node::link::B32_DIGEST_LEN,
+        "PRODUCT: room read printed a non-canonical full entry hash: {provisional_parent:?}"
+    );
+    let (exact_ok, exact_out, exact_err) = alice.vox(
+        &[
+            "room",
+            "post",
+            &room,
+            "--json",
+            "--re",
+            &provisional_parent,
+            "PROVISIONAL-EXACT-REPLY",
+        ],
+        None,
+    );
+    assert!(
+        exact_ok,
+        "PRODUCT: exact reply hash was refused merely because the room view was provisional: {exact_out}{exact_err}"
+    );
+    let exact_reply: serde_json::Value = serde_json::from_str(&exact_out).unwrap_or_else(|error| {
+        panic!("PRODUCT: exact provisional reply returned invalid JSON {exact_out:?}: {error}")
+    });
+    let exact_hash = exact_reply["entry_hash"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!("PRODUCT: exact provisional reply named no string entry_hash: {exact_reply}")
+        })
+        .to_owned();
+    let (ok, exact_rows, err) = alice.vox(&["room", "read", &room, "--json"], None);
+    assert!(
+        ok,
+        "PRODUCT: room read failed after exact provisional reply: {exact_rows}{err}"
+    );
+    let exact_row = exact_rows.lines().find_map(|line| {
+        let row: serde_json::Value = serde_json::from_str(line).unwrap_or_else(|error| {
+            panic!("PRODUCT: room read returned invalid JSON row {line:?}: {error}")
+        });
+        (row["entry_hash"] == exact_hash).then_some(row)
+    });
+    let exact_row = exact_row.unwrap_or_else(|| {
+        panic!("PRODUCT: room read omitted exact provisional reply {exact_hash}: {exact_rows}")
+    });
+    assert!(
+        exact_row["envelope"]["re"] == provisional_parent,
+        "PRODUCT: exact provisional reply did not keep parent {provisional_parent}: {exact_row}"
     );
 
     // ---- (b) her Session's next entry does not leave while held; (c) her text does ----
