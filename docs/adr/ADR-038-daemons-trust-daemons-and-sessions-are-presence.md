@@ -382,20 +382,31 @@ The decider then answered twelve questions, one at a time. His answers are the d
   `deferred`, `retiring` or `cleanup` and no task runs it; the flow-state pool is
   `RETAINED_FLOWS` charges per daemon (16 today, each 128 KiB), shared by every hosted node.
   When an eligible port cannot reserve flow state because the pool is full, the daemon MUST,
-  before re-queuing the port, choose and dispose one parked flow under the ordering below,
-  release its charge, and retry that port's reservation, and MUST repeat those steps until the
-  reservation succeeds or no parked flow remains. Ordering: parked flows of ports without a
-  need first; if they do not suffice, other parked flows; within either group the flow parked
-  longest first, ties broken arbitrarily. Reclamation MUST be demand-triggered: the daemon MUST
-  NOT expire or defer a flow by a count of periods or turns, by elapsed time or by CPU time
-  (FX-27). Disposing a flow MUST re-arm only work still outstanding under FX-29 and MUST NOT
-  create a need from a hint the node already holds. `vox status --json` MUST report, for every
-  port under `lanes.ports[]`, `start_outcome`, equal to `never_attempted` before the first
-  start attempt and thereafter `started` or `not_started`, each later attempt replacing the
-  earlier, and `start_reason` when it is `not_started`, a stable code among
-  `flow_state_pool_full` (the reservation still failed after no parked flow remained),
-  `live_lane_busy`, `room_busy`, `control_budget_busy`, `archive_budget_busy` and
-  `no_outbound_slot`; and MUST report the pool under `lanes.budget.flow_state` as the integers
+  before re-queuing the port, repeat the following while that reservation has not succeeded
+  and a parked flow remains: choose and dispose exactly one parked flow under the ordering
+  below, release its charge, and retry that port's reservation. The release and retry MUST be
+  atomic with respect to other flow-state reservations. The daemon MUST re-queue the port only
+  if its reservation still fails after no parked flow remains. Ordering: parked flows of ports
+  without a need first; if they do not suffice, other parked flows; within either group the
+  flow parked longest first, ties broken arbitrarily. Flow-state reclamation under this rule
+  MUST be triggered only by an eligible port's failed reservation of a full pool. A period
+  count, turn count, elapsed-time threshold or CPU-time threshold MUST NOT trigger disposal,
+  expiry, deferral or flow-state reclamation (FX-27); parked duration MAY be used only to apply
+  the longest-first ordering above. Disposing a flow MUST re-arm only work still outstanding
+  under FX-29 and MUST NOT create a need from a hint the node already holds. A start attempt
+  is one scheduler invocation for an eligible port, including every reclamation and
+  reservation retry required above; it ends `started` only when it launches the bounded-sync
+  round, otherwise `not_started`. `vox status --json` MUST report, for every port under
+  `lanes.ports[]`, `start_outcome`, equal to `never_attempted` before the first start attempt
+  and thereafter `started` or `not_started`, each later attempt replacing the earlier, and
+  `start_reason`, present if and only if `start_outcome` is `not_started`, the first gate the
+  attempt failed in the order the daemon tests them: `room_busy` (the room's state could not be
+  taken without waiting), `live_lane_busy` (the node's live flow slot holds another flow),
+  `control_budget_busy` (the control-lane job could not be reserved), `flow_state_pool_full`
+  (the flow-state reservation still failed after no parked flow remained),
+  `archive_budget_busy` (the archive-lane job could not be reserved) and `no_outbound_slot`
+  (the outbound slot could not be taken); and MUST report the pool under
+  `lanes.budget.flow_state` as the integers
   `in_use` and `limit` and, under `by_node`, an integer in-use count per hosted node whose sum
   equals `in_use`. After a start attempt for any port in a room ends `flow_state_pool_full`,
   and until a later start attempt for any port in that room ends `started`, the room's "no
@@ -438,7 +449,7 @@ Narrow successor amendments. Requirements not named here remain in force.
 | No predecessor: no ADR names a durability class for the store or a flush under a room's lock | FX-30 and FX-31 are new rules |
 | PRD-001 R7, R8; ADR-023 M23.1: the admin sets the room's retention; it applies to what is stored at the next sweep | Preserved; FX-33 adds that the sweep never stops the room |
 | ADR-028 K-10, ADR-031 CW-2, CW-7: a node unlocked at a terminal is remembered in the Keychain so the daemon makes it Ready at each start | Preserved where a credential store exists (the Keychain); FX-34 adds that unlocking never depends on remembering, that Linux remembers nothing for now, and that Vox never writes a passphrase file on its own |
-| ADR-037 R7, R11; ADR-026: a bounded flow keeps its state between turns, within a daemon-wide pool | FX-35 adds that a full pool never keeps an eligible port from starting (parked flows are disposed on demand, never by time), and that every start attempt's outcome is reported |
+| ADR-037 R7, R11; ADR-026: a bounded flow keeps its state between turns, within a daemon-wide pool | FX-35 adds that a full pool never keeps an eligible port from starting (parked flows are disposed on demand, never by time), and that the latest start attempt's outcome is reported for every port |
 | ADR-034 §5 "Health is true" (HL-1, HL-2), PRD-001 R35 | The lane's completed rounds are completed syncs (FX-16); the control socket answers under sync load (FX-17) |
 
 ## Implementation order and related work
