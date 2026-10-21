@@ -402,18 +402,16 @@ The decider then answered twelve questions, one at a time. His answers are the d
   the current daemon process ends and thereafter equal to `started` or `not_started` for the
   most recently ended attempt (an in-progress attempt does not replace that value, and a daemon
   restart resets it to `never_attempted`), and
-  `start_reason`, present if and only if `start_outcome` is `not_started`, the first gate the
-  attempt failed in the order the daemon tests them: `room_busy` (the room's state could not be
+  `start_reason`, present if and only if `start_outcome` is `not_started`, the gates MUST be tested in the following order, and `start_reason` MUST equal the first gate that fails: `room_busy` (the room's state could not be
   taken without waiting), `live_lane_busy` (the node's live flow slot holds another flow),
   `control_budget_busy` (the control-lane job could not be reserved), `flow_state_pool_full`
   (the flow-state reservation still failed after no parked flow remained),
   `archive_budget_busy` (the archive-lane job could not be reserved) and `no_outbound_slot`
   (the outbound slot could not be taken); and MUST report the pool under
   `lanes.budget.flow_state` as the integers
-  `in_use` and `limit` and, under `by_node`, an integer in-use count per hosted node whose sum
-  equals `in_use`. After a start attempt for any port in a room ends `flow_state_pool_full`,
+  `in_use` and `limit` and, under `by_node`, an object with exactly one member per hosted node, keyed by that node's node ID, whose value is that node's integer in-use count; the member values MUST sum to `in_use`. After a start attempt for any port in a room ends `not_started` with `start_reason` equal to `flow_state_pool_full`,
   and until a later start attempt in the same daemon process for any port in that room ends
-  `started`, the room's "no completed sync" text in `vox status` and in the app MUST name the flow-state pool. Measured
+  `started`, the room's "no completed sync" text in `vox status` and in the app MUST contain the literal text `flow-state pool`. Measured
   cause, 2026-10-21 (UTC, as
   every date in this record): on the decider's daemon (four hosted nodes, three rooms,
   restarted 02:32Z) every port of every node had started no round, `queued` froze, every room
@@ -452,7 +450,7 @@ Narrow successor amendments. Requirements not named here remain in force.
 | No predecessor: no ADR names a durability class for the store or a flush under a room's lock | FX-30 and FX-31 are new rules |
 | PRD-001 R7, R8; ADR-023 M23.1: the admin sets the room's retention; it applies to what is stored at the next sweep | Preserved; FX-33 adds that the sweep never stops the room |
 | ADR-028 K-10, ADR-031 CW-2, CW-7: a node unlocked at a terminal is remembered in the Keychain so the daemon makes it Ready at each start | Preserved where a credential store exists (the Keychain); FX-34 adds that unlocking never depends on remembering, that Linux remembers nothing for now, and that Vox never writes a passphrase file on its own |
-| ADR-037 R7, R11; ADR-026: a bounded flow keeps its state between turns, within a daemon-wide pool | FX-35 adds that a full pool never keeps an eligible port from starting (parked flows are disposed on demand, never by time), and that the latest start attempt's outcome is reported for every port |
+| ADR-037 R7, R11; ADR-026: a bounded flow keeps its state between turns, within a daemon-wide pool | FX-35 adds that a full pool does not keep an eligible port from starting while any flow-state charge is held by a parked flow (parked flows are disposed on demand, never by time), and that the latest start attempt's outcome is reported for every port |
 | ADR-034 §5 "Health is true" (HL-1, HL-2), PRD-001 R35 | The lane's completed rounds are completed syncs (FX-16); the control socket answers under sync load (FX-17) |
 
 ## Implementation order and related work
