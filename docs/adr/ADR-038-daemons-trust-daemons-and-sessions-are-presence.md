@@ -378,26 +378,29 @@ The decider then answered twelve questions, one at a time. His answers are the d
 - **FX-35.** A full daemon-wide flow-state pool MUST NOT keep an eligible port from starting
   a bounded-sync round while any charge of that pool is held by a parked flow. Terms: a port is
   eligible when it has a need (ADR-037 R7: a raised request or a head newer than it served), a
-  connection to its peer and no round running; a flow is parked while it sits in `ready`,
+  connection to its peer and no bounded-sync round running for that port; a flow is parked while it sits in `ready`,
   `deferred`, `retiring` or `cleanup` and no task runs it; the flow-state pool is
   `RETAINED_FLOWS` charges per daemon (16 today, each 128 KiB), shared by every hosted node.
-  When an eligible port cannot reserve flow state solely because the pool is full, the daemon
-  MUST, before re-queuing the port, dispose enough parked flows to satisfy the reservation,
-  release their charges and retry that port's reservation. Parked flows of ports without a need
-  MUST be chosen first; if they do not suffice, other parked flows MUST be chosen; within either
-  group the flow parked longest MUST be chosen first, ties broken arbitrarily. Reclamation MUST
-  be demand-triggered: the daemon MUST NOT expire or defer a flow by a count of periods or
-  turns, by elapsed time or by CPU time (FX-27). Disposing a flow MUST re-arm only work still
-  outstanding under FX-29; a hint already held MUST NOT become eligible because its flow was
-  reclaimed. `vox status --json` MUST report, for every port, the outcome of its most recent
-  start attempt as `started`, `not_started` or `never_attempted`, with a stable reason code
-  when `not_started` (`flow_state_pool_full` after the reclamation above still fails,
-  `live_lane_busy`, `room_busy`, `control_budget_busy`, `archive_budget_busy`,
-  `no_outbound_slot`), each later attempt replacing the earlier outcome, and MUST report the
-  pool's integer `in_use` and `limit` with an integer in-use count per hosted node whose sum
-  equals `in_use`. If a room's most recent eligible start attempt ended `flow_state_pool_full`
-  and no later attempt for that room started, the room's "no completed sync" text in `vox
-  status` and in the app MUST name the flow-state pool. Measured cause, 2026-10-21 (UTC, as
+  When an eligible port cannot reserve flow state because the pool is full, the daemon MUST,
+  before re-queuing the port, choose and dispose one parked flow under the ordering below,
+  release its charge, and retry that port's reservation, and MUST repeat those steps until the
+  reservation succeeds or no parked flow remains. Ordering: parked flows of ports without a
+  need first; if they do not suffice, other parked flows; within either group the flow parked
+  longest first, ties broken arbitrarily. Reclamation MUST be demand-triggered: the daemon MUST
+  NOT expire or defer a flow by a count of periods or turns, by elapsed time or by CPU time
+  (FX-27). Disposing a flow MUST re-arm only work still outstanding under FX-29 and MUST NOT
+  create a need from a hint the node already holds. `vox status --json` MUST report, for every
+  port under `lanes.ports[]`, `start_outcome`, equal to `never_attempted` before the first
+  start attempt and thereafter `started` or `not_started`, each later attempt replacing the
+  earlier, and `start_reason` when it is `not_started`, a stable code among
+  `flow_state_pool_full` (the reservation still failed after no parked flow remained),
+  `live_lane_busy`, `room_busy`, `control_budget_busy`, `archive_budget_busy` and
+  `no_outbound_slot`; and MUST report the pool under `lanes.budget.flow_state` as the integers
+  `in_use` and `limit` and, under `by_node`, an integer in-use count per hosted node whose sum
+  equals `in_use`. After a start attempt for any port in a room ends `flow_state_pool_full`,
+  and until a later start attempt for any port in that room ends `started`, the room's "no
+  completed sync" text in `vox status` and in the app MUST name the flow-state pool. Measured
+  cause, 2026-10-21 (UTC, as
   every date in this record): on the decider's daemon (four hosted nodes, three rooms,
   restarted 02:32Z) every port of every node had started no round, `queued` froze, every room
   said "no completed sync in 10 minutes", and posts moved neither between the two Macs nor
