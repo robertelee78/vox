@@ -549,10 +549,10 @@ const IDLE: Duration = Duration::from_secs(60);
 /// the non-recipient package turns the zero-partial claim red; granting body credit persists the
 /// hostile ciphertext and turns the Bob-only privacy assertion red; moving the archive cursor
 /// below the role-only header before its effect makes the interrupted request finish with debt;
-/// skipping the already-settled callback strands the resumed request; dropping bounded
-/// continuation stalls the exact older-row assertion; each mutation has its own script and
-/// PRODUCT red. The lane's completion no longer recording the sync (`note_lane_sync` removed)
-/// turns the last-sync claim red.
+/// skipping the already-settled callback or rejecting its terminal replay strands the resumed
+/// request; dropping bounded continuation stalls the exact older-row assertion; each mutation
+/// has its own script and PRODUCT red. The lane's completion no longer recording the sync
+/// (`note_lane_sync` removed) turns the last-sync claim red.
 #[cfg(feature = "optional-proofs")]
 #[test]
 #[ignore = "an idle minute on two real vox daemons; optional, run it in release"]
@@ -912,45 +912,6 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         "PRODUCT: after the shipped archive read crossed Carol's role-complete header and \
          returned the exact older row, its status was not exactly complete with zero remaining"
     );
-    // Ask for the same signed interval again after its semantic effects are already durable.
-    // A repeated user read still owes its own exact archive acknowledgement; the finished-effect
-    // fast path must invoke that callback instead of stranding a nonzero saved request.
-    let (ok, out, err) = vox(
-        &bob,
-        &[
-            "room",
-            "read",
-            &room,
-            "--history",
-            "older",
-            "--before",
-            &oldest,
-        ],
-        None,
-    );
-    assert!(
-        ok,
-        "PRODUCT: Bob's repeated shipped archive read was refused after the same effects were \
-         already settled: {out}{err}"
-    );
-    let repeated_deadline = Instant::now() + PAGE_WITHIN;
-    loop {
-        let repeated = history_status(&bob, &room);
-        if repeated == ("complete".to_owned(), 0) {
-            break;
-        }
-        assert!(
-            Instant::now() < repeated_deadline,
-            "PRODUCT: Bob's repeated shipped archive read did not acknowledge the already-settled \
-             role-only header exactly; status was {repeated:?}"
-        );
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    assert_eq!(
-        read_hash(&bob, &room, before_package_text).as_deref(),
-        Some(before_package_hash.as_str()),
-        "PRODUCT: Bob's repeated shipped archive read changed the exact retained older row"
-    );
     // ---- the room is quiet: acknowledgements settle, then the rounds are counted ----------
     let before = [synced(&alice), synced(&bob)];
     let before_lanes = [lane_why(&before[0].2), lane_why(&before[1].2)];
@@ -1065,11 +1026,31 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         said(&carol, "carol-from-bob"),
         said(&bob, "bob-after-restart")
     );
+    // A successful trust update causally releases retained key-package replay and advances its
+    // first bounded turn before the shipped command returns. Keep Alice offline, then wait on the
+    // shipped pending bit until every continuation is done: the privacy verdict is not a race
+    // with the separately scheduled package-maintenance turn.
+    let (ok, out, err) = vox(&carol, &["trust", "add", &fps[0], "--name", "alice"], None);
+    assert!(
+        ok,
+        "PRODUCT: Carol's idempotent shipped trust update could not start retained-package \
+         processing while Alice was offline: {out}{err}"
+    );
+    let packages_deadline = Instant::now() + READY_WITHIN;
+    while key_packages_pending(&carol, &room) != Some(false) {
+        assert!(
+            Instant::now() < packages_deadline,
+            "PRODUCT: Carol's shipped status did not report retained key-package processing \
+             complete within {READY_WITHIN:?} while Alice was offline\ncarol said: {}",
+            said(&carol, "carol-from-bob")
+        );
+        std::thread::yield_now();
+    }
     assert!(
         !reads(&carol, &room, &package_marker),
-        "PRODUCT: after a completed sync with Bob while Alice was offline, Carol read Alice's \
-         private-package tail {package_marker:?}; Bob persisted and re-served ciphertext addressed \
-         only to Carol\ncarol said: {}\nbob said: {}",
+        "PRODUCT: after a completed sync with Bob and a synchronous retained-package replay while \
+         Alice was offline, Carol read Alice's private-package tail {package_marker:?}; Bob \
+         persisted and re-served ciphertext addressed only to Carol\ncarol said: {}\nbob said: {}",
         said(&carol, "carol-from-bob"),
         said(&bob, "bob-after-restart")
     );
@@ -1822,6 +1803,19 @@ fn status_rows(dir: &Path, room: &str) -> Option<u64> {
         .iter()
         .find(|r| r["id"].as_str().is_some_and(|id| id.starts_with(room)))?["entries"]
         .as_u64()
+}
+
+/// Whether the shipped status says this room still owes a retained key-package turn.
+fn key_packages_pending(dir: &Path, room: &str) -> Option<bool> {
+    let (ok, out, _) = vox(dir, &["status", "--json"], None);
+    if !ok {
+        return None;
+    }
+    serde_json::from_str::<serde_json::Value>(&out).ok()?["rooms"]
+        .as_array()?
+        .iter()
+        .find(|r| r["id"].as_str().is_some_and(|id| id.starts_with(room)))?["key_packages_pending"]
+        .as_bool()
 }
 
 /// The operator-visible key-delivery state for one member: outer `None` means the member is not

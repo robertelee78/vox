@@ -975,7 +975,22 @@ pub fn role_header_admitted(
     let _charge = charge(job, STATE_WORK)?;
     let key = key(context)?;
     let scope = scope(context);
-    let mut state = live(batch, key, &scope, context, active)?;
+    let mut state = load(batch, key, &scope)?.ok_or_else(|| invalid("no history demand"))?;
+    // The same settled semantic effect can be handed back after the callback that completed
+    // this request: bounded contiguous feed restoration continues independently and asks the
+    // effect step to finish once more. Match the exact activation and authorize it before the
+    // terminal idempotence check; `Active::matches` intentionally rejects terminal work.
+    if active.node != context.fingerprint()
+        || !active.valid
+        || active.cancellation.is_cancelled()
+        || active.scope != state.scope
+        || active.request != state.request
+        || active.serial != state.serial
+        || active.binding != state.binding
+    {
+        return Err(invalid("history demand is paused, cancelled or replaced"));
+    }
+    authorize_in(batch, context, state.binding)?;
     if seq < state.bounds.lo || seq > state.bounds.hi {
         return Err(invalid("role-complete history header exceeds demand"));
     }
@@ -991,6 +1006,9 @@ pub fn role_header_admitted(
             }));
     if already_admitted {
         return Ok(());
+    }
+    if !active.matches(&state) {
+        return Err(invalid("history demand is paused, cancelled or replaced"));
     }
     if state.body.is_some()
         || state.cleanup.is_some()

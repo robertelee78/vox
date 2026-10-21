@@ -686,6 +686,8 @@ pub struct ChannelDetail {
     /// How many generations of other members' sender keys it holds here (PRD-001 R14 on the
     /// receiving side).
     pub received_key_generations: usize,
+    /// Whether a bounded scan or retained key-package replay still owes this room another turn.
+    pub key_packages_pending: bool,
     /// Authors this node froze here for signing two entries at one position (ADR-008).
     pub frozen: Vec<Digest32>,
     /// Entries this node refused here as at or below their author's checkpoint since it opened

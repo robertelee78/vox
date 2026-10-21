@@ -445,6 +445,7 @@ fn detail_of(
         retention_above_room: ch.retention_above_room(),
         key_generations: ch.key_generations(),
         received_key_generations: ch.received_key_generations(),
+        key_packages_pending: ch.key_packages_pending(),
         frozen,
         refused_below_checkpoint,
         read_by,
@@ -16199,7 +16200,10 @@ impl Node {
             self.key_package_rooms.entry(*channel_id).or_insert(false);
         }
         let Some(pending) = progress.package else {
-            return false;
+            // Publish the transition to no pending saved-package work. `vox status --json`
+            // exposes this causal boundary so an operator can distinguish an empty queue from a
+            // package whose bounded maintenance turn has not run yet.
+            return !progress.pending;
         };
         let now = self.now_ms();
         let opened = self
@@ -16252,7 +16256,9 @@ impl Node {
         if channel.key_packages_pending() && !channel.is_poisoned() {
             self.key_package_rooms.entry(*channel_id).or_insert(false);
         }
-        changed || channel.is_poisoned()
+        // An attempted locator advances the bounded queue even when it is not openable here.
+        // Publish that progress (and the pending bit) as well as successful key installation.
+        true
     }
 
     /// The responder half of an ADR-004 PQXDH opening message: consume the one-time prekey it
@@ -20334,6 +20340,7 @@ impl Node {
                 step_retention: room.step_retention,
                 key_generations: room.key_generations,
                 received_key_generations: room.received_key_generations,
+                key_packages_pending: room.key_packages_pending,
                 frozen: room.frozen.clone(),
                 refused_below_checkpoint: room.refused_below_checkpoint,
                 entries: summary.map_or(0, |c| c.entries),
