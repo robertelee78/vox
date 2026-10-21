@@ -34,7 +34,6 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 use vox_core::node::computer::{
     COMPUTER_CHANGE_SHOWN_WITHIN as CHANGE_SHOWN_WITHIN,
-    COMPUTER_REACHABILITY_EVENT_SHOWN_WITHIN as REACHABILITY_EVENT_SHOWN_WITHIN,
     COMPUTER_RETURN_SHOWN_WITHIN as RETURN_WITHIN,
 };
 
@@ -2389,10 +2388,6 @@ const SAMPLE_EVERY: Duration = Duration::from_secs(5);
 /// CPU time a daemon may spend over [`PAIRED_IDLE`] with nothing to settle: the quiet bound of
 /// a paired computer (ADR-038 FX-15, FX-28).
 const IDLE_CPU: Duration = Duration::from_secs(3);
-/// Staging: how long the exchange that carries a change to the other computer, and the receipts
-/// that confirm it on both, may take before the proof gives up on the pair.
-const EXCHANGE_WITHIN: Duration = Duration::from_secs(60);
-
 /// **Two paired computers follow each other's changes and are idle otherwise** (ADR-038 FX-15,
 /// FX-28; #989, #1020): alpha and beta, two data roots with a daemon each, pair as computers
 /// (`vox computer invite`, `pair --preview`, `approve` on both) and both report `confirmed`.
@@ -2412,7 +2407,7 @@ const EXCHANGE_WITHIN: Duration = Duration::from_secs(60);
 /// moment as before.
 ///
 /// A change made while the computers' only userspace path is closed arrives when that path is
-/// opened, with both daemon PIDs alive throughout. Within [`REACHABILITY_EVENT_SHOWN_WITHIN`] of
+/// opened, with both daemon PIDs alive throughout. Within [`RETURN_WITHIN`] of
 /// the open, after every final status and trust observation finishes, beta shows gamma personal,
 /// every binding current and every expected keyring grant, and both computers confirmed. The
 /// exported broader [`RETURN_WITHIN`] contract still names a peer that must reconnect.
@@ -2431,16 +2426,15 @@ const EXCHANGE_WITHIN: Duration = Duration::from_secs(60);
 /// on its healthy node and `vox node list` shows delta no longer attached. Cleanup may continue;
 /// queued room/node work cannot turn a late observation into an apparent pass.
 ///
-/// Mutants: the need filter in `Management::retry` removed (every computer exchanged every
-/// tick) turns the exchange-count claim red on its own number; the 1 s reconcile tick restored
-/// (every node's binding derived every second) turns the no-derivation claim red on the moment
-/// each binding was derived, and the CPU claim on its number; a merged exchange no longer
-/// treated as a change once the computer is confirmed (the follower not woken by it) turns the
-/// cross-daemon claim red: the other computer's bindings stay at their old revision and its
-/// keyrings never trust the new node. Remove the one-shot reachability stream or its authenticated
-/// wake and the live-heal claim misses [`REACHABILITY_EVENT_SHOWN_WITHIN`] (PRODUCT). Restore a
-/// reconcile cutoff beyond five seconds, or await actor cleanup before moving the slot to
-/// `Detaching`, and held delta remains `Ready` past [`CHANGE_SHOWN_WITHIN`] (PRODUCT).
+/// Independent mutants: (1) remove the need filter in `Management::retry`: the idle
+/// exchange-attempt count turns PRODUCT red (unchanged means no network); (2) remove the
+/// `computer_current` short circuit: the binding-derived moments turn PRODUCT red (unchanged
+/// means no re-derive); (3) discard the remote merge before publishing its change: the remote
+/// roster/keyring claim turns PRODUCT red; (4) suppress the authenticated reachability wake:
+/// the saturated-backoff live heal misses [`RETURN_WITHIN`] and turns PRODUCT red; (5) give
+/// reconciliation a fresh timeout or delay `Detaching`: held delta remains Ready past
+/// [`CHANGE_SHOWN_WITHIN`] and turns PRODUCT red; (6) serialize siblings behind held delta:
+/// beta's binding/keyring claim misses that same bound and turns PRODUCT red.
 #[test]
 #[ignore = "five minutes of two real vox daemons paired as computers; run in release"]
 fn two_paired_computers_that_are_idle_exchange_nothing() {
@@ -2488,7 +2482,7 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
         l.contains("beta is Ready")
     });
     assert!(
-        wait_until(Duration::from_secs(60), || {
+        wait_until(RETURN_WITHIN, || {
             a.run(&["computer", "status", "--json"], "").0
                 && b.run(&["computer", "status", "--json"], "").0
         }),
@@ -2979,8 +2973,8 @@ fn change_shows_on_both(
             );
         }
         assert!(
-            started.elapsed() < EXCHANGE_WITHIN,
-            "PRODUCT (staging): within {EXCHANGE_WITHIN:?} of {new_node} attaching, {}'s daemon \
+            started.elapsed() < RETURN_WITHIN,
+            "PRODUCT (staging): within {RETURN_WITHIN:?} of {new_node} attaching, {}'s daemon \
              completed no exchange it started toward {}'s computer with revision {revision_here} \
              sent: {}\nits daemon said: {}",
             names_here[0],
@@ -2992,12 +2986,12 @@ fn change_shows_on_both(
     }
     // Both confirm each other again: the other's receipt for the new state comes back.
     assert!(
-        wait_until(EXCHANGE_WITHIN, || {
+        wait_until(RETURN_WITHIN, || {
             computer(changer, &["status"])["state"] == "confirmed"
                 && computer(other, &["status"])["state"] == "confirmed"
         }),
         "PRODUCT: after {new_node} attached on {}'s computer the two computers did not both \
-         confirm again within {EXCHANGE_WITHIN:?}: {}'s {}, {}'s {}\n{}\n{}",
+         confirm again within {RETURN_WITHIN:?}: {}'s {}, {}'s {}\n{}\n{}",
         names_here[0],
         names_here[0],
         computer(changer, &["status"])["state"],
@@ -3067,12 +3061,12 @@ fn a_restart_derives_nothing(
         after.1
     );
     assert!(
-        wait_until(EXCHANGE_WITHIN, || {
+        wait_until(RETURN_WITHIN, || {
             computer(a, &["status"])["state"] == "confirmed"
                 && computer(b, &["status"])["state"] == "confirmed"
         }),
         "PRODUCT: after beta's daemon restarted the two computers did not both confirm again \
-         within {EXCHANGE_WITHIN:?}: alpha's {}, beta's {}\n{}\n{}",
+         within {RETURN_WITHIN:?}: alpha's {}, beta's {}\n{}\n{}",
         computer(a, &["status"])["state"],
         computer(b, &["status"])["state"],
         da.said(),
@@ -3083,9 +3077,10 @@ fn a_restart_derives_nothing(
 
 /// **A change made across a failed live path arrives on its authenticated restoration** (ADR-038
 /// FX-28; #1020). The userspace forward is the pair's only path. It closes while both daemons
-/// stay alive; gamma becomes alpha's personal node and alpha reaches four failed exchanges, whose
-/// next ordinary backoff is beyond the event bound. Opening that same path lets the one retained
-/// authenticated wake stream land. Only after beta's final
+/// stay alive; gamma becomes alpha's personal node and alpha reaches six failed exchanges,
+/// saturating its ordinary backoff. Opening that same path lets the one retained authenticated
+/// wake stream land. The forward adds three seconds each way so a mutant that waits out that
+/// saturated backoff cannot squeeze a late exchange under the return bound. Only after beta's final
 /// status and trust observations, and both computers' final confirmation observations, is the
 /// elapsed time sampled.
 fn change_reaches_a_live_computer(
@@ -3158,10 +3153,10 @@ fn change_reaches_a_live_computer(
         wait_until(RETURN_WITHIN.saturating_mul(2), || {
             application_toward(a, &b_id)["exchange_failures"]
                 .as_u64()
-                .is_some_and(|n| n >= 4)
+                .is_some_and(|n| n >= 6)
         }),
         "PRODUCT (staging): with the live path closed, alpha's `vox computer status` counted no \
-         fourth failed exchange toward it within {:?}: {}\nits daemon said: {}",
+         sixth failed exchange toward it within {:?}: {}\nits daemon said: {}",
         RETURN_WITHIN.saturating_mul(2),
         application_toward(a, &b_id),
         da.said()
@@ -3183,6 +3178,7 @@ fn change_reaches_a_live_computer(
 
     // Opening the only path is the restoration event. The clock is not sampled until every final
     // product observation below has returned.
+    forward.set_delay(Duration::from_secs(3));
     let restored = Instant::now();
     forward.open();
     let applied_at = loop {
@@ -3193,29 +3189,31 @@ fn change_reaches_a_live_computer(
         let delta_drives_gamma = grant_words(b, "delta", &gamma).as_deref() == Some("read + drive");
         let delta_reads_alpha = grant_words(b, "delta", &alpha).as_deref() == Some("read");
         let beta_reads_gamma = grant_words(b, "beta", &gamma).as_deref() == Some("read");
+        let alive = daemon_alive(da.child.id()) && daemon_alive(db.child.id());
         let shown = gamma_personal
             && roster_current(&status, &names_b)
             && delta_drives_gamma
             && delta_reads_alpha
             && beta_reads_gamma
             && computer(a, &["status"])["state"] == "confirmed"
-            && computer(b, &["status"])["state"] == "confirmed";
+            && computer(b, &["status"])["state"] == "confirmed"
+            && alive;
         // This is deliberately after the final status and trust commands: a late observation is
         // red even if the product became current before the command that exposed it returned.
         let elapsed = restored.elapsed();
-        if shown && elapsed <= REACHABILITY_EVENT_SHOWN_WITHIN {
+        if shown && elapsed <= RETURN_WITHIN {
             break elapsed;
         }
         assert!(
-            !shown && elapsed < REACHABILITY_EVENT_SHOWN_WITHIN,
-            "PRODUCT: {REACHABILITY_EVENT_SHOWN_WITHIN:?} after the live authenticated path was \
+            !shown && elapsed < RETURN_WITHIN,
+            "PRODUCT: {RETURN_WITHIN:?} after the live authenticated path was \
              restored, the change made while it was unreachable was not applied there in time \
              (ADR-038 FX-28, #1020; shown {shown} \
              when looked at after {elapsed:?}): gamma personal under alpha's \
              computer {gamma_personal}, bindings current {}, delta grants gamma {:?} (read + drive \
              expected), delta grants alpha {:?} (read expected), beta grants gamma {:?} (read \
              expected); status: revision {} nodes {}; applications {}\nbeta's daemon said: {}\n\
-             alpha's daemon said: {}",
+             alpha's daemon said: {}; daemons alive {alive}",
             roster_current(&status, &names_b),
             grant_words(b, "delta", &gamma),
             grant_words(b, "delta", &alpha),
@@ -3228,8 +3226,9 @@ fn change_reaches_a_live_computer(
         );
         std::thread::sleep(Duration::from_millis(200));
     };
+    forward.set_delay(Duration::ZERO);
     println!(
-        "[proof] {applied_at:?} after the live authenticated path was restored, the change made meanwhile is applied on every node of beta's computer and both computers confirm (event bound {REACHABILITY_EVENT_SHOWN_WITHIN:?}, return bound {RETURN_WITHIN:?})"
+        "[proof] {applied_at:?} after the live authenticated path was restored, the change made meanwhile is applied on every node of beta's computer and both computers confirm (return bound {RETURN_WITHIN:?})"
     );
     assert!(
         daemon_alive(da.child.id()) && daemon_alive(db.child.id()),
@@ -3293,7 +3292,9 @@ fn delayed_node_does_not_make_a_late_pass(
         let delta_non_attached = !delta_line.is_empty() && !delta_line.starts_with("delta Ready");
         let local_current = roster_current(&status_a, &["alpha", "gamma", "epsilon"]);
         let beta_current = roster_current(&status_b, &["beta"]);
-        let shown = local_current && beta_current && beta_grant.is_some() && delta_non_attached;
+        let alive = daemon_alive(da.child.id()) && daemon_alive(db.child.id());
+        let shown =
+            local_current && beta_current && beta_grant.is_some() && delta_non_attached && alive;
         // All final status/trust/list observations are complete before this sample.
         let seen = unix_ms();
         if let Some(at) = carried_at {
@@ -3310,7 +3311,7 @@ fn delayed_node_does_not_make_a_late_pass(
                  beta did not apply-or-detach every attached node (ADR-038 FX-28, #1020; shown \
                  {shown} only after {elapsed:?}): alpha bindings current {local_current}; beta \
                  binding current {beta_current}; beta's grant for epsilon {beta_grant:?}; delta \
-                 line {delta_line:?}; alpha status nodes {}; beta status nodes {}\nalpha \
+                 line {delta_line:?}; daemons alive {alive}; alpha status nodes {}; beta status nodes {}\nalpha \
                  daemon:\n{}\nbeta daemon:\n{}",
                 status_a["nodes"],
                 status_b["nodes"],
@@ -3319,9 +3320,9 @@ fn delayed_node_does_not_make_a_late_pass(
             );
         } else {
             assert!(
-                staged.elapsed() < EXCHANGE_WITHIN,
+                staged.elapsed() < RETURN_WITHIN,
                 "PRODUCT (staging): alpha completed no exchange carrying epsilon to beta within \
-                 {EXCHANGE_WITHIN:?}: {}\nalpha daemon:\n{}\nbeta daemon:\n{}",
+                 {RETURN_WITHIN:?}: {}\nalpha daemon:\n{}\nbeta daemon:\n{}",
                 application_toward(a, &b_id),
                 da.said(),
                 db.said()

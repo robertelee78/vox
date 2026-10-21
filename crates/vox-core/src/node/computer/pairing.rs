@@ -254,6 +254,8 @@ struct TransportLease {
     expires: u64,
     peer: Option<Digest32>,
     anchors: BootstrapSet,
+    /// Established transport is renewed; one-time transport simply expires with its invite.
+    renewable: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -286,7 +288,10 @@ pub struct Management {
     retry_wake: Arc<tokio::sync::Notify>,
     /// Failed peers whose authenticated reachability or machine path changed since their last
     /// attempt. Consumed once by `retry`, bypassing only that attempt's time backoff.
-    retry_ready: Mutex<BTreeSet<Digest32>>,
+    retry_ready: Mutex<BTreeMap<Digest32, std::time::Instant>>,
+    /// Coalesced causes for transport registration: durable policy, a real network transition,
+    /// an authenticated anchor connection ending, or an exact lease-renewal deadline.
+    transport_wake: Arc<tokio::sync::Notify>,
     /// At most one authenticated reachability waiter per failing computer. Its one stream is
     /// retained by QUIC through a transient path outage and wakes retry when the path carries it.
     reachability_waiters: Mutex<BTreeMap<Digest32, (u64, tokio::task::AbortHandle)>>,
@@ -306,6 +311,9 @@ struct Exchanged {
     attempts: u64,
     /// Failures in a row since the last success; the backoff doubles with each.
     failures: u32,
+    /// End of the one return contract that began at the last failed attempt. The next backoff
+    /// and exchange share it; neither gets a fresh timeout.
+    deadline: Option<std::time::Instant>,
     /// This node's state revision at the last attempt, and whether a pairing operation
     /// involving the computer was open then: a change in either is tried at once, backoff or
     /// not; the same state waits the backoff out.
@@ -421,11 +429,9 @@ impl Drop for Attempt {
 
 /// Without a need, a computer whose receipt covers this node's current state is exchanged with
 /// this often, so a lost message never leaves two computers apart for long.
-const EXCHANGE_FALLBACK: Duration = Duration::from_secs(60);
+const EXCHANGE_FALLBACK: Duration = COMPUTER_RETURN_SHOWN_WITHIN;
 /// A computer that could not be reached is tried again after this, doubling per failure.
 const EXCHANGE_BACKOFF: Duration = Duration::from_secs(2);
-/// The longest a failing computer waits between attempts.
-const EXCHANGE_BACKOFF_MAX: Duration = COMPUTER_RETURN_SHOWN_WITHIN;
 /// An authenticated no-state-change request held on a failed peer's QUIC connection. Its stream
 /// is written once; QUIC wakes it on delivery when a transient path becomes reachable again.
 const REACHABILITY_WAKE_OP: u64 = 3;
@@ -433,6 +439,45 @@ const REACHABILITY_WAKE_OP: u64 = 3;
 /// explicit command forever. Ordinary convergence uses [`COMPUTER_RETURN_SHOWN_WITHIN`].
 const PAIR_WITHIN: Duration = Duration::from_secs(600);
 impl Management {
+    /// Register and renew rendezvous leases only for a real cause. The only timer is derived
+    /// from the expiry returned by the registration itself; a quiet daemon has no refresh tick.
+    fn start_transport_refresh(self: &Arc<Self>) {
+        let weak = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let Some(me) = weak.upgrade() else { return };
+            let mut policy = me.computer.changes();
+            let mut network = me.net.presence().changes();
+            let wake = Arc::clone(&me.transport_wake);
+            let _ = policy.borrow_and_update();
+            drop(me);
+            loop {
+                let Some(me) = weak.upgrade() else { return };
+                // An optional unreachable anchor never holds up direct pairing, status or retry.
+                let next = me.refresh_transport().await.ok().flatten();
+                drop(me);
+                let deadline = async {
+                    match next {
+                        Some(at) => tokio::time::sleep_until(at.into()).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                };
+                tokio::select! {
+                    () = deadline => {}
+                    () = wake.notified() => {}
+                    changed = policy.changed() => {
+                        if changed.is_err() { return; }
+                        let _ = policy.borrow_and_update();
+                    }
+                    changed = network.recv() => {
+                        if matches!(changed, Err(tokio::sync::broadcast::error::RecvError::Closed)) {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     /// The account's explicit host:port lookup uses its existing socket, but no management
     /// identity or authority. The returned fingerprint is proved; lookup persists no anchor source.
     pub async fn lookup_anchor(&self, input: &str) -> Result<String> {
@@ -565,7 +610,8 @@ impl Management {
             revoked_transport: Mutex::new(Default::default()),
             exchanged: Mutex::new(BTreeMap::new()),
             retry_wake: Arc::new(tokio::sync::Notify::new()),
-            retry_ready: Mutex::new(BTreeSet::new()),
+            retry_ready: Mutex::new(BTreeMap::new()),
+            transport_wake: Arc::new(tokio::sync::Notify::new()),
             reachability_waiters: Mutex::new(BTreeMap::new()),
         });
         let weak = Arc::downgrade(&me);
@@ -614,6 +660,10 @@ impl Management {
                     () = wake.notified() => {}
                     changed = changes.changed() => {
                         if changed.is_err() { return; }
+                        let event = *changes.borrow_and_update();
+                        if let Some(me) = weak.upgrade() {
+                            me.retry_changed_now(event.return_deadline());
+                        }
                     }
                     changed = network.recv() => {
                         if matches!(changed, Err(tokio::sync::broadcast::error::RecvError::Closed)) {
@@ -626,19 +676,7 @@ impl Management {
                 }
             }
         });
-        let weak = Arc::downgrade(&me);
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(2));
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                tick.tick().await;
-                let Some(me) = weak.upgrade() else {
-                    return;
-                };
-                // An optional unreachable anchor never holds up direct pairing, status or retry.
-                let _ = me.refresh_transport().await;
-            }
-        });
+        me.start_transport_refresh();
         Ok(me)
     }
     fn serve(self: &Arc<Self>, conn: Arc<VoxConnection>) {
@@ -706,6 +744,9 @@ impl Management {
             }
             if let Some(me) = weak.upgrade() {
                 lock(&me.serving).remove(&conn.serial());
+                // A held anchor connection ending is a real transport event. Registration may
+                // move to another configured endpoint; direct peer reachability remains usable.
+                me.transport_wake.notify_one();
             }
         });
     }
@@ -1420,6 +1461,7 @@ impl Management {
                         .saturating_add(crate::nat::service::COMPUTER_TRANSPORT_TTL_MS / 2),
                     peer: Some(*peer),
                     anchors,
+                    renewable: true,
                 });
             }
         }
@@ -1454,6 +1496,7 @@ impl Management {
                 },
                 peer: Some(link.target),
                 anchors,
+                renewable: established,
             });
         }
         for i in &s.invitations {
@@ -1478,6 +1521,7 @@ impl Management {
                 },
                 peer: i.target,
                 anchors: self.anchors.clone(),
+                renewable: established,
             });
         }
         Ok(leases)
@@ -1507,7 +1551,8 @@ impl Management {
             .copied();
         if cached.is_none_or(|old| {
             old.connection != conn.serial()
-                || old.expires <= now().saturating_add(60_000)
+                || old.expires
+                    <= now().saturating_add(crate::nat::service::COMPUTER_TRANSPORT_TTL_MS / 10)
                 || old.peer != lease.peer
         }) {
             self.net
@@ -1551,9 +1596,10 @@ impl Management {
         Ok(conn)
     }
 
-    async fn refresh_transport(self: &Arc<Self>) -> Result<()> {
+    async fn refresh_transport(self: &Arc<Self>) -> Result<Option<std::time::Instant>> {
         let mut work = tokio::task::JoinSet::new();
-        for lease in self.transport_leases(None)? {
+        let leases = self.transport_leases(None)?;
+        for lease in leases.iter().cloned() {
             self.configure_transport_anchors(&lease.anchors);
             for anchor in lease.anchors.nodes() {
                 let me = Arc::clone(self);
@@ -1609,7 +1655,26 @@ impl Management {
             }
         }
         while work.join_next().await.is_some() {}
-        Ok(())
+
+        // The cached registration is the source of truth for an established lease's expiry.
+        // A failed registration has no lease deadline and waits for a real network/policy event;
+        // a successful renewable registration wakes at its exact renewal boundary.
+        let cached = lock(&self.transport_cache);
+        let renewal_margin = crate::nat::service::COMPUTER_TRANSPORT_TTL_MS / 10;
+        let next_ms = leases
+            .iter()
+            .filter(|lease| lease.renewable)
+            .flat_map(|lease| {
+                lease.anchors.nodes().iter().filter_map(|anchor| {
+                    cached
+                        .get(&(anchor.id, lease.registration))
+                        .filter(|registered| registered.peer == lease.peer)
+                        .map(|registered| registered.expires.saturating_sub(renewal_margin))
+                })
+            })
+            .min();
+        Ok(next_ms
+            .map(|at| std::time::Instant::now() + Duration::from_millis(at.saturating_sub(now()))))
     }
 
     async fn transport_incoming(
@@ -1925,7 +1990,10 @@ impl Management {
             .get(&peer)
             .is_some_and(|record| record.failures > 0)
         {
-            lock(&self.retry_ready).insert(peer);
+            lock(&self.retry_ready).insert(
+                peer,
+                std::time::Instant::now() + COMPUTER_RETURN_SHOWN_WITHIN,
+            );
             self.retry_wake.notify_one();
         }
     }
@@ -1937,7 +2005,23 @@ impl Management {
             .filter_map(|(peer, record)| (record.failures > 0).then_some(*peer))
             .collect();
         if !failed.is_empty() {
-            lock(&self.retry_ready).extend(failed);
+            let deadline = std::time::Instant::now() + COMPUTER_RETURN_SHOWN_WITHIN;
+            lock(&self.retry_ready).extend(failed.into_iter().map(|peer| (peer, deadline)));
+            self.retry_wake.notify_one();
+        }
+    }
+
+    /// A durable state event owns its deadline before scheduling. Every peer selected because
+    /// of that revision uses the same absolute end through exchange and local reconciliation.
+    fn retry_changed_now(&self, deadline: std::time::Instant) {
+        let local = self.computer.signer.fingerprint();
+        let peers: Vec<_> = lock(&self.computer.state)
+            .descriptions()
+            .into_keys()
+            .filter(|peer| *peer != local)
+            .collect();
+        if !peers.is_empty() {
+            lock(&self.retry_ready).extend(peers.into_iter().map(|peer| (peer, deadline)));
             self.retry_wake.notify_one();
         }
     }
@@ -1982,11 +2066,13 @@ impl Management {
             let mut next: Option<std::time::Instant> = None;
             let revision = s.revision;
             let mut exchanged = lock(&self.exchanged);
-            let retry_ready = lock(&self.retry_ready);
+            let mut retry_ready = lock(&self.retry_ready);
+            let mut selected_deadlines = BTreeMap::new();
             // A computer no longer paired (removed, or its pairing cancelled) keeps its
             // counts, which are "since the daemon started" and survive its re-enrollment, but
             // not its failure: that must not stand in the status for good.
             let known: std::collections::BTreeSet<Digest32> = peers.iter().copied().collect();
+            retry_ready.retain(|peer, _| known.contains(peer));
             let mut changed = false;
             for (peer, record) in exchanged.iter_mut() {
                 if !known.contains(peer) && (record.failures > 0 || record.problem.is_some()) {
@@ -2003,14 +2089,19 @@ impl Management {
             }
             peers.retain(|peer| {
                 let record = exchanged.get(peer).cloned().unwrap_or_default();
-                let reachability_restored = retry_ready.contains(peer);
+                let causal_deadline = retry_ready.get(peer).copied();
+                let reachability_restored = causal_deadline.is_some();
                 if let Some(last) = record.last {
                     if record.failures > 0 {
-                        // 2 s after the first failure, doubling, at most EXCHANGE_BACKOFF_MAX;
-                        // unless this node changed since that attempt, which is tried at once.
+                        // The backoff is inside the return contract begun by the failure. Leave
+                        // one apply-contract slice for an exchange attempt and one for the
+                        // reconciliation after it; no stage starts another clock.
                         let wait = EXCHANGE_BACKOFF
                             .saturating_mul(1u32 << (record.failures - 1).min(6))
-                            .min(EXCHANGE_BACKOFF_MAX);
+                            .min(
+                                COMPUTER_RETURN_SHOWN_WITHIN
+                                    .saturating_sub(COMPUTER_CHANGE_SHOWN_WITHIN.saturating_mul(2)),
+                            );
                         let unchanged = record.revision == revision
                             && record.involved == (involved == Some(*peer));
                         if unchanged && !reachability_restored && now.duration_since(last) < wait {
@@ -2033,6 +2124,12 @@ impl Management {
                         }
                     }
                 }
+                selected_deadlines.insert(
+                    *peer,
+                    causal_deadline
+                        .or(record.deadline)
+                        .unwrap_or(now + COMPUTER_RETURN_SHOWN_WITHIN),
+                );
                 true
             });
             drop(retry_ready);
@@ -2083,7 +2180,7 @@ impl Management {
                     true
                 });
             }
-            let attempted: Vec<(Digest32, bool, u64)> = {
+            let attempted: Vec<(Digest32, bool, u64, std::time::Instant)> = {
                 let inflight = lock(&self.inflight);
                 peers
                     .iter()
@@ -2092,6 +2189,10 @@ impl Management {
                             *p,
                             involved == Some(*p),
                             inflight.get(p).map_or(0, |f| f.serial),
+                            selected_deadlines
+                                .get(p)
+                                .copied()
+                                .unwrap_or(now + COMPUTER_RETURN_SHOWN_WITHIN),
                         )
                     })
                     .collect()
@@ -2122,10 +2223,11 @@ impl Management {
         };
         for (peer, endpoints, url) in peers {
             let me = Arc::clone(self);
-            let (involved, serial) = attempted
-                .iter()
-                .find(|(p, _, _)| *p == peer)
-                .map_or((false, 0), |(_, involved, serial)| (*involved, *serial));
+            let (involved, serial, deadline) =
+                attempted.iter().find(|(p, _, _, _)| *p == peer).map_or(
+                    (false, 0, std::time::Instant::now()),
+                    |(_, involved, serial, deadline)| (*involved, *serial, *deadline),
+                );
             // The guard exists before the task does and travels with it: a task cut before
             // its first poll drops the guard all the same, so no reservation ever leaks.
             let guard = Attempt {
@@ -2139,18 +2241,22 @@ impl Management {
             let task = tokio::spawn(async move {
                 // Each computer's outcome is recorded by its own task the moment it ends,
                 // dated then: a slow computer never delays another's record, status or next
-                // attempt, and one that hangs counts as failed inside the user-visible contract.
-                let outcome = match tokio::time::timeout(
-                    COMPUTER_RETURN_SHOWN_WITHIN,
-                    me.sync_peer(peer, endpoints, url),
+                // attempt. The exchange must return one apply contract before the causal return
+                // deadline, so the receiving daemon's reconciliation is inside that same clock.
+                let exchange_deadline = deadline
+                    .checked_sub(COMPUTER_CHANGE_SHOWN_WITHIN)
+                    .unwrap_or(deadline);
+                let outcome = match tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(exchange_deadline),
+                    me.sync_peer(peer, endpoints, url, deadline),
                 )
                 .await
                 {
                     Ok(Ok(revisions)) => Ok(revisions),
                     Ok(Err(e)) => Err(e.to_string()),
-                    Err(_) => Err(format!(
-                        "the exchange did not finish within {COMPUTER_RETURN_SHOWN_WITHIN:?}"
-                    )),
+                    Err(_) => Err(
+                        "the exchange did not finish before its causal convergence deadline".into(),
+                    ),
                 };
                 guard.done(outcome);
             });
@@ -2193,6 +2299,7 @@ impl Management {
                 record.last_ms = Some(at_ms);
                 record.count = record.count.saturating_add(1);
                 record.failures = 0;
+                record.deadline = None;
                 record.problem = None;
                 record.last_started = Some(ExchangeRecord {
                     at_ms,
@@ -2202,6 +2309,7 @@ impl Management {
             }
             Err(text) => {
                 record.failures = record.failures.saturating_add(1);
+                record.deadline = Some(std::time::Instant::now() + COMPUTER_RETURN_SHOWN_WITHIN);
                 record.problem = Some(text);
             }
         }
@@ -2278,6 +2386,7 @@ impl Management {
         peer: Digest32,
         endpoints: EndpointList,
         url: Option<Zeroizing<String>>,
+        deadline: std::time::Instant,
     ) -> Result<(u64, u64)> {
         let link = url.as_ref().map(|l| Link::parse(l)).transpose()?;
         let endpoints = link.as_ref().map(|l| &l.endpoints).unwrap_or(&endpoints);
@@ -2297,9 +2406,9 @@ impl Management {
         let f = frame(&mut recv).await?;
         // A merge that moves this daemon's revision is a change here: `change` wakes the
         // daemon's follower on it (ADR-038 FX-28).
-        let merged = self
-            .computer
-            .change(|s| merge(s, &f, peer, self.computer.signer.as_ref()).map(|()| s.revision))?;
+        let merged = self.computer.change_until(deadline, |s| {
+            merge(s, &f, peer, self.computer.signer.as_ref()).map(|()| s.revision)
+        })?;
         let _ = send.finish();
         Ok((sent, merged))
     }

@@ -33,10 +33,46 @@ pub const COMPUTER_CHANGE_SHOWN_WITHIN: Duration = Duration::from_secs(5);
 /// failed path becomes reachable again (ADR-038 FX-28).
 pub const COMPUTER_RETURN_SHOWN_WITHIN: Duration = Duration::from_secs(60);
 
-/// Once an already-running peer's authenticated path carries packets again, its one-shot
-/// reachability waiter must wake exchange and show the pending trust change within this long.
-/// The broader return contract remains [`COMPUTER_RETURN_SHOWN_WITHIN`] for reconnecting a peer.
-pub const COMPUTER_REACHABILITY_EVENT_SHOWN_WITHIN: Duration = Duration::from_secs(15);
+/// One durable policy revision and the absolute ends of the two user-visible contracts its
+/// cause began. A remote merge may shorten the local apply deadline, but never restarts the
+/// outer return deadline shared by exchange and reconciliation.
+#[derive(Clone, Copy, Debug)]
+pub struct ComputerChange {
+    revision: u64,
+    apply_deadline: std::time::Instant,
+    return_deadline: std::time::Instant,
+}
+
+impl ComputerChange {
+    /// A local cause gets the apply-or-detach contract from the instant it is observed.
+    #[must_use]
+    pub fn now(revision: u64) -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            revision,
+            apply_deadline: now + COMPUTER_CHANGE_SHOWN_WITHIN,
+            return_deadline: now + COMPUTER_RETURN_SHOWN_WITHIN,
+        }
+    }
+
+    /// The durable policy revision carried by this event.
+    #[must_use]
+    pub fn revision(self) -> u64 {
+        self.revision
+    }
+
+    /// The absolute end of this event's apply-or-detach contract.
+    #[must_use]
+    pub fn apply_deadline(self) -> std::time::Instant {
+        self.apply_deadline
+    }
+
+    /// The absolute end of this event's reachable-peer return contract.
+    #[must_use]
+    pub fn return_deadline(self) -> std::time::Instant {
+        self.return_deadline
+    }
+}
 
 /// The one fixed policy, displayed before either operator approves an enrollment.
 pub const POLICY: &str = "Every managed node can read every other managed node. Each computer's selected personal node can drive the non-personal nodes. Earlier individual grants are replaced by this policy; there are no per-node exceptions. Pairing does not join rooms or change repository bindings.";
@@ -2114,7 +2150,7 @@ pub struct Computer {
     >,
     /// The policy revision, sent whenever a change moves it: a local change or a merged
     /// exchange alike (ADR-038 FX-28). The daemon reconciles its nodes on this, and on no timer.
-    changed: tokio::sync::watch::Sender<u64>,
+    changed: tokio::sync::watch::Sender<ComputerChange>,
     /// Each node's plan at the revision it was derived at: the app's polling and every trust
     /// command answer from it while the revision stands, instead of verifying the history again.
     plans: Mutex<BTreeMap<Digest32, (u64, PolicyPlan)>>,
@@ -2139,7 +2175,7 @@ impl Computer {
 
     /// Follow the policy revision: `changed()` resolves when a change moved it, whether the
     /// change was made here or arrived in an exchange (ADR-038 FX-28).
-    pub fn changes(&self) -> tokio::sync::watch::Receiver<u64> {
+    pub fn changes(&self) -> tokio::sync::watch::Receiver<ComputerChange> {
         self.changed.subscribe()
     }
 
@@ -2670,7 +2706,7 @@ impl Computer {
                 signer,
                 state: Mutex::new(state),
                 reachers: Mutex::new(Vec::new()),
-                changed: tokio::sync::watch::channel(revision).0,
+                changed: tokio::sync::watch::channel(ComputerChange::now(revision)).0,
                 plans: Mutex::new(BTreeMap::new()),
             });
             // Validate present storage before any endpoint or managed node can resume authority.
@@ -2732,7 +2768,7 @@ impl Computer {
             signer: Arc::new(root),
             state: Mutex::new(state),
             reachers: Mutex::new(Vec::new()),
-            changed: tokio::sync::watch::channel(0).0,
+            changed: tokio::sync::watch::channel(ComputerChange::now(0)).0,
             plans: Mutex::new(BTreeMap::new()),
         });
         c.save(&lock(&c.state))?;
@@ -2759,6 +2795,16 @@ impl Computer {
     }
     /// Commit a complete management transaction before publishing it to live authorization.
     pub(crate) fn change<T>(&self, f: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
+        self.change_until(std::time::Instant::now() + COMPUTER_CHANGE_SHOWN_WITHIN, f)
+    }
+
+    /// Commit a transaction whose causal event already owns `deadline`. A merge and the
+    /// attached-node reconciliation it wakes share this one clock.
+    pub(crate) fn change_until<T>(
+        &self,
+        deadline: std::time::Instant,
+        f: impl FnOnce(&mut State) -> Result<T>,
+    ) -> Result<T> {
         let mut held = lock(&self.state);
         self.storage_ready()?;
         let mut next = held.clone();
@@ -2783,7 +2829,13 @@ impl Computer {
             if moved {
                 // A change here, or a merged exchange that moved this daemon's revision: either
                 // is a change here (ADR-038 FX-28), and the daemon reconciles its nodes on it.
-                self.changed.send_replace(held.revision);
+                // The local apply contract may shorten an outer return deadline, never extend it.
+                self.changed.send_replace(ComputerChange {
+                    revision: held.revision,
+                    apply_deadline: deadline
+                        .min(std::time::Instant::now() + COMPUTER_CHANGE_SHOWN_WITHIN),
+                    return_deadline: deadline,
+                });
             }
         }
         Ok(value)

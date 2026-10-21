@@ -1,12 +1,6 @@
 //! The daemon composes computer policy with already-attached node actors; no new unlock path.
 use super::*;
 
-/// Leave enough of FX-28's visible five-second contract for the daemon to publish `Detaching`
-/// and for the person's status request to observe it after a node fails to answer.
-const RECONCILE_DETACH_RESERVE: Duration = Duration::from_secs(1);
-const RECONCILE_APPLY_WITHIN: Duration =
-    vox_core::node::computer::COMPUTER_CHANGE_SHOWN_WITHIN.saturating_sub(RECONCILE_DETACH_RESERVE);
-
 impl Router {
     /// Reconcile the daemon's nodes with computer trust on change, and on no timer (ADR-038
     /// FX-28): when the policy revision moves (a change made here, or a merged exchange that
@@ -21,15 +15,26 @@ impl Router {
         let mut endpoints = management.endpoint_changes();
         let mut nodes = self.inner.events.subscribe();
         self.inner.rt.spawn(async move {
-            // The first pass runs at start; every later one has a cause.
-            policy.mark_changed();
+            // Daemon start is the first cause. Every later pass carries the deadline of the
+            // event that caused it; a remote merge does not get a new reconciliation clock.
+            let mut deadline =
+                vox_core::node::computer::ComputerChange::now(management.computer.revision())
+                    .apply_deadline();
             let mut advertised = endpoints.borrow_and_update().clone();
             loop {
-                tokio::select! {
+                let Some(inner) = weak.upgrade() else {
+                    return;
+                };
+                if inner.stopping.load(Ordering::Relaxed) {
+                    return;
+                }
+                Router { inner }.reconcile_computer_trust(deadline).await;
+                deadline = tokio::select! {
                     moved = policy.changed() => {
                         if moved.is_err() {
                             return;
                         }
+                        policy.borrow_and_update().apply_deadline()
                     }
                     moved = endpoints.changed() => {
                         if moved.is_err() {
@@ -40,36 +45,36 @@ impl Router {
                             continue;
                         }
                         advertised = now;
+                        vox_core::node::computer::ComputerChange::now(
+                            management.computer.revision(),
+                        ).apply_deadline()
                     }
                     event = nodes.recv() => {
                         match event {
                             Ok(DaemonEvent::Attached { .. } | DaemonEvent::Detached { .. })
-                            | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                            | Err(broadcast::error::RecvError::Lagged(_)) => {
+                                vox_core::node::computer::ComputerChange::now(
+                                    management.computer.revision(),
+                                ).apply_deadline()
+                            }
                             Err(broadcast::error::RecvError::Closed) => return,
                         }
                     }
-                }
-                let Some(inner) = weak.upgrade() else {
-                    return;
                 };
-                if inner.stopping.load(Ordering::Relaxed) {
-                    return;
-                }
-                Router { inner }.reconcile_computer_trust().await;
             }
         });
     }
 
     /// One reconciliation pass: the roster follows the nodes on disk, and every attached node
     /// that is behind the policy derives its binding and applies its keyring on a task of its
-    /// own, bounded by [`RECONCILE_APPLY_WITHIN`]; each records the application receipt when it is
+    /// own, bounded by the causal event's absolute deadline; each records the application receipt when it is
     /// done. The pass itself waits for none of them, so a revision arriving meanwhile starts its
     /// own pass at once and a stuck node holds nothing but itself. A node at the current
     /// revision is not asked; one that fails or does not answer is said in the status and
     /// detached (a failed write must not leave stale grants on the network). The slot moves to
     /// `Detaching` synchronously before cleanup starts, so queued actor work cannot hide a stale
     /// attached node past the public five-second contract.
-    async fn reconcile_computer_trust(&self) {
+    async fn reconcile_computer_trust(&self, deadline: std::time::Instant) {
         let management = Arc::clone(&self.inner.defaults.computer);
         if management.computer.binding_group().is_none() && !management.computer.grouped() {
             return;
@@ -91,9 +96,21 @@ impl Router {
         }
         let mut pending = Vec::new();
         let mut behind = Vec::new();
-        let attached = self.attached_handles();
+        let attached: Vec<_> = lock(&self.inner.slots)
+            .iter()
+            .filter_map(|(name, slot)| match slot {
+                Slot::Attached(attached) => Some((
+                    name.as_str().to_owned(),
+                    attached.handle.clone(),
+                    attached.generation,
+                )),
+                _ => None,
+            })
+            .collect();
         for info in self.nodes() {
-            let Some((_, handle)) = attached.iter().find(|(name, _)| name == info.name.as_str())
+            let Some((_, handle, generation)) = attached
+                .iter()
+                .find(|(name, _, _)| name == info.name.as_str())
             else {
                 pending.push(format!(
                     "{}: make this node Ready to apply computer trust",
@@ -104,7 +121,7 @@ impl Router {
             if handle.computer_current() {
                 continue;
             }
-            behind.push((info.name.clone(), handle.clone()));
+            behind.push((info.name.clone(), handle.clone(), *generation));
         }
         management.pending_nodes(pending);
         if behind.is_empty() {
@@ -113,20 +130,23 @@ impl Router {
             }
             return;
         }
-        for (name, handle) in behind {
+        for (name, handle, generation) in behind {
             let router = self.clone();
             let management = Arc::clone(&management);
             self.inner.rt.spawn(async move {
-                let outcome =
-                    match tokio::time::timeout(RECONCILE_APPLY_WITHIN, handle.reconcile_computer())
-                        .await
-                    {
-                        Ok(Ok(())) => Ok(()),
-                        Ok(Err(e)) => Err(e.to_string()),
-                        Err(_) => Err(format!(
-                            "did not apply computer trust within {RECONCILE_APPLY_WITHIN:?}"
-                        )),
-                    };
+                let outcome = match tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(deadline),
+                    handle.reconcile_computer(),
+                )
+                .await
+                {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(e)) => Err(e.to_string()),
+                    Err(_) => Err(format!(
+                        "did not apply computer trust before the change's {:?} deadline",
+                        vox_core::node::computer::COMPUTER_CHANGE_SHOWN_WITHIN,
+                    )),
+                };
                 match outcome {
                     Ok(()) => {
                         if let Err(e) = management.record_application() {
@@ -134,8 +154,8 @@ impl Router {
                         }
                     }
                     Err(why) => {
+                        router.detach_failed_computer_node(name.clone(), generation);
                         management.node_pending(name.as_str(), &why);
-                        router.detach_failed_computer_node(name);
                     }
                 }
             });
@@ -144,8 +164,16 @@ impl Router {
 
     /// Make a failed node non-attached in the same synchronous critical section that decides it,
     /// then leave its potentially slow actor cleanup to an independent task.
-    fn detach_failed_computer_node(&self, node: NodeName) {
-        let going = begin_detach(&mut lock(&self.inner.slots), &node);
+    fn detach_failed_computer_node(&self, node: NodeName, generation: u64) {
+        let going = {
+            let mut slots = lock(&self.inner.slots);
+            match slots.get(&node) {
+                Some(Slot::Attached(attached)) if attached.generation == generation => {
+                    begin_detach(&mut slots, &node)
+                }
+                _ => None,
+            }
+        };
         if let Some((attached, done)) = going {
             let router = self.clone();
             self.inner.rt.spawn(async move {
