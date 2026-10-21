@@ -4,8 +4,8 @@
   at a time, quoted below) are the requirements; nothing here is built. Each requirement lands
   with its proof (ADR-018) in a small release (FX-19).
 - **Date**: 2026-10-19; amended 2026-10-20 (FX-22–FX-27, the daemon's CPU); amended
-  2026-10-20 (FX-28–FX-32: the idle daemon's disk and CPU, measured on v0.4.9, and the own-feed
-  recovery ruling of 2026-10-19)
+  2026-10-20 (FX-28–FX-33: the idle daemon's disk and CPU, measured on v0.4.9, the own-feed
+  recovery ruling of 2026-10-19, and a retention change that poisoned a room)
 - **Deciders**: Robert E. Lee
 - **Tags**: trust, daemon identity, sessions, presence, agent comms, sync, health, releases
 - **Related**: ADR-018, ADR-020, ADR-026, ADR-029, ADR-031, ADR-033, ADR-034, ADR-035, ADR-036,
@@ -185,7 +185,7 @@ The decider then answered twelve questions, one at a time. His answers are the d
   MUST run on the VM setup (the macOS guests of the v0.4.4 app-proof work), not on his working
   Macs ("use the VM stuffs so I'm not losing ability to use my macs").
 - **FX-21.** Every product requirement above (FX-1–FX-10, FX-12–FX-18, FX-22–FX-24, FX-26,
-  FX-27, FX-28–FX-32) lands with a proof that drives the shipped `vox` binary as a person
+  FX-27, FX-28–FX-33) lands with a proof that drives the shipped `vox` binary as a person
   would, with a mutant that turns it red on its own assertion (ADR-018). The two-computer requirements
   (FX-2–FX-7) are proved by two daemons in two data roots on one machine. FX-11's design, FX-19,
   FX-20 and FX-25 are process rulings: FX-19's record is each closed release milestone, FX-20's
@@ -303,6 +303,18 @@ The decider then answered twelve questions, one at a time. His answers are the d
   and resume then; the daemon says once that it recovered and from whom. Measured before this: a
   restored node refused its writes correctly and never read the member's next post (the restarts
   proof, step 5, 2026-10-19).
+- **FX-33.** A change to a room's retention MUST NOT stop the room: the sweep that it starts
+  prunes what this node holds and skips what it does not, and an entry it cannot classify yet is
+  skipped, never a fault. Only a storage error poisons a room; a signed-format entry is never a
+  legacy Session, and an entry beyond the author's verified head, or one whose body never
+  arrived, is not evidence of a malformed store. Measured cause, 2026-10-20 (the decider's
+  node, vox 0.4.9): he set his repo room's retention from forever to one week in the app; the
+  next sweep's legacy Session classification (`legacy_kind_in`) refused a format-2 entry as
+  "Session classification source unverified", the room was poisoned, and the app said "vox
+  cannot save: store save room: malformed at-rest artifact … It recovers by itself when writes
+  succeed again", which it cannot while every tick's sweep hits the same entry; two earlier
+  sweeps the same day poisoned rooms with "retention entry missing" (a body never received has
+  no first-seen fact) and recovered only when the room was reopened.
 
 ## Unchanged rulings
 
@@ -343,7 +355,7 @@ Narrow successor amendments. Requirements not named here remain in force.
    symbols); one cut (v0.4.8).
 8. FX-28, FX-29, FX-30, FX-31: the idle daemon's disk and CPU, measured on the decider's
    daemon (v0.4.9) on 2026-10-20, in that order (the tick, the re-pull, the flush, the lock);
-   FX-32 under #934; one cut (v0.4.10).
+   FX-32 under #934; FX-33 with them; one cut (v0.4.10).
 
 Each ADR change under this record is reviewed by an independent session (opencode-work) before
 its stories are extracted.
