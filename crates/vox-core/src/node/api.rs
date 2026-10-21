@@ -702,6 +702,8 @@ pub struct ChannelDetail {
     pub held: Vec<(Digest32, u64)>,
     /// Last authenticated position each member said it holds in this node's feed.
     pub held_through: Vec<(Digest32, u64)>,
+    /// Last authenticated, role-complete position this node holds in each member's feed.
+    pub holds_through: Vec<(Digest32, u64)>,
     /// What this node's person has not read here, oldest first
     /// ([`crate::node::channel::ChannelState::unread`]): what a client counts at its start.
     pub unread: Vec<Digest32>,

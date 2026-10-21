@@ -27,6 +27,7 @@ pub(super) enum Staged {
     Header {
         entry: Entry,
         head: Digest32,
+        body_allowed: bool,
     },
     Verifier(CursorBinding),
     Busy,
@@ -215,9 +216,16 @@ fn stage_header(
         index.keep_history_header(&header)?;
         index.keep_history_pending_header(&head_id, &header)
     })?;
+    // Header authentication is the authority for recipient privacy.  A peer cannot make a
+    // private key package body admissible by merely sending it after its public header.
+    let body_allowed = !entry.skeleton.v2.as_ref().is_some_and(|v2| {
+        v2.kind == crate::log::history::SignedEntryKind::KeyPackage
+            && v2.recipient != Some(room.me())
+    });
     Ok(Staged::Header {
         entry,
         head: head_id,
+        body_allowed,
     })
 }
 

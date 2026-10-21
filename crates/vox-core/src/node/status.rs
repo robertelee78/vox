@@ -104,6 +104,8 @@ pub struct MemberStatus {
     pub key_waits: Option<String>,
     /// Last authenticated position this member said it holds in this node's room feed.
     pub held_through: Option<u64>,
+    /// Last authenticated, role-complete position this node holds in this member's room feed.
+    pub holds_through: Option<u64>,
 }
 
 /// One room that is still preparing: not open, not closed, and saying what it waits for.
@@ -459,7 +461,7 @@ impl StatusReport {
         let rooms = self.rooms.iter().map(|r| {
             let members = r.members.iter().map(|m| {
                 format!(
-                    "{{\"id\":{},\"me\":{},\"trusted\":{},\"connected\":{},\"last_seen_ms\":{},\"last_sync_ms\":{},\"key_waits\":{},\"held_through\":{}}}",
+                    "{{\"id\":{},\"me\":{},\"trusted\":{},\"connected\":{},\"last_seen_ms\":{},\"last_sync_ms\":{},\"key_waits\":{},\"held_through\":{},\"holds_through\":{}}}",
                     q(&b32_encode(&m.id)),
                     m.me,
                     m.trusted,
@@ -467,7 +469,8 @@ impl StatusReport {
                     opt(m.last_seen),
                     opt(m.last_sync),
                     m.key_waits.as_deref().map_or_else(|| "null".to_owned(), q),
-                    opt(m.held_through)
+                    opt(m.held_through),
+                    opt(m.holds_through)
                 )
             });
             let frozen = list(r.frozen.iter().map(|d| q(&b32_encode(d))));

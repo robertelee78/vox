@@ -463,26 +463,35 @@ const IDLE: Duration = Duration::from_secs(60);
 /// **A quiet room costs nothing and says when it last synced** (ADR-038 FX-15, FX-16; #979,
 /// #980, #996): alice and bob, each on a daemon of their own, read each other once. Carol joins,
 /// then goes offline; alice's consent must therefore travel as a key-package in her public feed.
-/// Bob reads alice's later marker, proving that he crossed the package addressed only to carol,
-/// while carol's package installer is held by the test-knob marker. Over [`IDLE`] seconds nobody
-/// posts, no lane becomes partial merely because bob correctly holds only that package's public
-/// header, and each profile completes no more sync rounds than the periodic
+/// While Bob is offline, Alice and Carol each append more than the production history-page bound.
+/// On return he is hostile-sent Carol's private package body once: he must reject it before
+/// persistence, cross the authenticated header, and durably acknowledge both authors' exact
+/// tails across a restart. Over [`IDLE`] seconds nobody posts, no lane becomes partial merely
+/// because Bob correctly holds only that package's public header, and each profile completes no
+/// more sync rounds than the periodic
 /// request allows (one per [`SYNC_INTERVAL_SECS`](vox_core::node::syncstream::SYNC_INTERVAL_SECS)
 /// plus the follow-up each may raise), and `vox status --json` names a last completed sync for
-/// the room and for the member. Once the apparatus releases carol's package, she reads alice's
-/// marker and all three members still exchange visible posts. Measured before #996's role-aware
-/// settlement: the package's header-only position remained a missing body on bob, whose periodic
-/// inventory probe ended partial forever.
+/// the room and for the member. With Alice offline, Carol completes a sync with Bob but cannot
+/// read Alice's tail; once the actual package source returns she reads it and all three members
+/// still exchange visible posts. Measured before #996's role-aware settlement: the package's
+/// header-only position remained a missing body on Bob, whose periodic inventory probe ended
+/// partial forever.
 ///
 /// Mutants: the own-head hint offered to every peer on every tick again (`offer_own_head`
 /// ignoring who acknowledged) turns the round-count claim red; undoing role-aware settlement for
-/// the non-recipient package turns the zero-partial claim red; the lane's completion no longer
-/// recording the sync (`note_lane_sync` removed) turns the last-sync claim red.
+/// the non-recipient package turns the zero-partial claim red; granting body credit persists the
+/// hostile ciphertext and turns the Bob-only privacy assertion red; dropping bounded
+/// continuation or its durable cursor turns an exact held-through assertion red; the lane's
+/// completion no longer recording the sync (`note_lane_sync` removed) turns the last-sync claim
+/// red.
 #[cfg(feature = "optional-proofs")]
 #[test]
 #[ignore = "an idle minute on two real vox daemons; optional, run it in release"]
 fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
-    test_knobs::require(&["VOX_TEST_HOLD_PACKAGES_FILE"]);
+    test_knobs::require(&[
+        "VOX_TEST_HOLD_PACKAGES_FILE",
+        "VOX_TEST_SERVE_NONRECIPIENT_HISTORY_BODY_FILE",
+    ]);
     watchdog::arm();
     let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("APPARATUS: no temp dir: {e}"));
     let root = tmp.path();
@@ -507,7 +516,16 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         let (ok, _, err) = vox(dir, &["trust", "add", fp, "--name", name], None);
         assert!(ok, "PRODUCT: `vox trust add` of {name} failed: {err}");
     }
-    let _alice_daemon = daemon(&alice, "alice");
+    let hostile = root.join("serve-private-body-once");
+    let hostile_path = hostile
+        .to_str()
+        .expect("APPARATUS: a UTF-8 hostile-body marker path")
+        .to_owned();
+    let alice_knob = [(
+        "VOX_TEST_SERVE_NONRECIPIENT_HISTORY_BODY_FILE",
+        hostile_path.as_str(),
+    )];
+    let alice_daemon = daemon_env(&alice, "alice", &alice_knob);
     attached(&alice, "alice");
     let (ok, _, err) = vox(
         &alice,
@@ -531,7 +549,7 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
     let (ok, link, err) = vox(&alice, &["room", "link", &room], None);
     assert!(ok, "PRODUCT: `vox room link` failed: {err}");
     let link = link.trim().to_owned();
-    let _bob_daemon = daemon(&bob, "bob");
+    let bob_daemon = daemon(&bob, "bob");
     attached(&bob, "bob");
     let (ok, _, err) = vox(
         &bob,
@@ -558,6 +576,10 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         said(&bob, "bob"),
         said(&alice, "alice")
     );
+    // Bob is now a real returning member, but is offline while two authors build suffixes.  That
+    // makes his next Page settle newer positions before the older private-package header closes
+    // Alice's gap, and gives the durable continuation scheduler two authors to rotate.
+    bob_daemon.stop();
 
     // ---- a private package Carol is owed is a header-only, role-complete row on Bob --------
     let hold = root.join("hold-carol-packages");
@@ -589,6 +611,31 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         );
         std::thread::sleep(Duration::from_millis(200));
     }
+    let carol_successors = vox_core::log::history::MAX_PAGE_ENTRIES + 1;
+    for n in 0..carol_successors {
+        let text = format!("carol settled successor {n}");
+        let (ok, out, err) = vox(&carol, &["room", "post", &room, &text], None);
+        assert!(ok, "PRODUCT: carol's successor {n} was refused: {out}{err}");
+    }
+    let carol_tail_through = room_own_feed_through(&carol, &room).unwrap_or_else(|| {
+        panic!(
+            "PRODUCT: carol's `vox status --json` did not name her authenticated feed after \
+             {carol_successors} accepted successors"
+        )
+    });
+    let carol_replicated_deadline = Instant::now() + READY_WITHIN;
+    while member_held_through(&carol, &room, &fps[0]).is_none_or(|held| held < carol_tail_through) {
+        assert!(
+            Instant::now() < carol_replicated_deadline,
+            "APPARATUS: Alice did not acknowledge Carol's exact feed position \
+             {carol_tail_through} within {READY_WITHIN:?}; the offline two-author continuation \
+             was not staged\ncarol said: {}\nalice said: {}",
+            said(&carol, "carol"),
+            said(&alice, "alice")
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let carol_bob_sync_before = member_last_sync(&carol, &room, &fps[1]);
     carol_daemon.stop();
     let before_package = status_rows(&alice, &room).unwrap_or_else(|| {
         panic!(
@@ -618,18 +665,52 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         );
         std::thread::sleep(Duration::from_millis(200));
     }
-    let package_marker = "after carol's private package";
-    let (ok, out, err) = vox(&alice, &["room", "post", &room, package_marker], None);
-    assert!(
-        ok,
-        "PRODUCT: alice's package marker was refused: {out}{err}"
-    );
+    let before_private_suffix = room_own_feed_through(&alice, &room).unwrap_or_else(|| {
+        panic!(
+            "PRODUCT: alice's `vox status --json` did not name her feed before the private \
+             package suffix"
+        )
+    });
+    let alice_successors = vox_core::log::history::MAX_PAGE_ENTRIES + 1;
+    for n in 0..alice_successors {
+        let text = format!("alice settled successor {n}");
+        let (ok, out, err) = vox(&alice, &["room", "post", &room, &text], None);
+        assert!(ok, "PRODUCT: alice's successor {n} was refused: {out}{err}");
+    }
+    let package_marker = format!("alice settled successor {}", alice_successors - 1);
     let marker_through = room_own_feed_through(&alice, &room).unwrap_or_else(|| {
         panic!(
             "PRODUCT: alice's `vox status --json` did not name her authenticated room-feed \
              position after the package marker"
         )
     });
+    assert!(
+        marker_through.saturating_sub(before_private_suffix)
+            > vox_core::log::history::MAX_PAGE_ENTRIES as u64,
+        "APPARATUS: Alice's authenticated feed advanced only from {before_private_suffix} to \
+         {marker_through}; the private-package suffix did not exceed the production page bound {}",
+        vox_core::log::history::MAX_PAGE_ENTRIES
+    );
+
+    // Turn Alice into a hostile authenticated server for exactly the first body frame of the
+    // package addressed to Carol. The server renames this marker only after sending that frame.
+    // Bob must reject it before staging/persistence, then retry the header-only role-complete
+    // entry and causally finish both authors' bounded suffixes.
+    std::fs::write(&hostile, b"")
+        .unwrap_or_else(|e| panic!("APPARATUS: could not create {}: {e}", hostile.display()));
+    let hostile_engaged = std::path::PathBuf::from(format!("{}.engaged", hostile.display()));
+    let bob_after_gap = daemon(&bob, "bob-after-gap");
+    attached(&bob, "bob-after-gap");
+    let hostile_deadline = Instant::now() + READY_WITHIN;
+    while !hostile_engaged.is_file() {
+        assert!(
+            Instant::now() < hostile_deadline,
+            "APPARATUS: Alice did not send the deliberately hostile non-recipient package body \
+             within {READY_WITHIN:?}; the privacy boundary was not exercised\nalice said: {}",
+            said(&alice, "alice")
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
     // Reading a fresh later row is not proof of crossing a sparse gap: it can arrive and render
     // independently. Alice must instead report Bob's authenticated receipt through the exact
     // feed position after the package. That role-contiguous cursor cannot jump over Carol's
@@ -642,17 +723,16 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
              room feed through {marker_through}; Carol's header-only package did not settle \
              contiguously for Bob's role\n\
              bob's daemon said: {}",
-            said(&bob, "bob")
+            said(&bob, "bob-after-gap")
         );
         std::thread::sleep(Duration::from_millis(200));
     }
     assert!(
-        reads(&bob, &room, package_marker),
+        reads(&bob, &room, &package_marker),
         "PRODUCT: Bob acknowledged Alice's feed through {marker_through}, but `vox room read` did \
          not show its later marker\nbob's daemon said: {}",
-        said(&bob, "bob")
+        said(&bob, "bob-after-gap")
     );
-
     // ---- the room is quiet: acknowledgements settle, then the rounds are counted ----------
     let before = [synced(&alice), synced(&bob)];
     let before_lanes = [lane_why(&before[0].2), lane_why(&before[1].2)];
@@ -714,24 +794,80 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         after_lanes[1]
     );
 
-    // Releasing only the apparatus hold makes the intended recipient able to use the private
-    // package. Bob's visible marker remains ordinary room content; no package body is surfaced.
-    let _carol_daemon = daemon_env(&carol, "carol-after-hold", &knob);
-    attached(&carol, "carol-after-hold");
+    // Restart Bob before the next receipt probe. Alice observing a newer completed sync and the
+    // same exact held-through position proves Bob reconstructed the durable cursor; it is not an
+    // in-memory acknowledgement left over from the first daemon.
+    bob_after_gap.stop();
+    let _bob_after_restart = daemon(&bob, "bob-after-restart");
+    attached(&bob, "bob-after-restart");
+    let restart_deadline = Instant::now() + READY_WITHIN;
+    while member_holds_through(&bob, &room, &fps[0]).is_none_or(|held| held < marker_through)
+        || member_holds_through(&bob, &room, &fps[2]).is_none_or(|held| held < carol_tail_through)
+    {
+        assert!(
+            Instant::now() < restart_deadline,
+            "PRODUCT: restarted Bob's `vox status --json` did not restore the exact durable \
+             role-complete cursors for Alice through {marker_through} and Carol through \
+             {carol_tail_through} within {READY_WITHIN:?}\nbob said: {}",
+            said(&bob, "bob-after-restart")
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    // Alice now goes offline. Release Carol's package hold only after Carol and Bob are running,
+    // then wait for a completed Carol↔Bob sync (not elapsed silence). If Bob persisted the hostile
+    // ciphertext, he can serve it and Carol will show Alice's tail. The correct product completed
+    // that sync but has only the authenticated package header, so her shipped read remains absent.
+    alice_daemon.stop();
+    let _carol_daemon = daemon_env(&carol, "carol-from-bob", &knob);
+    attached(&carol, "carol-from-bob");
     assert!(
-        !reads(&carol, &room, package_marker),
+        !reads(&carol, &room, &package_marker),
         "APPARATUS: carol read alice's marker while package opening was held; this binary lacks \
          the required `test-knobs` staging"
     );
     std::fs::remove_file(&hold)
         .unwrap_or_else(|e| panic!("APPARATUS: could not release {}: {e}", hold.display()));
+    let bob_only_deadline = Instant::now() + READY_WITHIN;
+    while member_last_sync(&carol, &room, &fps[1]) <= carol_bob_sync_before {
+        assert!(
+            Instant::now() < bob_only_deadline,
+            "PRODUCT: Carol did not complete a sync with reachable Bob within \
+             {READY_WITHIN:?} while Alice was offline\ncarol said: {}\nbob said: {}",
+            said(&carol, "carol-from-bob"),
+            said(&bob, "bob-after-restart")
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(
+        member_held_through(&carol, &room, &fps[1]).is_some_and(|held| held >= carol_tail_through),
+        "PRODUCT: after both authors exceeded the bounded continuation page and Carol completed \
+         a sync with restarted Bob, his receipt did not preserve her exact feed position \
+         {carol_tail_through}\ncarol said: {}\nbob said: {}",
+        said(&carol, "carol-from-bob"),
+        said(&bob, "bob-after-restart")
+    );
+    assert!(
+        !reads(&carol, &room, &package_marker),
+        "PRODUCT: after a completed sync with Bob while Alice was offline, Carol read Alice's \
+         private-package tail {package_marker:?}; Bob persisted and re-served ciphertext addressed \
+         only to Carol\ncarol said: {}\nbob said: {}",
+        said(&carol, "carol-from-bob"),
+        said(&bob, "bob-after-restart")
+    );
+
+    // Bringing the actual source back is the one causal change that makes Carol's package
+    // available. Her exact tail appears, then all three shipped daemons still exchange content.
+    let _alice_after_privacy = daemon_env(&alice, "alice-after-privacy", &alice_knob);
+    attached(&alice, "alice-after-privacy");
     let released_deadline = Instant::now() + READY_WITHIN;
-    while !reads(&carol, &room, package_marker) {
+    while !reads(&carol, &room, &package_marker) {
         assert!(
             Instant::now() < released_deadline,
-            "PRODUCT: carol did not read alice's marker within {READY_WITHIN:?} after her \
-             key-package hold was released\ncarol's daemon said: {}",
-            said(&carol, "carol-after-hold")
+            "PRODUCT: Carol did not read Alice's exact tail within {READY_WITHIN:?} after the \
+             actual package source returned\ncarol said: {}\nalice said: {}",
+            said(&carol, "carol-from-bob"),
+            said(&alice, "alice-after-privacy")
         );
         std::thread::sleep(Duration::from_millis(200));
     }
@@ -744,8 +880,8 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
             Instant::now() < converged_deadline,
             "PRODUCT: alice and bob did not both read carol's post within {READY_WITHIN:?} after \
              her package landed\nalice's daemon said: {}\nbob's daemon said: {}",
-            said(&alice, "alice"),
-            said(&bob, "bob")
+            said(&alice, "alice-after-privacy"),
+            said(&bob, "bob-after-restart")
         );
         std::thread::sleep(Duration::from_millis(200));
     }
@@ -1514,6 +1650,41 @@ fn member_held_through(dir: &Path, room: &str, member: &str) -> Option<u64> {
         .as_array()?
         .iter()
         .find(|row| row["id"].as_str() == Some(member))?["held_through"]
+        .as_u64()
+}
+
+/// The local role-complete cursor for `member` as the shipped status command reports it.
+fn member_holds_through(dir: &Path, room: &str, member: &str) -> Option<u64> {
+    let (ok, out, _) = vox(dir, &["status", "--json"], None);
+    if !ok {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(&out).ok()?;
+    value["rooms"]
+        .as_array()?
+        .iter()
+        .find(|row| row["id"].as_str().is_some_and(|id| id.starts_with(room)))?["members"]
+        .as_array()?
+        .iter()
+        .find(|row| row["id"].as_str() == Some(member))?["holds_through"]
+        .as_u64()
+}
+
+/// The last completed sync this profile reports for one exact room member. `None` is also the
+/// honest result before that pair has completed a session.
+fn member_last_sync(dir: &Path, room: &str, member: &str) -> Option<u64> {
+    let (ok, out, _) = vox(dir, &["status", "--json"], None);
+    if !ok {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(&out).ok()?;
+    value["rooms"]
+        .as_array()?
+        .iter()
+        .find(|row| row["id"].as_str().is_some_and(|id| id.starts_with(room)))?["members"]
+        .as_array()?
+        .iter()
+        .find(|row| row["id"].as_str() == Some(member))?["last_sync_ms"]
         .as_u64()
 }
 

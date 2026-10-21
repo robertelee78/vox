@@ -8582,6 +8582,13 @@ impl ChannelState {
         self.held.get(member).copied()
     }
 
+    /// Last authenticated, semantically complete position this node holds in `member`'s feed.
+    /// This is restored from the same durable cursor used to answer the member's receipt probe.
+    pub fn holds_through(&self, member: &Digest32) -> Option<u64> {
+        let through = self.dag.verified_head(member);
+        (through != 0).then_some(through)
+    }
+
     /// Record that `member`'s node said, in a sync, it holds this identity's feed here up to `seq`
     /// (ADR-028 R-6). Its last word stands. Kept on disk best effort: a write that fails costs a
     /// restart the count until the next sync, never the room.

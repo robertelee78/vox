@@ -325,7 +325,11 @@ impl Receiver {
                             }
                             result.verifiers.push(*binding);
                         }
-                        Staged::Header { entry, head } => {
+                        Staged::Header {
+                            entry,
+                            head,
+                            body_allowed,
+                        } => {
                             let seq = entry.skeleton.seq;
                             result.need(Query::Proof {
                                 head: *head,
@@ -334,6 +338,14 @@ impl Receiver {
                                 to: seq,
                             })?;
                             if matches!(query, Query::Header { .. }) {
+                                continue;
+                            }
+                            // The authenticated header says this private package belongs to a
+                            // different member.  Do not create a body staging target or grant
+                            // chunk credit.  An honest peer completes the role-visible entry
+                            // header-only; an unexpected body frame is refused by credit.accept
+                            // before Action::Chunk can persist a byte.
+                            if !body_allowed {
                                 continue;
                             }
                             let Some(staging) = &self.staging else {

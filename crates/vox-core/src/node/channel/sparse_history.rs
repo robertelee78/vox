@@ -925,18 +925,24 @@ impl ChannelState {
             return Err(self.save_failure());
         }
         if self.history_publication_busy(store)? {
-            return Ok(!self.sparse_contiguous_pending.is_empty());
+            return Ok(self.sparse_contiguous_pending.contains(author));
         }
         let mut batch = store.batch()?;
         let mut index = self
             .entries
             .write(&mut batch, &self.sek, &self.channel_id)?;
         let progress = index.advance_sparse_contiguous(author, &self.me())?;
+        if progress.state.is_none() && !progress.more {
+            drop(index);
+            self.note_contiguous_advance(*author, progress)?;
+            return Ok(false);
+        }
         index.seal()?;
         batch.commit()?;
         self.entries.committed();
+        let more = progress.more;
         self.note_contiguous_advance(*author, progress)?;
-        Ok(!self.sparse_contiguous_pending.is_empty())
+        Ok(more)
     }
 
     fn note_contiguous_advance(
@@ -973,7 +979,8 @@ impl ChannelState {
             return Ok(false);
         };
         self.sparse_contiguous_after = Some(author);
-        self.advance_history_contiguous(store, &author)
+        self.advance_history_contiguous(store, &author)?;
+        Ok(!self.sparse_contiguous_pending.is_empty())
     }
 }
 

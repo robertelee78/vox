@@ -407,6 +407,10 @@ fn detail_of(
         .iter()
         .filter_map(|member| ch.held_through(member).map(|seq| (*member, seq)))
         .collect();
+    let holds_through = members
+        .iter()
+        .filter_map(|member| ch.holds_through(member).map(|seq| (*member, seq)))
+        .collect();
     Ok(ChannelDetail {
         pause: ch.room_pause(),
         pause_resume_after: ch.pause_resume_after(),
@@ -446,6 +450,7 @@ fn detail_of(
         read_by,
         held,
         held_through,
+        holds_through,
         unread,
         // The authors this node can answer for now; a refreshing author is named in each
         // listing's revision rather than holding the whole room's detail back (ADR-037 R4).
@@ -20302,6 +20307,10 @@ impl Node {
                     key_waits: self.said_of(&room.channel_id, m),
                     held_through: room
                         .held_through
+                        .iter()
+                        .find_map(|(member, seq)| (*member == *m).then_some(*seq)),
+                    holds_through: room
+                        .holds_through
                         .iter()
                         .find_map(|(member, seq)| (*member == *m).then_some(*seq)),
                 })

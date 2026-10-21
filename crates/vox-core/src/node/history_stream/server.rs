@@ -17,6 +17,29 @@ const MIB: usize = 1024 * 1024;
 // cannot consume the terminal DONE credit. Duplicate ACKs are charged too, not free input.
 const ACK_RESERVE: usize = 128;
 
+/// **For proofs only.** While this marker exists, the first private key-package requested by a
+/// non-recipient is deliberately served once, then the marker is renamed with `.engaged`
+/// appended.  This makes a real peer hostile at the wire boundary so another shipped daemon can
+/// prove it refuses the unexpected ciphertext before persistence.  It is absent from installable
+/// builds (V210-105).
+#[cfg(feature = "test-knobs")]
+pub const TEST_SERVE_PRIVATE_BODY_ENV: &str = "VOX_TEST_SERVE_NONRECIPIENT_HISTORY_BODY_FILE";
+
+fn test_private_body_marker() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    #[cfg(feature = "test-knobs")]
+    {
+        let trigger = std::path::PathBuf::from(std::env::var(TEST_SERVE_PRIVATE_BODY_ENV).ok()?);
+        if !trigger.is_file() {
+            return None;
+        }
+        let mut engaged = trigger.as_os_str().to_os_string();
+        engaged.push(".engaged");
+        return Some((trigger, engaged.into()));
+    }
+    #[cfg(not(feature = "test-knobs"))]
+    None
+}
+
 enum Sent {
     Yes,
     Full,
@@ -472,13 +495,6 @@ async fn entry(
     } else {
         None
     };
-    // Five worst-case record/sealing copies plus fixed work space, scaled to the signed length.
-    // A small control uses the small pool; a large record must have the foreground/archive job.
-    let envelope = 5 * (length as usize + MAX_HEADER_BYTES + 9) + 4 * MIB;
-    let Some(record_job) = job.record_job(envelope) else {
-        result.status = Status::Busy;
-        return Ok(result);
-    };
     // Membership grants the public authenticated header, not another member's private key.
     // Decide this from the verified signed header before even opening the retained body. Page
     // and Entry share this path, so an archive request cannot override recipient privacy.
@@ -486,13 +502,29 @@ async fn entry(
         v2.kind == crate::log::history::SignedEntryKind::KeyPackage
             && v2.recipient != Some(source.peer)
     });
-    let payload = if private_for_another {
+    let mut hostile_private_body = private_for_another.then(test_private_body_marker).flatten();
+    let withhold_private_body = private_for_another && hostile_private_body.is_none();
+    // Five worst-case record/sealing copies plus fixed work space, scaled to the signed length.
+    // A small control uses the small pool; a large record must have the foreground/archive job.
+    let envelope = 5 * (length as usize + MAX_HEADER_BYTES + 9) + 4 * MIB;
+    let record_job = if withhold_private_body {
+        None
+    } else {
+        let Some(record_job) = job.record_job(envelope) else {
+            result.status = Status::Busy;
+            return Ok(result);
+        };
+        Some(record_job)
+    };
+    let payload = if withhold_private_body {
         None
     } else {
         Some(
             match source
                 .read_body(
-                    &record_job,
+                    record_job
+                        .as_ref()
+                        .expect("non-private history body reserved a record job"),
                     envelope,
                     length as usize + MAX_HEADER_BYTES + 9,
                     move |room, store| Ok(Some(room.history_payload(store, &hash)?)),
@@ -542,6 +574,15 @@ async fn entry(
         }
     }
     result.hash = Some(hash);
+    if withhold_private_body {
+        // This peer's role is fully satisfied by the authenticated header.  Complete the entry
+        // instead of advertising a missing body, so Page can continue past it without a retry.
+        result.status = Status::Complete;
+        if let Some(bound) = live {
+            job.finish_live(bound);
+        }
+        return Ok(result);
+    }
     credit.expect_body(hash, length, offset)?;
     let Some(bytes) = bytes else {
         result.status = if length == 0 {
@@ -583,7 +624,13 @@ async fn entry(
         )
         .await?
         {
-            Sent::Yes => {}
+            Sent::Yes => {
+                if let Some((trigger, engaged)) = hostile_private_body.take() {
+                    std::fs::rename(trigger, engaged).map_err(|_| {
+                        Error::Profile("test hostile-body marker could not record engagement")
+                    })?;
+                }
+            }
             Sent::Full => {
                 result.status = Status::More;
                 return Ok(result);
