@@ -569,8 +569,9 @@ const IDLE: Duration = Duration::from_secs(60);
 ///
 /// Mutants: the own-head hint offered to every peer on every tick again (`offer_own_head`
 /// ignoring who acknowledged) turns the round-count claim red; undoing role-aware settlement for
-/// the non-recipient package turns the zero-partial claim red; granting body credit persists the
-/// hostile ciphertext and turns the Bob-only privacy assertion red; moving the archive cursor
+/// the non-recipient package turns the exact held-through assertion red even though Bob still
+/// echoes its merely committed head in inventory; granting body credit persists the hostile
+/// ciphertext and turns the Bob-only privacy assertion red; moving the archive cursor
 /// below the role-only header before its effect makes the interrupted request finish with debt;
 /// skipping the already-settled callback or rejecting its terminal replay strands the resumed
 /// request; dropping bounded continuation stalls the exact older-row assertion; each mutation
@@ -605,6 +606,7 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
     for (dir, fp, name) in [
         (&alice, &fps[1], "bob"),
         (&bob, &fps[0], "alice"),
+        (&bob, &fps[2], "carol"),
         (&carol, &fps[0], "alice"),
         (&carol, &fps[1], "bob"),
     ] {

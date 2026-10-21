@@ -1274,12 +1274,9 @@ impl Flow {
                 }
                 if let Some(inventory) = result.inventory {
                     for page in inventory.hints.chunks(64) {
-                        let offered = source
+                        source
                             .offer_inventory(job, inbox, inbox_generation, self.room, page)
                             .await?;
-                        if let Some(seq) = offered.mine_held {
-                            self.mine_held = Some(self.mine_held.map_or(seq, |m| m.max(seq)));
-                        }
                     }
                 }
                 if result.status == Status::BodyNotHeld && task.purpose == Purpose::Live {
