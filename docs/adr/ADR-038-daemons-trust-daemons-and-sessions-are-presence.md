@@ -243,10 +243,11 @@ The decider then answered twelve questions, one at a time. His answers are the d
   rejecting a ten-fast-turns-then-one-a-second cap proposed for FX-24's cause).
 - **FX-28.** A change to the person's computer trust (ADR-035: a policy revision, a node
   attaching or detaching, a computer joining or leaving the roster) made on either of two paired
-  daemons MUST show on every node of both: `vox computer status` on each node names the new
-  policy (the computer added or removed, the drive granted or revoked) at once when the exchange
-  the changing daemon starts (#989) arrives, and within 60 s, the fallback exchange's period,
-  when that exchange is lost. Two daemons on which nothing changed MUST spend nothing on it:
+  daemons MUST show on every attached node of both: `vox computer status` asked of each such
+  node names the new policy (the computer added or removed, the drive granted or revoked, the
+  node attached or detached in the bound roster) within 5 s of the change when the exchange the
+  changing daemon starts (#989) completes, and within 60 s, the fallback exchange's period, when
+  that exchange is lost. Two daemons on which nothing changed MUST spend nothing on it:
   over an idle minute their CPU grows by no more than FX-15's quiet-room bound. "We need the
   detection of change logic to be sound. Easy for local daemon to notice, but daemon to daemon
   update needs to be solid" (the decider, 2026-10-20). Decision: a node's binding is derived
@@ -285,23 +286,24 @@ The decider then answered twelve questions, one at a time. His answers are the d
   nodes) is pulled again from every peer every period: 3.67 syncs per second over 39 peer-room
   pairs, a median 11 s between two syncs of one pair, about 370 commits per sync.
 - **FX-30.** What a person would lose MUST survive a crash of the daemon, of the machine, or a
-  power loss: every entry this node accepted (its own and those received), consent, trust, keys,
-  Session records and the format marker are on disk before the command that wrote them returns,
-  before a received entry is shown to a reader, and before it is acknowledged to its sender
-  (ruled 2026-10-20: "only what a person would lose … gets the full flush to disk", "correct").
-  Derived sync state (heads and headers already held, verifier contexts, cursors, live windows,
-  client cursors) MAY be lost in such a crash: the daemon rebuilds it from the proofs it holds
-  and from the peers it can reach, and a room whose peers are away syncs on when they return.
-  A sync round that persists only derived state MUST cost no flush to disk: over the
-  agents-at-work minute the daemon's time inside `F_FULLFSYNC` MUST be that of the content
-  commits alone. Decision: derived state commits at redb `Durability::None` or `Eventual` (a
-  later durable commit carries it); what a person would lose stays `Immediate`. Measured
-  cause, the same daemon: every `Batch::commit` is redb `Durability::Immediate` →
+  power loss: a node's own entries, consent, trust, keys, Session records and the format marker
+  are on disk before the command that wrote them returns (ruled 2026-10-20: "only what a person
+  would lose (own entries, consent, trust, keys, Sessions, the format marker) gets the full
+  flush to disk", "correct"). Derived sync state (held heads, cursors, verifier contexts, live
+  windows) MAY be lost in such a crash: the daemon rebuilds it from the proofs it holds and from
+  the peers it can reach. A sync round that persists only derived state MUST make no full flush:
+  `vox status --json` names the daemon's count of full flushes, and over a quiet minute it MUST
+  NOT move. Decision: derived state commits at redb `Durability::None` or `Eventual` (a later
+  durable commit carries it) and the ruled set stays `Immediate`; a received entry and the
+  header that carries it commit with the derived state that admitted them and reach disk with
+  the next durable commit, so a crash in between loses nothing a peer does not still hold.
+  Measured cause, the same daemon: every `Batch::commit` is redb `Durability::Immediate` →
   `sync_data` → `fcntl(F_FULLFSYNC)` (vox-core never calls `set_durability`); the process spent
   0.65 thread-seconds per wall second inside `F_FULLFSYNC` (about 0.5 ms per call back to back;
   an isolated 8 KiB probe cost 7.6 ms), and that flush was most of the 1,367 commits' cost.
 - **FX-31.** A flush to disk of one commit MUST NOT delay what does not depend on it: while a
-  flush is held (apparatus: the store's flush stalled by a test knob), the daemon's status
+  flush is held (apparatus: the store's flush stalled by a `VOX_TEST_*` knob of the `test-knobs`
+  build, the way every held-step proof here stages a stall), the daemon's status
   publication, a member's read in that room, a post in any other room and attention selection
   MUST answer within FX-17's bound, a post in that room MUST be accepted within the bound plus
   the held flush's duration, and `vox status` MUST NOT say "room publication is busy" for a
@@ -320,11 +322,12 @@ The decider then answered twelve questions, one at a time. His answers are the d
 - **FX-33.** A change to a room's retention MUST NOT stop the room: after the admin shortens
   it, every member MUST still read and post there, the rows the member holds that are older
   than the new lifetime MUST expire on it, and no daemon MUST say it cannot save because of the
-  sweep that change started. Decision: the sweep prunes what the node holds; an entry it cannot
-  classify yet (a Session step or a message) is skipped this sweep and classified when its body
-  or its page arrives, and what the member holds expires without waiting on it; a signed-format
-  entry is never a legacy Session, and an entry past its author's verified head, or one whose
-  body never arrived, is not evidence of a malformed store. Measured cause, 2026-10-20 (the
+  sweep that change started. Decision: the sweep prunes what the node holds; a signed-format
+  entry is never a legacy Session; an entry whose body never arrived, or that sits past its
+  author's verified head, is skipped that sweep and is not evidence of a malformed store; a row
+  the sweep cannot classify (a Session step or a message) expires under the message lifetime,
+  the longer of the two, once it is older than that, so nothing is kept forever for want of a
+  classification. Measured cause, 2026-10-20 (the
   decider's node, vox 0.4.9, its daemon log `.daemon/log` at 2026-10-21T00:00:11Z): he set his
   repo room's retention from forever to one week in the app; the next sweep's legacy Session
   classification (`legacy_kind_in`) refused a format-2 entry as "Session classification source
