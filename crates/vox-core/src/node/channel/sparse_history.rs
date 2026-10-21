@@ -77,7 +77,7 @@ impl ChannelState {
         peer: Digest32,
         author: Digest32,
         head: Digest32,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let peer_incarnation =
             self.history_inventory_incarnation(&peer)
                 .ok_or(Error::MalformedGovernance(
@@ -90,7 +90,7 @@ impl ChannelState {
         if read.history_declined_head(&peer, &author)?
             == Some((head, peer_incarnation, author_incarnation))
         {
-            return Ok(());
+            return Ok(false);
         }
         drop(read);
         self.history_write(store, |index| {
@@ -101,7 +101,8 @@ impl ChannelState {
                 peer_incarnation,
                 author_incarnation,
             )
-        })
+        })?;
+        Ok(true)
     }
 
     /// A relevant advertised successor or an ended membership scope removes the durable

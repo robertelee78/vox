@@ -141,6 +141,9 @@ pub(crate) struct Flow {
     /// a body chunk, a hint it did not have): a completed flow that brought nothing is an
     /// `empty` round in `vox status --json` (ADR-038 FX-29).
     pub(crate) brought: bool,
+    /// Exact unavailable advertised heads declined during this retained flow. The actor reports
+    /// the outcome through the lane in `vox status --json`.
+    pub(crate) declined: u64,
     pub(crate) admitted_authors: usize,
     pub(crate) external: Option<(Digest32, u64)>,
     pub(crate) archive_status: Option<crate::node::api::HistoryDemandStatus>,
@@ -287,6 +290,7 @@ impl Flow {
             rendered: false,
             governance: false,
             brought: false,
+            declined: 0,
             admitted_authors: 0,
             external: None,
             archive_status: None,
@@ -402,6 +406,7 @@ impl Flow {
             rendered: false,
             governance: false,
             brought: false,
+            declined: 0,
             admitted_authors: 0,
             external: None,
             archive_status: None,
@@ -573,15 +578,16 @@ impl Flow {
         })
     }
     async fn decline(
-        &self,
+        &mut self,
         source: &super::source::Source,
         job: &Job,
         inbox: &super::hints::HintInbox,
         author: Digest32,
         head: Digest32,
     ) -> Result<()> {
-        source.remember_decline(job, author, head).await?;
+        let remembered = source.remember_decline(job, author, head).await?;
         inbox.decline(self.room, source.peer, author, head);
+        self.declined = self.declined.saturating_add(u64::from(remembered));
         Ok(())
     }
     pub(crate) fn done(&self) -> bool {

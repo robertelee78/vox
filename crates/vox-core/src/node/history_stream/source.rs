@@ -57,16 +57,17 @@ impl Source {
         job: &Job,
         author: Digest32,
         head: Digest32,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let peer = self.peer;
         match self
             .read_charged(job, 0, 0, move |room, store| {
-                room.remember_history_decline(store, peer, author, head)?;
-                Ok(Some(()))
+                Ok(Some(
+                    room.remember_history_decline(store, peer, author, head)?,
+                ))
             })
             .await?
         {
-            Lookup::Found(_) => Ok(()),
+            Lookup::Found(saved) => Ok(saved.value),
             Lookup::Busy | Lookup::Missing => {
                 Err(Error::Unreachable("history refusal was not persisted"))
             }

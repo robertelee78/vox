@@ -1203,6 +1203,15 @@ pub struct PortCounters {
     /// a quiet room every round is one; a lane whose `completed` climbs faster than its
     /// `empty` is pulling or serving something.
     pub empty: u64,
+    /// Completed bounded-history rounds that fetched at least one object this node did not
+    /// already hold. Kept separately so status says which side moved history.
+    pub history_fetched: u64,
+    /// Completed bounded-history rounds in which this node served at least one object or newly
+    /// accepted a peer inventory hint.
+    pub history_served: u64,
+    /// New exact advertised-head decisions durably remembered after this peer could not serve
+    /// an unavailable newest body. Repeating an unchanged standing refusal does not increment it.
+    pub history_declined: u64,
     /// Sessions that ended without error but left requested entries unreceived (a bounded serve).
     pub partial: u64,
     /// Sessions that failed.
@@ -1647,7 +1656,8 @@ impl SyncBook {
             let _ = write!(
                 s,
                 "{{\"room\":\"{}\",\"peer\":\"{}\",\"opened\":{},\"admitted\":{},\"busy_refused\":{},\
-                 \"completed\":{},\"reasons\":{},\"empty\":{},\"partial\":{},\"failed\":{},\"last_failure\":{},\
+                 \"completed\":{},\"reasons\":{},\"empty\":{},\"history_fetched\":{},\"history_served\":{},\
+                 \"history_declined\":{},\"partial\":{},\"failed\":{},\"last_failure\":{},\
                  \"stale\":{},\"refused\":{},\"skipped_at_cap\":{},\"queued\":{},\"backoff\":{},\
                  \"running\":[{}]}}",
                 b32_encode(room),
@@ -1658,6 +1668,9 @@ impl SyncBook {
                 c.completed,
                 c.reasons.json(),
                 c.empty,
+                c.history_fetched,
+                c.history_served,
+                c.history_declined,
                 c.partial,
                 c.failed,
                 c.last_failure

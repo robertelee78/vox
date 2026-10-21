@@ -10677,6 +10677,8 @@ impl Node {
                                 // one: in a quiet room both periodic directions are (FX-29).
                                 if !moved {
                                     counts.empty += 1;
+                                } else {
+                                    counts.history_served += 1;
                                 }
                             }
                             Ok(_) => counts.partial += 1,

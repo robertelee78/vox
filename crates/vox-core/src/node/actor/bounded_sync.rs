@@ -1791,6 +1791,7 @@ impl Node {
                     port.clear_backoff();
                 }
                 let reason = flow.reason;
+                let declined = std::mem::take(&mut flow.declined);
                 crate::node::status::SyncBook::with(
                     &self.sync_book,
                     work.room,
@@ -1803,7 +1804,10 @@ impl Node {
                         // completion is empty by the same user-visible accounting rule.
                         if !flow.brought {
                             counts.empty += 1;
+                        } else {
+                            counts.history_fetched += 1;
                         }
+                        counts.history_declined = counts.history_declined.saturating_add(declined);
                         counts.backoff = None;
                     },
                 );
@@ -1973,6 +1977,7 @@ impl Node {
                 // quiet room every round is, and a person sees a re-pull as `completed`
                 // climbing faster than `empty` (ADR-038 FX-29).
                 let brought = flow.brought;
+                let declined = flow.declined;
                 crate::node::status::SyncBook::with(
                     &self.sync_book,
                     work.room,
@@ -1982,7 +1987,10 @@ impl Node {
                         counts.reasons.count(reason);
                         if !brought {
                             counts.empty += 1;
+                        } else {
+                            counts.history_fetched += 1;
                         }
+                        counts.history_declined = counts.history_declined.saturating_add(declined);
                     },
                 );
                 // A round the lane completed is a completed sync for `vox status` (PRD-001
