@@ -241,80 +241,86 @@ The decider then answered twelve questions, one at a time. His answers are the d
   rule and stands unchanged. Ruling: "caps on cpu seem like … footguns", "we need to understand
   what is driving the cpu inefficiency rather than capping the cpu" (the decider, 2026-10-20,
   rejecting a ten-fast-turns-then-one-a-second cap proposed for FX-24's cause).
-- **FX-28.** The daemon MUST reconcile a node's computer trust (ADR-035) only when something it
-  depends on has changed: the computer policy's revision, a node attaching or detaching, or the
-  roster of paired computers; never on a timer, and a node's binding MUST be derived once per
-  revision, not once per question. The detection of a change MUST be sound across daemons, not
-  only within one: "we need the detection of change logic to be sound. Easy for local daemon to
-  notice, but daemon to daemon update needs to be solid" (the decider, 2026-10-20). Decision: a
-  change made at another computer reaches this daemon through the pairing exchange its author
-  starts (ADR-035; a computer whose revision its peer has not receipted exchanges, #989), a
-  merged exchange that moves this daemon's revision is a change here, and the periodic fallback
-  exchange stays as the net for a lost one; the proof changes computer trust on one daemon and
-  asserts that a node on the other daemon is bound to the new policy within the bound, with no
-  tick. Measured cause, 2026-10-20 (the decider's daemon, vox 0.4.9,
-  four nodes Ready in eleven rooms, no room gaining an entry; `ps` 0.63 of a core at steady
-  state; two 10 s `sample` runs symbolized from the release symbols, FX-25): 21–24% of the busy
-  CPU was `prepare_computer_binding` → `Computer::bind_node` (`State::derive` and
-  `Binding::verify`: an ML-DSA verification of every management event, `CompositePublicKey::from_bytes`
-  expanding the key for each), reached from a 1 s `tokio::time::interval` in the host's
-  `follow_computer_trust` that calls `reconcile_computer()` for every attached node every second
-  and then `record_application()`, which derives again; a further 6–8% was the app's polling
-  re-deriving the same state per control answer (`individual_trust_eligibility` →
-  `Computer::capability` → `Binding::verify`). Four nodes, nothing changed.
-- **FX-29.** A sync round that brings this node nothing MUST write nothing durable. A hint for an
-  author whose head this node already holds, or whose missing pages the peer has said it does
-  not hold, MUST NOT be pulled again each period; a head or header already held MUST NOT be
-  saved again; and a verifier's progress MUST be persisted once per proof it completes, never
-  once per Merkle join (a proof is bounded and is verified again from its bytes after a crash).
-  Measured cause, the same daemon: 1,367 durable store commits per second across the four node
-  stores (redb transaction ids read 30 s apart: robert-work 524/s, opencode-work 495/s, codex-work
-  197/s, claude-work 151/s; robert-work's store at transaction 20.4 million) with no room gaining
-  an entry. By site, ≈64% of commit wall time was `history_stream::admission::advance` committing
-  the context and the cursor after every `Progress` step of `ControlRangeVerifier` and
-  `InclusionVerifier` (a `WorkBudget` of 4 signatures or 32 descriptors; the step's own CPU was 65
-  of 4,152 samples, the rest the flush), ≈16% `admission::stage` saving every hinted author's head
-  and headers whether or not held, ≈8% the private Session pull that runs with each sync.
-  `offer_inventory` re-offers every hint that is not `held` (committed head, control readiness and
-  a complete live window all at the hint), and a held one again when `missing_page` finds a
-  position within the last page, so an author whose missing bodies no peer holds any more (his
-  rooms are sparse: 200, 188 and 76 of one room's entries on three nodes) is pulled again from
-  every peer every period: 3.67 syncs per second over 39 peer-room pairs, a median 11 s between
-  two syncs of one pair, about 370 commits per sync.
-- **FX-30.** Only what a person would lose MUST be committed with a full flush to disk: a node's
-  own entries and content, consent, trust, keys, Session records and the format marker. Derived
+- **FX-28.** A change to the person's computer trust (ADR-035: a policy revision, a node
+  attaching or detaching, a computer joining or leaving the roster) made on either of two paired
+  daemons MUST reach every node on both within the pairing exchange's bound (the next on-need
+  exchange, ADR-035 CT-14 and #989; never later than its fallback period), and two daemons on
+  which nothing changed MUST verify no binding meanwhile: "we need the detection of change logic
+  to be sound. Easy for local daemon to notice, but daemon to daemon update needs to be solid"
+  (the decider, 2026-10-20). Decision: a node's binding is derived once per revision of the
+  computer policy and on no timer; a change made elsewhere arrives in the pairing exchange its
+  author starts, and a merged exchange that moves this daemon's revision is a change here.
+  Measured cause, 2026-10-20 (the decider's daemon, vox 0.4.9, four nodes Ready in eleven
+  rooms, no room gaining an entry; `ps` 0.63 of a core at steady state; two 10 s `sample` runs
+  symbolized from the release symbols, FX-25): 21–24% of the busy CPU was
+  `prepare_computer_binding` → `Computer::bind_node` (`State::derive` and `Binding::verify`: an
+  ML-DSA verification of every management event, `CompositePublicKey::from_bytes` expanding the
+  key for each), reached from a 1 s `tokio::time::interval` in the host's `follow_computer_trust`
+  that calls `reconcile_computer()` for every attached node every second and then
+  `record_application()`, which derives again; a further 6–8% was the app's polling re-deriving
+  the same state per control answer (`individual_trust_eligibility` → `Computer::capability` →
+  `Binding::verify`). Four nodes, nothing changed.
+- **FX-29.** A sync round that brings this node nothing MUST write nothing: over a quiet minute
+  a member's store MUST gain no commit beyond the rounds' own cursors, and a hint this node
+  holds (its committed head, its control readiness and its live window all at the hint) MUST
+  NOT be pulled again each period. A hint whose missing pages a peer has said it does not hold
+  MUST NOT be pulled from that peer again until that peer's inventory says otherwise; a head or
+  header already held MUST NOT be saved again; and a verifier's progress MUST be persisted once
+  per proof verified to its end (an inclusion proof or a control range), never once per Merkle
+  join, since a proof is bounded and is verified again from its bytes after a crash. Measured
+  cause, the same daemon: 1,367 durable store commits per second across the four node stores
+  (redb transaction ids read 30 s apart: robert-work 524/s, opencode-work 495/s, codex-work
+  197/s, claude-work 151/s; robert-work's store at transaction 20.4 million) with no room
+  gaining an entry. By site, ≈64% of commit wall time was `history_stream::admission::advance`
+  committing the context and the cursor after every `Progress` step of `ControlRangeVerifier`
+  and `InclusionVerifier` (a `WorkBudget` of 4 signatures or 32 descriptors; the step's own CPU
+  was 65 of 4,152 samples, the rest the flush), ≈16% `admission::stage` saving every hinted
+  author's head and headers whether or not held, ≈8% the private Session pull that runs with
+  each sync. `offer_inventory` re-offers every hint that is not `held`, and a held one again when
+  `missing_page` finds a position within the last page, so an author whose missing bodies no
+  peer holds any more (his rooms are sparse: 200, 188 and 76 of one room's entries on three
+  nodes) is pulled again from every peer every period: 3.67 syncs per second over 39 peer-room
+  pairs, a median 11 s between two syncs of one pair, about 370 commits per sync.
+- **FX-30.** What a person would lose MUST survive a crash of the daemon, of the machine, or a
+  power loss: every entry this node accepted (its own and those received), consent, trust, keys,
+  Session records and the format marker are on disk before the daemon says they are. Derived
   sync state (heads and headers already held, verifier contexts, cursors, live windows, client
-  cursors) MUST be committed without `F_FULLFSYNC` (redb `Durability::None` or `Eventual`; a later
-  durable commit carries it to disk), because it is rebuilt from the proofs and the peers after
-  a crash. Measured cause, the same daemon: every `Batch::commit` is redb `Durability::Immediate`
-  → `sync_data` → `fcntl(F_FULLFSYNC)` (vox-core never calls `set_durability`); the process spent
+  cursors) MAY be lost in such a crash and MUST be rebuilt from the proofs and the peers, and
+  MUST NOT be flushed to disk on its own: a sync round that persists only derived state MUST
+  cost no `F_FULLFSYNC`. Decision: derived state commits at redb `Durability::None` or
+  `Eventual` (a later durable commit carries it); what a person would lose stays `Immediate`.
+  Measured cause, the same daemon: every `Batch::commit` is redb `Durability::Immediate` →
+  `sync_data` → `fcntl(F_FULLFSYNC)` (vox-core never calls `set_durability`); the process spent
   0.65 thread-seconds per wall second inside `F_FULLFSYNC` (about 0.5 ms per call back to back;
   an isolated 8 KiB probe cost 7.6 ms), and that flush was most of the 1,367 commits' cost.
-- **FX-31.** A room's publication, a read, a post and an attention selection MUST NOT wait on a
-  disk flush: no commit's flush runs while the room's lock is held. Measured cause, the same
-  daemon: every commit ran inside `history_write` with the room mutex held (the `read_charged`
-  closure owns the `lock_owned()` guard), so the daemon log said `room publication is busy; retry
-  this operation` 424 times and `attention selection remains pending`, and the app's member list
-  flickered (#983).
+- **FX-31.** A flush to disk of one commit MUST NOT delay the daemon's status publication, a
+  member's read or post in that room, or attention selection: each MUST answer within FX-17's
+  bound while a flush is in progress, and `vox status` MUST NOT say "room publication is busy"
+  for a room whose only activity is a flush. Decision: no commit's flush runs while the room's
+  lock is held. Measured cause, the same daemon: every commit ran inside `history_write` with
+  the room mutex held (the `read_charged` closure owns the `lock_owned()` guard), so the daemon
+  log said `room publication is busy; retry this operation` 424 times and `attention selection
+  remains pending`, and the app's member list flickered (#983).
 - **FX-32.** A node that finds a member holding more of its own feed than it does (a restored
   older profile, ADR-037 R5) MUST recover its own entries from that member, each verified under
-  its own key and chain, and MUST keep reading meanwhile: "yes can supplement if signed/done
-  correctly" (the decider, 2026-10-19). Writes stay refused until the own feed is current again,
-  and resume then; the daemon says once that it recovered and from whom. Measured before this: a
-  restored node refused its writes correctly and never read the member's next post (the restarts
-  proof, step 5, 2026-10-19).
-- **FX-33.** A change to a room's retention MUST NOT stop the room: the sweep that it starts
-  prunes what this node holds and skips what it does not, and an entry it cannot classify yet is
-  skipped, never a fault. Only a storage error poisons a room; a signed-format entry is never a
-  legacy Session, and an entry beyond the author's verified head, or one whose body never
-  arrived, is not evidence of a malformed store. Measured cause, 2026-10-20 (the decider's
-  node, vox 0.4.9): he set his repo room's retention from forever to one week in the app; the
-  next sweep's legacy Session classification (`legacy_kind_in`) refused a format-2 entry as
-  "Session classification source unverified", the room was poisoned, and the app said "vox
-  cannot save: store save room: malformed at-rest artifact … It recovers by itself when writes
-  succeed again", which it cannot while every tick's sweep hits the same entry; two earlier
-  sweeps the same day poisoned rooms with "retention entry missing" (a body never received has
-  no first-seen fact) and recovered only when the room was reopened.
+  its own key and chain, and MUST keep reading meanwhile, the history it holds and the posts
+  that arrive: "yes can supplement if signed/done correctly" (the decider, 2026-10-19). Its
+  writes MUST stay refused until its own feed is current again and MUST resume then. Measured
+  before this: a restored node refused its writes correctly and never read the member's next
+  post (the restarts proof, step 5, 2026-10-19).
+- **FX-33.** A change to a room's retention MUST NOT stop the room: after the admin shortens
+  it, every member MUST still read and post there, the older rows MUST expire on every member,
+  and no daemon MUST say it cannot save. Decision: the sweep prunes what the node holds and
+  skips an entry it cannot classify yet; a signed-format entry is never a legacy Session, and an
+  entry past its author's verified head, or one whose body never arrived, is not a malformed
+  store. Measured cause, 2026-10-20 (the decider's node, vox 0.4.9): he set his repo room's
+  retention from forever to one week in the app; the next sweep's legacy Session classification
+  (`legacy_kind_in`) refused a format-2 entry as "Session classification source unverified", the
+  room was poisoned, and the app said "vox cannot save: store save room: malformed at-rest
+  artifact … It recovers by itself when writes succeed again", which it cannot while every
+  tick's sweep hits the same entry; two earlier sweeps the same day poisoned rooms with
+  "retention entry missing" (a body never received has no first-seen fact) and recovered only
+  when the room was reopened.
 
 ## Unchanged rulings
 
@@ -338,7 +344,9 @@ Narrow successor amendments. Requirements not named here remain in force.
 | ADR-037 R7, R11: event-driven gates; a turn may run several chunks, never a cycle | FX-15 adds: no round without a nameable need; a no-progress, no-wait round retires; a hint for a held head finishes on arrival |
 | ADR-037 R5: a member's higher own head marks the room "own history behind"; every write refuses until resolved | FX-32 says what resolves it: the node recovers its own entries from that member (verified under its own key), keeps reading, and writes again once current |
 | ADR-035 CT-9, CT-14: computer-trust changes are reconciled, idempotently and recoverably | Preserved; FX-28 adds when: on a change, never on a timer, one derivation per revision |
-| ADR-025 D7 and ADR-037 R7: the periodic request is the only cadence; a port runs a round only on a need | Preserved; FX-29–FX-31 add what a round may cost: a round that brings nothing writes nothing, derived sync state is not flushed to disk, and no flush holds a room's lock |
+| ADR-037 R7, R11: a port runs a round only on a need; a turn may run several chunks, never a cycle | Preserved; FX-29 adds what a round that brings nothing may write: nothing |
+| No predecessor: no ADR names a durability class for the store or a flush under a room's lock | FX-30 and FX-31 are new rules |
+| PRD-001 R7, R8; ADR-023 M23.1: the admin sets the room's retention; it applies to what is stored at the next sweep | Preserved; FX-33 adds that the sweep never stops the room |
 | ADR-034 §5 "Health is true" (HL-1, HL-2), PRD-001 R35 | The lane's completed rounds are completed syncs (FX-16); the control socket answers under sync load (FX-17) |
 
 ## Implementation order and related work
