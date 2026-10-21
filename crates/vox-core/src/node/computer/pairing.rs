@@ -342,6 +342,10 @@ struct Exchanged {
     involved: bool,
     /// The last failure's words, while failures stand.
     problem: Option<String>,
+    /// The state which was repaired only after its causal deadline. Its completed exchange is
+    /// still useful evidence and stops redundant retries, but the missed contract remains a
+    /// visible failure until a newer state creates a new cause and deadline.
+    repaired_late: Option<(u64, bool)>,
     /// The last completed exchange this node started, and the last one it answered.
     last_started: Option<ExchangeRecord>,
     last_answered: Option<ExchangeRecord>,
@@ -787,18 +791,17 @@ impl Management {
                 let c = Arc::clone(&conn);
                 tokio::spawn(async move {
                     let _slot = slot;
-                    let result = tokio::time::timeout(
-                        COMPUTER_RETURN_SHOWN_WITHIN,
-                        me.answer(&c, &mut send, &mut recv),
-                    )
-                    .await;
+                    // `answer` derives its one host-local deadline from the hello as soon as the
+                    // hello arrives. A second outer timeout would either truncate pairing's
+                    // longer public contract or mint a fresh ordinary-exchange clock.
+                    let result = me.answer(&c, &mut send, &mut recv).await;
                     // Only a fully parsed and meaningfully answered request on this
                     // authenticated computer stream proves the path is usable. A typed but
                     // malformed/refused/timed-out stream cannot bypass retry backoff.
-                    if matches!(result, Ok(Ok(()))) {
+                    if matches!(result, Ok(())) {
                         me.retry_peer_now(c.peer_id());
                     }
-                    if let Ok(Err(e)) = result {
+                    if let Err(e) = result {
                         let mut f = Encoder::new();
                         f.array(2).uint(0).text(&e.to_string());
                         let _ = write_frame(&mut send, &f.finish()).await;
@@ -1090,14 +1093,13 @@ impl Management {
         let me = Arc::clone(self);
         let (link_owned, url_owned) = (link, url.to_owned());
         let task = tokio::spawn(async move {
-            let pairing = me.pair(&link_owned, &url_owned, causal_deadline);
-            if causal_deadline <= std::time::Instant::now() {
-                // As for ordinary retry, a missed reporting boundary must not prevent a real
-                // repair attempt. Its merge still publishes the original deadline.
-                Ok(pairing.await)
-            } else {
-                tokio::time::timeout_at(causal_deadline.into(), pairing).await
-            }
+            // An explicit pairing owns this one causal deadline. Once it has elapsed the command
+            // fails; it cannot turn a retained, already-missed contract into a later success.
+            tokio::time::timeout_at(
+                causal_deadline.into(),
+                me.pair(&link_owned, &url_owned, causal_deadline),
+            )
+            .await
         });
         reserved.abort = Some(task.abort_handle());
         if let Some(flight) = lock(&self.inflight).get_mut(&target) {
@@ -1116,7 +1118,7 @@ impl Management {
             Ok(Ok(paired)) => (paired, false),
             Ok(Err(_)) => (
                 Err(Error::Profile(
-                    "the computer pairing did not finish within ten minutes; try again",
+                    "the computer pairing did not finish before its causal convergence deadline; try again",
                 )),
                 false,
             ),
@@ -2000,6 +2002,15 @@ impl Management {
         recv: &mut RecvStream,
     ) -> Result<()> {
         let (op, peer, id, remaining_ms) = read_hello(recv, conn).await?;
+        let deadline = match op {
+            REACHABILITY_WAKE_OP => None,
+            1 if remaining_ms > 0 => Some(local_deadline(remaining_ms, PAIR_WITHIN)),
+            2 if remaining_ms > 0 => {
+                Some(local_deadline(remaining_ms, COMPUTER_RETURN_SHOWN_WITHIN))
+            }
+            1 | 2 => return Err(bad()),
+            _ => return Err(bad()),
+        };
         write_frame(
             send,
             &hello(op, &self.computer.description(), &id, remaining_ms),
@@ -2009,14 +2020,13 @@ impl Management {
             return Ok(());
         }
         if op == 2 {
-            if remaining_ms == 0 {
-                return Err(bad());
-            }
             let payload = frame(recv).await?;
             // A merge that moves this daemon's revision is a change here (ADR-038 FX-28). The
             // reply is the merged state, encoded under the same lock, so the revision the
             // record names is the revision the reply carries.
-            let deadline = local_deadline(remaining_ms, COMPUTER_RETURN_SHOWN_WITHIN);
+            let Some(deadline) = deadline else {
+                return Err(bad());
+            };
             let (merged, reply) = self.computer.change_until(deadline, |s| {
                 merge(s, &payload, conn.peer_id(), self.computer.signer.as_ref())?;
                 Ok((s.revision, exchange(s)?))
@@ -2025,13 +2035,9 @@ impl Management {
             self.record_answered(conn.peer_id(), merged);
             return Ok(());
         }
-        if op != 1 {
+        let Some(deadline) = deadline else {
             return Err(bad());
-        }
-        if remaining_ms == 0 {
-            return Err(bad());
-        }
-        let deadline = local_deadline(remaining_ms, PAIR_WITHIN);
+        };
         let (invite, mut g) = {
             let s = lock(&self.computer.state);
             let i=s.invitations.iter().find(|i|i.id==id&&!i.cancelled&&i.expires>now()).ok_or(Error::Profile("computer pairing code expired, cancelled, or unknown; no new trust was established"))?;
@@ -2241,7 +2247,24 @@ impl Management {
                     .find_map(|r| r.problem.clone());
             }
             peers.retain(|peer| {
+                // A repair which completed after its deadline remains a visible miss for that
+                // exact state and needs no periodic retry. A later policy state is a new cause;
+                // it may make one attempt under its own already-created retry mark.
+                if let Some(record) = exchanged.get_mut(peer) {
+                    if record.repaired_late.is_some()
+                        && record.repaired_late != Some((revision, involved == Some(*peer)))
+                    {
+                        record.failures = 0;
+                        record.deadline = None;
+                        record.problem = None;
+                        record.repaired_late = None;
+                        changed = true;
+                    }
+                }
                 let record = exchanged.get(peer).cloned().unwrap_or_default();
+                if record.repaired_late == Some((revision, involved == Some(*peer))) {
+                    return false;
+                }
                 let causal_mark = retry_ready.get(peer).copied();
                 let reachability_restored = causal_mark.is_some();
                 let causal_deadline = match (causal_mark.map(|mark| mark.deadline), record.deadline)
@@ -2303,6 +2326,12 @@ impl Management {
                 }
                 true
             });
+            if changed {
+                *lock(&self.problem) = exchanged
+                    .values()
+                    .filter(|r| r.failures > 0)
+                    .find_map(|r| r.problem.clone());
+            }
             drop(retry_ready);
             drop(exchanged);
             // Reserved under one lock, after every other filter: a computer already in
@@ -2434,11 +2463,18 @@ impl Management {
                 // stage neither subtracts a private budget nor starts a new one.
                 let outcome = if deadline <= std::time::Instant::now() {
                     // The product already missed the causal contract, but repair must continue.
-                    // Transport operations carry their own source-owned bounds; do not let an
-                    // expired reporting deadline prevent a reachable peer from being dialled.
-                    me.sync_peer(peer, endpoints, url, revision, deadline)
-                        .await
-                        .map_err(|e| e.to_string())
+                    // A local operational bound prevents the transport from being held forever;
+                    // `guard` still records the original deadline, so completion remains a
+                    // visible miss and can never be reported as satisfying the original cause.
+                    me.sync_peer(
+                        peer,
+                        endpoints,
+                        url,
+                        revision,
+                        std::time::Instant::now() + COMPUTER_RETURN_SHOWN_WITHIN,
+                    )
+                    .await
+                    .map_err(|e| e.to_string())
                 } else {
                     let exchange = me.sync_peer(peer, endpoints, url, revision, deadline);
                     tokio::pin!(exchange);
@@ -2488,7 +2524,8 @@ impl Management {
     ) {
         let mut exchanged = lock(&self.exchanged);
         let record = exchanged.entry(peer).or_default();
-        record.last = Some(std::time::Instant::now());
+        let completed = std::time::Instant::now();
+        record.last = Some(completed);
         record.revision = revision;
         record.involved = involved;
         let failed = outcome.is_err();
@@ -2497,9 +2534,21 @@ impl Management {
                 let at_ms = now();
                 record.last_ms = Some(at_ms);
                 record.count = record.count.saturating_add(1);
-                record.failures = 0;
-                record.deadline = None;
-                record.problem = None;
+                if completed > deadline {
+                    record.failures = record.failures.saturating_add(1).max(1);
+                    record.deadline =
+                        Some(record.deadline.map_or(deadline, |held| held.min(deadline)));
+                    record.problem = Some(
+                        "the exchange repaired state only after its causal convergence deadline"
+                            .into(),
+                    );
+                    record.repaired_late = Some((revision, involved));
+                } else {
+                    record.failures = 0;
+                    record.deadline = None;
+                    record.problem = None;
+                    record.repaired_late = None;
+                }
                 record.last_started = Some(ExchangeRecord {
                     at_ms,
                     sent_revision,
@@ -2510,6 +2559,7 @@ impl Management {
                 record.failures = record.failures.saturating_add(1);
                 record.deadline = Some(record.deadline.map_or(deadline, |held| held.min(deadline)));
                 record.problem = Some(text);
+                record.repaired_late = None;
             }
         }
         *lock(&self.problem) = exchanged

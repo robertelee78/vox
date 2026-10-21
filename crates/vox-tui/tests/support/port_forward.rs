@@ -247,7 +247,6 @@ impl PortForward {
     /// emulator is an apparatus failure, not a product timeout.
     pub fn open_and_verify(&self) -> Instant {
         self.open();
-        let opened = Instant::now();
         let probe = UdpSocket::bind("[::1]:0")
             .unwrap_or_else(|e| panic!("APPARATUS: could not bind port-forward verifier: {e}"));
         probe
@@ -268,7 +267,9 @@ impl PortForward {
             from == self.public && &answer[..n] == OPEN_PROBE,
             "APPARATUS: port-forward probe returned from {from} with unexpected bytes"
         );
-        opened
+        // This proof-process monotonic instant is causally after the successful round trip.
+        // Emulator scheduling and probe transit are apparatus work, never PRODUCT latency.
+        Instant::now()
     }
 
     pub fn close(&self) {
