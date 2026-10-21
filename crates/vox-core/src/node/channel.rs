@@ -1044,6 +1044,9 @@ pub struct ChannelState {
     /// uses its message key up even when what it opened does not render, so a pass that rendered
     /// nothing must write the chains too, or a restart could derive that key again.
     chains_advanced: bool,
+    /// A render backfill was drained while the governance view was refreshing: nothing
+    /// rendered, the queue kept; the next governance turn drains it (ADR-038 FX-22, #1007).
+    backfill_refreshing: bool,
     /// Sealed exact-hash subtype evidence; never a permission or recovery eligibility decision.
     legacy_sessions: legacy_session::LegacySessions,
     /// Own-feed declaration cursor and the capable readers covered by that scan.
@@ -1938,6 +1941,7 @@ impl ChannelState {
             read_mark_complete: None,
             set_aside: SetAside::default(),
             chains_advanced: false,
+            backfill_refreshing: false,
             legacy_sessions: legacy_session::LegacySessions::default(),
             legacy_announced: None,
             private_sessions: private_session::PrivateSessions::default(),
@@ -2628,6 +2632,7 @@ impl ChannelState {
             read_mark_complete: None,
             set_aside,
             chains_advanced: false,
+            backfill_refreshing: false,
             legacy_sessions: legacy_session::LegacySessions::default(),
             legacy_announced: None,
             private_sessions: private_session::PrivateSessions::default(),
@@ -2892,6 +2897,7 @@ impl ChannelState {
             read_mark_complete: None,
             set_aside: SetAside::default(),
             chains_advanced: false,
+            backfill_refreshing: false,
             legacy_sessions: legacy_session::LegacySessions::default(),
             legacy_announced: None,
             private_sessions: private_session::PrivateSessions::default(),
@@ -7646,8 +7652,13 @@ impl ChannelState {
             &self.channel_id,
             self.genesis.creator_pubkey().fingerprint(),
         ) {
-            Ok(_) => {}
-            Err(error) if governance::refreshing(&error) => return Ok(Vec::new()),
+            Ok(_) => self.backfill_refreshing = false,
+            Err(error) if governance::refreshing(&error) => {
+                // Nothing rendered, the queue kept: the governance turn after this refresh
+                // drains it (ADR-038 FX-22, #1007), not the retention sweep.
+                self.backfill_refreshing = true;
+                return Ok(Vec::new());
+            }
             Err(error) => return Err(error),
         }
         let mut rows = Vec::new();
@@ -7745,6 +7756,14 @@ impl ChannelState {
             }
         }
         Ok(rows)
+    }
+
+    /// Whether a render backfill waits on the governance view's refresh (ADR-038 FX-22,
+    /// #1007): rows that arrived before their key, or before their author's consent folded,
+    /// are rendered by the governance turn after the refresh, with no re-ask.
+    #[must_use]
+    pub fn backfill_awaits_refresh(&self) -> bool {
+        self.backfill_refreshing
     }
 
     fn drain_backfill(&mut self, store: &Store, now_ms: u64) -> Result<usize> {
@@ -7880,15 +7899,15 @@ impl ChannelState {
             match allowed {
                 Some(true) => {}
                 Some(false) => {
-                    if !historical {
-                        // The author's consent control can be causally ahead of this content but
-                        // still in flight locally. Persist the reprojection cursor in the same
-                        // Batch as this effect: if the consent wake raced ahead of effect finish,
-                        // the completed turn still leaves bounded work for the next local wake.
-                        let mut writer = self.entries.write(batch, &self.sek, &self.channel_id)?;
-                        writer.queue_backfill(author, Some(1))?;
-                        writer.seal()?;
-                    }
+                    // The author's consent control can be causally ahead of this content but
+                    // still in flight locally. Persist the reprojection cursor in the same
+                    // Batch as this effect: if the consent wake raced ahead of effect finish,
+                    // the completed turn still leaves bounded work for the next local wake. A
+                    // historical row too (ADR-038 FX-22, #1007): a page whose grant folds after
+                    // its rows left them unrendered with nothing to revisit them.
+                    let mut writer = self.entries.write(batch, &self.sek, &self.channel_id)?;
+                    writer.queue_backfill(author, Some(1))?;
+                    writer.seal()?;
                     return Ok(ContentProjection::Applied);
                 }
                 None => {

@@ -16187,7 +16187,14 @@ impl Node {
                 let Some(profile) = self.profile.as_ref() else {
                     return false;
                 };
-                shared.lock().await.accept_skdm(profile.store(), &skdm, now)
+                let mut channel = shared.lock().await;
+                let installed = channel.accept_skdm(profile.store(), &skdm, now);
+                // A key accepted while the view refreshes rendered nothing yet: the next
+                // governance turn drains the backfill it queued (ADR-038 FX-22, #1007).
+                if channel.backfill_awaits_refresh() {
+                    self.governance_work.pending = true;
+                }
+                installed
             };
             if let Ok(backfilled) = installed {
                 changed = true;
@@ -17442,7 +17449,11 @@ impl Node {
             (Some(profile), Some(shared)) => {
                 let mut channel = shared.lock().await;
                 fresh = !channel.holds_generation(&author, skdm.body.chain_id);
-                channel.accept_skdm(profile.store(), skdm, now_ms).ok()
+                let installed = channel.accept_skdm(profile.store(), skdm, now_ms).ok();
+                if channel.backfill_awaits_refresh() {
+                    self.governance_work.pending = true;
+                }
+                installed
             }
             _ => None,
         };
@@ -18634,7 +18645,13 @@ impl Node {
                     .await?;
                 let installed = if let Some(skdm) = opened {
                     match self.profile.as_ref() {
-                        Some(profile) => ch.accept_skdm(profile.store(), &skdm, now).map(|_| ()),
+                        Some(profile) => {
+                            let installed = ch.accept_skdm(profile.store(), &skdm, now).map(|_| ());
+                            if ch.backfill_awaits_refresh() {
+                                self.governance_work.pending = true;
+                            }
+                            installed
+                        }
                         None => Err(Error::AtRestLocked),
                     }
                 } else {

@@ -278,7 +278,9 @@ impl View<'_> {
             return Err(Failure::Request(LEGACY_HISTORY_REQUIRED));
         }
         // The completed current authority is still required here; who may read whom is
-        // answered from the room's facts in memory (ADR-038 FX-22).
+        // answered from the room's facts in memory (ADR-038 FX-22). The requester renders a row
+        // that arrives before its key, or before its author's consent folds, when they land
+        // (#1007), so the faster answer costs it nothing.
         self.ch.checked_governance(self.store, self.ch.now_hint)?;
         let me = self.ch.me();
         let answer = self.answer(query, bytes)?;

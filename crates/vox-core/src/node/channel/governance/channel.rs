@@ -333,7 +333,9 @@ impl ChannelState {
         }
         match self.current_governance(store) {
             Ok(view) => drop(view),
-            Err(error) if super::refreshing(&error) => return Ok(false),
+            // A backfill drained into a refreshing view is still pending work: the turn after
+            // the refresh renders it (ADR-038 FX-22, #1007).
+            Err(error) if super::refreshing(&error) => return Ok(self.backfill_awaits_refresh()),
             Err(error) => return Err(error),
         }
         Ok(self
