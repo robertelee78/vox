@@ -1460,11 +1460,13 @@ impl Node {
             if self.ports.contains_key(&(room, peer)) {
                 self.drop_port(&room, &peer);
             }
+            self.history_hints.forget_member(room, peer);
             return;
         }
 
         self.bounded_sync.retire_port(room, peer);
-        self.history_hints.retire_peer(room, peer);
+        self.history_hints.retire_port(room, peer);
+        self.history_hints.forget_member(room, peer);
         let mut retired = Vec::new();
         if let Some(port) = self.ports.get_mut(&(room, peer)) {
             if let Some(attempt) = port.out.take() {

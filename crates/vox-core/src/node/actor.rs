@@ -14626,7 +14626,7 @@ impl Node {
             );
         }
         self.bounded_sync.retire_port(*channel_id, *peer);
-        self.history_hints.retire_peer(*channel_id, *peer);
+        self.history_hints.retire_port(*channel_id, *peer);
         if let Some(mut port) = self.ports.remove(&(*channel_id, *peer)) {
             for a in port.take_attempts() {
                 a.retire();

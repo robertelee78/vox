@@ -28,8 +28,6 @@ struct Declined {
     author: Digest32,
     head: Digest32,
 }
-/// Declined hints kept at most, oldest forgotten first: 128 bytes each, no charge.
-const MAX_DECLINED: usize = 4096;
 #[derive(Default)]
 struct State {
     /// Retirement belongs to one room/peer lane. A stopped room or peer must not invalidate an
@@ -247,16 +245,14 @@ impl HintInbox {
     /// bodies no peer held any more was pulled again from every peer every period.
     pub(crate) fn decline(&self, room: Digest32, peer: Digest32, author: Digest32, head: Digest32) {
         let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        if state.declined.iter().any(|declined| {
-            declined.room == room
-                && declined.peer == peer
-                && declined.author == author
-                && declined.head == head
+        if let Some(declined) = state.declined.iter_mut().find(|declined| {
+            declined.room == room && declined.peer == peer && declined.author == author
         }) {
+            // An inventory has one scalar head per author. Replace that decision when the
+            // source names a successor instead of accumulating a log or forgetting an older
+            // source merely because unrelated rooms crossed an arbitrary global count.
+            declined.head = head;
             return;
-        }
-        if state.declined.len() >= MAX_DECLINED {
-            state.declined.remove(0);
         }
         state.declined.push(Declined {
             room,
@@ -265,17 +261,26 @@ impl HintInbox {
             head,
         });
     }
-    pub(crate) fn retire_peer(&self, room: Digest32, peer: Digest32) {
+    /// Retire work bound to a port incarnation. Refusals describe the member's advertised
+    /// inventory, not its socket or port: an ordinary reconnect does not make the bodies exist.
+    pub(crate) fn retire_port(&self, room: Digest32, peer: Digest32) {
         let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         // MAX is a permanently retired generation: offer refuses it rather than wrapping.
         let generation = state.generations.entry((room, peer)).or_default();
         *generation = generation.saturating_add(1);
         state.pending.retain(|p| p.room != room || p.peer != peer);
-        // A port that comes back may be a restarted peer holding more: ask it once again.
-        state
-            .declined
-            .retain(|declined| declined.room != room || declined.peer != peer);
         Self::release_empty(&mut state);
+    }
+    /// Forget decisions whose real inventory lifetime ended because this room member departed.
+    /// The member may have been the source asked or the author whose scalar head was relayed.
+    pub(crate) fn forget_member(&self, room: Digest32, member: Digest32) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .declined
+            .retain(|declined| {
+                declined.room != room || (declined.peer != member && declined.author != member)
+            });
     }
     pub(crate) fn retire_room(&self, room: Digest32) {
         let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
