@@ -1321,6 +1321,14 @@ impl Management {
     pub fn pending_nodes(&self, nodes: Vec<String>) {
         *lock(&self.pending_nodes) = nodes;
     }
+    /// One node's application failed or did not finish: said in the status, in place of any
+    /// earlier word about that node.
+    pub fn node_pending(&self, node: &str, why: &str) {
+        let mut pending = lock(&self.pending_nodes);
+        let prefix = format!("{node}: ");
+        pending.retain(|entry| !entry.starts_with(&prefix));
+        pending.push(format!("{prefix}{why}"));
+    }
     fn transport_leases(&self, supplied: Option<&Link>) -> Result<Vec<TransportLease>> {
         let s = lock(&self.computer.state);
         let local = s.description.fingerprint()?;
@@ -1715,8 +1723,10 @@ impl Management {
         pop::verify(&proof, &ci, &transcript, &link.target)?;
         let exchange = d.bytes()?.to_vec();
         d.finish()?;
-        let sent = self.computer.revision();
-        let merged = self.computer.change(|s| {
+        let revisions = self.computer.change(|s| {
+            // The revision this node stood at when it accepted the pairing, read in the
+            // transaction that merges the computer's state, and the revision after.
+            let before = s.revision;
             if s.pending
                 .as_ref()
                 .is_some_and(|p| !enrolled(s, p) && p.body() != g.body())
@@ -1734,10 +1744,10 @@ impl Management {
             s.pending_expires = link.expires;
             s.pair_link = Some(Zeroizing::new(url.to_owned()));
             merge(s, &exchange, link.target, self.computer.signer.as_ref())?;
-            Ok(s.revision)
+            Ok((before, s.revision))
         })?;
         let _ = send.finish();
-        Ok((sent, merged))
+        Ok(revisions)
     }
     async fn answer(
         &self,
@@ -1749,13 +1759,14 @@ impl Management {
         write_frame(send, &hello(op, &self.computer.description(), &id)).await?;
         if op == 2 {
             let payload = frame(recv).await?;
-            // A merge that moves this daemon's revision is a change here (ADR-038 FX-28).
-            let merged = self.computer.change(|s| {
-                merge(s, &payload, conn.peer_id(), self.computer.signer.as_ref())
-                    .map(|()| s.revision)
+            // A merge that moves this daemon's revision is a change here (ADR-038 FX-28). The
+            // reply is the merged state, encoded under the same lock, so the revision the
+            // record names is the revision the reply carries.
+            let (merged, reply) = self.computer.change(|s| {
+                merge(s, &payload, conn.peer_id(), self.computer.signer.as_ref())?;
+                Ok((s.revision, exchange(s)?))
             })?;
-            let payload = exchange(&lock(&self.computer.state))?;
-            write_frame(send, &payload).await?;
+            write_frame(send, &reply).await?;
             self.record_answered(conn.peer_id(), merged);
             return Ok(());
         }
@@ -1818,7 +1829,7 @@ impl Management {
         );
         let proof = pop::open_pop(isk.as_ref(), sealed)?;
         pop::verify(&proof, &ci, &transcript, &conn.peer_id())?;
-        self.computer.change(|s| {
+        let recorded = self.computer.change(|s| {
             let i = s
                 .invitations
                 .iter_mut()
@@ -1838,15 +1849,18 @@ impl Management {
             }
             s.pending = Some(g);
             s.pending_expires = invite.expires;
-            Ok(())
+            // The state sent back, encoded with the pairing just recorded, and its revision.
+            Ok((s.revision, exchange(s)?))
         })?;
+        let (revision, payload) = recorded;
         let proof = pop::IdentityProof::create(self.computer.signer.as_ref(), &ci, &transcript)?;
-        let payload = exchange(&lock(&self.computer.state))?;
         let mut e = Encoder::new();
         e.array(2)
             .bytes(&pop::seal_pop(isk.as_ref(), &proof)?)
             .bytes(&payload);
         write_frame(send, &e.finish()).await?;
+        // The enrollment handshake is an exchange this daemon answered (ADR-038 FX-28).
+        self.record_answered(conn.peer_id(), revision);
         Ok(())
     }
     async fn retry(self: &Arc<Self>) -> Result<()> {

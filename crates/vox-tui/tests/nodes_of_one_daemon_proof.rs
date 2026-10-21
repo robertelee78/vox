@@ -2410,6 +2410,10 @@ const EXCHANGE_WITHIN: Duration = Duration::from_secs(60);
 /// delta is attached on beta's computer and the same holds the other way. Both confirm each
 /// other again each time.
 ///
+/// A restart derives nothing: beta's daemon is stopped and started again on the same port with
+/// nothing changed, and every binding there shows the same policy revision and the same derived
+/// moment as before.
+///
 /// A change made while the other computer is unreachable arrives when it returns: beta's daemon
 /// is stopped, gamma is made alpha's personal node (drive moves from alpha to gamma), alpha's
 /// status shows it applied within [`CHANGE_SHOWN_WITHIN`] and counts the exchange toward beta
@@ -2441,8 +2445,12 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
     let b = Account::new();
     let alpha = a.make_node("alpha");
     let beta = b.make_node("beta");
+    // Beta's daemon listens on one port for the whole proof, restarts included, so that a
+    // restart with nothing changed advertises the same endpoints: a reach that moved would be
+    // a change of its own, and the restart claim is that nothing is derived with none.
+    let listen_b = format!("127.0.0.1:{}", free_udp_port());
     let da = Daemon::start(&a, &["--node", "alpha"], &[]);
-    let db = Daemon::start(&b, &["--node", "beta"], &[]);
+    let db = Daemon::start(&b, &["--node", "beta"], &[("VOX_LISTEN", &listen_b)]);
     // Each node is Ready before it is chosen as its computer's personal node.
     da.expect("node alpha is Ready", Duration::from_secs(90), |l| {
         l.contains("alpha is Ready")
@@ -2497,8 +2505,12 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
     let nodes_b = [("beta", beta.as_str()), ("delta", delta.as_str())];
     change_shows_on_both((&b, &db, &nodes_b), (&a, &da, &nodes_a), "delta");
 
+    // ---- a restart derives nothing: each binding's (revision, when) survives it -----------
+    let db = a_restart_derives_nothing((&a, &da), (&b, db, &nodes_b, &listen_b));
+
     // ---- a change made while the peer is unreachable arrives when it returns --------------
-    let db = change_reaches_a_returning_computer((&a, &da, &nodes_a), (&b, db, &nodes_b));
+    let db =
+        change_reaches_a_returning_computer((&a, &da, &nodes_a), (&b, db, &nodes_b, &listen_b));
 
     // Let the confirmation's own exchanges settle before the idle minute is counted.
     std::thread::sleep(Duration::from_secs(10));
@@ -2834,20 +2846,24 @@ fn change_shows_on_both(
         "APPARATUS: attach {new_node} on {}'s computer: {out}{err}",
         names_here[0]
     );
-    // On the daemon where the change was made.
+    // On the daemon where the change was made. The clock is read before each look, and a
+    // success seen past the bound is as red as none.
     let shown_here = loop {
+        let elapsed = attached.elapsed();
         let status = computer(changer, &["status"]);
         let keyrings = keyrings_complete(changer, here, &all);
-        if roster_current(&status, &names_here) && keyrings.is_ok() {
+        let shown = roster_current(&status, &names_here) && keyrings.is_ok();
+        if shown && elapsed <= CHANGE_SHOWN_WITHIN {
             break status;
         }
         assert!(
-            attached.elapsed() < CHANGE_SHOWN_WITHIN,
+            !shown && elapsed < CHANGE_SHOWN_WITHIN,
             "PRODUCT: {CHANGE_SHOWN_WITHIN:?} after `vox node attach {new_node}` was asked of {}'s \
-             computer, `vox computer status` there does not show the change applied (ADR-038 \
-             FX-28, #1020): it should list {names_here:?} with bindings derived at its policy \
-             revision, and every node there should trust every node of both computers; status: \
-             revision {} nodes {}; keyrings: {}\nits daemon said: {}",
+             computer, `vox computer status` there did not show the change applied in time \
+             (ADR-038 FX-28, #1020; shown {shown} when looked at after {elapsed:?}): it should \
+             list {names_here:?} with bindings derived at its policy revision, and every node \
+             there should trust every node of both computers; status: revision {} nodes {}; \
+             keyrings: {}\nits daemon said: {}",
             names_here[0],
             status["revision"],
             status["nodes"],
@@ -2961,6 +2977,72 @@ fn change_shows_on_both(
     );
 }
 
+/// A UDP port nothing holds right now, for a daemon to listen on for the whole proof.
+fn free_udp_port() -> u16 {
+    std::net::UdpSocket::bind("127.0.0.1:0")
+        .and_then(|socket| socket.local_addr())
+        .map(|addr| addr.port())
+        .unwrap_or_else(|e| panic!("APPARATUS: no free UDP port: {e}"))
+}
+
+/// **A restart derives nothing** (ADR-038 FX-28; #1020): with nothing changed, beta's daemon
+/// is stopped and started again on the same port, its two nodes come back Ready, and its
+/// `vox computer status` shows every binding at the same policy revision and the same derived
+/// moment as before the restart: the record survived, and nothing was derived again. Both
+/// computers confirm each other again (staging). Returns beta's new daemon.
+fn a_restart_derives_nothing(
+    (a, da): (&Account, &Daemon),
+    (b, db, nodes_b, listen_b): (&Account, Daemon, &[(&str, &str)], &str),
+) -> Daemon {
+    let names_b: Vec<&str> = nodes_b.iter().map(|(n, _)| *n).collect();
+    let before = bindings_shown(&computer(b, &["status"]));
+    assert!(
+        roster_current(&computer(b, &["status"]), &names_b),
+        "PRODUCT (staging): before the restart beta's bindings are not all current: {before:?}"
+    );
+    let _stopped_said = db.stop();
+    let restarted = Instant::now();
+    let db = Daemon::start(b, &["--node", "beta"], &[("VOX_LISTEN", listen_b)]);
+    db.expect("node beta is Ready", RETURN_WITHIN, |l| {
+        l.contains("beta is Ready")
+    });
+    db.expect("node delta is Ready", RETURN_WITHIN, |l| {
+        l.contains("delta is Ready")
+    });
+    let after = bindings_shown(&computer(b, &["status"]));
+    assert!(
+        after == before,
+        "PRODUCT: a restart of beta's daemon with nothing changed derived a binding again, or lost \
+         the record of when it was derived (ADR-038 FX-28, #1020): before the restart policy \
+         revision {}, bindings (revision, derived at ms) {:?}; after it, with both nodes Ready, \
+         revision {}, {:?}\nbeta's daemon said: {}",
+        before.0,
+        before.1,
+        after.0,
+        after.1,
+        db.said()
+    );
+    println!(
+        "[proof] {:?} after beta's daemon was restarted with nothing changed, both nodes are Ready and every binding stands at policy revision {} with the same derived moment as before: {:?}",
+        restarted.elapsed(),
+        after.0,
+        after.1
+    );
+    assert!(
+        wait_until(EXCHANGE_WITHIN, || {
+            computer(a, &["status"])["state"] == "confirmed"
+                && computer(b, &["status"])["state"] == "confirmed"
+        }),
+        "PRODUCT: after beta's daemon restarted the two computers did not both confirm again \
+         within {EXCHANGE_WITHIN:?}: alpha's {}, beta's {}\n{}\n{}",
+        computer(a, &["status"])["state"],
+        computer(b, &["status"])["state"],
+        da.said(),
+        db.said()
+    );
+    db
+}
+
 /// **A change made while the other computer is unreachable arrives when it returns** (ADR-038
 /// FX-28; #1020). Beta's daemon is stopped; gamma is made alpha's personal node (drive moves
 /// from alpha to gamma: a grant and a revocation). Within [`CHANGE_SHOWN_WITHIN`] alpha's
@@ -2972,7 +3054,7 @@ fn change_shows_on_both(
 /// other again. Returns beta's new daemon.
 fn change_reaches_a_returning_computer(
     (a, da, nodes_a): (&Account, &Daemon, &[(&str, &str)]),
-    (b, db, nodes_b): (&Account, Daemon, &[(&str, &str)]),
+    (b, db, nodes_b, listen_b): (&Account, Daemon, &[(&str, &str)], &str),
 ) -> Daemon {
     let a_id = computer_id(a);
     let b_id = computer_id(b);
@@ -2992,6 +3074,7 @@ fn change_reaches_a_returning_computer(
     let changed = Instant::now();
     computer(a, &["personal", "gamma"]);
     let shown = loop {
+        let elapsed = changed.elapsed();
         let status = computer(a, &["status"]);
         let personal = status["nodes"]
             .as_array()
@@ -3000,17 +3083,18 @@ fn change_reaches_a_returning_computer(
             .any(|n| n["name"] == "gamma" && n["personal"] == true);
         let alpha_drives_gamma = grant_words(a, "alpha", &gamma).as_deref() == Some("read + drive");
         let gamma_reads_alpha = grant_words(a, "gamma", &alpha).as_deref() == Some("read");
-        if personal
+        let shown = personal
             && roster_current(&status, &["alpha", "gamma"])
             && alpha_drives_gamma
-            && gamma_reads_alpha
-        {
+            && gamma_reads_alpha;
+        if shown && elapsed <= CHANGE_SHOWN_WITHIN {
             break status;
         }
         assert!(
-            changed.elapsed() < CHANGE_SHOWN_WITHIN,
+            !shown && elapsed < CHANGE_SHOWN_WITHIN,
             "PRODUCT: {CHANGE_SHOWN_WITHIN:?} after `vox computer personal gamma`, alpha's computer \
-             does not show it applied (ADR-038 FX-28, #1020): gamma personal {personal}, bindings \
+             did not show it applied in time (ADR-038 FX-28, #1020; shown {shown} when looked at \
+             after {elapsed:?}): gamma personal {personal}, bindings \
              current {}, alpha grants gamma {:?} (read + drive expected), gamma grants alpha {:?} \
              (read expected); status: revision {} nodes {}\nits daemon said: {}",
             roster_current(&status, &["alpha", "gamma"]),
@@ -3043,9 +3127,10 @@ fn change_reaches_a_returning_computer(
         "[proof] alpha's status counts the exchange toward beta that could not complete: {} failed in a row",
         application_toward(a, &b_id)["exchange_failures"]
     );
-    // Beta's computer returns: its daemon starts again with its remembered nodes.
-    let db = Daemon::start(b, &["--node", "beta"], &[]);
+    // Beta's computer returns: its daemon starts again with its remembered nodes. The clock
+    // starts with the command that starts it.
     let restored = Instant::now();
+    let db = Daemon::start(b, &["--node", "beta"], &[("VOX_LISTEN", listen_b)]);
     db.expect("node beta is Ready", RETURN_WITHIN, |l| {
         l.contains("beta is Ready")
     });
@@ -3053,6 +3138,7 @@ fn change_reaches_a_returning_computer(
         l.contains("delta is Ready")
     });
     let applied_at = loop {
+        let elapsed = restored.elapsed();
         let status = computer(b, &["status"]);
         let gamma_personal = status["nodes"].as_array().into_iter().flatten().any(|n| {
             n["name"] == "gamma" && n["computer"] == a_id.as_str() && n["personal"] == true
@@ -3060,18 +3146,19 @@ fn change_reaches_a_returning_computer(
         let delta_drives_gamma = grant_words(b, "delta", &gamma).as_deref() == Some("read + drive");
         let delta_reads_alpha = grant_words(b, "delta", &alpha).as_deref() == Some("read");
         let beta_reads_gamma = grant_words(b, "beta", &gamma).as_deref() == Some("read");
-        if gamma_personal
+        let shown = gamma_personal
             && roster_current(&status, &names_b)
             && delta_drives_gamma
             && delta_reads_alpha
-            && beta_reads_gamma
-        {
-            break restored.elapsed();
+            && beta_reads_gamma;
+        if shown && elapsed <= RETURN_WITHIN {
+            break elapsed;
         }
         assert!(
-            restored.elapsed() < RETURN_WITHIN,
-            "PRODUCT: {RETURN_WITHIN:?} after beta's daemon returned, the change made while it was \
-             unreachable is not applied there (ADR-038 FX-28, #1020): gamma personal under alpha's \
+            !shown && elapsed < RETURN_WITHIN,
+            "PRODUCT: {RETURN_WITHIN:?} after beta's daemon was started again, the change made while \
+             it was unreachable was not applied there in time (ADR-038 FX-28, #1020; shown {shown} \
+             when looked at after {elapsed:?}): gamma personal under alpha's \
              computer {gamma_personal}, bindings current {}, delta grants gamma {:?} (read + drive \
              expected), delta grants alpha {:?} (read expected), beta grants gamma {:?} (read \
              expected); status: revision {} nodes {}; applications {}\nbeta's daemon said: {}\n\

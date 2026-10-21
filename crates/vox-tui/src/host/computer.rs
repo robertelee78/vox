@@ -58,11 +58,15 @@ impl Router {
         });
     }
 
-    /// One reconciliation pass: the roster follows the nodes on disk, every attached node that
-    /// is behind the policy derives its binding and applies its keyring, all at once and each
-    /// within [`RECONCILE_WITHIN`], and the application receipt is recorded. A node at the
-    /// current revision is not asked; one that fails or does not answer is detached, off this
-    /// task, so no node holds the follower.
+    /// One reconciliation pass: the roster follows the nodes on disk, and every attached node
+    /// that is behind the policy derives its binding and applies its keyring on a task of its
+    /// own, bounded by [`RECONCILE_WITHIN`]; each records the application receipt when it is
+    /// done. The pass itself waits for none of them, so a revision arriving meanwhile starts its
+    /// own pass at once and a stuck node holds nothing but itself. A node at the current
+    /// revision is not asked; one that fails or does not answer is said in the status and
+    /// detached (a failed write must not leave stale grants on the network); the detach is
+    /// waited on for the daemon's patience and, past that, left to finish on its own task, which
+    /// the status says.
     async fn reconcile_computer_trust(&self) {
         let management = Arc::clone(&self.inner.defaults.computer);
         if management.computer.binding_group().is_none() && !management.computer.grouped() {
@@ -84,7 +88,7 @@ impl Router {
             return;
         }
         let mut pending = Vec::new();
-        let mut behind = tokio::task::JoinSet::new();
+        let mut behind = Vec::new();
         let attached = self.attached_handles();
         for info in self.nodes() {
             let Some((_, handle)) = attached.iter().find(|(name, _)| name == info.name.as_str())
@@ -98,9 +102,19 @@ impl Router {
             if handle.computer_current() {
                 continue;
             }
-            let handle = handle.clone();
-            let name = info.name.clone();
-            behind.spawn(async move {
+            behind.push((info.name.clone(), handle.clone()));
+        }
+        management.pending_nodes(pending);
+        if behind.is_empty() {
+            if let Err(e) = management.record_application() {
+                eprintln!("vox daemon: computer trust application pending: {e}");
+            }
+            return;
+        }
+        for (name, handle) in behind {
+            let router = self.clone();
+            let management = Arc::clone(&management);
+            self.inner.rt.spawn(async move {
                 let outcome =
                     match tokio::time::timeout(RECONCILE_WITHIN, handle.reconcile_computer()).await
                     {
@@ -110,30 +124,33 @@ impl Router {
                             "did not apply computer trust within {RECONCILE_WITHIN:?}"
                         )),
                     };
-                (name, outcome)
-            });
-        }
-        while let Some(joined) = behind.join_next().await {
-            let (name, outcome) = match joined {
-                Ok(done) => done,
-                Err(e) => {
-                    eprintln!("vox daemon: computer trust application stopped: {e}");
-                    continue;
+                match outcome {
+                    Ok(()) => {
+                        if let Err(e) = management.record_application() {
+                            eprintln!("vox daemon: computer trust application pending: {e}");
+                        }
+                    }
+                    Err(why) => {
+                        management.node_pending(name.as_str(), &why);
+                        let patience = router.inner.defaults.patience;
+                        let detach_router = router.clone();
+                        let detach_name = name.clone();
+                        let detaching = router.inner.rt.spawn(async move {
+                            detach_router
+                                .detach(&detach_name, DetachCause::Requested)
+                                .await
+                        });
+                        if tokio::time::timeout(patience, detaching).await.is_err() {
+                            management.node_pending(
+                                name.as_str(),
+                                &format!(
+                                    "{why}; its stop did not finish within {patience:?} and continues"
+                                ),
+                            );
+                        }
+                    }
                 }
-            };
-            if let Err(e) = outcome {
-                pending.push(format!("{name}: {e}"));
-                // A failed write must not leave stale grants on the network. The detach waits
-                // for the node's actor to end, which a wedged one may not do soon: off this task.
-                let router = self.clone();
-                self.inner.rt.spawn(async move {
-                    let _ = router.detach(&name, DetachCause::Requested).await;
-                });
-            }
-        }
-        management.pending_nodes(pending);
-        if let Err(e) = management.record_application() {
-            eprintln!("vox daemon: computer trust application pending: {e}");
+            });
         }
     }
 
