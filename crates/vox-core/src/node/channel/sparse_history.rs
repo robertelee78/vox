@@ -678,6 +678,16 @@ impl ChannelState {
                     .retention(hash)?
                     .is_none_or(|tracked| tracked.cache_id.is_none());
             drop(input);
+            if !refill_pending {
+                // A foreground flow may have settled this effect after the archive staged the
+                // same header. The archive acknowledgement is still owed. Run its idempotent
+                // callback under the current grant and commit it before reporting completion;
+                // otherwise the demand can retain semantic debt forever despite the effect.
+                let mut batch = store.batch()?;
+                check_binding(&batch)?;
+                on_admitted(&mut batch, *hash)?;
+                batch.commit()?;
+            }
             // Feed restoration is local accepted-header maintenance. Advance at most one
             // successor in this bounded turn, including while the exact staged body continues
             // through refill below.

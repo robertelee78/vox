@@ -547,10 +547,12 @@ const IDLE: Duration = Duration::from_secs(60);
 /// Mutants: the own-head hint offered to every peer on every tick again (`offer_own_head`
 /// ignoring who acknowledged) turns the round-count claim red; undoing role-aware settlement for
 /// the non-recipient package turns the zero-partial claim red; granting body credit persists the
-/// hostile ciphertext and turns the Bob-only privacy assertion red; dropping bounded
-/// continuation or its durable cursor turns an exact held-through assertion red; the lane's
-/// completion no longer recording the sync (`note_lane_sync` removed) turns the last-sync claim
-/// red.
+/// hostile ciphertext and turns the Bob-only privacy assertion red; moving the archive cursor
+/// below the role-only header before its effect makes the interrupted request finish with debt;
+/// skipping the already-settled callback strands the resumed request; dropping bounded
+/// continuation stalls the exact older-row assertion; each mutation has its own script and
+/// PRODUCT red. The lane's completion no longer recording the sync (`note_lane_sync` removed)
+/// turns the last-sync claim red.
 #[cfg(feature = "optional-proofs")]
 #[test]
 #[ignore = "an idle minute on two real vox daemons; optional, run it in release"]
@@ -558,6 +560,7 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
     test_knobs::require(&[
         "VOX_TEST_HOLD_PACKAGES_FILE",
         "VOX_TEST_SERVE_NONRECIPIENT_HISTORY_BODY_FILE",
+        "VOX_TEST_HOLD_ROLE_HEADER_SETTLEMENT_FILE",
     ]);
     watchdog::arm();
     let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("APPARATUS: no temp dir: {e}"));
@@ -592,6 +595,13 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         "VOX_TEST_SERVE_NONRECIPIENT_HISTORY_BODY_FILE",
         hostile_path.as_str(),
     )];
+    let settlement_hold = root.join("hold-role-header-settlement");
+    let settlement_hold_path = settlement_hold
+        .to_str()
+        .expect("APPARATUS: a UTF-8 role-settlement hold path")
+        .to_owned();
+    let settlement_engaged =
+        std::path::PathBuf::from(format!("{}.engaged", settlement_hold.display()));
     let alice_daemon = daemon_env(&alice, "alice", &alice_knob);
     attached(&alice, "alice");
     let (ok, _, err) = vox(
@@ -776,8 +786,18 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
     // entry and causally finish both authors' bounded suffixes.
     std::fs::write(&hostile, b"")
         .unwrap_or_else(|e| panic!("APPARATUS: could not create {}: {e}", hostile.display()));
+    std::fs::write(&settlement_hold, b"").unwrap_or_else(|e| {
+        panic!(
+            "APPARATUS: could not create {}: {e}",
+            settlement_hold.display()
+        )
+    });
     let hostile_engaged = std::path::PathBuf::from(format!("{}.engaged", hostile.display()));
-    let bob_after_gap = daemon(&bob, "bob-after-gap");
+    let bob_settlement_knob = [(
+        "VOX_TEST_HOLD_ROLE_HEADER_SETTLEMENT_FILE",
+        settlement_hold_path.as_str(),
+    )];
+    let bob_after_gap = daemon_env(&bob, "bob-after-gap", &bob_settlement_knob);
     attached(&bob, "bob-after-gap");
     let marker_deadline = Instant::now() + READY_WITHIN;
     while !reads(&bob, &room, &package_marker) {
@@ -826,6 +846,41 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         );
         std::thread::sleep(Duration::from_millis(200));
     }
+    let settlement_deadline = Instant::now() + READY_WITHIN;
+    while !settlement_engaged.is_file() {
+        assert!(
+            Instant::now() < settlement_deadline,
+            "APPARATUS: Bob did not durably park the archive cursor on Carol's role-only header \
+             within {READY_WITHIN:?}; the checkpoint/effect interruption was not staged\n\
+             bob said: {}",
+            said(&bob, "bob-after-gap")
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let held_status = history_status(&bob, &room);
+    assert!(
+        held_status.0 != "complete" && held_status.1 != 0,
+        "PRODUCT: before Carol's role-only header was semantically settled, Bob reported the \
+         archive request complete with no remaining debt: {held_status:?}"
+    );
+    // Stop at the exact durable boundary, then resume through the shipped command. The source's
+    // private body is never accepted, and restart must retry this header rather than an older
+    // cursor or a false terminal state.
+    bob_after_gap.stop();
+    std::fs::remove_file(&settlement_engaged).unwrap_or_else(|e| {
+        panic!(
+            "APPARATUS: could not release {} after Bob stopped: {e}",
+            settlement_engaged.display()
+        )
+    });
+    let bob_after_interruption = daemon(&bob, "bob-after-interruption");
+    attached(&bob, "bob-after-interruption");
+    let (ok, out, err) = vox(&bob, &["room", "read", &room, "--history", "resume"], None);
+    assert!(
+        ok,
+        "PRODUCT: Bob's shipped `vox room read --history resume` was refused after interruption: \
+         {out}{err}"
+    );
     // Reading a fresh later row is not proof of crossing a sparse gap: it can arrive and render
     // independently. Alice must instead report Bob's authenticated receipt through the exact
     // feed position after the package. That role-contiguous cursor cannot jump over Carol's
@@ -838,7 +893,7 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
              room feed through {marker_through}; Carol's header-only package did not settle \
              contiguously for Bob's role\n\
              bob's daemon said: {}",
-            said(&bob, "bob-after-gap")
+            said(&bob, "bob-after-interruption")
         );
         std::thread::sleep(Duration::from_millis(200));
     }
@@ -848,7 +903,7 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         "PRODUCT: Bob's shipped archive read settled Alice's exact cursor through \
          {marker_through}, but did not continue past Carol's header to the exact older row \
          {before_package_hash}\nbob's daemon said: {}",
-        said(&bob, "bob-after-gap")
+        said(&bob, "bob-after-interruption")
     );
     let archive_status = history_status(&bob, &room);
     assert_eq!(
@@ -856,6 +911,45 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         ("complete".to_owned(), 0),
         "PRODUCT: after the shipped archive read crossed Carol's role-complete header and \
          returned the exact older row, its status was not exactly complete with zero remaining"
+    );
+    // Ask for the same signed interval again after its semantic effects are already durable.
+    // A repeated user read still owes its own exact archive acknowledgement; the finished-effect
+    // fast path must invoke that callback instead of stranding a nonzero saved request.
+    let (ok, out, err) = vox(
+        &bob,
+        &[
+            "room",
+            "read",
+            &room,
+            "--history",
+            "older",
+            "--before",
+            &oldest,
+        ],
+        None,
+    );
+    assert!(
+        ok,
+        "PRODUCT: Bob's repeated shipped archive read was refused after the same effects were \
+         already settled: {out}{err}"
+    );
+    let repeated_deadline = Instant::now() + PAGE_WITHIN;
+    loop {
+        let repeated = history_status(&bob, &room);
+        if repeated == ("complete".to_owned(), 0) {
+            break;
+        }
+        assert!(
+            Instant::now() < repeated_deadline,
+            "PRODUCT: Bob's repeated shipped archive read did not acknowledge the already-settled \
+             role-only header exactly; status was {repeated:?}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert_eq!(
+        read_hash(&bob, &room, before_package_text).as_deref(),
+        Some(before_package_hash.as_str()),
+        "PRODUCT: Bob's repeated shipped archive read changed the exact retained older row"
     );
     // ---- the room is quiet: acknowledgements settle, then the rounds are counted ----------
     let before = [synced(&alice), synced(&bob)];
@@ -921,7 +1015,7 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
     // Restart Bob before the next receipt probe. Alice observing a newer completed sync and the
     // same exact held-through position proves Bob reconstructed the durable cursor; it is not an
     // in-memory acknowledgement left over from the first daemon.
-    bob_after_gap.stop();
+    bob_after_interruption.stop();
     let _bob_after_restart = daemon(&bob, "bob-after-restart");
     attached(&bob, "bob-after-restart");
     let restart_deadline = Instant::now() + READY_WITHIN;

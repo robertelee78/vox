@@ -378,10 +378,10 @@ async fn respond(
                 }
                 if result.role_complete {
                     // The receiver still has to prove inclusion and commit this authenticated
-                    // header's role-specific effect. Keep the archive operation non-terminal
-                    // until that durable settlement has happened. At the lower bound the
-                    // current position is a sentinel; settlement turns a zero remaining count
-                    // into Complete in the same transaction as the accepted effect.
+                    // header's role-specific effect. Keep the durable continuation on this
+                    // exact position: only the receiver's semantic-effect transaction may move
+                    // it below the header while decrementing the demand. A cancellation between
+                    // this response and that transaction therefore retries rather than skips it.
                     return Ok((
                         Status::More,
                         Some(Continuation {
@@ -389,7 +389,7 @@ async fn respond(
                             head,
                             lo,
                             hi,
-                            next_seq: seq.checked_sub(1).filter(|next| *next >= lo).unwrap_or(seq),
+                            next_seq: seq,
                             entry: None,
                             offset: 0,
                             entries_remaining: credit.headers_left(),

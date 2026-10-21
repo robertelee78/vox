@@ -964,7 +964,7 @@ pub fn entry_admitted(
 /// Commit one bodyless, authenticated entry that is complete for this node's recipient role.
 /// The caller invokes this only from the exact entry's semantic-effect transaction, after its
 /// inclusion proof and typed dispatch have succeeded. Unlike body staging, this both advances
-/// the archive count and preserves the already-checkpointed next-page cursor atomically.
+/// the archive count and moves the cursor below the role-only header atomically.
 pub fn role_header_admitted(
     batch: &mut Batch<'_>,
     context: &Context,
@@ -976,10 +976,22 @@ pub fn role_header_admitted(
     let key = key(context)?;
     let scope = scope(context);
     let mut state = live(batch, key, &scope, context, active)?;
-    let expected_next = seq
-        .checked_sub(1)
-        .filter(|next| *next >= state.bounds.lo)
-        .unwrap_or(seq);
+    if seq < state.bounds.lo || seq > state.bounds.hi {
+        return Err(invalid("role-complete history header exceeds demand"));
+    }
+    let next = seq.checked_sub(1).filter(|next| *next >= state.bounds.lo);
+    let already_admitted = state.body.is_none()
+        && state.cleanup.is_none()
+        && ((state.progress == Progress::Complete && state.remaining == 0)
+            || state.cursor.is_some_and(|cursor| {
+                cursor.query_kind == 4
+                    && next == Some(cursor.next_seq)
+                    && cursor.entry.is_none()
+                    && cursor.offset == 0
+            }));
+    if already_admitted {
+        return Ok(());
+    }
     if state.body.is_some()
         || state.cleanup.is_some()
         || state.remaining == 0
@@ -988,7 +1000,7 @@ pub fn role_header_admitted(
         || state.progress != Progress::More
         || !state.cursor.is_some_and(|cursor| {
             cursor.query_kind == 4
-                && cursor.next_seq == expected_next
+                && cursor.next_seq == seq
                 && cursor.entry.is_none()
                 && cursor.offset == 0
         })
@@ -999,6 +1011,14 @@ pub fn role_header_admitted(
     if state.remaining == 0 {
         state.cursor = None;
         state.progress = Progress::Complete;
+    } else if let Some(next) = next {
+        let cursor = state
+            .cursor
+            .as_mut()
+            .ok_or_else(|| invalid("role-complete history cursor vanished"))?;
+        cursor.next_seq = next;
+    } else {
+        return Err(invalid("role-complete lower bound left remaining entries"));
     }
     put(batch, key, &scope, &state)
 }
@@ -1025,9 +1045,12 @@ pub fn checkpoint(
     let mut batch = context.store().batch()?;
     let mut state = live(&batch, key, &scope, context, active)?;
     if progress == Progress::Complete
-        && (state.body.is_some() || state.cleanup.is_some() || cursor.is_some())
+        && (state.body.is_some()
+            || state.cleanup.is_some()
+            || cursor.is_some()
+            || state.remaining != 0)
     {
-        return Err(invalid("history demand still has an unfinished body"));
+        return Err(invalid("history demand still has unfinished work"));
     }
     state.cursor = if let Some(cursor) = cursor {
         if cursor.head != state.bounds.head

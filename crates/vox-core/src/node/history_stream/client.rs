@@ -21,6 +21,12 @@ const VERIFY_ENVELOPE: usize = 4 * 1024 * 1024;
 // One atomic metadata object, or one selected staged body, per receiver handoff.
 const MAX_NEEDS: usize = 1;
 
+/// Proof-only interruption point after a hostile nonrecipient body has been refused and the
+/// archive cursor is durably parked on its authenticated header, but before semantic settlement.
+/// The trigger is renamed with `.engaged`; removing that engaged marker releases the worker.
+#[cfg(feature = "test-knobs")]
+pub const TEST_HOLD_ROLE_SETTLEMENT_ENV: &str = "VOX_TEST_HOLD_ROLE_HEADER_SETTLEMENT_FILE";
+
 /// Owned activation supplied by the actor after explicit archive demand or current live/control
 /// scheduling. Constructing a receiver never starts, resumes or replaces that activation.
 #[derive(Clone)]
@@ -52,7 +58,7 @@ pub(crate) struct Received {
     pub(crate) body_ready: Option<Digest32>,
     /// Exact authenticated header whose private body this node's role must not receive. Its
     /// inclusion and semantic settlement still have to complete before the archive can advance.
-    pub(crate) role_ready: Option<(Digest32, u64)>,
+    pub(crate) role_ready: Option<(Digest32, u64, Digest32)>,
     pub(crate) body_progress: bool,
     pub(crate) inventory: Option<Inventory>,
     pub(crate) heads: Vec<super::HeadHint>,
@@ -220,7 +226,64 @@ impl Receiver {
             // blocking worker. Its second decode never overlaps this first allocation.
             let action = {
                 let frame = incoming.frame()?;
-                credit.accept(&frame, incoming.wire_len())?;
+                if let Err(error) = credit.accept(&frame, incoming.wire_len()) {
+                    // A hostile authenticated source can send the private bytes which its own
+                    // signed header says belong to somebody else. Refuse those bytes, but do not
+                    // discard the already authenticated header handoff. Its inclusion/effect
+                    // work remains queued locally and the archive resumes below it only after
+                    // that durable settlement. Any other malformed frame still fails the peer.
+                    let refused_exact_role_body = matches!(
+                        (&result.role_ready, &frame),
+                        (
+                            Some((_, _, expected)),
+                            Frame::Chunk {
+                                request: chunk_request,
+                                entry,
+                                offset: 0,
+                                bytes,
+                            }
+                        ) if *chunk_request == request && entry == expected && !bytes.is_empty()
+                    );
+                    if refused_exact_role_body {
+                        let Some((_, seq, _)) = result.role_ready else {
+                            unreachable!()
+                        };
+                        let Query::Page {
+                            head,
+                            lo,
+                            hi,
+                            entries,
+                            ..
+                        } = &query
+                        else {
+                            return Err(error);
+                        };
+                        let continuation = Continuation {
+                            query_kind: 4,
+                            head: *head,
+                            lo: *lo,
+                            hi: *hi,
+                            next_seq: seq,
+                            entry: None,
+                            offset: 0,
+                            entries_remaining: *entries,
+                        };
+                        result.continuation = self
+                            .checkpoint_response(
+                                io.job(),
+                                request,
+                                &query,
+                                Status::More,
+                                Some(continuation),
+                            )
+                            .await?;
+                        io.abort(WireError::ProtocolLimits);
+                        self.hold_role_settlement().await?;
+                        result.status = Status::ControlPending;
+                        return Ok(result);
+                    }
+                    return Err(error);
+                }
                 match frame {
                     Frame::Meta { .. } => Action::Meta,
                     Frame::Have(hints) => Action::Inventory(hints),
@@ -350,7 +413,11 @@ impl Receiver {
                             // header-only; an unexpected body frame is refused by credit.accept
                             // before Action::Chunk can persist a byte.
                             if !body_allowed {
-                                if result.role_ready.replace((*head, seq)).is_some() {
+                                if result
+                                    .role_ready
+                                    .replace((*head, seq, entry.entry_hash()))
+                                    .is_some()
+                                {
                                     return Err(Error::SizeLimitExceeded(
                                         "history role-complete header handoff",
                                     ));
@@ -534,6 +601,32 @@ impl Receiver {
                 }
             }
         }
+    }
+
+    async fn hold_role_settlement(&self) -> Result<()> {
+        #[cfg(feature = "test-knobs")]
+        {
+            let Some(trigger) = std::env::var_os(TEST_HOLD_ROLE_SETTLEMENT_ENV)
+                .filter(|path| !path.is_empty())
+                .map(std::path::PathBuf::from)
+                .filter(|path| path.is_file())
+            else {
+                return Ok(());
+            };
+            let mut engaged = trigger.as_os_str().to_os_string();
+            engaged.push(".engaged");
+            let engaged: std::path::PathBuf = engaged.into();
+            std::fs::rename(&trigger, &engaged).map_err(|_| {
+                Error::Profile("test role-settlement marker could not record engagement")
+            })?;
+            while engaged.is_file() {
+                current(&self.source.fence, self.source.deadline)?;
+                // Apparatus polling only: removing the marker is the causal release; elapsed
+                // time never changes product state or makes the proof pass.
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+        Ok(())
     }
 
     /// One persisted verifier slice. This cannot send a request or follow a missing context.

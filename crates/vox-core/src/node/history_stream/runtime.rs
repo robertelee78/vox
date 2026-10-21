@@ -1411,7 +1411,7 @@ impl Flow {
                     return Ok(());
                 }
                 if self.archive && body {
-                    if let Some((head, seq)) = result.role_ready {
+                    if let Some((head, seq, _)) = result.role_ready {
                         self.archive_next = seq
                             .checked_sub(1)
                             .filter(|next| matches!(query, Query::Page { lo, .. } if *next >= lo));
