@@ -161,7 +161,7 @@ pub(crate) struct Flow {
     /// and the actor's fold hook is asked to drive the fold.
     pub(crate) governance_wait: bool,
     governance_cycles: u8,
-    last_head: Option<(super::HeadHint, u8)>,
+    last_head: Option<super::HeadHint>,
     /// Immutable identity of this cleanup obligation. `request` changes as continuations are
     /// derived; retirement ownership must not.
     retirement_request: RequestId,
@@ -206,6 +206,9 @@ pub(crate) enum Resumed {
     /// Every charge is held by a running round: unreachable while every held charge is a
     /// running round's (the pool is sized to every hosted node's rounds).
     PoolFull,
+    /// The current and retiring actor generations already occupy this fingerprint's two shared
+    /// running slots. Exact charge release, not a tick, wakes the retained round.
+    NodeBusy,
 }
 
 impl Flow {
@@ -492,9 +495,11 @@ impl Flow {
     }
 
     /// Reserve the flow state as the round begins, its bytes already held: the last gate before
-    /// running, so a held charge always belongs to a running round. [`Resumed::PoolFull`] when
-    /// every charge is held by a running round, which the pool's size rules out. A flow already
-    /// holding its state keeps it, and the bytes go back.
+    /// running, so a held charge always belongs to a running round. [`Resumed::NodeBusy`] when
+    /// this fingerprint's current and retiring generations already hold its source-owned slots;
+    /// [`Resumed::PoolFull`] when every charge is held by a running round, which the shared
+    /// per-fingerprint limit and pool size rule out. A flow already holding its state keeps it,
+    /// and the bytes go back.
     pub(crate) fn resume(
         &mut self,
         job: &Job,
@@ -509,6 +514,7 @@ impl Flow {
                 Resumed::Held
             }
             crate::node::history_budget::FlowStateTry::PoolFull => Resumed::PoolFull,
+            crate::node::history_budget::FlowStateTry::NodeBusy => Resumed::NodeBusy,
         }
     }
 
@@ -1318,18 +1324,10 @@ impl Flow {
                                 self.mine_held =
                                     Some(self.mine_held.map_or(head.size, |m| m.max(head.size)));
                             }
-                            let repeats = self
-                                .last_head
-                                .filter(|(prior, _)| {
-                                    prior.author == head.author
-                                        && prior.head == head.head
-                                        && prior.size == head.size
-                                })
-                                .map_or(0, |(_, repeats)| repeats.saturating_add(1));
-                            self.last_head = Some((*head, repeats));
-                            if repeats >= 2 {
-                                return Err(Error::Unreachable("peer repeats a head that cannot satisfy the current dependency"));
-                            }
+                            // A repeated signed head remains the peer's exact current answer.
+                            // Busy handling below retains the dependency and applies the named
+                            // port backoff; no count of identical answers may dispose its root.
+                            self.last_head = Some(*head);
                         }
                         if head.author == author
                             && self.hint.is_some_and(|hint| hint.author == author)

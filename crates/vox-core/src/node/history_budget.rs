@@ -23,6 +23,9 @@ pub const TEST_FOREGROUND_JOBS_ENV: &str = "VOX_TEST_FOREGROUND_JOBS";
 #[cfg(feature = "test-knobs")]
 /// Proof-only file whose presence holds an admitted Live job; absent from production.
 pub const TEST_HOLD_LIVE_JOB_ENV: &str = "VOX_TEST_HOLD_LIVE_JOB_FILE";
+#[cfg(feature = "test-knobs")]
+/// Proof-only file whose presence holds an admitted Archive job; absent from production.
+pub const TEST_HOLD_ARCHIVE_JOB_ENV: &str = "VOX_TEST_HOLD_ARCHIVE_JOB_FILE";
 /// The floor for the daemon's running bounded-sync flow-state capacity (ADR-038 FX-35).
 pub const FLOW_STATE_MIN_CAPACITY: usize = 16;
 /// The running bounded-sync slots one hosted node owns. This is the source of truth for both
@@ -421,14 +424,16 @@ impl Job {
         wake
     }
 
-    /// Proof-only: keep one admitted live job until apparatus removes its named file. Production
-    /// builds contain neither the variable nor this pause.
+    /// Proof-only: keep one admitted Live or Archive job until apparatus removes its lane's
+    /// named file. Production builds contain neither variable nor this pause.
     #[cfg(feature = "test-knobs")]
-    pub(crate) async fn hold_live_for_proof(&self) {
-        if self.0.lane != Lane::Live {
-            return;
-        }
-        let Some(path) = std::env::var_os(TEST_HOLD_LIVE_JOB_ENV) else {
+    pub(crate) async fn hold_for_proof(&self) {
+        let variable = match self.0.lane {
+            Lane::Archive => TEST_HOLD_ARCHIVE_JOB_ENV,
+            Lane::Live => TEST_HOLD_LIVE_JOB_ENV,
+            Lane::Control | Lane::LargeControl => return,
+        };
+        let Some(path) = std::env::var_os(variable) else {
             return;
         };
         while std::path::Path::new(&path).exists() {
@@ -437,14 +442,15 @@ impl Job {
     }
 
     #[cfg(not(feature = "test-knobs"))]
-    pub(crate) async fn hold_live_for_proof(&self) {}
+    pub(crate) async fn hold_for_proof(&self) {}
 
     /// Reserve flow state for a port's round (ADR-038 FX-35), the Control bytes it costs already
     /// reserved by the caller (the control budget's refusal is its own gate, never the pool's).
     /// The charge is the round's: it is recorded as running in the same step, under the one
-    /// lock, and is given back when the charge drops. `PoolFull` when every charge is held by a
-    /// running round, which the pool's size rules out while every held charge is a running
-    /// round's; the bytes go back then.
+    /// lock, and is given back when the charge drops. `NodeBusy` when this fingerprint's current
+    /// and retiring generations already hold its source-owned running slots. `PoolFull` when
+    /// every pool charge is held by a running round, which the per-fingerprint limit and pool
+    /// size rule out; the bytes go back on either refusal.
     pub(crate) fn reserve_flow_state(
         &self,
         room: Digest32,
@@ -457,7 +463,22 @@ impl Job {
             return FlowStateTry::PoolFull;
         };
         let key = (owner, self.0.node, room, peer);
-        if p.in_use >= p.limit || !p.owners.contains_key(&owner) {
+        let Some(node) = p.owners.get(&owner).map(|owner| owner.node) else {
+            return FlowStateTry::PoolFull;
+        };
+        // Actor replacement does not create a second pair of bounded slots for one hosted
+        // fingerprint. Retiring and current generations share the same source-owned slot count;
+        // the old charge's exact Drop wakes the replacement without a tick or elapsed escape.
+        let node_in_use: usize = p
+            .owners
+            .values()
+            .filter(|pool_owner| pool_owner.node == node)
+            .map(|pool_owner| pool_owner.charges)
+            .sum();
+        if node_in_use >= BOUNDED_SYNC_RUNNING_SLOTS {
+            return FlowStateTry::NodeBusy;
+        }
+        if p.in_use >= p.limit {
             return FlowStateTry::PoolFull;
         }
         let Some(pool_owner) = p.owners.get_mut(&owner) else {
@@ -806,6 +827,9 @@ pub(crate) enum FlowStateTry {
     /// to every hosted node's rounds); kept so the gate has its word if a charge is ever held
     /// by anything but a running round.
     PoolFull,
+    /// Both bounded running slots of this fingerprint belong to its current or retiring actor
+    /// generation. The retiring charge's release wakes the exact retained replacement work.
+    NodeBusy,
 }
 
 /// One running round's flow state, inseparable from its real Control byte charge. The Flow

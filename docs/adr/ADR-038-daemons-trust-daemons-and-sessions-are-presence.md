@@ -415,9 +415,11 @@ The decider then answered twelve questions, one at a time. His answers are the d
   reserved), `identity_busy` (the node's identity secret is exclusively held),
   `control_budget_busy` (the control/live-lane job or its byte envelope could not be reserved),
   `live_lane_busy` (the node's live flow slot holds another flow), `no_outbound_slot` (the
-  outbound slot could not be taken) and `flow_state_pool_full` (every charge of the pool is held
-  by a running round). Gates that do not apply to that exact work are skipped, without changing
-  the order of the remaining gates. The boolean `round_running` is true while a bounded-sync
+  outbound slot could not be taken), `flow_state_node_busy` (this fingerprint's two running
+  slots are held across its current and retiring actor generations) and `flow_state_pool_full`
+  (every charge of the pool is held by a running round). Gates that do not apply to that exact
+  work are skipped, without changing the order of the remaining gates. The boolean
+  `round_running` is true while a bounded-sync
   round of that port runs. It MUST report the pool under `lanes.budget.flow_state` as the
   integers `in_use` and `limit` and, under `by_node`, an object with exactly one member per
   currently hosted node, keyed by that node's node ID, whose value is the current actor

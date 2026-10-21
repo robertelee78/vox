@@ -528,6 +528,7 @@ struct Staged {
     waited: Duration,
     hosted: usize,
     live_hold: Option<std::path::PathBuf>,
+    archive_hold: Option<std::path::PathBuf>,
     _tmp: tempfile::TempDir,
 }
 
@@ -831,7 +832,11 @@ fn stage_hosted_nodes(
     // own Keychain file, never the login Keychain.
     let keychain = attach::keychain(&host).to_string_lossy().into_owned();
     let live_hold = hold_live_jobs.then(|| root.join("hold-live-job"));
+    let archive_hold = hold_live_jobs.then(|| root.join("hold-archive-job"));
     let live_hold_text = live_hold
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned());
+    let archive_hold_text = archive_hold
         .as_ref()
         .map(|path| path.to_string_lossy().into_owned());
     let mut env: Vec<(&str, &str)> = vec![("VOX_TEST_KEYCHAIN", keychain.as_str())];
@@ -840,6 +845,9 @@ fn stage_hosted_nodes(
     }
     if let Some(path) = live_hold_text.as_deref() {
         env.push(("VOX_TEST_HOLD_LIVE_JOB_FILE", path));
+    }
+    if let Some(path) = archive_hold_text.as_deref() {
+        env.push(("VOX_TEST_HOLD_ARCHIVE_JOB_FILE", path));
     }
     if single_foreground_job {
         env.push(("VOX_TEST_FOREGROUND_JOBS", "1"));
@@ -945,6 +953,7 @@ fn stage_hosted_nodes(
         waited,
         hosted: hosted.len(),
         live_hold,
+        archive_hold,
         _tmp: tmp,
     }
 }
@@ -1151,7 +1160,7 @@ fn parked_flow_charge_discriminator(staged: &Staged) {
 }
 
 /// The gates a start attempt can end at, in the order the daemon tests them (ADR-038 FX-35).
-const START_REASONS: [&str; 8] = [
+const START_REASONS: [&str; 9] = [
     "room_busy",
     "retained_flow_limit",
     "archive_budget_busy",
@@ -1159,6 +1168,7 @@ const START_REASONS: [&str; 8] = [
     "control_budget_busy",
     "live_lane_busy",
     "no_outbound_slot",
+    "flow_state_node_busy",
     "flow_state_pool_full",
 ];
 
@@ -1495,6 +1505,7 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
     test_knobs::require(&[
         "VOX_TEST_FOREGROUND_JOBS",
         "VOX_TEST_HOLD_LIVE_JOB_FILE",
+        "VOX_TEST_HOLD_ARCHIVE_JOB_FILE",
         "VOX_TEST_DISABLE_TICK_SCHEDULE",
         "VOX_TEST_PANIC_ON_TEXT",
     ]);
@@ -1534,10 +1545,22 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
             .expect("APPARATUS: pressure tail disappeared")
             .wait_for(ready, name, false);
     }
-    // Two real shipped archive requests are already running. A near-maximum post by the peer in
-    // the shared room now makes one live round eligible on every hosted node. The proof-only file
-    // holds those already-admitted jobs without changing product capacity: fifteen live plus the
-    // daemon's two source-owned archive jobs is the first legal population above the floor.
+    // Two real shipped archive requests are already running. The separate proof-only archive
+    // barrier is installed before either request is made, so observing both admissions proves
+    // they cannot finish before live pressure reaches the seventeenth reservation. A near-maximum
+    // post by the peer in the shared room then makes one live round eligible on every hosted node.
+    // The barriers hold already-admitted jobs without changing product capacity: fifteen live plus
+    // the daemon's two source-owned archive jobs is the first legal population above the floor.
+    let archive_hold = staged
+        .archive_hold
+        .as_ref()
+        .expect("APPARATUS: archive-pressure hold path was not staged");
+    std::fs::File::create(archive_hold).unwrap_or_else(|error| {
+        panic!(
+            "APPARATUS: could not create {}: {error}",
+            archive_hold.display()
+        )
+    });
     let archive_room = stage_two_archive_jobs(&staged);
     let hold = staged
         .live_hold
@@ -1656,6 +1679,12 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
     };
     std::fs::remove_file(hold)
         .unwrap_or_else(|error| panic!("APPARATUS: could not release {}: {error}", hold.display()));
+    std::fs::remove_file(archive_hold).unwrap_or_else(|error| {
+        panic!(
+            "APPARATUS: could not release {}: {error}",
+            archive_hold.display()
+        )
+    });
     if pool_full_seen {
         assert!(
             required_pool_full_seen,

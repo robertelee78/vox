@@ -308,9 +308,15 @@ struct ByteAdmission {
 }
 struct PoolAdmission {
     token: u64,
+    gate: &'static str,
     root: &'static str,
     lane: crate::node::history_budget::Lane,
     task: tokio::task::JoinHandle<()>,
+}
+#[derive(Clone, Copy)]
+struct PoolWait {
+    gate: &'static str,
+    work: AdmissionWork,
 }
 enum ArchiveTurn {
     Ready(crate::node::history_budget::Job),
@@ -705,7 +711,7 @@ impl Controller {
         next_token: &mut u64,
         room: Digest32,
         peer: Digest32,
-        work: AdmissionWork,
+        waiting: PoolWait,
         wake: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
     ) {
         if self.pool_admission.contains_key(&(room, peer)) {
@@ -724,8 +730,9 @@ impl Controller {
             (room, peer),
             PoolAdmission {
                 token,
-                root: work.root,
-                lane: work.lane,
+                gate: waiting.gate,
+                root: waiting.work.root,
+                lane: waiting.work.lane,
                 task,
             },
         );
@@ -2453,8 +2460,18 @@ impl Node {
         let flow_state_wake = Flow::flow_state_wake(&state_job);
         match flow.resume(&state_job, state_bytes) {
             crate::node::history_stream::runtime::Resumed::Held => {}
-            crate::node::history_stream::runtime::Resumed::PoolFull => {
-                self.note_start(room, peer, "flow_state_pool_full");
+            refused @ (crate::node::history_stream::runtime::Resumed::PoolFull
+            | crate::node::history_stream::runtime::Resumed::NodeBusy) => {
+                let (reason, gate) = match refused {
+                    crate::node::history_stream::runtime::Resumed::PoolFull => {
+                        ("flow_state_pool_full", "pool")
+                    }
+                    crate::node::history_stream::runtime::Resumed::NodeBusy => {
+                        ("flow_state_node_busy", "node_slots")
+                    }
+                    crate::node::history_stream::runtime::Resumed::Held => unreachable!(),
+                };
+                self.note_start(room, peer, reason);
                 // The invariant says this cannot happen in production, but a truthful failure
                 // path still owns all work it consumed while constructing this Flow: archive
                 // dispatch, exact required dependency, or scalar hint. Retain the exact parked
@@ -2470,7 +2487,10 @@ impl Node {
                     &mut self.next_token,
                     room,
                     peer,
-                    AdmissionWork { root, lane },
+                    PoolWait {
+                        gate,
+                        work: AdmissionWork { root, lane },
+                    },
                     flow_state_wake,
                 );
                 return false;
@@ -2535,7 +2555,7 @@ impl Node {
         let pstore = profile.store_handle();
         let worker = tokio::spawn(async move {
             let _slot = slot;
-            job.hold_live_for_proof().await;
+            job.hold_for_proof().await;
             let deadline =
                 tokio::time::Instant::now() + crate::node::history_budget::BOUNDED_ROUND_PATIENCE;
             let mut flow = worker_flow.lock().await;
@@ -2761,7 +2781,7 @@ impl Controller {
         }));
         admissions.extend(self.pool_admission.iter().map(|((room, peer), waiting)| {
             admission(
-                "pool",
+                waiting.gate,
                 waiting.token,
                 *room,
                 *peer,
