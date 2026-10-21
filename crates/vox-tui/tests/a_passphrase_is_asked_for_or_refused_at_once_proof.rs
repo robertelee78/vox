@@ -592,14 +592,26 @@ fn node_list(dir: &Path) -> String {
     )
 }
 
+/// A `vox daemon` the proof started, stopped and waited for when dropped.
+struct Served(Child);
+
+impl Drop for Served {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 /// A daemon for the profile at `dir` with its nodes left Locked (`--no-node`), serving.
-fn daemon_with_locked_nodes(dir: &Path) -> Child {
-    let mut daemon = vox_cmd(dir, &["daemon", "--no-node", "--listen", "127.0.0.1:0"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("APPARATUS: spawn vox daemon --no-node");
+fn daemon_with_locked_nodes(dir: &Path) -> Served {
+    let daemon = Served(
+        vox_cmd(dir, &["daemon", "--no-node", "--listen", "127.0.0.1:0"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("APPARATUS: spawn vox daemon --no-node"),
+    );
     let started = Instant::now();
     while started.elapsed() < SERVES_WITHIN {
         if node_list(dir).contains("Locked") {
@@ -607,7 +619,7 @@ fn daemon_with_locked_nodes(dir: &Path) -> Child {
         }
         std::thread::sleep(Duration::from_millis(200));
     }
-    let _ = daemon.kill();
+    drop(daemon);
     panic!(
         "PRODUCT (staging): `vox daemon --no-node` did not serve with its node Locked within \
          {SERVES_WITHIN:?}: `vox node list` says {}",
@@ -622,7 +634,7 @@ fn a_locked_node_is_unlocked_without_a_persistent_file() {
     let tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
     let (bob, _) = profile(tmp.path(), "bob");
     let _reaper = layout::Reaper(vec![bob.clone()]);
-    let mut daemon = daemon_with_locked_nodes(&bob);
+    let daemon = daemon_with_locked_nodes(&bob);
 
     // ---- 1. unlocked from stdin: Ready, and said to be not remembered where nothing keeps it ----
     let out = vox_cmd(
@@ -665,8 +677,7 @@ fn a_locked_node_is_unlocked_without_a_persistent_file() {
 
     // ---- 2. the daemon starts again, as it does at login: Locked where nothing keeps it, Ready
     // where the credential store does ------------------------------------------------------------
-    let _ = daemon.kill();
-    let _ = daemon.wait();
+    drop(daemon);
     layout::reap_daemon(&bob);
     let listed = daemon_started_again(&bob);
     if remembering_store {
