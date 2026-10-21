@@ -1244,7 +1244,16 @@ final class FirstRunProof: XCTestCase {
         XCTAssertNotNil(hair, "PRODUCT: the timeline and the inspector must be separated by line.hair #303137 (L-2, L-6); no pixel of it in the 40 points left of the inspector, at height \(y)")
         read.append("line.hair at x \(hair.map { "\($0)" } ?? "none")")
 
-        // Room > Rename…: a sheet on bg.panel, its title SF Pro semibold.
+        // Room > Rename…: take the shipped authenticated order before the UI action. The returned
+        // NodeModel entry must be the one new final row—not merely any valid hash already present.
+        let renameOrderBeforeResult = run(vox, ["room", "read", "--node", "alice", room, "--hashes"], env: voxEnv)
+        XCTAssertEqual(renameOrderBeforeResult.status, 0,
+                       "PRODUCT: shipped `vox room read --hashes` refused before the macOS rename: \(renameOrderBeforeResult.out)")
+        let renameOrderBefore = renameOrderBeforeResult.out.split(separator: "\n").compactMap {
+            $0.split(whereSeparator: \.isWhitespace).first.map(String.init)
+        }
+
+        // The sheet is on bg.panel, and its title is SF Pro semibold.
         ui.menuBars.menuBarItems["Room"].click()
         tap(ui, Key.menuItem("Rename…"), "Room > Rename…")
         let title = Key.showing("Rename the room")
@@ -1289,8 +1298,8 @@ final class FirstRunProof: XCTestCase {
         let orderedHashes = ordered.out.split(separator: "\n").compactMap {
             $0.split(whereSeparator: \.isWhitespace).first.map(String.init)
         }
-        XCTAssertTrue(orderedHashes.contains(renameEntry),
-                      "PRODUCT: macOS reported rename entry \(renameEntry), but shipped `vox room read --hashes` showed \(orderedHashes)")
+        XCTAssertEqual(orderedHashes, renameOrderBefore + [renameEntry],
+                       "PRODUCT: macOS rename entry \(renameEntry) was not the exact newly inserted final authenticated row; before \(renameOrderBefore), after \(orderedHashes)")
         missingWithin(ui, title, 5, "a completed Rename must close its sheet")
 
         // Room > Retention…: Return sets nothing (A9: a retention that deletes has no default).

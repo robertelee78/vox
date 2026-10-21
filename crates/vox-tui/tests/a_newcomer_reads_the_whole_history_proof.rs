@@ -538,7 +538,9 @@ fn wait_for_competing_author_turn(
             })
             .count();
         let competing = rows.iter().find(|row| row["entry_hash"] == competing_hash);
-        if let Some(competing) = competing.filter(|row| row["text"].as_str().is_some()) {
+        if let Some(competing) =
+            competing.filter(|row| row["text"].as_str().is_some() && readable_long > 0)
+        {
             assert!(
                 readable_long < long_hashes.len(),
                 "PRODUCT: the competing author's exact retained row {competing_hash} became \
@@ -559,18 +561,19 @@ fn wait_for_competing_author_turn(
         let status = room_status(dir, reader, room);
         if work_seen && !status.render_backfill_pending {
             panic!(
-                "PRODUCT: the causally engaged render continuation finished before the \
-                 competing author's exact retained row {competing_hash} became readable in \
-                 room {room}; all rows: {rows:?}; final status: {status:?}"
+                "PRODUCT: the causally engaged render continuation finished before both authors \
+                 had an exact readable retained row in room {room}; competing hash \
+                 {competing_hash}; readable long rows {readable_long}; all rows: {rows:?}; final \
+                 status: {status:?}"
             );
         }
         work_seen |= status.render_backfill_pending;
         assert!(
             Instant::now() < deadline,
-            "APPARATUS: within the journey watchdog {BOUND:?}, the shipped status never exposed \
-             the causally engaged continuation and the competing author's exact retained row \
-             {competing_hash} did not become observable in room {room}; all rows: {rows:?}; \
-             last status: {status:?}"
+            "APPARATUS: within the journey watchdog {BOUND:?}, both authors never became causally \
+             runnable through exact readable rows before the long continuation exhausted in room \
+             {room}; competing hash {competing_hash}; readable long rows {readable_long}; all rows: \
+             {rows:?}; last status: {status:?}"
         );
         std::thread::yield_now();
     }
@@ -657,7 +660,7 @@ fn room_id(dir: &Path, reader: &str, room: &str) -> vox_core::hash::Digest32 {
 }
 
 /// Exact authenticated room-order hashes exposed by the shipped diagnostic command.
-fn room_hashes(dir: &Path, reader: &str, room: &str) -> std::collections::BTreeSet<String> {
+fn room_hashes(dir: &Path, reader: &str, room: &str) -> Vec<String> {
     let (ok, out, err) = vox(dir, &["room", "read", room, "--hashes"], None);
     assert!(
         ok,
@@ -1544,15 +1547,19 @@ fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
         );
     }
 
-    // With Bob offline, releasing Alice's fold makes the product append the consent and its
-    // store-and-forward key package. No guessed log-count delta stands in for either object: the
-    // observations after Alice stops prove Bob retained both.
+    // With Bob offline, release the two authors separately. The exact ordered interval around
+    // Alice's release identifies grant1 itself: after subtracting the one causal same-name rename,
+    // exactly one newly appended authenticated object remains. Releasing Carol afterwards keeps
+    // her consent from being misidentified as Alice's grant.
+    let grant1_baselines: Vec<Vec<String>> = rooms
+        .iter()
+        .map(|room| room_hashes(&alice, "alice", room))
+        .collect();
     std::fs::remove_file(&fold_hold)
         .unwrap_or_else(|error| panic!("APPARATUS: could not release the fold hold: {error}"));
-    std::fs::remove_file(&carol_fold_hold)
-        .unwrap_or_else(|error| panic!("APPARATUS: could not release Carol's fold hold: {error}"));
     // Marker removal is apparatus, not a product wake. A second authenticated same-name action is
-    // the causal event that resumes the released folds on Alice and, once synced, Carol.
+    // the causal event that resumes Alice's released fold.
+    let mut alice_causal_renames = Vec::with_capacity(rooms.len());
     for room in &rooms {
         let causal = rename_hash(&alice, "alice", room, room);
         assert!(
@@ -1560,9 +1567,41 @@ fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
             "PRODUCT: Alice's causal same-name rename named {causal}, but the exact \
              authenticated row was absent after the fold hold was released in room {room}"
         );
+        alice_causal_renames.push(causal);
     }
     for room in &rooms {
         wait_trust_detail(&alice, "alice", room, "bob", "you trust each other");
+    }
+    let mut grant1_hashes = Vec::with_capacity(rooms.len());
+    for (index, room) in rooms.iter().enumerate() {
+        let after = room_hashes(&alice, "alice", room);
+        let appended: Vec<_> = after
+            .iter()
+            .filter(|hash| {
+                !grant1_baselines[index].contains(hash) && **hash != alice_causal_renames[index]
+            })
+            .cloned()
+            .collect();
+        assert_eq!(
+            appended.len(),
+            1,
+            "PRODUCT: Alice's released fold did not append exactly one identifiable consent grant1 in room {room}; before {:?}; causal rename {}; after {after:?}; candidates {appended:?}",
+            grant1_baselines[index],
+            alice_causal_renames[index]
+        );
+        grant1_hashes.push(appended[0].clone());
+    }
+
+    std::fs::remove_file(&carol_fold_hold)
+        .unwrap_or_else(|error| panic!("APPARATUS: could not release Carol's fold hold: {error}"));
+    // Carol's authenticated same-name action is the independent causal wake for her released
+    // fold; it cannot add another Alice-authored candidate to the grant1 boundary above.
+    for room in &rooms {
+        let causal = rename_hash(&carol, "carol", room, room);
+        assert!(
+            room_hashes(&carol, "carol", room).contains(&causal),
+            "PRODUCT: Carol's causal same-name rename named {causal}, but the exact authenticated row was absent after her fold hold was released in room {room}"
+        );
         wait_trust_detail(&carol, "carol", room, "bob", "you trust each other");
     }
 
@@ -1599,30 +1638,20 @@ fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
     carol_daemon.stop();
     std::fs::remove_file(&package_hold)
         .unwrap_or_else(|error| panic!("APPARATUS: could not release the package hold: {error}"));
-    // Every author is causally runnable before the fairness read begins. Otherwise Alice's long
-    // continuation could legitimately finish while Carol still lacked a sender key and the
-    // proof would blame the product for apparatus ordering.
-    let mut ready_rooms = Vec::with_capacity(rooms.len());
-    for room in &rooms {
-        let ready = wait_room_status(
+    // Readiness is author-specific and causal: in every room, observe Carol's exact retained row
+    // getting a fair turn before Alice's >64-row continuation is exhausted. An aggregate retained
+    // generation count is transient (a rendered generation may already be retired) and cannot
+    // establish that either named author is runnable.
+    for (index, room) in rooms.iter().enumerate() {
+        wait_for_competing_author_turn(
             &bob,
             "bob",
             room,
-            false,
-            "Bob never accepted both retained authors' sender keys",
-            |status| status.received_key_generations >= 2,
+            &late_hashes[index],
+            &competing_hashes[index][0],
         );
-        ready_rooms.push(ready);
     }
-    wait_for_competing_author_turn(
-        &bob,
-        "bob",
-        &rooms[0],
-        &late_hashes[0],
-        &competing_hashes[0][0],
-    );
     for (index, room) in rooms.iter().enumerate() {
-        let ready = ready_rooms[index];
         let expected_before: Vec<String> = (0..BEFORE_KEY)
             .map(|row| format!("alice before key room {} row {row}", index + 1))
             .collect();
@@ -1632,7 +1661,7 @@ fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
             room,
             &late_hashes[index],
             &expected_before,
-            &format!("row→consent→key with Alice unavailable; room status {ready:?}"),
+            "row→consent→key with Alice unavailable after the exact competing author was readable",
         );
         assert_exact_read_rows(
             &bob,
@@ -1722,15 +1751,21 @@ fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
     // and Alice's automatic, equal grant to every still-trusted reader. Bob's sparse catch-up
     // admits the newest control fact before filling the older reset, which is the reachable
     // grant₁ → reset → identical grant₂ → late-reset order: sequence, not arrival, must win.
-    let repeated_before = room_status(&bob, "bob", &rooms[0]);
     assert_eq!(
         trust_detail(&bob, "bob", &rooms[0], "alice"),
         "you trust each other",
         "APPARATUS: the first Alice→Bob grant was not visibly effective before staging the \
          repeated-grant sequence"
     );
+    let rotation_order_before = room_hashes(&alice, "alice", &rooms[0]);
+    let grant1_hash = &grant1_hashes[0];
+    assert!(
+        rotation_order_before.contains(grant1_hash),
+        "PRODUCT: Alice's exact consent grant1 {grant1_hash} disappeared before sender rotation: {rotation_order_before:?}"
+    );
     bob_daemon.stop();
     let mut last_rotated = None;
+    let mut rotation_post_hashes = Vec::new();
     for row in 0..vox_core::group::ROTATE_AFTER_MESSAGES {
         let text = format!("Alice rotation proof row {row}");
         let (ok, out, err) = vox(
@@ -1743,28 +1778,57 @@ fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
             "PRODUCT: Alice's shipped post {row} of the source-owned sender-generation bound \
              was refused: {out}{err}"
         );
+        let posted: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|error| {
+            panic!("PRODUCT: Alice's rotation-bound post answer was malformed ({error}): {out}")
+        });
+        let posted_hash = posted["entry_hash"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!("PRODUCT: Alice's rotation-bound post named no entry_hash: {posted}")
+            })
+            .to_owned();
+        rotation_post_hashes.push(posted_hash.clone());
         if row + 1 == vox_core::group::ROTATE_AFTER_MESSAGES {
-            let posted: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|error| {
-                panic!(
-                    "PRODUCT: Alice's final rotation-bound post answer was malformed ({error}): \
-                     {out}"
-                )
-            });
-            last_rotated = Some((
-                posted["entry_hash"]
-                    .as_str()
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "PRODUCT: the final rotation-bound post named no entry_hash: {posted}"
-                        )
-                    })
-                    .to_owned(),
-                text,
-            ));
+            last_rotated = Some((posted_hash, text));
         }
     }
     let (last_rotated_hash, last_rotated_text) = last_rotated
         .unwrap_or_else(|| panic!("APPARATUS: the source-owned rotation bound was empty"));
+    let after_presence = room_hashes(&alice, "alice", &rooms[0]);
+    let reset_candidates: Vec<_> = after_presence
+        .iter()
+        .filter(|hash| {
+            !rotation_order_before.contains(hash) && !rotation_post_hashes.contains(hash)
+        })
+        .cloned()
+        .collect();
+    assert_eq!(
+        reset_candidates.len(),
+        1,
+        "PRODUCT: the source-owned sender rotation did not append exactly one identifiable authenticated Presence reset; before {rotation_order_before:?}; posts {rotation_post_hashes:?}; after {after_presence:?}; candidates {reset_candidates:?}"
+    );
+    let reset_hash = reset_candidates[0].clone();
+    let grant1_at = after_presence
+        .iter()
+        .position(|hash| hash == grant1_hash)
+        .expect("PRODUCT: exact grant1 missing after Presence rotation");
+    let reset_at = after_presence
+        .iter()
+        .position(|hash| hash == &reset_hash)
+        .expect("PRODUCT: exact Presence reset missing from Alice's order");
+    assert!(
+        grant1_at < reset_at,
+        "PRODUCT: Alice's shipped room order did not place grant1 {grant1_hash} before Presence reset {reset_hash}: {after_presence:?}"
+    );
+    // Wait until the real Presence rotation has reached the semantic projection, then take the
+    // revision baseline. The next equality can therefore measure only the identical grant2.
+    wait_governance_current(
+        &alice,
+        "alice",
+        &rooms[0],
+        "the source-owned Presence reset never completed its bounded governance fold",
+    );
+    let semantic_after_reset = room_status(&alice, "alice", &rooms[0]);
     // `trust add` is idempotent as a human decision, but the shipped command completes only
     // after it has applied that decision to every open room and retried the retained key release.
     // This is the causal boundary that keeps Bob offline until grant₂ is durable; no sleep or
@@ -1775,29 +1839,85 @@ fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
         "PRODUCT: Alice's idempotent shipped trust decision did not finish the rotated \
          generation's retained grant while Bob was offline: {out}{err}"
     );
-    let repeated_source_hashes = room_hashes(&alice, "alice", &rooms[0]);
+    let after_grant2 = room_hashes(&alice, "alice", &rooms[0]);
+    let grant2_candidates: Vec<_> = after_grant2
+        .iter()
+        .filter(|hash| !after_presence.contains(hash))
+        .cloned()
+        .collect();
+    assert_eq!(
+        grant2_candidates.len(),
+        1,
+        "PRODUCT: Alice's idempotent trust decision did not append exactly one identifiable authenticated consent grant2; before {after_presence:?}; after {after_grant2:?}; candidates {grant2_candidates:?}"
+    );
+    let grant2_hash = grant2_candidates[0].clone();
+    let ordered_positions: Vec<_> = [grant1_hash, &reset_hash, &grant2_hash]
+        .iter()
+        .map(|hash| {
+            after_grant2
+                .iter()
+                .position(|entry| entry == *hash)
+                .unwrap_or_else(|| panic!("PRODUCT: exact sequence row {hash} missing"))
+        })
+        .collect();
+    assert!(
+        ordered_positions[0] < ordered_positions[1]
+            && ordered_positions[1] < ordered_positions[2],
+        "PRODUCT: Alice's shipped room order did not prove grant1 {grant1_hash} → reset {reset_hash} → identical grant2 {grant2_hash}: positions {ordered_positions:?}; order {after_grant2:?}"
+    );
+    wait_governance_current(
+        &alice,
+        "alice",
+        &rooms[0],
+        "the equal repeated grant never completed its bounded governance fold",
+    );
+    let semantic_after_grant2 = room_status(&alice, "alice", &rooms[0]);
+    assert_eq!(
+        semantic_after_grant2.governance_revision,
+        semantic_after_reset.governance_revision,
+        "PRODUCT: Alice's identical grant2 invented a displayed governance revision after the real Presence reset was already folded: reset {semantic_after_reset:?}, grant2 {semantic_after_grant2:?}"
+    );
+
     bob_daemon = daemon_env(&bob, "bob-repeated-grant", &package_knob);
     attached(&bob, "bob-repeated-grant");
-    let repeated_key_ready = wait_room_status(
-        &bob,
-        "bob",
-        &rooms[0],
-        false,
-        "Bob never accepted Alice's rotated sender generation and repeated grant",
-        |status| status.received_key_generations > repeated_before.received_key_generations,
-    );
+    // Sparse catch-up must first expose the newest grant2 while the older Presence reset is still
+    // absent. This is the apparatus boundary that makes the later reset genuinely late rather than
+    // merely asserting an eventual set. If reset arrives first, this run did not stage the claim.
     let feed_watchdog = Instant::now() + BOUND;
     loop {
         let held = room_hashes(&bob, "bob", &rooms[0]);
-        if repeated_source_hashes.is_subset(&held) {
+        if held.contains(&grant2_hash) && !held.contains(&reset_hash) {
             break;
         }
-        let missing: Vec<_> = repeated_source_hashes.difference(&held).cloned().collect();
+        assert!(
+            !held.contains(&reset_hash),
+            "APPARATUS: Bob received Presence reset {reset_hash} before the newer grant2 {grant2_hash}, so late-reset arrival was not staged; held order {held:?}"
+        );
         assert!(
             Instant::now() < feed_watchdog,
-            "APPARATUS: within the journey watchdog {BOUND:?}, Bob never retained Alice's exact \
-             authenticated interval containing grant1, reset and grant2; missing hashes: \
-             {missing:?}"
+            "APPARATUS: within the journey watchdog {BOUND:?}, Bob never retained newer grant2 {grant2_hash} ahead of older reset {reset_hash}; held order {held:?}"
+        );
+        std::thread::yield_now();
+    }
+    loop {
+        let held = room_hashes(&bob, "bob", &rooms[0]);
+        if [grant1_hash, &reset_hash, &grant2_hash]
+            .iter()
+            .all(|hash| held.contains(hash))
+        {
+            let positions: Vec<_> = [grant1_hash, &reset_hash, &grant2_hash]
+                .iter()
+                .map(|hash| held.iter().position(|entry| entry == *hash).unwrap())
+                .collect();
+            assert!(
+                positions[0] < positions[1] && positions[1] < positions[2],
+                "PRODUCT: Bob's shipped order changed the authenticated grant1/reset/grant2 sequence: positions {positions:?}; held {held:?}"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < feed_watchdog,
+            "APPARATUS: within the journey watchdog {BOUND:?}, Bob never retained the complete exact grant1 {grant1_hash}, late reset {reset_hash}, grant2 {grant2_hash} interval; held order {held:?}"
         );
         std::thread::yield_now();
     }
@@ -1812,17 +1932,6 @@ fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
         "you trust each other",
         "PRODUCT: after the equal repeated grant and late reset completed, Bob no longer saw \
          Alice's newer grant as effective"
-    );
-    let repeated_live = room_status(&bob, "bob", &rooms[0]);
-    assert_eq!(
-        repeated_live.governance_revision, repeated_before.governance_revision,
-        "PRODUCT: Alice's equal repeated grant invented a displayed governance revision after \
-         the intervening reset: before {repeated_before:?}, after {repeated_live:?}"
-    );
-    assert!(
-        repeated_live.received_key_generations > repeated_before.received_key_generations,
-        "PRODUCT: Bob lost Alice's causally observed rotated generation after the equal grant \
-         completed: ready {repeated_key_ready:?}, final {repeated_live:?}"
     );
     assert_exact_read_rows(
         &bob,
