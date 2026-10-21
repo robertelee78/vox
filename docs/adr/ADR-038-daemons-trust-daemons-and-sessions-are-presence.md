@@ -357,17 +357,14 @@ The decider then answered twelve questions, one at a time. His answers are the d
 - **FX-34.** Unlocking a node is not remembering it. `vox node unlock` with a passphrase typed
   at the terminal, read from stdin or taken from `VOX_IDENTITY_PASSPHRASE` MUST make the node
   Ready for this daemon's life on every system, and the Locked status line MUST name a command
-  that works. Where the system has a credential store Vox uses, `vox node unlock` MAY also
-  remember the node there and MUST say so, and `vox node lock` MUST forget it: the Keychain on
-  macOS (ADR-028 K-10), and on Linux systemd's encrypted user credentials, bound to the TPM when
-  the machine has one and to the host key otherwise, delivered to the daemon by `systemd --user`
-  at its start, so a remembered node is Ready after a reboot with nothing typed and nothing
-  readable on disk; where systemd cannot do that, the kernel's per-user keyring keeps the
-  passphrase across daemon restarts until the next boot, and the unlock names which store it
-  used. Where there is no such store, `vox node unlock` MUST NOT persist the passphrase
-  anywhere and MUST say that a daemon restart will ask again. Vox MUST remember a plaintext
-  passphrase file only by the path the person named with `--passphrase-file` (it copies
-  nothing), and MUST never write one on its own. "I'm not saying passphrases should be stored,
+  that works. Where the system has a credential store Vox uses, the Keychain on macOS
+  (ADR-028 K-10), `vox node unlock` MAY also remember the node there and MUST say so, and `vox
+  node lock` MUST forget it. Where there is no such store, Linux today, `vox node unlock` MUST
+  NOT persist the passphrase anywhere and MUST say that a daemon restart will ask again; a node
+  Locked after a restart is unlocked again by hand, which the decider accepts ("that's ok as
+  long as I can actually unlock them", 2026-10-21), so no Linux credential store is built for
+  now. Vox MUST remember a plaintext passphrase file only by the path the person named with
+  `--passphrase-file` (it copies nothing), and MUST never write one on its own. "I'm not saying passphrases should be stored,
   but there has to be a way to unlock a node"; "at least put the files in a correct place" (the
   decider, 2026-10-21). Measured cause, 2026-10-21 (the decider's Linux host, Ubuntu 26.04, vox
   0.4.9): after `vox update` restarted the daemon, the three nodes attached from typed
@@ -403,7 +400,7 @@ Narrow successor amendments. Requirements not named here remain in force.
 | ADR-037 R7, R11: a port runs a round only on a need; a turn may run several chunks, never a cycle | Preserved; FX-29 adds what a round that brings nothing may write: nothing |
 | No predecessor: no ADR names a durability class for the store or a flush under a room's lock | FX-30 and FX-31 are new rules |
 | PRD-001 R7, R8; ADR-023 M23.1: the admin sets the room's retention; it applies to what is stored at the next sweep | Preserved; FX-33 adds that the sweep never stops the room |
-| ADR-028 K-10, ADR-031 CW-2, CW-7: a node unlocked at a terminal is remembered in the Keychain so the daemon makes it Ready at each start | Preserved where a credential store exists (the Keychain); FX-34 adds that unlocking never depends on remembering, names the Linux credential store, and forbids a file Vox writes on its own |
+| ADR-028 K-10, ADR-031 CW-2, CW-7: a node unlocked at a terminal is remembered in the Keychain so the daemon makes it Ready at each start | Preserved where a credential store exists (the Keychain); FX-34 adds that unlocking never depends on remembering, that Linux remembers nothing for now, and that Vox never writes a passphrase file on its own |
 | ADR-034 §5 "Health is true" (HL-1, HL-2), PRD-001 R35 | The lane's completed rounds are completed syncs (FX-16); the control socket answers under sync load (FX-17) |
 
 ## Implementation order and related work
