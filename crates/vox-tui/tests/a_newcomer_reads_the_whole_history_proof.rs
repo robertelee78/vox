@@ -609,10 +609,18 @@ const ANSWER_WITHIN: Duration = Duration::from_millis(200);
 /// [`AT_WORK`] each posts once a second, round-robin over the rooms, as two harness sessions at
 /// work do. Over that minute each daemon's CPU time MUST grow by at most [`WORK_CPU`], every
 /// `vox status --json` asked meanwhile MUST answer within [`ANSWER_WITHIN`], and the work MUST be
-/// real: each reads the other's last post within [`READY_WITHIN`] of the end.
+/// real: each reads the other's last post within [`READY_WITHIN`] of the end. And every post
+/// MUST be readable, not only the last (ADR-038 FX-22, #1007): once a room has held still and
+/// its daemon has accepted the other's sender key (`received_key_generations` in `vox status
+/// --json`), the next `vox room read` shows every post the other made there, with no re-ask: a
+/// row that arrived before its key, or before its author's consent folded, is rendered when
+/// they land.
 ///
-/// Mutant: every status publication deriving every room's trust picture again (the reuse in
-/// `detail_of` removed) turns the CPU claim red on its own number.
+/// Mutants: every status publication deriving every room's trust picture again (the reuse in
+/// `detail_of` removed) turns the CPU claim red on its own number; the key's arrival no longer
+/// queuing the author's render backfill (`accept_skdm` without `queue_backfill(author,
+/// Some(1))`) leaves the rows that arrived before their key unrendered, red on the every-post
+/// claim with the rows named.
 #[cfg(feature = "optional-proofs")]
 #[test]
 #[ignore = "a minute of two real vox daemons at work; optional, run it in release"]
@@ -788,6 +796,78 @@ fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
          {}\nalice's daemon said: {}\nbob's daemon said: {}",
         lanes_of(&alice_status),
         lanes_of(&bob_status),
+        said(&alice, "alice"),
+        said(&bob, "bob")
+    );
+    // Every post is readable, not only the last (ADR-038 FX-22, #1007): per room, once the
+    // reader's status shows the room still (its entry count unchanged across two looks 2 s
+    // apart) and the other's sender key accepted, one `vox room read` must show every post the
+    // other made there; a row that arrived before its key must have been rendered when the
+    // key landed, with no re-ask.
+    let mut unreadable: Vec<String> = Vec::new();
+    for (reader, dir, author, posted) in [
+        ("bob", &bob, "alice", posted_a),
+        ("alice", &alice, "bob", posted_b),
+    ] {
+        for (index, room) in rooms.iter().enumerate() {
+            let expected: Vec<String> = (0..posted)
+                .filter(|i| i % rooms.len() == index)
+                .map(|i| format!("{author} step {i}"))
+                .collect();
+            let room_of = |status: &str| -> Option<(u64, u64)> {
+                let v: serde_json::Value = serde_json::from_str(status).ok()?;
+                v["rooms"].as_array()?.iter().find_map(|r| {
+                    r["id"]
+                        .as_str()
+                        .filter(|id| id.starts_with(room.as_str()))
+                        .map(|_| {
+                            (
+                                r["entries"].as_u64().unwrap_or(0),
+                                r["received_key_generations"].as_u64().unwrap_or(0),
+                            )
+                        })
+                })
+            };
+            // Still, and the key held: two looks 2 s apart with the same entry count and a
+            // received key generation, within READY_WITHIN of the end.
+            let settled_by = Instant::now() + READY_WITHIN;
+            let mut look = room_of(&vox(dir, &["status", "--json"], None).1);
+            let mut still = false;
+            while Instant::now() < settled_by {
+                std::thread::sleep(Duration::from_secs(2));
+                let next = room_of(&vox(dir, &["status", "--json"], None).1);
+                if let (Some(a), Some(b)) = (look, next) {
+                    if a.0 == b.0 && b.1 >= 1 {
+                        still = true;
+                        break;
+                    }
+                }
+                look = next;
+            }
+            let (ok, out, err) = vox(dir, &["room", "read", room], None);
+            assert!(
+                ok,
+                "PRODUCT: {reader}'s `vox room read` refused: {out}{err}"
+            );
+            let missing: Vec<&String> = expected
+                .iter()
+                .filter(|t| !out.contains(t.as_str()))
+                .collect();
+            if !missing.is_empty() {
+                unreadable.push(format!(
+                    "{reader} in room {room} (still {still}, entries and received key generations {look:?}): \
+                     {} of {author}'s {} posts unreadable: {missing:?}",
+                    missing.len(),
+                    expected.len()
+                ));
+            }
+        }
+    }
+    assert!(
+        unreadable.is_empty(),
+        "PRODUCT: a post that arrived before its key or its author's consent stayed unreadable \
+         after they landed (ADR-038 FX-22, #1007): {unreadable:?}\nalice's daemon said: {}\nbob's \
+         daemon said: {}",
         said(&alice, "alice"),
         said(&bob, "bob")
     );
