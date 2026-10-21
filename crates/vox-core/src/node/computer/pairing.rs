@@ -23,6 +23,12 @@ const PATIENCE: Duration = Duration::from_secs(15);
 /// Shipped builds neither name nor read this variable.
 #[cfg(feature = "test-knobs")]
 const TEST_HOLD_FIRST_COMPUTER_EXCHANGE_ENV: &str = "VOX_TEST_HOLD_FIRST_COMPUTER_EXCHANGE_FILE";
+/// **Test-only** (`test-knobs`): `<arm>\t<engaged>\t<release socket>`. Once a superseded
+/// exchange has released its reservation and left only its causal retry mark, the scheduler
+/// creates `engaged` and waits for one connection to `release`. This lets a shipped-binary
+/// journey place an operator takeover at that exact boundary; no verdict reads this apparatus.
+#[cfg(feature = "test-knobs")]
+const TEST_HOLD_COMPUTER_RETRY_READY_ENV: &str = "VOX_TEST_HOLD_COMPUTER_RETRY_READY_FILE";
 // An exchange carries retained records from the same bounded transaction, never a smaller
 // unrelated limit that would strand an otherwise valid roster as nodes are added.
 const MAX_FRAME: usize = MAX_STATE as usize;
@@ -1087,6 +1093,13 @@ impl Management {
         if let Some(flight) = lock(&self.inflight).get_mut(&target) {
             if flight.serial == serial {
                 flight.abort = Some(task.abort_handle());
+                // Retry supersession can land after this operator reserved the flight but before
+                // its task handle existed. Installing the handle must observe that decision, as
+                // retry-owned flights do, or stale operator work can hold the peer until
+                // PAIR_WITHIN and exclude the current revision's replacement.
+                if flight.superseded {
+                    task.abort();
+                }
             }
         }
         let (paired, superseded) = match task.await {
@@ -2154,6 +2167,8 @@ impl Management {
     }
 
     async fn retry(self: &Arc<Self>) -> Result<Option<std::time::Instant>> {
+        #[cfg(feature = "test-knobs")]
+        self.hold_retry_ready_for_proof().await;
         let (peers, attempted, revision, mut next) = {
             let s = lock(&self.computer.state);
             let local = self.computer.signer.fingerprint();
@@ -2637,6 +2652,44 @@ impl Management {
             return;
         }
         std::future::pending::<()>().await;
+    }
+
+    /// Park the scheduler only at the state in which a superseded flight is gone and its causal
+    /// retry mark is the sole owner of the deadline. The release is an exact Unix-socket event,
+    /// not a polling interval or a second correctness clock.
+    #[cfg(feature = "test-knobs")]
+    async fn hold_retry_ready_for_proof(&self) {
+        let Ok(spec) = std::env::var(TEST_HOLD_COMPUTER_RETRY_READY_ENV) else {
+            return;
+        };
+        let mut fields = spec.splitn(3, '\t');
+        let (Some(arm), Some(engaged), Some(release)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            return;
+        };
+        if lock(&self.retry_ready).is_empty() || !lock(&self.inflight).is_empty() {
+            return;
+        }
+        let _ = std::fs::remove_file(release);
+        let Ok(listener) = tokio::net::UnixListener::bind(release) else {
+            return;
+        };
+        if std::fs::remove_file(arm).is_err() {
+            let _ = std::fs::remove_file(release);
+            return;
+        }
+        if std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(engaged)
+            .is_err()
+        {
+            let _ = std::fs::remove_file(release);
+            return;
+        }
+        let _ = listener.accept().await;
+        let _ = std::fs::remove_file(release);
     }
 
     /// Record an exchange `peer` started and this node answered, now: what a person reads as

@@ -1255,7 +1255,10 @@ fn close_expired_pairing() {
 #[ignore = "real binaries with production Argon2id; run in release"]
 fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
     watchdog::arm();
-    test_knobs::require(&["VOX_TEST_HOLD_FIRST_COMPUTER_EXCHANGE_FILE"]);
+    test_knobs::require(&[
+        "VOX_TEST_HOLD_FIRST_COMPUTER_EXCHANGE_FILE",
+        "VOX_TEST_HOLD_COMPUTER_RETRY_READY_FILE",
+    ]);
     let anchor = Account::new();
     let a = Account::new();
     let b = Account::new();
@@ -1294,6 +1297,15 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         first_flight_arm.display(),
         first_flight_engaged.display()
     );
+    let retry_ready_arm = a.data.join("hold-computer-retry-ready");
+    let retry_ready_engaged = a.data.join("held-computer-retry-ready");
+    let retry_ready_release = a.data.join("release-computer-retry-ready.sock");
+    let retry_ready_spec = format!(
+        "{}\t{}\t{}",
+        retry_ready_arm.display(),
+        retry_ready_engaged.display(),
+        retry_ready_release.display()
+    );
     let start = |account: &Account, listen: &str, anchor: &str, env: &[(&str, &str)]| {
         let daemon = Daemon::start(
             account,
@@ -1309,10 +1321,13 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         &a,
         "127.0.0.1:0",
         &v4,
-        &[(
-            "VOX_TEST_HOLD_FIRST_COMPUTER_EXCHANGE_FILE",
-            &first_flight_spec,
-        )],
+        &[
+            (
+                "VOX_TEST_HOLD_FIRST_COMPUTER_EXCHANGE_FILE",
+                &first_flight_spec,
+            ),
+            ("VOX_TEST_HOLD_COMPUTER_RETRY_READY_FILE", &retry_ready_spec),
+        ],
     );
     let mut right = start(&b, "[::1]:0", &v6, &[]);
     let invitation = computer(&a, &["invite"]);
@@ -1412,6 +1427,8 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         "PRODUCT: after the first shipped policy change, status did not show its held exchange as a new attempt without a fabricated failure: before {before}; after {staged}"
     );
     let first_revision = computer(&a, &["status"])["revision"].as_u64().unwrap_or(0);
+    std::fs::write(&retry_ready_arm, b"armed\n")
+        .expect("APPARATUS: arm the retry-ready scheduler boundary");
     let (ok, out, err) = a.run(
         &[
             "node",
@@ -1433,12 +1450,22 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         "PRODUCT: the second attached node did not create a later policy revision than {first_revision}: {}",
         computer(&a, &["status"])
     );
+    assert!(
+        wait_until(RETURN_WITHIN, || retry_ready_engaged.is_file()),
+        "APPARATUS: the superseded retry did not release its flight and leave the causal deadline solely retry-ready; status: {}; daemon: {}",
+        computer(&a, &["status"]),
+        left.said()
+    );
 
     // Exercise the operator takeover race itself while every path is still down. B's fresh
-    // invitation is a shipped operator request targeting the same computer whose superseded retry
-    // just transferred the first deadline into retry_ready. Run it concurrently so only the
-    // remote anchor's later return can answer it.
+    // invitation is a shipped operator request targeting the same computer. The apparatus marker
+    // above is created only after the superseded retry released its reservation and while the
+    // scheduler is parked before consuming retry_ready, so this command can inherit the first
+    // deadline from no other source. Run it concurrently so only the remote anchor's later return
+    // can answer it. Mutant seam: omit retry_ready from the operator's causal-deadline lookup.
     let takeover_invitation = computer(&b, &["invite"]);
+    let expected_local = computer(&a, &["status"])["this_computer"].clone();
+    let expected_peer = takeover_invitation["this_computer"].clone();
     let takeover_link = takeover_invitation["invite_link"]
         .as_str()
         .expect("PRODUCT: takeover invitation named no invite_link")
@@ -1447,6 +1474,9 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         .as_str()
         .expect("PRODUCT: takeover invitation named no invite_id")
         .to_owned();
+    let takeover_attempts_before = application_toward(&a, &b_id)["exchange_attempts"]
+        .as_u64()
+        .unwrap_or(0);
     let mut takeover = a
         .cmd(&["computer", "pair", &takeover_link, "--preview", "--json"])
         .stdin(Stdio::null())
@@ -1454,6 +1484,20 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("APPARATUS: could not start shipped operator takeover command");
+    assert!(
+        wait_until(RETURN_WITHIN, || application_toward(&a, &b_id)
+            ["exchange_attempts"]
+            .as_u64()
+            .is_some_and(|attempts| attempts > takeover_attempts_before)),
+        "PRODUCT: while the retry scheduler was held at retry-ready, the shipped operator command did not reserve the exact peer as a new exchange: before {takeover_attempts_before}; status {}",
+        application_toward(&a, &b_id)
+    );
+    std::os::unix::net::UnixStream::connect(&retry_ready_release).unwrap_or_else(|e| {
+        panic!(
+            "APPARATUS: could not release the scheduler's exact retry-ready boundary at {}: {e}",
+            retry_ready_release.display()
+        )
+    });
 
     // Keep the only path down until a failed replacement's source-owned ordinary backoff would
     // pass the first revision's absolute deadline. Correct code backstops that retry by the first
@@ -1492,10 +1536,33 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
     let takeover_output = takeover
         .wait_with_output()
         .expect("APPARATUS: could not collect the completed operator takeover command");
-    println!(
-        "[proof] shipped operator takeover completed before the inherited deadline: {}{}",
+    assert!(
+        takeover_output.status.success(),
+        "PRODUCT: the retry-ready-only operator takeover exited unsuccessfully: stdout {}; stderr {}",
         String::from_utf8_lossy(&takeover_output.stdout),
         String::from_utf8_lossy(&takeover_output.stderr)
+    );
+    let takeover_preview: serde_json::Value = serde_json::from_slice(&takeover_output.stdout)
+        .unwrap_or_else(|e| {
+            panic!(
+                "PRODUCT: the successful retry-ready-only `computer pair --preview --json` did not return readable JSON: {e}: {}",
+                String::from_utf8_lossy(&takeover_output.stdout)
+            )
+        });
+    assert!(
+        takeover_preview["this_computer"] == expected_local
+            && takeover_preview["pairing"]["peer"] == expected_peer
+            && takeover_preview["pairing"]["operation_id"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty())
+            && takeover_preview["pairing"]["approved_here"] == false
+            && takeover_preview["pairing"]["approved_there"] == false
+            && takeover_preview["pairing"]["expires_ms"]
+                == takeover_invitation["invite_expires_ms"],
+        "PRODUCT: the successful retry-ready-only preview did not show the exact authenticated local computer, inviting peer, unapproved operation and expiry: {takeover_preview}"
+    );
+    println!(
+        "[proof] shipped operator takeover completed successfully from retry-ready alone before the inherited deadline: {takeover_preview}"
     );
     computer(&b, &["cancel", &takeover_invite_id]);
     let expected_roster = [
@@ -1527,9 +1594,24 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
     println!(
         "[proof] after {returned_after:?}, remote-anchor-only recovery carried both revisions through a new peer connection before the first revision's {RETURN_WITHIN:?} deadline"
     );
+    let before_restart = (
+        full_roster(&computer(&a, &["status"])).unwrap_or_else(|| {
+            panic!(
+                "PRODUCT: before restart the left status did not expose every user-visible roster field: {}",
+                computer(&a, &["status"])
+            )
+        }),
+        full_roster(&computer(&b, &["status"])).unwrap_or_else(|| {
+            panic!(
+                "PRODUCT: before restart the right status did not expose every user-visible roster field: {}",
+                computer(&b, &["status"])
+            )
+        }),
+    );
 
     // Persistence remains part of the same journey: restart both managers and the anchor, then
-    // read the exact already-applied identities rather than manufacturing a fresh revision.
+    // read every field of the exact already-applied roster rather than manufacturing a fresh
+    // revision or accepting a name/fingerprint-only projection.
     stop_pid(a.lock_pid().expect("APPARATUS: left scratch daemon"));
     stop_pid(b.lock_pid().expect("APPARATUS: right scratch daemon"));
     stop_pid(anchor.lock_pid().expect("APPARATUS: scratch anchor daemon"));
@@ -1546,19 +1628,24 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         &a,
         "127.0.0.1:0",
         &v4,
-        &[(
-            "VOX_TEST_HOLD_FIRST_COMPUTER_EXCHANGE_FILE",
-            &first_flight_spec,
-        )],
+        &[
+            (
+                "VOX_TEST_HOLD_FIRST_COMPUTER_EXCHANGE_FILE",
+                &first_flight_spec,
+            ),
+            ("VOX_TEST_HOLD_COMPUTER_RETRY_READY_FILE", &retry_ready_spec),
+        ],
     );
     right = start(&b, "[::1]:0", &v6, &[]);
     assert!(
         wait_until(RETURN_WITHIN, || {
-            exact_roster(&computer(&a, &["status"]), &expected_roster)
-                && exact_roster(&computer(&b, &["status"]), &expected_roster)
+            full_roster(&computer(&a, &["status"])) == Some(before_restart.0.clone())
+                && full_roster(&computer(&b, &["status"])) == Some(before_restart.1.clone())
                 && exact_grants(&b, "after-remote-anchor-b", &expected_bob_grants)
         }),
-        "PRODUCT: the exact recovered roster and grants did not survive all three process restarts; left: {}; right: {}; anchor: {}",
+        "PRODUCT: the exact recovered user-visible roster fields (name, fingerprint, computer, personal role, binding revision and derived moment) and grants did not survive all three process restarts; expected left {:?}; expected right {:?}; left: {}; right: {}; anchor: {}",
+        before_restart.0,
+        before_restart.1,
         a.log(),
         b.log(),
         relay.said()
@@ -3043,6 +3130,47 @@ fn exact_roster(status: &serde_json::Value, expected: &[(&str, &str)]) -> bool {
         .collect();
     let expected: std::collections::BTreeMap<_, _> = expected.iter().copied().collect();
     nodes.len() == shown.len() && shown == expected
+}
+
+/// Every user-visible field of one `computer status --json` roster entry. A restart comparison
+/// uses the exact pre-restart values, including ownership, personal role and both binding-current
+/// fields; neither a default nor a missing/wrong-typed field can compare equal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct VisibleRosterNode {
+    computer: String,
+    fingerprint: String,
+    personal: bool,
+    binding_revision: Option<u64>,
+    binding_derived_ms: Option<u64>,
+}
+
+fn nullable_u64(value: &serde_json::Value, field: &str) -> Option<Option<u64>> {
+    match value.get(field)? {
+        serde_json::Value::Null => Some(None),
+        value => value.as_u64().map(Some),
+    }
+}
+
+fn full_roster(
+    status: &serde_json::Value,
+) -> Option<std::collections::BTreeMap<String, VisibleRosterNode>> {
+    let nodes = status.get("nodes")?.as_array()?;
+    let shown: std::collections::BTreeMap<_, _> = nodes
+        .iter()
+        .map(|node| {
+            Some((
+                node.get("name")?.as_str()?.to_owned(),
+                VisibleRosterNode {
+                    computer: node.get("computer")?.as_str()?.to_owned(),
+                    fingerprint: node.get("fingerprint")?.as_str()?.to_owned(),
+                    personal: node.get("personal")?.as_bool()?,
+                    binding_revision: nullable_u64(node, "binding_revision")?,
+                    binding_derived_ms: nullable_u64(node, "binding_derived_ms")?,
+                },
+            ))
+        })
+        .collect::<Option<_>>()?;
+    (shown.len() == nodes.len()).then_some(shown)
 }
 
 /// Whether one shipped `vox trust list` shows exactly these fingerprint/capability grants.
