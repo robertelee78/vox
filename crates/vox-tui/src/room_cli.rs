@@ -1651,6 +1651,37 @@ pub(crate) fn shown_tags(tags: &[String]) -> String {
         .join(" ")
 }
 
+/// Test-only: hold reply-prefix resolution after its first bounded page while this file exists;
+/// write a sibling `.reached` marker first. A proof changes the real room during that hold and
+/// requires the shipped CLI to refuse the stale scan. Absent from packaged builds.
+#[cfg(feature = "test-knobs")]
+const TEST_REPLY_PREFIX_HOLD_ENV: &str = "VOX_TEST_REPLY_PREFIX_HOLD_FILE";
+#[cfg(feature = "test-knobs")]
+const TEST_REPLY_PREFIX_HOLD_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+
+#[cfg(feature = "test-knobs")]
+async fn hold_reply_prefix_after_first_page(before: Option<Digest32>) -> Result<(), AppError> {
+    if before.is_some() {
+        return Ok(());
+    }
+    let Some(hold) = std::env::var_os(TEST_REPLY_PREFIX_HOLD_ENV).filter(|path| !path.is_empty())
+    else {
+        return Ok(());
+    };
+    let hold = std::path::PathBuf::from(hold);
+    let reached = hold.with_extension("reached");
+    std::fs::write(&reached, b"reached").map_err(|error| {
+        AppError::Usage(format!(
+            "reply-prefix proof could not mark {}: {error}",
+            reached.display()
+        ))
+    })?;
+    while hold.exists() {
+        tokio::time::sleep(TEST_REPLY_PREFIX_HOLD_POLL).await;
+    }
+    Ok(())
+}
+
 /// Resolve a shortened reply selector among readable room messages. Exact hashes keep the
 /// direct lookup path; prefixes scan bounded pages and name every matching id when ambiguous.
 async fn reply_entry(
@@ -1682,9 +1713,6 @@ async fn reply_entry(
     };
     let mut before = None;
     let mut found = std::collections::BTreeSet::new();
-    let mut rows_seen = std::collections::BTreeSet::new();
-    let mut cursors_seen = std::collections::BTreeSet::new();
-    let mut expected_rows = None;
     loop {
         let (rows, older, provisional) = match client
             .request(&Request::RoomPage {
@@ -1702,6 +1730,8 @@ async fn reply_entry(
             Frame::Error { reason } => return Err(AppError::Usage(reason)),
             other => return Err(crate::client::unexpected(&other)),
         };
+        #[cfg(feature = "test-knobs")]
+        hold_reply_prefix_after_first_page(before).await?;
         let current_revision = match client
             .request(&Request::RoomDisplayRevision { channel_id: cid })
             .await?
@@ -1717,34 +1747,16 @@ async fn reply_entry(
             ));
         }
         for row in &rows {
-            if !rows_seen.insert(row.entry_hash) {
-                return Err(AppError::Usage(
-                    "cannot resolve reply prefix: a room page repeated an entry; read the room and retry"
-                        .into(),
-                ));
-            }
             let hash = b32_encode(&row.entry_hash);
             if hash.starts_with(&prefix) {
                 found.insert(hash);
             }
         }
-        let counted = u64::try_from(rows_seen.len()).unwrap_or(u64::MAX);
-        let total = counted.saturating_add(older);
-        match expected_rows {
-            None => expected_rows = Some(total),
-            Some(expected) if total != expected => {
-                return Err(AppError::Usage(
-                    "cannot resolve reply prefix: the room page count changed; read the room and retry"
-                        .into(),
-                ));
-            }
-            Some(_) => {}
-        }
         if older == 0 {
             break;
         }
         let next = rows.first().map(|row| row.entry_hash);
-        if next.is_none() || next == before || next.is_some_and(|next| !cursors_seen.insert(next)) {
+        if next.is_none() || next == before {
             return Err(AppError::Usage(
                 "cannot resolve reply prefix: the room page changed; read the room and retry"
                     .into(),

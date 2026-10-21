@@ -1799,6 +1799,67 @@ fn legacy_placeholder_journey(
         owed(bob, legacy.entry_hash()) && owed(bob, ordinary.entry_hash()),
         "APPARATUS: the receiver never showed both staged missing bodies before the index"
     );
+    // FX-14: a row printed as not received yet still participates in prefix uniqueness. The
+    // selected body remains unavailable, so the existing reply rule refuses it for that exact
+    // reason. Mutant: skip `row.owed` while resolving reply prefixes; the command instead says no
+    // printed entry matched this prefix.
+    let owed_hashes = [legacy.entry_hash(), ordinary.entry_hash()];
+    let (ok, shown, err) = bob.vox(&["room", "read", room, "--json"], None);
+    assert!(
+        ok,
+        "PRODUCT: receiver could not read its staged missing-body rows: {shown}{err}"
+    );
+    let shown_hashes: Vec<String> = shown
+        .lines()
+        .map(|line| {
+            let row: serde_json::Value = serde_json::from_str(line).unwrap_or_else(|error| {
+                panic!("PRODUCT: room read returned invalid JSON row {line:?}: {error}")
+            });
+            row["entry_hash"]
+                .as_str()
+                .unwrap_or_else(|| {
+                    panic!("PRODUCT: room read row named no string entry_hash: {row}")
+                })
+                .to_owned()
+        })
+        .collect();
+    let (owed_full, owed_prefix) = owed_hashes
+        .iter()
+        .filter_map(|hash| {
+            let full = b32_encode(hash);
+            let prefix = full.get(..8)?.to_owned();
+            (shown_hashes
+                .iter()
+                .filter(|entry| entry.starts_with(&prefix))
+                .count()
+                == 1)
+                .then_some((full, prefix))
+        })
+        .next()
+        .expect(
+            "APPARATUS: neither printed missing-body entry had a unique eight-character prefix",
+        );
+    let (reply_ok, reply_out, reply_err) = bob.vox(
+        &[
+            "room",
+            "post",
+            room,
+            "--json",
+            "--re",
+            &owed_prefix,
+            "OWED-PREFIX-REPLY",
+        ],
+        None,
+    );
+    assert!(
+        !reply_ok && reply_err.contains("cannot read that message"),
+        "PRODUCT: printed owed prefix {owed_prefix} must resolve to {owed_full} before the unavailable-body refusal: {reply_out}{reply_err}"
+    );
+    let (ok, after_reply, err) = bob.vox(&["room", "read", room, "--json"], None);
+    assert!(
+        ok && !after_reply.contains("OWED-PREFIX-REPLY"),
+        "PRODUCT: refusing the owed parent still posted the reply: {after_reply}{err}"
+    );
     offer(&declaration);
     assert!(
         !owed(bob, legacy.entry_hash()),

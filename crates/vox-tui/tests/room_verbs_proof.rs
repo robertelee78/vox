@@ -160,6 +160,18 @@ fn vox(
     args: &[&str],
     stdin: Option<&str>,
 ) -> (bool, String, String) {
+    vox_with_env(data, cfg, args, stdin, &[])
+}
+
+/// Run the shipped binary with proof-only environment added after harness variables are stripped.
+/// The ordinary helper passes none; a proof that uses one first verifies that the binary reads it.
+fn vox_with_env(
+    data: &std::path::Path,
+    cfg: &std::path::Path,
+    args: &[&str],
+    stdin: Option<&str>,
+    extra_env: &[(&str, &std::ffi::OsStr)],
+) -> (bool, String, String) {
     let mut cmd = Command::new(VOX);
     support::strip_harness_env(&mut cmd);
     cmd.args(args)
@@ -172,6 +184,7 @@ fn vox(
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    cmd.envs(extra_env.iter().copied());
     // A keyring change's passphrase is typed at a terminal, as a person types it (ADR-028 K-13).
     if support::typed::is_keyring_change(args) || args.starts_with(&["node", "rename"]) {
         let (ok, shown) = support::typed::keyring(&cmd);
@@ -916,10 +929,11 @@ fn a_debug_daemon_makes_a_room_takes_a_post_and_keeps_running() {
         .find(|line| line.ends_with(" posted in debug"))
         .and_then(|line| line.split_whitespace().next())
         .expect("PRODUCT: room read did not print the posted entry hash");
-    assert!(
-        root.len() >= 8,
-        "PRODUCT: room read printed a reply selector shorter than eight characters: {root:?}"
-    );
+    let root_prefix = root.get(..8).unwrap_or_else(|| {
+        panic!(
+            "PRODUCT: room read printed a reply selector without an eight-character ASCII prefix: {root:?}"
+        )
+    });
     let post = |args: &[&str]| {
         let mut argv = vec!["room", "post", &room, "--json"];
         argv.extend_from_slice(args);
@@ -932,7 +946,7 @@ fn a_debug_daemon_makes_a_room_takes_a_post_and_keeps_running() {
             .expect("PRODUCT: post named no entry")
             .to_owned()
     };
-    let reply = post(&["--re", &root[..8], "PREFIX-REPLY"]);
+    let reply = post(&["--re", root_prefix, "PREFIX-REPLY"]);
     let (ok, rows, err) = vox(&data, &cfg, &["room", "read", &room, "--json"], None);
     assert!(ok, "PRODUCT: read reply failed: {rows}{err}");
     let reply_row = rows
@@ -982,18 +996,27 @@ fn a_debug_daemon_makes_a_room_takes_a_post_and_keeps_running() {
         vox(&data, &cfg, &["room", "read", &room, "--json"], None);
     assert!(
         newest_ok,
-        "APPARATUS: could not read the newest collision page: {newest_rows}{newest_err}"
+        "PRODUCT: could not read the newest collision page: {newest_rows}{newest_err}"
     );
     let entry_ids = |rows: &str| {
         rows.lines()
-            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-            .filter_map(|row| row["entry_hash"].as_str().map(str::to_owned))
+            .map(|line| {
+                let row: serde_json::Value = serde_json::from_str(line).unwrap_or_else(|error| {
+                    panic!("PRODUCT: room read returned invalid JSON row {line:?}: {error}")
+                });
+                row["entry_hash"]
+                    .as_str()
+                    .unwrap_or_else(|| {
+                        panic!("PRODUCT: room read row named no string entry_hash: {row}")
+                    })
+                    .to_owned()
+            })
             .collect::<Vec<_>>()
     };
     let newest_ids = entry_ids(&newest_rows);
     assert!(
         newest_ids.len() == vox_core::node::ipc::SESSION_PAGE_ROWS,
-        "APPARATUS: newest room page held {} entries instead of the product bound {}: {newest_rows}",
+        "PRODUCT: newest room page held {} entries instead of the product bound {}: {newest_rows}",
         newest_ids.len(),
         vox_core::node::ipc::SESSION_PAGE_ROWS
     );
@@ -1008,12 +1031,12 @@ fn a_debug_daemon_makes_a_room_takes_a_post_and_keeps_running() {
     );
     assert!(
         older_ok,
-        "APPARATUS: could not read the older collision page: {older_rows}{older_err}"
+        "PRODUCT: could not read the older collision page: {older_rows}{older_err}"
     );
     let older_ids = entry_ids(&older_rows);
     assert!(
         !older_ids.is_empty(),
-        "APPARATUS: the staged room did not cross its bounded page: {older_rows}"
+        "PRODUCT: the staged posts did not cross the room's bounded page: {older_rows}"
     );
     let older_first: std::collections::BTreeSet<_> = older_ids
         .iter()
@@ -1064,6 +1087,80 @@ fn a_debug_daemon_makes_a_room_takes_a_post_and_keeps_running() {
     assert!(
         !after_ambiguous.contains("PREFIX-AMBIGUOUS"),
         "PRODUCT: the ambiguous-prefix refusal posted the rejected text: {after_ambiguous}"
+    );
+
+    // A multi-page selector is one logical read. Hold the shipped CLI after its first page,
+    // change the room through a second shipped CLI, then let it continue. It must refuse the
+    // stale scan and post nothing. Mutant: remove the display-revision comparison; the reply is
+    // posted against a collection that never existed as one room view.
+    #[cfg(feature = "test-knobs")]
+    {
+        test_knobs::require(&["VOX_TEST_REPLY_PREFIX_HOLD_FILE"]);
+        let all_ids = newest_ids.iter().chain(&older_ids).collect::<Vec<_>>();
+        let (changing_target, changing_prefix) = older_ids
+            .iter()
+            .find_map(|entry| {
+                let prefix = entry.get(..51)?;
+                (all_ids
+                    .iter()
+                    .filter(|candidate| candidate.starts_with(prefix))
+                    .count()
+                    == 1)
+                    .then_some((entry.clone(), prefix.to_owned()))
+            })
+            .expect("APPARATUS: no older printed entry had a unique 51-character prefix");
+        let hold = tmp.path().join("reply-prefix.hold");
+        let reached = hold.with_extension("reached");
+        std::fs::write(&hold, b"hold")
+            .expect("APPARATUS: could not stage the reply-prefix scan hold");
+
+        let scan_data = data.clone();
+        let scan_cfg = cfg.clone();
+        let scan_room = room.clone();
+        let scan_hold = hold.clone();
+        let scan = std::thread::spawn(move || {
+            vox_with_env(
+                &scan_data,
+                &scan_cfg,
+                &[
+                    "room",
+                    "post",
+                    &scan_room,
+                    "--re",
+                    &changing_prefix,
+                    "PREFIX-CHANGED-SCAN",
+                ],
+                None,
+                &[("VOX_TEST_REPLY_PREFIX_HOLD_FILE", scan_hold.as_os_str())],
+            )
+        });
+        while !reached.exists() {
+            assert!(
+                !scan.is_finished(),
+                "APPARATUS: reply-prefix command ended before reaching its staged first-page hold"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let changed = post(&["PREFIX-CHANGES-WHILE-SCANNED"]);
+        std::fs::remove_file(&hold)
+            .expect("APPARATUS: could not release the staged reply-prefix scan");
+        let (changed_ok, changed_out, changed_err) = scan
+            .join()
+            .expect("APPARATUS: reply-prefix command thread panicked");
+        assert!(
+            !changed_ok && changed_err.contains("room changed"),
+            "PRODUCT: reply-prefix scan accepted stale pages after room entry {changed} changed revision while resolving {changing_target}: {changed_out}{changed_err}"
+        );
+        let (read_ok, after_changed, read_err) =
+            vox(&data, &cfg, &["room", "read", &room, "--json"], None);
+        assert!(
+            read_ok && !after_changed.contains("PREFIX-CHANGED-SCAN"),
+            "PRODUCT: stale reply-prefix scan posted after the room changed: {after_changed}{read_err}"
+        );
+    }
+    #[cfg(not(feature = "test-knobs"))]
+    eprintln!(
+        "OPTIONAL PROOF NOT RUN: changing-room reply-prefix scan needs --features vox-tui/test-knobs"
     );
     let exited = node.0.try_wait().ok().flatten();
     assert!(
