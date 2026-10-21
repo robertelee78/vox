@@ -26,8 +26,10 @@
 //! [`a_locked_node_is_unlocked_without_a_persistent_file`]: a node with a passphrase, Locked on
 //! a daemon started with `--no-node`, becomes Ready from `vox node unlock` with the passphrase on
 //! stdin (`--passphrase-file -`) and again from `VOX_IDENTITY_PASSPHRASE`; where the system has
-//! no credential store (every system but macOS) the command says the node is not remembered, and
-//! the daemon's next start finds it Locked again; a wrong passphrase is refused naming the node.
+//! no credential store (every system but macOS, and a Mac whose keychain is not available) the
+//! command says the node is not remembered and an ordinary daemon start (`--detach`, as at
+//! login) finds it Locked again, where a remembered one is Ready with nothing typed; a wrong
+//! passphrase is refused naming the node.
 //! Measured on the decider's Linux host, vox 0.4.9: every such unlock was refused ("cannot be
 //! remembered from a typed passphrase, an environment variable or stdin on this system"), so
 //! after an update's daemon restart no node could be unlocked while the Locked line said to run
@@ -661,13 +663,19 @@ fn a_locked_node_is_unlocked_without_a_persistent_file() {
         );
     }
 
-    // ---- 2. the daemon starts again: Locked where nothing keeps it ------------------------------
+    // ---- 2. the daemon starts again, as it does at login: Locked where nothing keeps it, Ready
+    // where the credential store does ------------------------------------------------------------
     let _ = daemon.kill();
     let _ = daemon.wait();
     layout::reap_daemon(&bob);
-    let mut daemon = daemon_with_locked_nodes_or_ready(&bob, remembering_store);
-    let listed = node_list(&bob);
-    if !remembering_store {
+    let listed = daemon_started_again(&bob);
+    if remembering_store {
+        assert!(
+            listed.contains("Ready"),
+            "PRODUCT: a node the unlock said it remembered must be Ready after the daemon starts \
+             again, with nothing typed; `vox node list`: {listed}"
+        );
+    } else {
         assert!(
             listed.contains("Locked"),
             "PRODUCT: a node unlocked from stdin, stored nowhere, must be Locked after the daemon \
@@ -715,30 +723,33 @@ fn a_locked_node_is_unlocked_without_a_persistent_file() {
             ", stored nowhere, and was Locked again after the daemon restarted"
         }
     );
-    let _ = daemon.kill();
-    let _ = daemon.wait();
+    layout::reap_daemon(&bob);
 }
 
-/// The daemon started again: where a credential store remembered the node it is Ready, else
-/// Locked; either way it serves.
-fn daemon_with_locked_nodes_or_ready(dir: &Path, remembered: bool) -> Child {
-    if !remembered {
-        return daemon_with_locked_nodes(dir);
-    }
-    let mut daemon = vox_cmd(dir, &["daemon", "--no-node", "--listen", "127.0.0.1:0"])
+/// The daemon started again the ordinary way (`vox daemon --detach`, as the app and a login item
+/// start it: nothing typed), serving; what `vox node list` says once it does. The daemon is the
+/// detached process behind the data root's lock, reaped by the caller.
+fn daemon_started_again(dir: &Path) -> String {
+    let out = vox_cmd(dir, &["daemon", "--detach", "--listen", "127.0.0.1:0"])
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("APPARATUS: spawn vox daemon --no-node");
+        .output()
+        .expect("APPARATUS: spawn vox daemon --detach");
+    assert!(
+        out.status.success(),
+        "PRODUCT (staging): `vox daemon --detach` did not start: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let started = Instant::now();
     while started.elapsed() < SERVES_WITHIN {
         let listed = node_list(dir);
         if listed.contains("Locked") || listed.contains("Ready") {
-            return daemon;
+            return listed;
         }
         std::thread::sleep(Duration::from_millis(200));
     }
-    let _ = daemon.kill();
-    panic!("PRODUCT (staging): the daemon did not serve again within {SERVES_WITHIN:?}");
+    panic!(
+        "PRODUCT (staging): the daemon started again did not serve within {SERVES_WITHIN:?}: \
+         `vox node list` says {}",
+        node_list(dir)
+    );
 }
