@@ -1,6 +1,31 @@
 //! The daemon composes computer policy with already-attached node actors; no new unlock path.
 use super::*;
 
+/// **Test-only** (`test-knobs`): `<arm>\t<accepted>\t<returned>`. The daemon consumes `arm` and
+/// creates `accepted` immediately before one shipped `computer status` enters the synchronous
+/// status read, then creates `returned` immediately after it leaves. A shipped-binary journey can
+/// prove that an accepted status was overtaken by a later independent command instead of waiting
+/// for an arbitrary deadman. Shipped builds neither name nor read this variable.
+#[cfg(feature = "test-knobs")]
+const TEST_MARK_COMPUTER_STATUS_ENV: &str = "VOX_TEST_MARK_COMPUTER_STATUS_FILE";
+
+#[cfg(feature = "test-knobs")]
+fn mark_computer_status_accepted_for_proof() -> Option<std::path::PathBuf> {
+    let spec = std::env::var(TEST_MARK_COMPUTER_STATUS_ENV).ok()?;
+    let mut fields = spec.splitn(3, '\t');
+    let (arm, accepted, returned) = (fields.next()?, fields.next()?, fields.next()?);
+    std::fs::remove_file(arm).ok()?;
+    std::fs::write(accepted, b"accepted\n").ok()?;
+    Some(returned.into())
+}
+
+#[cfg(feature = "test-knobs")]
+fn mark_computer_status_returned_for_proof(returned: Option<std::path::PathBuf>) {
+    if let Some(returned) = returned {
+        let _ = std::fs::write(returned, b"returned\n");
+    }
+}
+
 impl Router {
     /// Reconcile the daemon's nodes with computer trust on change, and on no timer (ADR-038
     /// FX-28): when the policy revision moves (a change made here, or a merged exchange that
@@ -206,7 +231,14 @@ impl Router {
     pub(super) async fn computer_request(&self, request: DaemonRequest) -> DaemonFrame {
         let management = &self.inner.defaults.computer;
         let result = match request {
-            DaemonRequest::ComputerStatus => management.status(),
+            DaemonRequest::ComputerStatus => {
+                #[cfg(feature = "test-knobs")]
+                let returned = mark_computer_status_accepted_for_proof();
+                let status = management.status();
+                #[cfg(feature = "test-knobs")]
+                mark_computer_status_returned_for_proof(returned);
+                status
+            }
             DaemonRequest::ComputerBegin => management.begin(),
             DaemonRequest::ComputerPreview { link } => management.preview(&link).await,
             DaemonRequest::ComputerApprove { operation } => management.approve(&operation),

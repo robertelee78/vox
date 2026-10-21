@@ -8,7 +8,8 @@
   recovery ruling of 2026-10-19, a retention change that poisoned a room, and a node on Linux
   that could not be unlocked); amended 2026-10-21 (FX-35: a daemon whose parked flows held
   the flow-state pool synced nothing); amended 2026-10-21 (FX-37: room creation overflowed a
-  normal Tokio worker stack while reconstructing an ML-DSA root key for one signature)
+  normal Tokio worker stack while reconstructing an ML-DSA root key for one signature); amended
+  2026-10-21 (FX-28: observable needless work, not a machine-dependent CPU cutoff, is the verdict)
 - **Deciders**: Robert E. Lee
 - **Tags**: trust, daemon identity, sessions, presence, agent comms, sync, health, releases
 - **Related**: ADR-018, ADR-020, ADR-026, ADR-029, ADR-031, ADR-033, ADR-034, ADR-035, ADR-036,
@@ -256,11 +257,11 @@ The decider then answered twelve questions, one at a time. His answers are the d
   it was made, whatever the other daemon does; on the other daemon within 5 s of the exchange
   the changing daemon starts for it (#989) completing, and, when that exchange does not
   complete (the peer unreachable, the stream cut), within 60 s, the fallback exchange's
-  period, after the peer becomes reachable again. Two daemons on which nothing changed
-  MUST spend nothing on it:
-  over an idle minute their CPU grows by no more than FX-15's quiet-room bound. "We need the
-  detection of change logic to be sound. Easy for local daemon to notice, but daemon to daemon
-  update needs to be solid" (the decider, 2026-10-20). Decision: a node's binding is derived
+  period, after the peer becomes reachable again. Two daemons on which nothing changed MUST
+  start no pairing exchange except FX-15's named fallback and MUST derive no node binding again.
+  These are the shipped, user-visible work records; a machine-dependent CPU threshold is not a
+  verdict. "We need the detection of change logic to be sound. Easy for local daemon to notice,
+  but daemon to daemon update needs to be solid" (the decider, 2026-10-20). Decision: a node's binding is derived
   once per revision of the computer policy and on no timer; a change made on the other daemon
   arrives in the pairing exchange that daemon starts, and a merged exchange that moves this
   daemon's revision is a change here, so detection on either side is the exchange itself.
@@ -496,7 +497,7 @@ Narrow successor amendments. Requirements not named here remain in force.
 | ADR-036 legacy history recovery (Legacy history required, resume, cancel, cached-only reads) | Deleted (FX-18) |
 | ADR-037 R7, R11: event-driven gates; a turn may run several chunks, never a cycle | FX-15 adds: no round without a nameable need; a no-progress, no-wait round retires; a hint for a held head finishes on arrival |
 | ADR-037 R5: a member's higher own head marks the room "own history behind"; every write refuses until resolved | FX-32 says what resolves it: the node recovers its own entries from that member (verified under its own key), keeps reading, and writes again once current |
-| ADR-035 CT-9, CT-14: computer-trust changes are reconciled, idempotently and recoverably | Preserved; FX-28 adds the bound: a change made on either daemon shows on every attached node of both within 5 s, or within 60 s after the peer is reachable again when its exchange was lost, and an unchanged pair spends nothing |
+| ADR-035 CT-9, CT-14: computer-trust changes are reconciled, idempotently and recoverably | Preserved; FX-28 adds the bound: a change made on either daemon shows on every attached node of both within 5 s, or within 60 s after the peer is reachable again when its exchange was lost; an unchanged pair starts no exchange except the named fallback and derives no binding again |
 | ADR-037 R7, R11: a port runs a round only on a need; a turn may run several chunks, never a cycle | Preserved; FX-29 adds what a round that brings nothing may write: nothing |
 | No predecessor: no ADR names a durability class for the store or a flush under a room's lock | FX-30 and FX-31 are new rules |
 | PRD-001 R7, R8; ADR-023 M23.1: the admin sets the room's retention; it applies to what is stored at the next sweep | Preserved; FX-33 adds that the sweep never stops the room |

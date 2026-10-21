@@ -23,12 +23,20 @@ const PATIENCE: Duration = Duration::from_secs(15);
 /// Shipped builds neither name nor read this variable.
 #[cfg(feature = "test-knobs")]
 const TEST_HOLD_FIRST_COMPUTER_EXCHANGE_ENV: &str = "VOX_TEST_HOLD_FIRST_COMPUTER_EXCHANGE_FILE";
-/// **Test-only** (`test-knobs`): `<arm>\t<engaged>\t<release socket>`. Once a superseded
+/// **Test-only** (`test-knobs`): `<arm>\t<engaged>\t<release socket>\t<fault>`. Once a superseded
 /// exchange has released its reservation and left only its causal retry mark, the scheduler
 /// creates `engaged` and waits for one connection to `release`. This lets a shipped-binary
 /// journey place an operator takeover at that exact boundary; no verdict reads this apparatus.
 #[cfg(feature = "test-knobs")]
 const TEST_HOLD_COMPUTER_RETRY_READY_ENV: &str = "VOX_TEST_HOLD_COMPUTER_RETRY_READY_FILE";
+/// **Test-only** (`test-knobs`): `<arm>\t<engaged>\t<superseded>\t<release socket>`. An operator
+/// pairing parks after reserving its exact flight but before spawning/installing its task. When a
+/// later policy revision supersedes that handle-less flight, the scheduler creates `superseded`.
+/// A shipped-binary journey can therefore release the operator only after causally staging the
+/// reserve-to-handle-install race; shipped builds neither name nor read this variable.
+#[cfg(feature = "test-knobs")]
+const TEST_HOLD_COMPUTER_OPERATOR_RESERVED_ENV: &str =
+    "VOX_TEST_HOLD_COMPUTER_OPERATOR_RESERVED_FILE";
 // An exchange carries retained records from the same bounded transaction, never a smaller
 // unrelated limit that would strand an otherwise valid roster as nodes are added.
 const MAX_FRAME: usize = MAX_STATE as usize;
@@ -1066,6 +1074,8 @@ impl Management {
                 }
             }
         }
+        #[cfg(feature = "test-knobs")]
+        self.hold_operator_reserved_for_proof(target, serial).await;
         let mut reserved = Reserved {
             me: Arc::clone(self),
             peer: target,
@@ -2314,6 +2324,10 @@ impl Management {
                         // convergence clock.
                         self.mark_retry(*peer, flight.deadline);
                         flight.superseded = true;
+                        #[cfg(feature = "test-knobs")]
+                        if flight.origin == Origin::Operator && flight.abort.is_none() {
+                            self.mark_operator_superseded_for_proof(*peer);
+                        }
                         if let Some(abort) = &flight.abort {
                             abort.abort();
                         }
@@ -2662,15 +2676,56 @@ impl Management {
         let Ok(spec) = std::env::var(TEST_HOLD_COMPUTER_RETRY_READY_ENV) else {
             return;
         };
-        let mut fields = spec.splitn(3, '\t');
-        let (Some(arm), Some(engaged), Some(release)) =
-            (fields.next(), fields.next(), fields.next())
+        let mut fields = spec.splitn(4, '\t');
+        let (Some(arm), Some(engaged), Some(release), Some(fault)) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
         else {
             return;
         };
-        if lock(&self.retry_ready).is_empty() || !lock(&self.inflight).is_empty() {
+        let ready = lock(&self.retry_ready).clone();
+        if ready.is_empty() {
             return;
         }
+        let inflight = lock(&self.inflight).len();
+        let sole = (ready.len() == 1)
+            .then(|| ready.iter().next().map(|(peer, mark)| (*peer, *mark)))
+            .flatten();
+        let exact = (inflight == 0)
+            .then_some(sole)
+            .flatten()
+            .filter(|(peer, _)| {
+                lock(&self.exchanged)
+                    .get(peer)
+                    .is_none_or(|record| record.failures == 0 && record.deadline.is_none())
+            });
+        let Some((peer, _)) = exact else {
+            if std::fs::remove_file(arm).is_ok() {
+                let detail = if inflight != 0 {
+                    format!("retry-ready still had {inflight} in-flight deadline source(s)")
+                } else {
+                    match sole {
+                        None => format!(
+                            "retry-ready held {} peers instead of exactly one",
+                            ready.len()
+                        ),
+                        Some((peer, _)) => {
+                            let record = lock(&self.exchanged)
+                                .get(&peer)
+                                .cloned()
+                                .unwrap_or_default();
+                            format!(
+                                "{} also had failure count {} and a retained failure deadline {}",
+                                text_id(&peer),
+                                record.failures,
+                                record.deadline.is_some()
+                            )
+                        }
+                    }
+                };
+                let _ = std::fs::write(fault, detail);
+            }
+            return;
+        };
         let _ = std::fs::remove_file(release);
         let Ok(listener) = tokio::net::UnixListener::bind(release) else {
             return;
@@ -2688,8 +2743,65 @@ impl Management {
             let _ = std::fs::remove_file(release);
             return;
         }
+        let _ = std::fs::write(engaged, text_id(&peer));
         let _ = listener.accept().await;
         let _ = std::fs::remove_file(release);
+    }
+
+    /// Park an operator after it owns the exact peer reservation and before its task or abort
+    /// handle exists. A later policy revision can therefore supersede the handle-less flight.
+    #[cfg(feature = "test-knobs")]
+    async fn hold_operator_reserved_for_proof(&self, peer: Digest32, serial: u64) {
+        let Ok(spec) = std::env::var(TEST_HOLD_COMPUTER_OPERATOR_RESERVED_ENV) else {
+            return;
+        };
+        let mut fields = spec.splitn(4, '\t');
+        let (Some(arm), Some(engaged), Some(_superseded), Some(release)) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            return;
+        };
+        if !lock(&self.inflight).get(&peer).is_some_and(|flight| {
+            flight.serial == serial
+                && flight.origin == Origin::Operator
+                && flight.abort.is_none()
+                && !flight.superseded
+        }) {
+            return;
+        }
+        let _ = std::fs::remove_file(release);
+        let Ok(listener) = tokio::net::UnixListener::bind(release) else {
+            return;
+        };
+        if std::fs::remove_file(arm).is_err() {
+            let _ = std::fs::remove_file(release);
+            return;
+        }
+        if std::fs::write(engaged, text_id(&peer)).is_err() {
+            let _ = std::fs::remove_file(release);
+            return;
+        }
+        let _ = listener.accept().await;
+        let _ = std::fs::remove_file(release);
+    }
+
+    /// Mark the exact event the reserve-to-handle-install proof waits for: the scheduler has
+    /// observed a newer policy revision and marked the parked operator flight superseded while it
+    /// still has no abort handle.
+    #[cfg(feature = "test-knobs")]
+    fn mark_operator_superseded_for_proof(&self, peer: Digest32) {
+        let Ok(spec) = std::env::var(TEST_HOLD_COMPUTER_OPERATOR_RESERVED_ENV) else {
+            return;
+        };
+        let mut fields = spec.splitn(4, '\t');
+        let (Some(_arm), Some(engaged), Some(superseded), Some(_release)) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            return;
+        };
+        if std::path::Path::new(engaged).is_file() {
+            let _ = std::fs::write(superseded, text_id(&peer));
+        }
     }
 
     /// Record an exchange `peer` started and this node answered, now: what a person reads as
