@@ -3886,7 +3886,15 @@ impl CoreHandle for DaemonCore {
                 passphrase: Zeroizing::new(secret(&passphrase)),
             }),
             Command::RenameRoom { channel_id, name } => {
-                self.send(Request::RenameRoom { channel_id, name })
+                match self.request(&Request::RenameRoom { channel_id, name }) {
+                    Ok(Frame::Appended { entry }) => CommandStatus::Said(format!(
+                        "room renamed · entry {}",
+                        vox_core::node::link::b32_encode(&entry)
+                    )),
+                    Ok(Frame::Error { reason }) => failed(&reason),
+                    Ok(_) => CommandStatus::Failed(UiError::Internal),
+                    Err(lost) => lost_status(lost),
+                }
             }
             Command::AcceptOffer {
                 target,

@@ -1171,7 +1171,10 @@ impl<'a, 'store> Write<'a, 'store> {
             Self::current_head_key(author, body).ok_or(invalid("governance current head kind"))?;
         self.latest(Table::CurrentHeads, head, seq, log)?;
         match body {
-            GovBody::ConsentGrant(c) if c.body.epoch == 0 && changes_projection => {
+            // The durable slot carries causal sequence as well as displayed value. A repeated
+            // equal grant must advance it even though it does not revise the projection: a reset
+            // that arrives later but lies between the two grants must not revoke the newer one.
+            GovBody::ConsentGrant(c) if c.body.epoch == 0 => {
                 self.latest(
                     Table::Consent,
                     frontier(author, &c.body.target_id),
@@ -1186,7 +1189,7 @@ impl<'a, 'store> Write<'a, 'store> {
                     seq,
                     log,
                 )?;
-                if c.body.epoch == 0 && changes_projection {
+                if c.body.epoch == 0 {
                     self.latest(
                         Table::Consent,
                         frontier(author, &c.body.target_id),

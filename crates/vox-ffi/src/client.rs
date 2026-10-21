@@ -4647,18 +4647,20 @@ impl VoxClient {
     }
 
     /// Give a room a new name, for every member (ADR-028 R-1), as `vox room rename`: only its
-    /// creator or an admin may. No passphrase is asked for (ADR-028 K-11).
+    /// creator or an admin may. No passphrase is asked for (ADR-028 K-11). Returns the exact
+    /// authenticated entry appended for the rename, so an app can identify the causal action it
+    /// reports to a person.
     ///
     /// # Errors
     /// A malformed id, or the node's refusal in its own words (this node may not rename the
     /// room; the name is not one DNS label).
-    pub async fn rename_room(&self, room: String, name: String) -> Result<(), VoxError> {
+    pub async fn rename_room(&self, room: String, name: String) -> Result<String, VoxError> {
         let req = Request::RenameRoom {
             channel_id: digest(&room, "room id")?,
             name,
         };
         on_held!(self, |c| match ask(c, &req).await? {
-            Frame::Appended { .. } => Ok(()),
+            Frame::Appended { entry } => Ok(b32_encode(&entry)),
             other => Err(unexpected(&other)),
         })
     }

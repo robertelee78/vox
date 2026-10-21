@@ -520,7 +520,7 @@ impl ChannelState {
         // The governance index records authenticated single-writer current inputs at this
         // publication boundary. Presence side effects, private floors, keys and rendering still
         // wait for semantic completion.
-        let governance_changed = governance::accepted_into(
+        let accepted = governance::accepted_into(
             &mut batch,
             &self.entries,
             &self.sek,
@@ -535,7 +535,7 @@ impl ChannelState {
         batch.commit()?;
         // Advance the in-memory mirror only after this path's Batch commits. Unlike the ordinary
         // publication paths, a sparse history caller does not poison the room on commit failure.
-        if governance_changed {
+        if accepted.current_advanced {
             self.note_committed_consent(entry)?;
         }
         self.entries.committed();

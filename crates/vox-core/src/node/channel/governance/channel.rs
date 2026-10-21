@@ -514,7 +514,7 @@ impl ChannelState {
             .read(store, &self.sek, &self.channel_id)?
             .child_after(&entry.entry_hash(), None)?
             .is_some();
-        let governance_changed = super::accepted_into(
+        let accepted = super::accepted_into(
             batch,
             &self.entries,
             &self.sek,
@@ -529,10 +529,10 @@ impl ChannelState {
         // The Batch failure path poisons this ChannelState, so it is safe to advance the
         // in-memory mirror here with the same accepted input: no usable state can outlive a
         // failed commit. This covers every publication path without polling a sealed header.
-        if governance_changed {
+        if accepted.current_advanced {
             self.note_committed_consent(entry)?;
         }
-        if governance_changed {
+        if accepted.work_changed {
             if let Ok(body) = GovEntry::body_bound_to(entry) {
                 if let Some(key) = self.authors.get(&entry.skeleton.author_id) {
                     if body.verify(key).is_ok() {
@@ -562,6 +562,6 @@ impl ChannelState {
                 }
             }
         }
-        Ok(governance_changed)
+        Ok(accepted.work_changed)
     }
 }

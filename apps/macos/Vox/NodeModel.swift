@@ -2892,8 +2892,10 @@ final class NodeModel: ObservableObject {
         defer { end(attempt) }
         guard let id = roomOnScreen else { return false }
         do {
-            try await client.renameRoom(room: id, name: name)
-            report(operation: operation, done: "The room is now \(name) for every member.")
+            let entry = try await client.renameRoom(room: id, name: name)
+            report(
+                operation: operation,
+                done: "The room is now \(name) for every member. Entry \(entry).")
             await refresh()
             return true
         } catch {

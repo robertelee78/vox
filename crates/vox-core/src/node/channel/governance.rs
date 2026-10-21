@@ -218,6 +218,11 @@ fn is_control(entry: &crate::log::entry::Entry) -> bool {
     }
 }
 
+pub(super) struct Acceptance {
+    pub(super) work_changed: bool,
+    pub(super) current_advanced: bool,
+}
+
 fn observe(
     writer: &mut facts::Write<'_, '_>,
     log: u64,
@@ -226,7 +231,7 @@ fn observe(
     entry: &crate::log::entry::Entry,
     authors: &std::collections::BTreeMap<Digest32, crate::identity::composite::CompositePublicKey>,
     root: &Digest32,
-) -> Result<bool> {
+) -> Result<Acceptance> {
     use crate::governance::entry::GovEntry;
     let hash = entry.entry_hash();
     let control = is_control(entry);
@@ -249,10 +254,16 @@ fn observe(
         writer.enqueue(&hash, log, control)?;
     }
     if !control {
-        return Ok(changed);
+        return Ok(Acceptance {
+            work_changed: changed,
+            current_advanced: false,
+        });
     }
     let Some(payload) = entry.payload.as_deref() else {
-        return Ok(changed);
+        return Ok(Acceptance {
+            work_changed: changed,
+            current_advanced: false,
+        });
     };
     let _ = payload;
     if writer
@@ -260,7 +271,10 @@ fn observe(
         .is_some()
     {
         // The content hash, not the receipt time or cursor, binds the verified body.
-        return Ok(changed);
+        return Ok(Acceptance {
+            work_changed: changed,
+            current_advanced: false,
+        });
     }
     let key = authors
         .get(&entry.skeleton.author_id)
@@ -268,7 +282,12 @@ fn observe(
     let body = match GovEntry::body_bound_to(entry) {
         Ok(body) => body,
         Err(error) if entry.skeleton.v2.is_some() => return Err(error),
-        Err(_) => return Ok(changed),
+        Err(_) => {
+            return Ok(Acceptance {
+                work_changed: changed,
+                current_advanced: false,
+            });
+        }
     };
     // Malformed/unauthenticated nested statements confer nothing, just as in
     // the original pass-1 evaluator. Local Store/index errors above remain errors.
@@ -276,7 +295,10 @@ fn observe(
         return if entry.skeleton.v2.is_some() {
             Err(error)
         } else {
-            Ok(changed)
+            Ok(Acceptance {
+                work_changed: changed,
+                current_advanced: false,
+            })
         };
     }
     let current = facts::Write::current_input_kind(&body);
@@ -321,7 +343,10 @@ fn observe(
             changes_projection,
         )?;
     }
-    Ok(changed)
+    Ok(Acceptance {
+        work_changed: changed,
+        current_advanced: updates_current,
+    })
 }
 
 /// Advance a bounded batch of authoritative source rows. The cursor and every
@@ -363,8 +388,8 @@ fn advance_source(
         if published {
             let clock = published_clock(input.log_id(&hash)?, input.clock(&hash)?, id)?;
             let late = input.child_after(&hash, None)?.is_some();
-            let changed = observe(&mut writer, id, clock, late, &entry, authors, root)?;
-            if changed && grants_this_reader(&entry, me) {
+            let accepted = observe(&mut writer, id, clock, late, &entry, authors, root)?;
+            if accepted.work_changed && grants_this_reader(&entry, me) {
                 backfill.insert(entry.skeleton.author_id);
             }
         }
@@ -455,7 +480,7 @@ pub(super) fn accepted_into(
     log: u64,
     entry: &crate::log::entry::Entry,
     late: bool,
-) -> Result<bool> {
+) -> Result<Acceptance> {
     let (clock, sparse) = {
         let input = entries.in_batch(batch, sek, room)?;
         let hash = entry.entry_hash();
@@ -466,14 +491,14 @@ pub(super) fn accepted_into(
     };
     let mut writer = facts::Write::open(batch, sek, room)?;
     writer.set_control_only(sparse);
-    let changed = observe(&mut writer, log, clock, late, entry, authors, root)?;
+    let accepted = observe(&mut writer, log, clock, late, entry, authors, root)?;
     writer.live_receipt(log)?;
-    let backfill = changed && grants_this_reader(entry, me);
+    let backfill = accepted.work_changed && grants_this_reader(entry, me);
     writer.seal()?;
     if backfill {
         queue_backfill(batch, entries, sek, room, entry.skeleton.author_id)?;
     }
-    Ok(changed)
+    Ok(accepted)
 }
 
 fn grants_this_reader(entry: &crate::log::entry::Entry, me: &Digest32) -> bool {

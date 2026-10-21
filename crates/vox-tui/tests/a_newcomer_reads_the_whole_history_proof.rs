@@ -460,8 +460,9 @@ fn wait_for_held_rows(dir: &Path, room: &str, expected_hashes: &[String], hold: 
     }
 }
 
-/// One paged shipped-binary observation proves that these exact retained objects—not merely
-/// equal text from a refetch or duplicate post—became readable once each in source order.
+/// Bounded shipped reads wait for a multi-turn render continuation, then one exact observation
+/// proves that these retained objects—not merely equal text from a refetch or duplicate post—
+/// became readable once each in source order.
 fn assert_exact_read_rows(
     dir: &Path,
     room: &str,
@@ -469,27 +470,35 @@ fn assert_exact_read_rows(
     expected_texts: &[String],
     ordering: &str,
 ) {
-    let rows = room_rows(dir, room);
-    let actual: Vec<(String, Option<String>)> = rows
-        .iter()
-        .filter_map(|row| {
-            let hash = row["entry_hash"].as_str()?;
-            expected_hashes
-                .iter()
-                .any(|expected| expected == hash)
-                .then(|| (hash.to_owned(), row["text"].as_str().map(str::to_owned)))
-        })
-        .collect();
     let expected: Vec<(String, Option<String>)> = expected_hashes
         .iter()
         .cloned()
         .zip(expected_texts.iter().cloned().map(Some))
         .collect();
-    assert_eq!(
-        actual, expected,
-        "PRODUCT: after {ordering}, Bob's paged `vox room read --json` did not show each exact \
-         retained object once, readable, and in source order in room {room}; all rows: {rows:?}"
-    );
+    let deadline = Instant::now() + BOUND;
+    loop {
+        let rows = room_rows(dir, room);
+        let actual: Vec<(String, Option<String>)> = rows
+            .iter()
+            .filter_map(|row| {
+                let hash = row["entry_hash"].as_str()?;
+                expected_hashes
+                    .iter()
+                    .any(|expected| expected == hash)
+                    .then(|| (hash.to_owned(), row["text"].as_str().map(str::to_owned)))
+            })
+            .collect();
+        if actual == expected {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT: within {BOUND:?} after {ordering}, Bob's paged `vox room read --json` did \
+             not show each exact retained object once, readable, and in source order in room \
+             {room}; expected: {expected:?}; actual: {actual:?}; all rows: {rows:?}"
+        );
+        std::thread::yield_now();
+    }
 }
 
 /// Observe the competing author's exact retained object before a long author's durable
