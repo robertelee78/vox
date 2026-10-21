@@ -955,7 +955,12 @@ impl DaemonCore {
         let answer = self.request(&request);
         wipe(&mut request);
         match answer {
-            Ok(Frame::Ok | Frame::Bound { .. } | Frame::OwnRetention { .. }) => {
+            Ok(
+                Frame::Ok
+                | Frame::Appended { .. }
+                | Frame::Bound { .. }
+                | Frame::OwnRetention { .. },
+            ) => {
                 self.asked = None;
                 CommandStatus::Done
             }

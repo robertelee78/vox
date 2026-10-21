@@ -2,6 +2,31 @@
 
 use super::*;
 
+/// **Test-only**: the named marker contains one raw room id. When a bounded governance sweep
+/// selects that room, rename the marker with `.engaged` appended and park with the cursor already
+/// after it. The FX-22 journey then lets that room's real authority deadline supply the only wake,
+/// proving an expiry behind an in-progress cursor cannot be lost.
+#[cfg(feature = "test-knobs")]
+pub const TEST_HOLD_SWEEP_AFTER_ENV: &str = "VOX_TEST_HOLD_GOVERNANCE_SWEEP_AFTER_FILE";
+
+#[cfg(feature = "test-knobs")]
+fn hold_sweep_after(room: &Digest32) -> bool {
+    let Some(path) = std::env::var_os(TEST_HOLD_SWEEP_AFTER_ENV).filter(|path| !path.is_empty())
+    else {
+        return false;
+    };
+    let path = std::path::PathBuf::from(path);
+    let Ok(held) = std::fs::read(&path) else {
+        return false;
+    };
+    if held.as_slice() != room {
+        return false;
+    }
+    let mut engaged = path.as_os_str().to_owned();
+    engaged.push(".engaged");
+    std::fs::rename(path, engaged).is_ok()
+}
+
 #[derive(Default)]
 pub(super) struct Maintenance {
     pub pending: bool,
@@ -36,6 +61,12 @@ impl Maintenance {
             }
             self.deadline_order.remove(&(deadline, room));
             self.deadlines.remove(&room);
+            // A deadline can expire while a bounded sweep is already beyond this room.  The
+            // current sweep cannot observe it, and its completion replaces `pending` with
+            // `again`; carry a second sweep explicitly instead of waiting for unrelated work.
+            if self.after.is_some_and(|after| room <= after) {
+                self.again = true;
+            }
             woke = true;
         }
         self.pending |= woke;
@@ -243,6 +274,13 @@ impl Node {
             return;
         };
         self.governance_work.after = Some(room);
+        #[cfg(feature = "test-knobs")]
+        if hold_sweep_after(&room) {
+            // The marker is apparatus. Leave the selected room behind the cursor and park; its
+            // actual stored authority deadline is the only event that can resume this sweep.
+            self.governance_work.pending = false;
+            return;
+        }
         let Ok(mut channel) = shared.try_lock() else {
             // This room's durable work was selected but not examined. Carry the wake into the
             // next round; a quiet room must not wait for a command, network event or timer tick

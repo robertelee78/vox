@@ -199,15 +199,17 @@ The decider then answered twelve questions, one at a time. His answers are the d
   is the walkthrough's defect record, FX-11's is the amendment it produces, and FX-25's is each
   release's asset list.
 - **FX-22.** A governance question about a room (who may read whom, who has consented, what a
-  member offers) MUST read nothing from the store but the governance index's header, and decrypt
-  no fact or entry, when the room's governance has not changed since the question was last
-  answered. Decision: the room keeps its folded consent facts in memory as a semantic projection
-  (per author, the readers it consented to and its reset sequence), never a store snapshot, page
-  or row vector, so the index's bounded-turn rule stands; the index header's revision, which
-  moves with every change to the index, says whether the projection is current, so no
-  in-process bookkeeping can miss a write; the sealed index remains the only durable
-  representation, and a restart loads the projection from the index and the entries it names,
-  never by replaying the log. Measured
+  member offers) MUST answer entirely from the room's in-memory semantic projection, without
+  opening the store or decrypting even the governance index header, while that semantic meaning
+  is unchanged. Decision: the room keeps its folded consent facts in memory (per author, the
+  readers it consented to and its reset sequence), never a store snapshot, page or row vector, so
+  the index's bounded-turn rule stands. Acceptance of a fact whose canonical authorized meaning
+  changes the projection, and expiry of authority at its exact recorded deadline, causally
+  invalidate and rebuild that projection; sequence-only, unauthorized, superseded and same-value
+  facts do not. The internal durable revision tracks canonical work, while the published display
+  revision moves only when a completed fold changes what a person sees. The sealed index remains
+  the only durable representation, and a restart rebuilds in bounded turns from the index and the
+  entries it names, never by replaying the log. Measured
   cause, 2026-10-20 (the decider's daemon, vox 0.4.7; `ps` 155–170% of a core; two 10 s `sample`
   runs, 13,558 busy samples each, about 1.36 cores): 72% of all busy CPU was the status
   publication and 44% of all busy CPU was `trusted_by`, which opened a fresh view (a store

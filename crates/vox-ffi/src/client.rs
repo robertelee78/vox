@@ -4657,7 +4657,10 @@ impl VoxClient {
             channel_id: digest(&room, "room id")?,
             name,
         };
-        on_held!(self, |c| done(c, &req).await)
+        on_held!(self, |c| match ask(c, &req).await? {
+            Frame::Appended { .. } => Ok(()),
+            other => Err(unexpected(&other)),
+        })
     }
 
     /// A room link, for someone else to join with.

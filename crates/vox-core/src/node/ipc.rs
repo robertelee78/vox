@@ -3375,7 +3375,7 @@ pub enum Frame {
         /// Each share.
         shares: Vec<crate::node::shares::ShareRow>,
     },
-    /// The Session entry a [`Request::AppendSession`] appended.
+    /// The exact entry appended by [`Request::AppendSession`] or [`Request::RenameRoom`].
     Appended {
         /// Its entry hash.
         entry: Digest32,
@@ -7942,7 +7942,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             .apply(crate::node::api::NodeCommand::RenameRoom { channel_id, name })
             .await
         {
-            crate::node::api::Outcome::Done => Frame::Ok,
+            crate::node::api::Outcome::Appended(entry) => Frame::Appended { entry },
             other => Frame::Error {
                 reason: other.to_string(),
             },

@@ -151,6 +151,15 @@ struct State {
     projection: Digest32,
 }
 impl State {
+    fn note_deadline(&mut self, grant: Grant) {
+        if grant.present && grant.expiry > self.now {
+            self.deadline = if self.deadline == 0 {
+                grant.expiry
+            } else {
+                self.deadline.min(grant.expiry)
+            };
+        }
+    }
     fn new(writer: &Write<'_, '_>, now: u64) -> Self {
         let auth = writer.authority_generation() != writer.authority_folded();
         Self {
@@ -280,8 +289,8 @@ impl State {
             .query
             .get_or_insert_with(|| CachedQuery::new(scope, target));
         let grant = query.advance(writer, root, self.now, self.generation)?;
-        if grant.is_some() {
-            self.grant = grant;
+        if let Some(grant) = grant {
+            self.grant = Some(grant);
             self.query = None;
         }
         Ok(grant)
@@ -363,13 +372,6 @@ fn authority_step(writer: &mut Write<'_, '_>, root: &Digest32, state: &mut State
     let body = GovEntry::body_bound_to(&entry)?;
     match body {
         GovBody::AdminCert(cert) => {
-            if cert.body.expiry_ms > state.now {
-                state.deadline = if state.deadline == 0 {
-                    cert.body.expiry_ms
-                } else {
-                    state.deadline.min(cert.body.expiry_ms)
-                };
-            }
             let Some(grant) = state.query(writer, root, Scope(Some(hash)), cert.body.issuer_id)?
             else {
                 return Ok(());
@@ -383,15 +385,15 @@ fn authority_step(writer: &mut Write<'_, '_>, root: &Digest32, state: &mut State
             writer.put(Table::IssuerRoles, key, Some(record))?;
         }
         GovBody::AdminRevocation(rev) => {
-            let authorized = if rev.body.epoch == 0 {
+            let authorization = if rev.body.epoch == 0 {
                 let Some(grant) =
                     state.query(writer, root, Scope(Some(hash)), rev.body.issuer_id)?
                 else {
                     return Ok(());
                 };
-                grant.admin
+                grant.admin.then_some(grant)
             } else {
-                false
+                None
             };
             if let Some(named_log) =
                 writer.get(Table::Hashes, &hash_key(&rev.body.revoked_delegation_hash))?
@@ -401,7 +403,10 @@ fn authority_step(writer: &mut Write<'_, '_>, root: &Digest32, state: &mut State
                     // Only an authorized revocation outside the named certificate's
                     // strict past takes that certificate away. Keep a generation stamp:
                     // replay/expiry can change the issuer's historical authority.
-                    if authorized && !Scope(Some(named.entry_hash())).contains(writer, &entry)? {
+                    let outside_named_past =
+                        !Scope(Some(named.entry_hash())).contains(writer, &entry)?;
+                    if let Some(grant) = authorization.filter(|_| outside_named_past) {
+                        state.note_deadline(grant);
                         writer.put(
                             Table::NamedRevoked,
                             hash_key(&named.entry_hash()),
@@ -415,7 +420,7 @@ fn authority_step(writer: &mut Write<'_, '_>, root: &Digest32, state: &mut State
                     )?;
                 }
             }
-            authority::save_revocation(writer, &hash, state.generation, authorized)?;
+            authority::save_revocation(writer, &hash, state.generation, authorization.is_some())?;
         }
         _ => return Err(invalid("governance authority order kind")),
     }
@@ -491,6 +496,7 @@ fn action_step(
     let entry = writer.entry(state.log)?;
     let hash = entry.entry_hash();
     let body = GovEntry::body_bound_to(&entry)?;
+    let mut action_grant = None;
     let Some(kind) = effect_kind(&body) else {
         state.clear_query();
         return Ok(());
@@ -521,7 +527,10 @@ fn action_step(
                     state.clear_query();
                     return Ok(());
                 }
-                Concurrent::Clear => true,
+                Concurrent::Clear => {
+                    action_grant = Some(grant);
+                    true
+                }
             }
         }
     };
@@ -531,6 +540,9 @@ fn action_step(
             .transpose()?
             .is_some_and(|previous| same_effect(&previous, &body, kind));
         if !duplicate {
+            if let Some(grant) = action_grant {
+                state.note_deadline(grant);
+            }
             let effect_key = rank_key(state.after_rank);
             effect_token(&mut state.projection, &entry);
             writer.put(Table::Effects, effect_key, Some(state.log))?;
@@ -584,6 +596,7 @@ fn next_concurrent_revoke(
 fn head_step(writer: &mut Write<'_, '_>, root: &Digest32, state: &mut State) -> Result<()> {
     if state.target.is_none() {
         let Some((key, _)) = writer.first(Table::AllCerts, None)? else {
+            writer.authority_published(state.generation, state.deadline)?;
             writer.head_published(state.generation)?;
             writer.projection_published(state.projection)?;
             writer.evaluation_published(state.ordered)?;
@@ -601,6 +614,7 @@ fn head_step(writer: &mut Write<'_, '_>, root: &Digest32, state: &mut State) -> 
         let Some(grant) = state.query(writer, root, Scope(None), target)? else {
             return Ok(());
         };
+        state.note_deadline(grant);
         state.head_grant = Some(grant);
         state.clear_query();
     }
@@ -637,6 +651,7 @@ fn head_step(writer: &mut Write<'_, '_>, root: &Digest32, state: &mut State) -> 
             )
         }
         None => {
+            writer.authority_published(state.generation, state.deadline)?;
             writer.head_published(state.generation)?;
             writer.projection_published(state.projection)?;
             writer.evaluation_published(state.ordered)?;

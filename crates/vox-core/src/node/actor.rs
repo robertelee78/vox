@@ -20562,11 +20562,12 @@ impl Node {
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return Outcome::Failed(Fault::ChannelNotOpen);
         };
-        if let Err(e) = shared.lock().await.set_name(profile, name, now_ms) {
-            return Outcome::Failed(fault_of(&e));
-        }
+        let appended = match shared.lock().await.set_name(profile, name, now_ms) {
+            Ok(appended) => appended,
+            Err(e) => return Outcome::Failed(fault_of(&e)),
+        };
         self.note_local_governance_append(channel_id);
-        Outcome::Done
+        Outcome::Appended(appended)
     }
 
     /// Set the room rule when authorized; another member may shorten only its own retention.

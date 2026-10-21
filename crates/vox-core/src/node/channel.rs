@@ -509,6 +509,16 @@ pub const AUTHORS_HARD_LIMIT: usize = 2 * MAX_AUTHORS;
 /// durable and another event-driven turn continues it.
 pub const RENDER_BACKFILL_ROWS_PER_TURN: usize = governance::PAGE_ROWS;
 
+/// **Test-only**: when set, `room admin add` gives the certificate this finite lifetime. The
+/// optional FX-22 journey uses the real shipped command and this source-owned interval to prove
+/// that an otherwise quiet room wakes exactly when its effective authority expires.
+#[cfg(feature = "test-knobs")]
+pub const TEST_EXPIRING_ADMIN_ENV: &str = "VOX_TEST_EXPIRING_ADMIN";
+
+/// Lifetime of the expiring administrator certificate staged by [`TEST_EXPIRING_ADMIN_ENV`].
+#[cfg(feature = "test-knobs")]
+pub const TEST_EXPIRING_ADMIN_LIFETIME: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// **Test-only**: while the named marker exists, retain an already durable render continuation
 /// without advancing it. Proofs use the shipped status command to distinguish "no work was
 /// queued" from a synchronous rescan that would otherwise finish before the command returns.
@@ -9405,7 +9415,12 @@ impl ChannelState {
     ///
     /// # Errors
     /// Not an admin, not a room name, or an append that fails.
-    pub fn set_name(&mut self, profile: &Profile, name: &str, now: crate::time::Ms) -> Result<()> {
+    pub fn set_name(
+        &mut self,
+        profile: &Profile,
+        name: &str,
+        now: crate::time::Ms,
+    ) -> Result<Digest32> {
         let now_ms = now.get();
         let signer = profile.signer()?;
         if !self.may_rename(profile.store(), &signer.fingerprint(), now)? {
@@ -9415,8 +9430,7 @@ impl ChannelState {
         }
         let statement =
             crate::governance::name::RoomName::build(signer, &self.channel_id, self.epoch, name)?;
-        self.append_governance(profile, &statement.to_wire(), now_ms)?;
-        Ok(())
+        self.append_governance(profile, &statement.to_wire(), now_ms)
     }
 
     /// Creation time recorded in the manifest, milliseconds since the Unix epoch.
@@ -9792,13 +9806,24 @@ impl ChannelState {
             .get(member)
             .cloned()
             .ok_or(Error::Profile("that identity is not a member of the room"))?;
+        #[cfg(feature = "test-knobs")]
+        let expiry =
+            if std::env::var_os(TEST_EXPIRING_ADMIN_ENV).is_some_and(|value| !value.is_empty()) {
+                now_ms.saturating_add(
+                    u64::try_from(TEST_EXPIRING_ADMIN_LIFETIME.as_millis()).unwrap_or(u64::MAX),
+                )
+            } else {
+                0
+            };
+        #[cfg(not(feature = "test-knobs"))]
+        let expiry = 0;
         let cert = crate::governance::cert::AdminCert::build(
             signer,
             &self.channel_id,
             self.epoch,
             key,
             Self::delegated_admin_caps(),
-            0,
+            expiry,
         )?;
         self.append_governance(profile, &cert.to_wire(), now_ms)
     }
