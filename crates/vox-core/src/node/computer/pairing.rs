@@ -1207,8 +1207,10 @@ impl Management {
                 if authority.binding_owners.get(&id) != Some(&binding.id()) {
                     continue;
                 }
+                // Read from the state this status already holds: a second lock of it here
+                // would wait on itself and hang every `vox computer status`.
                 let derived = (*manager == local)
-                    .then(|| self.computer.derived_binding(&id))
+                    .then(|| s.derived.get(&id).copied())
                     .flatten();
                 nodes.push(ComputerNode {
                     computer: text_id(manager),

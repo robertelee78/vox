@@ -2137,11 +2137,6 @@ impl Computer {
             .is_some_and(|d| d.revision == s.revision)
     }
 
-    /// When `node`'s binding was last derived, and at which revision.
-    pub(crate) fn derived_binding(&self, node: &Digest32) -> Option<DerivedBinding> {
-        lock(&self.state).derived.get(node).copied()
-    }
-
     /// A failed policy write invalidates current grants even when the durable revision did not
     /// advance. Restart revalidates the retained state and its ability to be saved before attach.
     pub(crate) fn policy_current(&self, applied: u64) -> bool {
