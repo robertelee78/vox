@@ -1369,6 +1369,10 @@ enum NetEvent {
         token: crate::node::ports::Token,
         result: crate::error::Result<crate::node::history_stream::Status>,
         inventory_added: bool,
+        /// The served round moved something: a hint added from the peer's inventory, or an
+        /// object the peer asked for. A completed round that moved nothing is `empty` in
+        /// `vox status --json` (ADR-038 FX-29).
+        moved: bool,
     },
     /// A session's worker persisted entries (ADR-025 D1a): the room's generation moved, so its
     /// ports are evaluated — reported on its own, because a retired worker's result is ignored
@@ -10649,6 +10653,7 @@ impl Node {
                 token,
                 result,
                 inventory_added,
+                moved,
             } => {
                 let current = self
                     .ports
@@ -10668,6 +10673,11 @@ impl Node {
                                 counts
                                     .reasons
                                     .count(crate::node::status::RoundReason::Served);
+                                // A served round that moved nothing is as empty as a fetched
+                                // one: in a quiet room both periodic directions are (FX-29).
+                                if !moved {
+                                    counts.empty += 1;
+                                }
                             }
                             Ok(_) => counts.partial += 1,
                             Err(error) => {
@@ -16199,7 +16209,7 @@ impl Node {
         let tx = self.net_tx.clone();
         let inbox = Arc::clone(&self.history_hints);
         let task = tokio::spawn(async move {
-            let (result, inventory_added) = crate::node::history_stream::serve(
+            let (result, inventory_added, moved) = crate::node::history_stream::serve(
                 shared,
                 store,
                 peer,
@@ -16219,6 +16229,7 @@ impl Node {
                     token,
                     result,
                     inventory_added,
+                    moved,
                 })
                 .await;
         });

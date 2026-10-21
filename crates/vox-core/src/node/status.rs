@@ -1197,9 +1197,11 @@ pub struct PortCounters {
     pub completed: u64,
     /// Why each of them ran (ADR-038 FX-15, #996): one count per `completed`.
     pub reasons: RoundReasons,
-    /// Completed rounds this node ran that fetched nothing it did not hold: no head, header,
-    /// context, proof, body or hint it lacked (ADR-038 FX-29). In a quiet room every round is
-    /// one; a lane whose `completed` climbs faster than its `empty` is pulling something.
+    /// Completed rounds, in either direction, that moved nothing: a round this node ran that
+    /// fetched no head, header, context, proof, body or hint it lacked, or a round it served
+    /// whose inventory exchange added no hint and that asked for no object (ADR-038 FX-29). In
+    /// a quiet room every round is one; a lane whose `completed` climbs faster than its
+    /// `empty` is pulling or serving something.
     pub empty: u64,
     /// Sessions that ended without error but left requested entries unreceived (a bounded serve).
     pub partial: u64,

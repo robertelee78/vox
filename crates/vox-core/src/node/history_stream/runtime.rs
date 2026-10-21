@@ -545,6 +545,33 @@ impl Flow {
     pub(crate) fn needs_board(&self) -> bool {
         (self.inventory && !self.initialized) || self.wants_board
     }
+    /// The author of a retained signed head, for the record of a peer that could not fill a
+    /// body under it; `None` when the head is not retained or the room is busy, and then no
+    /// record is made (the next period asks once more).
+    async fn head_author(
+        &self,
+        source: &super::source::Source,
+        job: &Job,
+        head: Digest32,
+    ) -> Result<Option<Digest32>> {
+        let found = source
+            .read(
+                job,
+                std::mem::size_of::<Option<Digest32>>(),
+                move |room, store| {
+                    Ok(Some(
+                        room.history_read(store)?
+                            .history_head(&head)?
+                            .map(|signed| signed.binding.author),
+                    ))
+                },
+            )
+            .await?;
+        Ok(match found {
+            Lookup::Found(found) => found.value,
+            Lookup::Busy | Lookup::Missing => None,
+        })
+    }
     pub(crate) fn done(&self) -> bool {
         self.tasks.is_empty() && self.replay.is_none()
     }
@@ -1386,16 +1413,28 @@ impl Flow {
                             "live body refusal has no exact entry",
                         ));
                     };
-                    // The advertising peer does not hold a missing body of the hinted author's
-                    // newest window. Its inventory's same head is not pulled from it again
-                    // until it names another (ADR-038 FX-29): an author whose missing bodies
-                    // no peer held any more was pulled from every peer every period, about
-                    // 370 commits a sync, for bodies none of them had.
+                    // The peer does not hold a missing body of this author's newest window:
+                    // an answer that says it cannot fill the hint. Its inventory's same head
+                    // is not pulled from it again until it names another (ADR-038 FX-29), in
+                    // a required flow as in a hinted one: an author whose missing bodies no
+                    // peer held any more was pulled from every peer every period, about 370
+                    // commits a sync, for bodies none of them had.
+                    let author = self
+                        .tasks
+                        .iter()
+                        .find_map(|pending| match pending.operation {
+                            Operation::LiveAdvance { author, window, .. }
+                                if window.head == head && window.next == seq =>
+                            {
+                                Some(author)
+                            }
+                            _ => None,
+                        });
+                    if let Some(author) = author {
+                        inbox.decline(self.room, self.peer, author, head);
+                    }
                     if let Some(hint) = self.hint {
-                        inbox.decline(self.room, self.hint_peer, hint.author, hint.head);
-                        if head != hint.head {
-                            inbox.decline(self.room, self.hint_peer, hint.author, head);
-                        }
+                        inbox.decline(self.room, self.peer, hint.author, hint.head);
                     }
                     if !self.tasks.iter().any(|pending| matches!(pending.operation,
                         Operation::LiveAdvance { window, .. } if window.head == head && window.next == seq)) {
@@ -1437,6 +1476,16 @@ impl Flow {
                         self.tasks.clear();
                         return Ok(());
                     }
+                    if result.status == Status::BodyNotHeld {
+                        // The peer said it cannot fill this body: not asked for it again until
+                        // its inventory names another head of the author (ADR-038 FX-29).
+                        if let Query::Entry { head, .. } | Query::Page { head, .. } = &query {
+                            let head = *head;
+                            if let Some(author) = self.head_author(&source, job, head).await? {
+                                inbox.decline(self.room, self.peer, author, head);
+                            }
+                        }
+                    }
                     return Err(Error::Unreachable(
                         "selected current body is unavailable or cancelled",
                     ));
@@ -1453,6 +1502,15 @@ impl Flow {
                         // the healthy room/peer port can strand a later fresh head behind it.
                         // Third-party heads route to their author below; dependency failures
                         // after a head was selected remain hard failures.
+                        // A peer that cannot serve the head of its own feed it advertised is not
+                        // asked for that hint again until its inventory names another (ADR-038
+                        // FX-29); the own-feed echo (`author == self.node`) is settlement's and
+                        // stays as it is.
+                        if let (Query::Head(author), Some(hint)) = (&query, self.hint) {
+                            if *author == self.peer && hint.author == *author {
+                                inbox.decline(self.room, self.peer, *author, hint.head);
+                            }
+                        }
                         self.tasks.clear();
                         return Ok(());
                     }
@@ -1492,6 +1550,21 @@ impl Flow {
                             }
                             Query::Inventory | Query::Context(_) => None,
                         };
+                        // The peer said it cannot serve this header or proof: the hint that
+                        // depends on it is not pulled from that peer again until its inventory
+                        // names another head of the author (ADR-038 FX-29), whether the flow
+                        // was hinted or required. The route to the author's port below still
+                        // runs once for this exact query.
+                        if let Some(dependency) = dependency {
+                            if dependency.author != self.node {
+                                inbox.decline(
+                                    self.room,
+                                    self.peer,
+                                    dependency.author,
+                                    dependency.head,
+                                );
+                            }
+                        }
                         if dependency.is_some_and(|head| {
                             head.author != self.peer && head.author != self.node
                         }) {

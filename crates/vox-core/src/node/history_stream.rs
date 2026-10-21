@@ -111,12 +111,16 @@ pub(crate) async fn serve(
     fence: std::sync::Arc<crate::transport::stream_transport::Fence>,
     inbox: std::sync::Arc<HintInbox>,
     departure_receipt: std::sync::Arc<std::sync::atomic::AtomicBool>,
-) -> (Result<Status>, bool) {
+) -> (Result<Status>, bool, bool) {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     let source = source::Source::new(room, store, preamble.epoch, peer, fence.clone(), deadline);
     let mut io = transport::Transport::new(send, recv, job, fence, deadline);
     let generation = inbox.generation(preamble.room, peer);
     let mut inventory_added = false;
+    // Whether the round moved anything: an inventory exchange that added no hint on this side
+    // served the peer nothing it lacked, and is an `empty` round in `vox status --json`
+    // (ADR-038 FX-29); any other query is an object the peer asked for because it lacked it.
+    let mut served_object = false;
     let result = serve_request(
         &source,
         &mut io,
@@ -124,6 +128,7 @@ pub(crate) async fn serve(
         &inbox,
         generation,
         &mut inventory_added,
+        &mut served_object,
         &departure_receipt,
     )
     .await;
@@ -136,9 +141,10 @@ pub(crate) async fn serve(
         };
         io.abort(code);
     }
-    (result, inventory_added)
+    (result, inventory_added, inventory_added || served_object)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn serve_request(
     source: &source::Source,
     io: &mut transport::Transport,
@@ -146,6 +152,7 @@ async fn serve_request(
     inbox: &HintInbox,
     inbox_generation: u64,
     inventory_added: &mut bool,
+    served_object: &mut bool,
     departure_receipt: &std::sync::atomic::AtomicBool,
 ) -> Result<Status> {
     let first = match io.read_hello().await? {
@@ -193,6 +200,7 @@ async fn serve_request(
         _ => return Err(invalid("history expected bound WANT")),
     };
     drop(next);
+    *served_object = !matches!(query, Query::Inventory);
     // Parsed and request-bound before publication. If the peer's departure is applied while
     // this response is in flight, lifecycle cleanup may retain only this exact query. The server
     // and Source still restrict the response to the peer's own settled, included head.
