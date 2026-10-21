@@ -1652,7 +1652,7 @@ pub(crate) fn shown_tags(tags: &[String]) -> String {
 }
 
 /// Resolve a shortened reply selector among readable room messages. Exact hashes keep the
-/// direct lookup path; prefixes scan bounded pages and retain only one matching id.
+/// direct lookup path; prefixes scan bounded pages and name every matching id when ambiguous.
 async fn reply_entry(
     client: &mut IpcClient,
     cid: Digest32,
@@ -1673,7 +1673,7 @@ async fn reply_entry(
         )));
     }
     let mut before = None;
-    let mut found = None;
+    let mut found = std::collections::BTreeSet::new();
     loop {
         let (rows, older) = match client
             .request(&Request::RoomPage {
@@ -1690,12 +1690,7 @@ async fn reply_entry(
         for row in rows.iter().filter(|row| !row.owed) {
             let hash = b32_encode(&row.entry_hash);
             if hash.starts_with(&prefix) {
-                if found.as_ref().is_some_and(|previous| previous != &hash) {
-                    return Err(AppError::Usage(format!(
-                        "cannot reply to {typed}: entry prefix is ambiguous; use more characters"
-                    )));
-                }
-                found = Some(hash);
+                found.insert(hash);
             }
         }
         if older == 0 {
@@ -1710,11 +1705,18 @@ async fn reply_entry(
         }
         before = next;
     }
-    found.ok_or_else(|| {
-        AppError::Usage(format!(
-        "cannot reply to {typed}: no readable message matches that entry prefix; nothing was posted"
-    ))
-    })
+    match found.len() {
+        0 => Err(AppError::Usage(format!(
+            "cannot reply to {typed}: no readable message matches that entry prefix; nothing was posted"
+        ))),
+        1 => found.into_iter().next().ok_or_else(|| {
+            AppError::Usage("cannot resolve reply prefix; read the room and retry".into())
+        }),
+        _ => Err(AppError::Usage(format!(
+            "cannot reply to {typed}: entry prefix is ambiguous; it matches {}; use more characters",
+            found.into_iter().collect::<Vec<_>>().join(", ")
+        ))),
+    }
 }
 
 /// What a post answers, its hop budget and its known thread root, by the rule `vox room post` and

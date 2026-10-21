@@ -966,6 +966,22 @@ fn a_debug_daemon_makes_a_room_takes_a_post_and_keeps_running() {
             (!first_chars.insert(first.clone())).then_some(first)
         })
         .expect("APPARATUS: 33 base32 hashes must share a first character");
+    let (read_ok, collision_rows, read_err) =
+        vox(&data, &cfg, &["room", "read", &room, "--json"], None);
+    assert!(
+        read_ok,
+        "APPARATUS: could not read the staged ambiguous-prefix entries: {collision_rows}{read_err}"
+    );
+    let collision_ids: Vec<_> = collision_rows
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|row| row["entry_hash"].as_str().map(str::to_owned))
+        .filter(|entry| entry.starts_with(&ambiguous))
+        .collect();
+    assert!(
+        collision_ids.len() >= 2,
+        "APPARATUS: the staged prefix {ambiguous} no longer names multiple readable entries: {collision_rows}"
+    );
     let (ok, out, err) = vox(
         &data,
         &cfg,
@@ -980,8 +996,10 @@ fn a_debug_daemon_makes_a_room_takes_a_post_and_keeps_running() {
         None,
     );
     assert!(
-        !ok && err.contains("entry prefix is ambiguous"),
-        "PRODUCT: an ambiguous reply prefix must name the problem: {out}{err}"
+        !ok
+            && err.contains("entry prefix is ambiguous")
+            && collision_ids.iter().all(|entry| err.contains(entry)),
+        "PRODUCT: an ambiguous reply prefix must name every matching entry {collision_ids:?}: {out}{err}"
     );
     let exited = node.0.try_wait().ok().flatten();
     assert!(
