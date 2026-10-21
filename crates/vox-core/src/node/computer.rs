@@ -2041,6 +2041,7 @@ fn exclude_retired(
 
 /// A complete replacement for the covered part of one node's keyring.
 /// `denied` includes retained bindings: a fault cannot reveal an older manual grant.
+#[derive(Clone)]
 pub struct PolicyPlan {
     /// Exact durable local policy journal revision.
     pub revision: u64,
@@ -2061,11 +2062,50 @@ pub struct Computer {
     reachers: Mutex<
         Vec<std::sync::Weak<tokio::sync::watch::Sender<std::collections::BTreeSet<Digest32>>>>,
     >,
+    /// The policy revision, sent whenever a change moves it: a local change or a merged
+    /// exchange alike (ADR-038 FX-28). The daemon reconciles its nodes on this, and on no timer.
+    changed: tokio::sync::watch::Sender<u64>,
+    /// Per node, the revision its binding was last derived at and when: a binding is derived
+    /// once per revision, and a node whose record names the current revision is left alone.
+    derived: Mutex<BTreeMap<Digest32, DerivedBinding>>,
+    /// Each node's plan at the revision it was derived at: the app's polling and every trust
+    /// command answer from it while the revision stands, instead of verifying the history again.
+    plans: Mutex<BTreeMap<Digest32, (u64, PolicyPlan)>>,
+}
+
+/// When a node's management binding was last derived, and at which policy revision (ADR-038
+/// FX-28): what `vox computer status` shows, so a person can tell a stale binding from a
+/// current one. In memory only: a daemon derives each node's binding again when it attaches.
+#[derive(Clone, Copy, Debug)]
+pub struct DerivedBinding {
+    /// The policy revision the binding was derived at.
+    pub revision: u64,
+    /// When, Unix milliseconds.
+    pub at_ms: u64,
 }
 impl Computer {
     /// Local durable policy revision.
     pub fn revision(&self) -> u64 {
         lock(&self.state).revision
+    }
+
+    /// Follow the policy revision: `changed()` resolves when a change moved it, whether the
+    /// change was made here or arrived in an exchange (ADR-038 FX-28).
+    pub fn changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.changed.subscribe()
+    }
+
+    /// Whether `node`'s binding was derived at the current policy revision.
+    pub fn binding_current(&self, node: &Digest32) -> bool {
+        let s = lock(&self.state);
+        lock(&self.derived)
+            .get(node)
+            .is_some_and(|d| d.revision == s.revision)
+    }
+
+    /// When `node`'s binding was last derived since the daemon started, and at which revision.
+    pub(crate) fn derived_binding(&self, node: &Digest32) -> Option<DerivedBinding> {
+        lock(&self.derived).get(node).copied()
     }
 
     /// A failed policy write invalidates current grants even when the durable revision did not
@@ -2149,6 +2189,12 @@ impl Computer {
         };
         let local = self.signer.fingerprint();
         let key = signer.fingerprint();
+        // Derived once per revision (ADR-038 FX-28): the history is verified again only when
+        // the policy moved, by a change here or by a merged exchange.
+        if self.binding_current(&key) {
+            return Ok(());
+        }
+        let mut derived_at = None;
         self.change(|s| {
             if s.quarantined.contains(&local) {
                 return Ok(());
@@ -2234,8 +2280,21 @@ impl Computer {
                 s.retain_roster(r)?;
                 s.binding_approvals.remove(&key);
             }
+            // The revision the binding now stands at: the one the roster event just made, or
+            // the one it was found current at.
+            derived_at = Some(s.revision);
             Ok(())
-        })
+        })?;
+        if let Some(revision) = derived_at {
+            lock(&self.derived).insert(
+                key,
+                DerivedBinding {
+                    revision,
+                    at_ms: pairing::now(),
+                },
+            );
+        }
+        Ok(())
     }
 
     /// Exact policy for an attached node, from verified durable rosters. No roster grants room
@@ -2246,6 +2305,21 @@ impl Computer {
             return Ok(None);
         }
         self.storage_ready()?;
+        // Derived once per revision (ADR-038 FX-28): every input of the plan moves the
+        // revision when it changes (`fold_history`, `retain_roster`, `merge`), so a plan at the
+        // current revision is the plan.
+        if let Some((revision, plan)) = lock(&self.plans).get(&node) {
+            if *revision == s.revision {
+                return Ok(Some(plan.clone()));
+            }
+        }
+        let plan = Self::derive_plan(&s, self.signer.fingerprint(), node)?;
+        lock(&self.plans).insert(node, (s.revision, plan.clone()));
+        Ok(Some(plan))
+    }
+
+    /// The plan for `node` from the verified rosters of `s`, derived.
+    fn derive_plan(s: &State, local: Digest32, node: Digest32) -> Result<PolicyPlan> {
         let group = s.genesis.as_ref().map(Enrollment::incarnation);
         let mut covered = BTreeMap::new();
         let mut owner = None;
@@ -2262,7 +2336,7 @@ impl Computer {
                     .entry(id)
                     .or_insert_with(BTreeSet::new)
                     .insert(e.author);
-                if id == node && e.author == self.signer.fingerprint() {
+                if id == node && e.author == local {
                     owner = Some(e.author);
                 }
             }
@@ -2345,11 +2419,11 @@ impl Computer {
                 .then_some(peer)
             })
             .collect();
-        Ok(Some(PolicyPlan {
+        Ok(PolicyPlan {
             revision: s.revision,
             grants,
             denied,
-        }))
+        })
     }
 
     /// Is this exact local policy revision durably applied to this node's keyring?
@@ -2550,12 +2624,16 @@ impl Computer {
             if state.history.len() >= MAX_RECORDS {
                 return Err(Error::Profile(HISTORY_FULL));
             }
+            let revision = state.revision;
             let c = Arc::new(Self {
                 path,
                 storage_failed: std::sync::atomic::AtomicBool::new(false),
                 signer,
                 state: Mutex::new(state),
                 reachers: Mutex::new(Vec::new()),
+                changed: tokio::sync::watch::channel(revision).0,
+                derived: Mutex::new(BTreeMap::new()),
+                plans: Mutex::new(BTreeMap::new()),
             });
             // Validate present storage before any endpoint or managed node can resume authority.
             // If a failed prior write could not persist its fault, the retained signed state is
@@ -2615,6 +2693,9 @@ impl Computer {
             signer: Arc::new(root),
             state: Mutex::new(state),
             reachers: Mutex::new(Vec::new()),
+            changed: tokio::sync::watch::channel(0).0,
+            derived: Mutex::new(BTreeMap::new()),
+            plans: Mutex::new(BTreeMap::new()),
         });
         c.save(&lock(&c.state))?;
         Ok(c)
@@ -2656,10 +2737,16 @@ impl Computer {
                 self.storage_failure();
                 return Err(error);
             }
-            if held.revision != next.revision {
+            let moved = held.revision != next.revision;
+            if moved {
                 self.invalidate_reachers();
             }
             *held = next;
+            if moved {
+                // A change here, or a merged exchange that moved this daemon's revision: either
+                // is a change here (ADR-038 FX-28), and the daemon reconciles its nodes on it.
+                self.changed.send_replace(held.revision);
+            }
         }
         Ok(value)
     }

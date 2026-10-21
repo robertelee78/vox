@@ -2,64 +2,107 @@
 use super::*;
 
 impl Router {
+    /// Reconcile the daemon's nodes with computer trust on change, and on no timer (ADR-038
+    /// FX-28): when the policy revision moves (a change made here, or a merged exchange that
+    /// moved it), when a node attaches or detaches, and when the endpoints this daemon advertises
+    /// move (its reach is then recorded for the other computers). Measured before this
+    /// (2026-10-20, the decider's daemon): a 1 s tick re-derived every node's binding, an ML-DSA
+    /// verification of every management event, with nothing changed.
     pub(super) fn follow_computer_trust(&self) {
         let weak = Arc::downgrade(&self.inner);
+        let management = Arc::clone(&self.inner.defaults.computer);
+        let mut policy = management.computer.changes();
+        let mut endpoints = management.endpoint_changes();
+        let mut nodes = self.inner.events.subscribe();
         self.inner.rt.spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(1));
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // The first pass runs at start; every later one has a cause.
+            policy.mark_changed();
+            let mut advertised = endpoints.borrow_and_update().clone();
             loop {
-                tick.tick().await;
+                tokio::select! {
+                    moved = policy.changed() => {
+                        if moved.is_err() {
+                            return;
+                        }
+                    }
+                    moved = endpoints.changed() => {
+                        if moved.is_err() {
+                            return;
+                        }
+                        let now = endpoints.borrow_and_update().clone();
+                        if now == advertised {
+                            continue;
+                        }
+                        advertised = now;
+                    }
+                    event = nodes.recv() => {
+                        match event {
+                            Ok(DaemonEvent::Attached { .. } | DaemonEvent::Detached { .. })
+                            | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                            Err(broadcast::error::RecvError::Closed) => return,
+                        }
+                    }
+                }
                 let Some(inner) = weak.upgrade() else {
                     return;
                 };
                 if inner.stopping.load(Ordering::Relaxed) {
                     return;
                 }
-                let router = Router { inner };
-                let management = Arc::clone(&router.inner.defaults.computer);
-                if management.computer.binding_group().is_none() && !management.computer.grouped() {
-                    continue;
-                }
-                if let Err(e) = management.computer.ensure_roster() {
-                    eprintln!("vox daemon: computer roster pending: {e}");
-                    continue;
-                }
-                let names = router
-                    .inner
-                    .account
-                    .nodes_on_disk()
-                    .into_iter()
-                    .map(|n| n.to_string())
-                    .collect();
-                if let Err(e) = management.computer.retain_local_nodes(&names) {
-                    eprintln!("vox daemon: computer roster pending: {e}");
-                    continue;
-                }
-                let mut pending = Vec::new();
-                for info in router.nodes() {
-                    let Some((_, handle)) = router
-                        .attached_handles()
-                        .into_iter()
-                        .find(|(name, _)| name == info.name.as_str())
-                    else {
-                        pending.push(format!(
-                            "{}: make this node Ready to apply computer trust",
-                            info.name
-                        ));
-                        continue;
-                    };
-                    if let Err(e) = handle.reconcile_computer().await {
-                        pending.push(format!("{}: {e}", info.name));
-                        // A failed write must not leave stale grants on the network.
-                        let _ = router.detach(&info.name, DetachCause::Requested).await;
-                    }
-                }
-                management.pending_nodes(pending);
-                if let Err(e) = management.record_application() {
-                    eprintln!("vox daemon: computer trust application pending: {e}");
-                }
+                Router { inner }.reconcile_computer_trust().await;
             }
         });
+    }
+
+    /// One reconciliation pass: the roster follows the nodes on disk, every attached node that
+    /// is behind the policy derives its binding and applies its keyring, and the application
+    /// receipt is recorded. A node at the current revision is not asked.
+    async fn reconcile_computer_trust(&self) {
+        let management = Arc::clone(&self.inner.defaults.computer);
+        if management.computer.binding_group().is_none() && !management.computer.grouped() {
+            return;
+        }
+        if let Err(e) = management.computer.ensure_roster() {
+            eprintln!("vox daemon: computer roster pending: {e}");
+            return;
+        }
+        let names = self
+            .inner
+            .account
+            .nodes_on_disk()
+            .into_iter()
+            .map(|n| n.to_string())
+            .collect();
+        if let Err(e) = management.computer.retain_local_nodes(&names) {
+            eprintln!("vox daemon: computer roster pending: {e}");
+            return;
+        }
+        let mut pending = Vec::new();
+        for info in self.nodes() {
+            let Some((_, handle)) = self
+                .attached_handles()
+                .into_iter()
+                .find(|(name, _)| name == info.name.as_str())
+            else {
+                pending.push(format!(
+                    "{}: make this node Ready to apply computer trust",
+                    info.name
+                ));
+                continue;
+            };
+            if handle.computer_current() {
+                continue;
+            }
+            if let Err(e) = handle.reconcile_computer().await {
+                pending.push(format!("{}: {e}", info.name));
+                // A failed write must not leave stale grants on the network.
+                let _ = self.detach(&info.name, DetachCause::Requested).await;
+            }
+        }
+        management.pending_nodes(pending);
+        if let Err(e) = management.record_application() {
+            eprintln!("vox daemon: computer trust application pending: {e}");
+        }
     }
 
     pub(super) async fn computer_request(&self, request: DaemonRequest) -> DaemonFrame {

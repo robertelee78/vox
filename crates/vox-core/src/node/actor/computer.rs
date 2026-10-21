@@ -49,6 +49,28 @@ impl NodeHandle {
         result
     }
 
+    /// Whether this node stands at the current computer policy: its binding derived at the
+    /// current revision and its keyring applied at it (ADR-038 FX-28). A node that does has
+    /// nothing to reconcile; the daemon asks it to only when a change moved the revision.
+    pub fn computer_current(&self) -> bool {
+        let Some(computer) = &self.computer else {
+            return true;
+        };
+        if !computer.grouped() && computer.binding_group().is_none() {
+            return true;
+        }
+        let applied = self
+            .computer_revision
+            .load(std::sync::atomic::Ordering::Acquire);
+        let me = self
+            .view_rx
+            .borrow()
+            .identity
+            .as_ref()
+            .map(|id| id.fingerprint);
+        computer.policy_current(applied) && me.is_some_and(|me| computer.binding_current(&me))
+    }
+
     /// Ask the already attached node to sign its management binding and durably apply policy.
     pub async fn reconcile_computer(&self) -> crate::error::Result<()> {
         let (reply, rx) = oneshot::channel();

@@ -19,7 +19,7 @@ const PATIENCE: Duration = Duration::from_secs(15);
 // An exchange carries retained records from the same bounded transaction, never a smaller
 // unrelated limit that would strand an otherwise valid roster as nodes are added.
 const MAX_FRAME: usize = MAX_STATE as usize;
-fn now() -> u64 {
+pub(super) fn now() -> u64 {
     static CLOCK: std::sync::OnceLock<crate::time::Clock> = std::sync::OnceLock::new();
     CLOCK.get_or_init(crate::time::clock_with_test_skew)()
 }
@@ -90,6 +90,14 @@ pub struct ComputerNode {
     pub name: String,
     /// Saved selected personal node; drives non-personal nodes while enrolled.
     pub personal: bool,
+    /// For a node of this computer: the policy revision its binding was last derived at since
+    /// the daemon started, so a person can tell a stale binding from a current one (ADR-038
+    /// FX-28); `None` for another computer's node, or one not Ready since the daemon started.
+    #[serde(default)]
+    pub binding_revision: Option<u64>,
+    /// When that binding was derived, Unix milliseconds.
+    #[serde(default)]
+    pub binding_derived_ms: Option<u64>,
 }
 /// One available explicit operation derived from retained authenticated binding evidence.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -112,6 +120,10 @@ pub struct ComputerStatus {
     pub policy: String,
     /// Individual, waiting, needs-approval, applying, or confirmed.
     pub state: String,
+    /// This daemon's policy revision: it moves with every change to computer trust, made here or
+    /// merged from an exchange; a node's binding is current when it names the same revision.
+    #[serde(default)]
+    pub revision: u64,
     /// Current one-time link, returned only over the account's private control socket.
     pub invite_link: Option<String>,
     /// Identifier used to cancel before a peer has presented itself.
@@ -623,6 +635,11 @@ impl Management {
                 lock(&me.serving).remove(&conn.serial());
             }
         });
+    }
+    /// Follow the endpoints this daemon advertises: `changed()` resolves when they moved, and
+    /// the daemon then records its reach for the other computers (ADR-038 FX-28: on no timer).
+    pub fn endpoint_changes(&self) -> tokio::sync::watch::Receiver<Option<EndpointList>> {
+        self.net.presence().advertised()
     }
     /// An active invitation or enrolled management endpoint keeps a zero-node daemon available.
     pub fn keeps_daemon_alive(&self) -> bool {
@@ -1164,11 +1181,16 @@ impl Management {
                 if authority.binding_owners.get(&id) != Some(&binding.id()) {
                     continue;
                 }
+                let derived = (*manager == local)
+                    .then(|| self.computer.derived_binding(&id))
+                    .flatten();
                 nodes.push(ComputerNode {
                     computer: text_id(manager),
                     fingerprint: text_id(&id),
                     name: binding.name.clone(),
                     personal: e.personal == Some(id),
+                    binding_revision: derived.map(|d| d.revision),
+                    binding_derived_ms: derived.map(|d| d.at_ms),
                 });
             }
         }
@@ -1240,6 +1262,7 @@ impl Management {
             this_computer: ComputerIdentity::of(&s.description)?,
             policy: POLICY.into(),
             state: state.into(),
+            revision: s.revision,
             invite_link,
             invite_id: invitation.map(|i| text_id(&i.id)),
             invite_expires_ms: invitation.map(|i| i.expires),

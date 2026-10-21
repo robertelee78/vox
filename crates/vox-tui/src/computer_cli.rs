@@ -246,11 +246,12 @@ fn show(status: &ComputerStatus, json: bool) -> Result<(), AppError> {
         return Ok(());
     }
     println!(
-        "{}  {}\ninstallation {}\ncomputer trust: {}",
+        "{}  {}\ninstallation {}\ncomputer trust: {}\npolicy revision {}",
         status.this_computer.name,
         status.this_computer.fingerprint,
         status.this_computer.installation,
-        status.state
+        status.state,
+        status.revision
     );
     println!("{}", status.policy);
     if let Some(p) = &status.pairing {
@@ -318,9 +319,37 @@ fn show(status: &ComputerStatus, json: bool) -> Result<(), AppError> {
             }
         );
     }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
     for node in &status.nodes {
+        // A node of this computer says at which policy revision its binding was derived and
+        // when: current when it names the status's revision, stale otherwise (ADR-038 FX-28).
+        let binding = match (node.binding_revision, node.binding_derived_ms) {
+            (Some(revision), Some(at)) => format!(
+                "; binding derived at policy revision {revision}{}, {} s ago",
+                if revision == status.revision {
+                    " (current)"
+                } else {
+                    " (stale)"
+                },
+                now_ms.saturating_sub(at) / 1000
+            ),
+            (Some(revision), None) => format!(
+                "; binding derived at policy revision {revision}{}",
+                if revision == status.revision {
+                    " (current)"
+                } else {
+                    " (stale)"
+                }
+            ),
+            (None, _) if node.computer == status.this_computer.fingerprint => {
+                "; binding not derived since the daemon started".to_owned()
+            }
+            (None, _) => String::new(),
+        };
         println!(
-            "{}  {}  computer {}  {}",
+            "{}  {}  computer {}  {}{binding}",
             node.name,
             node.fingerprint,
             node.computer,
