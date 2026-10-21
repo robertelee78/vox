@@ -153,7 +153,6 @@ pub(crate) struct Flow {
     replay: Option<Task>,
     slots: Arc<BodySlots>,
     owners: [Option<RequestId>; 2],
-    no_progress: u8,
     /// A durable body chunk moved in this flow's last turn: the waiting slice is
     /// progress, not a busy wait, and its port must not grow a Busy backoff.
     pub(crate) body_progress: bool,
@@ -168,7 +167,8 @@ pub(crate) struct Flow {
     retirement_request: RequestId,
     request: RequestId,
     cleanup_store: Arc<Store>,
-    cleanup_job: Job,
+    cleanup_budget: Arc<crate::node::history_budget::Budget>,
+    actor_incarnation: Option<u64>,
     cleanup_after: Option<[u8; 64]>,
     live_context: Option<Arc<Context>>,
     control_context: Arc<Context>,
@@ -228,7 +228,7 @@ impl Flow {
     }
 
     pub(crate) fn actor_incarnation(&self) -> Option<u64> {
-        self.cleanup_job.flow_owner()
+        self.actor_incarnation
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -245,7 +245,8 @@ impl Flow {
         required: Option<(Digest32, u64)>,
         slots: Arc<BodySlots>,
         cleanup_store: Arc<Store>,
-        cleanup_job: Job,
+        cleanup_budget: Arc<crate::node::history_budget::Budget>,
+        actor_incarnation: Option<u64>,
     ) -> Result<Self> {
         let request = request_id()?;
         let mut flow = Self {
@@ -281,7 +282,6 @@ impl Flow {
             replay: None,
             slots,
             owners: [None, None],
-            no_progress: 0,
             body_progress: false,
             governance_wait: false,
             governance_cycles: 0,
@@ -289,7 +289,8 @@ impl Flow {
             retirement_request: request,
             request,
             cleanup_store,
-            cleanup_job,
+            cleanup_budget,
+            actor_incarnation,
             cleanup_after: None,
             live_context: Some(live),
             control_context: control,
@@ -357,7 +358,8 @@ impl Flow {
         fence: Arc<Fence>,
         slots: Arc<BodySlots>,
         cleanup_store: Arc<Store>,
-        cleanup_job: Job,
+        cleanup_budget: Arc<crate::node::history_budget::Budget>,
+        actor_incarnation: Option<u64>,
     ) -> Self {
         Self {
             room,
@@ -390,7 +392,6 @@ impl Flow {
             authorization_changed: false,
             slots,
             owners: [None, None],
-            no_progress: 0,
             body_progress: false,
             governance_wait: false,
             governance_cycles: 0,
@@ -398,7 +399,8 @@ impl Flow {
             retirement_request: request,
             request,
             cleanup_store,
-            cleanup_job,
+            cleanup_budget,
+            actor_incarnation,
             cleanup_after: None,
             tasks: {
                 let mut tasks = Vec::with_capacity(MAX_TASKS);
@@ -470,35 +472,38 @@ impl Flow {
     /// The Control bytes one flow state costs, reserved on this flow's own control job before
     /// the pool is asked (ADR-038 FX-35): `None` is the control budget's refusal, never the
     /// pool's, and the caller names it so.
-    pub(crate) fn reserve_state_bytes(&self) -> Option<crate::node::history_budget::BufferCharge> {
-        self.cleanup_job
-            .reserve(crate::node::history_budget::FLOW_STATE_BYTES)
+    pub(crate) fn reserve_state_bytes(
+        &self,
+        job: &Job,
+    ) -> Option<crate::node::history_budget::BufferCharge> {
+        job.reserve(crate::node::history_budget::FLOW_STATE_BYTES)
     }
 
     pub(crate) fn state_bytes_wake(
-        &self,
+        job: &Job,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
-        self.cleanup_job.bytes_wake()
+        job.bytes_wake()
     }
 
     pub(crate) fn flow_state_wake(
-        &self,
+        job: &Job,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
-        self.cleanup_job.flow_state_wake()
+        job.flow_state_wake()
     }
 
     /// Reserve the flow state as the round begins, its bytes already held: the last gate before
     /// running, so a held charge always belongs to a running round. [`Resumed::PoolFull`] when
     /// every charge is held by a running round, which the pool's size rules out. A flow already
     /// holding its state keeps it, and the bytes go back.
-    pub(crate) fn resume(&mut self, bytes: crate::node::history_budget::BufferCharge) -> Resumed {
+    pub(crate) fn resume(
+        &mut self,
+        job: &Job,
+        bytes: crate::node::history_budget::BufferCharge,
+    ) -> Resumed {
         if self.state_charge.is_some() {
             return Resumed::Held;
         }
-        match self
-            .cleanup_job
-            .reserve_flow_state(self.room, self.peer, bytes)
-        {
+        match job.reserve_flow_state(self.room, self.peer, bytes) {
             crate::node::history_budget::FlowStateTry::Reserved(charge) => {
                 self.state_charge = Some(charge);
                 Resumed::Held
@@ -597,7 +602,15 @@ impl Flow {
             .tasks
             .iter()
             .any(|task| matches!(task.operation, Operation::Reclaim(Purpose::Control)));
-        let cleanup_job = self.cleanup_job.clone();
+        // A parked flow owns no worker. Retirement admits one independent large-control job for
+        // this bounded local slice and gives it back before the flow is retained again.
+        let Some(cleanup_job) = self
+            .cleanup_budget
+            .admit_job(self.node, crate::node::history_budget::Lane::LargeControl)
+            .await
+        else {
+            return Ok(false);
+        };
         if reclaim_live
             && !self
                 .reclaim_stage(Purpose::Live, &cleanup_job, true)
@@ -617,13 +630,9 @@ impl Flow {
         // any general publication/verifier cleanup. Nothing here opens a stream or schedules
         // another turn.
         self.cancel();
-        // Retained flow metadata is charged to the daemon's small control reservation.
-        // Cleanup must not need that same pool to free it: several hosted nodes can fill
-        // its headroom. Use an independently admitted foreground-control envelope instead.
+        // Cleanup uses the independently admitted foreground-control envelope above; no parked
+        // flow retains a Control worker merely so it can eventually retire.
         const CLEANUP_ENVELOPE: usize = 6 * 1024 * 1024;
-        let Some(cleanup_job) = self.cleanup_job.record_job(CLEANUP_ENVELOPE).await else {
-            return Ok(false);
-        };
         let Some(charge) = cleanup_job.reserve(CLEANUP_ENVELOPE) else {
             return Ok(false);
         };
@@ -785,22 +794,9 @@ impl Flow {
             self.authorization_changed = true;
             return Ok(());
         }
-        if self.owners.iter().any(Option::is_some)
-            && self.waiting
-            && !self.body_progress
-            && !self.governance_wait
-        {
-            self.no_progress = self.no_progress.saturating_add(1);
-            if self.no_progress >= 3 {
-                return Err(Error::Unreachable(
-                    "current work repeatedly busy; retiring its body slot",
-                ));
-            }
-        } else {
-            // A successful metadata/local slice or durable body chunk is progress. Retain
-            // its exact body slot across progressing multi-quantum current entries.
-            self.no_progress = 0;
-        }
+        // Busy is a retained exact need. A count of turns can neither revoke the body slot nor
+        // dispose its root; the semantic response/progress edge is the only thing that advances
+        // it, while the actor's named Busy backoff prevents spinning between those edges.
         result
     }
 

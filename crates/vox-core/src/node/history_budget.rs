@@ -219,6 +219,20 @@ impl Budget {
         Arc::new(Self::default())
     }
 
+    /// Admit one exact daemon job without borrowing an already-admitted worker. Retirement and
+    /// other local cleanup use this so a parked flow retains only durable demand, never a lane
+    /// slot. The ticket subscribes before each attempt; capacity release is the only wake.
+    pub(crate) async fn admit_job(self: &Arc<Self>, node: Digest32, lane: Lane) -> Option<Job> {
+        let mut ticket = self.enqueue(node, lane)?;
+        loop {
+            let wake = ticket.wake();
+            if let Some(job) = ticket.try_admit() {
+                return Some(job);
+            }
+            wake.await;
+        }
+    }
+
     pub(crate) fn retirement_ledger(&self) -> Arc<RetirementLedger> {
         Arc::clone(&self.retirements)
     }

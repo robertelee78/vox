@@ -999,21 +999,24 @@ fn converged(staged: &Staged, product_bound: Option<Duration>) {
                         )
                     });
                 let pool = &value["lanes"]["budget"]["flow_state"];
-                let running = value["lanes"]["ports"]
+                // The controller's actual worker slots are independent of the budget pool's
+                // charge ledger. Comparing those catches `Flow::park` retaining a charge; port
+                // `round_running` cannot, because it is deliberately projected from that ledger.
+                let running = value["lanes"]["bounded"]["running"]
                     .as_array()
                     .into_iter()
                     .flatten()
-                    .filter(|port| port["round_running"] == true)
+                    .filter(|slot| !slot.is_null())
                     .count() as u64;
                 let charged = pool["by_node"][fingerprint].as_u64().unwrap_or(u64::MAX);
                 let by_node = pool["by_node"]
                     .as_object()
                     .map(|counts| counts.values().filter_map(serde_json::Value::as_u64).sum())
                     .unwrap_or(u64::MAX);
-                assert_eq!(
-                    charged, running,
+                assert!(
+                    charged <= running,
                     "PRODUCT: {name}'s flow-state pool charged a parked/non-running flow during \
-                     convergence (charged {charged}, running ports {running}): {}",
+                     convergence (charged {charged}, controller worker slots {running}): {}",
                     shown.status
                 );
                 assert_eq!(
@@ -1080,6 +1083,70 @@ fn converged(staged: &Staged, product_bound: Option<Duration>) {
             said(host, "host"),
             said(peer, "peer")
         );
+    }
+}
+
+/// A pool charge can disappear before the actor consumes a finished worker, so equality is not
+/// required. The reverse is impossible: more charges than this controller's actual worker slots
+/// means a parked flow retained one. Observe a quiet edge within the source-owned round contract
+/// so the park mutant has its own bounded PRODUCT discriminator, independent of the pool-derived
+/// port projection and of the apparatus watchdog.
+#[cfg(feature = "optional-proofs")]
+fn parked_flow_charge_discriminator(staged: &Staged) {
+    let quiet_by = Instant::now() + vox_core::node::history_budget::BOUNDED_ROUND_PATIENCE;
+    loop {
+        let mut active = Vec::new();
+        let mut retained_control = Vec::new();
+        for (dir, node, name, fingerprint) in &staged.everyone {
+            let shown = synced(dir, *node);
+            let value: serde_json::Value =
+                serde_json::from_str(&shown.status).unwrap_or_else(|e| {
+                    panic!(
+                        "PRODUCT: {name}'s flow-state status was not JSON: {e}: {}",
+                        shown.status
+                    )
+                });
+            let charged = value["lanes"]["budget"]["flow_state"]["by_node"][fingerprint]
+                .as_u64()
+                .unwrap_or(u64::MAX);
+            let running = value["lanes"]["bounded"]["running"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|slot| !slot.is_null())
+                .count() as u64;
+            assert!(
+                charged <= running,
+                "PRODUCT: {name}'s flow-state pool retained a parked charge with no controller \
+                 worker owner (charged {charged}, controller slots {running}): {}",
+                shown.status
+            );
+            if running != 0 {
+                active.push(format!("{name}: {running}"));
+            }
+            let control = value["lanes"]["budget"]["control"]
+                .as_u64()
+                .unwrap_or(u64::MAX);
+            if control != 0 {
+                retained_control.push(format!("{name}: {control}"));
+            }
+        }
+        if active.is_empty() && retained_control.is_empty() {
+            return;
+        }
+        if active.is_empty() && Instant::now() >= quiet_by {
+            panic!(
+                "PRODUCT: bounded controllers had no running worker throughout the final \
+                 source-owned quiet observation, but parked flows still retained admitted \
+                 Control jobs: {retained_control:?}"
+            );
+        }
+        assert!(
+            Instant::now() < quiet_by,
+            "APPARATUS: actual bounded workers did not reach the quiet precondition within the \
+             source-owned round contract: {active:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
@@ -1411,7 +1478,7 @@ fn generation_accounting_keeps_actor_incarnations_exact(staged: &Staged) {
 ///
 /// Mutants, one per claim: `Flow::park` keeping its charge turns convergence PRODUCT red;
 /// `scratchpad/mutant_fx35_undersized.py` obstructs the seventeenth reservation while still
-/// reporting the right limit, turning the pool-full/over-sixteen PRODUCT assertion red;
+/// reporting the right limit, turning the unused-capacity PoolFull PRODUCT assertion red;
 /// `scratchpad/mutant_fx35_required.py` disposes the exact required root at an admission
 /// refusal, turning the retained-required-root PRODUCT assertion red at the PoolFull snapshot;
 /// `scratchpad/mutant_fx35_release_wake.py` drops both exact release wakes and leaves the shipped
@@ -1442,6 +1509,7 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
     );
     let staged = stage_hosted_nodes(&FX35_HOSTED, true, false, true);
     converged(&staged, None);
+    parked_flow_charge_discriminator(&staged);
     let converged_after = staged.posted.elapsed();
     // Attach before pressure. After a PoolFull snapshot no command is sent until this already
     // running shipped observer sees the exact room's target, so a tick or a status/read request
@@ -1526,7 +1594,8 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
             if !full_ports.is_empty() {
                 assert_eq!(
                     pool["in_use"], pool["limit"],
-                    "APPARATUS: {name} reported PoolFull without a full pool: {}",
+                    "PRODUCT: {name} refused a legal flow-state reservation as PoolFull while \
+                     shipped status reported unused capacity: {}",
                     shown.status
                 );
                 pool_full_seen = true;

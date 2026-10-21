@@ -365,6 +365,19 @@ pub(super) struct Controller {
 
 impl Drop for Controller {
     fn drop(&mut self) {
+        self.cancel_archive_admission();
+        for index in 0..self.foreground_admission.len() {
+            self.cancel_foreground_admission(index);
+        }
+        for (_, admission) in std::mem::take(&mut self.room_admission) {
+            admission.task.abort();
+        }
+        for (_, admission) in std::mem::take(&mut self.secret_admission) {
+            admission.task.abort();
+        }
+        for (_, admission) in std::mem::take(&mut self.byte_admission) {
+            admission.task.abort();
+        }
         for (_, admission) in std::mem::take(&mut self.pool_admission) {
             admission.task.abort();
         }
@@ -1892,19 +1905,9 @@ impl Node {
                     self.governance_work.pending = true;
                 }
                 if index == 0 {
-                    if self.bounded_sync.deferred.len() == 8 {
-                        if let Some(old) = self.bounded_sync.deferred.pop_front() {
-                            if let Some(hint) = old.hint {
-                                self.history_hints.finish(
-                                    old.room,
-                                    old.hint_peer,
-                                    hint.author,
-                                    hint.head,
-                                );
-                            }
-                            self.bounded_sync.dispose(old);
-                        }
-                    }
+                    // The controller-wide retained-flow permit already bounds this collection.
+                    // Never evict an exact required/hint/inventory root merely because some
+                    // arbitrary number of other ports are also deferred.
                     self.bounded_sync.deferred.push_back(flow);
                 } else {
                     self.bounded_sync.ready[index] = Some(flow);
@@ -2003,6 +2006,7 @@ impl Node {
                     .is_some_and(|flow| flow.room == room && flow.peer == peer && !flow.waiting)
         });
         let mut admitted_archive = None;
+        let mut admitted_control = None;
         let mut flow = if let Some(index) = existing {
             let Some(flow) = self.bounded_sync.ready[index].take() else {
                 return false;
@@ -2092,6 +2096,8 @@ impl Node {
                         return false;
                     }
                 };
+                let actor_incarnation = state_job.flow_owner();
+                admitted_control = Some(state_job.clone());
 
                 // Inventory must first advertise the new local departure. Once that fixed
                 // exchange completes, probe only our own exact head; no archive is followed.
@@ -2171,7 +2177,8 @@ impl Node {
                             dispatch.fence,
                             self.bounded_sync.body_slots.clone(),
                             store.clone(),
-                            state_job.clone(),
+                            Arc::clone(&self.history_budget),
+                            actor_incarnation,
                         )
                     } else {
                         if self.bounded_sync.ready[0].is_some()
@@ -2217,7 +2224,8 @@ impl Node {
                             required,
                             self.bounded_sync.body_slots.clone(),
                             store.clone(),
-                            state_job.clone(),
+                            Arc::clone(&self.history_budget),
+                            actor_incarnation,
                         ) {
                             Ok(flow) => {
                                 if let Some(at) = required_at {
@@ -2277,7 +2285,8 @@ impl Node {
                         required,
                         self.bounded_sync.body_slots.clone(),
                         store.clone(),
-                        state_job.clone(),
+                        Arc::clone(&self.history_budget),
+                        actor_incarnation,
                     ) {
                         Ok(flow) => {
                             if let Some(at) = required_at {
@@ -2336,6 +2345,28 @@ impl Node {
                     }
                 }
             }
+        } else if lane == crate::node::history_budget::Lane::Control {
+            if let Some(job) = admitted_control.take() {
+                job
+            } else {
+                match self.bounded_sync.foreground_turn(
+                    &self.history_budget,
+                    &self.net_tx,
+                    &mut self.next_token,
+                    node,
+                    room,
+                    peer,
+                    flow.root_name(),
+                    lane,
+                ) {
+                    ForegroundTurn::Ready(job) => job,
+                    ForegroundTurn::Waiting | ForegroundTurn::Full => {
+                        self.note_start(room, peer, "control_budget_busy");
+                        self.shelve_exact(flow, index);
+                        return false;
+                    }
+                }
+            }
         } else {
             match self.bounded_sync.foreground_turn(
                 &self.history_budget,
@@ -2356,11 +2387,37 @@ impl Node {
                 }
             }
         };
+        // Flow-state bytes always come from Control. A newly created flow reuses the construction
+        // job; a resumed non-Control flow admits a fresh Control job for this round only. Neither
+        // worker survives `Flow::park` because the state charge owns its final reference.
+        let state_job = if lane == crate::node::history_budget::Lane::Control {
+            job.clone()
+        } else if let Some(job) = admitted_control.take() {
+            job
+        } else {
+            match self.bounded_sync.foreground_turn(
+                &self.history_budget,
+                &self.net_tx,
+                &mut self.next_token,
+                node,
+                room,
+                peer,
+                flow.root_name(),
+                crate::node::history_budget::Lane::Control,
+            ) {
+                ForegroundTurn::Ready(job) => job,
+                ForegroundTurn::Waiting | ForegroundTurn::Full => {
+                    self.note_start(room, peer, "control_budget_busy");
+                    self.shelve_exact(flow, index);
+                    return false;
+                }
+            }
+        };
         // The Control bytes the flow state costs, from the same budget gate (ADR-038 FX-35):
         // their refusal is the control budget's, never the pool's, and they go back with the
         // flow if a later gate ends the attempt.
-        let bytes_wake = flow.state_bytes_wake();
-        let Some(state_bytes) = flow.reserve_state_bytes() else {
+        let bytes_wake = Flow::state_bytes_wake(&state_job);
+        let Some(state_bytes) = flow.reserve_state_bytes(&state_job) else {
             self.bounded_sync.wait_for_bytes(
                 &self.net_tx,
                 &mut self.next_token,
@@ -2393,8 +2450,8 @@ impl Node {
         // is a running round's; if it ever does, the attempt ends like any other gate's: the
         // exact flow parked, the lane job and the slot taken above given back on return, and the
         // port keeps its need.
-        let flow_state_wake = flow.flow_state_wake();
-        match flow.resume(state_bytes) {
+        let flow_state_wake = Flow::flow_state_wake(&state_job);
+        match flow.resume(&state_job, state_bytes) {
             crate::node::history_stream::runtime::Resumed::Held => {}
             crate::node::history_stream::runtime::Resumed::PoolFull => {
                 self.note_start(room, peer, "flow_state_pool_full");
