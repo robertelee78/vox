@@ -7,7 +7,8 @@
   2026-10-20 (FX-28–FX-34: the idle daemon's disk and CPU, measured on v0.4.9, the own-feed
   recovery ruling of 2026-10-19, a retention change that poisoned a room, and a node on Linux
   that could not be unlocked); amended 2026-10-21 (FX-35: a daemon whose parked flows held
-  the flow-state pool synced nothing)
+  the flow-state pool synced nothing); amended 2026-10-21 (FX-37: room creation overflowed a
+  normal Tokio worker stack while reconstructing an ML-DSA root key for one signature)
 - **Deciders**: Robert E. Lee
 - **Tags**: trust, daemon identity, sessions, presence, agent comms, sync, health, releases
 - **Related**: ADR-018, ADR-020, ADR-026, ADR-029, ADR-031, ADR-033, ADR-034, ADR-035, ADR-036,
@@ -187,7 +188,7 @@ The decider then answered twelve questions, one at a time. His answers are the d
   MUST run on the VM setup (the macOS guests of the v0.4.4 app-proof work), not on his working
   Macs ("use the VM stuffs so I'm not losing ability to use my macs").
 - **FX-21.** Every product requirement above (FX-1–FX-10, FX-12–FX-18, FX-22–FX-24, FX-26,
-  FX-27, FX-28–FX-35) lands with a proof that drives the shipped `vox` binary as a person
+  FX-27, FX-28–FX-35, FX-37) lands with a proof that drives the shipped `vox` binary as a person
   would, with a mutant that turns it red on its own assertion (ADR-018). The two-computer requirements
   (FX-2–FX-7) are proved by two daemons in two data roots on one machine. FX-11's design, FX-19,
   FX-20 and FX-25 are process rulings: FX-19's record is each closed release milestone, FX-20's
@@ -436,6 +437,33 @@ The decider then answered twelve questions, one at a time. His answers are the d
   pool full (16 of 16) by the first fifth of the run with 1,951 flows started before and none
   after, the outbound slots 0 of 16 in use and the archive lane empty throughout. The product
   said only the symptom. "please make vox work"; "be methodical" (the decider, 2026-10-21).
+- **FX-37.** A software root signer MUST retain the ML-DSA signing key constructed from its
+  seed and MUST reuse that key's cached public and expanded signing material. Asking the signer
+  for its public key or a signature MUST NOT reconstruct the signing key from its seed. The
+  retained library `SigningKey` MUST keep its existing zeroize-on-drop behavior; Vox MUST NOT
+  make the containing secret clonable; encrypted backup MUST copy the same seed directly from
+  that key into zeroizing memory; the fingerprint, public-key bytes, deterministic signature
+  behavior and restored identity MUST remain seed-identical. The one expansion already performed
+  during signer construction remains; FX-37 removes per-operation reconstruction and does not
+  claim that construction performs no work on a Tokio worker.
+
+  Measured cause, 2026-10-21: the shipped-binary room journey failed twice on exact FX-14
+  candidate `48e8daccd2c80010fcc21dc274003c03cb5e4331` and once on untouched `origin/main`
+  `7fb5a8068a3aeb36589fac73155e415bde3d5f2a`. In every run `vox room create` lost a Ready
+  daemon to `tokio-rt-worker has overflowed its stack`; each run used fresh explicit scratch
+  data and config roots and began below machine load 6. LLDB stopped at the guard page with the
+  exact product path `finish_create_channel_unboxed` → `Node::publish_channel_locally` →
+  `NodeNet::own_records` → `RendezvousRecord::build` → `CompositeSecret::sign` →
+  `CompositeSecret::ml_dsa_key` → `ml_dsa::SigningKey::from_seed` → ML-DSA expanded-key
+  verification-matrix cloning. The signer kept only its 32-byte ML-DSA seed and repeated that
+  expansion for every signature. On unchanged main, giving the process a 16 MiB worker stack
+  made the same journey pass; that isolates finite stack exhaustion but is diagnostic evidence,
+  not a fix. A larger worker stack, quota, pacing delay or timeout MUST NOT substitute for
+  removing the repeated expansion. The shipped debug daemon on its normal runtime MUST create a
+  room, post, read the post and remain running. An isolated mutant that restores per-sign key
+  reconstruction MUST turn that room-create claim PRODUCT red with the reproduced worker-stack
+  overflow.
+
 ## Unchanged rulings
 
 The decider confirmed these on 2026-10-19 ("that still sounds right to me"): no human/agent
@@ -463,6 +491,7 @@ Narrow successor amendments. Requirements not named here remain in force.
 | PRD-001 R7, R8; ADR-023 M23.1: the admin sets the room's retention; it applies to what is stored at the next sweep | Preserved; FX-33 adds that the sweep never stops the room |
 | ADR-028 K-10, ADR-031 CW-2, CW-7: a node unlocked at a terminal is remembered in the Keychain so the daemon makes it Ready at each start | Preserved where a credential store exists (the Keychain); FX-34 adds that unlocking never depends on remembering, that Linux remembers nothing for now, and that Vox never writes a passphrase file on its own |
 | ADR-037 R7, R11; ADR-026: a bounded flow keeps its state between turns, within a daemon-wide pool | FX-35 adds that a flow-state pool charge is held only while a round runs, so the pool never accounts for flows at rest (nothing is disposed by time), and that the latest start attempt's outcome is reported for every port |
+| No predecessor: the software root signer reconstructed its expanded ML-DSA key for every public-key read and signature | FX-37 retains the zeroizing library signing key built from the seed and reuses its cached public and expanded signing material; a larger worker stack or an elapsed-work workaround is not the fix |
 | ADR-034 §5 "Health is true" (HL-1, HL-2), PRD-001 R35 | The lane's completed rounds are completed syncs (FX-16); the control socket answers under sync load (FX-17) |
 
 ## Implementation order and related work
@@ -481,6 +510,8 @@ Narrow successor amendments. Requirements not named here remain in force.
    daemon (v0.4.9) on 2026-10-20, in that order (the tick, the re-pull, the flush, the lock);
    FX-32 under #934; FX-33 and FX-34 with them; FX-35 first among them, since until it lands
    the reproduced four-node daemon syncs nothing; one cut (v0.4.10).
+9. FX-37 is an immediate cross-cutting v0.4.10 blocker: until the normal shipped daemon can
+   create a room, every room journey that reaches creation is red regardless of its own change.
 
 Each ADR change under this record is reviewed by an independent session (opencode-work) before
 its stories are extracted.
@@ -493,12 +524,17 @@ its stories are extracted.
   nodes drive the agents, and no keyring is edited by hand.
 - A room's roster says who is really there: which Sessions, on which node.
 - An idle Vox is idle, and a red banner is true.
+- Creating and publishing a room reuses already-constructed signing material instead of risking
+  the daemon on each signature.
 
 ### Negative
 
 - Delivering into idle harness windows through tmux ties Vox to how the person runs harnesses;
   it is explicit and per harness.
 - Deleting legacy recovery orphans rooms created before v0.4.5; the decider accepts that.
+- A software signer retains expanded ML-DSA secret material for its lifetime. The seed already
+  carries the same cryptographic authority, and the library zeroizes both on drop; the tradeoff
+  is additional resident secret memory in exchange for bounded stack use on every signature.
 
 ### Neutral
 
