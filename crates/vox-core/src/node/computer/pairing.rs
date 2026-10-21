@@ -6,7 +6,7 @@ use crate::nat::multiaddr::{EndpointList, Multiaddr};
 use crate::node::network::NodeNet;
 use crate::node::presence::NetPresence;
 use crate::transport::{
-    framing::{read_frame_within, write_frame},
+    framing::{read_frame, read_frame_within, write_frame},
     quic::VoxConnection,
     streams::{self, StreamKind},
 };
@@ -281,6 +281,15 @@ pub struct Management {
     /// Per computer: when this node last exchanged state with it, and how many exchanges in a row
     /// failed since one succeeded. What `retry` keys its cadence on (ADR-038 FX-15; #989).
     exchanged: Mutex<BTreeMap<Digest32, Exchanged>>,
+    /// Coalesced reasons to reconsider the exact next exchange deadline: local state, a real
+    /// network change, an authenticated peer connection/stream, or an attempt ending.
+    retry_wake: Arc<tokio::sync::Notify>,
+    /// Failed peers whose authenticated reachability or machine path changed since their last
+    /// attempt. Consumed once by `retry`, bypassing only that attempt's time backoff.
+    retry_ready: Mutex<BTreeSet<Digest32>>,
+    /// At most one authenticated reachability waiter per failing computer. Its one stream is
+    /// retained by QUIC through a transient path outage and wakes retry when the path carries it.
+    reachability_waiters: Mutex<BTreeMap<Digest32, (u64, tokio::task::AbortHandle)>>,
 }
 
 /// One computer's exchange record.
@@ -379,6 +388,7 @@ impl Drop for Reserved {
         {
             inflight.remove(&self.peer);
         }
+        self.me.retry_wake.notify_one();
     }
 }
 
@@ -405,6 +415,7 @@ impl Drop for Attempt {
             );
         }
         inflight.remove(&self.peer);
+        self.me.retry_wake.notify_one();
     }
 }
 
@@ -414,11 +425,13 @@ const EXCHANGE_FALLBACK: Duration = Duration::from_secs(60);
 /// A computer that could not be reached is tried again after this, doubling per failure.
 const EXCHANGE_BACKOFF: Duration = Duration::from_secs(2);
 /// The longest a failing computer waits between attempts.
-const EXCHANGE_BACKOFF_MAX: Duration = Duration::from_secs(120);
-/// An exchange that has not finished by then counts as failed and is tried again after its
-/// backoff: a computer that hangs must not stay "in flight" forever. Generous, because a
-/// slow but valid exchange of a long history must complete; no other computer waits on it.
-const EXCHANGE_WITHIN: Duration = Duration::from_secs(600);
+const EXCHANGE_BACKOFF_MAX: Duration = COMPUTER_RETURN_SHOWN_WITHIN;
+/// An authenticated no-state-change request held on a failed peer's QUIC connection. Its stream
+/// is written once; QUIC wakes it on delivery when a transient path becomes reachable again.
+const REACHABILITY_WAKE_OP: u64 = 3;
+/// An operator's enrollment ceremony may carry a long retained history, but never holds its
+/// explicit command forever. Ordinary convergence uses [`COMPUTER_RETURN_SHOWN_WITHIN`].
+const PAIR_WITHIN: Duration = Duration::from_secs(600);
 impl Management {
     /// The account's explicit host:port lookup uses its existing socket, but no management
     /// identity or authority. The returned fingerprint is proved; lookup persists no anchor source.
@@ -551,6 +564,9 @@ impl Management {
             transport_cache: Mutex::new(BTreeMap::new()),
             revoked_transport: Mutex::new(Default::default()),
             exchanged: Mutex::new(BTreeMap::new()),
+            retry_wake: Arc::new(tokio::sync::Notify::new()),
+            retry_ready: Mutex::new(BTreeSet::new()),
+            reachability_waiters: Mutex::new(BTreeMap::new()),
         });
         let weak = Arc::downgrade(&me);
         tokio::spawn(async move {
@@ -559,6 +575,9 @@ impl Management {
                     return;
                 };
                 let filed = me.net.manager().take_inbound(c).await;
+                // The identity exchange completed before `take_inbound`: no unauthenticated
+                // packet can wake a computer exchange.
+                me.retry_peer_now(filed.kept.peer_id());
                 me.serve(filed.kept);
                 if let Some(c) = filed.also_serve {
                     me.serve(c);
@@ -567,15 +586,43 @@ impl Management {
         });
         let weak = Arc::downgrade(&me);
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(2));
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let Some(me) = weak.upgrade() else { return };
+            let mut changes = me.computer.changes();
+            let mut network = me.net.presence().changes();
+            let wake = Arc::clone(&me.retry_wake);
+            drop(me);
             loop {
-                tick.tick().await;
                 let Some(me) = weak.upgrade() else {
                     return;
                 };
-                if let Err(e) = me.retry().await {
-                    *lock(&me.problem) = Some(e.to_string());
+                let next = match me.retry().await {
+                    Ok(next) => next,
+                    Err(e) => {
+                        *lock(&me.problem) = Some(e.to_string());
+                        Some(std::time::Instant::now() + EXCHANGE_FALLBACK)
+                    }
+                };
+                drop(me);
+                let deadline = async {
+                    match next {
+                        Some(at) => tokio::time::sleep_until(at.into()).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                };
+                tokio::select! {
+                    () = deadline => {}
+                    () = wake.notified() => {}
+                    changed = changes.changed() => {
+                        if changed.is_err() { return; }
+                    }
+                    changed = network.recv() => {
+                        if matches!(changed, Err(tokio::sync::broadcast::error::RecvError::Closed)) {
+                            return;
+                        }
+                        if let Some(me) = weak.upgrade() {
+                            me.retry_failed_now();
+                        }
+                    }
                 }
             }
         });
@@ -634,6 +681,9 @@ impl Management {
                     streams::refuse(&mut send, &mut recv);
                     continue;
                 }
+                // Reaching this point required the authenticated QUIC connection and a typed
+                // computer stream. Coalesce the wake; the request below is answered separately.
+                me.retry_peer_now(conn.peer_id());
                 let Ok(slot) = Arc::clone(&me.slots).try_acquire_owned() else {
                     streams::refuse(&mut send, &mut recv);
                     continue;
@@ -898,7 +948,7 @@ impl Management {
         let me = Arc::clone(self);
         let (link_owned, url_owned) = (link, url.to_owned());
         let task = tokio::spawn(async move {
-            tokio::time::timeout(EXCHANGE_WITHIN, me.pair(&link_owned, &url_owned)).await
+            tokio::time::timeout(PAIR_WITHIN, me.pair(&link_owned, &url_owned)).await
         });
         reserved.abort = Some(task.abort_handle());
         if let Some(flight) = lock(&self.inflight).get_mut(&target) {
@@ -1759,6 +1809,9 @@ impl Management {
     ) -> Result<()> {
         let (op, peer, id) = read_hello(recv, conn).await?;
         write_frame(send, &hello(op, &self.computer.description(), &id)).await?;
+        if op == REACHABILITY_WAKE_OP {
+            return Ok(());
+        }
         if op == 2 {
             let payload = frame(recv).await?;
             // A merge that moves this daemon's revision is a change here (ADR-038 FX-28). The
@@ -1865,8 +1918,32 @@ impl Management {
         self.record_answered(conn.peer_id(), revision);
         Ok(())
     }
-    async fn retry(self: &Arc<Self>) -> Result<()> {
-        let (peers, attempted, revision) = {
+    /// Wake one failed peer from authenticated connection/application activity. A peer that has
+    /// no failed exchange cannot spend work by sending streams: it is not put on this set.
+    fn retry_peer_now(&self, peer: Digest32) {
+        if lock(&self.exchanged)
+            .get(&peer)
+            .is_some_and(|record| record.failures > 0)
+        {
+            lock(&self.retry_ready).insert(peer);
+            self.retry_wake.notify_one();
+        }
+    }
+
+    /// A real machine network transition may restore any failed peer's path.
+    fn retry_failed_now(&self) {
+        let failed: Vec<_> = lock(&self.exchanged)
+            .iter()
+            .filter_map(|(peer, record)| (record.failures > 0).then_some(*peer))
+            .collect();
+        if !failed.is_empty() {
+            lock(&self.retry_ready).extend(failed);
+            self.retry_wake.notify_one();
+        }
+    }
+
+    async fn retry(self: &Arc<Self>) -> Result<Option<std::time::Instant>> {
+        let (peers, attempted, revision, mut next) = {
             let s = lock(&self.computer.state);
             let local = self.computer.signer.fingerprint();
             let mut peers: std::collections::BTreeSet<_> = s
@@ -1902,8 +1979,10 @@ impl Management {
                 })
                 .flatten();
             let now = std::time::Instant::now();
+            let mut next: Option<std::time::Instant> = None;
             let revision = s.revision;
             let mut exchanged = lock(&self.exchanged);
+            let retry_ready = lock(&self.retry_ready);
             // A computer no longer paired (removed, or its pairing cancelled) keeps its
             // counts, which are "since the daemon started" and survive its re-enrollment, but
             // not its failure: that must not stand in the status for good.
@@ -1924,6 +2003,7 @@ impl Management {
             }
             peers.retain(|peer| {
                 let record = exchanged.get(peer).cloned().unwrap_or_default();
+                let reachability_restored = retry_ready.contains(peer);
                 if let Some(last) = record.last {
                     if record.failures > 0 {
                         // 2 s after the first failure, doubling, at most EXCHANGE_BACKOFF_MAX;
@@ -1933,7 +2013,9 @@ impl Management {
                             .min(EXCHANGE_BACKOFF_MAX);
                         let unchanged = record.revision == revision
                             && record.involved == (involved == Some(*peer));
-                        if unchanged && now.duration_since(last) < wait {
+                        if unchanged && !reachability_restored && now.duration_since(last) < wait {
+                            let due = last + wait;
+                            next = Some(next.map_or(due, |held| held.min(due)));
                             return false;
                         }
                     } else {
@@ -1945,12 +2027,15 @@ impl Management {
                             && involved != Some(*peer)
                             && now.duration_since(last) < EXCHANGE_FALLBACK
                         {
+                            let due = last + EXCHANGE_FALLBACK;
+                            next = Some(next.map_or(due, |held| held.min(due)));
                             return false;
                         }
                     }
                 }
                 true
             });
+            drop(retry_ready);
             drop(exchanged);
             // Reserved under one lock, after every other filter: a computer already in
             // flight (with the retry or with the operator's pairing) is left alone, and no
@@ -1987,6 +2072,10 @@ impl Management {
                             superseded: false,
                         },
                     );
+                    // Consume a reachability event only after it has actually reserved the
+                    // replacement attempt. If an older attempt is still in flight, its drop
+                    // wakes the scheduler and the event remains ready for that next pass.
+                    lock(&self.retry_ready).remove(peer);
                     // A round counts from its start: one in flight, or cut, is a round too.
                     let mut exchanged = lock(&self.exchanged);
                     let record = exchanged.entry(*peer).or_default();
@@ -2029,7 +2118,7 @@ impl Management {
                     (peer, endpoints, url)
                 })
                 .collect::<Vec<_>>();
-            (peers, attempted, revision)
+            (peers, attempted, revision, next)
         };
         for (peer, endpoints, url) in peers {
             let me = Arc::clone(self);
@@ -2050,17 +2139,19 @@ impl Management {
             let task = tokio::spawn(async move {
                 // Each computer's outcome is recorded by its own task the moment it ends,
                 // dated then: a slow computer never delays another's record, status or next
-                // attempt, and one that hangs counts as failed after EXCHANGE_WITHIN.
-                let outcome =
-                    match tokio::time::timeout(EXCHANGE_WITHIN, me.sync_peer(peer, endpoints, url))
-                        .await
-                    {
-                        Ok(Ok(revisions)) => Ok(revisions),
-                        Ok(Err(e)) => Err(e.to_string()),
-                        Err(_) => Err(format!(
-                            "the exchange did not finish within {EXCHANGE_WITHIN:?}"
-                        )),
-                    };
+                // attempt, and one that hangs counts as failed inside the user-visible contract.
+                let outcome = match tokio::time::timeout(
+                    COMPUTER_RETURN_SHOWN_WITHIN,
+                    me.sync_peer(peer, endpoints, url),
+                )
+                .await
+                {
+                    Ok(Ok(revisions)) => Ok(revisions),
+                    Ok(Err(e)) => Err(e.to_string()),
+                    Err(_) => Err(format!(
+                        "the exchange did not finish within {COMPUTER_RETURN_SHOWN_WITHIN:?}"
+                    )),
+                };
                 guard.done(outcome);
             });
             // Installed on this flight only: a flight that ended and was replaced meanwhile
@@ -2071,7 +2162,12 @@ impl Management {
                 }
             }
         }
-        Ok(())
+        // A spawned attempt wakes this scheduler when its reservation ends. Until then the exact
+        // deadline of another peer (if any) is the only timer; with no work there is no polling.
+        if next.is_some_and(|at| at <= std::time::Instant::now()) {
+            next = Some(std::time::Instant::now());
+        }
+        Ok(next)
     }
     /// Record one attempt's outcome for `peer`, now: `last` paces the next attempt whether it
     /// succeeded or not; `last_ms`, what a person reads as the last exchange, is set only by a
@@ -2079,7 +2175,7 @@ impl Management {
     /// none: it never clears while a failure stands, and never stands once every computer is
     /// exchanged with again.
     fn record_exchange(
-        &self,
+        self: &Arc<Self>,
         peer: Digest32,
         revision: u64,
         involved: bool,
@@ -2090,6 +2186,7 @@ impl Management {
         record.last = Some(std::time::Instant::now());
         record.revision = revision;
         record.involved = involved;
+        let failed = outcome.is_err();
         match outcome {
             Ok((sent_revision, merged_revision)) => {
                 let at_ms = now();
@@ -2112,6 +2209,67 @@ impl Management {
             .values()
             .filter(|r| r.failures > 0)
             .find_map(|r| r.problem.clone());
+        drop(exchanged);
+        if failed {
+            self.arm_reachability_waiter(peer);
+        } else if let Some((_, waiter)) = lock(&self.reachability_waiters).remove(&peer) {
+            waiter.abort();
+        }
+    }
+
+    /// After an exchange has failed on a still-held authenticated connection, put one computer
+    /// hello on that connection and leave it there. QUIC retransmits the one write; no timer and
+    /// no repeated probe is needed. When the path carries authenticated packets again, the peer's
+    /// computer-stream answer completes this waiter and directly wakes the scheduler.
+    fn arm_reachability_waiter(self: &Arc<Self>, peer: Digest32) {
+        let Some(conn) = self.net.manager().held(&peer) else {
+            return;
+        };
+        let mut waiters = lock(&self.reachability_waiters);
+        if waiters.contains_key(&peer) {
+            return;
+        }
+        let serial = next_flight();
+        let start = Arc::new(tokio::sync::Notify::new());
+        let started = Arc::clone(&start);
+        let weak = Arc::downgrade(self);
+        let description = self.computer.description();
+        let task = tokio::spawn(async move {
+            started.notified().await;
+            let result = async {
+                let (mut send, mut recv) = streams::open_typed(&conn, StreamKind::Computer).await?;
+                write_frame(
+                    &mut send,
+                    &hello(REACHABILITY_WAKE_OP, &description, &[0; 32]),
+                )
+                .await?;
+                let response = read_frame(&mut recv, MAX_FRAME)
+                    .await?
+                    .ok_or(Error::Profile(
+                        "computer reachability peer closed before answering",
+                    ))?;
+                let (op, _, _) = parse_hello(&response, &conn)?;
+                if op != REACHABILITY_WAKE_OP {
+                    return Err(bad());
+                }
+                Result::<()>::Ok(())
+            }
+            .await;
+            if let Some(me) = weak.upgrade() {
+                let mut held = lock(&me.reachability_waiters);
+                if held.get(&peer).is_some_and(|(held, _)| *held == serial) {
+                    held.remove(&peer);
+                }
+                drop(held);
+                // Success is authenticated reachability restored. Closure is an authenticated
+                // connection event too: retry may establish a replacement without waiting for
+                // the fallback deadline. Both are coalesced with every other reason to retry.
+                let _ = result;
+                me.retry_peer_now(peer);
+            }
+        });
+        waiters.insert(peer, (serial, task.abort_handle()));
+        start.notify_one();
     }
     /// One exchange this node starts with `peer`: this node's revision as sent, and after the
     /// computer's state was merged.
@@ -2188,7 +2346,10 @@ async fn read_hello(
     conn: &VoxConnection,
 ) -> Result<(u64, Description, Digest32)> {
     let f = frame(recv).await?;
-    let mut d = Decoder::new(&f);
+    parse_hello(&f, conn)
+}
+fn parse_hello(f: &[u8], conn: &VoxConnection) -> Result<(u64, Description, Digest32)> {
+    let mut d = Decoder::new(f);
     arity(&mut d, 5)?;
     if d.uint()? != PROTOCOL || d.uint()? != u64::from(conn.session().suite_id) {
         return Err(Error::Profile(

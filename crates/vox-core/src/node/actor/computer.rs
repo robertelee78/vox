@@ -3,6 +3,39 @@ use super::*;
 use crate::identity::composite::RootSigner;
 use crate::node::trust::HistoryGrant;
 
+/// **Test-only** (`test-knobs`): `<node>\t<milliseconds>\t<marker path>`. Once the marker exists,
+/// that node holds its next computer-policy actor message long enough for a shipped-binary proof
+/// to establish that apply-or-detach is independent of queued node work. Shipped builds neither
+/// name nor read this variable (V210-105).
+#[cfg(feature = "test-knobs")]
+const TEST_HOLD_COMPUTER_POLICY_ENV: &str = "VOX_TEST_HOLD_COMPUTER_POLICY";
+
+#[cfg(feature = "test-knobs")]
+impl Node {
+    pub(super) async fn hold_computer_policy_for_proof(&self) {
+        let Ok(spec) = std::env::var(TEST_HOLD_COMPUTER_POLICY_ENV) else {
+            return;
+        };
+        let mut fields = spec.splitn(3, '\t');
+        let (Some(node), Some(milliseconds), Some(marker)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            return;
+        };
+        let mine = self
+            .paths
+            .profile_dir
+            .file_name()
+            .and_then(|name| name.to_str());
+        let Some(delay) = milliseconds.parse::<u64>().ok() else {
+            return;
+        };
+        if mine == Some(node) && std::path::Path::new(marker).is_file() {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
+    }
+}
+
 impl NodeHandle {
     /// Current daemon policy for rendering individual Trust actions. This is an observation,
     /// never an authorization token: every mutation reconciles and checks policy again.

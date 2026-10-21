@@ -12,22 +12,31 @@
 
 #![allow(clippy::unwrap_used)]
 
-#[path = "support/attach.rs"]
-mod unlock_staging;
-
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
-#[path = "support/layout.rs"]
-mod layout;
+#[path = "support/world.rs"]
+mod world;
+use world::{attach as unlock_staging, typed};
 
-#[path = "support/typed.rs"]
-mod typed;
+#[path = "support/relay.rs"]
+mod relay;
+
+#[path = "support/port_forward.rs"]
+mod port_forward;
+
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+use vox_core::node::computer::{
+    COMPUTER_CHANGE_SHOWN_WITHIN as CHANGE_SHOWN_WITHIN,
+    COMPUTER_REACHABILITY_EVENT_SHOWN_WITHIN as REACHABILITY_EVENT_SHOWN_WITHIN,
+    COMPUTER_RETURN_SHOWN_WITHIN as RETURN_WITHIN,
+};
 
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 const PASS: &str = "identity passphrase";
@@ -44,7 +53,7 @@ impl Drop for Account {
     /// A daemon a client started for this account (no child of this proof) is stopped by the pid
     /// in its lock, however the proof ends.
     fn drop(&mut self) {
-        layout::reap_daemon(&self.data);
+        world::reap_daemon(&self.data);
     }
 }
 
@@ -80,18 +89,13 @@ impl Account {
                 c.env(key, v);
             }
         }
-        c.args(crate::unlock_staging::persistent_args(
-            &self.data, args, PASS,
-        ))
-        .env(
-            "VOX_TEST_KEYCHAIN",
-            crate::unlock_staging::keychain(&self.data),
-        )
-        .env("HOME", self._tmp.path().join("home"))
-        .env("VOX_DATA_DIR", &self.data)
-        .env("VOX_CONFIG_DIR", &self.cfg)
-        .env("VOX_LISTEN", "127.0.0.1:0")
-        .env("VOX_IDENTITY_PASSPHRASE", PASS);
+        c.args(unlock_staging::persistent_args(&self.data, args, PASS))
+            .env("VOX_TEST_KEYCHAIN", unlock_staging::keychain(&self.data))
+            .env("HOME", self._tmp.path().join("home"))
+            .env("VOX_DATA_DIR", &self.data)
+            .env("VOX_CONFIG_DIR", &self.cfg)
+            .env("VOX_LISTEN", "127.0.0.1:0")
+            .env("VOX_IDENTITY_PASSPHRASE", PASS);
         c
     }
 
@@ -956,15 +960,15 @@ fn pair_computers(
 // the daemon's log if SIGTERM does not establish staging, then use the existing scratch crash
 // helper and verify that no daemon holds this account's lock before continuing.
 fn offline_for_enrollment(account: &Account, label: &str) {
-    if let Some(pid) = layout::daemon_pid(&account.data) {
+    if let Some(pid) = world::daemon_pid(&account.data) {
         stop_pid(pid);
     }
-    if layout::daemon_pid(&account.data).is_some() {
+    if world::daemon_pid(&account.data).is_some() {
         eprintln!("APPARATUS: {label} did not release its lock after SIGTERM; staging a scratch host loss. Daemon log: {}",account.log());
-        layout::kill_daemon(&account.data);
+        world::kill_daemon(&account.data);
     }
     assert!(
-        layout::daemon_pid(&account.data).is_none(),
+        world::daemon_pid(&account.data).is_none(),
         "APPARATUS: {label} still holds its daemon lock after scratch hard-stop"
     );
 }
@@ -2385,13 +2389,6 @@ const SAMPLE_EVERY: Duration = Duration::from_secs(5);
 /// CPU time a daemon may spend over [`PAIRED_IDLE`] with nothing to settle: the quiet bound of
 /// a paired computer (ADR-038 FX-15, FX-28).
 const IDLE_CPU: Duration = Duration::from_secs(3);
-/// How soon after a change to computer trust `vox computer status` shows it applied (ADR-038
-/// FX-28): on the daemon where it was made, after the change; on the other daemon, after the
-/// exchange the changing daemon started for it completed.
-const CHANGE_SHOWN_WITHIN: Duration = Duration::from_secs(5);
-/// How soon after an unreachable computer becomes reachable again a change made meanwhile shows
-/// applied on it: the fallback exchange's period (ADR-038 FX-28).
-const RETURN_WITHIN: Duration = Duration::from_secs(60);
 /// Staging: how long the exchange that carries a change to the other computer, and the receipts
 /// that confirm it on both, may take before the proof gives up on the pair.
 const EXCHANGE_WITHIN: Duration = Duration::from_secs(60);
@@ -2414,12 +2411,11 @@ const EXCHANGE_WITHIN: Duration = Duration::from_secs(60);
 /// nothing changed, and every binding there shows the same policy revision and the same derived
 /// moment as before.
 ///
-/// A change made while the other computer is unreachable arrives when it returns: beta's daemon
-/// is stopped, gamma is made alpha's personal node (drive moves from alpha to gamma), alpha's
-/// status shows it applied within [`CHANGE_SHOWN_WITHIN`] and counts the exchange toward beta
-/// that could not complete; beta's daemon is started again, and within [`RETURN_WITHIN`] of
-/// that its status shows gamma personal with every binding there current and its keyrings
-/// granting gamma drive and alpha read, and both confirm each other again.
+/// A change made while the computers' only userspace path is closed arrives when that path is
+/// opened, with both daemon PIDs alive throughout. Within [`REACHABILITY_EVENT_SHOWN_WITHIN`] of
+/// the open, after every final status and trust observation finishes, beta shows gamma personal,
+/// every binding current and every expected keyring grant, and both computers confirmed. The
+/// exported broader [`RETURN_WITHIN`] contract still names a peer that must reconnect.
 ///
 /// Over [`PAIRED_IDLE`] of nothing changing, with four nodes hosted, each side's `vox computer
 /// status --json` MUST count at most [`IDLE_EXCHANGES`] more exchanges with the other and name
@@ -2430,6 +2426,10 @@ const EXCHANGE_WITHIN: Duration = Duration::from_secs(60);
 /// computer every 2 s and re-verified it, 47–95% of a core while nothing changed; and a 1 s tick
 /// re-derived every attached node's binding (an ML-DSA verification of every management event)
 /// with nothing changed, 21–24% of the busy CPU of a daemon idling at 0.63 of a core.
+/// Finally, a test-only held actor message keeps delta queued for 15 s while epsilon attaches.
+/// Within [`CHANGE_SHOWN_WITHIN`], after all final observations finish, beta has applied epsilon
+/// on its healthy node and `vox node list` shows delta no longer attached. Cleanup may continue;
+/// queued room/node work cannot turn a late observation into an apparent pass.
 ///
 /// Mutants: the need filter in `Management::retry` removed (every computer exchanged every
 /// tick) turns the exchange-count claim red on its own number; the 1 s reconcile tick restored
@@ -2437,20 +2437,49 @@ const EXCHANGE_WITHIN: Duration = Duration::from_secs(60);
 /// each binding was derived, and the CPU claim on its number; a merged exchange no longer
 /// treated as a change once the computer is confirmed (the follower not woken by it) turns the
 /// cross-daemon claim red: the other computer's bindings stay at their old revision and its
-/// keyrings never trust the new node.
+/// keyrings never trust the new node. Remove the one-shot reachability stream or its authenticated
+/// wake and the live-heal claim misses [`REACHABILITY_EVENT_SHOWN_WITHIN`] (PRODUCT). Restore a
+/// reconcile cutoff beyond five seconds, or await actor cleanup before moving the slot to
+/// `Detaching`, and held delta remains `Ready` past [`CHANGE_SHOWN_WITHIN`] (PRODUCT).
 #[test]
-#[ignore = "three minutes of two real vox daemons paired as computers; run in release"]
+#[ignore = "five minutes of two real vox daemons paired as computers; run in release"]
 fn two_paired_computers_that_are_idle_exchange_nothing() {
+    test_knobs::require(&["VOX_TEST_ADVERTISE", "VOX_TEST_HOLD_COMPUTER_POLICY"]);
     let a = Account::new();
     let b = Account::new();
     let alpha = a.make_node("alpha");
     let beta = b.make_node("beta");
-    // Beta's daemon listens on one port for the whole proof, restarts included, so that a
-    // restart with nothing changed advertises the same endpoints: a reach that moved would be
+    // Split loopback address families make this userspace forward the only direct path. Its
+    // open/close switch changes reachability without stopping either shipped daemon.
+    let listen_a = format!("127.0.0.1:{}", port_forward::free_v4_udp_port());
+    let forward = port_forward::PortForward::start(
+        listen_a
+            .parse()
+            .unwrap_or_else(|e| panic!("APPARATUS: constructed listen address is invalid: {e}")),
+        true,
+    );
+    let advertised = forward.public.to_string();
+    // Beta keeps one endpoint for the whole proof, restart included. A reach that moved would be
     // a change of its own, and the restart claim is that nothing is derived with none.
-    let listen_b = format!("127.0.0.1:{}", free_udp_port());
-    let da = Daemon::start(&a, &["--node", "alpha"], &[]);
-    let db = Daemon::start(&b, &["--node", "beta"], &[("VOX_LISTEN", &listen_b)]);
+    let listen_b = format!("[::1]:{}", free_v6_udp_port());
+    let hold_marker = b.data.join("hold-delta-computer-policy");
+    let hold_spec = format!("delta\t15000\t{}", hold_marker.display());
+    let da = Daemon::start(
+        &a,
+        &["--node", "alpha"],
+        &[
+            ("VOX_LISTEN", &listen_a),
+            ("VOX_TEST_ADVERTISE", &advertised),
+        ],
+    );
+    let db = Daemon::start(
+        &b,
+        &["--node", "beta"],
+        &[
+            ("VOX_LISTEN", &listen_b),
+            ("VOX_TEST_HOLD_COMPUTER_POLICY", &hold_spec),
+        ],
+    );
     // Each node is Ready before it is chosen as its computer's personal node.
     da.expect("node alpha is Ready", Duration::from_secs(90), |l| {
         l.contains("alpha is Ready")
@@ -2506,11 +2535,10 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
     change_shows_on_both((&b, &db, &nodes_b), (&a, &da, &nodes_a), "delta");
 
     // ---- a restart derives nothing: each binding's (revision, when) survives it -----------
-    let db = a_restart_derives_nothing((&a, &da), (&b, db, &nodes_b, &listen_b));
+    let db = a_restart_derives_nothing((&a, &da), (&b, db, &nodes_b, &listen_b, &hold_spec));
 
-    // ---- a change made while the peer is unreachable arrives when it returns --------------
-    let db =
-        change_reaches_a_returning_computer((&a, &da, &nodes_a), (&b, db, &nodes_b, &listen_b));
+    // ---- both live daemons converge when their userspace path is restored -----------------
+    change_reaches_a_live_computer((&a, &da, &nodes_a), (&b, &db, &nodes_b), &forward);
 
     // Let the confirmation's own exchanges settle before the idle minute is counted.
     std::thread::sleep(Duration::from_secs(10));
@@ -2701,6 +2729,9 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
         spent.0,
         spent.1
     );
+
+    // ---- one queued node applies or becomes non-attached without a late apparent pass -------
+    delayed_node_does_not_make_a_late_pass((&a, &da, &nodes_a), (&b, &db, &nodes_b), &hold_marker);
 }
 
 /// Unix milliseconds now, the clock `vox computer status` dates exchanges and bindings with.
@@ -2846,13 +2877,13 @@ fn change_shows_on_both(
         "APPARATUS: attach {new_node} on {}'s computer: {out}{err}",
         names_here[0]
     );
-    // On the daemon where the change was made. The clock is read before each look, and a
-    // success seen past the bound is as red as none.
+    // On the daemon where the change was made. The clock is read after each status/trust look,
+    // and a success seen past the bound is as red as none.
     let shown_here = loop {
-        let elapsed = attached.elapsed();
         let status = computer(changer, &["status"]);
         let keyrings = keyrings_complete(changer, here, &all);
         let shown = roster_current(&status, &names_here) && keyrings.is_ok();
+        let elapsed = attached.elapsed();
         if shown && elapsed <= CHANGE_SHOWN_WITHIN {
             break status;
         }
@@ -2978,11 +3009,11 @@ fn change_shows_on_both(
 }
 
 /// A UDP port nothing holds right now, for a daemon to listen on for the whole proof.
-fn free_udp_port() -> u16 {
-    std::net::UdpSocket::bind("127.0.0.1:0")
+fn free_v6_udp_port() -> u16 {
+    std::net::UdpSocket::bind("[::1]:0")
         .and_then(|socket| socket.local_addr())
         .map(|addr| addr.port())
-        .unwrap_or_else(|e| panic!("APPARATUS: no free UDP port: {e}"))
+        .unwrap_or_else(|e| panic!("APPARATUS: no free UDP port on [::1]: {e}"))
 }
 
 /// **A restart derives nothing** (ADR-038 FX-28; #1020): with nothing changed, beta's daemon
@@ -2992,7 +3023,7 @@ fn free_udp_port() -> u16 {
 /// computers confirm each other again (staging). Returns beta's new daemon.
 fn a_restart_derives_nothing(
     (a, da): (&Account, &Daemon),
-    (b, db, nodes_b, listen_b): (&Account, Daemon, &[(&str, &str)], &str),
+    (b, db, nodes_b, listen_b, hold_spec): (&Account, Daemon, &[(&str, &str)], &str, &str),
 ) -> Daemon {
     let names_b: Vec<&str> = nodes_b.iter().map(|(n, _)| *n).collect();
     let before = bindings_shown(&computer(b, &["status"]));
@@ -3002,7 +3033,14 @@ fn a_restart_derives_nothing(
     );
     let _stopped_said = db.stop();
     let restarted = Instant::now();
-    let db = Daemon::start(b, &["--node", "beta"], &[("VOX_LISTEN", listen_b)]);
+    let db = Daemon::start(
+        b,
+        &["--node", "beta"],
+        &[
+            ("VOX_LISTEN", listen_b),
+            ("VOX_TEST_HOLD_COMPUTER_POLICY", hold_spec),
+        ],
+    );
     db.expect("node beta is Ready", RETURN_WITHIN, |l| {
         l.contains("beta is Ready")
     });
@@ -3043,19 +3081,18 @@ fn a_restart_derives_nothing(
     db
 }
 
-/// **A change made while the other computer is unreachable arrives when it returns** (ADR-038
-/// FX-28; #1020). Beta's daemon is stopped; gamma is made alpha's personal node (drive moves
-/// from alpha to gamma: a grant and a revocation). Within [`CHANGE_SHOWN_WITHIN`] alpha's
-/// status shows it applied, with alpha's keyring granting gamma drive and gamma's granting
-/// alpha read; alpha's status then counts an exchange toward beta that could not complete.
-/// Beta's daemon is started again, and within [`RETURN_WITHIN`] of that its status shows gamma
-/// personal under alpha's computer with every binding of its own current, delta's keyring grants
-/// gamma drive and alpha read only, beta's grants gamma read, and both computers confirm each
-/// other again. Returns beta's new daemon.
-fn change_reaches_a_returning_computer(
+/// **A change made across a failed live path arrives on its authenticated restoration** (ADR-038
+/// FX-28; #1020). The userspace forward is the pair's only path. It closes while both daemons
+/// stay alive; gamma becomes alpha's personal node and alpha reaches four failed exchanges, whose
+/// next ordinary backoff is beyond the event bound. Opening that same path lets the one retained
+/// authenticated wake stream land. Only after beta's final
+/// status and trust observations, and both computers' final confirmation observations, is the
+/// elapsed time sampled.
+fn change_reaches_a_live_computer(
     (a, da, nodes_a): (&Account, &Daemon, &[(&str, &str)]),
-    (b, db, nodes_b, listen_b): (&Account, Daemon, &[(&str, &str)], &str),
-) -> Daemon {
+    (b, db, nodes_b): (&Account, &Daemon, &[(&str, &str)]),
+    forward: &port_forward::PortForward,
+) {
     let a_id = computer_id(a);
     let b_id = computer_id(b);
     let fp = |nodes: &[(&str, &str)], name: &str| -> String {
@@ -3067,14 +3104,17 @@ fn change_reaches_a_returning_computer(
     };
     let (alpha, gamma) = (fp(nodes_a, "alpha"), fp(nodes_a, "gamma"));
     let names_b: Vec<&str> = nodes_b.iter().map(|(n, _)| *n).collect();
-    // Beta's computer goes away: its daemon is stopped and waited for. (No `vox` command is run
-    // against beta's account meanwhile: a client would start a daemon of its own.)
-    let _stopped_said = db.stop();
+    forward.close();
+    assert!(
+        daemon_alive(da.child.id()) && daemon_alive(db.child.id()),
+        "PRODUCT (staging): closing the userspace path stopped a daemon: alpha pid {}, beta pid {}",
+        da.child.id(),
+        db.child.id()
+    );
     // The change, on alpha's computer: gamma becomes its personal node.
     let changed = Instant::now();
     computer(a, &["personal", "gamma"]);
     let shown = loop {
-        let elapsed = changed.elapsed();
         let status = computer(a, &["status"]);
         let personal = status["nodes"]
             .as_array()
@@ -3087,6 +3127,8 @@ fn change_reaches_a_returning_computer(
             && roster_current(&status, &["alpha", "gamma"])
             && alpha_drives_gamma
             && gamma_reads_alpha;
+        // The verdict's clock is sampled only after every status/trust observation above.
+        let elapsed = changed.elapsed();
         if shown && elapsed <= CHANGE_SHOWN_WITHIN {
             break status;
         }
@@ -3108,18 +3150,19 @@ fn change_reaches_a_returning_computer(
     };
     let revision = shown["revision"].as_u64().unwrap_or(0);
     println!(
-        "[proof] {:?} after `vox computer personal gamma` with beta's daemon stopped, alpha's computer shows it applied at policy revision {revision}",
+        "[proof] {:?} after `vox computer personal gamma` with the live path closed, alpha's computer shows it applied at policy revision {revision}",
         changed.elapsed()
     );
     // The exchange alpha's daemon starts for it cannot complete: its status says so.
     assert!(
-        wait_until(EXCHANGE_WITHIN, || {
+        wait_until(RETURN_WITHIN.saturating_mul(2), || {
             application_toward(a, &b_id)["exchange_failures"]
                 .as_u64()
-                .is_some_and(|n| n >= 1)
+                .is_some_and(|n| n >= 4)
         }),
-        "PRODUCT (staging): with beta's daemon stopped, alpha's `vox computer status` counted no \
-         failed exchange toward it within {EXCHANGE_WITHIN:?}: {}\nits daemon said: {}",
+        "PRODUCT (staging): with the live path closed, alpha's `vox computer status` counted no \
+         fourth failed exchange toward it within {:?}: {}\nits daemon said: {}",
+        RETURN_WITHIN.saturating_mul(2),
         application_toward(a, &b_id),
         da.said()
     );
@@ -3127,18 +3170,22 @@ fn change_reaches_a_returning_computer(
         "[proof] alpha's status counts the exchange toward beta that could not complete: {} failed in a row",
         application_toward(a, &b_id)["exchange_failures"]
     );
-    // Beta's computer returns: its daemon starts again with its remembered nodes. The clock
-    // starts with the command that starts it.
+    assert!(
+        forward.dropped() > 0,
+        "APPARATUS: the closed userspace path dropped no datagram, so unreachability was not staged"
+    );
+    assert!(
+        daemon_alive(da.child.id()) && daemon_alive(db.child.id()),
+        "PRODUCT (staging): a daemon stopped during the live path outage: alpha pid {}, beta pid {}",
+        da.child.id(),
+        db.child.id()
+    );
+
+    // Opening the only path is the restoration event. The clock is not sampled until every final
+    // product observation below has returned.
     let restored = Instant::now();
-    let db = Daemon::start(b, &["--node", "beta"], &[("VOX_LISTEN", listen_b)]);
-    db.expect("node beta is Ready", RETURN_WITHIN, |l| {
-        l.contains("beta is Ready")
-    });
-    db.expect("node delta is Ready", RETURN_WITHIN, |l| {
-        l.contains("delta is Ready")
-    });
+    forward.open();
     let applied_at = loop {
-        let elapsed = restored.elapsed();
         let status = computer(b, &["status"]);
         let gamma_personal = status["nodes"].as_array().into_iter().flatten().any(|n| {
             n["name"] == "gamma" && n["computer"] == a_id.as_str() && n["personal"] == true
@@ -3150,14 +3197,20 @@ fn change_reaches_a_returning_computer(
             && roster_current(&status, &names_b)
             && delta_drives_gamma
             && delta_reads_alpha
-            && beta_reads_gamma;
-        if shown && elapsed <= RETURN_WITHIN {
+            && beta_reads_gamma
+            && computer(a, &["status"])["state"] == "confirmed"
+            && computer(b, &["status"])["state"] == "confirmed";
+        // This is deliberately after the final status and trust commands: a late observation is
+        // red even if the product became current before the command that exposed it returned.
+        let elapsed = restored.elapsed();
+        if shown && elapsed <= REACHABILITY_EVENT_SHOWN_WITHIN {
             break elapsed;
         }
         assert!(
-            !shown && elapsed < RETURN_WITHIN,
-            "PRODUCT: {RETURN_WITHIN:?} after beta's daemon was started again, the change made while \
-             it was unreachable was not applied there in time (ADR-038 FX-28, #1020; shown {shown} \
+            !shown && elapsed < REACHABILITY_EVENT_SHOWN_WITHIN,
+            "PRODUCT: {REACHABILITY_EVENT_SHOWN_WITHIN:?} after the live authenticated path was \
+             restored, the change made while it was unreachable was not applied there in time \
+             (ADR-038 FX-28, #1020; shown {shown} \
              when looked at after {elapsed:?}): gamma personal under alpha's \
              computer {gamma_personal}, bindings current {}, delta grants gamma {:?} (read + drive \
              expected), delta grants alpha {:?} (read expected), beta grants gamma {:?} (read \
@@ -3176,26 +3229,114 @@ fn change_reaches_a_returning_computer(
         std::thread::sleep(Duration::from_millis(200));
     };
     println!(
-        "[proof] {applied_at:?} after beta's daemon returned, the change made meanwhile is applied on every node of beta's computer (bound {RETURN_WITHIN:?})"
+        "[proof] {applied_at:?} after the live authenticated path was restored, the change made meanwhile is applied on every node of beta's computer and both computers confirm (event bound {REACHABILITY_EVENT_SHOWN_WITHIN:?}, return bound {RETURN_WITHIN:?})"
     );
     assert!(
-        wait_until(RETURN_WITHIN.saturating_sub(applied_at), || {
-            computer(a, &["status"])["state"] == "confirmed"
-                && computer(b, &["status"])["state"] == "confirmed"
-        }),
-        "PRODUCT: {RETURN_WITHIN:?} after beta's daemon returned the two computers do not both \
-         confirm again (ADR-038 FX-28, #1020): alpha's {}, beta's {}; alpha toward beta {}\n{}\n{}",
-        computer(a, &["status"])["state"],
-        computer(b, &["status"])["state"],
-        application_toward(a, &b_id),
-        da.said(),
-        db.said()
+        daemon_alive(da.child.id()) && daemon_alive(db.child.id()),
+        "PRODUCT: a daemon stopped across userspace path restoration: alpha pid {}, beta pid {}",
+        da.child.id(),
+        db.child.id()
     );
-    println!(
-        "[proof] {:?} after beta's daemon returned, both computers confirm each other again",
-        restored.elapsed()
+}
+
+/// One node whose actor queue is held must be visibly non-attached within FX-28's five seconds;
+/// its healthy sibling applies the same revision inside that bound. The elapsed time is sampled
+/// after both computer statuses, the sibling's shipped `vox trust list`, and `vox node list`.
+fn delayed_node_does_not_make_a_late_pass(
+    (a, da, _nodes_a): (&Account, &Daemon, &[(&str, &str)]),
+    (b, db, _nodes_b): (&Account, &Daemon, &[(&str, &str)]),
+    hold_marker: &Path,
+) {
+    let epsilon = a.make_node("epsilon");
+    let b_id = computer_id(b);
+    let before_revision = computer(a, &["status"])["revision"].as_u64().unwrap_or(0);
+    std::fs::write(hold_marker, b"hold delta's next policy message")
+        .unwrap_or_else(|e| panic!("APPARATUS: could not stage the held delta marker: {e}"));
+    let staged = Instant::now();
+    let (ok, out, err) = a.run(
+        &["node", "attach", "epsilon", "--passphrase-file", "-"],
+        PASS,
     );
-    db
+    assert!(
+        ok,
+        "APPARATUS: attach epsilon on alpha's computer: {out}{err}"
+    );
+
+    let mut carried_at = None;
+    loop {
+        let status_a = computer(a, &["status"]);
+        if carried_at.is_none()
+            && status_a["revision"]
+                .as_u64()
+                .is_some_and(|revision| revision > before_revision)
+        {
+            let sent_revision = status_a["revision"].as_u64().unwrap_or(0);
+            let record = application_toward(a, &b_id)["last_started_exchange"].clone();
+            if record["sent_revision"]
+                .as_u64()
+                .is_some_and(|revision| revision >= sent_revision)
+            {
+                carried_at = record["at_ms"].as_u64();
+            }
+        }
+        let status_b = computer(b, &["status"]);
+        let beta_grant = grant_words(b, "beta", &epsilon);
+        let (listed_ok, listed, listed_err) = b.run(&["node", "list"], "");
+        assert!(
+            listed_ok,
+            "PRODUCT: `vox node list` did not answer while delta's policy work was held: {listed_err}"
+        );
+        let delta_line = listed
+            .lines()
+            .find(|line| line.split_whitespace().next() == Some("delta"))
+            .unwrap_or("");
+        let delta_non_attached = !delta_line.is_empty() && !delta_line.starts_with("delta Ready");
+        let local_current = roster_current(&status_a, &["alpha", "gamma", "epsilon"]);
+        let beta_current = roster_current(&status_b, &["beta"]);
+        let shown = local_current && beta_current && beta_grant.is_some() && delta_non_attached;
+        // All final status/trust/list observations are complete before this sample.
+        let seen = unix_ms();
+        if let Some(at) = carried_at {
+            let elapsed = Duration::from_millis(seen.saturating_sub(at));
+            if shown && elapsed <= CHANGE_SHOWN_WITHIN {
+                println!(
+                    "[proof] after {elapsed:?}, beta applied epsilon on its healthy node and lists held delta non-attached ({delta_line:?}); bound {CHANGE_SHOWN_WITHIN:?}"
+                );
+                break;
+            }
+            assert!(
+                !shown && elapsed < CHANGE_SHOWN_WITHIN,
+                "PRODUCT: {CHANGE_SHOWN_WITHIN:?} after the exchange carrying epsilon completed, \
+                 beta did not apply-or-detach every attached node (ADR-038 FX-28, #1020; shown \
+                 {shown} only after {elapsed:?}): alpha bindings current {local_current}; beta \
+                 binding current {beta_current}; beta's grant for epsilon {beta_grant:?}; delta \
+                 line {delta_line:?}; alpha status nodes {}; beta status nodes {}\nalpha \
+                 daemon:\n{}\nbeta daemon:\n{}",
+                status_a["nodes"],
+                status_b["nodes"],
+                da.said(),
+                db.said()
+            );
+        } else {
+            assert!(
+                staged.elapsed() < EXCHANGE_WITHIN,
+                "PRODUCT (staging): alpha completed no exchange carrying epsilon to beta within \
+                 {EXCHANGE_WITHIN:?}: {}\nalpha daemon:\n{}\nbeta daemon:\n{}",
+                application_toward(a, &b_id),
+                da.said(),
+                db.said()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn daemon_alive(pid: u32) -> bool {
+    let out = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "pid="])
+        .output()
+        .unwrap_or_else(|e| panic!("APPARATUS: could not inspect daemon pid {pid}: {e}"));
+    out.status.success() && !out.stdout.is_empty()
 }
 
 /// A process's CPU time so far, as Activity Monitor shows it (`ps -o cputime`).

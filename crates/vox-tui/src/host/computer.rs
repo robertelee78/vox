@@ -1,9 +1,11 @@
 //! The daemon composes computer policy with already-attached node actors; no new unlock path.
 use super::*;
 
-/// How long one node may take to apply computer trust before it is treated as a failed write:
-/// its stale grants must not stand on the network, and the other nodes never wait on it.
-const RECONCILE_WITHIN: Duration = Duration::from_secs(30);
+/// Leave enough of FX-28's visible five-second contract for the daemon to publish `Detaching`
+/// and for the person's status request to observe it after a node fails to answer.
+const RECONCILE_DETACH_RESERVE: Duration = Duration::from_secs(1);
+const RECONCILE_APPLY_WITHIN: Duration =
+    vox_core::node::computer::COMPUTER_CHANGE_SHOWN_WITHIN.saturating_sub(RECONCILE_DETACH_RESERVE);
 
 impl Router {
     /// Reconcile the daemon's nodes with computer trust on change, and on no timer (ADR-038
@@ -60,13 +62,13 @@ impl Router {
 
     /// One reconciliation pass: the roster follows the nodes on disk, and every attached node
     /// that is behind the policy derives its binding and applies its keyring on a task of its
-    /// own, bounded by [`RECONCILE_WITHIN`]; each records the application receipt when it is
+    /// own, bounded by [`RECONCILE_APPLY_WITHIN`]; each records the application receipt when it is
     /// done. The pass itself waits for none of them, so a revision arriving meanwhile starts its
     /// own pass at once and a stuck node holds nothing but itself. A node at the current
     /// revision is not asked; one that fails or does not answer is said in the status and
-    /// detached (a failed write must not leave stale grants on the network); the detach is
-    /// waited on for the daemon's patience and, past that, left to finish on its own task, which
-    /// the status says.
+    /// detached (a failed write must not leave stale grants on the network). The slot moves to
+    /// `Detaching` synchronously before cleanup starts, so queued actor work cannot hide a stale
+    /// attached node past the public five-second contract.
     async fn reconcile_computer_trust(&self) {
         let management = Arc::clone(&self.inner.defaults.computer);
         if management.computer.binding_group().is_none() && !management.computer.grouped() {
@@ -116,12 +118,13 @@ impl Router {
             let management = Arc::clone(&management);
             self.inner.rt.spawn(async move {
                 let outcome =
-                    match tokio::time::timeout(RECONCILE_WITHIN, handle.reconcile_computer()).await
+                    match tokio::time::timeout(RECONCILE_APPLY_WITHIN, handle.reconcile_computer())
+                        .await
                     {
                         Ok(Ok(())) => Ok(()),
                         Ok(Err(e)) => Err(e.to_string()),
                         Err(_) => Err(format!(
-                            "did not apply computer trust within {RECONCILE_WITHIN:?}"
+                            "did not apply computer trust within {RECONCILE_APPLY_WITHIN:?}"
                         )),
                     };
                 match outcome {
@@ -132,24 +135,23 @@ impl Router {
                     }
                     Err(why) => {
                         management.node_pending(name.as_str(), &why);
-                        let patience = router.inner.defaults.patience;
-                        let detach_router = router.clone();
-                        let detach_name = name.clone();
-                        let detaching = router.inner.rt.spawn(async move {
-                            detach_router
-                                .detach(&detach_name, DetachCause::Requested)
-                                .await
-                        });
-                        if tokio::time::timeout(patience, detaching).await.is_err() {
-                            management.node_pending(
-                                name.as_str(),
-                                &format!(
-                                    "{why}; its stop did not finish within {patience:?} and continues"
-                                ),
-                            );
-                        }
+                        router.detach_failed_computer_node(name);
                     }
                 }
+            });
+        }
+    }
+
+    /// Make a failed node non-attached in the same synchronous critical section that decides it,
+    /// then leave its potentially slow actor cleanup to an independent task.
+    fn detach_failed_computer_node(&self, node: NodeName) {
+        let going = begin_detach(&mut lock(&self.inner.slots), &node);
+        if let Some((attached, done)) = going {
+            let router = self.clone();
+            self.inner.rt.spawn(async move {
+                let _ = router
+                    .finish_detach(node, attached, done, DetachCause::Requested)
+                    .await;
             });
         }
     }

@@ -10778,6 +10778,8 @@ impl Node {
                 let _ = reply.send(result);
             }
             NetEvent::ComputerPolicy(reply) => {
+                #[cfg(feature = "test-knobs")]
+                self.hold_computer_policy_for_proof().await;
                 let result = match self.prepare_computer_binding() {
                     Ok(()) => self.apply_computer_keyring().await,
                     Err(e) => Err(e),

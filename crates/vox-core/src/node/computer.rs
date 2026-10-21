@@ -5,6 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use crate::atrest::{Argon2Profile, IdentityVault};
 use crate::cbor::{Decoder, Encoder};
@@ -23,6 +24,19 @@ pub use pairing::{
     ComputerApplication, ComputerBindingAction, ComputerIdentity, ComputerNode, ComputerStatus,
     ExchangeRecord, Management, PairingPreview,
 };
+
+/// A trust change must either be applied by an attached node or make that node visibly no longer
+/// attached within this long (ADR-038 FX-28).
+pub const COMPUTER_CHANGE_SHOWN_WITHIN: Duration = Duration::from_secs(5);
+
+/// A reachable enrolled computer must show a trust change within this long, including after a
+/// failed path becomes reachable again (ADR-038 FX-28).
+pub const COMPUTER_RETURN_SHOWN_WITHIN: Duration = Duration::from_secs(60);
+
+/// Once an already-running peer's authenticated path carries packets again, its one-shot
+/// reachability waiter must wake exchange and show the pending trust change within this long.
+/// The broader return contract remains [`COMPUTER_RETURN_SHOWN_WITHIN`] for reconnecting a peer.
+pub const COMPUTER_REACHABILITY_EVENT_SHOWN_WITHIN: Duration = Duration::from_secs(15);
 
 /// The one fixed policy, displayed before either operator approves an enrollment.
 pub const POLICY: &str = "Every managed node can read every other managed node. Each computer's selected personal node can drive the non-personal nodes. Earlier individual grants are replaced by this policy; there are no per-node exceptions. Pairing does not join rooms or change repository bindings.";
