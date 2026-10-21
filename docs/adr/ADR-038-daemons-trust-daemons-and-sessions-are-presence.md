@@ -381,8 +381,8 @@ The decider then answered twelve questions, one at a time. His answers are the d
   round. Terms: a port is eligible when it has a need (ADR-037 R7: a raised request or a head
   newer than it served), a connection to its peer and no bounded-sync round running for that
   port; a flow is parked while it sits in `ready`, `deferred`, `retiring` or `cleanup` and no
-  task runs it; the flow-state pool is `RETAINED_FLOWS` charges per daemon (16 today, each 128
-  KiB), shared by every hosted node. Decision: each running bounded-sync round MUST hold exactly
+  task runs it; the flow-state pool is at least 16 charges per daemon (each 128 KiB), and grows
+  by the shared running-slots-per-node constant, shared by every hosted node. Decision: each running bounded-sync round MUST hold exactly
   one flow-state charge, and each flow-state charge that is held MUST be held by exactly one running bounded-sync round; acquisition of the charge and the round's transition to running MUST be
   one atomic state transition for accounting and status; every transition out of running, by
   completion, failure or cancellation, MUST release the charge; a flow in `ready`, `deferred`,
@@ -390,18 +390,14 @@ The decider then answered twelve questions, one at a time. His answers are the d
   the pool bounds rounds running at once, never flows at rest. Each node's bounded controller
   MUST retain at most twelve flows in all across `ready`, `running`, `deferred`, `retiring` and
   `cleanup`, and MUST run at most two bounded-sync rounds at once; the daemon-wide number of
-  running rounds is therefore at most the smaller of `RETAINED_FLOWS` and twice the hosted
-  nodes. When an eligible port cannot reserve flow state because every charge is held by a
-  running round, the daemon MUST dispose the flow whose resume made that reservation attempt,
-  MUST re-arm all and only work still outstanding under FX-29 without creating a need from a
-  hint the node already holds, MUST release every room, lane-job, live-flow, outbound-slot and
-  flow-state reservation the attempt acquired, and MUST re-queue the port with its need
-  preserved. The port MUST then have exactly one entry in a daemon-wide first-come flow-state
-  wait queue; it MUST retain that entry until it is selected or ceases to be eligible, and the
-  daemon MUST remove it immediately when either occurs. Whenever a charge is available and at least one eligible waiter remains, the daemon MUST select the earliest-enqueued eligible waiter, remove its entry and run one start
-  attempt for it before permitting a port not selected from that queue to reserve the charge; if
-  that attempt ends before reserving the charge, the daemon MUST repeat this selection while a
-  charge and an eligible waiter remain; ties in enqueue order MAY be broken arbitrarily. No
+  running rounds is therefore at most twice the hosted nodes. The daemon-wide pool limit MUST be
+  exactly `max(16, two × currently hosted node identities)`: replacement actor generations for
+  one node ID count once, while an unregistered node identity remains counted until its last
+  running charge returns. Registration precedes every start. Thus a legal running round cannot
+  find the pool full. If this invariant is nevertheless violated, the attempt MUST retain its
+  exact parked Flow—including a consumed archive dispatch, required dependency or scalar hint—
+  and retry it from the exact completion/release wake of a running round; it MUST NOT reconstruct
+  only one kind of work, create a wait queue, or depend on a tick. No
   count or threshold of periods, turns, elapsed time or CPU time MAY dispose, expire or defer a
   parked flow, or delay, skip or space a start attempt (FX-27); flow-state release MUST be
   caused solely by a round's transition out of running, which a timeout or a connection failure
@@ -420,17 +416,17 @@ The decider then answered twelve questions, one at a time. His answers are the d
   outbound slot could not be taken) and `flow_state_pool_full` (every charge of the pool is held
   by a running round); and the boolean `round_running`, true while a bounded-sync round of that
   port runs. It MUST report the pool under `lanes.budget.flow_state` as the integers `in_use`
-  and `limit` and, under `by_node`, an object with exactly one member per hosted node, keyed by
-  that node's node ID, whose value is that node's integer in-use count; the member values MUST
-  sum to `in_use`. The same snapshot MUST list `actors`, with the unique actor incarnation,
+  and `limit` and, under `by_node`, an object with exactly one member per currently hosted node,
+  keyed by that node's node ID, whose value is the current actor generation's integer in-use
+  count. The same snapshot MUST list `actors`, with the unique actor incarnation,
   node ID, registration state and in-use count for every active or retiring generation, and
   `running`, with the incarnation/node/room/peer of every charge; old and replacement actors of
   one fingerprint MUST NOT be collapsed. A node's `round_running` values and its active actor
   member MUST be taken from that snapshot, and that member MUST equal the number of that node's
-  ports whose `round_running` is true. While at least one port in a room has an entry in the daemon-wide
-  flow-state wait queue, any "no completed sync" text shown for that room in `vox status` or in
-  the app MUST contain the literal text `flow-state pool`; when no port in the room has such an
-  entry, that text MUST NOT identify the flow-state pool as the cause. Measured cause,
+  ports whose `round_running` is true. Retiring generations' charges remain in `in_use`, `actors`
+  and `running`, not in the replacement actor's `by_node` value; those generation-specific lists
+  account for the deliberate difference while retirement finishes. No health text is derived
+  from a flow-state queue because none exists. Measured cause,
   2026-10-21 (UTC, as every date in this record): on the decider's daemon (four hosted nodes,
   three rooms, restarted 02:32Z) every port of every node had started no round, `queued` froze,
   every room said "no completed sync in 10 minutes", and posts moved neither between the two

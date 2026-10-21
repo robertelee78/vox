@@ -163,6 +163,9 @@ pub(crate) struct Flow {
     pub(crate) governance_wait: bool,
     governance_cycles: u8,
     last_head: Option<(super::HeadHint, u8)>,
+    /// Immutable identity of this cleanup obligation. `request` changes as continuations are
+    /// derived; retirement ownership must not.
+    retirement_request: RequestId,
     request: RequestId,
     cleanup_store: Arc<Store>,
     cleanup_job: Job,
@@ -207,7 +210,7 @@ pub(crate) enum Resumed {
 
 impl Flow {
     pub(crate) fn retirement_request(&self) -> RequestId {
-        self.request
+        self.retirement_request
     }
 
     pub(crate) fn actor_incarnation(&self) -> Option<u64> {
@@ -269,6 +272,7 @@ impl Flow {
             governance_wait: false,
             governance_cycles: 0,
             last_head: None,
+            retirement_request: request,
             request,
             cleanup_store,
             cleanup_job,
@@ -377,6 +381,7 @@ impl Flow {
             governance_wait: false,
             governance_cycles: 0,
             last_head: None,
+            retirement_request: request,
             request,
             cleanup_store,
             cleanup_job,
@@ -460,6 +465,12 @@ impl Flow {
         &self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
         self.cleanup_job.bytes_wake()
+    }
+
+    pub(crate) fn flow_state_wake(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        self.cleanup_job.flow_state_wake()
     }
 
     /// Reserve the flow state as the round begins, its bytes already held: the last gate before

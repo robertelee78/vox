@@ -656,6 +656,9 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::BoundedRoomReady { .. } => "retrying work after its room was released",
         NetEvent::BoundedSecretReady { .. } => "retrying work after secret access was released",
         NetEvent::BoundedBytesReady { .. } => "retrying work after bounded bytes were released",
+        NetEvent::BoundedFlowStateReady { .. } => {
+            "retrying retained work after running flow state was released"
+        }
         NetEvent::BackoffExpired { .. } => "retrying a sync whose backoff is due",
         NetEvent::SkdmRefused { .. } => "re-owing a key the recipient did not take",
         NetEvent::PublishDone { .. } => "filing what a board said to a publish",
@@ -1371,6 +1374,12 @@ enum NetEvent {
     },
     /// The exact shared byte reservation a bounded port met was released.
     BoundedBytesReady {
+        token: u64,
+        room: Digest32,
+        peer: Digest32,
+    },
+    /// A running round returned one daemon flow-state charge.
+    BoundedFlowStateReady {
         token: u64,
         room: Digest32,
         peer: Digest32,
@@ -10330,6 +10339,13 @@ impl Node {
             }
             NetEvent::BoundedBytesReady { token, room, peer } => {
                 if self.bounded_sync.release_byte_admission(token, room, peer)
+                    && self.port_eligible(&(room, peer), std::time::Instant::now())
+                {
+                    self.sched_rooms.insert(room);
+                }
+            }
+            NetEvent::BoundedFlowStateReady { token, room, peer } => {
+                if self.bounded_sync.release_pool_admission(token, room, peer)
                     && self.port_eligible(&(room, peer), std::time::Instant::now())
                 {
                     self.sched_rooms.insert(room);

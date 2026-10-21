@@ -146,22 +146,57 @@ fn start_retirement(
 
 fn adopt_retirement_cell(
     ledger: &Arc<RetirementLedger>,
-    key: RetirementKey,
+    mut key: RetirementKey,
     flow: Arc<tokio::sync::Mutex<Option<Flow>>>,
 ) {
-    let entry = {
+    let (entry, collision) = {
         let mut entries = ledger
             .entries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Arc::clone(entries.entry(key).or_insert_with(|| {
-            Arc::new(RetirementEntry {
-                flow,
-                running: std::sync::atomic::AtomicBool::new(false),
-                task: StdMutex::new(None),
-            })
-        }))
+        let mut collision = false;
+        loop {
+            match entries.get(&key) {
+                Some(entry) if Arc::ptr_eq(&entry.flow, &flow) => {
+                    break (Arc::clone(entry), collision);
+                }
+                Some(_) => {
+                    // A malformed duplicate key must never discard either owned Flow. Retain
+                    // the incoming obligation under a deterministic collision suffix and make
+                    // the condition visible until that obligation finishes.
+                    collision = true;
+                    for byte in key.request.iter_mut().rev() {
+                        let (next, carry) = byte.overflowing_add(1);
+                        *byte = next;
+                        if !carry {
+                            break;
+                        }
+                    }
+                }
+                None => {
+                    let entry = Arc::new(RetirementEntry {
+                        flow: Arc::clone(&flow),
+                        running: std::sync::atomic::AtomicBool::new(false),
+                        task: StdMutex::new(None),
+                    });
+                    entries.insert(key, Arc::clone(&entry));
+                    break (entry, collision);
+                }
+            }
+        }
     };
+    if collision {
+        eprintln!(
+            "vox: distinct history retirements collided for {}/{}, retaining both obligations",
+            crate::node::link::b32_encode(&key.room),
+            crate::node::link::b32_encode(&key.peer)
+        );
+        note_retirement_error(
+            ledger,
+            key,
+            "distinct history retirements collided; both were retained",
+        );
+    }
     start_retirement(ledger, key, entry);
 }
 
@@ -250,6 +285,10 @@ struct ByteAdmission {
     token: u64,
     task: tokio::task::JoinHandle<()>,
 }
+struct PoolAdmission {
+    token: u64,
+    task: tokio::task::JoinHandle<()>,
+}
 enum ArchiveTurn {
     Ready(crate::node::history_budget::Job),
     Waiting,
@@ -275,6 +314,7 @@ pub(super) struct Controller {
     room_admission: BTreeMap<(Digest32, Digest32), RoomAdmission>,
     secret_admission: BTreeMap<(Digest32, Digest32), SecretAdmission>,
     byte_admission: BTreeMap<(Digest32, Digest32), ByteAdmission>,
+    pool_admission: BTreeMap<(Digest32, Digest32), PoolAdmission>,
     deferred: VecDeque<Flow>,
     body_slots: Arc<stream::runtime::BodySlots>,
     required: VecDeque<(Digest32, Digest32, Digest32, u64)>,
@@ -292,6 +332,9 @@ pub(super) struct Controller {
 
 impl Drop for Controller {
     fn drop(&mut self) {
+        for (_, admission) in std::mem::take(&mut self.pool_admission) {
+            admission.task.abort();
+        }
         let mut flows = Vec::new();
         flows.extend(self.ready.iter_mut().filter_map(Option::take));
         flows.extend(self.deferred.drain(..));
@@ -376,6 +419,7 @@ impl Controller {
             || self.room_admission.contains_key(&(room, peer))
             || self.secret_admission.contains_key(&(room, peer))
             || self.byte_admission.contains_key(&(room, peer))
+            || self.pool_admission.contains_key(&(room, peer))
     }
 
     fn cancel_archive_admission(&mut self) {
@@ -560,6 +604,54 @@ impl Controller {
         self.byte_admission
             .insert((room, peer), ByteAdmission { token, task });
     }
+
+    fn cancel_pool_admission(&mut self, room: Digest32, peer: Digest32) {
+        if let Some(admission) = self.pool_admission.remove(&(room, peer)) {
+            admission.task.abort();
+        }
+    }
+
+    pub(super) fn release_pool_admission(
+        &mut self,
+        token: u64,
+        room: Digest32,
+        peer: Digest32,
+    ) -> bool {
+        if self
+            .pool_admission
+            .get(&(room, peer))
+            .is_some_and(|admission| admission.token == token)
+        {
+            self.cancel_pool_admission(room, peer);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn wait_for_pool(
+        &mut self,
+        net_tx: &mpsc::Sender<NetEvent>,
+        next_token: &mut u64,
+        room: Digest32,
+        peer: Digest32,
+        wake: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+    ) {
+        if self.pool_admission.contains_key(&(room, peer)) {
+            return;
+        }
+        let token = *next_token;
+        *next_token += 1;
+        let tx = net_tx.clone();
+        let task = tokio::spawn(async move {
+            wake.await;
+            let _ = tx
+                .send(NetEvent::BoundedFlowStateReady { token, room, peer })
+                .await;
+        });
+        self.pool_admission
+            .insert((room, peer), PoolAdmission { token, task });
+    }
     /// Retiring work stays inside the same twelve-flow limit and retains its charge/lease.
     /// Other rooms may progress while one room waits for its next bounded cleanup slice.
     fn flow_count(&self) -> usize {
@@ -602,6 +694,16 @@ impl Controller {
                     Ok(true) => clear_retirement_error(&self.retirement_ledger, key),
                     Ok(false) => {
                         self.retiring.push_back(flow);
+                        self.cleanup_due = Some(
+                            std::time::Instant::now()
+                                + crate::node::history_budget::RETIRE_RETRY_BACKOFF,
+                        );
+                        let wake = self.completion_wake();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(crate::node::history_budget::RETIRE_RETRY_BACKOFF)
+                                .await;
+                            wake.notify_one();
+                        });
                     }
                     Err(error) => {
                         eprintln!("vox: history retirement is pending: {error}");
@@ -751,6 +853,15 @@ impl Controller {
         for (room, peer) in waiting {
             self.cancel_byte_admission(room, peer);
         }
+        let waiting: Vec<(Digest32, Digest32)> = self
+            .pool_admission
+            .keys()
+            .filter(|(waiting_room, _)| *waiting_room == room)
+            .copied()
+            .collect();
+        for (room, peer) in waiting {
+            self.cancel_pool_admission(room, peer);
+        }
         for slot in &mut self.ready {
             if let Some(flow) = slot.take_if(|flow| flow.room == room) {
                 self.retiring.push_back(flow);
@@ -838,6 +949,7 @@ impl Controller {
         self.cancel_room_admission(room, peer);
         self.cancel_secret_admission(room, peer);
         self.cancel_byte_admission(room, peer);
+        self.cancel_pool_admission(room, peer);
         for slot in &mut self.ready {
             if slot
                 .as_ref()
@@ -881,6 +993,9 @@ impl Controller {
             admission.task.abort();
         }
         for (_, admission) in std::mem::take(&mut self.byte_admission) {
+            admission.task.abort();
+        }
+        for (_, admission) in std::mem::take(&mut self.pool_admission) {
             admission.task.abort();
         }
         for flow in self
@@ -2159,11 +2274,27 @@ impl Node {
         // is a running round's; if it ever does, the attempt ends like any other gate's: the
         // flow shelved or let go with its work re-armed, the lane job and the slot taken above
         // given back on return, and the port keeps its need.
+        let flow_state_wake = flow.flow_state_wake();
         match flow.resume(state_bytes) {
             crate::node::history_stream::runtime::Resumed::Held => {}
             crate::node::history_stream::runtime::Resumed::PoolFull => {
                 self.note_start(room, peer, "flow_state_pool_full");
-                self.shelve_or_let_go(flow, index, fresh);
+                // The invariant says this cannot happen in production, but a truthful failure
+                // path still owns all work it consumed while constructing this Flow: archive
+                // dispatch, exact required dependency, or scalar hint. Retain the exact parked
+                // Flow in its lane until a running completion releases capacity and wakes the
+                // actor; never reconstruct only the hint and strand the other two forms.
+                let mut flow = flow;
+                flow.park();
+                debug_assert!(self.bounded_sync.ready[index].is_none());
+                self.bounded_sync.ready[index] = Some(flow);
+                self.bounded_sync.wait_for_pool(
+                    &self.net_tx,
+                    &mut self.next_token,
+                    room,
+                    peer,
+                    flow_state_wake,
+                );
                 return false;
             }
         }
@@ -2361,7 +2492,7 @@ impl Controller {
             })
             .collect();
         format!(
-            "{{\"ready\":[{}],\"running\":[{}],\"deferred\":{},\"retiring\":{},\"required\":{},\"archive_admission\":{},\"foreground_admissions\":{},\"room_admissions\":{},\"secret_admissions\":{},\"byte_admissions\":{},\"cleanup\":{},\"cleanup_error\":{},\"cleanup_errors\":[{}]}}",
+            "{{\"ready\":[{}],\"running\":[{}],\"deferred\":{},\"retiring\":{},\"required\":{},\"archive_admission\":{},\"foreground_admissions\":{},\"room_admissions\":{},\"secret_admissions\":{},\"byte_admissions\":{},\"pool_admissions\":{},\"cleanup\":{},\"cleanup_error\":{},\"cleanup_errors\":[{}]}}",
             ready.join(","),
             running.join(","),
             self.deferred.len(),
@@ -2372,6 +2503,7 @@ impl Controller {
             self.room_admission.len(),
             self.secret_admission.len(),
             self.byte_admission.len(),
+            self.pool_admission.len(),
             self.cleanup.is_some(),
             serde_json::to_string(&cleanup_error).unwrap_or_else(|_| "null".to_owned()),
             cleanup_errors.join(",")

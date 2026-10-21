@@ -202,6 +202,9 @@ pub struct Budget {
     control_bytes: AtomicUsize,
     /// The daemon's flow-state pool, one record under one lock (ADR-038 FX-35).
     pool: Mutex<Pool>,
+    /// Exact running-charge releases. The pool-full invariant's defensive path subscribes
+    /// before attempting its reservation, so replacement/retirement cannot lose the wake.
+    flow_changed: Arc<Notify>,
     /// Owed retirement ownership belongs to the daemon, not one actor incarnation. An actor
     /// panic therefore cannot lose a Flow or its visible failure, and a replacement resumes the
     /// same exact request.
@@ -386,6 +389,14 @@ impl Job {
         self.0.flow_owner
     }
 
+    pub(crate) fn flow_state_wake(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        let mut wake = Box::pin(Arc::clone(&self.0.budget.flow_changed).notified_owned());
+        wake.as_mut().enable();
+        wake
+    }
+
     /// Subscribe before a shared byte reservation attempt so its exact release cannot be lost.
     pub(crate) fn bytes_wake(
         &self,
@@ -441,7 +452,6 @@ impl Job {
         pool_owner.charges += 1;
         p.in_use += 1;
         *p.running.entry(key).or_insert(0) += 1;
-        *p.by_node.entry(key.1).or_insert(0) += 1;
         drop(p);
         FlowStateTry::Reserved(FlowStateCharge {
             budget,
@@ -685,8 +695,9 @@ impl Drop for BufferCharge {
 
 /// The daemon's flow-state pool (ADR-038 FX-35), one record under one lock, so that what
 /// `vox status --json` shows of it is one coordinated view: how many flow states it allows;
-/// which running rounds hold one (node, room, peer); and the count per hosted node (one member
-/// per hosted node, 0 until it holds one; always the count of that node's running rounds). The
+/// which running rounds hold one (actor, node, room, peer); and the current actor's count per
+/// hosted node (one member per hosted node, 0 until it holds one). Retiring generations remain
+/// visible separately and do not inflate the hosted-node limit. The
 /// limit is [`FLOW_STATE_MIN_CAPACITY`] or [`BOUNDED_SYNC_RUNNING_SLOTS`] per hosted node,
 /// whichever is more,
 /// raised as nodes register: a charge is held only by a running round and a node runs at most
@@ -698,12 +709,11 @@ struct Pool {
     /// A port can run its live and archive slots together, so retain multiplicity here while
     /// status needs only the key to say that the port has a running round.
     running: BTreeMap<(u64, Digest32, Digest32, Digest32), usize>,
-    by_node: BTreeMap<Digest32, usize>,
     next_owner: u64,
     /// The current actor generation for each hosted fingerprint.
     active: BTreeMap<Digest32, u64>,
     /// Active and retiring actor generations. A replacement with the same fingerprint gets its
-    /// own owner, so old panic cleanup cannot shrink capacity beneath either generation's work.
+    /// own owner for exact attribution, but both generations count as one hosted node.
     owners: BTreeMap<u64, PoolOwner>,
 }
 
@@ -719,12 +729,21 @@ impl Default for Pool {
             limit: FLOW_STATE_MIN_CAPACITY,
             in_use: 0,
             running: BTreeMap::new(),
-            by_node: BTreeMap::new(),
             next_owner: 0,
             active: BTreeMap::new(),
             owners: BTreeMap::new(),
         }
     }
+}
+
+fn resize_flow_pool(pool: &mut Pool) {
+    let hosted = pool
+        .owners
+        .values()
+        .map(|owner| owner.node)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    pool.limit = FLOW_STATE_MIN_CAPACITY.max(BOUNDED_SYNC_RUNNING_SLOTS * hosted);
 }
 
 /// One hosted node's ownership of its daemon flow-state capacity. Kept in the node actor, so
@@ -761,12 +780,7 @@ impl Drop for FlowPoolRegistration {
         {
             p.owners.remove(&self.owner);
         }
-        if !p.owners.values().any(|owner| owner.node == self.node)
-            && p.by_node.get(&self.node) == Some(&0)
-        {
-            p.by_node.remove(&self.node);
-        }
-        p.limit = FLOW_STATE_MIN_CAPACITY.max(BOUNDED_SYNC_RUNNING_SLOTS * p.owners.len());
+        resize_flow_pool(&mut p);
     }
 }
 
@@ -804,9 +818,6 @@ impl Drop for FlowStateCharge {
                 p.running.remove(&self.key);
             }
         }
-        if let Some(n) = p.by_node.get_mut(&self.key.1) {
-            *n = n.saturating_sub(1);
-        }
         if let Some(owner) = p.owners.get_mut(&self.owner) {
             owner.charges = owner.charges.saturating_sub(1);
         }
@@ -816,12 +827,9 @@ impl Drop for FlowStateCharge {
         {
             p.owners.remove(&self.owner);
         }
-        if !p.owners.values().any(|owner| owner.node == self.key.1)
-            && p.by_node.get(&self.key.1) == Some(&0)
-        {
-            p.by_node.remove(&self.key.1);
-        }
-        p.limit = FLOW_STATE_MIN_CAPACITY.max(BOUNDED_SYNC_RUNNING_SLOTS * p.owners.len());
+        resize_flow_pool(&mut p);
+        drop(p);
+        self.budget.flow_changed.notify_waiters();
     }
 }
 
@@ -844,7 +852,8 @@ pub struct BudgetSnapshot {
     pub flow_state_in_use: usize,
     /// The flow states the daemon allows at once: enough for every hosted node's rounds.
     pub flow_state_limit: usize,
-    /// Who holds them, by node: one member per hosted node, the count of its running rounds.
+    /// Current actor charges by node: one member per currently hosted node. Retiring actor
+    /// charges remain in `in_use`, `actors` and `running`, never attributed to the replacement.
     pub flow_state_by_node: Vec<(Digest32, usize)>,
     /// Every active or retiring actor generation and its exact charge count.
     pub flow_state_actors: Vec<(u64, Digest32, bool, usize)>,
@@ -880,8 +889,7 @@ impl Budget {
         );
         p.owners
             .retain(|_, owner| owner.registered || owner.charges > 0);
-        p.by_node.entry(node).or_insert(0);
-        p.limit = FLOW_STATE_MIN_CAPACITY.max(BOUNDED_SYNC_RUNNING_SLOTS * p.owners.len());
+        resize_flow_pool(&mut p);
         drop(p);
         FlowPoolRegistration {
             budget: Arc::clone(self),
@@ -911,7 +919,11 @@ impl Budget {
             // they stand together.
             flow_state_in_use: p.in_use,
             flow_state_limit: p.limit,
-            flow_state_by_node: p.by_node.iter().map(|(n, c)| (*n, *c)).collect(),
+            flow_state_by_node: p
+                .active
+                .iter()
+                .map(|(node, owner)| (*node, p.owners.get(owner).map_or(0, |owner| owner.charges)))
+                .collect(),
             flow_state_actors: p
                 .owners
                 .iter()

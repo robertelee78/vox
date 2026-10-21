@@ -1158,6 +1158,8 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
         );
     }
     let pressure_started = Instant::now();
+    let mut pool_full_seen = false;
+    let mut most_pressure = 0;
     let observed = loop {
         let shown = synced(&staged.host, Some(FX35_HOSTED[0]));
         let v: serde_json::Value = serde_json::from_str(&shown.status).unwrap_or_default();
@@ -1179,14 +1181,11 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
             .into_iter()
             .flatten()
             .any(|port| port["start_reason"] == "flow_state_pool_full");
-        assert!(
-            !pool_full,
-            "PRODUCT: a legal hosted-node round was obstructed by flow_state_pool_full before \
-             all node-owned slots could run: {}",
-            shown.status
-        );
-        if in_use > vox_core::node::history_budget::FLOW_STATE_MIN_CAPACITY as u64 {
-            break in_use;
+        pool_full_seen |= pool_full;
+        most_pressure = most_pressure.max(in_use);
+        if in_use > vox_core::node::history_budget::FLOW_STATE_MIN_CAPACITY as u64 || pool_full_seen
+        {
+            break most_pressure;
         }
         assert!(
             pressure_started.elapsed() < vox_core::node::history_budget::BOUNDED_ROUND_PATIENCE,
@@ -1223,6 +1222,48 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
         );
         std::thread::sleep(Duration::from_millis(200));
     }
+    // The two consumed archive dispatches must also finish. Under the undersized mutant, this
+    // observes the full-pool branch retain and retry exact archive work before the invariant red
+    // is judged; a lost dispatch fails here on the shipped request's own status.
+    for (dir, node, name, _) in &staged.everyone[..vox_core::node::history_budget::ARCHIVE_JOBS] {
+        let complete_by = Instant::now() + BOUND;
+        loop {
+            let (ok, out, err) = vox(
+                dir,
+                &as_node(
+                    &[
+                        "room",
+                        "read",
+                        &archive_room,
+                        "--history",
+                        "status",
+                        "--json",
+                    ],
+                    *node,
+                ),
+                None,
+            );
+            assert!(
+                ok,
+                "PRODUCT: {name}'s retained archive request status was refused: {out}{err}"
+            );
+            let status: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|error| {
+                panic!("PRODUCT: {name}'s archive status was not JSON: {error}: {out}")
+            });
+            if matches!(
+                status["status"]["phase"].as_str(),
+                Some("complete" | "more")
+            ) {
+                break;
+            }
+            assert!(
+                Instant::now() < complete_by,
+                "PRODUCT: {name}'s exact shipped archive request did not recover to a completed \
+                 quantum after pool pressure: {out}"
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
     // The product's account of the pool, now that everyone has read everyone.
     let hosted_fps: BTreeSet<&str> = staged.everyone[..staged.hosted]
         .iter()
@@ -1231,6 +1272,13 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
     let mut most = 0u64;
     let mut limit: Option<u64> = None;
     let mut broken: Vec<String> = Vec::new();
+    if pool_full_seen {
+        broken.push(
+            "a legal round reached flow_state_pool_full; its retained work recovered before this \
+             invariant verdict"
+                .to_owned(),
+        );
+    }
     for (dir, node, name, fp) in &staged.everyone {
         let shown = synced(dir, *node);
         let v: serde_json::Value = serde_json::from_str(&shown.status).unwrap_or_default();
@@ -1338,6 +1386,7 @@ fn foreground_release_wakes_without_a_tick() {
                     "room_admissions",
                     "secret_admissions",
                     "byte_admissions",
+                    "pool_admissions",
                 ]
                 .into_iter()
                 .filter_map(|key| bounded[key].as_u64())
