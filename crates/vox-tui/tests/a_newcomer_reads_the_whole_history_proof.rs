@@ -94,7 +94,7 @@ mod attach;
 #[path = "support/typed.rs"]
 mod typed;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -211,6 +211,11 @@ fn daemon(dir: &Path, tag: &str) -> Daemon {
 
 /// The same, with environment the daemon reads at its start (a test-only knob, for instance).
 fn daemon_env(dir: &Path, tag: &str, env: &[(&str, &str)]) -> Daemon {
+    daemon_with(dir, tag, &[], env)
+}
+
+/// The same, with more arguments (`--no-node`, say) after the listen address.
+fn daemon_with(dir: &Path, tag: &str, args: &[&str], env: &[(&str, &str)]) -> Daemon {
     let file = |kind: &str| {
         let at = dir.join(format!("daemon-{tag}.{kind}"));
         std::fs::File::create(&at)
@@ -218,6 +223,7 @@ fn daemon_env(dir: &Path, tag: &str, env: &[(&str, &str)]) -> Daemon {
     };
     let mut cmd = Command::new(VOX);
     cmd.args(["daemon", "--listen", "127.0.0.1:0"])
+        .args(args)
         .env("VOX_DATA_DIR", dir)
         .env("VOX_CONFIG_DIR", dir.join("cfg"))
         .env_remove("VOX_ROOM");
@@ -247,10 +253,15 @@ fn said(dir: &Path, tag: &str) -> String {
 
 /// `vox room list` once the daemon's socket answers.
 fn attached(dir: &Path, tag: &str) -> String {
+    attached_as(dir, tag, None)
+}
+
+/// The same, as `node` (one of several a daemon hosts).
+fn attached_as(dir: &Path, tag: &str, node: Option<&str>) -> String {
     let deadline = Instant::now() + Duration::from_secs(90);
     let mut last = String::new();
     while Instant::now() < deadline {
-        let (ok, out, err) = vox(dir, &["room", "list"], None);
+        let (ok, out, err) = vox(dir, &as_node(&["room", "list"], node), None);
         if ok {
             return out;
         }
@@ -258,7 +269,8 @@ fn attached(dir: &Path, tag: &str) -> String {
         std::thread::sleep(Duration::from_millis(200));
     }
     panic!(
-        "PRODUCT: {tag}'s daemon never answered `vox room list` in 90 s: {last}\nits stderr: {}",
+        "PRODUCT: {tag}'s daemon never answered `vox room list{}` in 90 s: {last}\nits stderr: {}",
+        node.map(|n| format!(" --node {n}")).unwrap_or_default(),
         said(dir, tag)
     );
 }
@@ -456,134 +468,454 @@ fn a_newcomer_talks_both_ways_at_one_wait_fresh_or_behind_a_backlog() {
     );
 }
 
-/// How long the converged room idles while its sync rounds are counted.
+/// How long the converged rooms idle while their sync rounds, the hosting daemon's CPU time and
+/// traffic, and its answers are measured.
 const IDLE: Duration = Duration::from_secs(60);
+/// The nodes one daemon hosts in the quiet rooms, as the decider's work Mac hosts a person's node
+/// and the agents' beside it on one `vox daemon --no-node`, each made Ready with `vox node unlock`.
+const HOSTED: [&str; 4] = ["robert", "claude", "codex", "opencode"];
+/// The rooms every node is in; the first hosted node makes them.
+const QUIET_ROOMS: [&str; 2] = ["quiet-1", "quiet-2"];
+/// CPU time a daemon in quiet rooms may spend over [`IDLE`]: Activity Monitor's number, the
+/// issue's bound for the daemon hosting [`HOSTED`] (#986). Measured 2026-10-20 on the decider's
+/// work Mac on v0.4.6: 150–168% of a core, 90–100 s a minute.
+const IDLE_CPU: Duration = Duration::from_secs(6);
+/// How often `vox status --json` is asked of every hosted node during the idle minute; each
+/// answer is held to [`ANSWER_WITHIN`]. Measured on v0.4.6: 0.26–0.82 s.
+const ASK_EVERY: Duration = Duration::from_secs(5);
+/// How long a post is retried while the room says a previous change is still being applied:
+/// two periodic sync intervals, the staging's patience, not a claim.
+const POST_WAIT: Duration = Duration::from_secs(60);
+/// Bytes, in and out together, one sync round with nothing to fetch may cost the hosting daemon:
+/// the traffic bound is its lanes times the rounds each is allowed times this. A round between
+/// two nodes of one daemon crosses loopback and counts on both sides. 64 KiB is far above what
+/// an empty frontier round carries (a `HAVE` and a `WANT` of a few authors, under 1 KiB each
+/// way) and below what one re-fetched window costs; measured 2026-10-20 on main (v0.4.9 code,
+/// this staging), the host's daemon moved 13.2 MB in and 13.2 MB out in the idle minute, about
+/// 200 KiB per allowed round: the idle re-pull of a sparse author's hint (ADR-038 FX-29).
+const ROUND_BYTES: u64 = 64 * 1024;
 
-/// **A quiet room costs nothing and says when it last synced** (ADR-038 FX-15, FX-16; #979,
-/// #980): alice and bob, each on a daemon of their own, read each other once and then nobody
-/// posts. Over [`IDLE`] seconds each profile completes no more sync rounds than the periodic
-/// request allows (one per [`SYNC_INTERVAL_SECS`](vox_core::node::syncstream::SYNC_INTERVAL_SECS)
-/// plus the follow-up each may raise), and `vox status --json` names a last completed sync for
-/// the room and for the member. Measured before the fix: one round per peer per second, the
-/// settlement tick re-offering the own head; "last sync never" on every room.
+/// **Quiet rooms cost no rounds, no CPU and no bytes, answer at once, and say when they last
+/// synced** (ADR-038 FX-15, FX-16, FX-17; #979, #980, #986): one daemon hosts [`HOSTED`], four
+/// nodes as the decider's work Mac does, and a second daemon hosts bob; every node is in both
+/// [`QUIET_ROOMS`], trusts every other before anyone posts (a member trusted after a post never
+/// reads it), posts once in each room, and reads every other's post. Then nobody posts. Over
+/// [`IDLE`]:
 ///
-/// Mutants: the own-head hint offered to every peer on every tick again (`offer_own_head`
-/// ignoring who acknowledged) turns claim 1 red on its own count; the lane's completion no longer
-/// recording the sync (`note_lane_sync` removed) turns claim 2 red on `last_sync_ms`.
+/// 1. **No rounds beyond the periodic ones** (FX-15): no lane (a room with a peer) of any node
+///    runs more sync rounds than the periodic request allows, one per
+///    [`SYNC_INTERVAL_SECS`](vox_core::node::syncstream::SYNC_INTERVAL_SECS) from each side plus
+///    the follow-up each may raise. A round counts however it ended (`completed`, `partial` or
+///    `failed` in `vox status --json`): a round that ends partial, its requested entries
+///    unreceived, is the one that runs again a second later. Measured before the fix: one round
+///    per peer per second, the settlement tick re-offering the own head.
+/// 2. **The last sync is named** (FX-16): `vox status --json` names a last completed sync for
+///    every room and every other member, on every node. Before: "last sync never".
+/// 3. **No CPU** (FX-15, #986): each daemon's CPU time, as Activity Monitor shows it, grows by at
+///    most [`IDLE_CPU`]; the hosting daemon's is the number the issue bounds.
+/// 4. **Answers at once** (FX-17, #986): every `vox status --json` asked of a hosted node, every
+///    [`ASK_EVERY`], answers within [`ANSWER_WITHIN`].
+/// 5. **No bytes beyond the periodic rounds** (FX-15, #986): the hosting daemon's network bytes,
+///    in and out as Activity Monitor counts them (`nettop`, unprivileged), grow by at most the
+///    rounds its lanes are allowed times [`ROUND_BYTES`]: no window of entries is fetched again.
+///    Measured on v0.4.6: 27 GiB in and 20 GiB out over 4.9 hours of quiet rooms. Off a Mac the
+///    bytes are not read and the proof says so; the rounds and the CPU stand.
+///
+/// Mutants: the own-head hint offered to every connected peer on every settlement tick again
+/// (the `held_through` filter in `settle_room` removed, #979's fix reverted) turns claims 1, 3
+/// and 5 red on their own numbers; the lane's completion no longer recording the sync
+/// (`note_lane_sync` removed) turns claim 2 red on `last_sync_ms`.
 #[cfg(feature = "optional-proofs")]
 #[test]
-#[ignore = "an idle minute on two real vox daemons; optional, run it in release"]
+#[ignore = "an idle minute of two real vox daemons, one hosting four nodes; optional, run it in release"]
 fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
-    watchdog::arm_for_setup(1, 6);
+    // Two rooms joined by four nodes each; four unlocks on the host and the peer daemon's own.
+    watchdog::arm_for_setup(8, 5);
     let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("APPARATUS: no temp dir: {e}"));
     let root = tmp.path();
-    let alice = root.join("alice");
-    let bob = root.join("bob");
-    for d in [&alice, &bob] {
+    let host = root.join("host");
+    let peer = root.join("peer");
+    for d in [&host, &peer] {
         std::fs::create_dir_all(d.join("cfg"))
             .unwrap_or_else(|e| panic!("APPARATUS: could not create {}: {e}", d.display()));
     }
-    let mut fps = Vec::new();
-    for dir in [&alice, &bob] {
-        let (ok, out, err) = vox(dir, &["id"], None);
-        assert!(ok, "PRODUCT: `vox id` failed: {err}");
-        fps.push(out.trim().to_owned());
+    // Every node: its data root, its `--node` (none for the peer root's one node), its name and
+    // its fingerprint.
+    let mut everyone: Vec<(&Path, Option<&str>, &str, String)> = Vec::new();
+    for name in HOSTED {
+        let (ok, out, err) = vox(&host, &["id", "--node", name], None);
+        assert!(ok, "PRODUCT: `vox id --node {name}` failed: {err}");
+        everyone.push((&host, Some(name), name, out.trim().to_owned()));
     }
-    for (dir, fp, name) in [(&alice, &fps[1], "bob"), (&bob, &fps[0], "alice")] {
-        let (ok, _, err) = vox(dir, &["trust", "add", fp, "--name", name], None);
-        assert!(ok, "PRODUCT: `vox trust add` of {name} failed: {err}");
-    }
-    let _alice_daemon = daemon(&alice, "alice");
-    attached(&alice, "alice");
-    let (ok, _, err) = vox(
-        &alice,
-        &[
-            "room",
-            "create",
-            "--passphrase-file",
-            "-",
-            "--name",
-            "quiet",
-        ],
-        Some(&format!("{ROOMPASS}\n")),
-    );
-    assert!(ok, "PRODUCT: `vox room create` failed: {err}");
-    let listed = attached(&alice, "alice");
-    let room = listed
-        .split_whitespace()
-        .find(|w| w.len() >= 8 && w.chars().all(|c| c.is_ascii_alphanumeric()))
-        .unwrap_or_else(|| panic!("PRODUCT: `vox room list` shows no room id: {listed}"))
-        .to_owned();
-    let (ok, link, err) = vox(&alice, &["room", "link", &room], None);
-    assert!(ok, "PRODUCT: `vox room link` failed: {err}");
-    let link = link.trim().to_owned();
-    let _bob_daemon = daemon(&bob, "bob");
-    attached(&bob, "bob");
-    let (ok, _, err) = vox(
-        &bob,
-        &["room", "join", "--passphrase-file", "-", &link],
-        Some(&format!("{ROOMPASS}\n")),
-    );
-    assert!(ok, "PRODUCT: bob's `vox room join` was refused: {err}");
-    let joined = Instant::now();
-    let (ok, out, err) = vox(&alice, &["room", "post", &room, "post 1"], None);
-    assert!(ok, "PRODUCT: alice's post was refused: {out}{err}");
-    let (ok, out, err) = vox(&bob, &["room", "post", &room, "bob is here"], None);
-    assert!(ok, "PRODUCT: bob's first post was refused: {out}{err}");
-    let (to_alice, to_bob) = arrivals(
-        joined,
-        (&alice, "bob is here"),
-        (&bob, "post 1"),
-        &room,
-        BOUND,
-    );
-    assert!(
-        to_alice.is_some() && to_bob.is_some(),
-        "PRODUCT: within {BOUND:?} of the join, alice read bob: {to_alice:?}; bob read alice: \
-         {to_bob:?} (None = never)\nbob's daemon said: {}\nalice's daemon said: {}",
-        said(&bob, "bob"),
-        said(&alice, "alice")
-    );
+    let (ok, out, err) = vox(&peer, &["id"], None);
+    assert!(ok, "PRODUCT: `vox id` failed: {err}");
+    everyone.push((&peer, None, "bob", out.trim().to_owned()));
 
-    // ---- the room is quiet: acknowledgements settle, then the rounds are counted ----------
+    // One daemon for the host's nodes, as the decider's Mac runs it: `vox daemon --no-node`, each
+    // node made Ready in it with `vox node unlock`. The passphrases it remembers go to the proof's
+    // own Keychain file, never the login Keychain.
+    let keychain = attach::keychain(&host);
+    let host_daemon = daemon_with(
+        &host,
+        "host",
+        &["--no-node"],
+        &[("VOX_TEST_KEYCHAIN", &keychain.to_string_lossy())],
+    );
+    let started = Instant::now();
+    while !attach::Root::at(&host, IDENTITY).daemon_running() {
+        assert!(
+            started.elapsed() < Duration::from_secs(90),
+            "PRODUCT: the host's `vox daemon --no-node` never took its data root in 90 s\nit \
+             said: {}",
+            said(&host, "host")
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    for name in HOSTED {
+        unlock(&host, name);
+        attached_as(&host, "host", Some(name));
+    }
+    let peer_daemon = daemon(&peer, "peer");
+    attached_as(&peer, "peer", None);
+
+    // Trust in every direction before anyone posts.
+    for (dir, node, name, _) in &everyone {
+        for (_, _, other, fp) in &everyone {
+            if other == name {
+                continue;
+            }
+            let (ok, _, err) = vox(
+                dir,
+                &as_node(&["trust", "add", fp.as_str(), "--name", other], *node),
+                None,
+            );
+            assert!(
+                ok,
+                "PRODUCT: `vox trust add` of {other} on {name} failed: {err}"
+            );
+        }
+    }
+    // The rooms: the first hosted node makes each, and every other node joins by its link.
+    let maker = Some(HOSTED[0]);
+    let mut rooms = Vec::with_capacity(QUIET_ROOMS.len());
+    for name in QUIET_ROOMS {
+        let (ok, _, err) = vox(
+            &host,
+            &as_node(
+                &["room", "create", "--passphrase-file", "-", "--name", name],
+                maker,
+            ),
+            Some(&format!("{ROOMPASS}\n")),
+        );
+        assert!(ok, "PRODUCT: `vox room create {name}` failed: {err}");
+        let listed = attached_as(&host, "host", maker);
+        let room = listed
+            .lines()
+            .find(|l| l.contains(name))
+            .and_then(|l| l.split_whitespace().next())
+            .unwrap_or_else(|| panic!("PRODUCT: `vox room list` shows no room {name}: {listed}"))
+            .to_owned();
+        let (ok, link, err) = vox(&host, &as_node(&["room", "link", &room], maker), None);
+        assert!(ok, "PRODUCT: `vox room link` failed: {err}");
+        let link = link
+            .lines()
+            .find(|l| l.starts_with("vox://"))
+            .unwrap_or(link.trim())
+            .to_owned();
+        for (dir, node, who, _) in &everyone {
+            if *node == maker {
+                continue;
+            }
+            let (ok, _, err) = vox(
+                dir,
+                &as_node(&["room", "join", "--passphrase-file", "-", &link], *node),
+                Some(&format!("{ROOMPASS}\n")),
+            );
+            assert!(
+                ok,
+                "PRODUCT: {who}'s `vox room join {name}` was refused: {err}"
+            );
+        }
+        rooms.push(room);
+    }
+    // One post each in each room, and every node reads every other's within BOUND. A post the
+    // room turns away because its last change is still being applied ("this request made no
+    // change") is retried for up to [`POST_WAIT`], as the person told so does; the longest such
+    // wait is reported.
+    let posted = Instant::now();
+    let mut waited = Duration::ZERO;
+    for room in &rooms {
+        for (dir, node, name, _) in &everyone {
+            let text = format!("{name} is here");
+            let args = as_node(&["room", "post", room, &text], *node);
+            let asked = Instant::now();
+            loop {
+                let (ok, out, err) = vox(dir, &args, None);
+                if ok {
+                    break;
+                }
+                let busy =
+                    err.contains("still being applied") || out.contains("still being applied");
+                assert!(
+                    busy && asked.elapsed() < POST_WAIT,
+                    "PRODUCT: {name}'s post in {room} was refused{}: {out}{err}",
+                    if busy {
+                        format!(" for {POST_WAIT:?} while the room applied its last change")
+                    } else {
+                        String::new()
+                    }
+                );
+                std::thread::sleep(Duration::from_millis(500));
+                waited = waited.max(asked.elapsed());
+            }
+        }
+    }
+    let mut unread: Vec<String> = Vec::new();
+    loop {
+        unread.clear();
+        for room in &rooms {
+            for (dir, node, reader, _) in &everyone {
+                let (ok, out, err) = vox(dir, &as_node(&["room", "read", room], *node), None);
+                assert!(
+                    ok,
+                    "PRODUCT: {reader}'s `vox room read` refused: {out}{err}"
+                );
+                for (_, _, author, _) in &everyone {
+                    if author != reader && !out.contains(&format!("{author} is here")) {
+                        unread.push(format!("{reader} has not read {author} in {room}"));
+                    }
+                }
+            }
+        }
+        if unread.is_empty() || posted.elapsed() > BOUND {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    if !unread.is_empty() {
+        // What each node's status says of its rooms' members (their key waits) and lanes.
+        let pictures: Vec<String> = everyone
+            .iter()
+            .map(|(dir, node, name, _)| {
+                let s = synced(dir, *node);
+                let v: serde_json::Value = serde_json::from_str(&s.status).unwrap_or_default();
+                let rooms = v["rooms"]
+                    .as_array()
+                    .map(|rs| {
+                        rs.iter()
+                            .map(|r| format!("room {} members {}", r["id"], r["members"]))
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    })
+                    .unwrap_or_default();
+                format!("{name}: {rooms}; lanes: {}", lanes_of(&s.status))
+            })
+            .collect();
+        panic!(
+            "PRODUCT: within {BOUND:?} of the posts, not every member read every other: \
+             {unread:?}\n{}\nthe host's daemon said: {}\nthe peer's daemon said: {}",
+            pictures.join("\n"),
+            said(&host, "host"),
+            said(&peer, "peer")
+        );
+    }
+
+    // ---- the rooms are quiet: acknowledgements settle, then the minute is measured ------------
     std::thread::sleep(Duration::from_secs(20));
-    let before = [synced(&alice), synced(&bob)];
+    let before: Vec<Synced> = everyone
+        .iter()
+        .map(|(dir, node, _, _)| synced(dir, *node))
+        .collect();
+    let cpu0 = (cpu_time(host_daemon.0.id()), cpu_time(peer_daemon.0.id()));
+    let net0 = net_bytes(host_daemon.0.id());
     let counted = Instant::now();
-    std::thread::sleep(IDLE);
-    let after = [synced(&alice), synced(&bob)];
+    let mut answers: Vec<(&str, Duration)> = Vec::new();
+    while counted.elapsed() < IDLE {
+        std::thread::sleep(ASK_EVERY.min(IDLE.saturating_sub(counted.elapsed())));
+        for name in HOSTED {
+            let asked = Instant::now();
+            let (ok, _, err) = vox(&host, &["status", "--json", "--node", name], None);
+            assert!(
+                ok,
+                "PRODUCT: `vox status --json --node {name}` refused in the quiet minute: {err}"
+            );
+            answers.push((name, asked.elapsed()));
+        }
+    }
     let idled = counted.elapsed();
-    let allowed = 2 * (idled.as_secs() / vox_core::node::syncstream::SYNC_INTERVAL_SECS + 1);
-    let grown: Vec<u64> = (0..2)
-        .map(|i| after[i].0.saturating_sub(before[i].0))
+    let after: Vec<Synced> = everyone
+        .iter()
+        .map(|(dir, node, _, _)| synced(dir, *node))
+        .collect();
+    let cpu1 = (cpu_time(host_daemon.0.id()), cpu_time(peer_daemon.0.id()));
+    let net1 = net_bytes(host_daemon.0.id());
+
+    // ---- the numbers ---------------------------------------------------------------------------
+    let interval = vox_core::node::syncstream::SYNC_INTERVAL_SECS;
+    let allowed = 2 * (idled.as_secs() / interval + 1);
+    let mut over: Vec<String> = Vec::new();
+    let mut most = LaneRounds::default();
+    for (i, (_, _, name, _)) in everyone.iter().enumerate() {
+        for ((room, peer), n) in &after[i].lanes {
+            let was = before[i]
+                .lanes
+                .get(&(room.clone(), peer.clone()))
+                .copied()
+                .unwrap_or_default();
+            let grown = n.since(was);
+            if grown.rounds() > most.rounds() {
+                most = grown;
+            }
+            if grown.rounds() > allowed {
+                over.push(format!(
+                    "{name}'s lane {}/{}: {} rounds ({} completed, {} partial, {} failed)",
+                    &room[..room.len().min(8)],
+                    &peer[..peer.len().min(8)],
+                    grown.rounds(),
+                    grown.completed,
+                    grown.partial,
+                    grown.failed
+                ));
+            }
+        }
+    }
+    let host_lanes: usize = after[..HOSTED.len()].iter().map(|s| s.lanes.len()).sum();
+    let traffic_bound = host_lanes as u64 * allowed * ROUND_BYTES;
+    // The bytes moved, or why they are not known; judged after every number is printed.
+    let moved: Result<(u64, u64), String> = match (&net0, &net1) {
+        (Ok(a), Ok(b)) if b.0 >= a.0 && b.1 >= a.1 => Ok((b.0 - a.0, b.1 - a.1)),
+        (Ok(a), Ok(b)) => Err(format!(
+            "a socket of the host's daemon closed during the quiet minute, so the bytes it \
+             carried are not counted: {a:?} before, {b:?} after"
+        )),
+        (Err(e), _) | (_, Err(e)) => Err(e.clone()),
+    };
+    let spent = (cpu1.0.saturating_sub(cpu0.0), cpu1.1.saturating_sub(cpu0.1));
+    let slowest = answers.iter().map(|(_, d)| *d).max().unwrap_or_default();
+    let not_recorded: Vec<&str> = everyone
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !after[*i].recorded)
+        .map(|(_, (_, _, name, _))| *name)
         .collect();
     println!(
-        "[proof] over {idled:?} of quiet: alice completed {} rounds, bob {} (allowed {allowed}: \
-         one periodic every {} s and its follow-up); last sync recorded: alice {}, bob {}",
-        grown[0],
-        grown[1],
-        vox_core::node::syncstream::SYNC_INTERVAL_SECS,
-        after[0].1,
-        after[1].1
+        "[proof] over {idled:?} of quiet with {} nodes on the host's daemon and one on the peer's, \
+         in {} rooms (a post waited at most {waited:?} for a room applying its last change): a lane \
+         ran at most {} rounds ({} completed, {} partial, {} failed; \
+         allowed {allowed}: one periodic every {interval} s from each side and its follow-up; the \
+         host's nodes hold {host_lanes} lanes); last sync \
+         recorded on every node: {}; CPU time: the host's daemon +{:?}, the peer's +{:?} (bound \
+         {IDLE_CPU:?}); {} status answers, slowest {slowest:?} (bound {ANSWER_WITHIN:?}); the \
+         host's daemon moved {} (bound {traffic_bound} bytes = {host_lanes} lanes x {allowed} \
+         rounds x {ROUND_BYTES} bytes)",
+        HOSTED.len(),
+        rooms.len(),
+        most.rounds(),
+        most.completed,
+        most.partial,
+        most.failed,
+        not_recorded.is_empty(),
+        spent.0,
+        spent.1,
+        answers.len(),
+        match &moved {
+            Ok((i, o)) => format!("{i} bytes in and {o} bytes out"),
+            Err(why) => format!("bytes not measured: {why}"),
+        }
     );
+    // Each node's lanes over the minute: what `vox status --json` counted per room and peer.
+    for (i, (_, _, name, _)) in everyone.iter().enumerate() {
+        let lanes: Vec<String> = after[i]
+            .lanes
+            .iter()
+            .map(|((room, peer), n)| {
+                let g = n.since(
+                    before[i]
+                        .lanes
+                        .get(&(room.clone(), peer.clone()))
+                        .copied()
+                        .unwrap_or_default(),
+                );
+                format!(
+                    "{}/{}: +{} rounds ({} completed, {} partial, {} failed; {} completed in all)",
+                    &room[..room.len().min(8)],
+                    &peer[..peer.len().min(8)],
+                    g.rounds(),
+                    g.completed,
+                    g.partial,
+                    g.failed,
+                    n.completed
+                )
+            })
+            .collect();
+        println!(
+            "[proof] {name}'s lanes over the minute: {}",
+            lanes.join("; ")
+        );
+    }
+    // Every claim is judged, so a run that breaks several names each on its own number.
+    let mut reds: Vec<String> = Vec::new();
+    if !over.is_empty() {
+        reds.push(format!(
+            "PRODUCT: a quiet room ran sync rounds with nothing to sync (ADR-038 FX-15): over \
+             {idled:?} these lanes ran more rounds than the {allowed} allowed (one periodic \
+             request of {interval} s from each side plus the follow-up each may raise; a partial \
+             or failed round is a round): {over:?}"
+        ));
+    }
+    if !not_recorded.is_empty() {
+        let statuses: Vec<String> = everyone
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !after[*i].recorded)
+            .map(|(i, (_, _, name, _))| format!("{name}'s status: {}", after[i].status))
+            .collect();
+        reds.push(format!(
+            "PRODUCT: `vox status` does not say when the room and the member last completed a \
+             sync (ADR-038 FX-16) on {not_recorded:?}\n{}",
+            statuses.join("\n")
+        ));
+    }
+    if spent.0 > IDLE_CPU || spent.1 > IDLE_CPU {
+        reds.push(format!(
+            "PRODUCT: a daemon in quiet rooms spent CPU with nothing to sync (ADR-038 FX-15, \
+             #986): the host's daemon ({} nodes) +{:?}, the peer's +{:?} over {idled:?} (bound \
+             {IDLE_CPU:?})",
+            HOSTED.len(),
+            spent.0,
+            spent.1
+        ));
+    }
+    if slowest > ANSWER_WITHIN {
+        reds.push(format!(
+            "PRODUCT: `vox status --json` answered in {slowest:?} in quiet rooms, over \
+             {ANSWER_WITHIN:?} (ADR-038 FX-17, #986); every answer: {answers:?}"
+        ));
+    }
+    match moved {
+        Ok((i, o)) if i + o > traffic_bound => reds.push(format!(
+            "PRODUCT: a daemon in quiet rooms moved bytes beyond its periodic rounds \
+             (ADR-038 FX-15, #986): {i} in and {o} out over {idled:?}, more than its \
+             {host_lanes} lanes' {allowed} allowed rounds at {ROUND_BYTES} bytes each \
+             ({traffic_bound}): a window of entries was fetched again"
+        )),
+        Ok(_) => {}
+        // On a Mac the bytes are what Activity Monitor shows, and not reading them is a
+        // fault of the apparatus; elsewhere there is no `nettop`, and the claim is not made.
+        Err(why) if cfg!(target_os = "macos") => reds.push(format!(
+            "APPARATUS: the host daemon's network bytes could not be read: {why}"
+        )),
+        Err(why) => eprintln!(
+            "[proof] NOT MEASURED: the host daemon's network bytes ({why}); claim 5 rests on \
+             the lanes' rounds here"
+        ),
+    }
     assert!(
-        grown.iter().all(|g| *g <= allowed),
-        "PRODUCT: a quiet room ran sync rounds with nothing to sync (ADR-038 FX-15): over \
-         {idled:?}, alice completed {} and bob {} (allowed {allowed}, one per periodic request \
-         of {} s plus its follow-up)\nalice's status: {}\nbob's status: {}",
-        grown[0],
-        grown[1],
-        vox_core::node::syncstream::SYNC_INTERVAL_SECS,
-        after[0].2,
-        after[1].2
-    );
-    assert!(
-        after[0].1 && after[1].1,
-        "PRODUCT: `vox status` does not say when the room and the member last completed a sync \
-         (ADR-038 FX-16): alice {}, bob {}\nalice's status: {}\nbob's status: {}",
-        after[0].1,
-        after[1].1,
-        after[0].2,
-        after[1].2
+        reds.is_empty(),
+        "{}\nthe host's daemon said: {}\nthe peer's daemon said: {}",
+        reds.join("\n\n"),
+        said(&host, "host"),
+        said(&peer, "peer")
     );
 }
 
@@ -1854,22 +2186,54 @@ fn cpu_time(pid: u32) -> Duration {
     Duration::from_secs_f64(hours * 3600.0 + mins * 60.0 + secs)
 }
 
-/// `vox status --json` of one profile: completed sync rounds summed over its ports, whether the
-/// room and every other member carry a last completed sync, and the raw status for a red.
-fn synced(dir: &Path) -> (u64, bool, String) {
-    let (ok, out, err) = vox(dir, &["status", "--json"], None);
+/// One lane's sync rounds as `vox status --json` counts them, however each ended: completed,
+/// partial (its requested entries unreceived) or failed. A round is a round whichever way it
+/// ended (ADR-038 FX-15); `opened` and `admitted` are not used, as a hinted round grows neither.
+#[derive(Clone, Copy, Default, Debug)]
+struct LaneRounds {
+    completed: u64,
+    partial: u64,
+    failed: u64,
+}
+
+impl LaneRounds {
+    fn rounds(self) -> u64 {
+        self.completed + self.partial + self.failed
+    }
+
+    fn since(self, before: Self) -> Self {
+        Self {
+            completed: self.completed.saturating_sub(before.completed),
+            partial: self.partial.saturating_sub(before.partial),
+            failed: self.failed.saturating_sub(before.failed),
+        }
+    }
+}
+
+/// What `vox status --json` shows of one node: its sync rounds per lane (a room with a peer),
+/// whether every room and every other member carry a last completed sync, and the raw status
+/// for a red.
+struct Synced {
+    lanes: BTreeMap<(String, String), LaneRounds>,
+    recorded: bool,
+    status: String,
+}
+
+fn synced(dir: &Path, node: Option<&str>) -> Synced {
+    let (ok, out, err) = vox(dir, &as_node(&["status", "--json"], node), None);
     assert!(ok, "PRODUCT: `vox status --json` failed: {err}");
     let v: serde_json::Value = serde_json::from_str(&out)
         .unwrap_or_else(|e| panic!("PRODUCT: `vox status --json` is not JSON: {e}: {out}"));
-    let completed = v["sync"]
-        .as_array()
-        .map(|ports| {
-            ports
-                .iter()
-                .map(|p| p["completed"].as_u64().unwrap_or(0))
-                .sum()
-        })
-        .unwrap_or(0);
+    let mut lanes: BTreeMap<(String, String), LaneRounds> = BTreeMap::new();
+    for lane in v["sync"].as_array().into_iter().flatten() {
+        let room = lane["room"].as_str().unwrap_or("?").to_owned();
+        let peer = lane["peer"].as_str().unwrap_or("?").to_owned();
+        let n = |k: &str| lane[k].as_u64().unwrap_or(0);
+        let l = lanes.entry((room, peer)).or_default();
+        l.completed += n("completed");
+        l.partial += n("partial");
+        l.failed += n("failed");
+    }
     let recorded = v["rooms"].as_array().is_some_and(|rooms| {
         !rooms.is_empty()
             && rooms.iter().all(|r| {
@@ -1882,7 +2246,63 @@ fn synced(dir: &Path) -> (u64, bool, String) {
                     })
             })
     });
-    (completed, recorded, out)
+    Synced {
+        lanes,
+        recorded,
+        status: out,
+    }
+}
+
+/// `args` as `node` runs it: `--node <node>` appended; a root with one node names none.
+fn as_node<'a>(args: &[&'a str], node: Option<&'a str>) -> Vec<&'a str> {
+    let mut v = args.to_vec();
+    if let Some(n) = node {
+        v.extend(["--node", n]);
+    }
+    v
+}
+
+/// `vox node unlock <node>` in the daemon holding `dir`, as a person makes a second node Ready
+/// beside the first. The passphrase comes from a private file the proof writes
+/// (`attach::persistent_args`: stdin's `-` is read on a Mac only).
+fn unlock(dir: &Path, node: &str) {
+    let args = attach::persistent_args(
+        dir,
+        &["node", "unlock", node, "--passphrase-file", "-"],
+        IDENTITY,
+    );
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let (ok, out, err) = vox_plain(dir, &args, None);
+    assert!(ok, "PRODUCT: `vox node unlock {node}` failed: {out}{err}");
+}
+
+/// A process's network bytes so far, in and out, as Activity Monitor's network columns count
+/// them: on a Mac `nettop -P -p <pid>` (unprivileged), summed over its open sockets since each
+/// opened. `Err` says why they could not be read (there is no `nettop` off a Mac).
+fn net_bytes(pid: u32) -> Result<(u64, u64), String> {
+    if !cfg!(target_os = "macos") {
+        return Err("no nettop on this platform".to_owned());
+    }
+    let out = Command::new("nettop")
+        .args(["-x", "-n", "-P", "-J", "bytes_in,bytes_out", "-p"])
+        .arg(pid.to_string())
+        .args(["-L", "1"])
+        .output()
+        .map_err(|e| format!("nettop: {e}"))?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    // `time,,bytes_in,bytes_out,` then `17:09:08.504028,vox.83287,0,0,`
+    let suffix = format!(".{pid}");
+    let row = text
+        .lines()
+        .find(|l| l.split(',').nth(1).is_some_and(|p| p.ends_with(&suffix)))
+        .ok_or_else(|| format!("nettop printed no row for pid {pid}: {text}"))?;
+    let cols: Vec<&str> = row.split(',').collect();
+    let n = |i: usize| {
+        cols.get(i)
+            .and_then(|c| c.parse::<u64>().ok())
+            .ok_or_else(|| format!("nettop row {row:?} has no byte count at column {i}"))
+    };
+    Ok((n(2)?, n(3)?))
 }
 
 /// Alice posts `posts` times under `root`; bob, trusted before any of them and joining cold, is
