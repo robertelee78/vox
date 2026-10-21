@@ -15,6 +15,10 @@
 //! it is compiled only with vox-tui's `optional-proofs` feature, and without it a stand-in of the
 //! same name says `OPTIONAL PROOF NOT RUN`. It blocks nothing, and it accepts no gap.
 //!
+//! [`an_update_and_rollback_leave_one_launchable_vox`] extends the same journey on macOS with
+//! LaunchServices and the signed shipped app for ADR-014 M-29a. It too is optional and ignored:
+//! it is ad hoc QE, never a CI or release gate.
+//!
 //! On macOS it also measures a Vox.app install (ADR-014 M-29): `vox update` replaces the whole
 //! bundle, from a loopback release this proof serves, and `--rollback` restores the whole previous
 //! one. `vox update` fetches only from GitHub in a build a person installs; the loopback release
@@ -43,7 +47,10 @@ mod release_server;
 
 #[path = "support/test_knobs.rs"]
 mod test_knobs;
-optional_proof::not_run!(an_older_release_updates_itself_and_refuses_a_bad_download);
+optional_proof::not_run!(
+    an_older_release_updates_itself_and_refuses_a_bad_download,
+    an_update_and_rollback_leave_one_launchable_vox,
+);
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -618,25 +625,44 @@ fn version_stub(path: &Path, version: &str) {
 /// ad-hoc signed: a Developer ID signature exists only as output of the release workflow.
 #[cfg(target_os = "macos")]
 fn app_bundle(dir: &Path, version: &str, helper: &Path) -> PathBuf {
+    app_bundle_as(dir, version, "us.vox.app", helper, Path::new(VOX))
+}
+
+/// A signed scratch app with an explicit identifier and launcher. The ordinary update journey
+/// keeps its historical fixture above; M-29a uses a unique identifier and makes LaunchServices
+/// run the release's distinguishable launcher through `open -b`.
+#[cfg(target_os = "macos")]
+fn app_bundle_as(
+    dir: &Path,
+    version: &str,
+    identifier: &str,
+    helper: &Path,
+    launcher: &Path,
+) -> PathBuf {
     let app = dir.join("Vox.app");
     let contents = app.join("Contents");
     for sub in ["MacOS", "Helpers"] {
         std::fs::create_dir_all(contents.join(sub))
             .unwrap_or_else(|e| panic!("APPARATUS: could not make {}: {e}", contents.display()));
     }
-    copy(Path::new(VOX), &contents.join("MacOS/Vox"));
+    copy(launcher, &contents.join("MacOS/Vox"));
+    make_executable(&contents.join("MacOS/Vox"));
     copy(helper, &contents.join("Helpers/vox"));
     make_executable(&contents.join("Helpers/vox"));
+    let parsed = semver::Version::parse(version)
+        .unwrap_or_else(|e| panic!("APPARATUS: fixture version {version:?} is not SemVer: {e}"));
+    let build = format!("{}.{}.{}", parsed.major + 1, parsed.minor, parsed.patch);
     write(
         &contents.join("Info.plist"),
         &format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \
              \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
              <plist version=\"1.0\"><dict>\
-             <key>CFBundleIdentifier</key><string>us.vox.app</string>\
+             <key>CFBundleIdentifier</key><string>{identifier}</string>\
              <key>CFBundleExecutable</key><string>Vox</string>\
              <key>CFBundlePackageType</key><string>APPL</string>\
              <key>CFBundleShortVersionString</key><string>{version}</string>\
+             <key>CFBundleVersion</key><string>{build}</string>\
              <key>LSMinimumSystemVersion</key><string>13.0</string>\
              </dict></plist>\n"
         ),
@@ -656,6 +682,63 @@ fn app_bundle(dir: &Path, version: &str, helper: &Path) -> PathBuf {
             String::from_utf8_lossy(&signed.stderr)
         );
     }
+    app
+}
+
+/// Copy the candidate's real signed app into a scratch bundle, give that fixture the requested
+/// release facts and helper, then re-sign it ad hoc after those fixture-only changes. Its main
+/// executable remains the shipped Vox app; no script or test double decides which path opened.
+#[cfg(all(target_os = "macos", feature = "optional-proofs"))]
+fn product_app_bundle_as(
+    dir: &Path,
+    signed_app: &Path,
+    version: &str,
+    identifier: &str,
+    helper: &Path,
+) -> PathBuf {
+    let app = dir.join("Vox.app");
+    let copied = Command::new("/usr/bin/ditto")
+        .arg(signed_app)
+        .arg(&app)
+        .output()
+        .unwrap_or_else(|e| panic!("APPARATUS: could not copy the signed app: {e}"));
+    assert!(
+        copied.status.success(),
+        "APPARATUS: copying the signed app failed: {}",
+        String::from_utf8_lossy(&copied.stderr)
+    );
+    let parsed = semver::Version::parse(version)
+        .unwrap_or_else(|e| panic!("APPARATUS: fixture version {version:?} is not SemVer: {e}"));
+    let build = format!("{}.{}.{}", parsed.major + 1, parsed.minor, parsed.patch);
+    for (key, value) in [
+        ("CFBundleIdentifier", identifier),
+        ("CFBundleShortVersionString", version),
+        ("CFBundleVersion", build.as_str()),
+    ] {
+        let changed = Command::new("/usr/libexec/PlistBuddy")
+            .args(["-c", &format!("Set :{key} {value}")])
+            .arg(app.join("Contents/Info.plist"))
+            .output()
+            .unwrap_or_else(|e| panic!("APPARATUS: could not set {key}: {e}"));
+        assert!(
+            changed.status.success(),
+            "APPARATUS: setting {key} on the scratch app failed: {}",
+            String::from_utf8_lossy(&changed.stderr)
+        );
+    }
+    let bundled_vox = app.join("Contents/Helpers/vox");
+    copy(helper, &bundled_vox);
+    make_executable(&bundled_vox);
+    let signed = Command::new("/usr/bin/codesign")
+        .args(["--force", "--deep", "--sign", "-"])
+        .arg(&app)
+        .output()
+        .unwrap_or_else(|e| panic!("APPARATUS: could not sign the scratch product app: {e}"));
+    assert!(
+        signed.status.success(),
+        "APPARATUS: signing the scratch product app failed: {}",
+        String::from_utf8_lossy(&signed.stderr)
+    );
     app
 }
 
@@ -696,14 +779,39 @@ fn bundle_release(root: &Path, channels: &[(&str, Option<&str>)]) {
 /// [`bundle_release`] of `version`, its app carrying `helper` as its vox.
 #[cfg(target_os = "macos")]
 fn bundle_release_of(root: &Path, version: &str, helper: &Path, channels: &[(&str, Option<&str>)]) {
+    bundle_release_of_as(
+        root,
+        version,
+        "us.vox.app",
+        helper,
+        Path::new(VOX),
+        channels,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn bundle_release_of_as(
+    root: &Path,
+    version: &str,
+    identifier: &str,
+    helper: &Path,
+    launcher: &Path,
+    channels: &[(&str, Option<&str>)],
+) {
+    let work = tmpdir();
+    let app = app_bundle_as(work.path(), version, identifier, helper, launcher);
+    bundle_release_app(root, version, &app, channels);
+}
+
+#[cfg(target_os = "macos")]
+fn bundle_release_app(root: &Path, version: &str, app: &Path, channels: &[(&str, Option<&str>)]) {
     let triple = target_triple();
     let work = tmpdir();
-    let app = app_bundle(work.path(), version, helper);
     let zip_name = format!("Vox-{version}-{triple}.zip");
     let zip = work.path().join(&zip_name);
     let zipped = Command::new("/usr/bin/ditto")
         .args(["-c", "-k", "--keepParent"])
-        .arg(&app)
+        .arg(app)
         .arg(&zip)
         .output()
         .unwrap_or_else(|e| panic!("APPARATUS: could not run ditto: {e}"));
@@ -756,12 +864,51 @@ fn bundle_release_of(root: &Path, version: &str, helper: &Path, channels: &[(&st
 /// naming `channel` (none when `None`), and `home/bin/vox` a link into it. Returns the link.
 #[cfg(target_os = "macos")]
 fn bundle_install(home: &Path, channel: Option<&str>) -> PathBuf {
+    bundle_install_as(
+        home,
+        channel,
+        VERSION,
+        "us.vox.app",
+        Path::new(VOX),
+        Path::new(VOX),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn bundle_install_as(
+    home: &Path,
+    channel: Option<&str>,
+    version: &str,
+    identifier: &str,
+    helper: &Path,
+    launcher: &Path,
+) -> PathBuf {
     let apps = home.join("Apps");
     std::fs::create_dir_all(&apps).unwrap_or_else(|e| panic!("APPARATUS: {e}"));
-    app_bundle(&apps, VERSION, Path::new(VOX));
+    app_bundle_as(&apps, version, identifier, helper, launcher);
     if let Some(channel) = channel {
         write(&apps.join(".vox-standalone.json"), &marker_json(channel));
     }
+    let bin = home.join("bin");
+    std::fs::create_dir_all(&bin).unwrap_or_else(|e| panic!("APPARATUS: {e}"));
+    std::os::unix::fs::symlink(apps.join("Vox.app/Contents/Helpers/vox"), bin.join("vox"))
+        .unwrap_or_else(|e| panic!("APPARATUS: could not link vox: {e}"));
+    bin.join("vox")
+}
+
+#[cfg(all(target_os = "macos", feature = "optional-proofs"))]
+fn bundle_install_product(
+    home: &Path,
+    channel: &str,
+    signed_app: &Path,
+    version: &str,
+    identifier: &str,
+    helper: &Path,
+) -> PathBuf {
+    let apps = home.join("Apps");
+    std::fs::create_dir_all(&apps).unwrap_or_else(|e| panic!("APPARATUS: {e}"));
+    product_app_bundle_as(&apps, signed_app, version, identifier, helper);
+    write(&apps.join(".vox-standalone.json"), &marker_json(channel));
     let bin = home.join("bin");
     std::fs::create_dir_all(&bin).unwrap_or_else(|e| panic!("APPARATUS: {e}"));
     std::os::unix::fs::symlink(apps.join("Vox.app/Contents/Helpers/vox"), bin.join("vox"))
@@ -1163,6 +1310,622 @@ fn bundle_claims(claims: &mut Vec<Claim>, receipts: &mut BTreeMap<String, String
         ));
     }
     drop(server);
+}
+
+/// LaunchServices' own registration tool. Every call in this proof names one exact scratch
+/// bundle; cleanup never resets the database and never unregisters the person's Vox.app.
+#[cfg(all(target_os = "macos", feature = "optional-proofs"))]
+const LSREGISTER: &str = "/System/Library/Frameworks/CoreServices.framework/Frameworks/\
+                          LaunchServices.framework/Support/lsregister";
+
+#[cfg(all(target_os = "macos", feature = "optional-proofs"))]
+fn lsregister(flag: &str, bundle: &Path) -> Result<(), String> {
+    let out = Command::new(LSREGISTER)
+        .arg(flag)
+        .arg(bundle)
+        .output()
+        .map_err(|e| format!("could not run lsregister for {}: {e}", bundle.display()))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "lsregister {flag} {} exited {}: {}",
+            bundle.display(),
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+    }
+}
+
+/// Exact paths LaunchServices currently associates with `identifier`.
+#[cfg(all(target_os = "macos", feature = "optional-proofs"))]
+fn launch_services_paths(identifier: &str) -> Result<Vec<PathBuf>, String> {
+    let out = Command::new(LSREGISTER)
+        .arg("-dump")
+        .output()
+        .map_err(|e| format!("could not ask LaunchServices for its records: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("lsregister -dump exited {}", out.status));
+    }
+    let mut path = None;
+    let mut found = Vec::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let line = line.trim();
+        if let Some(value) = line.strip_prefix("path:") {
+            let value = value.trim();
+            let value = value.split_once(" (0x").map_or(value, |(before, _)| before);
+            path = Some(PathBuf::from(value));
+        } else if line
+            .strip_prefix("identifier:")
+            .is_some_and(|value| value.trim() == identifier)
+        {
+            if let Some(value) = path.take() {
+                found.push(value);
+            }
+        }
+    }
+    found.sort();
+    found.dedup();
+    Ok(found)
+}
+
+/// Paths this proof may have registered. Drop repeats `lsregister -u` on those exact paths only.
+#[cfg(all(target_os = "macos", feature = "optional-proofs"))]
+struct LaunchServicesCleanup(Vec<PathBuf>);
+
+#[cfg(all(target_os = "macos", feature = "optional-proofs"))]
+impl LaunchServicesCleanup {
+    fn register(&mut self, bundle: &Path) -> Result<(), String> {
+        lsregister("-f", bundle)?;
+        self.0.push(bundle.to_path_buf());
+        Ok(())
+    }
+
+    fn remember(&mut self, bundle: &Path) {
+        self.0.push(bundle.to_path_buf());
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "optional-proofs"))]
+impl Drop for LaunchServicesCleanup {
+    fn drop(&mut self) {
+        self.0.sort();
+        self.0.dedup();
+        for bundle in &self.0 {
+            let _ = lsregister("-u", bundle);
+        }
+    }
+}
+
+/// What `open -b` and LaunchServices' resulting application record said.
+#[cfg(all(target_os = "macos", feature = "optional-proofs"))]
+struct OpenedBundle {
+    ok: bool,
+    path: Option<PathBuf>,
+    error: String,
+}
+
+/// Ask LaunchServices to open one identifier, then read the path on its exact application record
+/// and terminate that scratch app. The shipped Vox app receives scratch profile directories from
+/// `open --env`. There is no elapsed wait: `open`, `lsappinfo find/info`, and the exact kill each
+/// complete before the next observation. Failing to run the tools is APPARATUS; their completed
+/// answer is the PRODUCT observation returned to the claim.
+#[cfg(all(target_os = "macos", feature = "optional-proofs"))]
+fn opened_bundle(identifier: &str, data: &Path, config: &Path) -> Result<OpenedBundle, String> {
+    let out = Command::new("/usr/bin/open")
+        .args(["-n", "-b", identifier, "--env"])
+        .arg(format!("VOX_DATA_DIR={}", data.display()))
+        .arg("--env")
+        .arg(format!("VOX_CONFIG_DIR={}", config.display()))
+        .output()
+        .map_err(|e| format!("could not open {identifier}: {e}"))?;
+    let mut error = String::from_utf8_lossy(&out.stderr).trim().to_owned();
+    let found = Command::new("/usr/bin/lsappinfo")
+        .args(["find", &format!("bundleid={identifier}")])
+        .output()
+        .map_err(|e| format!("could not ask for the opened app: {e}"))?;
+    let asn = String::from_utf8_lossy(&found.stdout)
+        .lines()
+        .next()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned);
+    let mut path = None;
+    if let Some(asn) = &asn {
+        let info = Command::new("/usr/bin/lsappinfo")
+            .args(["info", "-only", "bundlepath", asn])
+            .output()
+            .map_err(|e| format!("could not read the opened app's path: {e}"))?;
+        let words = String::from_utf8_lossy(&info.stdout);
+        path = words.lines().find_map(|line| {
+            line.trim()
+                .strip_prefix("bundle path=\"")
+                .and_then(|value| value.strip_suffix('"'))
+                .map(PathBuf::from)
+        });
+        let killed = Command::new("/usr/bin/lsappinfo")
+            .args(["kill", "-hard", asn])
+            .output()
+            .map_err(|e| format!("could not terminate the scratch app: {e}"))?;
+        if !killed.status.success() {
+            error.push_str(&format!(
+                "; lsappinfo could not terminate {asn}: {}",
+                String::from_utf8_lossy(&killed.stderr).trim()
+            ));
+        }
+    } else if out.status.success() {
+        error.push_str("; LaunchServices made no application record for the opened identifier");
+    }
+    Ok(OpenedBundle {
+        ok: out.status.success(),
+        path,
+        error,
+    })
+}
+
+#[cfg(all(target_os = "macos", feature = "optional-proofs"))]
+fn plist_value(app: &Path, key: &str) -> Result<String, String> {
+    let out = Command::new("/usr/libexec/PlistBuddy")
+        .args(["-c", &format!("Print :{key}")])
+        .arg(app.join("Contents/Info.plist"))
+        .output()
+        .map_err(|e| format!("could not read {key} from {}: {e}", app.display()))?;
+    if !out.status.success() {
+        return Err(format!("{} has no readable {key}", app.display()));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+}
+
+#[cfg(all(target_os = "macos", feature = "optional-proofs"))]
+fn expected_build_version(version: &str) -> Result<String, String> {
+    let parsed = semver::Version::parse(version)
+        .map_err(|e| format!("the app version {version:?} is not SemVer: {e}"))?;
+    Ok(format!(
+        "{}.{}.{}",
+        parsed
+            .major
+            .checked_add(1)
+            .ok_or_else(|| "the app version's major component cannot be raised".to_owned())?,
+        parsed.minor,
+        parsed.patch
+    ))
+}
+
+#[cfg(all(target_os = "macos", feature = "optional-proofs"))]
+fn preceding_patch(version: &str) -> Result<String, String> {
+    let parsed = semver::Version::parse(version)
+        .map_err(|e| format!("the app version {version:?} is not SemVer: {e}"))?;
+    let patch = parsed.patch.checked_sub(1).ok_or_else(|| {
+        format!("the candidate {version} has no preceding patch release for this ordering proof")
+    })?;
+    Ok(format!("{}.{}.{}", parsed.major, parsed.minor, patch))
+}
+
+#[cfg(all(target_os = "macos", feature = "optional-proofs"))]
+fn signed(path: &Path) -> Result<(), String> {
+    let out = Command::new("/usr/bin/codesign")
+        .args(["--verify", "--strict", "--deep", "--all-architectures"])
+        .arg(path)
+        .output()
+        .map_err(|e| format!("could not run codesign for {}: {e}", path.display()))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "the restored {} does not verify: {}",
+            path.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "optional-proofs"))]
+fn last_line(words: &str) -> &str {
+    words
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("")
+}
+
+/// ADR-014 M-29a: real scratch updates and rollbacks through the shipped `vox`, with
+/// LaunchServices asked exactly as Finder/Dock/Spotlight ask it. Fully optional QE: ignored even
+/// when compiled, absent from every CI and release gate.
+#[cfg(all(target_os = "macos", feature = "optional-proofs"))]
+#[test]
+#[ignore = "optional macOS LaunchServices QE; run explicitly (docs/release/optional-proofs.md)"]
+fn an_update_and_rollback_leave_one_launchable_vox() {
+    test_knobs::require(&["VOX_TEST_RELEASE_BASE", "VOX_TEST_ABORT_AFTER_SWAP"]);
+    let mut claims = Vec::new();
+    let mut receipts = BTreeMap::new();
+    let identifier = format!("us.vox.app.proof.m29a.{}", std::process::id());
+    let signed_app = std::env::var_os("VOX_PROOF_SIGNED_APP")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            panic!(
+                "APPARATUS: VOX_PROOF_SIGNED_APP must name scripts/build-macos-app.sh's signed candidate"
+            )
+        });
+    let tree = tmpdir();
+    let newer = tmpdir();
+    let newer_vox = newer.path().join("vox");
+    version_stub(&newer_vox, NEWER);
+    let newer_app =
+        product_app_bundle_as(newer.path(), &signed_app, NEWER, &identifier, &newer_vox);
+    bundle_release_app(tree.path(), NEWER, &newer_app, &[("stable", None)]);
+    let server = release_server::serve(tree.path())
+        .unwrap_or_else(|why| panic!("APPARATUS: the scratch release server: {why}"));
+    let no_daemon = tmpdir();
+    let no_data = no_daemon.path().join("data");
+    let no_config = no_daemon.path().join("config");
+    let base = [
+        ("VOX_TEST_RELEASE_BASE", server.base.as_str()),
+        ("VOX_NO_SHELL_SETUP", "1"),
+        (
+            "VOX_DATA_DIR",
+            no_data.to_str().expect("APPARATUS: UTF-8 scratch path"),
+        ),
+        (
+            "VOX_CONFIG_DIR",
+            no_config.to_str().expect("APPARATUS: UTF-8 scratch path"),
+        ),
+    ];
+
+    // ---- update, exact LaunchServices record, and opening by identifier -----------------
+    // Mutant seams: omit `launch_services(false, previous)` for the record claim; omit the
+    // Info.plist rename in `set_aside` for the non-application claim. Each has its own red.
+    {
+        let tmp = tmpdir();
+        let home = tmp.path();
+        let link = bundle_install_product(
+            home,
+            "stable",
+            &signed_app,
+            VERSION,
+            &identifier,
+            Path::new(VOX),
+        );
+        let apps = home.join("Apps");
+        let active = apps.join("Vox.app");
+        let previous = apps.join(".Vox.app.previous");
+        let mut registrations = LaunchServicesCleanup(vec![active.clone(), previous.clone()]);
+        registrations
+            .register(&active)
+            .unwrap_or_else(|why| panic!("APPARATUS: {why}"));
+        let out = vox(&link, home, &["update"], &base);
+        let text = said(&out);
+        registrations.remember(&active);
+        registrations.remember(&previous);
+        let records =
+            launch_services_paths(&identifier).unwrap_or_else(|why| panic!("APPARATUS: {why}"));
+        let opened = opened_bundle(&identifier, &no_data, &no_config)
+            .unwrap_or_else(|why| panic!("APPARATUS: {why}"));
+        claims.push(claim(
+            "bundle.kept_bundle_is_not_an_application",
+            out.status.success()
+                && !previous.join("Contents/Info.plist").exists()
+                && previous.join("Contents/Info.plist.kept").is_file(),
+            format!(
+                "update exit_ok={}; kept Info.plist={}, kept copy={}; said {text:?}",
+                out.status.success(),
+                previous.join("Contents/Info.plist").exists(),
+                previous.join("Contents/Info.plist.kept").is_file()
+            ),
+        ));
+        claims.push(claim(
+            "bundle.kept_bundle_has_no_launchservices_record",
+            !records.contains(&previous),
+            format!("LaunchServices paths for {identifier}: {records:?}"),
+        ));
+        claims.push(claim(
+            "bundle.opening_the_identifier_selects_the_current_bundle",
+            opened.ok && opened.path.as_deref() == Some(active.as_path()),
+            format!(
+                "`open -b {identifier}` exit_ok={} opened {:?}, wanted {}; stderr {:?}",
+                opened.ok,
+                opened.path,
+                active.display(),
+                opened.error
+            ),
+        ));
+
+        // `restore` is the rollback mutant seam: without its kept-plist rename the swap may move
+        // bytes, but it cannot restore a signed launchable prior app.
+        let rollback = vox(&link, home, &["update", "--rollback"], &base);
+        let rollback_text = said(&rollback);
+        let records =
+            launch_services_paths(&identifier).unwrap_or_else(|why| panic!("APPARATUS: {why}"));
+        let opened = opened_bundle(&identifier, &no_data, &no_config)
+            .unwrap_or_else(|why| panic!("APPARATUS: {why}"));
+        let signature = signed(&active);
+        claims.push(claim(
+            "bundle.rollback_restores_one_signed_launchable_prior_bundle",
+            rollback.status.success()
+                && opened.ok
+                && opened.path.as_deref() == Some(active.as_path())
+                && app_says(&active) == VERSION
+                && signature.is_ok()
+                && active.join("Contents/Info.plist").is_file()
+                && !previous.join("Contents/Info.plist").exists()
+                && previous.join("Contents/Info.plist.kept").is_file()
+                && !records.contains(&previous),
+            format!(
+                "rollback exit_ok={}; open exit_ok={} selected {:?}, stderr {:?}; active version {:?}; signature={signature:?}; active plist={}; displaced plist={}; records={records:?}; said {rollback_text:?}",
+                rollback.status.success(),
+                opened.ok,
+                opened.path,
+                opened.error,
+                app_says(&active),
+                active.join("Contents/Info.plist").is_file(),
+                previous.join("Contents/Info.plist").exists(),
+            ),
+        ));
+        receipts.insert("m29a.update".into(), text);
+        receipts.insert("m29a.rollback".into(), rollback_text);
+    }
+
+    // A repair-only update needs a record for this build, so it takes the `is current` path after
+    // recovery. The active bundle's inode is the causal no-swap observation.
+    let current_tree = tmpdir();
+    bundle_release_of_as(
+        current_tree.path(),
+        VERSION,
+        &identifier,
+        Path::new(VOX),
+        Path::new(VOX),
+        &[("stable", None)],
+    );
+    let current_server = release_server::serve(current_tree.path())
+        .unwrap_or_else(|why| panic!("APPARATUS: the current scratch release server: {why}"));
+    let current_base = [
+        ("VOX_TEST_RELEASE_BASE", current_server.base.as_str()),
+        ("VOX_NO_SHELL_SETUP", "1"),
+        base[2],
+        base[3],
+    ];
+
+    // ---- recovery: a publish cut after its swap, then a same-version update ---------------
+    // Mutant seam: omit the published-version branch in `recover`.
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let tmp = tmpdir();
+        let home = tmp.path();
+        let link = bundle_install_as(
+            home,
+            Some("stable"),
+            VERSION,
+            &identifier,
+            Path::new(VOX),
+            Path::new(VOX),
+        );
+        let apps = home.join("Apps");
+        let active = apps.join("Vox.app");
+        let interrupted_env: Vec<(&str, &str)> = base
+            .iter()
+            .copied()
+            .chain([("VOX_TEST_ABORT_AFTER_SWAP", "1")])
+            .collect();
+        let cut = vox(&link, home, &["update"], &interrupted_env);
+        copy(Path::new(VOX), &active.join("Contents/Helpers/vox"));
+        let before = std::fs::metadata(&active)
+            .expect("APPARATUS: active app after cut")
+            .ino();
+        let repaired = vox(&link, home, &["update"], &current_base);
+        let text = said(&repaired);
+        let after = std::fs::metadata(&active)
+            .expect("APPARATUS: active app after repair")
+            .ino();
+        claims.push(claim(
+            "bundle.recovery_finishes_an_interrupted_publish_without_another_swap",
+            !cut.status.success()
+                && repaired.status.success()
+                && before == after
+                && app_says(&active) == NEWER
+                && apps.join(".Vox.app.previous/Contents/Info.plist.kept").is_file()
+                && !apps.join(".Vox.app.publishing").exists()
+                && last_line(&text).contains("without swapping Vox.app")
+                && last_line(&text).contains("cut short"),
+            format!(
+                "cut exit_ok={}; repair exit_ok={}; active inode {before}->{after}, version {:?}; final {:?}; said {text:?}",
+                cut.status.success(),
+                repaired.status.success(),
+                app_says(&active),
+                last_line(&text)
+            ),
+        ));
+    }
+
+    // ---- recovery: set-aside failed, then the exact obstruction is removed ----------------
+    // Mutant seam: omit the no-journal previous-bundle `set_aside` retry in `recover`.
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let tmp = tmpdir();
+        let home = tmp.path();
+        let link = bundle_install_as(
+            home,
+            Some("stable"),
+            VERSION,
+            &identifier,
+            Path::new(VOX),
+            Path::new(VOX),
+        );
+        let apps = home.join("Apps");
+        let active = apps.join("Vox.app");
+        let previous_work = tmpdir();
+        let previous = app_bundle_as(
+            previous_work.path(),
+            "0.4.8",
+            &identifier,
+            Path::new(VOX),
+            Path::new(VOX),
+        );
+        let kept = apps.join(".Vox.app.previous");
+        std::fs::rename(previous, &kept).expect("APPARATUS: place previous app");
+        let before = std::fs::metadata(&active)
+            .expect("APPARATUS: active app")
+            .ino();
+        let mut permissions = std::fs::metadata(kept.join("Contents"))
+            .expect("APPARATUS: previous Contents")
+            .permissions();
+        let writable_mode = permissions.mode();
+        permissions.set_mode(writable_mode & !0o222);
+        std::fs::set_permissions(kept.join("Contents"), permissions)
+            .expect("APPARATUS: make previous Contents read-only");
+        let refused = vox(&link, home, &["update"], &current_base);
+        let mut permissions = std::fs::metadata(kept.join("Contents"))
+            .expect("APPARATUS: previous Contents after refusal")
+            .permissions();
+        permissions.set_mode(writable_mode);
+        std::fs::set_permissions(kept.join("Contents"), permissions)
+            .expect("APPARATUS: restore previous Contents permissions");
+        let repaired = vox(&link, home, &["update"], &current_base);
+        let text = said(&repaired);
+        let after = std::fs::metadata(&active)
+            .expect("APPARATUS: active app after repair")
+            .ino();
+        claims.push(claim(
+            "bundle.recovery_retries_a_failed_set_aside_without_a_swap",
+            !refused.status.success()
+                && repaired.status.success()
+                && before == after
+                && !kept.join("Contents/Info.plist").exists()
+                && kept.join("Contents/Info.plist.kept").is_file()
+                && last_line(&text).contains("without swapping Vox.app")
+                && last_line(&text).contains("previous bundle"),
+            format!(
+                "refusal exit_ok={} said {:?}; repair exit_ok={}; inode {before}->{after}; final {:?}",
+                refused.status.success(),
+                said(&refused),
+                repaired.status.success(),
+                last_line(&text)
+            ),
+        ));
+    }
+
+    // ---- recovery: a retired bundle still executing is disarmed, then swept after exit ----
+    // Mutant seam: omit `sweep`'s set-aside-before-in-use check.
+    {
+        use std::io::{BufRead as _, Write as _};
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let tmp = tmpdir();
+        let home = tmp.path();
+        let link = bundle_install_as(
+            home,
+            Some("stable"),
+            VERSION,
+            &identifier,
+            Path::new(VOX),
+            Path::new(VOX),
+        );
+        let apps = home.join("Apps");
+        let active = apps.join("Vox.app");
+        let work = tmpdir();
+        let fixture = app_bundle_as(
+            work.path(),
+            "0.4.8",
+            &identifier,
+            Path::new(VOX),
+            Path::new(VOX),
+        );
+        let retired = apps.join(".Vox.app.retired.proof");
+        std::fs::rename(fixture, &retired).expect("APPARATUS: place retired app");
+        let hold = retired.join("Contents/MacOS/hold");
+        copy(Path::new("/bin/sh"), &hold);
+        let mut permissions = std::fs::metadata(&hold)
+            .expect("APPARATUS: retired hold executable")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&hold, permissions)
+            .expect("APPARATUS: chmod retired hold executable");
+        let mut child = Command::new(&hold)
+            .args(["-c", "echo READY; read answer"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("APPARATUS: start exact retired executable");
+        let mut ready = String::new();
+        std::io::BufReader::new(child.stdout.take().expect("APPARATUS: retired stdout"))
+            .read_line(&mut ready)
+            .expect("APPARATUS: read retired readiness event");
+        assert_eq!(
+            ready.trim(),
+            "READY",
+            "APPARATUS: retired process did not become ready"
+        );
+        let before = std::fs::metadata(&active)
+            .expect("APPARATUS: active app")
+            .ino();
+        let first = vox(&link, home, &["update"], &current_base);
+        let first_text = said(&first);
+        let after = std::fs::metadata(&active)
+            .expect("APPARATUS: active app after repair")
+            .ino();
+        let disarmed = retired.exists()
+            && !retired.join("Contents/Info.plist").exists()
+            && retired.join("Contents/Info.plist.kept").is_file();
+        if let Some(mut input) = child.stdin.take() {
+            let _ = writeln!(input, "done");
+        }
+        let status = child.wait().expect("APPARATUS: exact retired process exit");
+        let second = vox(&link, home, &["update"], &current_base);
+        let second_text = said(&second);
+        claims.push(claim(
+            "bundle.recovery_disarms_a_retired_live_bundle_then_removes_it_after_exit",
+            first.status.success()
+                && before == after
+                && disarmed
+                && last_line(&first_text).contains("without swapping Vox.app")
+                && last_line(&first_text).contains("retired bundle")
+                && status.success()
+                && second.status.success()
+                && !retired.exists()
+                && last_line(&second_text).contains("without swapping Vox.app")
+                && last_line(&second_text).contains("removed 1 retired bundle"),
+            format!(
+                "first exit_ok={}, inode {before}->{after}, disarmed={disarmed}, process={status}; second exit_ok={}, retired exists={}; first final {:?}; second final {:?}",
+                first.status.success(),
+                second.status.success(),
+                retired.exists(),
+                last_line(&first_text),
+                last_line(&second_text)
+            ),
+        ));
+    }
+
+    // The exact shipped app build supplied by the QE runner: signature, documented build-number
+    // form, and strict increase over the previous release fact staged by the update journey.
+    // Mutant seam: restore CURRENT_PROJECT_VERSION=1 in scripts/build-macos-app.sh.
+    let short = plist_value(&signed_app, "CFBundleShortVersionString")
+        .unwrap_or_else(|why| panic!("APPARATUS: {why}"));
+    let build = plist_value(&signed_app, "CFBundleVersion")
+        .unwrap_or_else(|why| panic!("APPARATUS: {why}"));
+    let expected = expected_build_version(&short).unwrap_or_else(|why| panic!("APPARATUS: {why}"));
+    let previous = preceding_patch(&short).unwrap_or_else(|why| panic!("APPARATUS: {why}"));
+    let previous_build =
+        expected_build_version(&previous).unwrap_or_else(|why| panic!("APPARATUS: {why}"));
+    let signature = signed(&signed_app);
+    let order = (
+        semver::Version::parse(&build),
+        semver::Version::parse(&previous_build),
+    );
+    claims.push(claim(
+        "bundle.shipped_build_number_grows_in_apples_documented_form",
+        signature.is_ok()
+            && short == VERSION
+            && build == expected
+            && matches!(order, (Ok(ref now), Ok(ref before)) if now > before),
+        format!(
+            "{} says short={short:?}, build={build:?}, expected={expected:?}, previous={previous_build:?}, signature={signature:?}",
+            signed_app.display()
+        ),
+    ));
+
+    dispose(
+        "one launchable Vox optional proof",
+        &claims,
+        &receipts,
+        false,
+    );
 }
 
 /// A genuinely compiled next-release binary, supplied as proof apparatus. Patching version

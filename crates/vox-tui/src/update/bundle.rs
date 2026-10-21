@@ -89,9 +89,10 @@ pub(super) fn update(
             // A previous bundle left as an application (before M-29a, or by a set-aside that
             // failed) is repaired here too, so a plain `vox update` finishes the job.
             let _lock = InstallLock::acquire(apps)?;
-            recover(apps)?;
+            let repaired = recover(apps)?;
             shell_setup_from(apps, exe);
             println!("Vox {current} is current; {}", super::skill_said());
+            repaired.say_without_swap();
         }
         return Ok(());
     }
@@ -105,7 +106,8 @@ pub(super) fn update(
 
     // The lock first: what is in `apps` is read only while no other transition changes it.
     let _lock = InstallLock::acquire(apps)?;
-    recover(apps)?;
+    let repaired = recover(apps)?;
+    repaired.say_before_transition();
     let active = apps.join(BUNDLE);
     if !active.join(HELPER).is_file() {
         return Err(usage(format!(
@@ -157,7 +159,8 @@ pub(super) fn rollback(apps: &Path, exe: &Path) -> Result<(), AppError> {
     let active = apps.join(BUNDLE);
     let previous = apps.join(PREVIOUS);
     let _lock = InstallLock::acquire(apps)?;
-    recover(apps)?;
+    let repaired = recover(apps)?;
+    repaired.say_before_transition();
     if !previous.join(HELPER).is_file() {
         return Err(usage(format!(
             "no previous Vox.app was retained in {} — nothing to roll back to",
@@ -171,7 +174,7 @@ pub(super) fn rollback(apps: &Path, exe: &Path) -> Result<(), AppError> {
     if let Err(failed) = swap(&previous, &active) {
         // Nothing was swapped: the kept bundle is set aside again, never left an application.
         return Err(match set_aside(&previous) {
-            Ok(()) => failed,
+            Ok(_) => failed,
             Err(aside) => AppError::Usage(format!(
                 "the rollback swap failed ({failed}), and {aside}; run `vox update` to repair, \
                  and until then open Vox as {}",
@@ -290,7 +293,7 @@ fn retire(apps: &Path, bundle: &Path) -> Result<(), AppError> {
     let name = format!("{RETIRED_PREFIX}{ms}.{}", std::process::id());
     let retired = apps.join(name);
     fs::rename(bundle, &retired).map_err(AppError::Io)?;
-    set_aside(&retired)
+    set_aside(&retired).map(|_| ())
 }
 
 /// Tell LaunchServices about a bundle: `register` adds or refreshes the bundle in place;
@@ -336,20 +339,21 @@ const INFO_PLIST: &str = "Contents/Info.plist";
 /// application, whatever record remains); the record removal is the second measure, said when it
 /// fails and tried again by every later transition that finds the bundle still there (`sweep`,
 /// `recover`, the next publish), until it succeeds.
-fn set_aside(bundle: &Path) -> Result<(), AppError> {
+fn set_aside(bundle: &Path) -> Result<bool, AppError> {
     if let Err(said) = launch_services(false, bundle) {
         println!("note: {said}; tried again at the next update or rollback");
     }
     let plist = bundle.join(INFO_PLIST);
     if !plist.is_file() {
-        return Ok(());
+        return Ok(false);
     }
     fs::rename(&plist, bundle.join(KEPT_INFO_PLIST)).map_err(|e| {
         AppError::Usage(format!(
             "{} is still an application: its Info.plist could not be set aside ({e})",
             bundle.display()
         ))
-    })
+    })?;
+    Ok(true)
 }
 
 /// Make a set-aside bundle an application again, for the swap that brings it back.
@@ -362,7 +366,7 @@ fn restore(bundle: &Path) -> Result<(), AppError> {
 }
 
 /// Remove the retired bundles nothing runs from any more.
-fn sweep(apps: &Path) -> Result<(), AppError> {
+fn sweep(apps: &Path, repaired: &mut Recovery) -> Result<(), AppError> {
     let Ok(entries) = fs::read_dir(apps) else {
         return Ok(());
     };
@@ -374,9 +378,12 @@ fn sweep(apps: &Path) -> Result<(), AppError> {
         if retired {
             // Set aside first, again if an earlier attempt failed: the record goes and the
             // bundle is no application even if it then cannot be removed. One still in use stays.
-            set_aside(&entry.path())?;
+            if set_aside(&entry.path())? {
+                repaired.retired_set_aside += 1;
+            }
             if !in_use(&entry.path()) {
                 clear(&entry.path())?;
+                repaired.retired_removed += 1;
             }
         }
     }
@@ -424,8 +431,9 @@ fn in_use(bundle: &Path) -> bool {
 /// partial name holds the replaced bundle, which becomes [`PREVIOUS`]; otherwise the partial is
 /// the unpublished candidate, and goes. Either way the journal's earlier previous bundle comes
 /// back when nothing has taken its place.
-fn recover(apps: &Path) -> Result<(), AppError> {
-    sweep(apps)?;
+fn recover(apps: &Path) -> Result<Recovery, AppError> {
+    let mut repaired = Recovery::default();
+    sweep(apps, &mut repaired)?;
     let journal = apps.join(PUBLISHING);
     if fs::symlink_metadata(&journal).is_err() {
         // No publish was cut short. A previous bundle is set aside again under the lock: one an
@@ -433,9 +441,9 @@ fn recover(apps: &Path) -> Result<(), AppError> {
         // failed last time.
         let previous = apps.join(PREVIOUS);
         if fs::symlink_metadata(&previous).is_ok() {
-            set_aside(&previous)?;
+            repaired.previous_set_aside = set_aside(&previous)?;
         }
-        return Ok(());
+        return Ok(repaired);
     }
     let staged = apps.join(PARTIAL);
     let previous = apps.join(PREVIOUS);
@@ -443,13 +451,8 @@ fn recover(apps: &Path) -> Result<(), AppError> {
     if fs::symlink_metadata(&previous).is_err() && staged.join(HELPER).is_file() {
         if app_version(&apps.join(BUNDLE)).as_deref() == Some(published.trim()) {
             fs::rename(&staged, &previous).map_err(AppError::Io)?;
-            set_aside(&previous)?;
-            println!(
-                "vox: an update was cut short after Vox {} was put in place; the Vox.app it \
-                 replaced is kept at {} for `vox update --rollback`",
-                published.trim(),
-                previous.display()
-            );
+            let _ = set_aside(&previous)?;
+            repaired.interrupted_publish = Some(published.trim().to_owned());
         } else {
             clear(&staged)?;
         }
@@ -461,10 +464,71 @@ fn recover(apps: &Path) -> Result<(), AppError> {
     // The previous bundle is set aside again under the lock, before anything else reads `apps`:
     // one an earlier release left as an application, or one whose record removal failed.
     if fs::symlink_metadata(&previous).is_ok() {
-        set_aside(&previous)?;
+        repaired.previous_set_aside |= set_aside(&previous)?;
     }
     sync_dir(apps)?;
-    clear(&journal)
+    clear(&journal)?;
+    Ok(repaired)
+}
+
+/// Work an earlier or interrupted transition left for the next update. It is accumulated so a
+/// repair-only `vox update` can say, as its final line, both what it repaired and that it did not
+/// exchange the active bundle (ADR-014 M-29a).
+#[derive(Default)]
+struct Recovery {
+    interrupted_publish: Option<String>,
+    previous_set_aside: bool,
+    retired_set_aside: usize,
+    retired_removed: usize,
+}
+
+impl Recovery {
+    fn is_empty(&self) -> bool {
+        self.interrupted_publish.is_none()
+            && !self.previous_set_aside
+            && self.retired_set_aside == 0
+            && self.retired_removed == 0
+    }
+
+    fn detail(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(version) = &self.interrupted_publish {
+            parts.push(format!(
+                "finished the update cut short after Vox {version} was put in place and kept the replaced app for rollback"
+            ));
+        }
+        if self.previous_set_aside {
+            parts.push("made the kept previous bundle non-launchable again".to_owned());
+        }
+        if self.retired_set_aside > 0 {
+            parts.push(format!(
+                "made {} retired bundle(s) non-launchable",
+                self.retired_set_aside
+            ));
+        }
+        if self.retired_removed > 0 {
+            parts.push(format!(
+                "removed {} retired bundle(s) no process still used",
+                self.retired_removed
+            ));
+        }
+        parts.join("; ")
+    }
+
+    fn say_before_transition(&self) {
+        if !self.is_empty() {
+            println!("vox: repaired an earlier app transition: {}", self.detail());
+        }
+    }
+
+    fn say_without_swap(&self) {
+        if !self.is_empty() {
+            println!(
+                "vox: repaired an earlier app transition without swapping Vox.app: {}",
+                self.detail()
+            );
+        }
+    }
 }
 
 /// Unpack the downloaded zip beside the bundle, on its filesystem, and return the one Vox.app
