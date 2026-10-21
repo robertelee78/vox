@@ -159,6 +159,10 @@ pub(crate) struct Flow {
     pub(crate) reroute: Option<Digest32>,
     /// Original peer while the next exact wire dependency runs against its author.
     pub(crate) route_origin: Option<Digest32>,
+    /// Fetch progress accumulated on the advertising source's lane before a dependency is routed
+    /// to its author. The routed lane gets a fresh directional account; returning restores only
+    /// the origin's progress, so one fetched object cannot make both lanes non-empty.
+    pub(crate) route_origin_brought: bool,
     /// The routed wire response completed and the retained continuation must return to origin.
     pub(crate) route_complete: bool,
     /// A local trust edit invalidated this flow's grant. Retire it without blaming the peer;
@@ -306,6 +310,7 @@ impl Flow {
             archive_status: None,
             reroute: None,
             route_origin: None,
+            route_origin_brought: false,
             route_complete: false,
             authorization_changed: false,
             tasks: Vec::with_capacity(MAX_TASKS),
@@ -425,6 +430,7 @@ impl Flow {
             archive_status: None,
             reroute: None,
             route_origin: None,
+            route_origin_brought: false,
             route_complete: false,
             authorization_changed: false,
             slots,
@@ -723,6 +729,7 @@ impl Flow {
         let request = self.request;
         let instance = self.instance;
         let after = self.cleanup_after;
+        let committed = Arc::clone(&self.work_committed);
         let step = tokio::task::spawn_blocking(move || {
             let _charge = charge;
             let mut channel = room.blocking_lock();
@@ -734,10 +741,10 @@ impl Flow {
                 Ok(current) if current != instance => return Ok((true, None)),
                 Ok(_) => {}
             }
-            if !channel.cleanup_history_source_owned(&store, request)? {
+            if !channel.cleanup_history_source_owned(&store, &committed, request)? {
                 return Ok((false, after));
             }
-            channel.cleanup_history_verifiers(&store, request, after)
+            channel.cleanup_history_verifiers(&store, &committed, request, after)
         })
         .await
         .map_err(|_| Error::Profile("history retirement worker stopped"))??;
@@ -978,6 +985,7 @@ impl Flow {
                 let node = self.node;
                 let room = self.room;
                 let epoch = self.epoch;
+                let committed = Arc::clone(&self.work_committed);
                 let found = source
                     .read(job, 256, move |channel, store| {
                         if channel.history_instance(store)? != instance
@@ -1021,7 +1029,7 @@ impl Flow {
                         let through = target.root.leaves;
                         drop(input);
                         channel
-                            .history_write(store, |index| {
+                            .history_write_tracked(store, &committed, |index| {
                                 index.select_history_live_window(&author, head)
                             })
                             .map(|window| Some((window, through)))
@@ -1183,6 +1191,7 @@ impl Flow {
                 let room = self.room;
                 let epoch = self.epoch;
                 let unavailable = self.live_unavailable == Some((window.head, window.next));
+                let committed = Arc::clone(&self.work_committed);
                 let advanced = source
                     .read(job, 128, move |channel, store| {
                         if channel.history_instance(store)? != instance
@@ -1223,7 +1232,7 @@ impl Flow {
                         }
                         drop(input);
                         channel
-                            .history_write(store, |index| {
+                            .history_write_tracked(store, &committed, |index| {
                                 index.advance_history_live_window(&author, window)
                             })
                             .map(Some)

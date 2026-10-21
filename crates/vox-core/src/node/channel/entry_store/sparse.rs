@@ -699,13 +699,14 @@ impl Source<'_> {
 }
 
 impl Read<'_> {
-    /// The exact inventory head this source refused for this author, and the two membership
-    /// incarnations that scope that decision. One indexed scalar exists per real relationship.
+    /// The exact inventory head this source refused for this author, and the authorization plus
+    /// two membership incarnations that scope that decision. One indexed scalar exists per real
+    /// relationship.
     pub(crate) fn history_declined_head(
         &self,
         peer: &Digest32,
         author: &Digest32,
-    ) -> Result<Option<(Digest32, u64, u64)>> {
+    ) -> Result<Option<(Digest32, Digest32, u64, u64)>> {
         let key = declined_head_key(peer, author);
         let Some(id) = self.source().number(
             self.sek,
@@ -720,17 +721,26 @@ impl Read<'_> {
             .source()
             .sparse_record(self.sek, self.channel, id, STATE_BYTES)?;
         let mut d = Decoder::new(&bytes);
-        if d.array()? != 6 || d.uint()? != 1 || d.bytes()? != peer || d.bytes()? != author {
+        if d.array()? != 7 || d.uint()? != 2 || d.bytes()? != peer || d.bytes()? != author {
             return Err(invalid("declined history head binding"));
         }
         let head = d
             .bytes()?
             .try_into()
             .map_err(|_| invalid("declined history head"))?;
+        let authorization = d
+            .bytes()?
+            .try_into()
+            .map_err(|_| invalid("declined history authorization generation"))?;
         let peer_incarnation = d.uint()?;
         let author_incarnation = d.uint()?;
         d.finish()?;
-        Ok(Some((head, peer_incarnation, author_incarnation)))
+        Ok(Some((
+            head,
+            authorization,
+            peer_incarnation,
+            author_incarnation,
+        )))
     }
 
     pub(crate) fn history_settled_tip(&self, author: &Digest32) -> Result<Option<Entry>> {
@@ -1117,6 +1127,7 @@ impl Write<'_, '_> {
         peer: Digest32,
         author: Digest32,
         head: Digest32,
+        authorization: Digest32,
         peer_incarnation: u64,
         author_incarnation: u64,
     ) -> Result<()> {
@@ -1125,11 +1136,12 @@ impl Write<'_, '_> {
         let root = self.directory.active.sparse.declined_heads;
         let old = Source::Batch(self.batch).number(self.sek, self.channel, root, &key)?;
         let mut e = Encoder::new();
-        e.array(6)
-            .uint(1)
+        e.array(7)
+            .uint(2)
             .bytes(&peer)
             .bytes(&author)
             .bytes(&head)
+            .bytes(&authorization)
             .uint(peer_incarnation)
             .uint(author_incarnation);
         let id = self.save_sparse_record(old, &e.finish(), STATE_BYTES)?;

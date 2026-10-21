@@ -10662,6 +10662,18 @@ impl Node {
                 let departure_receipt = current
                     .as_ref()
                     .is_some_and(|attempt| attempt.is_departure_receipt());
+                // Count the actual user-visible transfer edge even if the round later ends
+                // partial, fails, or its actor attempt has already retired. A sent history
+                // object, or a newly accepted symmetric inventory hint, did happen and must not
+                // disappear from the lane's account because terminal DONE did not arrive.
+                if moved {
+                    crate::node::status::SyncBook::with(
+                        &self.sync_book,
+                        channel_id,
+                        peer,
+                        |counts| counts.history_served = counts.history_served.saturating_add(1),
+                    );
+                }
                 if current.is_some() {
                     crate::node::status::SyncBook::with(
                         &self.sync_book,
@@ -10679,8 +10691,6 @@ impl Node {
                                 if !moved {
                                     counts.empty += 1;
                                     counts.served_empty += 1;
-                                } else {
-                                    counts.history_served += 1;
                                 }
                             }
                             Ok(_) => counts.partial += 1,

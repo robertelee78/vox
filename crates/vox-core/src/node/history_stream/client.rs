@@ -184,11 +184,13 @@ impl Receiver {
             Lookup::Missing => return Ok(LocalProof::Missing),
         };
         let generation = self.generation;
+        let committed = self.source.commit_ledger();
         let staged = self
             .read(&work_job, VERIFY_ENVELOPE, move |room, store| {
                 admission::stage(
                     room,
                     store,
+                    &committed,
                     request,
                     generation,
                     &query,
@@ -339,6 +341,7 @@ impl Receiver {
                 Action::Meta => {
                     let generation = self.generation;
                     let selected = query.clone();
+                    let committed = self.source.commit_ledger();
                     let Some(work_job) = io.job().record_job(12 * 1024 * 1024).await else {
                         io.abort(WireError::SessionBusy);
                         result.status = Status::Busy;
@@ -349,8 +352,10 @@ impl Receiver {
                             let Frame::Meta { object, .. } = incoming.frame()? else {
                                 return Err(Error::MalformedBundle("metadata frame changed"));
                             };
-                            admission::stage(room, store, request, generation, &selected, object)
-                                .map(Some)
+                            admission::stage(
+                                room, store, &committed, request, generation, &selected, object,
+                            )
+                            .map(Some)
                         })
                         .await?;
                     let Lookup::Found(staged) = staged else {
@@ -358,16 +363,6 @@ impl Receiver {
                         result.status = Status::Busy;
                         return Ok(result);
                     };
-                    let committed = match &staged.value {
-                        Staged::Object { brought }
-                        | Staged::Head { brought, .. }
-                        | Staged::Header { brought, .. } => *brought,
-                        Staged::Verifier(_) => true,
-                        Staged::Busy => false,
-                    };
-                    if committed {
-                        self.source.note_work_committed();
-                    }
                     match &staged.value {
                         Staged::Object { brought } => result.brought |= *brought,
                         Staged::Busy => {
@@ -703,21 +698,15 @@ impl Receiver {
         let Some(work_job) = job.record_job(12 * 1024 * 1024).await else {
             return Ok(Lookup::Busy);
         };
+        let commit_ledger = self.source.commit_ledger();
         let advanced = self
             .read(&work_job, VERIFY_ENVELOPE, move |room, store| {
                 if room.channel_id() != binding.room {
                     return Err(Error::Profile("history verifier room changed"));
                 }
-                admission::advance(room, store, &binding).map(Some)
+                admission::advance(room, store, &commit_ledger, &binding).map(Some)
             })
             .await?;
-        if matches!(
-            &advanced,
-            Lookup::Found(found)
-                if matches!(found.value, Advanced::Progress | Advanced::Need(_) | Advanced::Complete)
-        ) {
-            self.source.note_work_committed();
-        }
         Ok(advanced)
     }
 }
@@ -829,11 +818,13 @@ impl Receiver {
     ) -> Result<Lookup<(Arc<Record>, admission::EntryStart)>> {
         let generation = self.generation;
         let job = record.job.clone();
+        let committed = self.source.commit_ledger();
         // The record already owns the complete verification/parse envelope.
         self.read_precharged(&job, 64 * 1024, record, move |room, store, record| {
             admission::start_entry(
                 room,
                 store,
+                &committed,
                 request,
                 generation,
                 head,
@@ -855,6 +846,7 @@ impl Receiver {
             return Err(Error::Profile("history entry activation changed"));
         }
         let job = record.job.clone();
+        let committed = self.source.commit_ledger();
         self.read_precharged(&job, 512 * 1024, record, move |room, store, record| {
             if record.entry.skeleton.author_id != binding.author
                 || record.entry.skeleton.seq != binding.from
@@ -864,7 +856,7 @@ impl Receiver {
             if room.channel_id() != binding.room {
                 return Err(Error::Profile("history entry room changed"));
             }
-            admission::advance_entry(room, store, binding).map(Some)
+            admission::advance_entry(room, store, &committed, binding).map(Some)
         })
         .await
     }
@@ -1028,8 +1020,10 @@ impl Receiver {
         record: Arc<Record>,
     ) -> Result<Lookup<(Arc<Record>, bool)>> {
         let job = record.job.clone();
+        let committed = self.source.commit_ledger();
         self.read_precharged(&job, 64 * 1024, record, move |room, store, _| {
-            room.advance_history_source(store).map(Some)
+            let advanced = room.advance_history_source(store, &committed)?;
+            Ok(Some(advanced))
         })
         .await
     }
@@ -1045,6 +1039,7 @@ impl Receiver {
         }
         let job = record.job.clone();
         let grant = self.grant();
+        let committed = self.source.commit_ledger();
         self.read_precharged(&job, 64 * 1024, record, move |room, store, record| {
             if binding.room != room.channel_id()
                 || binding.author != record.entry.skeleton.author_id
@@ -1055,7 +1050,7 @@ impl Receiver {
             let room_id = room.channel_id();
             let instance = room.history_instance(store)?;
             let epoch = room.epoch();
-            room.commit_history_source(store, &record.entry, now, |batch| {
+            room.commit_history_source(store, &committed, &record.entry, now, |batch| {
                 grant.check_batch(batch, room_id, instance, epoch)
             })?;
             // Publication is now Switched, not Idle. Keep the exact verifier until the
@@ -1074,6 +1069,7 @@ impl Receiver {
             return Err(Error::Profile("history cleanup activation changed"));
         }
         let job = record.job.clone();
+        let committed = self.source.commit_ledger();
         self.read_precharged(&job, 64 * 1024, record, move |room, store, record| {
             if binding.room != room.channel_id()
                 || binding.author != record.entry.skeleton.author_id
@@ -1091,12 +1087,14 @@ impl Receiver {
                 return Err(Error::Profile("history cleanup head/entry changed"));
             }
             drop(input);
-            let done = room.cleanup_history_source(store)?;
+            let done = room.cleanup_history_source(store, &committed)?;
             if done {
                 // The same room lock spans cleanup's transition to Idle and this exact
                 // cursor retirement. A crash between them leaves only a resumable cursor;
                 // the accepted source is already durable and is never rolled back here.
-                room.history_write(store, |index| index.finish_history_verifier_cursor(binding))?;
+                room.history_write_tracked(store, &committed, |index| {
+                    index.finish_history_verifier_cursor(binding)
+                })?;
             }
             Ok(Some(done))
         })
@@ -1123,6 +1121,7 @@ impl Receiver {
         let staging = self.staging.clone();
         let grant = self.grant();
         let historical = self.historical;
+        let committed = self.source.commit_ledger();
         self.read_precharged(&job, 64 * 1024, record, move |room, store, record| {
             let room_id = room.channel_id();
             let instance = room.history_instance(store)?;
@@ -1130,6 +1129,7 @@ impl Receiver {
             let body_expected = record.staged.is_some();
             let outcome = room.advance_history_effect(
                 store,
+                &committed,
                 &mut cursor,
                 now,
                 body_expected,
@@ -1153,6 +1153,7 @@ impl Receiver {
         let staging = self.staging.clone();
         let grant = self.grant();
         let historical = self.historical;
+        let committed = self.source.commit_ledger();
         self.read_precharged(&job, 64 * 1024, record, move |room, store, record| {
             use crate::node::channel::governance::{PayloadValidation, TypedSparseBody};
             let key = room
@@ -1169,16 +1170,17 @@ impl Receiver {
             let room_id = room.channel_id();
             let instance = room.history_instance(store)?;
             let epoch = room.epoch();
-            room.refill_history_body(
+            let progress = room.refill_history_body(
                 store,
+                &committed,
                 &record.entry,
                 &body,
                 now,
                 historical,
                 |batch| grant.check_batch(batch, room_id, instance, epoch),
                 |batch, hash| complete_staged(batch, staging.as_ref(), record, hash),
-            )
-            .map(Some)
+            )?;
+            Ok(Some(progress))
         })
         .await
     }
@@ -1573,10 +1575,11 @@ impl Receiver {
             }
             EntryPhase::Begin(binding) => {
                 let job = record.job.clone();
+                let committed = self.source.commit_ledger();
                 let value = self
                     .read_precharged(&job, 64 * 1024, record, move |room, store, record| {
                         let admission::EntryAdvanced::Validated(validated) =
-                            admission::advance_entry(room, store, binding)?
+                            admission::advance_entry(room, store, &committed, binding)?
                         else {
                             return Err(Error::Profile(
                                 "completed history validation requires renewed evidence",
@@ -1584,13 +1587,14 @@ impl Receiver {
                         };
                         let started = room.begin_history_source(
                             store,
+                            &committed,
                             request,
                             &record.entry,
                             &validated,
                             now,
                         )?;
                         if matches!(started, Start::Duplicate) {
-                            room.history_write(store, |index| {
+                            room.history_write_tracked(store, &committed, |index| {
                                 index.finish_history_verifier_cursor(binding)
                             })?;
                         }
@@ -1687,6 +1691,7 @@ impl Receiver {
         let Some(work_job) = job.record_job(12 * 1024 * 1024).await else {
             return Ok(LocalResult::busy(step));
         };
+        let committed = self.source.commit_ledger();
         let value = self
             .read(&work_job, VERIFY_ENVELOPE, move |room, store| {
                 let input = room.history_read(store)?;
@@ -1720,7 +1725,7 @@ impl Receiver {
                     }
                 }
                 drop(input);
-                let progress = room.history_write(store, |index| {
+                let progress = room.history_write_tracked(store, &committed, |index| {
                     if effects {
                         index.advance_control_effects(&head, through)
                     } else {

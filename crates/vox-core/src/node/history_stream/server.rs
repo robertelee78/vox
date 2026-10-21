@@ -63,6 +63,7 @@ pub(super) async fn answer(
     inbox: &super::HintInbox,
     inbox_generation: u64,
     inventory_added: &mut bool,
+    served_object: &mut bool,
 ) -> Result<Status> {
     let receipt_source;
     let source = if preamble.purpose == Purpose::Control
@@ -112,7 +113,7 @@ pub(super) async fn answer(
     let (status, continuation) = if credit.remaining_wire() < super::DONE_RESERVE {
         (Status::Busy, None)
     } else {
-        respond(source, io, preamble, &query, &mut credit).await?
+        respond(source, io, preamble, &query, &mut credit, served_object).await?
     };
     // Source objects and their envelopes have been dropped before the terminal allocation.
     let done = Frame::Done {
@@ -151,12 +152,28 @@ async fn send(
     Ok(Sent::Yes)
 }
 
+async fn send_object(
+    source: &Source,
+    io: &mut Transport,
+    credit: &mut Response,
+    frame: Frame<'_>,
+    credit_reply_reserve: usize,
+    served_object: &mut bool,
+) -> Result<Sent> {
+    let sent = send(source, io, credit, frame, credit_reply_reserve).await?;
+    if matches!(sent, Sent::Yes) {
+        *served_object = true;
+    }
+    Ok(sent)
+}
+
 async fn respond(
     source: &Source,
     io: &mut Transport,
     preamble: Preamble,
     query: &Query,
     credit: &mut Response,
+    served_object: &mut bool,
 ) -> Result<(Status, Option<Continuation>)> {
     let job = io.job().clone();
     let request = preamble.request;
@@ -213,7 +230,7 @@ async fn respond(
                 Lookup::Missing => return Ok((Status::EvidenceUnavailable, None)),
             };
             let wire = held.value.to_wire();
-            let status = match send(
+            let status = match send_object(
                 source,
                 io,
                 credit,
@@ -222,6 +239,7 @@ async fn respond(
                     object: Object::Head(&wire),
                 },
                 0,
+                served_object,
             )
             .await?
             {
@@ -242,7 +260,7 @@ async fn respond(
                 Lookup::Missing => return Ok((Status::EvidenceUnavailable, None)),
             };
             let wire = held.value.to_wire()?;
-            let status = match send(
+            let status = match send_object(
                 source,
                 io,
                 credit,
@@ -251,6 +269,7 @@ async fn respond(
                     object: Object::Context(&wire),
                 },
                 0,
+                served_object,
             )
             .await?
             {
@@ -276,7 +295,7 @@ async fn respond(
                 Lookup::Busy => return Ok((Status::Busy, None)),
                 Lookup::Missing => return Ok((Status::EvidenceUnavailable, None)),
             };
-            let status = match send(
+            let status = match send_object(
                 source,
                 io,
                 credit,
@@ -285,6 +304,7 @@ async fn respond(
                     object: Object::Header(&held.value.wire),
                 },
                 0,
+                served_object,
             )
             .await?
             {
@@ -331,14 +351,24 @@ async fn respond(
                 request,
                 object: Object::Proof(held_proof.value),
             };
-            match send(source, io, credit, frame, 0).await? {
+            match send_object(source, io, credit, frame, 0, served_object).await? {
                 Sent::Yes if continuation.is_some() => Ok((Status::More, continuation)),
                 Sent::Yes => Ok((Status::Complete, None)),
                 Sent::Busy | Sent::Full => Ok((Status::Busy, None)),
             }
         }
         Query::Entry { head, seq, offset } => {
-            let result = entry(source, io, preamble, credit, head, seq, offset).await?;
+            let result = entry(
+                source,
+                io,
+                preamble,
+                credit,
+                head,
+                seq,
+                offset,
+                served_object,
+            )
+            .await?;
             let cursor = (result.status != Status::Complete
                 && (result.hash.is_some() || result.offset == 0))
                 .then_some(Continuation {
@@ -360,7 +390,8 @@ async fn respond(
             // reader's next ask cut short left rendered rows below unrendered ones; nothing
             // refilled the hole, and the ask below the bottom row found nothing to fetch.
             for seq in (lo..=hi).rev() {
-                let result = entry(source, io, preamble, credit, head, seq, 0).await?;
+                let result =
+                    entry(source, io, preamble, credit, head, seq, 0, served_object).await?;
                 if result.status != Status::Complete {
                     return Ok((
                         result.status,
@@ -408,6 +439,7 @@ async fn respond(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn entry(
     source: &Source,
     io: &mut Transport,
@@ -416,6 +448,7 @@ async fn entry(
     head: Digest32,
     seq: u64,
     offset: u64,
+    served_object: &mut bool,
 ) -> Result<EntryResult> {
     let job = io.job().clone();
     let request = preamble.request;
@@ -570,7 +603,7 @@ async fn entry(
         Some(HistoryPayload::Missing) => return Ok(result),
         _ => return Err(Error::MalformedAtRest("history body/header length differs")),
     };
-    match send(
+    match send_object(
         source,
         io,
         credit,
@@ -579,6 +612,7 @@ async fn entry(
             object: Object::Header(&header.value.wire),
         },
         0,
+        served_object,
     )
     .await?
     {
@@ -634,7 +668,7 @@ async fn entry(
         if let Some(bound) = live {
             job.live_sent(bound, result.offset, result.offset + take as u64)?;
         }
-        match send(
+        match send_object(
             source,
             io,
             credit,
@@ -645,6 +679,7 @@ async fn entry(
                 bytes: &bytes[start..start + take],
             },
             ACK_RESERVE,
+            served_object,
         )
         .await?
         {

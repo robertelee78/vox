@@ -208,7 +208,6 @@ async fn serve_request(
         _ => return Err(invalid("history expected bound WANT")),
     };
     drop(next);
-    *served_object = !matches!(query, Query::Inventory);
     // Parsed and request-bound before publication. If the peer's departure is applied while
     // this response is in flight, lifecycle cleanup may retain only this exact query. The server
     // and Source still restrict the response to the peer's own settled, included head.
@@ -226,6 +225,7 @@ async fn serve_request(
         inbox,
         inbox_generation,
         inventory_added,
+        served_object,
     )
     .await
 }

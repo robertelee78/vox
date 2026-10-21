@@ -52,6 +52,7 @@ fn invalid(message: &'static str) -> Error {
 pub(super) fn stage(
     room: &ChannelState,
     store: &Store,
+    committed: &std::sync::atomic::AtomicBool,
     request: RequestId,
     generation: Digest32,
     query: &Query,
@@ -103,8 +104,9 @@ pub(super) fn stage(
             drop(input);
             let brought = !(retained && observed_already);
             if brought {
-                let conflict =
-                    room.history_write(store, |index| index.observe_history_head(&verified))?;
+                let conflict = room.history_write_tracked(store, committed, |index| {
+                    index.observe_history_head(&verified)
+                })?;
                 if conflict {
                     return Err(invalid("conflicting authenticated heads retained"));
                 }
@@ -142,14 +144,16 @@ pub(super) fn stage(
             {
                 return Ok(Staged::Object { brought: false });
             }
-            room.history_write(store, |index| index.keep_history_context(&context))?;
+            room.history_write_tracked(store, committed, |index| {
+                index.keep_history_context(&context)
+            })?;
             Ok(Staged::Object { brought: true })
         }
         (Query::Entry { head, seq, .. } | Query::Header { head, seq }, Object::Header(bytes)) => {
-            stage_header(room, store, *head, *seq, *seq, bytes, &mut work)
+            stage_header(room, store, committed, *head, *seq, *seq, bytes, &mut work)
         }
         (Query::Page { head, lo, hi, .. }, Object::Header(bytes)) => {
-            stage_header(room, store, *head, *lo, *hi, bytes, &mut work)
+            stage_header(room, store, committed, *head, *lo, *hi, bytes, &mut work)
         }
         (
             Query::Proof {
@@ -220,7 +224,7 @@ pub(super) fn stage(
                 _ => return Err(invalid("proof response kind differs")),
             };
             drop(input);
-            if !room.history_write(store, |index| {
+            if !room.history_write_tracked(store, committed, |index| {
                 index.keep_history_verifier_cursor(binding, &cursor)
             })? {
                 return Ok(Staged::Busy);
@@ -231,9 +235,11 @@ pub(super) fn stage(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn stage_header(
     room: &ChannelState,
     store: &Store,
+    committed: &std::sync::atomic::AtomicBool,
     head_id: Digest32,
     lo: u64,
     hi: u64,
@@ -279,7 +285,7 @@ fn stage_header(
             brought: false,
         });
     }
-    room.history_write(store, |index| {
+    room.history_write_tracked(store, committed, |index| {
         index.keep_history_header(&header)?;
         index.keep_history_pending_header(&head_id, &header)
     })?;
@@ -328,6 +334,7 @@ pub(super) enum Advanced {
 pub(super) fn advance(
     room: &ChannelState,
     store: &Store,
+    committed: &std::sync::atomic::AtomicBool,
     binding: &CursorBinding,
 ) -> Result<Advanced> {
     if room.history_publication_busy(store)? {
@@ -401,22 +408,36 @@ pub(super) fn advance(
     match result {
         ResultStep::Missing(hash) => Ok(Advanced::MissingContext(hash)),
         ResultStep::Included(included) => {
-            room.history_write(store, |index| {
+            room.history_write_tracked(store, committed, |index| {
                 keep_generated(index)?;
                 index.keep_history_inclusion_receipt(&included)?;
                 index.finish_history_verifier_cursor(*binding)
             })?;
-            combine_parent(room, store, binding.head, binding.author, binding.from)?;
-            promote_head(room, store, binding.head)
+            combine_parent(
+                room,
+                store,
+                committed,
+                binding.head,
+                binding.author,
+                binding.from,
+            )?;
+            promote_head(room, store, committed, binding.head)
         }
         ResultStep::Prefix(prefix) => {
-            room.history_write(store, |index| {
+            room.history_write_tracked(store, committed, |index| {
                 keep_generated(index)?;
                 index.keep_history_prefix_receipt(&prefix)?;
                 index.finish_history_verifier_cursor(*binding)
             })?;
-            combine_parent(room, store, binding.head, binding.author, binding.from)?;
-            promote_head(room, store, binding.head)
+            combine_parent(
+                room,
+                store,
+                committed,
+                binding.head,
+                binding.author,
+                binding.from,
+            )?;
+            promote_head(room, store, committed, binding.head)
         }
         ResultStep::Controls(controls) => {
             let input = room.history_read(store)?;
@@ -436,19 +457,19 @@ pub(super) fn advance(
             if !accepted {
                 // The finished cursor is kept with what it generated: the next turn, after
                 // the promotion, completes at once instead of verifying the range again.
-                room.history_write(store, |index| {
+                room.history_write_tracked(store, committed, |index| {
                     keep_generated(index)?;
                     if !index.keep_history_verifier_cursor(*binding, &cursor)? {
                         return Err(invalid("existing verifier capacity vanished"));
                     }
                     Ok(())
                 })?;
-                return Ok(match promote_head(room, store, binding.head)? {
+                return Ok(match promote_head(room, store, committed, binding.head)? {
                     Advanced::Complete => Advanced::Progress,
                     other => other,
                 });
             }
-            room.history_write(store, |index| {
+            room.history_write_tracked(store, committed, |index| {
                 keep_generated(index)?;
                 if index.keep_control_coverage(&controls, 0)?.is_some() {
                     return Err(invalid("bounded control coverage unexpectedly incomplete"));
@@ -463,6 +484,7 @@ pub(super) fn advance(
 fn combine_parent(
     room: &ChannelState,
     store: &Store,
+    committed: &std::sync::atomic::AtomicBool,
     head: Digest32,
     author: Digest32,
     seq: u64,
@@ -473,12 +495,19 @@ fn combine_parent(
     drop(input);
     if let (Some(included), Some(prefix)) = (included, prefix) {
         let parent = governance::VerifiedParentPrefix::new(included, prefix)?;
-        room.history_write(store, |index| index.keep_history_parent_receipt(&parent))?;
+        room.history_write_tracked(store, committed, |index| {
+            index.keep_history_parent_receipt(&parent)
+        })?;
     }
     Ok(())
 }
 
-pub(super) fn promote_head(room: &ChannelState, store: &Store, id: Digest32) -> Result<Advanced> {
+pub(super) fn promote_head(
+    room: &ChannelState,
+    store: &Store,
+    committed: &std::sync::atomic::AtomicBool,
+    id: Digest32,
+) -> Result<Advanced> {
     let input = room.history_read(store)?;
     let signed = input
         .history_head(&id)?
@@ -553,8 +582,9 @@ pub(super) fn promote_head(room: &ChannelState, store: &Store, id: Digest32) -> 
         return Ok(Advanced::Busy);
     };
     drop(input);
-    let conflict =
-        room.history_write(store, |index| index.commit_history_head(&verified, &prefix))?;
+    let conflict = room.history_write_tracked(store, committed, |index| {
+        index.commit_history_head(&verified, &prefix)
+    })?;
     if conflict {
         return Err(invalid("conflicting authenticated heads retained"));
     }
@@ -581,6 +611,7 @@ pub(super) enum EntryStart {
 pub(super) fn start_entry(
     room: &ChannelState,
     store: &Store,
+    committed: &std::sync::atomic::AtomicBool,
     request: RequestId,
     generation: Digest32,
     head: Digest32,
@@ -607,7 +638,7 @@ pub(super) fn start_entry(
     }
     if !input.history_head_accepted(&head, included.binding())? {
         drop(input);
-        return match promote_head(room, store, head)? {
+        return match promote_head(room, store, committed, head)? {
             Advanced::Need(query) => Ok(EntryStart::Need(query)),
             _ => Ok(EntryStart::Busy),
         };
@@ -744,7 +775,7 @@ pub(super) fn start_entry(
         generation,
     };
     drop(input);
-    if !room.history_write(store, |index| {
+    if !room.history_write_tracked(store, committed, |index| {
         index.keep_history_verifier_cursor(binding, &HistoryVerifier::Validation(cursor))
     })? {
         return Ok(EntryStart::Busy);
@@ -766,6 +797,7 @@ pub(super) enum EntryAdvanced {
 pub(super) fn advance_entry(
     room: &ChannelState,
     store: &Store,
+    committed: &std::sync::atomic::AtomicBool,
     binding: CursorBinding,
 ) -> Result<EntryAdvanced> {
     if room.history_publication_busy(store)? {
@@ -815,7 +847,7 @@ pub(super) fn advance_entry(
         }
     };
     drop(input);
-    room.history_write(store, |index| {
+    room.history_write_tracked(store, committed, |index| {
         if !index.keep_history_verifier_cursor(binding, &HistoryVerifier::Validation(cursor))? {
             return Err(invalid("existing entry verifier capacity vanished"));
         }

@@ -63,20 +63,16 @@ impl Source {
         head: Digest32,
     ) -> Result<bool> {
         let peer = self.peer;
+        let committed = Arc::clone(&self.work_committed);
         match self
             .read_charged(job, 0, 0, move |room, store| {
-                Ok(Some(
-                    room.remember_history_decline(store, peer, author, head)?,
-                ))
+                Ok(Some(room.remember_history_decline(
+                    store, peer, author, head, &committed,
+                )?))
             })
             .await?
         {
-            Lookup::Found(saved) => {
-                if saved.value {
-                    self.note_work_committed();
-                }
-                Ok(saved.value)
-            }
+            Lookup::Found(saved) => Ok(saved.value),
             Lookup::Busy | Lookup::Missing => {
                 Err(Error::Unreachable("history refusal was not persisted"))
             }
@@ -108,6 +104,10 @@ impl Source {
     /// surrounding exchange is later cancelled, superseded, retired or rejected.
     pub(super) fn note_work_committed(&self) {
         self.work_committed.store(true, Ordering::Release);
+    }
+
+    pub(super) fn commit_ledger(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.work_committed)
     }
 
     pub(super) fn for_own_head_receipt(&self) -> Self {
@@ -508,6 +508,7 @@ impl Source {
         };
         let peer = self.peer;
         let slice = hints.to_vec();
+        let committed = Arc::clone(&self.work_committed);
         let peer = self.peer;
         let output_envelope = 64
             * (std::mem::size_of::<super::HeadHint>()
@@ -520,19 +521,27 @@ impl Source {
                 if room.channel_id() != room_id {
                     return Err(Error::MalformedBundle("inventory room binding"));
                 }
+                let current_authorization = super::authorization_generation(
+                    store,
+                    room.me(),
+                    room_id,
+                    room.history_instance(store)?,
+                    room.epoch(),
+                )?;
                 let read = room.history_read(store)?;
                 let mut missing = Vec::with_capacity(slice.len());
                 let mut changed = Vec::new();
                 let mut mine: Option<u64> = None;
                 let own_contiguous = room.own_verified_head();
                 for hint in slice {
-                    if let Some((declined, peer_incarnation, author_incarnation)) =
+                    if let Some((declined, authorization, peer_incarnation, author_incarnation)) =
                         read.history_declined_head(&peer, &hint.author)?
                     {
                         let current = room
                             .history_inventory_incarnation(&peer)
                             .zip(room.history_author_inventory_incarnation(&hint.author));
                         if declined == hint.head
+                            && authorization == current_authorization
                             && current == Some((peer_incarnation, author_incarnation))
                         {
                             // The durable relationship is the source of truth. Do not mirror it
@@ -630,7 +639,7 @@ impl Source {
                 changed.dedup();
                 let rearmed = changed.len();
                 for author in changed {
-                    room.forget_history_decline(store, peer, author)?;
+                    room.forget_history_decline(store, peer, author, &committed)?;
                 }
                 Ok(Some((missing, mine, rearmed)))
             })
@@ -638,9 +647,6 @@ impl Source {
         match filtered {
             Lookup::Found(filtered) => {
                 let (missing, mine, rearmed) = filtered.value;
-                if rearmed != 0 {
-                    self.note_work_committed();
-                }
                 let mut offer = inbox.offer(job, generation, room_id, self.peer, &missing)?;
                 offer.mine_held = mine;
                 offer.rearmed = rearmed;

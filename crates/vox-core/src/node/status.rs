@@ -1215,8 +1215,9 @@ pub struct PortCounters {
     /// already hold. Counted at the commit edge even if the enclosing attempt is later stale,
     /// cancelled, superseded or failed, so zero means no durable fetched-side work occurred.
     pub history_fetched: u64,
-    /// Completed bounded-history rounds in which this node served at least one object or newly
-    /// accepted a peer inventory hint.
+    /// Bounded-history rounds in which this node actually sent at least one history object or
+    /// newly accepted a peer inventory hint, including a round that later ended partial, failed,
+    /// or stale.
     pub history_served: u64,
     /// New exact advertised-head decisions durably remembered after this peer could not serve
     /// an unavailable newest body. Repeating an unchanged standing refusal does not increment it.

@@ -1680,6 +1680,8 @@ impl Node {
                         });
                 flow.peer = target;
                 flow.route_origin = Some(work.peer);
+                flow.route_origin_brought = flow.brought;
+                flow.brought = false;
                 flow.route_complete = false;
                 debug_assert!(self.bounded_sync.ready[0].is_none());
                 if self.bounded_sync.ready[0].is_some() {
@@ -1831,6 +1833,7 @@ impl Node {
                         counts.backoff = None;
                     },
                 );
+                flow.brought = std::mem::take(&mut flow.route_origin_brought);
                 // A round the lane completed is a completed sync for `vox status` (PRD-001
                 // R35), as a session's clean report was before ADR-037. Without this every
                 // lane-served room read "last sync never" and, after ten minutes, "no completed

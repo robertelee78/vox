@@ -78,6 +78,7 @@ impl ChannelState {
         peer: Digest32,
         author: Digest32,
         head: Digest32,
+        committed: &std::sync::atomic::AtomicBool,
     ) -> Result<bool> {
         let peer_incarnation =
             self.history_inventory_incarnation(&peer)
@@ -87,18 +88,26 @@ impl ChannelState {
         let author_incarnation = self.history_author_inventory_incarnation(&author).ok_or(
             Error::MalformedGovernance("declined history author is not admitted"),
         )?;
+        let authorization = crate::node::history_stream::authorization_generation(
+            store,
+            self.me(),
+            self.channel_id(),
+            self.history_instance(store)?,
+            self.epoch(),
+        )?;
         let read = self.history_read(store)?;
         if read.history_declined_head(&peer, &author)?
-            == Some((head, peer_incarnation, author_incarnation))
+            == Some((head, authorization, peer_incarnation, author_incarnation))
         {
             return Ok(false);
         }
         drop(read);
-        self.history_write(store, |index| {
+        self.history_write_tracked(store, committed, |index| {
             index.keep_history_declined_head(
                 peer,
                 author,
                 head,
+                authorization,
                 peer_incarnation,
                 author_incarnation,
             )
@@ -114,13 +123,14 @@ impl ChannelState {
         store: &Store,
         peer: Digest32,
         author: Digest32,
+        committed: &std::sync::atomic::AtomicBool,
     ) -> Result<()> {
         let read = self.history_read(store)?;
         if read.history_declined_head(&peer, &author)?.is_none() {
             return Ok(());
         }
         drop(read);
-        self.history_write(store, |index| {
+        self.history_write_tracked(store, committed, |index| {
             index.forget_history_declined_head(peer, author)
         })
     }
@@ -331,6 +341,20 @@ impl ChannelState {
         Ok(result)
     }
 
+    /// Run one history transaction and mark its user-visible lane immediately after the commit.
+    /// A later transaction or callback failure must not turn already durable work into a quiet
+    /// status sample.
+    pub(crate) fn history_write_tracked<T>(
+        &self,
+        store: &Store,
+        committed: &std::sync::atomic::AtomicBool,
+        operation: impl FnOnce(&mut entry_store::Write<'_, '_>) -> Result<T>,
+    ) -> Result<T> {
+        let result = self.history_write(store, operation)?;
+        committed.store(true, std::sync::atomic::Ordering::Release);
+        Ok(result)
+    }
+
     pub(crate) fn history_head_by_id(
         &self,
         store: &Store,
@@ -487,6 +511,7 @@ impl ChannelState {
     pub(crate) fn begin_history_source(
         &mut self,
         store: &Store,
+        committed: &std::sync::atomic::AtomicBool,
         request: [u8; 16],
         entry: &Entry,
         validated: &governance::ValidatedSparseEntry,
@@ -544,6 +569,7 @@ impl ChannelState {
                 )
                 .map_err(|_| Error::MalformedBundle("sparse fork proof verification failed"))?;
             self.keep_forks(store)?;
+            committed.store(true, std::sync::atomic::Ordering::Release);
             return Err(Error::MalformedGovernance(
                 "author equivocated at a held sparse position",
             ));
@@ -566,19 +592,28 @@ impl ChannelState {
                 local_id: self.me(),
             },
         )?;
+        committed.store(true, std::sync::atomic::Ordering::Release);
         Ok(HistorySourceStart::Started)
     }
 
     /// One bounded preparation quantum. A true result still leaves roots unpublished until
     /// commit_history_source records both the source and its governance work atomically.
-    pub(crate) fn advance_history_source(&self, store: &Store) -> Result<bool> {
-        self.entries
-            .advance_sparse_publication(store, &self.sek, &self.channel_id)
+    pub(crate) fn advance_history_source(
+        &self,
+        store: &Store,
+        committed: &std::sync::atomic::AtomicBool,
+    ) -> Result<bool> {
+        let ready = self
+            .entries
+            .advance_sparse_publication(store, &self.sek, &self.channel_id)?;
+        committed.store(true, std::sync::atomic::Ordering::Release);
+        Ok(ready)
     }
 
     pub(crate) fn commit_history_source(
         &mut self,
         store: &Store,
+        committed: &std::sync::atomic::AtomicBool,
         entry: &Entry,
         now: crate::time::Ms,
         on_publish: impl FnOnce(&mut Batch<'_>) -> Result<()>,
@@ -628,6 +663,7 @@ impl ChannelState {
             late,
         )?;
         batch.commit()?;
+        committed.store(true, std::sync::atomic::Ordering::Release);
         self.entries.committed();
         self.next_log_id = log
             .checked_add(1)
@@ -637,10 +673,15 @@ impl ChannelState {
     }
 
     /// Cleanup is resumable and does not turn source storage into a user-visible admission.
-    pub(crate) fn cleanup_history_source(&mut self, store: &Store) -> Result<bool> {
+    pub(crate) fn cleanup_history_source(
+        &mut self,
+        store: &Store,
+        committed: &std::sync::atomic::AtomicBool,
+    ) -> Result<bool> {
         let done = self
             .entries
             .cleanup_publication(store, &self.sek, &self.channel_id)?;
+        committed.store(true, std::sync::atomic::Ordering::Release);
         if done {
             let read = self.history_read(store)?;
             self.dag.set_order_revision(
@@ -656,12 +697,13 @@ impl ChannelState {
     pub(crate) fn cleanup_history_source_owned(
         &mut self,
         store: &Store,
+        committed: &std::sync::atomic::AtomicBool,
         request: [u8; 16],
     ) -> Result<bool> {
         if self.history_read(store)?.sparse_publication_request() != Some(request) {
             return Ok(true);
         }
-        self.cleanup_history_source(store)
+        self.cleanup_history_source(store, committed)
     }
 
     /// One local retirement slice. Another request's publication must finish first; it is
@@ -669,6 +711,7 @@ impl ChannelState {
     pub(crate) fn cleanup_history_verifiers(
         &self,
         store: &Store,
+        committed: &std::sync::atomic::AtomicBool,
         request: [u8; 16],
         after: Option<[u8; 64]>,
     ) -> Result<(bool, Option<[u8; 64]>)> {
@@ -683,6 +726,7 @@ impl ChannelState {
         if changed {
             index.seal()?;
             batch.commit()?;
+            committed.store(true, std::sync::atomic::Ordering::Release);
             self.entries.committed();
         }
         Ok((done, next))
@@ -734,6 +778,7 @@ impl ChannelState {
     pub(crate) fn advance_history_effect(
         &mut self,
         store: &Store,
+        committed: &std::sync::atomic::AtomicBool,
         cursor: &mut HistoryEffectCursor,
         now: crate::time::Ms,
         body_expected: bool,
@@ -787,7 +832,8 @@ impl ChannelState {
             // Feed restoration is local accepted-header maintenance. Advance at most one
             // successor in this bounded turn, including while the exact staged body continues
             // through refill below.
-            let contiguous_pending = self.advance_history_contiguous(store, &author)?;
+            let contiguous_pending =
+                self.advance_history_contiguous(store, committed, &author)?;
             if refill_pending {
                 return Ok(HistoryEffectProgress::RefillPending { governance: false });
             }
@@ -966,6 +1012,7 @@ impl ChannelState {
                 progress
             };
             batch.commit()?;
+            committed.store(true, std::sync::atomic::Ordering::Release);
             self.entries.committed();
             // The settled-tip index and presence update are now durable in the same Batch.
             // A source-only entry cannot change membership, and a late earlier effect must
@@ -1031,6 +1078,7 @@ impl ChannelState {
     pub(crate) fn advance_history_contiguous(
         &mut self,
         store: &Store,
+        committed: &std::sync::atomic::AtomicBool,
         author: &Digest32,
     ) -> Result<bool> {
         if self.poisoned {
@@ -1051,6 +1099,7 @@ impl ChannelState {
         }
         index.seal()?;
         batch.commit()?;
+        committed.store(true, std::sync::atomic::Ordering::Release);
         self.entries.committed();
         let more = progress.more;
         self.note_contiguous_advance(*author, progress)?;
@@ -1091,7 +1140,8 @@ impl ChannelState {
             return Ok(false);
         };
         self.sparse_contiguous_after = Some(author);
-        self.advance_history_contiguous(store, &author)?;
+        let committed = std::sync::atomic::AtomicBool::new(false);
+        self.advance_history_contiguous(store, &committed, &author)?;
         Ok(!self.sparse_contiguous_pending.is_empty())
     }
 }
@@ -1103,6 +1153,7 @@ impl ChannelState {
     pub(crate) fn refill_history_body(
         &mut self,
         store: &Store,
+        committed: &std::sync::atomic::AtomicBool,
         entry: &Entry,
         body: &governance::TypedSparseBody,
         now: crate::time::Ms,
@@ -1216,6 +1267,7 @@ impl ChannelState {
                 None
             };
             batch.commit()?;
+            committed.store(true, std::sync::atomic::Ordering::Release);
             self.entries.committed();
             if settled && kind == SignedEntryKind::KeyPackage && key_package_for(entry, &self.me())
             {
