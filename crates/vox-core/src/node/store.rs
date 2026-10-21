@@ -300,26 +300,24 @@ impl Store {
         self
     }
 
-    /// Reopen after a failed write, retaining the profile lock for the whole transition.
-    /// Rewrite this room's persisted sealed state durably through the same allocation and
-    /// commit path that failed. An empty transaction can succeed on a full filesystem and
-    /// cannot establish that a room can save. The failed user operation is never replayed.
-    pub fn reopen_after_write_failure(&self, channel: &Digest32) -> Result<()> {
-        let mut backing = self.db.write().unwrap_or_else(PoisonError::into_inner);
-        drop(std::mem::replace(&mut *backing, Backing::Closed));
-        let db = match open_database(&self.path) {
-            Ok(db) => db,
-            Err(e) => {
-                // A failed writable reopen must not hide saved rooms while waiting to retry.
-                if let Ok(db) = open_read_only_database(&self.path) {
-                    *backing = Backing::ReadOnly(db);
-                }
-                return Err(open_error(e));
-            }
-        };
-        *backing = Backing::Writable(db);
+    /// Re-save a room after a failed write: rewrite this room's persisted sealed state durably
+    /// through the same allocation and commit path that failed, on the store as it is open.
+    /// An empty transaction can succeed on a full filesystem and cannot establish that a room
+    /// can save. The failed user operation is never replayed.
+    ///
+    /// The store is never closed for this (ADR-038 FX-33). It used to be closed and reopened
+    /// writable first; redb refuses that reopen while any other handle in the process is alive,
+    /// and the fallback left the whole node's store read-only or closed, every room of the node
+    /// answering "the store is being reopened" on each retry, for hours, on the decider's
+    /// daemon (2026-10-21 00:15Z). A failed commit leaves a redb database usable, so there is
+    /// nothing a reopen would mend that a fresh transaction does not.
+    pub fn resave_room_after_write_failure(&self, channel: &Digest32) -> Result<()> {
+        let backing = self.db.read().unwrap_or_else(PoisonError::into_inner);
         let Backing::Writable(db) = &*backing else {
-            unreachable!()
+            return Err(Error::Storage {
+                op: "recover room",
+                detail: "the store is read-only until the identity is unlocked".into(),
+            });
         };
         let original = db.begin_read().map_err(storage("retry read"))?;
         let txn = db.begin_write().map_err(storage("retry write"))?;
