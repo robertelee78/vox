@@ -22,6 +22,20 @@
 //! hangup's signal once the terminal's input ends — red, PRODUCT (exit 1, "no identity
 //! passphrase").
 //!
+//! ## A locked node is unlocked without a persistent file (ADR-038 FX-34)
+//! [`a_locked_node_is_unlocked_without_a_persistent_file`]: a node with a passphrase, Locked on
+//! a daemon started with `--no-node`, becomes Ready from `vox node unlock` with the passphrase on
+//! stdin (`--passphrase-file -`) and again from `VOX_IDENTITY_PASSPHRASE`; where the system has
+//! no credential store (every system but macOS, and a Mac whose keychain is not available) the
+//! command says the node is not remembered and an ordinary daemon start (`--detach`, as at
+//! login) finds it Locked again, where a remembered one is Ready with nothing typed; a wrong
+//! passphrase is refused naming the node.
+//! Measured on the decider's Linux host, vox 0.4.9: every such unlock was refused ("cannot be
+//! remembered from a typed passphrase, an environment variable or stdin on this system"), so
+//! after an update's daemon restart no node could be unlocked while the Locked line said to run
+//! that very command. Mutation: that refusal restored (`node_unlock` erroring when no persistent
+//! file is given off macOS) — red, PRODUCT (claim 1, on Linux).
+//!
 //! ## No command waits silently for input it cannot get (V210-165)
 //! [`no_command_waits_for_input_it_cannot_get`]: with stdin open, nothing written to it and no
 //! terminal — an agent's harness — every command that needs a passphrase it has not been given
@@ -562,5 +576,191 @@ fn no_command_waits_for_input_it_cannot_get() {
         "PRODUCT: with stdin open and no terminal, a command waited for input it cannot get, or \
          said nothing of how to give it, or a read demanded a passphrase:\n{}",
         reds.join("\n\n")
+    );
+}
+
+/// `vox node list` for the profile at `dir`, as printed.
+fn node_list(dir: &Path) -> String {
+    let out = vox_cmd(dir, &["node", "list"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("APPARATUS: spawn vox node list");
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+/// A `vox daemon` the proof started, stopped and waited for when dropped.
+struct Served(Child);
+
+impl Drop for Served {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// A daemon for the profile at `dir` with its nodes left Locked (`--no-node`), serving.
+fn daemon_with_locked_nodes(dir: &Path) -> Served {
+    let daemon = Served(
+        vox_cmd(dir, &["daemon", "--no-node", "--listen", "127.0.0.1:0"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("APPARATUS: spawn vox daemon --no-node"),
+    );
+    let started = Instant::now();
+    while started.elapsed() < SERVES_WITHIN {
+        if node_list(dir).contains("Locked") {
+            return daemon;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    drop(daemon);
+    panic!(
+        "PRODUCT (staging): `vox daemon --no-node` did not serve with its node Locked within \
+         {SERVES_WITHIN:?}: `vox node list` says {}",
+        node_list(dir)
+    );
+}
+
+#[test]
+#[ignore = "real vox daemons and production Argon2id; run on demand, on Linux too"]
+fn a_locked_node_is_unlocked_without_a_persistent_file() {
+    watchdog::arm();
+    let tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
+    let (bob, _) = profile(tmp.path(), "bob");
+    let _reaper = layout::Reaper(vec![bob.clone()]);
+    let daemon = daemon_with_locked_nodes(&bob);
+
+    // ---- 1. unlocked from stdin: Ready, and said to be not remembered where nothing keeps it ----
+    let out = vox_cmd(
+        &bob,
+        &["node", "unlock", "default", "--passphrase-file", "-"],
+    )
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .and_then(|mut child| {
+        if let Some(mut pipe) = child.stdin.take() {
+            let _ = writeln!(pipe, "{IDPASS}");
+        }
+        child.wait_with_output()
+    })
+    .expect("APPARATUS: spawn vox node unlock");
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success() && said.contains("is Ready") && node_list(&bob).contains("Ready"),
+        "PRODUCT: `vox node unlock default --passphrase-file -` with the passphrase on stdin did \
+         not make the node Ready, or failed with it Ready (ADR-038 FX-34); it said:\n{said}\n\
+         `vox node list`: {}",
+        node_list(&bob)
+    );
+    // Whether this system remembered it is what the unlock itself said: the Keychain on a Mac
+    // that has one; nothing anywhere else, or on a Mac whose keychain is not available here.
+    let remembering_store = said.contains("is Ready and remembered");
+    if !remembering_store {
+        assert!(
+            said.contains("not remembered"),
+            "PRODUCT: on a system with no credential store the unlock must say the node is not \
+             remembered and a daemon restart will ask again (ADR-038 FX-34); it said:\n{said}"
+        );
+    }
+
+    // ---- 2. the daemon starts again, as it does at login: Locked where nothing keeps it, Ready
+    // where the credential store does ------------------------------------------------------------
+    drop(daemon);
+    layout::reap_daemon(&bob);
+    let listed = daemon_started_again(&bob);
+    if remembering_store {
+        assert!(
+            listed.contains("Ready"),
+            "PRODUCT: a node the unlock said it remembered must be Ready after the daemon starts \
+             again, with nothing typed; `vox node list`: {listed}"
+        );
+    } else {
+        assert!(
+            listed.contains("Locked"),
+            "PRODUCT: a node unlocked from stdin, stored nowhere, must be Locked after the daemon \
+             starts again; `vox node list`: {listed}"
+        );
+    }
+
+    // ---- 3. unlocked from the environment variable; a wrong passphrase refused ------------------
+    let out = vox_cmd(&bob, &["node", "unlock", "default"])
+        .env("VOX_IDENTITY_PASSPHRASE", "not the passphrase")
+        .stdin(Stdio::null())
+        .output()
+        .expect("APPARATUS: spawn vox node unlock");
+    let wrong = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success() && wrong.contains("does not open node default"),
+        "PRODUCT: a wrong passphrase must be refused naming the node; it said:\n{wrong}"
+    );
+    let out = vox_cmd(&bob, &["node", "unlock", "default"])
+        .env("VOX_IDENTITY_PASSPHRASE", IDPASS)
+        .stdin(Stdio::null())
+        .output()
+        .expect("APPARATUS: spawn vox node unlock");
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success() && node_list(&bob).contains("Ready"),
+        "PRODUCT: `vox node unlock default` with VOX_IDENTITY_PASSPHRASE did not make the node \
+         Ready (ADR-038 FX-34); it said:\n{said}\n`vox node list`: {}",
+        node_list(&bob)
+    );
+    println!(
+        "[proof] a locked node was unlocked from stdin and from the environment{}; a wrong \
+         passphrase was refused",
+        if remembering_store {
+            " (this system has a credential store: the Keychain)"
+        } else {
+            ", stored nowhere, and was Locked again after the daemon restarted"
+        }
+    );
+    layout::reap_daemon(&bob);
+}
+
+/// The daemon started again the ordinary way (`vox daemon --detach`, as the app and a login item
+/// start it: nothing typed), serving; what `vox node list` says once it does. The daemon is the
+/// detached process behind the data root's lock, reaped by the caller.
+fn daemon_started_again(dir: &Path) -> String {
+    let out = vox_cmd(dir, &["daemon", "--detach", "--listen", "127.0.0.1:0"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("APPARATUS: spawn vox daemon --detach");
+    assert!(
+        out.status.success(),
+        "PRODUCT (staging): `vox daemon --detach` did not start: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let started = Instant::now();
+    while started.elapsed() < SERVES_WITHIN {
+        let listed = node_list(dir);
+        if listed.contains("Locked") || listed.contains("Ready") {
+            return listed;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    panic!(
+        "PRODUCT (staging): the daemon started again did not serve within {SERVES_WITHIN:?}: \
+         `vox node list` says {}",
+        node_list(dir)
     );
 }
