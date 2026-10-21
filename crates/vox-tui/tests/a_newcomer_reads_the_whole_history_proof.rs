@@ -1829,28 +1829,74 @@ fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
         "the source-owned Presence reset never completed its bounded governance fold",
     );
     let semantic_after_reset = room_status(&alice, "alice", &rooms[0]);
-    // `trust add` is idempotent as a human decision, but the shipped command completes only
-    // after it has applied that decision to every open room and retried the retained key release.
-    // This is the causal boundary that keeps Bob offline until grant₂ is durable; no sleep or
-    // guessed count of governance rows stands in for it.
+    // `trust add` is idempotent as a human decision. With Bob offline its retained release is
+    // deliberately asynchronous: the fallback may append its key package before the consent.
+    // Therefore command success is not the durability boundary and an immediate row-count delta
+    // cannot identify grant₂. The next semantic projection revision is the causal product
+    // observation: after the already-folded reset, only the new grant changes canonical meaning.
     let (ok, out, err) = vox(&alice, &["trust", "add", &fps[1], "--name", "bob"], None);
     assert!(
         ok,
         "PRODUCT: Alice's idempotent shipped trust decision did not finish the rotated \
          generation's retained grant while Bob was offline: {out}{err}"
     );
-    let after_grant2 = room_hashes(&alice, "alice", &rooms[0]);
+    let grant2_revision = semantic_after_reset
+        .governance_revision
+        .checked_add(1)
+        .expect("PRODUCT: Alice's governance revision overflowed before the repeated grant");
+    let grant2_watchdog = Instant::now() + BOUND;
+    let (after_grant2, semantic_after_grant2) = loop {
+        let status = room_status(&alice, "alice", &rooms[0]);
+        assert!(
+            status.governance_revision <= grant2_revision,
+            "PRODUCT: Alice published more than the one reset→grant semantic transition while \
+             Bob was offline in quiet room {}: reset {semantic_after_reset:?}, now {status:?}",
+            rooms[0]
+        );
+        if status.governance_revision == grant2_revision {
+            wait_governance_current(
+                &alice,
+                "alice",
+                &rooms[0],
+                "the exact reset→grant2 semantic transition never completed its bounded fold",
+            );
+            let settled = room_status(&alice, "alice", &rooms[0]);
+            assert_eq!(
+                settled.governance_revision, grant2_revision,
+                "PRODUCT: Alice published an extra semantic revision while settling the one \
+                 repeated grant in quiet room {}: reset {semantic_after_reset:?}, settled \
+                 {settled:?}",
+                rooms[0]
+            );
+            break (room_hashes(&alice, "alice", &rooms[0]), settled);
+        }
+        assert!(
+            Instant::now() < grant2_watchdog,
+            "APPARATUS: within the journey watchdog {BOUND:?}, Alice's shipped status never \
+             exposed the causal reset→grant2 semantic transition in room {}; reset \
+             {semantic_after_reset:?}, last {status:?}",
+            rooms[0]
+        );
+        std::thread::yield_now();
+    };
     let grant2_candidates: Vec<_> = after_grant2
         .iter()
         .filter(|hash| !after_presence.contains(hash))
         .cloned()
         .collect();
-    assert_eq!(
-        grant2_candidates.len(),
-        1,
-        "PRODUCT: Alice's idempotent trust decision did not append exactly one identifiable authenticated consent grant2; before {after_presence:?}; after {after_grant2:?}; candidates {grant2_candidates:?}"
+    assert!(
+        matches!(grant2_candidates.len(), 1 | 2),
+        "PRODUCT: at the exact reset→grant2 semantic revision, Alice's offline fallback did not \
+         expose its authenticated consent alone or after its one key package; before \
+         {after_presence:?}; after {after_grant2:?}; candidates {grant2_candidates:?}"
     );
-    let grant2_hash = grant2_candidates[0].clone();
+    // The fallback awaits the optional key-package append before it records consent. Room order
+    // is causal, so the final candidate at the exact one-revision boundary uniquely names grant₂
+    // whether the already-held package made the delta one row or the fallback made it two.
+    let grant2_hash = grant2_candidates
+        .last()
+        .expect("PRODUCT: reset→grant2 revision advanced without an authenticated room row")
+        .clone();
     let ordered_positions: Vec<_> = [grant1_hash, &reset_hash, &grant2_hash]
         .iter()
         .map(|hash| {
@@ -1865,17 +1911,11 @@ fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
             && ordered_positions[1] < ordered_positions[2],
         "PRODUCT: Alice's shipped room order did not prove grant1 {grant1_hash} → reset {reset_hash} → identical grant2 {grant2_hash}: positions {ordered_positions:?}; order {after_grant2:?}"
     );
-    wait_governance_current(
-        &alice,
-        "alice",
-        &rooms[0],
-        "the equal repeated grant never completed its bounded governance fold",
-    );
-    let semantic_after_grant2 = room_status(&alice, "alice", &rooms[0]);
     assert_eq!(
-        semantic_after_grant2.governance_revision,
-        semantic_after_reset.governance_revision,
-        "PRODUCT: Alice's identical grant2 invented a displayed governance revision after the real Presence reset was already folded: reset {semantic_after_reset:?}, grant2 {semantic_after_grant2:?}"
+        semantic_after_grant2.governance_revision, grant2_revision,
+        "PRODUCT: Alice's newer post-reset grant did not make exactly one required semantic \
+         transition, or invented an extra displayed revision: reset {semantic_after_reset:?}, \
+         grant2 {semantic_after_grant2:?}"
     );
 
     bob_daemon = daemon_env(&bob, "bob-repeated-grant", &package_knob);
