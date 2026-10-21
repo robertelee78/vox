@@ -3,12 +3,121 @@
 use super::*;
 use crate::node::history_stream::{self as stream, runtime::Flow, Purpose};
 use crate::node::store::Store;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Mutex as StdMutex;
 
+type RetirementKey = (Digest32, Digest32, bool, [u8; 16], Digest32);
+pub(super) type RetirementErrors = Arc<StdMutex<BTreeMap<RetirementKey, String>>>;
+
+fn retirement_key(flow: &Flow) -> RetirementKey {
+    (
+        flow.room,
+        flow.peer,
+        flow.archive,
+        flow.instance,
+        flow.generation,
+    )
+}
+
+fn note_retirement_error(errors: &RetirementErrors, key: RetirementKey, error: &str) {
+    if let Ok(mut errors) = errors.lock() {
+        errors.insert(key, error.to_owned());
+    }
+}
+
+fn clear_retirement_error(errors: &RetirementErrors, key: RetirementKey) {
+    if let Ok(mut errors) = errors.lock() {
+        errors.remove(&key);
+    }
+}
+
+struct OwedRetirement {
+    flow: Option<Flow>,
+    errors: RetirementErrors,
+    key: RetirementKey,
+}
+
+struct DroppedActorRetirements {
+    keys: BTreeSet<RetirementKey>,
+}
+
+impl Drop for DroppedActorRetirements {
+    fn drop(&mut self) {
+        for key in &self.keys {
+            eprintln!(
+                "vox: actor retirement supervisor ended while cleanup remained owed for {}/{}/{}",
+                crate::node::link::b32_encode(&key.0),
+                crate::node::link::b32_encode(&key.1),
+                if key.2 { "archive" } else { "live" }
+            );
+        }
+    }
+}
+
+impl Drop for OwedRetirement {
+    fn drop(&mut self) {
+        if self.flow.is_some() {
+            let message = "history retirement task ended before durable cleanup";
+            note_retirement_error(&self.errors, self.key, message);
+            eprintln!(
+                "vox: {message} for {}/{}/{}",
+                crate::node::link::b32_encode(&self.key.0),
+                crate::node::link::b32_encode(&self.key.1),
+                if self.key.2 { "archive" } else { "live" }
+            );
+        }
+    }
+}
+
+async fn finish_owed_retirement(flow: Flow, errors: RetirementErrors) {
+    let key = retirement_key(&flow);
+    let mut owed = OwedRetirement {
+        flow: Some(flow),
+        errors,
+        key,
+    };
+    loop {
+        let Some(flow) = owed.flow.as_mut() else {
+            return;
+        };
+        match flow.retire_slice().await {
+            Ok(true) => {
+                clear_retirement_error(&owed.errors, key);
+                owed.flow.take();
+                return;
+            }
+            Ok(false) => tokio::task::yield_now().await,
+            Err(error) => {
+                note_retirement_error(&owed.errors, key, &error.to_string());
+                eprintln!(
+                    "vox: history retirement for {}/{}/{} remains owed: {error}",
+                    crate::node::link::b32_encode(&key.0),
+                    crate::node::link::b32_encode(&key.1),
+                    if key.2 { "archive" } else { "live" }
+                );
+                tokio::time::sleep(crate::node::history_budget::RETIRE_RETRY_BACKOFF).await;
+            }
+        }
+    }
+}
+
+fn spawn_owed_retirement(flow: Flow, errors: RetirementErrors) {
+    let key = retirement_key(&flow);
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn(finish_owed_retirement(flow, errors));
+        }
+        Err(error) => {
+            let message = format!("no runtime can finish owed history retirement: {error}");
+            note_retirement_error(&errors, key, &message);
+            eprintln!("vox: {message}");
+        }
+    }
+}
+
 struct Returned {
-    flow: Flow,
     error: Option<String>,
+    panic: Option<String>,
 }
 struct Running {
     room: Digest32,
@@ -17,7 +126,11 @@ struct Running {
     generation: u64,
     request: u64,
     archive: Option<(stream::RequestId, Digest32)>,
+    retirement_key: RetirementKey,
     fence: Arc<crate::transport::stream_transport::Fence>,
+    /// Exclusive ownership stays outside the fallible worker future. The supervised outer task
+    /// observes its JoinError and the actor reclaims this exact Flow even when the worker panics.
+    flow: Arc<tokio::sync::Mutex<Option<Flow>>>,
     result: Arc<StdMutex<Option<Returned>>>,
     task: tokio::task::JoinHandle<()>,
     started: std::time::Instant,
@@ -27,6 +140,7 @@ struct Running {
 pub(crate) const RETAINED_FLOW_LIMIT: usize = 12;
 
 struct Cleanup {
+    key: RetirementKey,
     /// The task borrows the flow through shared ownership. If that task panics, the controller
     /// still owns the only durable cell and can retry instead of silently dropping the flow.
     flow: Arc<tokio::sync::Mutex<Option<Flow>>>,
@@ -95,15 +209,126 @@ pub(super) struct Controller {
     retiring: VecDeque<Flow>,
     cleanup: Option<Cleanup>,
     cleanup_due: Option<std::time::Instant>,
-    cleanup_error: Option<String>,
+    /// Per-flow retirement failures outlive controller replacement and remain visible until that
+    /// exact flow reaches its durable end. An unrelated cleanup can never clear another's error.
+    retirement_errors: RetirementErrors,
     /// Workers publish their durable result before notifying this coalesced edge. `Notify`
     /// retains a permit while the actor is elsewhere; one wake audits every result slot, so no
     /// completion can be stranded behind the actor's bounded event queue.
     completion_wake: Arc<tokio::sync::Notify>,
 }
+
+impl Drop for Controller {
+    fn drop(&mut self) {
+        let mut flows = Vec::new();
+        flows.extend(self.ready.iter_mut().filter_map(Option::take));
+        flows.extend(self.deferred.drain(..));
+        flows.extend(self.retiring.drain(..));
+        let cleanup = self.cleanup.take();
+        let running = self
+            .running
+            .iter_mut()
+            .filter_map(Option::take)
+            .collect::<Vec<_>>();
+        if flows.is_empty() && cleanup.is_none() && running.is_empty() {
+            return;
+        }
+        for flow in &flows {
+            flow.cancel();
+        }
+        if let Some(cleanup) = &cleanup {
+            for cancellation in &cleanup.cancellations {
+                cancellation.cancel();
+            }
+        }
+        for work in &running {
+            work.fence.retire();
+        }
+        let errors = Arc::clone(&self.retirement_errors);
+        let message = "actor ended with durable history retirement still owed";
+        let mut owed_keys: BTreeSet<RetirementKey> = flows.iter().map(retirement_key).collect();
+        if let Some(cleanup) = &cleanup {
+            owed_keys.insert(cleanup.key);
+        }
+        for work in &running {
+            owed_keys.insert(work.retirement_key);
+        }
+        for key in &owed_keys {
+            note_retirement_error(&errors, *key, message);
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            eprintln!(
+                "vox: actor ended with {} direct, {} running and {} cleanup history retirements \
+                 still owed; no runtime remained to finish them",
+                flows.len(),
+                running.len(),
+                usize::from(cleanup.is_some())
+            );
+            for key in &owed_keys {
+                eprintln!(
+                    "vox: history retirement remains owed for {}/{}/{}",
+                    crate::node::link::b32_encode(&key.0),
+                    crate::node::link::b32_encode(&key.1),
+                    if key.2 { "archive" } else { "live" }
+                );
+            }
+            return;
+        };
+        runtime.spawn(async move {
+            let mut owed = DroppedActorRetirements { keys: owed_keys };
+            if let Some(cleanup) = cleanup {
+                let cleanup_key = cleanup.key;
+                let joined = cleanup.task.await;
+                let outcome = cleanup
+                    .result
+                    .lock()
+                    .ok()
+                    .and_then(|mut result| result.take());
+                if let Some(flow) = cleanup.flow.lock().await.take() {
+                    match outcome {
+                        Some(Ok(true)) => {
+                            clear_retirement_error(&errors, retirement_key(&flow));
+                            owed.keys.remove(&cleanup_key);
+                        }
+                        Some(Ok(false) | Err(_)) | None => flows.push(flow),
+                    }
+                }
+                if joined.is_err() {
+                    eprintln!("vox: dropped actor's history cleanup worker panicked");
+                }
+            }
+            for work in running {
+                let work_key = work.retirement_key;
+                let joined = work.task.await;
+                if joined.is_err() {
+                    eprintln!("vox: dropped actor's bounded history supervisor panicked");
+                }
+                if let Some(flow) = work.flow.lock().await.take() {
+                    flows.push(flow);
+                } else {
+                    note_retirement_error(
+                        &errors,
+                        work_key,
+                        "bounded history worker returned no retirement owner",
+                    );
+                }
+            }
+            for flow in flows {
+                let key = retirement_key(&flow);
+                spawn_owed_retirement(flow, Arc::clone(&errors));
+                owed.keys.remove(&key);
+            }
+        });
+    }
+}
+
 impl Controller {
     pub(super) fn set_completion_wake(&mut self, wake: Arc<tokio::sync::Notify>) {
         self.completion_wake = wake;
+    }
+
+    pub(super) fn set_retirement_errors(&mut self, errors: RetirementErrors) {
+        self.retirement_errors = errors;
     }
 
     pub(super) fn completion_wake(&self) -> Arc<tokio::sync::Notify> {
@@ -351,19 +576,21 @@ impl Controller {
                 .try_lock()
                 .ok()
                 .and_then(|mut flow| flow.take());
-            self.cleanup.take();
+            let Some(cleanup) = self.cleanup.take() else {
+                return;
+            };
             if let Some(flow) = flow {
+                let key = retirement_key(&flow);
                 match result.unwrap_or(Err(crate::error::Error::Profile(
                     "history retirement worker stopped",
                 ))) {
-                    Ok(true) => self.cleanup_error = None,
+                    Ok(true) => clear_retirement_error(&self.retirement_errors, key),
                     Ok(false) => {
-                        self.cleanup_error = None;
                         self.retiring.push_back(flow);
                     }
                     Err(error) => {
                         eprintln!("vox: history retirement is pending: {error}");
-                        self.cleanup_error = Some(error.to_string());
+                        note_retirement_error(&self.retirement_errors, key, &error.to_string());
                         self.retiring.push_back(flow);
                         self.cleanup_due = Some(
                             std::time::Instant::now()
@@ -378,7 +605,11 @@ impl Controller {
                     }
                 }
             } else {
-                self.cleanup_error = Some("history retirement owner unavailable".to_owned());
+                note_retirement_error(
+                    &self.retirement_errors,
+                    cleanup.key,
+                    "history retirement owner unavailable",
+                );
             }
         }
         if self.cleanup.is_some()
@@ -393,6 +624,7 @@ impl Controller {
             return;
         };
         let cancellations = flow.cancellation_handles();
+        let key = retirement_key(&flow);
         let flow = Arc::new(tokio::sync::Mutex::new(Some(flow)));
         let result = Arc::new(StdMutex::new(None));
         let task_flow = Arc::clone(&flow);
@@ -414,6 +646,7 @@ impl Controller {
             wake.notify_one();
         });
         self.cleanup = Some(Cleanup {
+            key,
             flow,
             result,
             task,
@@ -422,6 +655,7 @@ impl Controller {
     }
     async fn join_cleanup(&mut self) -> crate::error::Result<()> {
         if let Some(cleanup) = self.cleanup.take() {
+            let key = cleanup.key;
             let joined = cleanup.task.await;
             let result = cleanup
                 .result
@@ -430,6 +664,7 @@ impl Controller {
                 .and_then(|mut value| value.take());
             let flow = cleanup.flow.lock().await.take();
             if let Some(flow) = flow {
+                let key = retirement_key(&flow);
                 match result.unwrap_or_else(|| {
                     Err(crate::error::Error::Profile(if joined.is_err() {
                         "history retirement worker stopped"
@@ -437,14 +672,20 @@ impl Controller {
                         "history retirement result vanished"
                     }))
                 }) {
-                    Ok(true) => {}
+                    Ok(true) => clear_retirement_error(&self.retirement_errors, key),
                     Ok(false) => self.retiring.push_back(flow),
                     Err(error) => {
+                        note_retirement_error(&self.retirement_errors, key, &error.to_string());
                         self.retiring.push_back(flow);
                         return Err(error);
                     }
                 }
             } else {
+                note_retirement_error(
+                    &self.retirement_errors,
+                    key,
+                    "history retirement owner vanished",
+                );
                 return Err(crate::error::Error::Profile(
                     "history retirement owner vanished",
                 ));
@@ -513,11 +754,9 @@ impl Controller {
             if let Some(work) = slot.take_if(|work| work.room == room) {
                 work.fence.retire();
                 let _ = work.task.await;
-                if let Ok(mut result) = work.result.lock() {
-                    if let Some(returned) = result.take() {
-                        self.retiring.push_back(returned.flow);
-                    }
-                };
+                if let Some(flow) = work.flow.lock().await.take() {
+                    self.retiring.push_back(flow);
+                }
             }
         }
         self.required.retain(|(r, _, _, _)| *r != room);
@@ -657,16 +896,16 @@ impl Controller {
         self.required.clear();
         for slot in &mut self.running {
             if let Some(work) = slot.take() {
-                let _ = work.task.await;
-                if let Ok(mut result) = work.result.lock() {
-                    if let Some(returned) = result.take() {
-                        self.retiring.push_back(returned.flow);
-                    }
-                };
+                let joined = work.task.await;
+                if joined.is_err() {
+                    eprintln!("vox: bounded history supervisor stopped during retirement");
+                }
+                if let Some(flow) = work.flow.lock().await.take() {
+                    self.retiring.push_back(flow);
+                }
             }
         }
         if let Err(error) = self.join_cleanup().await {
-            self.cleanup_error = Some(error.to_string());
             eprintln!("vox: history retirement is pending: {error}");
         }
         while let Some(mut flow) = self.retiring.pop_front() {
@@ -675,16 +914,22 @@ impl Controller {
             // Memory admission may still be held by a fenced actual worker. Keep this
             // owner until a later bounded slice observes the erased key.
             match flow.retire_slice().await {
-                Ok(true) => self.cleanup_error = None,
+                Ok(true) => clear_retirement_error(&self.retirement_errors, retirement_key(&flow)),
                 Ok(false) => {
                     self.retiring.push_back(flow);
                     tokio::task::yield_now().await;
                 }
                 Err(error) => {
-                    self.cleanup_error = Some(error.to_string());
                     eprintln!("vox: history retirement is pending: {error}");
-                    self.retiring.push_back(flow);
-                    tokio::time::sleep(crate::node::history_budget::RETIRE_RETRY_BACKOFF).await;
+                    note_retirement_error(
+                        &self.retirement_errors,
+                        retirement_key(&flow),
+                        &error.to_string(),
+                    );
+                    // A permanent local error must not hold lock/unlock or shutdown forever.
+                    // Ownership moves to the daemon runtime, which keeps retrying under the
+                    // named policy while the stable status ledger remains visible.
+                    spawn_owed_retirement(flow, Arc::clone(&self.retirement_errors));
                 }
             }
         }
@@ -986,10 +1231,21 @@ impl Node {
             let Some(mut returned) = returned else {
                 continue;
             };
-            let Some(work) = self.bounded_sync.running[index].take() else {
-                self.dispose_rearming_hint(returned.flow);
+            let flow = work.flow.try_lock().ok().and_then(|mut flow| flow.take());
+            let Some(flow) = flow else {
+                if let Ok(mut result) = work.result.lock() {
+                    *result = Some(returned);
+                }
                 continue;
             };
+            let Some(work) = self.bounded_sync.running[index].take() else {
+                self.dispose_rearming_hint(flow);
+                continue;
+            };
+            let mut flow = flow;
+            if let Some(panic) = returned.panic.take() {
+                returned.error = Some(format!("bounded history worker panicked: {panic}"));
+            }
             let current = self
                 .ports
                 .get_mut(&(work.room, work.peer))
@@ -1000,25 +1256,25 @@ impl Node {
                 && self
                     .channels
                     .get(&work.room)
-                    .is_some_and(|room| Arc::ptr_eq(room, &returned.flow.shared));
+                    .is_some_and(|room| Arc::ptr_eq(room, &flow.shared));
             if !valid {
-                self.dispose_rearming_hint(returned.flow);
+                self.dispose_rearming_hint(flow);
                 continue;
             }
-            if let Some(seq) = returned.flow.mine_held.take() {
+            if let Some(seq) = flow.mine_held.take() {
                 // The peer's word on how far it holds this node's feed (ADR-028 R-6), recorded
                 // on the actor's next turn; the settlement tick then stops offering the own
                 // head to that peer (ADR-038 FX-15).
                 self.held_notes.push((work.room, work.peer, seq));
             }
-            if returned.flow.admitted_authors > 0 {
-                returned.flow.admitted_authors = 0;
+            if flow.admitted_authors > 0 {
+                flow.admitted_authors = 0;
                 let _ = self.net_tx.try_send(NetEvent::BoardGrew {
                     channel_id: work.room,
                 });
             }
-            if returned.flow.published {
-                returned.flow.published = false;
+            if flow.published {
+                flow.published = false;
                 self.governance_work.pending = true;
                 self.sched_rooms.insert(work.room);
                 // A bounded publication may have made an addressed key-package durable. Its
@@ -1029,11 +1285,11 @@ impl Node {
                 self.key_package_rooms.entry(work.room).or_insert(false);
                 let _ = self.net_tx.try_send(NetEvent::BoundedRoomAdvanced {
                     channel_id: work.room,
-                    rendered: returned.flow.rendered,
-                    governance: returned.flow.governance,
+                    rendered: flow.rendered,
+                    governance: flow.governance,
                 });
-                returned.flow.rendered = false;
-                returned.flow.governance = false;
+                flow.rendered = false;
+                flow.governance = false;
                 // A required control finished: the archive's next local slice can recheck its
                 // exact dependency. No archive wire request is created by this wake.
                 if let Some(flow) = self.bounded_sync.ready[1].as_mut() {
@@ -1041,7 +1297,7 @@ impl Node {
                     self.sched_rooms.insert(flow.room);
                 }
             }
-            if let Some((head, seq)) = returned.flow.external.take() {
+            if let Some((head, seq)) = flow.external.take() {
                 let need = (work.room, work.peer, head, seq);
                 if !self.bounded_sync.required.contains(&need)
                     && self.bounded_sync.required.len() < 128
@@ -1049,7 +1305,7 @@ impl Node {
                     self.bounded_sync.required.push_back(need);
                 }
             }
-            if let Some(target) = returned.flow.reroute.take() {
+            if let Some(target) = flow.reroute.take() {
                 // EvidenceUnavailable named the author of the exact missing signed dependency.
                 // Keep this flow, its in-flight hint owner and its exact query/continuation
                 // intact; only the next wire turn moves to the authoritative port.
@@ -1074,15 +1330,15 @@ impl Node {
                         .required
                         .iter()
                         .any(|(room, peer, _, _)| *room == work.room && *peer == work.peer);
-                returned.flow.peer = target;
-                returned.flow.route_origin = Some(work.peer);
-                returned.flow.route_complete = false;
+                flow.peer = target;
+                flow.route_origin = Some(work.peer);
+                flow.route_complete = false;
                 debug_assert!(self.bounded_sync.ready[0].is_none());
                 if self.bounded_sync.ready[0].is_some() {
-                    self.dispose_rearming_hint(returned.flow);
+                    self.dispose_rearming_hint(flow);
                     continue;
                 }
-                self.bounded_sync.ready[0] = Some(returned.flow);
+                self.bounded_sync.ready[0] = Some(flow);
                 crate::node::status::SyncBook::with(
                     &self.sync_book,
                     work.room,
@@ -1109,20 +1365,13 @@ impl Node {
                 self.sched_rooms.insert(work.room);
                 continue;
             }
-            if returned.flow.authorization_changed {
-                let retry_peer = returned
-                    .flow
-                    .route_origin
-                    .unwrap_or(returned.flow.hint_peer);
-                if let Some(hint) = returned.flow.hint {
-                    self.history_hints.retry(
-                        work.room,
-                        returned.flow.hint_peer,
-                        hint.author,
-                        hint.head,
-                    );
+            if flow.authorization_changed {
+                let retry_peer = flow.route_origin.unwrap_or(flow.hint_peer);
+                if let Some(hint) = flow.hint {
+                    self.history_hints
+                        .retry(work.room, flow.hint_peer, hint.author, hint.head);
                 }
-                self.bounded_sync.dispose(returned.flow);
+                self.bounded_sync.dispose(flow);
                 crate::node::status::SyncBook::with(
                     &self.sync_book,
                     work.room,
@@ -1159,20 +1408,15 @@ impl Node {
                 let cancelled = error
                     == crate::error::Error::Profile(crate::node::history_demand::CANCELLED)
                         .to_string();
-                if let Some(request) = returned.flow.archive_request {
-                    self.history_demand
-                        .failed(request, returned.flow.generation, &error);
+                if let Some(request) = flow.archive_request {
+                    self.history_demand.failed(request, flow.generation, &error);
                 }
 
-                if let Some(hint) = returned.flow.hint {
-                    self.history_hints.finish(
-                        work.room,
-                        returned.flow.hint_peer,
-                        hint.author,
-                        hint.head,
-                    );
+                if let Some(hint) = flow.hint {
+                    self.history_hints
+                        .finish(work.room, flow.hint_peer, hint.author, hint.head);
                 }
-                self.bounded_sync.dispose(returned.flow);
+                self.bounded_sync.dispose(flow);
                 if cancelled {
                     self.sched_rooms.insert(work.room);
                     continue;
@@ -1202,12 +1446,12 @@ impl Node {
                 );
                 continue;
             }
-            if returned.flow.route_complete {
-                let Some(origin) = returned.flow.route_origin.take() else {
-                    self.dispose_rearming_hint(returned.flow);
+            if flow.route_complete {
+                let Some(origin) = flow.route_origin.take() else {
+                    self.dispose_rearming_hint(flow);
                     continue;
                 };
-                returned.flow.route_complete = false;
+                flow.route_complete = false;
                 let more_for_target = self.history_hints.pending(work.room, work.peer)
                     || self
                         .bounded_sync
@@ -1237,7 +1481,7 @@ impl Node {
                 // 2026-10-19).
                 self.note_lane_sync(work.room, work.peer);
                 let origin_room =
-                    crate::node::ports::RoomRef::Channel(Arc::downgrade(&returned.flow.shared));
+                    crate::node::ports::RoomRef::Channel(Arc::downgrade(&flow.shared));
                 let origin_live = self
                     .ports
                     .get(&(work.room, origin))
@@ -1247,17 +1491,17 @@ impl Node {
                     // exact author turn was in flight. Its inbox scope has already retired (or
                     // this hint is safely re-armed for a later reopen); never strand the sole
                     // foreground lane on an absent/unschedulable origin port.
-                    self.dispose_rearming_hint(returned.flow);
+                    self.dispose_rearming_hint(flow);
                     self.sched_rooms.insert(work.room);
                     continue;
                 }
-                returned.flow.peer = origin;
+                flow.peer = origin;
                 debug_assert!(self.bounded_sync.ready[0].is_none());
                 if self.bounded_sync.ready[0].is_some() {
-                    self.dispose_rearming_hint(returned.flow);
+                    self.dispose_rearming_hint(flow);
                     continue;
                 }
-                self.bounded_sync.ready[0] = Some(returned.flow);
+                self.bounded_sync.ready[0] = Some(flow);
                 if let Some(port) = self.ports.get_mut(&(work.room, origin)) {
                     port.raise();
                     port.clear_backoff();
@@ -1268,13 +1512,9 @@ impl Node {
                 self.sched_rooms.insert(work.room);
                 continue;
             }
-            let superseded = returned.flow.hint.is_some_and(|hint| {
-                self.history_hints.newer_pending(
-                    work.room,
-                    returned.flow.hint_peer,
-                    hint.author,
-                    hint.size,
-                )
+            let superseded = flow.hint.is_some_and(|hint| {
+                self.history_hints
+                    .newer_pending(work.room, flow.hint_peer, hint.author, hint.size)
             });
             if superseded {
                 // The worker has returned from its bounded slice, so no in-flight state is
@@ -1282,7 +1522,7 @@ impl Node {
                 // and missing-body facts already committed by earlier slices remain durable.
                 // `retry` drops this obsolete owner because the inbox holds a newer successor,
                 // which resumes the same live window instead of waiting behind up to 128 bodies.
-                self.dispose_rearming_hint(returned.flow);
+                self.dispose_rearming_hint(flow);
                 if let Some(port) = self.ports.get_mut(&(work.room, work.peer)) {
                     port.req_done = port.req_done.max(work.request);
                     port.raise();
@@ -1305,8 +1545,7 @@ impl Node {
             // on the same port, and leaving its old Busy backoff intact spaces that real work at
             // the exponential cap even though capacity has just made progress. Transport, policy
             // and no-progress backoffs retain their distinct meaning.
-            let local_progress =
-                returned.flow.done() || !returned.flow.waiting || returned.flow.body_progress;
+            let local_progress = flow.done() || !flow.waiting || flow.body_progress;
             let cleared_busy = local_progress
                 && self
                     .ports
@@ -1329,46 +1568,42 @@ impl Node {
                     |counts| counts.backoff = None,
                 );
             }
-            if returned.flow.done() {
-                if !returned.flow.archive && !returned.flow.inventory {
-                    if let Some(head) = returned.flow.authenticated_head {
+            if flow.done() {
+                if !flow.archive && !flow.inventory {
+                    if let Some(head) = flow.authenticated_head {
                         let event = NetEvent::BoundedHeadCompleted {
                             channel_id: work.room,
-                            instance: Arc::downgrade(&returned.flow.shared),
+                            instance: Arc::downgrade(&flow.shared),
                             head,
-                            epoch: returned.flow.epoch,
-                            room_instance: returned.flow.instance,
-                            generation: returned.flow.generation,
+                            epoch: flow.epoch,
+                            room_instance: flow.instance,
+                            generation: flow.generation,
                         };
                         if self.net_tx.try_send(event).is_err() {
                             // Retain the charged completed flow and its in-flight hint until
                             // the actor can receive the exact completion; never lose this edge.
-                            self.bounded_sync.ready[index] = Some(returned.flow);
+                            self.bounded_sync.ready[index] = Some(flow);
                             self.sched_rooms.insert(work.room);
                             continue;
                         }
                     }
                 }
-                if let Some(status) = returned.flow.archive_status.take() {
+                if let Some(status) = flow.archive_status.take() {
                     if let Some(request) = status.request {
                         self.history_demand
-                            .completed(request, returned.flow.generation, status);
+                            .completed(request, flow.generation, status);
                     }
                 }
-                if let Some(hint) = returned.flow.hint {
-                    self.history_hints.finish(
-                        work.room,
-                        returned.flow.hint_peer,
-                        hint.author,
-                        hint.head,
-                    );
+                if let Some(hint) = flow.hint {
+                    self.history_hints
+                        .finish(work.room, flow.hint_peer, hint.author, hint.head);
                 }
                 let mut raised = false;
                 if let Some(port) = self.ports.get_mut(&(work.room, work.peer)) {
-                    if returned.flow.inventory {
+                    if flow.inventory {
                         port.done_gen = port.done_gen.max(work.generation);
                     }
-                    if returned.flow.inventory || returned.flow.hint.is_some() {
+                    if flow.inventory || flow.hint.is_some() {
                         // This attempt consumed the request that selected its inventory or
                         // scalar hint. Leaving it outstanding immediately schedules another
                         // inventory and recreates the feedback churn the bounded inbox removed.
@@ -1415,9 +1650,9 @@ impl Node {
                 // 2026-10-19).
                 self.note_lane_sync(work.room, work.peer);
             } else {
-                let waiting = returned.flow.waiting;
-                let body_progress = returned.flow.body_progress;
-                if returned.flow.governance_wait {
+                let waiting = flow.waiting;
+                let body_progress = flow.body_progress;
+                if flow.governance_wait {
                     // The flow found the fold pending: the actor's fold hook drives it (ADR-037
                     // R2 b), and the flow's next round finds it ready.
                     self.governance_work.pending = true;
@@ -1436,9 +1671,9 @@ impl Node {
                             self.bounded_sync.dispose(old);
                         }
                     }
-                    self.bounded_sync.deferred.push_back(returned.flow);
+                    self.bounded_sync.deferred.push_back(flow);
                 } else {
-                    self.bounded_sync.ready[index] = Some(returned.flow);
+                    self.bounded_sync.ready[index] = Some(flow);
                 }
                 if waiting {
                     if body_progress {
@@ -1958,10 +2193,13 @@ impl Node {
         let archive = flow
             .archive_request
             .map(|request| (request, flow.generation));
+        let running_retirement_key = retirement_key(&flow);
         // A key to this peer waiting on its bundle makes this round read the peer's board,
         // hinted or not (ADR-038 FX-35); once the bundle is held the fact is gone.
         flow.wants_board = self.key_waiting.contains_key(&(room, peer));
+        let flow = Arc::new(tokio::sync::Mutex::new(Some(flow)));
         let result = Arc::new(StdMutex::new(None));
+        let worker_flow = Arc::clone(&flow);
         let output = result.clone();
         let worker_fence = fence.clone();
         let completion_wake = self.bounded_sync.completion_wake();
@@ -1970,11 +2208,15 @@ impl Node {
         let now = self.now_ms().get();
         let net = self.net.as_ref().cloned();
         let pstore = profile.store_handle();
-        let task = tokio::spawn(async move {
+        let worker = tokio::spawn(async move {
             let _slot = slot;
             job.hold_live_for_proof().await;
             let deadline =
                 tokio::time::Instant::now() + crate::node::history_budget::BOUNDED_ROUND_PATIENCE;
+            let mut flow = worker_flow.lock().await;
+            let Some(flow) = flow.as_mut() else {
+                return Some("bounded history supervisor retained no Flow".to_owned());
+            };
             if flow.needs_board() && !worker_fence.is_retired() {
                 if let Some(net) = net {
                     flow.admitted_authors = tokio::select! {
@@ -2001,8 +2243,15 @@ impl Node {
             // The round is over: its flow state goes back here, in the step that ends it
             // (ADR-038 FX-35), not when the actor next looks; a finished task holds no charge.
             flow.park();
+            error
+        });
+        let task = tokio::spawn(async move {
+            let (error, panic) = match worker.await {
+                Ok(error) => (error, None),
+                Err(error) => (None, Some(error.to_string())),
+            };
             if let Ok(mut result) = output.lock() {
-                *result = Some(Returned { flow, error });
+                *result = Some(Returned { error, panic });
             }
             completion_wake.notify_one();
         });
@@ -2013,7 +2262,9 @@ impl Node {
             generation,
             request,
             archive,
+            retirement_key: running_retirement_key,
             fence,
+            flow,
             result,
             task,
             started: std::time::Instant::now(),
@@ -2029,6 +2280,23 @@ impl Controller {
     /// must be able to see it.
     pub(super) fn lanes_json(&self) -> String {
         use crate::node::link::b32_encode;
+        let retirement_errors = self
+            .retirement_errors
+            .lock()
+            .map(|errors| errors.clone())
+            .unwrap_or_default();
+        let cleanup_errors = retirement_errors
+            .iter()
+            .map(|((room, peer, archive, _, _), error)| {
+                format!(
+                    "{{\"room\":\"{}\",\"peer\":\"{}\",\"archive\":{archive},\"error\":{}}}",
+                    b32_encode(room),
+                    b32_encode(peer),
+                    serde_json::to_string(error).unwrap_or_else(|_| "null".to_owned())
+                )
+            })
+            .collect::<Vec<_>>();
+        let cleanup_error = retirement_errors.values().next().cloned();
         let flow = |f: &Flow| {
             format!(
                 "{{\"room\":\"{}\",\"peer\":\"{}\",\"archive\":{},\"waiting\":{},\"inventory\":{}}}",
@@ -2065,7 +2333,7 @@ impl Controller {
             })
             .collect();
         format!(
-            "{{\"ready\":[{}],\"running\":[{}],\"deferred\":{},\"retiring\":{},\"required\":{},\"archive_admission\":{},\"foreground_admissions\":{},\"room_admissions\":{},\"secret_admissions\":{},\"byte_admissions\":{},\"cleanup\":{},\"cleanup_error\":{}}}",
+            "{{\"ready\":[{}],\"running\":[{}],\"deferred\":{},\"retiring\":{},\"required\":{},\"archive_admission\":{},\"foreground_admissions\":{},\"room_admissions\":{},\"secret_admissions\":{},\"byte_admissions\":{},\"cleanup\":{},\"cleanup_error\":{},\"cleanup_errors\":[{}]}}",
             ready.join(","),
             running.join(","),
             self.deferred.len(),
@@ -2077,7 +2345,8 @@ impl Controller {
             self.secret_admission.len(),
             self.byte_admission.len(),
             self.cleanup.is_some(),
-            serde_json::to_string(&self.cleanup_error).unwrap_or_else(|_| "null".to_owned())
+            serde_json::to_string(&cleanup_error).unwrap_or_else(|_| "null".to_owned()),
+            cleanup_errors.join(",")
         )
     }
 }

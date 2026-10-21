@@ -13,7 +13,9 @@ use tokio::sync::Notify;
 use crate::hash::Digest32;
 
 const MIB: usize = 1024 * 1024;
-const ARCHIVE_JOBS: usize = 2;
+/// Archive rounds the daemon may run together. Exported so shipped-binary proofs derive their
+/// hosted-node pressure from the same admission rule instead of copying a count.
+pub const ARCHIVE_JOBS: usize = 2;
 const FOREGROUND_JOBS: usize = 64;
 #[cfg(feature = "test-knobs")]
 /// Proof-only foreground capacity override; absent from a production build.
@@ -277,11 +279,20 @@ impl Ticket {
         drop(state);
         // A second archive slot or another reserved lane may also be available.
         self.budget.notify_lane(self.lane);
+        let flow_owner = self
+            .budget
+            .pool
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .active
+            .get(&self.node)
+            .copied();
         Some(Job(Arc::new(Worker {
             budget: Arc::clone(&self.budget),
             node: self.node,
             lane: self.lane,
             bytes: AtomicUsize::new(0),
+            flow_owner,
         })))
     }
 }
@@ -301,6 +312,10 @@ struct Worker {
     node: Digest32,
     lane: Lane,
     bytes: AtomicUsize,
+    /// Registration generation that admitted this actor's work. A retired actor's running
+    /// charge and a replacement actor with the same fingerprint therefore retain distinct pool
+    /// capacity until the old round really returns it.
+    flow_owner: Option<u64>,
 }
 
 impl Worker {
@@ -376,9 +391,16 @@ impl Job {
         let key = (self.0.node, room, peer);
         let budget = Arc::clone(&self.0.budget);
         let mut p = budget.pool.lock().unwrap_or_else(PoisonError::into_inner);
-        if p.in_use >= p.limit {
+        let Some(owner) = self.0.flow_owner else {
+            return FlowStateTry::PoolFull;
+        };
+        if p.in_use >= p.limit || !p.owners.contains_key(&owner) {
             return FlowStateTry::PoolFull;
         }
+        let Some(pool_owner) = p.owners.get_mut(&owner) else {
+            return FlowStateTry::PoolFull;
+        };
+        pool_owner.charges += 1;
         p.in_use += 1;
         *p.running.entry(key).or_insert(0) += 1;
         *p.by_node.entry(key.0).or_insert(0) += 1;
@@ -386,6 +408,7 @@ impl Job {
         FlowStateTry::Reserved(FlowStateCharge {
             budget,
             key,
+            owner,
             charge: Some(bytes),
         })
     }
@@ -638,9 +661,18 @@ struct Pool {
     /// status needs only the key to say that the port has a running round.
     running: BTreeMap<(Digest32, Digest32, Digest32), usize>,
     by_node: BTreeMap<Digest32, usize>,
-    /// Live ownership guards. A node whose actor has ended remains in `by_node` until its last
-    /// charge goes back, so capacity can never shrink underneath work that still owns it.
-    registrations: BTreeMap<Digest32, usize>,
+    next_owner: u64,
+    /// The current actor generation for each hosted fingerprint.
+    active: BTreeMap<Digest32, u64>,
+    /// Active and retiring actor generations. A replacement with the same fingerprint gets its
+    /// own owner, so old panic cleanup cannot shrink capacity beneath either generation's work.
+    owners: BTreeMap<u64, PoolOwner>,
+}
+
+struct PoolOwner {
+    node: Digest32,
+    registered: bool,
+    charges: usize,
 }
 
 impl Default for Pool {
@@ -650,7 +682,9 @@ impl Default for Pool {
             in_use: 0,
             running: BTreeMap::new(),
             by_node: BTreeMap::new(),
-            registrations: BTreeMap::new(),
+            next_owner: 0,
+            active: BTreeMap::new(),
+            owners: BTreeMap::new(),
         }
     }
 }
@@ -661,6 +695,7 @@ impl Default for Pool {
 pub(crate) struct FlowPoolRegistration {
     budget: Arc<Budget>,
     node: Digest32,
+    owner: u64,
 }
 
 impl Drop for FlowPoolRegistration {
@@ -670,16 +705,24 @@ impl Drop for FlowPoolRegistration {
             .pool
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if let Some(registrations) = p.registrations.get_mut(&self.node) {
-            *registrations = registrations.saturating_sub(1);
-            if *registrations == 0 {
-                p.registrations.remove(&self.node);
-            }
+        if p.active.get(&self.node) == Some(&self.owner) {
+            p.active.remove(&self.node);
         }
-        if !p.registrations.contains_key(&self.node) && p.by_node.get(&self.node) == Some(&0) {
+        if let Some(owner) = p.owners.get_mut(&self.owner) {
+            owner.registered = false;
+        }
+        if p.owners
+            .get(&self.owner)
+            .is_some_and(|owner| owner.charges == 0)
+        {
+            p.owners.remove(&self.owner);
+        }
+        if !p.owners.values().any(|owner| owner.node == self.node)
+            && p.by_node.get(&self.node) == Some(&0)
+        {
             p.by_node.remove(&self.node);
         }
-        p.limit = FLOW_STATE_MIN_CAPACITY.max(BOUNDED_SYNC_RUNNING_SLOTS * p.by_node.len());
+        p.limit = FLOW_STATE_MIN_CAPACITY.max(BOUNDED_SYNC_RUNNING_SLOTS * p.owners.len());
     }
 }
 
@@ -699,6 +742,7 @@ pub(crate) enum FlowStateTry {
 pub(crate) struct FlowStateCharge {
     budget: Arc<Budget>,
     key: (Digest32, Digest32, Digest32),
+    owner: u64,
     charge: Option<BufferCharge>,
 }
 impl Drop for FlowStateCharge {
@@ -719,10 +763,21 @@ impl Drop for FlowStateCharge {
         if let Some(n) = p.by_node.get_mut(&self.key.0) {
             *n = n.saturating_sub(1);
         }
-        if !p.registrations.contains_key(&self.key.0) && p.by_node.get(&self.key.0) == Some(&0) {
-            p.by_node.remove(&self.key.0);
-            p.limit = FLOW_STATE_MIN_CAPACITY.max(BOUNDED_SYNC_RUNNING_SLOTS * p.by_node.len());
+        if let Some(owner) = p.owners.get_mut(&self.owner) {
+            owner.charges = owner.charges.saturating_sub(1);
         }
+        if p.owners
+            .get(&self.owner)
+            .is_some_and(|owner| !owner.registered && owner.charges == 0)
+        {
+            p.owners.remove(&self.owner);
+        }
+        if !p.owners.values().any(|owner| owner.node == self.key.0)
+            && p.by_node.get(&self.key.0) == Some(&0)
+        {
+            p.by_node.remove(&self.key.0);
+        }
+        p.limit = FLOW_STATE_MIN_CAPACITY.max(BOUNDED_SYNC_RUNNING_SLOTS * p.owners.len());
     }
 }
 
@@ -759,13 +814,30 @@ impl Budget {
     /// grows to hold every hosted node's rounds before this node's first start attempt.
     pub(crate) fn register_node(self: &Arc<Self>, node: Digest32) -> FlowPoolRegistration {
         let mut p = self.pool.lock().unwrap_or_else(PoisonError::into_inner);
+        p.next_owner = p.next_owner.checked_add(1).unwrap_or(1);
+        let owner = p.next_owner;
+        if let Some(replaced) = p.active.insert(node, owner) {
+            if let Some(replaced) = p.owners.get_mut(&replaced) {
+                replaced.registered = false;
+            }
+        }
+        p.owners.insert(
+            owner,
+            PoolOwner {
+                node,
+                registered: true,
+                charges: 0,
+            },
+        );
+        p.owners
+            .retain(|_, owner| owner.registered || owner.charges > 0);
         p.by_node.entry(node).or_insert(0);
-        *p.registrations.entry(node).or_insert(0) += 1;
-        p.limit = FLOW_STATE_MIN_CAPACITY.max(BOUNDED_SYNC_RUNNING_SLOTS * p.by_node.len());
+        p.limit = FLOW_STATE_MIN_CAPACITY.max(BOUNDED_SYNC_RUNNING_SLOTS * p.owners.len());
         drop(p);
         FlowPoolRegistration {
             budget: Arc::clone(self),
             node,
+            owner,
         }
     }
 
@@ -792,10 +864,10 @@ impl Budget {
             flow_state_limit: p.limit,
             flow_state_by_node: p.by_node.iter().map(|(n, c)| (*n, *c)).collect(),
             flow_state_retiring_nodes: p
-                .by_node
-                .keys()
-                .filter(|node| !p.registrations.contains_key(*node))
-                .copied()
+                .owners
+                .values()
+                .filter(|owner| !owner.registered)
+                .map(|owner| owner.node)
                 .collect(),
             flow_state_running: p.running.keys().copied().collect(),
         }

@@ -4925,6 +4925,9 @@ pub struct Node {
     /// Stable across lock/unlock controller replacement, so every generation's completion wakes
     /// the one actor select that audits its durable result slots.
     bounded_completion_wake: Arc<tokio::sync::Notify>,
+    /// Per-flow retirement failures survive lock/unlock controller replacement until the exact
+    /// owed cleanup completes.
+    bounded_retirement_errors: bounded_sync::RetirementErrors,
     history_hints: Arc<crate::node::history_stream::HintInbox>,
     /// Peers' acknowledgements of this node's own feed reported by lane rounds, applied on
     /// the next schedule (`note_held`).
@@ -5709,12 +5712,15 @@ impl Node {
                 Err(error) => (Vec::new(), Some(error.to_string())),
             };
         let bounded_completion_wake = Arc::new(tokio::sync::Notify::new());
+        let bounded_retirement_errors = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
         let mut bounded_sync = bounded_sync::Controller::default();
         bounded_sync.set_completion_wake(Arc::clone(&bounded_completion_wake));
+        bounded_sync.set_retirement_errors(Arc::clone(&bounded_retirement_errors));
         let node = Self {
             history_demand: history_demand::Controller::default(),
             bounded_sync,
             bounded_completion_wake,
+            bounded_retirement_errors,
             history_hints: crate::node::history_stream::HintInbox::new(),
             held_notes: Vec::new(),
             history_budget,
@@ -17852,6 +17858,8 @@ impl Node {
         let mut bounded_sync = std::mem::take(&mut self.bounded_sync);
         self.bounded_sync
             .set_completion_wake(Arc::clone(&self.bounded_completion_wake));
+        self.bounded_sync
+            .set_retirement_errors(Arc::clone(&self.bounded_retirement_errors));
         bounded_sync.fence();
         self.history_hints.clear();
         let mut history_demand = std::mem::take(&mut self.history_demand);

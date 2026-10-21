@@ -96,7 +96,7 @@ mod attach;
 mod typed;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -468,9 +468,14 @@ const IDLE: Duration = Duration::from_secs(60);
 /// The nodes one daemon hosts in the quiet rooms, as the decider's work Mac hosts a person's node
 /// and the agents' beside it on one `vox daemon --no-node`, each made Ready with `vox node unlock`.
 const HOSTED: [&str; 4] = ["robert", "claude", "codex", "opencode"];
-/// More than eight hosted nodes makes the exact two-slots-per-node pool larger than its floor.
-const FX35_HOSTED: [&str; 9] = [
-    "robert", "claude", "codex", "opencode", "kimi", "glm", "fable", "one", "two",
+/// One live round per hosted node plus every daemon archive job exceeds the pool floor by one.
+/// This derives the required population from the product's two source-owned capacities.
+const FX35_HOSTED_COUNT: usize = vox_core::node::history_budget::FLOW_STATE_MIN_CAPACITY
+    - vox_core::node::history_budget::ARCHIVE_JOBS
+    + 1;
+const FX35_HOSTED: [&str; FX35_HOSTED_COUNT] = [
+    "robert", "claude", "codex", "opencode", "kimi", "glm", "fable", "one", "two", "three", "four",
+    "five", "six", "seven", "eight",
 ];
 const FX35_WAKE_HOSTED: [&str; 2] = ["wake-one", "wake-two"];
 /// The rooms every node is in; the first hosted node makes them.
@@ -521,6 +526,264 @@ struct Staged {
     hosted: usize,
     live_hold: Option<std::path::PathBuf>,
     _tmp: tempfile::TempDir,
+}
+
+/// A setup post uses the bounded-sync round's own product contract as apparatus patience. A
+/// different refusal is the product's exact output; an unchanged busy room is a failed staging
+/// precondition, never left to the global watchdog.
+fn stage_post(dir: &Path, node: Option<&str>, name: &str, room: &str, text: &str) -> Duration {
+    let asked = Instant::now();
+    loop {
+        let (ok, out, err) = bounded_stage_post(dir, node, room, text, false, asked);
+        if ok {
+            return asked.elapsed();
+        }
+        let busy = err.contains("still being applied") || out.contains("still being applied");
+        assert!(
+            busy,
+            "APPARATUS: {name}'s staging post in {room} was refused before the measured moment: \
+             {out}{err}"
+        );
+        assert!(
+            asked.elapsed() < vox_core::node::history_budget::BOUNDED_ROUND_PATIENCE,
+            "APPARATUS: {name}'s staging post in {room} remained busy for the source-owned \
+             bounded-round contract: {out}{err}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+fn stage_large_post(
+    dir: &Path,
+    node: Option<&str>,
+    name: &str,
+    room: &str,
+    text: &str,
+) -> Duration {
+    let asked = Instant::now();
+    loop {
+        let (ok, out, err) = bounded_stage_post(dir, node, room, text, true, asked);
+        if ok {
+            return asked.elapsed();
+        }
+        let busy = err.contains("still being applied") || out.contains("still being applied");
+        assert!(
+            busy,
+            "APPARATUS: {name}'s large staging post in {room} was refused before the measured \
+             moment: {out}{err}"
+        );
+        assert!(
+            asked.elapsed() < vox_core::node::history_budget::BOUNDED_ROUND_PATIENCE,
+            "APPARATUS: {name}'s large staging post in {room} remained busy for the \
+             source-owned bounded-round contract: {out}{err}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Run one setup post under the bounded-round contract even if the client itself wedges. The
+/// command is still the shipped binary; this only gives the apparatus its own named watchdog.
+fn bounded_stage_post(
+    dir: &Path,
+    node: Option<&str>,
+    room: &str,
+    text: &str,
+    stdin: bool,
+    asked: Instant,
+) -> (bool, String, String) {
+    let deadline = asked + vox_core::node::history_budget::BOUNDED_ROUND_PATIENCE;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    assert!(
+        !remaining.is_zero(),
+        "APPARATUS: staging post in {room} exhausted the source-owned bounded-round contract \
+         before its shipped client could start"
+    );
+    let dir = dir.to_owned();
+    let node = node.map(str::to_owned);
+    let room = room.to_owned();
+    let text = text.to_owned();
+    let room_for_error = room.clone();
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut args = vec![
+            "room".to_owned(),
+            "post".to_owned(),
+            room,
+            if stdin { "-".to_owned() } else { text.clone() },
+        ];
+        if let Some(node) = node {
+            args.extend(["--node".to_owned(), node]);
+        }
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let result = vox(&dir, &refs, stdin.then_some(text.as_str()));
+        let _ = result_tx.send(result);
+    });
+    result_rx.recv_timeout(remaining).unwrap_or_else(|error| {
+        panic!(
+            "APPARATUS: shipped staging post in {room_for_error} did not return within the \
+             source-owned bounded-round contract: {error}"
+        )
+    })
+}
+
+/// Create ordinary shipped archive demand on two hosted nodes. The peer posts beyond the live
+/// window before either joins; each node then asks for the page below its oldest held row with
+/// `vox room read --history older`. Returning means both shipped requests were accepted and the
+/// daemon reported both archive jobs admitted together.
+fn stage_two_archive_jobs(staged: &Staged) -> String {
+    let (peer_dir, peer_node, peer_name, _) = &staged.everyone[staged.hosted];
+    let (ok, _, err) = vox(
+        peer_dir,
+        &as_node(
+            &[
+                "room",
+                "create",
+                "--passphrase-file",
+                "-",
+                "--name",
+                "pool-archive",
+            ],
+            *peer_node,
+        ),
+        Some(&format!("{ROOMPASS}\n")),
+    );
+    assert!(
+        ok,
+        "APPARATUS: archive-pressure room creation failed: {err}"
+    );
+    let listed = attached_as(peer_dir, "peer", *peer_node);
+    let room = listed
+        .lines()
+        .find(|line| line.contains("pool-archive"))
+        .and_then(|line| line.split_whitespace().next())
+        .unwrap_or_else(|| panic!("APPARATUS: archive-pressure room is not listed: {listed}"))
+        .to_owned();
+
+    // More rows than the live window leaves a real older page. Source-owned sizes make this
+    // pressure evolve with the product rather than copying today's 128/16 values.
+    let archive_rows =
+        vox_core::log::history::MAX_PAGE_ENTRIES + vox_core::node::history_budget::ARCHIVE_JOBS;
+    let payload_bytes =
+        vox_core::log::history::MAX_PAYLOAD_BYTES - vox_core::log::history::MAX_HEADER_BYTES;
+    for index in 0..archive_rows {
+        let mut body = format!("archive-pressure-{index} ");
+        if index < vox_core::node::history_budget::ARCHIVE_JOBS {
+            body.push_str(&"a".repeat(payload_bytes.saturating_sub(body.len())));
+            stage_large_post(peer_dir, *peer_node, peer_name, &room, &body);
+        } else {
+            stage_post(peer_dir, *peer_node, peer_name, &room, &body);
+        }
+    }
+    let (ok, link, err) = vox(
+        peer_dir,
+        &as_node(&["room", "link", &room], *peer_node),
+        None,
+    );
+    assert!(ok, "APPARATUS: archive-pressure link failed: {err}");
+    let link = link
+        .lines()
+        .find(|line| line.starts_with("vox://"))
+        .unwrap_or(link.trim())
+        .to_owned();
+    for (dir, node, name, _) in &staged.everyone[..vox_core::node::history_budget::ARCHIVE_JOBS] {
+        let (ok, out, err) = vox(
+            dir,
+            &as_node(&["room", "join", "--passphrase-file", "-", &link], *node),
+            Some(&format!("{ROOMPASS}\n")),
+        );
+        assert!(
+            ok,
+            "APPARATUS: {name}'s archive-pressure join was refused: {out}{err}"
+        );
+    }
+
+    let page = vox_core::log::history::MAX_PAGE_ENTRIES.to_string();
+    for (dir, node, name, _) in &staged.everyone[..vox_core::node::history_budget::ARCHIVE_JOBS] {
+        let ready_by = Instant::now() + vox_core::node::history_budget::BOUNDED_ROUND_PATIENCE;
+        let oldest = loop {
+            let (ok, out, err) = vox(
+                dir,
+                &as_node(&["room", "read", &room, "--json", "--limit", &page], *node),
+                None,
+            );
+            assert!(
+                ok,
+                "APPARATUS: {name}'s archive-pressure staging read refused: {out}{err}"
+            );
+            let rows = out
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(serde_json::from_str::<serde_json::Value>)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "APPARATUS: {name}'s archive-pressure staging read was not JSON: \
+                         {error}: {out}"
+                    )
+                });
+            if rows.len() == vox_core::log::history::MAX_PAGE_ENTRIES {
+                break rows[0]["entry_hash"]
+                    .as_str()
+                    .unwrap_or_else(|| {
+                        panic!("APPARATUS: {name}'s oldest archive-pressure row has no entry_hash")
+                    })
+                    .to_owned();
+            }
+            assert!(
+                Instant::now() < ready_by,
+                "APPARATUS: {name} never held the source-sized live window needed to stage an \
+                 older-history request; held {} rows",
+                rows.len()
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        };
+        let (ok, out, err) = vox(
+            dir,
+            &as_node(
+                &[
+                    "room",
+                    "read",
+                    &room,
+                    "--history",
+                    "older",
+                    "--before",
+                    &oldest,
+                ],
+                *node,
+            ),
+            None,
+        );
+        assert!(
+            ok,
+            "APPARATUS: {name}'s shipped older-history request was refused: {out}{err}"
+        );
+    }
+
+    let admitted_by = Instant::now() + vox_core::node::history_budget::BOUNDED_ROUND_PATIENCE;
+    let expected: BTreeSet<&str> = staged.everyone[..vox_core::node::history_budget::ARCHIVE_JOBS]
+        .iter()
+        .map(|(_, _, _, fingerprint)| fingerprint.as_str())
+        .collect();
+    loop {
+        let shown = synced(&staged.host, Some(FX35_HOSTED[0]));
+        let value: serde_json::Value = serde_json::from_str(&shown.status).unwrap_or_default();
+        let archives: BTreeSet<&str> = value["lanes"]["budget"]["archive_nodes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        if archives == expected {
+            return room;
+        }
+        assert!(
+            Instant::now() < admitted_by,
+            "APPARATUS: the two shipped older-history requests never occupied both source-owned \
+             archive jobs together (expected {expected:?}, saw {archives:?}): {}",
+            shown.status
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// Stage [`HOSTED`] on one `vox daemon --no-node` (each made Ready with `vox node unlock`) and
@@ -579,7 +842,11 @@ fn stage_hosted_nodes(hosted: &'static [&'static str], exact_admission_wake: boo
         unlock(&host, name);
         attached_as(&host, "host", Some(name));
     }
-    let peer_daemon = daemon(&peer, "peer");
+    let peer_daemon = if exact_admission_wake {
+        daemon_env(&peer, "peer", &[("VOX_TEST_DISABLE_TICK_SCHEDULE", "1")])
+    } else {
+        daemon(&peer, "peer")
+    };
     attached_as(&peer, "peer", None);
 
     // Trust in every direction before anyone posts.
@@ -651,22 +918,7 @@ fn stage_hosted_nodes(hosted: &'static [&'static str], exact_admission_wake: boo
     for room in &rooms {
         for (dir, node, name, _) in &everyone {
             let text = format!("{name} is here");
-            let args = as_node(&["room", "post", room, &text], *node);
-            let asked = Instant::now();
-            loop {
-                let (ok, out, err) = vox(dir, &args, None);
-                if ok {
-                    break;
-                }
-                let busy =
-                    err.contains("still being applied") || out.contains("still being applied");
-                assert!(
-                    busy,
-                    "APPARATUS: {name}'s staging post in {room} was refused: {out}{err}"
-                );
-                std::thread::sleep(Duration::from_millis(500));
-                waited = waited.max(asked.elapsed());
-            }
+            waited = waited.max(stage_post(dir, *node, name, room, &text));
         }
     }
     Staged {
@@ -853,9 +1105,9 @@ fn start_words(name: &str, v: &serde_json::Value) -> Vec<String> {
 ///
 /// Mutants, one per claim: `Flow::park` keeping its charge turns convergence PRODUCT red;
 /// `scratchpad/mutant_fx35_undersized.py` obstructs the seventeenth reservation while still
-/// reporting the right limit, turning the pool-full/over-sixteen PRODUCT assertion red; dropping
-/// the retained foreground ticket or its release event
-/// leaves `foreground_admissions` nonzero with periodic scheduling disabled; removing the
+/// reporting the right limit, turning the pool-full/over-sixteen PRODUCT assertion red;
+/// `scratchpad/mutant_fx35_release_wake.py` drops both exact release wakes and leaves the shipped
+/// tail short of its target with periodic scheduling disabled; removing the
 /// post-quiet need re-arm leaves the waiting node short of the named `re-armed` posts.
 #[cfg(feature = "optional-proofs")]
 #[test]
@@ -867,62 +1119,41 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
         "VOX_TEST_DISABLE_TICK_SCHEDULE",
     ]);
     watchdog::arm_for_setup(
-        u32::try_from(QUIET_ROOMS.len() * (FX35_HOSTED.len() + FX35_WAKE_HOSTED.len()))
-            .expect("APPARATUS: join count does not fit the watchdog"),
+        u32::try_from(
+            QUIET_ROOMS.len() * (FX35_HOSTED.len() + FX35_WAKE_HOSTED.len())
+                + vox_core::node::history_budget::ARCHIVE_JOBS,
+        )
+        .expect("APPARATUS: join count does not fit the watchdog"),
         u32::try_from(FX35_HOSTED.len() + FX35_WAKE_HOSTED.len() + 2)
             .expect("APPARATUS: unlock count does not fit the watchdog"),
     );
     let staged = stage_hosted_nodes(&FX35_HOSTED, false);
     converged(&staged);
     let converged_after = staged.posted.elapsed();
-    // Two legal rounds per hosted node must actually overlap above the sixteen-state floor.
-    // Three different peers append a near-maximum legal body and then a small visible marker in
-    // both rooms. Each hosted node therefore has work for at least two peers, so its two running
-    // slots can overlap despite the separate per-peer outbound bound. This is ordinary shipped-
-    // product traffic: no pool-capacity or worker-hold test knob stages it.
-    let pressure_authors = [
-        &staged.everyone[0],
-        &staged.everyone[1],
-        &staged.everyone[staged.hosted],
-    ];
-    let pressure_body = "x".repeat(vox_core::log::history::MAX_PAYLOAD_BYTES - 4096);
-    std::thread::scope(|scope| {
-        let mut posts = Vec::new();
-        for (number, room) in staged.rooms.iter().enumerate() {
-            for (dir, node, name, _) in pressure_authors {
-                let body = &pressure_body;
-                posts.push((
-                    number,
-                    name,
-                    scope.spawn(move || {
-                        vox(
-                            dir,
-                            &as_node(&["room", "post", room, "-"], *node),
-                            Some(body),
-                        )
-                    }),
-                ));
-            }
-        }
-        for (number, name, post) in posts {
-            let (ok, out, err) = post
-                .join()
-                .unwrap_or_else(|_| panic!("APPARATUS: {name}/{number} pressure client panicked"));
-            assert!(
-                ok,
-                "APPARATUS: {name}/{number}'s legal pressure post was refused: {out}{err}"
-            );
-        }
-    });
+    // Two real shipped archive requests are already running. A near-maximum post by the peer in
+    // each shared room now makes one live round eligible on every hosted node. Fifteen live plus
+    // the daemon's two source-owned archive jobs is the first legal population above the floor;
+    // no product capacity knob or worker hold creates it.
+    let archive_room = stage_two_archive_jobs(&staged);
+    let (pressure_dir, pressure_node, pressure_name, _) = &staged.everyone[staged.hosted];
+    let pressure_body = "x".repeat(
+        vox_core::log::history::MAX_PAYLOAD_BYTES - vox_core::log::history::MAX_HEADER_BYTES,
+    );
     for (number, room) in staged.rooms.iter().enumerate() {
-        for (dir, node, name, _) in pressure_authors {
-            let marker = format!("pool-pressure-{number}-{name}-landed");
-            let (ok, out, err) = vox(dir, &as_node(&["room", "post", room, &marker], *node), None);
-            assert!(
-                ok,
-                "APPARATUS: {name}/{number}'s pressure marker was refused: {out}{err}"
-            );
-        }
+        stage_large_post(
+            pressure_dir,
+            *pressure_node,
+            pressure_name,
+            room,
+            &pressure_body,
+        );
+        stage_post(
+            pressure_dir,
+            *pressure_node,
+            pressure_name,
+            room,
+            &format!("pool-pressure-{number}-landed"),
+        );
     }
     let pressure_started = Instant::now();
     let observed = loop {
@@ -931,6 +1162,16 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
         let in_use = v["lanes"]["budget"]["flow_state"]["in_use"]
             .as_u64()
             .unwrap_or(0);
+        let archives = v["lanes"]["budget"]["archive_nodes"]
+            .as_array()
+            .map_or(0, Vec::len);
+        assert_eq!(
+            archives,
+            vox_core::node::history_budget::ARCHIVE_JOBS,
+            "APPARATUS: the source-owned archive jobs did not remain staged while the live \
+             heads were made eligible (archive room {archive_room}): {}",
+            shown.status
+        );
         let pool_full = v["lanes"]["ports"]
             .as_array()
             .into_iter()
@@ -947,8 +1188,9 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
         }
         assert!(
             pressure_started.elapsed() < vox_core::node::history_budget::BOUNDED_ROUND_PATIENCE,
-            "PRODUCT: the daemon never ran more than the sixteen-floor flow states while nine \
-             hosted nodes had legal new-head rounds for multiple peers: {}",
+            "PRODUCT: the daemon never ran more than the floor while {} hosted nodes had one \
+             legal live round each and both shipped archive requests remained admitted: {}",
+            FX35_HOSTED.len(),
             shown.status
         );
         std::thread::sleep(Duration::from_millis(20));
@@ -964,10 +1206,8 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
                     None,
                 );
                 assert!(ok, "PRODUCT: {name}'s pressure read refused: {out}{err}");
-                for (_, _, author, _) in pressure_authors {
-                    if !out.contains(&format!("pool-pressure-{number}-{author}-landed")) {
-                        missing.push(format!("{name}/{number}/{author}"));
-                    }
+                if !out.contains(&format!("pool-pressure-{number}-landed")) {
+                    missing.push(format!("{name}/{number}/{pressure_name}"));
                 }
             }
         }
@@ -998,7 +1238,8 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
             .iter()
             .filter(|p| p["round_running"] == serde_json::Value::Bool(true))
             .count() as u64;
-        // The nodes this node's daemon hosts: nine on the host, bob alone on the peer.
+        // The nodes this node's daemon hosts: the source-derived pressure population on the host,
+        // bob alone on the peer.
         let expected: BTreeSet<&str> = if hosted_fps.contains(fp.as_str()) {
             hosted_fps.clone()
         } else {
@@ -1139,11 +1380,7 @@ fn foreground_release_wakes_without_a_tick() {
     let room = &staged.rooms[0];
     for (dir, node, name, _) in &staged.everyone[..staged.hosted] {
         let text = format!("{name} re-armed");
-        let (ok, out, err) = vox(dir, &as_node(&["room", "post", room, &text], *node), None);
-        assert!(
-            ok,
-            "APPARATUS: {name}'s post-quiet staging post was refused: {out}{err}"
-        );
+        stage_post(dir, *node, name, room, &text);
     }
     let staged_by = Instant::now() + vox_core::node::history_budget::BOUNDED_ROUND_PATIENCE;
     let (waiting_dir, waiting_node, waiting_name) = loop {
@@ -1178,48 +1415,104 @@ fn foreground_release_wakes_without_a_tick() {
         );
         std::thread::sleep(Duration::from_millis(20));
     };
+
+    // Create one remote result the retained waiter can reveal. It must still be absent before
+    // release. The read and the tail subscription may schedule while capacity is held; neither
+    // can be the event that starts the waiter after capacity changes.
+    let target = format!("release-event-target-for-{waiting_name}");
+    let (peer_dir, peer_node, peer_name, _) = &staged.everyone[staged.hosted];
+    stage_post(peer_dir, *peer_node, peer_name, room, &target);
+    let (ok, before, err) = vox(
+        &waiting_dir,
+        &as_node(&["room", "read", room], waiting_node),
+        None,
+    );
+    assert!(
+        ok,
+        "APPARATUS: {waiting_name}'s pre-release staging read refused: {before}{err}"
+    );
+    assert!(
+        !before.contains(&target),
+        "APPARATUS: the retained waiter already held the release target before capacity was \
+         released: {before}"
+    );
+
+    let mut command = Command::new(VOX);
+    command
+        .args(as_node(&["room", "tail", room], waiting_node))
+        .env("VOX_DATA_DIR", &waiting_dir)
+        .env("VOX_CONFIG_DIR", waiting_dir.join("cfg"))
+        .env("VOX_IDENTITY_PASSPHRASE", IDENTITY)
+        .env_remove("VOX_ROOM")
+        .env_remove("VOX_SESSION")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut tail = command.spawn().unwrap_or_else(|error| {
+        panic!("APPARATUS: could not start release-observer tail: {error}")
+    });
+    let stdout = tail
+        .stdout
+        .take()
+        .expect("APPARATUS: release-observer tail has no stdout");
+    let (lines_tx, lines_rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            match line {
+                Ok(line) => {
+                    if lines_tx.send(Ok(line)).is_err() {
+                        return;
+                    }
+                }
+                Err(error) => {
+                    let _ = lines_tx.send(Err(error.to_string()));
+                    return;
+                }
+            }
+        }
+    });
+    let ready = format!("tail-attached-for-{waiting_name}");
+    stage_post(&waiting_dir, waiting_node, waiting_name, room, &ready);
+    let attached_by = Instant::now() + vox_core::node::history_budget::BOUNDED_ROUND_PATIENCE;
+    loop {
+        let left = attached_by.saturating_duration_since(Instant::now());
+        match lines_rx.recv_timeout(left) {
+            Ok(Ok(line)) if line.contains(&ready) => break,
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                panic!("APPARATUS: release-observer tail could not read stdout: {error}")
+            }
+            Err(error) => panic!(
+                "APPARATUS: release-observer tail did not show its pre-release ready marker \
+                 within the source-owned bounded-round contract: {error}"
+            ),
+        }
+    }
+
     std::fs::remove_file(hold)
         .unwrap_or_else(|e| panic!("APPARATUS: could not release {}: {e}", hold.display()));
-
+    // No status, read, post, or other actor request occurs after this point. The retained lane's
+    // exact capacity-release notification is the only product event that can expose `target` to
+    // the already-running shipped tail while periodic scheduling is disabled.
     let released_by = Instant::now() + vox_core::node::history_budget::BOUNDED_ROUND_PATIENCE;
     loop {
-        let released = synced(&waiting_dir, waiting_node);
-        let v: serde_json::Value = serde_json::from_str(&released.status).unwrap_or_default();
-        if v["lanes"]["bounded"]["foreground_admissions"].as_u64() == Some(0) {
-            break;
+        let left = released_by.saturating_duration_since(Instant::now());
+        match lines_rx.recv_timeout(left) {
+            Ok(Ok(line)) if line.contains(&target) => break,
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => panic!(
+                "PRODUCT: {waiting_name}'s shipped room tail failed after foreground release: {error}"
+            ),
+            Err(error) => panic!(
+                "PRODUCT: {waiting_name}'s already-running room tail did not show the retained \
+                 target from the foreground release event within the source-owned bounded-round \
+                 contract while periodic scheduling was disabled: {error}"
+            ),
         }
-        assert!(
-            Instant::now() < released_by,
-            "PRODUCT: {waiting_name}'s port did not retry from the foreground release event \
-             within the source-owned round contract while periodic scheduling was disabled: {}",
-            released.status
-        );
-        std::thread::sleep(Duration::from_millis(20));
     }
-    let rearmed_at = Instant::now();
-    loop {
-        let (ok, out, err) = vox(
-            &waiting_dir,
-            &as_node(&["room", "read", room], waiting_node),
-            None,
-        );
-        assert!(
-            ok,
-            "PRODUCT: {waiting_name}'s post-quiet read refused: {out}{err}"
-        );
-        if FX35_WAKE_HOSTED
-            .iter()
-            .all(|name| out.contains(&format!("{name} re-armed")))
-        {
-            break;
-        }
-        assert!(
-            rearmed_at.elapsed() < BOUND,
-            "PRODUCT: post-quiet new heads did not converge within {BOUND:?} after the exact \
-             foreground release while periodic scheduling was disabled; {waiting_name}: {out}"
-        );
-        std::thread::sleep(Duration::from_millis(200));
-    }
+    let _ = tail.kill();
+    let _ = tail.wait();
+    let _ = reader.join();
 }
 
 /// **Quiet rooms cost no rounds, no CPU and no bytes, answer at once, and say when they last
