@@ -330,11 +330,11 @@ The decider then answered twelve questions, one at a time. His answers are the d
 - **FX-33.** A change to a room's retention MUST NOT stop the room: after the admin shortens
   it, every member MUST still read and post there, the rows the member holds that are older
   than the new lifetime MUST expire on it, and no daemon MUST say it cannot save because of the
-  sweep that change started. A room's recovery after a failed save MUST NOT touch the node's
+  sweep that change started. A room's recovery after a failed save MUST NOT impair the node's
   other rooms: while one room recovers, and when its recovery fails, every other room of the
-  node MUST still read and post, and the daemon MUST NOT close the node's store to recover a
-  room. Decision: the recovery re-saves the room's sealed state in an ordinary write
-  transaction on the store as it is open, never by closing and reopening the file; the sweep prunes what the node holds; a signed-format
+  node MUST still read and post, and `vox status` MUST still answer. Decision: the recovery
+  re-saves the room's sealed state in an ordinary write transaction on the store as it is
+  open, never by closing and reopening the node's store file; the sweep prunes what the node holds; a signed-format
   entry is never a legacy Session; an entry whose body never arrived, or that sits past its
   author's verified head, is skipped that sweep and is not evidence of a malformed store; a row
   the sweep cannot classify (a Session step or a message) expires under the message lifetime,
