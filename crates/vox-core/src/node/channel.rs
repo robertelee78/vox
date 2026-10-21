@@ -7683,6 +7683,28 @@ impl ChannelState {
             let Some((author, seq)) = writer.next_backfill()? else {
                 break;
             };
+            // Consent applies to every row by this author, and no row by the author can open
+            // before this node holds at least one of its sender generations. Remove a blocked
+            // author from runnable work instead of scanning or resetting it forever. Acceptance
+            // of the missing consent/key is the durable event that queues it again. Removing only
+            // this author leaves every other queued author eligible in this same bounded turn.
+            let author_ready = if author == self.me() {
+                true
+            } else {
+                let consented = governance::View::current_in_batch(
+                    writer.batch(),
+                    &self.sek,
+                    &self.channel_id,
+                    self.genesis.creator_pubkey().fingerprint(),
+                )?
+                .can_read(&self.me(), &author)?;
+                consented && self.has_sender_key(&author)
+            };
+            if !author_ready {
+                writer.queue_backfill(author, None)?;
+                writer.seal()?;
+                continue;
+            }
             let sparse = writer.sparse_enabled();
             let (entry_seq, entry) = if sparse {
                 let Some((accepted_seq, entry)) = writer.next_sparse_backfill(&author, seq)? else {
@@ -7914,15 +7936,10 @@ impl ChannelState {
             match allowed {
                 Some(true) => {}
                 Some(false) => {
-                    // The author's consent control can be causally ahead of this content but
-                    // still in flight locally. Persist the reprojection cursor in the same
-                    // Batch as this effect: if the consent wake raced ahead of effect finish,
-                    // the completed turn still leaves bounded work for the next local wake. A
-                    // historical row too (ADR-038 FX-22, #1007): a page whose grant folds after
-                    // its rows left them unrendered with nothing to revisit them.
-                    let mut writer = self.entries.write(batch, &self.sek, &self.channel_id)?;
-                    writer.queue_backfill(author, Some(1))?;
-                    writer.seal()?;
+                    // Park on the missing fact. The consent grant's acceptance queues this
+                    // author in the same durable transaction as that grant; making every row
+                    // queue itself here reset the cursor to one during historical backfill and
+                    // kept an idle daemon turning forever.
                     return Ok(ContentProjection::Applied);
                 }
                 None => {
@@ -7962,14 +7979,9 @@ impl ChannelState {
             }
         }
         let Some(chain) = self.receivers.get_mut(&slot) else {
-            if !historical {
-                // SKDM installation normally queues this author, but it may commit and drain
-                // before the concurrently admitted content effect finishes. Queue again at the
-                // effect's own crash boundary so that ordering cannot lose the reprojection.
-                let mut writer = self.entries.write(batch, &self.sek, &self.channel_id)?;
-                writer.queue_backfill(author, Some(1))?;
-                writer.seal()?;
-            }
+            // Park on the missing fact. Installing or widening an SKDM queues this author in
+            // the same durable transaction as the receiver chain. ChannelState is serialized,
+            // so a key cannot commit and drain between this check and this row's acceptance.
             return Ok(ContentProjection::Applied);
         };
         let plaintext = match if historical {

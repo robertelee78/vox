@@ -16189,9 +16189,10 @@ impl Node {
                 };
                 let mut channel = shared.lock().await;
                 let installed = channel.accept_skdm(profile.store(), &skdm, now);
-                // A key accepted while the view refreshes rendered nothing yet: the next
-                // governance turn drains the backfill it queued (ADR-038 FX-22, #1007).
-                if channel.backfill_awaits_refresh() {
+                // Key acceptance is the event that wakes any rows parked on this missing fact.
+                // accept_skdm drains one bounded page itself; one governance turn continues a
+                // retained cursor or observes that it is already empty.
+                if installed.is_ok() {
                     self.governance_work.pending = true;
                 }
                 installed
@@ -17450,7 +17451,7 @@ impl Node {
                 let mut channel = shared.lock().await;
                 fresh = !channel.holds_generation(&author, skdm.body.chain_id);
                 let installed = channel.accept_skdm(profile.store(), skdm, now_ms).ok();
-                if channel.backfill_awaits_refresh() {
+                if installed.is_some() {
                     self.governance_work.pending = true;
                 }
                 installed
@@ -18647,7 +18648,7 @@ impl Node {
                     match self.profile.as_ref() {
                         Some(profile) => {
                             let installed = ch.accept_skdm(profile.store(), &skdm, now).map(|_| ());
-                            if ch.backfill_awaits_refresh() {
+                            if installed.is_ok() {
                                 self.governance_work.pending = true;
                             }
                             installed
