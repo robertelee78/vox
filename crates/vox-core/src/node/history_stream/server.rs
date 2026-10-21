@@ -148,7 +148,6 @@ async fn respond(
             Ok((status, None))
         }
         Query::Head(author) => {
-            source.flush_received_before_ack().await?;
             let receipt = author == source.peer;
             let found = source
                 .read(&job, 128 * 1024, move |room, store| {
@@ -192,6 +191,9 @@ async fn respond(
                 Lookup::Busy => return Ok((Status::Busy, None)),
                 Lookup::Missing => return Ok((Status::EvidenceUnavailable, None)),
             };
+            // The head was read; what it covers is on disk before the peer hears of it
+            // (ADR-038 FX-30).
+            source.flush_received_before_ack().await?;
             let wire = held.value.to_wire();
             let status = match send(
                 source,

@@ -395,10 +395,12 @@ impl Source {
 }
 
 impl Source {
-    /// Before this node tells the peer what it holds (its inventory, its answer to a head
-    /// probe): one flush, off the async worker, if a received entry committed without a flush
-    /// is waiting for one, so the acknowledgement never precedes the disk (ADR-038 FX-30,
-    /// ADR-028 R-6). Nothing pending costs nothing.
+    /// After this node has read what it will tell the peer it holds (its inventory, its answer
+    /// to a head probe) and before it says so: one flush, off the async worker, if a received
+    /// entry committed without a flush is waiting for one, so the acknowledgement never
+    /// precedes the disk (ADR-038 FX-30, ADR-028 R-6). Read first, then flush: a commit that
+    /// the read saw has raised the store's received epoch by the time the flush decides, under
+    /// the store's writer. Nothing pending costs nothing.
     pub(super) async fn flush_received_before_ack(&self) -> Result<()> {
         if !self.store.received_pending() {
             return Ok(());
@@ -412,7 +414,6 @@ impl Source {
     /// One bounded, charged scalar inventory. Every page rechecks current room access;
     /// the compact index is read without touching content bodies or walking the archive.
     pub(super) async fn inventory(&self, job: &Job) -> Result<Lookup<Vec<super::HeadHint>>> {
-        self.flush_received_before_ack().await?;
         let Some(charge) = job.reserve(
             crate::log::history::MAX_CONTEXT_AUTHORS * std::mem::size_of::<super::HeadHint>(),
         ) else {
@@ -441,10 +442,11 @@ impl Source {
             match page.value.next {
                 Some(next) if after.is_none_or(|previous| next > previous) => after = Some(next),
                 None => {
+                    self.flush_received_before_ack().await?;
                     return Ok(Lookup::Found(Held {
                         value: hints,
                         _charge: charge,
-                    }))
+                    }));
                 }
                 _ => return Err(Error::MalformedAtRest("inventory cursor did not advance")),
             }

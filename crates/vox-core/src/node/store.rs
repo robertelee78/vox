@@ -28,7 +28,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 
 use redb::{Database, ReadOnlyDatabase, ReadableDatabase, ReadableTable, TableDefinition};
 
@@ -213,19 +213,23 @@ pub struct StoreCounts {
     pub flushes: u64,
 }
 
-/// The store's running counts and its one pending fact: whether a received entry committed
-/// without a flush is still waiting for one (ADR-038 FX-30), kept as two epochs. Every
-/// Received commit takes the next `received` epoch before its transaction becomes visible, and
-/// every flushed commit records, after it is durable, the `received` epoch it read while it
-/// held redb's one writer; a flush covers exactly the Received commits before it in writer
-/// order. A pending flag stored after the commit was a lost wakeup (a responder saw the entry
-/// and no flag) and an older flush's `false` could overwrite a newer commit's `true`.
+/// The store's running counts, for `vox status`.
 #[derive(Default)]
 struct Counting {
     commits: AtomicU64,
     flushes: AtomicU64,
-    received: AtomicU64,
-    flushed: AtomicU64,
+}
+
+/// Whether a received entry committed without a flush is still waiting for one (ADR-038
+/// FX-30), as two epochs under the store's writer mutex: a Received commit raises `received`
+/// once its transaction has committed, and a flushed commit sets `flushed` to `received` once
+/// it is durable, both while the mutex is held, so a flush covers exactly the Received commits
+/// before it and no two callers flush one epoch. Pending = received > flushed. A reader of the
+/// epochs takes the mutex too, so it never runs between a commit and its mark.
+#[derive(Default)]
+struct Epochs {
+    received: u64,
+    flushed: u64,
 }
 
 /// What a [`Batch`] holds, which decides how it commits (ADR-038 FX-30). Only what a person
@@ -252,6 +256,10 @@ pub struct Store {
     db: RwLock<Backing>,
     path: PathBuf,
     counts: Counting,
+    /// The store's one writer (ADR-038 FX-30): every write transaction is begun, committed and
+    /// its epochs moved while this is held, so the commit's visibility and its mark are one
+    /// step to every other holder. redb admits one writer at a time anyway; this names it.
+    writer: Mutex<Epochs>,
     /// The profile directory's lock, when this store is a profile's (V210-100). Declared after
     /// `db` so it is released only after the database is closed: the store goes with its last
     /// handle, and the lock with it — never before, which let a vox waiting for the lock open a
@@ -313,6 +321,7 @@ impl Store {
             db: RwLock::new(Backing::Writable(db)),
             path: path.to_owned(),
             counts: Counting::default(),
+            writer: Mutex::new(Epochs::default()),
             _lock: None,
         };
         store.init_schema()?;
@@ -336,6 +345,7 @@ impl Store {
             db: RwLock::new(Backing::ReadOnly(db)),
             path: path.to_owned(),
             counts: Counting::default(),
+            writer: Mutex::new(Epochs::default()),
             _lock: None,
         };
         if store.schema_is_current()? {
@@ -366,6 +376,10 @@ impl Store {
     /// daemon (2026-10-21 00:15Z). A failed commit leaves a redb database usable, so there is
     /// nothing a reopen would mend that a fresh transaction does not.
     pub fn resave_room_after_write_failure(&self, channel: &Digest32) -> Result<()> {
+        // Keep one lock order for every writer, including `rewrite_fresh`: writer before db.
+        // Taking the read snapshot first would let a rewrite hold `writer` while waiting for
+        // this `db` read, and this recovery wait for `writer` in the other direction.
+        let mut epochs = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
         let backing = self.db.read().unwrap_or_else(PoisonError::into_inner);
         let Backing::Writable(db) = &*backing else {
             return Err(Error::Storage {
@@ -406,7 +420,7 @@ impl Store {
                     .map_err(storage("retry save room wrap"))?;
             }
         }
-        self.commit_flushed(txn, "retry commit room")
+        self.commit_flushed(txn, &mut epochs, "retry commit room")
     }
 
     /// Reopen a read-only store writable; a no-op for one that already is.
@@ -454,6 +468,10 @@ impl Store {
     /// The store is not writable, or the new file cannot be written or put in place. The old
     /// store is left open and unchanged in every case but a failed reopen after the rename.
     pub fn rewrite_fresh(&self) -> Result<()> {
+        // A write transaction can outlive the `db` guard that created it (`Cached` above).
+        // Serialize the complete snapshot and replacement with every such transaction, or one
+        // can commit to the old inode after the snapshot and disappear at the rename.
+        let mut epochs = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
         let mut backing = self.db.write().unwrap_or_else(PoisonError::into_inner);
         let Backing::Writable(old) = &*backing else {
             return Err(Error::Storage {
@@ -515,7 +533,13 @@ impl Store {
         // The store is open again before the directory's flush is reported, so a failed flush
         // leaves a usable store and says so, rather than being ignored (V210-55).
         *backing = Backing::Writable(open_database(&self.path).map_err(open_error)?);
-        super::paths::sync_dir(&self.path)
+        super::paths::sync_dir(&self.path)?;
+        // Only the installed, directory-durable replacement covers the pending epochs. A
+        // failed copy, rename, reopen or directory flush leaves the counters and epochs alone.
+        self.counts.commits.fetch_add(1, Ordering::Relaxed);
+        self.counts.flushes.fetch_add(1, Ordering::Relaxed);
+        epochs.flushed = epochs.received;
+        Ok(())
     }
 
     /// Begin a read transaction on whichever handle is open.
@@ -526,10 +550,14 @@ impl Store {
             .begin_read()
     }
 
-    /// Begin a write transaction — refused, writing nothing, while the store is read-only.
-    fn begin_write(&self) -> Result<Cached<redb::WriteTransaction>> {
+    /// Begin a write transaction, holding the store's writer — refused, writing nothing, while
+    /// the store is read-only.
+    fn begin_write(&self) -> Result<(MutexGuard<'_, Epochs>, Cached<redb::WriteTransaction>)> {
+        let epochs = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
         match &*self.db.read().unwrap_or_else(PoisonError::into_inner) {
-            Backing::Writable(db) => db.begin_write().map_err(storage("begin write")),
+            Backing::Writable(db) => {
+                Ok((epochs, db.begin_write().map_err(storage("begin write"))?))
+            }
             Backing::ReadOnly(_) | Backing::Closed => Err(Error::Storage {
                 op: "begin write",
                 detail: "the store is read-only until the identity is unlocked".into(),
@@ -549,7 +577,7 @@ impl Store {
         if self.schema_is_current()? {
             return Ok(());
         }
-        let txn = self.begin_write()?;
+        let (mut epochs, txn) = self.begin_write()?;
         {
             let mut meta = txn.open_table(META).map_err(storage("open meta"))?;
             // Ensure the other tables exist so readers never see "table missing".
@@ -583,7 +611,7 @@ impl Store {
                 }
             }
         }
-        self.commit_flushed(txn, "commit")
+        self.commit_flushed(txn, &mut epochs, "commit")
     }
 
     /// Whether every table exists and the stored schema is this build's — a store that needs
@@ -789,12 +817,12 @@ impl Store {
     /// Write a public metadata entry (its own durable transaction). Meta holds
     /// only public facts (schema version, identity fingerprint, creation time).
     pub fn put_meta(&self, name: &str, value: &[u8]) -> Result<()> {
-        let txn = self.begin_write()?;
+        let (mut epochs, txn) = self.begin_write()?;
         {
             let mut meta = txn.open_table(META).map_err(storage("open meta"))?;
             meta.insert(name, value).map_err(storage("write meta"))?;
         }
-        self.commit_flushed(txn, "commit")
+        self.commit_flushed(txn, &mut epochs, "commit")
     }
 
     /// Read a public metadata entry.
@@ -833,7 +861,7 @@ impl Store {
         name: &str,
         f: impl FnOnce(Option<&[u8]>) -> Result<(Vec<u8>, T)>,
     ) -> Result<T> {
-        let txn = self.begin_write()?;
+        let (mut epochs, txn) = self.begin_write()?;
         let out = {
             let mut meta = txn.open_table(META).map_err(storage("open meta"))?;
             let current = meta
@@ -845,7 +873,7 @@ impl Store {
                 .map_err(storage("write meta"))?;
             out
         };
-        self.commit_flushed(txn, "commit")?;
+        self.commit_flushed(txn, &mut epochs, "commit")?;
         Ok(out)
     }
 
@@ -855,66 +883,70 @@ impl Store {
     /// ruled set ([`Batch::received`]); a batch that says so and then queues something of the
     /// ruled set is flushed anyway ([`Batch::ruled`]) (ADR-038 FX-30).
     pub fn batch(&self) -> Result<Batch<'_>> {
-        let txn = self.begin_write()?;
+        let (epochs, txn) = self.begin_write()?;
         Ok(Batch {
             txn,
             store: self,
             class: Class::Unsaid,
+            epochs,
         })
     }
 
     /// One flushed, empty write transaction: it carries every commit made without a flush since
     /// the last one to disk (redb persists its pending `Durability::None` commits with the next
     /// `Immediate` one; measured 2026-10-21 on redb 4.3.0: 2,000 unflushed commits then one
-    /// flush, every row on disk after a SIGKILL; one flush 4 ms on the decider's Mac). It holds
-    /// redb's one writer for that long, so a post begun meanwhile waits in `begin_write` at
-    /// most one flush, as it waited behind any one commit before this, all of which flushed;
-    /// FX-17's bound is a hundred times that. Nothing to flush costs one `F_FULLFSYNC` all the
-    /// same, so callers ask [`Self::flush_if_received_pending`] (ADR-038 FX-30). A store that
-    /// is read-only or closed has nothing pending and flushes nothing.
+    /// flush, every row on disk after a SIGKILL). It holds redb's one writer for the whole disk
+    /// flush. No measured duration is a correctness bound: FX-31 moves flush latency off paths
+    /// that do not depend on it. Nothing to flush costs one `F_FULLFSYNC` all the same, so callers
+    /// ask [`Self::flush_if_received_pending`] (ADR-038 FX-30). A store that is read-only or
+    /// closed has nothing pending and flushes nothing.
     ///
     /// # Errors
     /// The transaction cannot be begun or committed.
     pub fn flush(&self) -> Result<()> {
+        let mut epochs = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
         let txn = match &*self.db.read().unwrap_or_else(PoisonError::into_inner) {
             Backing::Writable(db) => db.begin_write().map_err(storage("begin flush"))?,
             Backing::ReadOnly(_) | Backing::Closed => return Ok(()),
         };
-        self.commit_flushed(txn, "flush")
+        self.commit_flushed(txn, &mut epochs, "flush")
     }
 
-    /// Flush, if a received entry committed without a flush is still waiting for one: the
-    /// moment before this node tells a peer what it holds (its inventory, its answer to a head
-    /// probe), and the end of a sync round that received something (ADR-038 FX-30). One flush
-    /// per pending epoch: a caller that finds, once it holds redb's writer, that a flush since
-    /// its look covered every Received commit, gives the writer back and flushes nothing.
-    /// Returns whether it flushed.
+    /// Flush, if a received entry committed without a flush is still waiting for one: after
+    /// this node has read what it will tell a peer it holds (its inventory, its answer to a
+    /// head probe) and before it says so, and at the end of a sync round that received
+    /// something (ADR-038 FX-30). Decided and done under the store's writer: a Received commit
+    /// that was visible to the caller's read has raised `received` by then, and one flush
+    /// covers an epoch however many callers found it pending. Returns whether it flushed.
     ///
     /// # Errors
     /// As [`Self::flush`].
     pub fn flush_if_received_pending(&self) -> Result<bool> {
-        if !self.received_pending() {
+        let mut epochs = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        if epochs.received <= epochs.flushed {
             return Ok(false);
         }
         let txn = match &*self.db.read().unwrap_or_else(PoisonError::into_inner) {
             Backing::Writable(db) => db.begin_write().map_err(storage("begin flush"))?,
             Backing::ReadOnly(_) | Backing::Closed => return Ok(false),
         };
-        // Holding the writer: every Received commit so far has taken its epoch, and every
-        // flush so far has recorded what it covered.
-        if !self.received_pending() {
-            drop(txn);
-            return Ok(false);
-        }
-        self.commit_flushed(txn, "flush")?;
+        self.commit_flushed(txn, &mut epochs, "flush")?;
         Ok(true)
     }
 
-    /// Whether a received entry committed without a flush is still waiting for one: a Received
-    /// commit took an epoch no flush has covered.
+    /// Whether a received entry committed without a flush may be waiting for one: a look
+    /// without waiting, for the actor at a round's end. A writer busy at that moment counts as
+    /// pending; [`Self::flush_if_received_pending`] decides under the writer.
     #[must_use]
     pub fn received_pending(&self) -> bool {
-        self.counts.received.load(Ordering::Acquire) > self.counts.flushed.load(Ordering::Acquire)
+        match self.writer.try_lock() {
+            Ok(epochs) => epochs.received > epochs.flushed,
+            Err(std::sync::TryLockError::WouldBlock) => true,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                let epochs = poisoned.into_inner();
+                epochs.received > epochs.flushed
+            }
+        }
     }
 
     /// What this store has committed since it was opened (ADR-038 FX-30).
@@ -926,14 +958,18 @@ impl Store {
         }
     }
 
-    /// Commit a raw transaction flushed to disk, counted; it covers every Received commit
-    /// before it in writer order (`covered`, read while `txn` holds the writer).
-    fn commit_flushed(&self, txn: Cached<redb::WriteTransaction>, op: &'static str) -> Result<()> {
-        let covered = self.counts.received.load(Ordering::Acquire);
+    /// Commit a raw transaction flushed to disk, counted; under the writer it covers every
+    /// Received commit so far.
+    fn commit_flushed(
+        &self,
+        txn: Cached<redb::WriteTransaction>,
+        epochs: &mut Epochs,
+        op: &'static str,
+    ) -> Result<()> {
         txn.commit().map_err(storage(op))?;
         self.counts.commits.fetch_add(1, Ordering::Relaxed);
         self.counts.flushes.fetch_add(1, Ordering::Relaxed);
-        self.counts.flushed.fetch_max(covered, Ordering::AcqRel);
+        epochs.flushed = epochs.received;
         Ok(())
     }
 
@@ -1098,6 +1134,8 @@ pub struct Batch<'a> {
     txn: Cached<redb::WriteTransaction>,
     store: &'a Store,
     class: Class,
+    /// The store's writer, held from the batch's beginning to its commit's mark.
+    epochs: MutexGuard<'a, Epochs>,
 }
 
 impl Batch<'_> {
@@ -1366,25 +1404,24 @@ impl Batch<'_> {
             mut txn,
             store,
             class,
+            mut epochs,
         } = self;
         let flushed = matches!(class, Class::Unsaid | Class::Ruled);
         if !flushed {
             txn.set_durability(redb::Durability::None)
                 .map_err(storage("set durability"))?;
         }
-        // This transaction holds redb's one writer: a Received commit takes its epoch before it
-        // becomes visible, and a flushed commit reads the epoch it will cover before it is
-        // durable, so what a reader sees is always owed a flush, and a flush never covers a
-        // commit that came after it (see `Counting`).
-        if matches!(class, Class::Received) {
-            store.counts.received.fetch_add(1, Ordering::AcqRel);
-        }
-        let covered = store.counts.received.load(Ordering::Acquire);
+        // Under the store's writer: a Received commit that succeeded raises `received`, and a
+        // flushed commit that succeeded covers every Received commit so far, before any other
+        // holder can look (see `Epochs`). A commit that failed moves nothing.
         txn.commit().map_err(storage("commit"))?;
         store.counts.commits.fetch_add(1, Ordering::Relaxed);
+        if matches!(class, Class::Received) {
+            epochs.received += 1;
+        }
         if flushed {
             store.counts.flushes.fetch_add(1, Ordering::Relaxed);
-            store.counts.flushed.fetch_max(covered, Ordering::AcqRel);
+            epochs.flushed = epochs.received;
         }
         Ok(())
     }

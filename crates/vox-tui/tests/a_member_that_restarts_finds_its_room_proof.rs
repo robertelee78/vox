@@ -59,25 +59,30 @@
 //!
 //! - (e) **a member whose daemon crashes keeps what it was told it has** (ADR-038 FX-30, #1022).
 //!   Only what a person would lose is flushed to disk; derived sync state is not, and is rebuilt
-//!   after a crash. Staged with bob's post read under the key he released and a Session of alice's
-//!   opened through the shipped hook; three crashes, each a SIGKILL by PID (nothing is closed,
-//!   nothing is flushed on the way out): (1) alice posts [`CRASH_POSTS`] rows and her daemon is
-//!   killed the moment the last `vox room post` has returned; with bob's daemon frozen (nothing
-//!   can be fetched again) she comes back on her port: `vox room list` shows the room open, she
-//!   reads every kept row and bob's post (his key), `vox trust list` still names bob and carol
-//!   (consent), and `vox room sessions --json` lists the same Session. (2) alice posts once more
-//!   and the proof waits until her own row says it is held on bob's node (`vox room read --json`'s
-//!   `held`, ADR-028 R-6: bob's own word in a sync, which the design flushes before); bob's daemon
-//!   is killed; back on his port his room is open and he reads it. (3) carol, trusted before
-//!   alice's [`CRASH_BACKLOG`] posts, joins cold; once her read shows some of them and not all,
-//!   her daemon is frozen (SIGSTOP, `ps` state `T`), her data root copied, her daemon resumed and
-//!   killed; with alice frozen a daemon started from the copy on carol's port opens the room and
-//!   shows no row twice; alice resumed, within [`SYNCS_ON_WITHIN`] it shows every post exactly
-//!   once, the cursors and heads the copy lost rebuilt from her. A copy of a frozen process is a
-//!   crash image: redb advances its on-disk commit slot only on a flushed commit, so what was
-//!   committed without one is absent from the copy as it is after a power loss. Mutations: own
-//!   posts committed without a flush — (1) red, a post `vox room post` accepted is gone; the
-//!   flush before a node says what it holds removed — (2) red, bob's acknowledged row is gone.
+//!   after a crash. Each record of the ruled set is the last thing written before a SIGKILL by
+//!   PID (nothing is closed, nothing is flushed on the way out), so nothing flushed after it can
+//!   carry it, and after every restart the whole set staged so far is read back as a person
+//!   would: the room open in `vox room list`, the own rows, bob's post (read only under the key
+//!   he released), `vox trust list`, `vox room sessions --json`, and the room's
+//!   `received_key_generations` in `vox status --json`. Alice: (1) `vox trust add carol`, then
+//!   the kill; (2) her Session opened through the shipped hook and listed, then the kill; (3)
+//!   bob's first post read, bob's daemon frozen so nothing can be fetched again, then the kill;
+//!   (4) [`CRASH_POSTS`] own posts, then the kill. Bob: (5) alice posts once more and the proof
+//!   waits until her own row says it is held on his node (`vox room read --json`'s `held`,
+//!   ADR-028 R-6: bob's own word in a sync, which the design flushes before); his daemon is
+//!   killed; back on his port his room is open, he reads it, and his trust and alice's key are
+//!   there. Carol: (6) trusted before alice's [`CRASH_BACKLOG`] posts, she joins cold; once her
+//!   read shows some of them and not all and her store has flushed since the join, her daemon is
+//!   frozen (SIGSTOP, `ps` state `T`), her data root copied, her daemon resumed and killed; with
+//!   alice frozen a daemon started from the copy on carol's port opens the room, lists some of
+//!   the posts and not all (else the image was not mid-fetch: APPARATUS), none twice, alice's
+//!   trust and key; alice resumed, and before the proof's apparatus watchdog it shows every post
+//!   exactly once, the cursors and heads the copy lost rebuilt from her. A copy of a frozen process is a crash
+//!   image: redb advances its on-disk commit slot only on a flushed commit, so what was
+//!   committed without one is absent from the copy as it is after a power loss. Independent
+//!   mutations make the trust, Session, received key, own-entry and acknowledged-received-entry
+//!   durability promises red at (1), (2), (3), (4) and (5), respectively; each mutation changes
+//!   only the persistence path for the promise whose product assertion it must trip.
 
 #![cfg(unix)]
 
@@ -100,6 +105,10 @@ use std::time::{Duration, Instant};
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 const IDENTITY: &str = "an identity passphrase";
 const ROOMPASS: &str = "the room passphrase";
+/// A proof-process ceiling only. FX-30 gives eventual recovery no product deadline, so expiry
+/// is APPARATUS (no verdict), never a copied product timeout. Product timing claims below use
+/// their own named contracts instead.
+const APPARATUS_WATCHDOG: Duration = Duration::from_secs(120);
 /// How soon after the restarted node answers both sides must have each other's message.
 const WITHIN: Duration = Duration::from_secs(10);
 /// (d): rows alice posts before her data directory is copied, and after.
@@ -203,27 +212,37 @@ fn vox(dir: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String)
         let (ok, shown) = typed::keyring(&cmd);
         return (ok, shown.clone(), shown);
     }
-    let mut child = cmd.spawn().expect("spawn vox");
+    let mut child = cmd.spawn().expect("APPARATUS: cannot spawn vox");
     if let Some(text) = stdin {
         child
             .stdin
             .as_mut()
-            .expect("stdin")
+            .expect("APPARATUS: vox has no stdin pipe")
             .write_all(text.as_bytes())
-            .expect("write stdin");
+            .expect("APPARATUS: cannot write vox stdin");
         drop(child.stdin.take());
     }
     // Bounded: a node that stops answering must fail this proof by name, not hang it.
-    let deadline = Instant::now() + Duration::from_secs(120);
-    while child.try_wait().expect("try_wait").is_none() {
+    let deadline = Instant::now() + APPARATUS_WATCHDOG;
+    while child
+        .try_wait()
+        .expect("APPARATUS: cannot inspect vox process")
+        .is_none()
+    {
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            panic!("`vox {}` got no answer in 120 s", args.join(" "));
+            panic!(
+                "APPARATUS: `vox {}` outlived the proof-process watchdog {APPARATUS_WATCHDOG:?}; \
+                 no product verdict",
+                args.join(" ")
+            );
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    let out = child.wait_with_output().expect("wait");
+    let out = child
+        .wait_with_output()
+        .expect("APPARATUS: cannot collect vox output");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -249,8 +268,10 @@ fn daemon(
     listen: &str,
     env: &[(&str, String)],
 ) -> Daemon {
-    let out = std::fs::File::create(dir.join(format!("daemon-{tag}.out"))).unwrap();
-    let err = std::fs::File::create(dir.join(format!("daemon-{tag}.err"))).unwrap();
+    let out = std::fs::File::create(dir.join(format!("daemon-{tag}.out")))
+        .expect("APPARATUS: cannot create daemon stdout log");
+    let err = std::fs::File::create(dir.join(format!("daemon-{tag}.err")))
+        .expect("APPARATUS: cannot create daemon stderr log");
     let mut cmd = Command::new(VOX);
     cmd.args(["daemon", "--listen", listen])
         .env("VOX_DATA_DIR", dir)
@@ -262,12 +283,16 @@ fn daemon(
     for (k, v) in env {
         cmd.env(k, v);
     }
-    let mut child = cmd.spawn().expect("spawn vox daemon");
-    let mut pipe = child.stdin.take().expect("daemon stdin");
-    pipe.write_all(stdin_lines.as_bytes()).unwrap();
+    let mut child = cmd.spawn().expect("APPARATUS: cannot spawn vox daemon");
+    let mut pipe = child
+        .stdin
+        .take()
+        .expect("APPARATUS: daemon has no stdin pipe");
+    pipe.write_all(stdin_lines.as_bytes())
+        .expect("APPARATUS: cannot write daemon stdin");
     drop(pipe);
     let d = Daemon(child);
-    let deadline = Instant::now() + Duration::from_secs(90);
+    let deadline = Instant::now() + APPARATUS_WATCHDOG;
     loop {
         if vox(dir, &["room", "list"], None).0 {
             return d;
@@ -281,7 +306,8 @@ fn daemon(
         );
         assert!(
             Instant::now() < deadline,
-            "{tag}'s daemon never answered: {}",
+            "APPARATUS: {tag}'s daemon did not answer before {APPARATUS_WATCHDOG:?}; no product \
+             verdict: {}",
             std::fs::read_to_string(dir.join(format!("daemon-{tag}.err"))).unwrap_or_default()
         );
         std::thread::sleep(Duration::from_millis(200));
@@ -290,16 +316,16 @@ fn daemon(
 
 fn identity(tmp: &Path, name: &str) -> (PathBuf, String) {
     let dir = tmp.join(name);
-    std::fs::create_dir_all(dir.join("cfg")).unwrap();
+    std::fs::create_dir_all(dir.join("cfg")).expect("APPARATUS: cannot create profile directories");
     let (ok, out, err) = vox(&dir, &["id"], None);
-    assert!(ok, "vox id {name}: {err}");
+    assert!(ok, "PRODUCT: `vox id` for {name} failed: {err}");
     (dir, out.trim().to_owned())
 }
 
 /// The texts `vox room read` returns.
 fn read(dir: &Path, room: &str) -> Vec<String> {
     let (ok, out, err) = vox(dir, &["room", "read", room], None);
-    assert!(ok, "vox room read: {err}");
+    assert!(ok, "PRODUCT: `vox room read` failed: {err}");
     out.lines()
         .filter_map(|l| l.splitn(3, ' ').nth(2).map(str::to_owned))
         .collect()
@@ -311,12 +337,12 @@ fn count(texts: &[String], prefix: &str) -> usize {
 
 fn post(dir: &Path, room: &str, text: &str) {
     let (ok, _, err) = vox(dir, &["room", "post", room, text], None);
-    assert!(ok, "vox room post {text:?}: {err}");
+    assert!(ok, "PRODUCT: `vox room post` {text:?} failed: {err}");
 }
 
 fn trust(dir: &Path, fp: &str, name: &str) {
     let (ok, _, err) = vox(dir, &["trust", "add", fp, "--name", name], None);
-    assert!(ok, "vox trust add {name}: {err}");
+    assert!(ok, "PRODUCT: `vox trust add` {name} failed: {err}");
 }
 
 /// `creator` makes a room; returns its short id as `vox room list` prints it.
@@ -326,36 +352,40 @@ fn create(creator: &Path) -> String {
         &["room", "create", "--passphrase-file", "-", "--name", "r"],
         Some(&format!("{ROOMPASS}\n")),
     );
-    assert!(ok, "vox room create: {err}");
+    assert!(ok, "PRODUCT: `vox room create` failed: {err}");
     let (_, listed, _) = vox(creator, &["room", "list"], None);
     listed
         .split_whitespace()
         .next()
-        .expect("a room id")
+        .expect("PRODUCT: `vox room list` has no created room id")
         .to_owned()
 }
 
 fn join(creator: &Path, joiner: &Path, room: &str) {
     let (ok, link, err) = vox(creator, &["room", "link", room], None);
-    assert!(ok, "vox room link: {err}");
+    assert!(ok, "PRODUCT: `vox room link` failed: {err}");
     let (ok, _, err) = vox(
         joiner,
         &["room", "join", "--passphrase-file", "-", link.trim()],
         Some(&format!("{ROOMPASS}\n")),
     );
-    assert!(ok, "vox room join: {err}");
+    assert!(ok, "PRODUCT: `vox room join` failed: {err}");
 }
 
 /// `author` posts a probe until every one of `readers` shows one: from then on they read it.
 fn until_readable(author: &Path, readers: &[&Path], room: &str) {
-    let deadline = Instant::now() + Duration::from_secs(120);
+    let deadline = Instant::now() + APPARATUS_WATCHDOG;
     loop {
         post(author, room, "probe");
         std::thread::sleep(Duration::from_millis(500));
         if readers.iter().all(|r| count(&read(r, room), "probe") > 0) {
             return;
         }
-        assert!(Instant::now() < deadline, "a reader never read the author");
+        assert!(
+            Instant::now() < deadline,
+            "APPARATUS: initial readability was not staged before {APPARATUS_WATCHDOG:?}; no \
+             product verdict"
+        );
     }
 }
 
@@ -387,7 +417,7 @@ fn a_member_that_restarts_finds_its_room_again_without_an_anchor() {
     watchdog::arm();
     test_knobs::require(&["VOX_TEST_NO_NEARBY"]);
     let unheard = [("VOX_TEST_NO_NEARBY", "1".to_owned())];
-    let t = tempfile::tempdir().unwrap();
+    let t = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let (alice, alice_fp) = identity(t.path(), "alice");
     let (bob, bob_fp) = identity(t.path(), "bob");
     let mut alice_d = Some(daemon(
@@ -569,19 +599,26 @@ fn until_reads(reader: &Path, room: &str, text: &str, within: Duration) -> bool 
     false
 }
 
-/// Rows alice posts before her daemon is killed (e, 1).
+/// Rows alice posts before her daemon is killed (e, 4).
 const CRASH_POSTS: usize = 3;
-/// Alice's backlog that carol's daemon is fetching when its data root is copied (e, 3): under
+/// Alice's backlog that carol's daemon is fetching when its data root is copied (e, 6): under
 /// one `vox room read` page (64 rows), so a plain read sees it whole.
 const CRASH_BACKLOG: usize = 60;
-/// How long alice's row has to show as held on bob's node (e, 2): a sync round each way.
-const HELD_WITHIN: Duration = Duration::from_secs(90);
-/// Within this of carol's join her read MUST show some of the backlog and not all of it (e, 3):
-/// the moment her daemon is frozen mid-fetch. Apparatus: a fetch that was never caught under way
-/// gives a clean image, not a crash during a sync.
-const MID_FETCH_WITHIN: Duration = Duration::from_secs(60);
-/// Once the daemon started from the copy answers, how long it has to hold the whole backlog.
-const SYNCS_ON_WITHIN: Duration = Duration::from_secs(120);
+
+/// What a crashed member must still show of the ruled set, as staged so far (e).
+#[derive(Default, Clone)]
+struct Ruled {
+    /// Own posts `kept 1..=kept`.
+    kept: usize,
+    /// Bob's post, readable only under the sender key he released.
+    from_bob: bool,
+    /// Names `vox trust list` names.
+    trusted: Vec<&'static str>,
+    /// The Session ids `vox room sessions --json` lists.
+    sessions: Vec<String>,
+    /// `received_key_generations` of the room in `vox status --json`, when a key was staged.
+    keys: Option<u64>,
+}
 
 /// (e) — see the module doc.
 #[test]
@@ -616,99 +653,129 @@ fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
     join(&alice, &bob, &room);
     trust(&alice, &bob_fp, "bob");
     trust(&bob, &alice_fp, "alice");
-    // Carol is trusted before any of the backlog, so she reads all of it when she joins.
-    trust(&alice, &carol_fp, "carol");
-    trust(&carol, &alice_fp, "alice");
+    // Alice's probes reach bob; bob posts nothing yet, so his key reaches alice only in (3).
     until_readable(&alice, &[&bob], &room);
-    until_readable(&bob, &[&alice], &room);
-    // The rest of the ruled set, as a person sees it: a post of bob's, which alice reads only
-    // under the sender key he released to her; a Session of alice's, opened through the shipped
-    // hook, which `vox room sessions --json` lists.
-    post(&bob, &room, "from bob");
-    assert!(
-        until_reads(&alice, &room, "from bob", Duration::from_secs(60)),
-        "PRODUCT (staging): alice never read bob's post: she reads {:?}",
-        read(&alice, &room)
+    // Carol trusts alice now; alice's trust in carol is the record (1) stages last.
+    trust(&carol, &alice_fp, "alice");
+    let mut ruled = Ruled {
+        trusted: vec!["bob"],
+        ..Ruled::default()
+    };
+    // Each record of the ruled set is the last thing written before a SIGKILL of alice's
+    // daemon, so nothing flushed after it can carry it to disk; after every restart the whole
+    // set staged so far is read back.
+
+    // ---- (1) a trust decision, last ------------------------------------------------------------
+    trust(&alice, &carol_fp, "carol");
+    ruled.trusted.push("carol");
+    let alice_d = crash_and_restart(
+        alice_d,
+        &alice,
+        "alice-1",
+        &alice_at,
+        &unheard,
+        &room,
+        "`vox trust add carol` returned",
     );
+    ruled_set_intact(
+        &alice,
+        "alice-1",
+        &room,
+        &ruled,
+        "(1) a trust decision was the last write",
+    );
+
+    // ---- (2) a Session record, last ------------------------------------------------------------
     hook(&alice, &room, &work, "a word from alice");
     let listed_at = Instant::now();
-    let sessions_before = loop {
+    ruled.sessions = loop {
         let sessions = sessions_of(&alice, &room);
         if !sessions.is_empty() {
             break sessions;
         }
         assert!(
-            listed_at.elapsed() < Duration::from_secs(30),
-            "PRODUCT (staging): 30 s after the hook ran, `vox room sessions --json` lists no \
-             Session of alice's, so no Session record could be staged"
+            listed_at.elapsed() < APPARATUS_WATCHDOG,
+            "APPARATUS: before {APPARATUS_WATCHDOG:?}, `vox room sessions --json` listed no \
+             Session of alice's, so Session durability was not staged; no product verdict"
         );
         std::thread::sleep(Duration::from_millis(250));
     };
+    let alice_d = crash_and_restart(
+        alice_d,
+        &alice,
+        "alice-2",
+        &alice_at,
+        &unheard,
+        &room,
+        "her Session was listed",
+    );
+    ruled_set_intact(
+        &alice,
+        "alice-2",
+        &room,
+        &ruled,
+        "(2) a Session record was the last write",
+    );
 
-    // ---- (1) alice's own posts, her keys, consent and Session survive her daemon's SIGKILL ----
+    // ---- (3) a received key, last: bob's first post, read; bob frozen through the restart -----
+    post(&bob, &room, "from bob");
+    assert!(
+        until_reads(&alice, &room, "from bob", APPARATUS_WATCHDOG),
+        "APPARATUS: before {APPARATUS_WATCHDOG:?}, alice did not read bob's post, so received-key \
+         durability was not staged; no product verdict: she reads {:?}",
+        read(&alice, &room)
+    );
+    let keys = received_key_generations(&alice, &room);
+    assert!(
+        keys >= 1,
+        "PRODUCT (staging): alice reads bob's post yet `vox status --json` counts no received \
+         key generation for the room, so no key record could be staged"
+    );
+    ruled.from_bob = true;
+    ruled.keys = Some(keys);
+    let bob_pid = bob_d.0.id().to_string();
+    signal(&bob_pid, "STOP");
+    let alice_d = crash_and_restart(
+        alice_d,
+        &alice,
+        "alice-3",
+        &alice_at,
+        &unheard,
+        &room,
+        "she read bob's post; bob's daemon frozen",
+    );
+    ruled_set_intact(
+        &alice,
+        "alice-3",
+        &room,
+        &ruled,
+        "(3) a received key was the last write, bob frozen",
+    );
+    signal(&bob_pid, "CONT");
+
+    // ---- (4) own posts, last -------------------------------------------------------------------
     for i in 1..=CRASH_POSTS {
         post(&alice, &room, &format!("kept {i}"));
     }
-    drop(alice_d);
-    // Bob frozen: nothing alice shows after her restart can have been fetched from him again.
-    let bob_pid = bob_d.0.id().to_string();
-    signal(&bob_pid, "STOP");
-    println!(
-        "[proof] (1) alice's daemon killed the moment `vox room post kept {CRASH_POSTS}` returned; \
-         bob's daemon frozen ({})",
-        process_state(&bob_pid)
-    );
-    let alice_d = daemon(
+    ruled.kept = CRASH_POSTS;
+    let alice_d = crash_and_restart(
+        alice_d,
         &alice,
-        "alice-2",
-        &format!("{IDENTITY}\n{ROOMPASS}\n"),
+        "alice-4",
         &alice_at,
         &unheard,
+        &room,
+        "`vox room post kept 3` returned",
     );
-    assert!(
-        room_answers(&alice, &room, REOPENS_WITHIN),
-        "PRODUCT (staging): alice's room did not answer `vox room read` within {REOPENS_WITHIN:?} \
-         of her restart after a SIGKILL: {}\nher daemon said:\n{}",
-        vox(&alice, &["room", "read", &room], None).2,
-        daemon_said(&alice, "alice-2")
-    );
-    let listed = room_list_line(&alice, &room);
-    assert!(
-        !listed.contains("[preparing") && !listed.contains("closed"),
-        "PRODUCT: after a crash of the daemon the room is not open (ADR-038 FX-30, #1022): `vox \
-         room list` says {listed:?}"
-    );
-    let hers = read(&alice, &room);
-    assert!(
-        holds(&hers, "kept", CRASH_POSTS) == CRASH_POSTS,
-        "PRODUCT: a post `vox room post` had accepted was lost by a crash of the daemon (ADR-038 \
-         FX-30, #1022): alice posted kept 1..={CRASH_POSTS}, was killed, and reads {hers:?}"
-    );
-    assert!(
-        hers.iter().any(|t| t == "from bob"),
-        "PRODUCT: a key bob released to alice was lost by a crash of her daemon (ADR-038 FX-30, \
-         #1022): with bob's daemon frozen she reads {hers:?}, and not his post"
-    );
-    let (ok, trusted, err) = vox(&alice, &["trust", "list"], None);
-    assert!(
-        ok && trusted.contains("bob") && trusted.contains("carol"),
-        "PRODUCT: a trust decision was lost by a crash of the daemon (ADR-038 FX-30, #1022): \
-         `vox trust list` after the restart: {trusted}{err}"
-    );
-    let sessions_after = sessions_of(&alice, &room);
-    assert!(
-        sessions_after == sessions_before,
-        "PRODUCT: a Session record was lost by a crash of the daemon (ADR-038 FX-30, #1022): `vox \
-         room sessions --json` listed {sessions_before:?} before the crash and {sessions_after:?} \
-         after"
-    );
-    signal(&bob_pid, "CONT");
-    println!(
-        "[proof] (1) after the crash alice reads {hers:?}, trusts bob and carol, and lists her \
-         Session {sessions_after:?}"
+    ruled_set_intact(
+        &alice,
+        "alice-4",
+        &room,
+        &ruled,
+        "(4) own posts were the last write",
     );
 
-    // ---- (2) a post bob's node said it holds survives bob's SIGKILL ------------------------------
+    // ---- (5) a post bob's node said it holds, last before bob's SIGKILL ------------------------
     post(&alice, &room, "acked");
     let asked = Instant::now();
     let held_on_bob = loop {
@@ -716,43 +783,42 @@ fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
             Some((held, _)) if held >= 1 => break asked.elapsed(),
             seen => {
                 assert!(
-                    asked.elapsed() < HELD_WITHIN,
-                    "PRODUCT (staging): within {HELD_WITHIN:?} alice's own row never showed as held \
+                    asked.elapsed() < APPARATUS_WATCHDOG,
+                    "APPARATUS: before {APPARATUS_WATCHDOG:?}, alice's own row never showed as held \
                      on bob's node (`vox room read --json` held/others: {seen:?}; bob reads {:?}), \
-                     so bob's acknowledgement could not be staged\nalice's daemon said:\n{}\nbob's \
-                     daemon said:\n{}",
+                     so bob's acknowledgement could not be staged; no product verdict\nalice's \
+                     daemon said:\n{}\nbob's daemon said:\n{}",
                     read(&bob, &room),
-                    daemon_said(&alice, "alice-2"),
+                    daemon_said(&alice, "alice-4"),
                     daemon_said(&bob, "bob")
                 );
                 std::thread::sleep(Duration::from_millis(250));
             }
         }
     };
-    drop(bob_d);
-    println!(
-        "[proof] (2) alice's row showed as held on bob's node {held_on_bob:?} after the post; bob's \
-         daemon killed"
-    );
-    let _bob_d = daemon(
+    let bobs_keys = received_key_generations(&bob, &room);
+    let _bob_d = crash_and_restart(
+        bob_d,
         &bob,
         "bob-2",
-        &format!("{IDENTITY}\n{ROOMPASS}\n"),
         &bob_at,
         &unheard,
+        &room,
+        &format!("alice's row showed as held on his node, {held_on_bob:?} after her post"),
     );
-    assert!(
-        room_answers(&bob, &room, REOPENS_WITHIN),
-        "PRODUCT (staging): bob's room did not answer `vox room read` within {REOPENS_WITHIN:?} of \
-         his restart after a SIGKILL: {}\nhis daemon said:\n{}",
-        vox(&bob, &["room", "read", &room], None).2,
-        daemon_said(&bob, "bob-2")
-    );
-    let listed = room_list_line(&bob, &room);
-    assert!(
-        !listed.contains("[preparing") && !listed.contains("closed"),
-        "PRODUCT: after a crash of the daemon bob's room is not open (ADR-038 FX-30, #1022): `vox \
-         room list` says {listed:?}"
+    let bobs = Ruled {
+        kept: 0,
+        from_bob: true,
+        trusted: vec!["alice"],
+        sessions: Vec::new(),
+        keys: Some(bobs_keys),
+    };
+    ruled_set_intact(
+        &bob,
+        "bob-2",
+        &room,
+        &bobs,
+        "(5) an acknowledged received post was the last write",
     );
     let his = read(&bob, &room);
     assert!(
@@ -760,9 +826,9 @@ fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
         "PRODUCT: a post bob's node had acknowledged holding (alice's row showed held on 1 \
          node) was lost by a crash of his daemon (ADR-038 FX-30, #1022): bob reads {his:?}"
     );
-    println!("[proof] (2) after the crash bob reads the acknowledged post");
+    println!("[proof] (5) after the crash bob reads the acknowledged post");
 
-    // ---- (3) a data root copied mid-fetch reopens whole and syncs on ----------------------------
+    // ---- (6) a data root copied mid-fetch reopens whole and syncs on ----------------------------
     for i in 1..=CRASH_BACKLOG {
         post(&alice, &room, &format!("post {i}"));
     }
@@ -776,17 +842,23 @@ fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
     let carol_at = listening(&carol);
     join(&alice, &carol, &room);
     let joined = Instant::now();
-    // Caught under way: her read shows some of the backlog and not all of it.
-    let partial = loop {
+    // Counted once the join has returned: the join's own flushed commits are behind it, and
+    // what the fetch brings is flushed at the end of each round that received something.
+    let flushes_at_join = flushes_of(&carol);
+    // Caught under way, with part of it on disk: her read shows some of the backlog and not
+    // all, and her store has flushed since the join (a round that received something ended).
+    let (partial, flushed) = loop {
         let n = holds(&read(&carol, &room), "post", CRASH_BACKLOG);
-        if (1..CRASH_BACKLOG).contains(&n) {
-            break n;
+        let flushed = flushes_of(&carol);
+        if (1..CRASH_BACKLOG).contains(&n) && flushed > flushes_at_join {
+            break (n, flushed - flushes_at_join);
         }
         assert!(
-            joined.elapsed() < MID_FETCH_WITHIN,
-            "APPARATUS: staging not achieved: within {MID_FETCH_WITHIN:?} of her join carol's \
-             read never showed some but not all of the {CRASH_BACKLOG} posts (last {n}), so no \
-             copy could be taken mid-fetch"
+            joined.elapsed() < APPARATUS_WATCHDOG,
+            "APPARATUS: staging not achieved: before {APPARATUS_WATCHDOG:?} after her join carol's \
+             read never showed some but not all of the {CRASH_BACKLOG} posts with a flush since \
+             the join (last: {n} posts, {} flushes), so no copy could be taken mid-fetch",
+            flushed - flushes_at_join
         );
         std::thread::sleep(Duration::from_millis(100));
     };
@@ -802,8 +874,8 @@ fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
     signal(&pid, "CONT");
     drop(carol_d);
     println!(
-        "[proof] (3) carol's data root copied {:?} after her join with her daemon stopped ({state}) \
-         and {partial} of {CRASH_BACKLOG} posts read before the freeze",
+        "[proof] (6) carol's data root copied {:?} after her join with her daemon stopped ({state}), \
+         {partial} of {CRASH_BACKLOG} posts read and {flushed} flush(es) since the join",
         joined.elapsed()
     );
     // Alice frozen while the copy's daemon reads what it holds: no row or key can come from her.
@@ -819,31 +891,38 @@ fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
         &carol_at,
         &unheard,
     );
-    let opened = room_answers(&copy, &room, REOPENS_WITHIN);
-    let listed = if opened {
-        room_list_line(&copy, &room)
+    let opened = room_answers(&copy, &room, APPARATUS_WATCHDOG);
+    let (listed, at_reopen, copy_keys, copy_trusted) = if opened {
+        (
+            room_list_line(&copy, &room),
+            read(&copy, &room),
+            received_key_generations(&copy, &room),
+            vox(&copy, &["trust", "list"], None).1,
+        )
     } else {
-        String::new()
-    };
-    let at_reopen = if opened {
-        read(&copy, &room)
-    } else {
-        Vec::new()
+        (String::new(), Vec::new(), 0, String::new())
     };
     signal(&alice_pid, "CONT");
     assert!(
         opened,
-        "PRODUCT: the daemon started from a data root copied during a fetch did not open the \
-         room within {REOPENS_WITHIN:?} (ADR-038 FX-30, #1022): {}\nits daemon said:\n{}",
+        "APPARATUS: before {APPARATUS_WATCHDOG:?}, the daemon started from a data root copied \
+         during a fetch did not open the room, so the recovery assertion was not reached; no \
+         product verdict: {}\nits daemon said:\n{}",
         vox(&copy, &["room", "read", &room], None).2,
         daemon_said(&copy, tag)
     );
-    assert!(
-        !listed.contains("[preparing") && !listed.contains("closed"),
-        "PRODUCT: the room reopened from a copy taken during a fetch is not open (ADR-038 FX-30, \
-         #1022): `vox room list` says {listed:?}"
+    assert_open_line(
+        &listed,
+        &room,
+        "the room reopened from a copy taken during a fetch",
     );
     let held_at_reopen = holds(&at_reopen, "post", CRASH_BACKLOG);
+    assert!(
+        (1..CRASH_BACKLOG).contains(&held_at_reopen),
+        "APPARATUS: the image was not mid-fetch: reopened from the copy, the room lists \
+         {held_at_reopen} of {CRASH_BACKLOG} posts (some and not all were expected; {partial} were \
+         read before the freeze); it reads {at_reopen:?}"
+    );
     let twice = not_once_each(&at_reopen, "post", CRASH_BACKLOG)
         .into_iter()
         .filter(|(_, n)| *n > 1)
@@ -853,17 +932,28 @@ fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
         "PRODUCT: the room reopened from a copy taken during a fetch shows a row more than once \
          (ADR-038 FX-30, #1022): (post, times) {twice:?}; it reads {at_reopen:?}"
     );
+    assert!(
+        copy_trusted.contains("alice"),
+        "PRODUCT: a trust decision is missing from the room reopened from a copy (ADR-038 FX-30, \
+         #1022): `vox trust list` says {copy_trusted}"
+    );
+    assert!(
+        copy_keys >= 1,
+        "PRODUCT: the key alice released is missing from the room reopened from a copy (ADR-038 \
+         FX-30, #1022): with alice frozen it lists {held_at_reopen} of her posts and `vox status \
+         --json` counts {copy_keys} received key generations"
+    );
     let synced_on = Instant::now();
     assert!(
-        until_holds(&copy, &room, "post", CRASH_BACKLOG, SYNCS_ON_WITHIN),
-        "PRODUCT: the room reopened from a copy taken during a fetch did not sync on (ADR-038 \
-         FX-30, #1022): it held {held_at_reopen} of {CRASH_BACKLOG} posts at reopen and, \
-         {SYNCS_ON_WITHIN:?} later, {} of them; it reads {:?}\nits daemon said:\n{}\nalice's daemon \
-         said:\n{}",
+        until_holds(&copy, &room, "post", CRASH_BACKLOG, APPARATUS_WATCHDOG),
+        "APPARATUS: before {APPARATUS_WATCHDOG:?}, recovery had not reached the FX-30 assertion; \
+         no product verdict: the room reopened from a copy held {held_at_reopen} of \
+         {CRASH_BACKLOG} posts and now holds {}; it reads {:?}\nits daemon said:\n{}\nalice's \
+         daemon said:\n{}",
         holds(&read(&copy, &room), "post", CRASH_BACKLOG),
         read(&copy, &room),
         daemon_said(&copy, tag),
-        daemon_said(&alice, "alice-2")
+        daemon_said(&alice, "alice-4")
     );
     let whole = read(&copy, &room);
     let not_once = not_once_each(&whole, "post", CRASH_BACKLOG);
@@ -873,11 +963,100 @@ fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
          exactly once (ADR-038 FX-30, #1022): (post, times) {not_once:?}; it reads {whole:?}"
     );
     println!(
-        "[proof] (3) the copy held {held_at_reopen} of {CRASH_BACKLOG} posts at reopen, with alice \
-         frozen, and every one exactly once {:?} after she was resumed",
+        "[proof] (6) the copy held {held_at_reopen} of {CRASH_BACKLOG} posts, alice's key and the \
+         trust at reopen, with alice frozen, and every post exactly once {:?} after she was resumed",
         synced_on.elapsed()
     );
     drop(alice_d);
+}
+
+/// SIGKILL `d` by its PID the moment `what` happened, start the member again on `at`, and wait
+/// for its room to answer; the new daemon.
+fn crash_and_restart(
+    d: Daemon,
+    dir: &Path,
+    tag: &str,
+    at: &str,
+    env: &[(&str, String)],
+    room: &str,
+    what: &str,
+) -> Daemon {
+    drop(d);
+    println!("[proof] {tag}: the daemon killed the moment {what}");
+    let restarted = daemon(dir, tag, &format!("{IDENTITY}\n{ROOMPASS}\n"), at, env);
+    assert!(
+        room_answers(dir, room, APPARATUS_WATCHDOG),
+        "APPARATUS: before {APPARATUS_WATCHDOG:?}, {tag}'s room did not answer `vox room read` \
+         after a SIGKILL, so the durability assertion was not reached; no product verdict: \
+         {}\nits daemon said:\n{}",
+        vox(dir, &["room", "read", room], None).2,
+        daemon_said(dir, tag)
+    );
+    restarted
+}
+
+/// Everything of the ruled set staged so far, read back as a person would after the crash (e):
+/// the room open in `vox room list`, the own and received rows, the trust, the Session, the key.
+fn ruled_set_intact(dir: &Path, tag: &str, room: &str, ruled: &Ruled, when: &str) {
+    let listed = room_list_line(dir, room);
+    assert_open_line(&listed, room, &format!("{tag}, after the crash ({when})"));
+    let rows = read(dir, room);
+    assert!(
+        holds(&rows, "kept", ruled.kept) == ruled.kept,
+        "PRODUCT: a post `vox room post` had accepted was lost by a crash of the daemon (ADR-038 \
+         FX-30, #1022; {when}): {tag} should read kept 1..={} and reads {rows:?}",
+        ruled.kept
+    );
+    if ruled.from_bob {
+        assert!(
+            rows.iter().any(|t| t == "from bob"),
+            "PRODUCT: a received post, or the key it is read under, was lost by a crash of the \
+             daemon (ADR-038 FX-30, #1022; {when}): {tag} reads {rows:?}, and not bob's post"
+        );
+    }
+    let (ok, trusted, err) = vox(dir, &["trust", "list"], None);
+    for name in &ruled.trusted {
+        assert!(
+            ok && trusted.contains(name),
+            "PRODUCT: a trust decision was lost by a crash of the daemon (ADR-038 FX-30, #1022; \
+             {when}): `vox trust list` after {tag}'s restart does not name {name}: {trusted}{err}"
+        );
+    }
+    let sessions = sessions_of(dir, room);
+    assert!(
+        sessions == ruled.sessions,
+        "PRODUCT: a Session record was lost by a crash of the daemon (ADR-038 FX-30, #1022; \
+         {when}): `vox room sessions --json` listed {:?} before the crash and {sessions:?} after \
+         {tag}'s restart",
+        ruled.sessions
+    );
+    if let Some(keys) = ruled.keys {
+        let now = received_key_generations(dir, room);
+        assert!(
+            now == keys,
+            "PRODUCT: a received key was lost by a crash of the daemon (ADR-038 FX-30, #1022; \
+             {when}): `vox status --json` counted {keys} received key generation(s) for the room \
+             before the crash and {now} after {tag}'s restart"
+        );
+    }
+    println!(
+        "[proof] {tag}: after the crash ({when}) the room is open, it reads {rows:?}, trusts {:?}, \
+         lists Sessions {sessions:?} and holds {:?} received key generation(s)",
+        ruled.trusted, ruled.keys
+    );
+}
+
+/// `line`, the `vox room list` line for `room`, MUST be there and show the room open.
+fn assert_open_line(line: &str, room: &str, when: &str) {
+    assert!(
+        !line.is_empty(),
+        "PRODUCT: {when}: `vox room list` does not list the room {room} (ADR-038 FX-30, #1022)"
+    );
+    assert!(
+        !line.contains("[preparing") && !line.contains("closed"),
+        "PRODUCT: {when}: the room is not open (ADR-038 FX-30, #1022): `vox room list` says \
+         {line:?}"
+    );
 }
 
 /// `kill -<sig> <pid>`, or an APPARATUS red.
@@ -927,6 +1106,39 @@ fn sessions_of(dir: &Path, room: &str) -> Vec<String> {
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
         .filter_map(|v| v["id"].as_str().map(str::to_owned))
         .collect()
+}
+
+/// `vox status --json` of `dir`, parsed.
+fn status_json(dir: &Path) -> serde_json::Value {
+    let (ok, out, err) = vox(dir, &["status", "--json"], None);
+    assert!(ok, "PRODUCT: `vox status --json` failed: {err}");
+    serde_json::from_str(&out)
+        .unwrap_or_else(|e| panic!("PRODUCT: `vox status --json` is not JSON: {e}: {out}"))
+}
+
+/// How many other members' sender key generations `dir` holds for `room`, as `vox status --json`
+/// counts them (`rooms[].received_key_generations`): the key record as the product shows it.
+fn received_key_generations(dir: &Path, room: &str) -> u64 {
+    let v = status_json(dir);
+    v["rooms"]
+        .as_array()
+        .and_then(|rooms| {
+            rooms
+                .iter()
+                .find(|r| r["id"].as_str().is_some_and(|id| id.starts_with(room)))
+        })
+        .and_then(|r| r["received_key_generations"].as_u64())
+        .unwrap_or_else(|| panic!("PRODUCT: `vox status --json` does not count received key generations for the room {room}: {v}"))
+}
+
+/// How many commits `dir`'s store has flushed to disk since its daemon started (`store.flushes`).
+fn flushes_of(dir: &Path) -> u64 {
+    let v = status_json(dir);
+    v["store"]["flushes"].as_u64().unwrap_or_else(|| {
+        panic!(
+            "PRODUCT: `vox status --json` does not count the store's flushes (ADR-038 FX-30): {v}"
+        )
+    })
 }
 
 /// One run of the shipped harness hook (`vox agent hook`) for `dir`'s node in `room`, fed a
