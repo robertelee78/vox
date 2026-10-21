@@ -52,8 +52,9 @@ impl ChannelState {
 
     /// The admitted author's inventory lifetime, including a historical author who has left.
     /// Peers may still advertise that author's terminal head after the departure. The departure
-    /// itself clears prior refusals; if the same historical head is subsequently advertised, it
-    /// becomes one new exact decision scoped to the departed author's terminal position.
+    /// itself changes the incarnation that validates prior refusals; if the same historical head
+    /// is subsequently advertised, that indexed relationship is invalidated and becomes one new
+    /// exact decision scoped to the departed author's terminal position.
     pub(crate) fn history_author_inventory_incarnation(&self, author: &Digest32) -> Option<u64> {
         if !self.is_author(author) {
             return None;
@@ -105,8 +106,9 @@ impl ChannelState {
         Ok(true)
     }
 
-    /// A relevant advertised successor or an ended membership scope removes the durable
-    /// refusal. The in-memory inbox mirrors this same lifecycle.
+    /// A relevant advertised successor or changed membership incarnation removes the durable
+    /// refusal. The inbox holds only charged pending work; this indexed record is the sole
+    /// refusal state.
     pub(crate) fn forget_history_decline(
         &self,
         store: &Store,
@@ -121,19 +123,6 @@ impl ChannelState {
         self.history_write(store, |index| {
             index.forget_history_declined_head(peer, author)
         })
-    }
-
-    pub(crate) fn forget_history_declines_for_member(
-        &self,
-        store: &Store,
-        member: Digest32,
-    ) -> Result<()> {
-        let read = self.history_read(store)?;
-        if !read.history_declined_member_exists(member)? {
-            return Ok(());
-        }
-        drop(read);
-        self.history_write(store, |index| index.forget_history_declined_member(member))
     }
 
     pub(crate) fn uses_sparse_history(&self, store: &Store) -> Result<bool> {

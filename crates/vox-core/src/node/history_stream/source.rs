@@ -1,6 +1,9 @@
 //! Bounded disk reads used by one response. No pinned read or room lock crosses network I/O.
 
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use tokio::sync::Mutex;
 use tokio::time::Instant;
@@ -47,6 +50,7 @@ pub(super) struct Source {
     pub(super) deadline: Instant,
     // Only a server clone bound to Control/Head(peer) may return a departed peer receipt.
     own_head_receipt: bool,
+    work_committed: Arc<AtomicBool>,
 }
 
 impl Source {
@@ -67,7 +71,12 @@ impl Source {
             })
             .await?
         {
-            Lookup::Found(saved) => Ok(saved.value),
+            Lookup::Found(saved) => {
+                if saved.value {
+                    self.note_work_committed();
+                }
+                Ok(saved.value)
+            }
             Lookup::Busy | Lookup::Missing => {
                 Err(Error::Unreachable("history refusal was not persisted"))
             }
@@ -81,6 +90,7 @@ impl Source {
         peer: Digest32,
         fence: Arc<Fence>,
         deadline: Instant,
+        work_committed: Arc<AtomicBool>,
     ) -> Self {
         Self {
             room,
@@ -90,7 +100,14 @@ impl Source {
             fence,
             deadline,
             own_head_receipt: false,
+            work_committed,
         }
+    }
+
+    /// Record user-visible history work at the commit edge, independently of whether the
+    /// surrounding exchange is later cancelled, superseded, retired or rejected.
+    pub(super) fn note_work_committed(&self) {
+        self.work_committed.store(true, Ordering::Release);
     }
 
     pub(super) fn for_own_head_receipt(&self) -> Self {
@@ -209,7 +226,9 @@ impl Source {
                 return Err(Error::Unreachable("history room access changed"));
             }
             let value = read(&mut room, &source.store)?;
-            source.current()?;
+            // Do not turn a completed callback into cancellation after it may have committed.
+            // The actor validates the returned Flow against its current port/fence and accounts
+            // the shared commit edge before disposing a stale result.
             drop(scratch);
             Ok(match value {
                 Some(value) => Lookup::Found(Held {
@@ -225,7 +244,8 @@ impl Source {
         let result = task
             .await
             .map_err(|_| Error::Unreachable("history disk reader stopped"))?;
-        self.current()?;
+        // For the same reason, return the worker's exact outcome after join instead of replacing
+        // it with a later fence/deadline observation.
         result
     }
 
@@ -482,6 +502,7 @@ impl Source {
         let Some(input_charge) = job.reserve(64 * std::mem::size_of::<super::HeadHint>()) else {
             return Ok(super::hints::Offer {
                 added: 0,
+                rearmed: 0,
                 full: true,
             });
         };
@@ -491,7 +512,8 @@ impl Source {
         let output_envelope = 64
             * (std::mem::size_of::<super::HeadHint>()
                 + std::mem::size_of::<(Digest32, Digest32)>()
-                + std::mem::size_of::<Digest32>());
+                + std::mem::size_of::<Digest32>())
+            + std::mem::size_of::<usize>();
         let filtered = self
             .read(job, output_envelope, move |room, store| {
                 let _input_charge = input_charge;
@@ -500,7 +522,6 @@ impl Source {
                 }
                 let read = room.history_read(store)?;
                 let mut missing = Vec::with_capacity(slice.len());
-                let mut remembered = Vec::new();
                 let mut changed = Vec::new();
                 let mut mine: Option<u64> = None;
                 let own_contiguous = room.own_verified_head();
@@ -514,7 +535,10 @@ impl Source {
                         if declined == hint.head
                             && current == Some((peer_incarnation, author_incarnation))
                         {
-                            remembered.push((hint.author, hint.head));
+                            // The durable relationship is the source of truth. Do not mirror it
+                            // in an uncharged process-global vector: an unchanged inventory is
+                            // simply ineligible, including after reconnect and restart.
+                            continue;
                         } else {
                             changed.push(hint.author);
                         }
@@ -604,25 +628,27 @@ impl Source {
                 drop(read);
                 changed.sort_unstable();
                 changed.dedup();
+                let rearmed = changed.len();
                 for author in changed {
                     room.forget_history_decline(store, peer, author)?;
                 }
-                Ok(Some((missing, mine, remembered)))
+                Ok(Some((missing, mine, rearmed)))
             })
             .await?;
         match filtered {
             Lookup::Found(filtered) => {
-                self.current()?;
-                let (missing, mine, remembered) = filtered.value;
-                for (author, head) in remembered {
-                    inbox.decline(room_id, self.peer, author, head);
+                let (missing, mine, rearmed) = filtered.value;
+                if rearmed != 0 {
+                    self.note_work_committed();
                 }
                 let mut offer = inbox.offer(job, generation, room_id, self.peer, &missing)?;
                 offer.mine_held = mine;
+                offer.rearmed = rearmed;
                 Ok(offer)
             }
             Lookup::Busy | Lookup::Missing => Ok(super::hints::Offer {
                 added: 0,
+                rearmed: 0,
                 full: true,
             }),
         }

@@ -10673,10 +10673,12 @@ impl Node {
                                 counts
                                     .reasons
                                     .count(crate::node::status::RoundReason::Served);
+                                counts.served_completed += 1;
                                 // A served round that moved nothing is as empty as a fetched
                                 // one: in a quiet room both periodic directions are (FX-29).
                                 if !moved {
                                     counts.empty += 1;
+                                    counts.served_empty += 1;
                                 } else {
                                     counts.history_served += 1;
                                 }
@@ -20070,23 +20072,11 @@ impl Node {
                 .filter(|d| !seen.contains(*d))
                 .copied()
                 .collect();
-            // A refusal is scoped to real source/author membership, so a departure ends it.
-            // Clear it on this once-per-departure edge, not in the per-tick port retirement.
-            if let Some(store) = store.as_ref() {
-                for member in &newly {
-                    let cleared = ch.uses_sparse_history(store).and_then(|sparse| {
-                        if sparse {
-                            ch.forget_history_declines_for_member(store, *member)
-                        } else {
-                            Ok(())
-                        }
-                    });
-                    if let Err(error) = cleared {
-                        ch.poison(&error);
-                        break;
-                    }
-                }
-            }
+            // Durable refusals are scoped by the source and author's signed membership
+            // incarnations. They are invalidated lazily, one indexed relationship at a time,
+            // when that source next advertises it. A restart therefore cannot mistake all
+            // historical departures for new ones and erase otherwise-current decisions, and
+            // lifecycle tending never scans a room-wide refusal table.
             let ended_here = ch.ended(now_ms).is_some();
             *seen = departed.iter().copied().collect();
             for b in back {

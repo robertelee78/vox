@@ -141,9 +141,16 @@ pub(crate) struct Flow {
     /// a body chunk, a hint it did not have): a completed flow that brought nothing is an
     /// `empty` round in `vox status --json` (ADR-038 FX-29).
     pub(crate) brought: bool,
+    /// Set at the durable/user-visible work edge and drained by the actor before it classifies
+    /// the worker result. This survives any later cancellation, error or supersession.
+    pub(crate) work_committed: Arc<std::sync::atomic::AtomicBool>,
     /// Exact unavailable advertised heads declined during this retained flow. The actor reports
     /// the outcome through the lane in `vox status --json`.
     pub(crate) declined: u64,
+    /// Newly eligible scalar hints and durable refusal relationships invalidated this turn.
+    /// The actor publishes them even if the enclosing attempt is later retired or stale.
+    pub(crate) offered: u64,
+    pub(crate) rearmed: u64,
     pub(crate) admitted_authors: usize,
     pub(crate) external: Option<(Digest32, u64)>,
     pub(crate) archive_status: Option<crate::node::api::HistoryDemandStatus>,
@@ -290,7 +297,10 @@ impl Flow {
             rendered: false,
             governance: false,
             brought: false,
+            work_committed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             declined: 0,
+            offered: 0,
+            rearmed: 0,
             admitted_authors: 0,
             external: None,
             archive_status: None,
@@ -406,7 +416,10 @@ impl Flow {
             rendered: false,
             governance: false,
             brought: false,
+            work_committed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             declined: 0,
+            offered: 0,
+            rearmed: 0,
             admitted_authors: 0,
             external: None,
             archive_status: None,
@@ -586,7 +599,7 @@ impl Flow {
         head: Digest32,
     ) -> Result<()> {
         let remembered = source.remember_decline(job, author, head).await?;
-        inbox.decline(self.room, source.peer, author, head);
+        inbox.finish(self.room, source.peer, author, head);
         self.declined = self.declined.saturating_add(u64::from(remembered));
         Ok(())
     }
@@ -785,6 +798,7 @@ impl Flow {
             purpose == Purpose::History,
             fence,
             deadline,
+            Arc::clone(&self.work_committed),
         )
     }
     fn binding(&self) -> Binding {
@@ -889,6 +903,7 @@ impl Flow {
             self.peer,
             fence.clone(),
             deadline,
+            Arc::clone(&self.work_committed),
         );
         if !self.initialized {
             let room = self.room;
@@ -1361,7 +1376,12 @@ impl Flow {
                 )
                 .await?;
                 self.body_progress |= result.body_progress;
-                self.brought |= result.brought || result.body_progress;
+                let brought_now = result.brought || result.body_progress;
+                self.brought |= brought_now;
+                if brought_now {
+                    self.work_committed
+                        .store(true, std::sync::atomic::Ordering::Release);
+                }
                 if self.route_origin.is_some()
                     && !matches!(result.status, Status::Busy | Status::EvidenceUnavailable)
                 {
@@ -1422,7 +1442,14 @@ impl Flow {
                         let offered = source
                             .offer_inventory(job, inbox, inbox_generation, self.room, page)
                             .await?;
-                        self.brought |= offered.added != 0;
+                        self.offered = self.offered.saturating_add(offered.added as u64);
+                        self.rearmed = self.rearmed.saturating_add(offered.rearmed as u64);
+                        let added = offered.added != 0;
+                        self.brought |= added;
+                        if added {
+                            self.work_committed
+                                .store(true, std::sync::atomic::Ordering::Release);
+                        }
                     }
                 }
                 if result.status == Status::BodyNotHeld && task.purpose == Purpose::Live {

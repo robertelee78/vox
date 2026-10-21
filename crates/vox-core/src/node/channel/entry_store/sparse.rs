@@ -733,33 +733,6 @@ impl Read<'_> {
         Ok(Some((head, peer_incarnation, author_incarnation)))
     }
 
-    pub(crate) fn history_declined_member_exists(&self, member: Digest32) -> Result<bool> {
-        let mut after = None;
-        loop {
-            let seek = match after {
-                Some(key) => match dag_facts::successor(key) {
-                    Some(next) => next,
-                    None => return Ok(false),
-                },
-                None => [0; 64],
-            };
-            let Some((key, _)) = self.source().first(
-                self.sek,
-                self.channel,
-                self.directory.active.sparse.declined_heads,
-                &seek,
-                0,
-            )?
-            else {
-                return Ok(false);
-            };
-            after = Some(key);
-            if key[..32] == member || key[32..] == member {
-                return Ok(true);
-            }
-        }
-    }
-
     pub(crate) fn history_settled_tip(&self, author: &Digest32) -> Result<Option<Entry>> {
         let source = self.source();
         let Some(id) = source.number(
@@ -1174,38 +1147,6 @@ impl Write<'_, '_> {
         let key = declined_head_key(&peer, &author);
         let root = self.directory.active.sparse.declined_heads;
         if let Some(id) = Source::Batch(self.batch).number(self.sek, self.channel, root, &key)? {
-            self.retire(id)?;
-            self.directory.active.sparse.declined_heads = self.change_value(root, key, None)?;
-        }
-        Ok(())
-    }
-
-    /// Remove every decision whose source or author membership scope ended. The tree contains
-    /// only one row per live relationship, so this is bounded by actual inventory, not a cap.
-    pub(crate) fn forget_history_declined_member(&mut self, member: Digest32) -> Result<()> {
-        self.require_sparse_idle()?;
-        let mut after = None;
-        loop {
-            let seek = match after {
-                Some(key) => match dag_facts::successor(key) {
-                    Some(next) => next,
-                    None => break,
-                },
-                None => [0; 64],
-            };
-            let root = self.directory.active.sparse.declined_heads;
-            let Some((key, value)) =
-                Source::Batch(self.batch).first(self.sek, self.channel, root, &seek, 0)?
-            else {
-                break;
-            };
-            after = Some(key);
-            if key[..32] != member && key[32..] != member {
-                continue;
-            }
-            let Value::Number(id) = value else {
-                return Err(invalid("declined history head locator"));
-            };
             self.retire(id)?;
             self.directory.active.sparse.declined_heads = self.change_value(root, key, None)?;
         }

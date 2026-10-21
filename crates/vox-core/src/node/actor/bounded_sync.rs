@@ -1460,13 +1460,11 @@ impl Node {
             if self.ports.contains_key(&(room, peer)) {
                 self.drop_port(&room, &peer);
             }
-            self.history_hints.forget_member(room, peer);
             return;
         }
 
         self.bounded_sync.retire_port(room, peer);
         self.history_hints.retire_port(room, peer);
-        self.history_hints.forget_member(room, peer);
         let mut retired = Vec::new();
         if let Some(port) = self.ports.get_mut(&(room, peer)) {
             if let Some(attempt) = port.out.take() {
@@ -1566,6 +1564,30 @@ impl Node {
             let mut flow = flow;
             if let Some(panic) = returned.panic.take() {
                 returned.error = Some(format!("bounded history worker panicked: {panic}"));
+            }
+            // These facts were committed by the worker before it returned. Account for them
+            // before deciding whether its attempt is still current: cancellation, retirement,
+            // an error after the store callback, or a newer scalar head must not turn durable
+            // work into a false zero in the user-visible lane.
+            let fetched = u64::from(
+                flow.work_committed
+                    .swap(false, std::sync::atomic::Ordering::AcqRel),
+            );
+            let declined = std::mem::take(&mut flow.declined);
+            let offered = std::mem::take(&mut flow.offered);
+            let rearmed = std::mem::take(&mut flow.rearmed);
+            if fetched != 0 || declined != 0 || offered != 0 || rearmed != 0 {
+                crate::node::status::SyncBook::with(
+                    &self.sync_book,
+                    work.room,
+                    work.peer,
+                    |counts| {
+                        counts.history_fetched = counts.history_fetched.saturating_add(fetched);
+                        counts.history_declined = counts.history_declined.saturating_add(declined);
+                        counts.history_offered = counts.history_offered.saturating_add(offered);
+                        counts.history_rearmed = counts.history_rearmed.saturating_add(rearmed);
+                    },
+                );
             }
             let current = self
                 .ports
@@ -1791,7 +1813,6 @@ impl Node {
                     port.clear_backoff();
                 }
                 let reason = flow.reason;
-                let declined = std::mem::take(&mut flow.declined);
                 crate::node::status::SyncBook::with(
                     &self.sync_book,
                     work.room,
@@ -1799,15 +1820,14 @@ impl Node {
                     |counts| {
                         counts.completed += 1;
                         counts.reasons.count(reason);
+                        counts.fetched_completed += 1;
                         // Returning one dependency turn to its advertising source is a lane
                         // completion too. If the whole retained flow has brought nothing, this
                         // completion is empty by the same user-visible accounting rule.
                         if !flow.brought {
                             counts.empty += 1;
-                        } else {
-                            counts.history_fetched += 1;
+                            counts.fetched_empty += 1;
                         }
-                        counts.history_declined = counts.history_declined.saturating_add(declined);
                         counts.backoff = None;
                     },
                 );
@@ -1977,7 +1997,6 @@ impl Node {
                 // quiet room every round is, and a person sees a re-pull as `completed`
                 // climbing faster than `empty` (ADR-038 FX-29).
                 let brought = flow.brought;
-                let declined = flow.declined;
                 crate::node::status::SyncBook::with(
                     &self.sync_book,
                     work.room,
@@ -1985,12 +2004,11 @@ impl Node {
                     |counts| {
                         counts.completed += 1;
                         counts.reasons.count(reason);
+                        counts.fetched_completed += 1;
                         if !brought {
                             counts.empty += 1;
-                        } else {
-                            counts.history_fetched += 1;
+                            counts.fetched_empty += 1;
                         }
-                        counts.history_declined = counts.history_declined.saturating_add(declined);
                     },
                 );
                 // A round the lane completed is a completed sync for `vox status` (PRD-001

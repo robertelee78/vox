@@ -17,24 +17,12 @@ struct Pending {
     hint: HeadHint,
     in_flight: bool,
 }
-/// A hint a peer answered for already: it said it does not hold the missing bodies of this
-/// author's newest window (ADR-038 FX-29). The peer is not asked for that hint again until its
-/// inventory names another head for the author. The durable room record reconstructs this
-/// process-local index after a restart before the same inventory can be offered.
-#[derive(Clone, Copy)]
-struct Declined {
-    room: Digest32,
-    peer: Digest32,
-    author: Digest32,
-    head: Digest32,
-}
 #[derive(Default)]
 struct State {
     /// Retirement belongs to one room/peer lane. A stopped room or peer must not invalidate an
     /// unrelated worker that happened to read inventory concurrently.
     generations: BTreeMap<(Digest32, Digest32), u64>,
     pending: Vec<Pending>,
-    declined: Vec<Declined>,
 }
 #[derive(Default)]
 pub(crate) struct HintInbox(Mutex<State>);
@@ -42,6 +30,8 @@ pub(crate) struct HintInbox(Mutex<State>);
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Offer {
     pub(crate) added: usize,
+    /// Durable exact refusal relationships invalidated before these hints became eligible.
+    pub(crate) rearmed: usize,
     pub(crate) full: bool,
 }
 
@@ -74,20 +64,6 @@ impl HintInbox {
         }
         let mut outcome = Offer::default();
         for hint in hints {
-            // The peer's inventory names the head it declined to fill: not asked again. A
-            // different head for the author is a changed inventory, so the record goes and the
-            // hint is offered (ADR-038 FX-29).
-            let same_declined = |declined: &Declined| {
-                declined.room == room && declined.peer == peer && declined.author == hint.author
-            };
-            if state
-                .declined
-                .iter()
-                .any(|declined| same_declined(declined) && declined.head == hint.head)
-            {
-                continue;
-            }
-            state.declined.retain(|declined| !same_declined(declined));
             if state.pending.iter().any(|p| {
                 p.room == room
                     && p.peer == peer
@@ -239,28 +215,6 @@ impl HintInbox {
             pending.in_flight = false;
         }
     }
-    /// The peer said it does not hold the missing bodies this hint's newest window asked it for
-    /// (`BodyNotHeld` to a live retry). Its inventory's same head is not offered again until it
-    /// names another head for the author (ADR-038 FX-29): before this, an author whose missing
-    /// bodies no peer held any more was pulled again from every peer every period.
-    pub(crate) fn decline(&self, room: Digest32, peer: Digest32, author: Digest32, head: Digest32) {
-        let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(declined) = state.declined.iter_mut().find(|declined| {
-            declined.room == room && declined.peer == peer && declined.author == author
-        }) {
-            // An inventory has one scalar head per author. Replace that decision when the
-            // source names a successor instead of accumulating a log or forgetting an older
-            // source merely because unrelated rooms crossed an arbitrary global count.
-            declined.head = head;
-            return;
-        }
-        state.declined.push(Declined {
-            room,
-            peer,
-            author,
-            head,
-        });
-    }
     /// Retire work bound to a port incarnation. Refusals describe the member's advertised
     /// inventory, not its socket or port: an ordinary reconnect does not make the bodies exist.
     pub(crate) fn retire_port(&self, room: Digest32, peer: Digest32) {
@@ -270,17 +224,6 @@ impl HintInbox {
         *generation = generation.saturating_add(1);
         state.pending.retain(|p| p.room != room || p.peer != peer);
         Self::release_empty(&mut state);
-    }
-    /// Forget decisions whose real inventory lifetime ended because this room member departed.
-    /// The member may have been the source asked or the author whose scalar head was relayed.
-    pub(crate) fn forget_member(&self, room: Digest32, member: Digest32) {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .declined
-            .retain(|declined| {
-                declined.room != room || (declined.peer != member && declined.author != member)
-            });
     }
     pub(crate) fn retire_room(&self, room: Digest32) {
         let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
@@ -293,7 +236,6 @@ impl HintInbox {
             }
         }
         state.pending.retain(|p| p.room != room);
-        state.declined.retain(|declined| declined.room != room);
         Self::release_empty(&mut state);
     }
     pub(crate) fn clear(&self) {
@@ -304,7 +246,6 @@ impl HintInbox {
             *generation = generation.saturating_add(1);
         }
         state.pending = Vec::new();
-        state.declined = Vec::new();
     }
     fn release_empty(state: &mut State) {
         if state.pending.is_empty() {

@@ -114,9 +114,10 @@ impl Receiver {
         historical: bool,
         fence: Arc<crate::transport::stream_transport::Fence>,
         deadline: tokio::time::Instant,
+        work_committed: Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         Self {
-            source: Source::new(room, store, epoch, peer, fence, deadline),
+            source: Source::new(room, store, epoch, peer, fence, deadline, work_committed),
             generation,
             node,
             staging,
@@ -198,7 +199,10 @@ impl Receiver {
             .await?;
         Ok(match staged {
             Lookup::Found(staged) => match staged.value {
-                Staged::Verifier(binding) => LocalProof::Verified(binding),
+                Staged::Verifier(binding) => {
+                    self.source.note_work_committed();
+                    LocalProof::Verified(binding)
+                }
                 Staged::Busy => LocalProof::Busy,
                 _ => {
                     return Err(Error::MalformedAtRest(
@@ -354,6 +358,16 @@ impl Receiver {
                         result.status = Status::Busy;
                         return Ok(result);
                     };
+                    let committed = match &staged.value {
+                        Staged::Object { brought }
+                        | Staged::Head { brought, .. }
+                        | Staged::Header { brought, .. } => *brought,
+                        Staged::Verifier(_) => true,
+                        Staged::Busy => false,
+                    };
+                    if committed {
+                        self.source.note_work_committed();
+                    }
                     match &staged.value {
                         Staged::Object { brought } => result.brought |= *brought,
                         Staged::Busy => {
@@ -567,7 +581,6 @@ impl Receiver {
                             snapshot.state().body.as_ref().is_some_and(|body| {
                                 body.entry == exact && body.offset == body.length
                             });
-                        current(&fence, deadline)?;
                         Ok((persisted, complete))
                     })
                     .await
@@ -579,6 +592,7 @@ impl Receiver {
                     if complete && unexpected_body == Some(entry) {
                         self.hold_unexpected_body_durable(&entry).await?;
                     }
+                    self.source.note_work_committed();
                     // Durable nonempty chunk progress remains progress even if later metadata
                     // or ACK allocation is Busy within this same bounded response.
                     result.body_progress = true;
@@ -689,13 +703,22 @@ impl Receiver {
         let Some(work_job) = job.record_job(12 * 1024 * 1024).await else {
             return Ok(Lookup::Busy);
         };
-        self.read(&work_job, VERIFY_ENVELOPE, move |room, store| {
-            if room.channel_id() != binding.room {
-                return Err(Error::Profile("history verifier room changed"));
-            }
-            admission::advance(room, store, &binding).map(Some)
-        })
-        .await
+        let advanced = self
+            .read(&work_job, VERIFY_ENVELOPE, move |room, store| {
+                if room.channel_id() != binding.room {
+                    return Err(Error::Profile("history verifier room changed"));
+                }
+                admission::advance(room, store, &binding).map(Some)
+            })
+            .await?;
+        if matches!(
+            &advanced,
+            Lookup::Found(found)
+                if matches!(found.value, Advanced::Progress | Advanced::Need(_) | Advanced::Complete)
+        ) {
+            self.source.note_work_committed();
+        }
+        Ok(advanced)
     }
 }
 

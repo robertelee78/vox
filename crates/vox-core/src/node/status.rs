@@ -1203,8 +1203,17 @@ pub struct PortCounters {
     /// a quiet room every round is one; a lane whose `completed` climbs faster than its
     /// `empty` is pulling or serving something.
     pub empty: u64,
-    /// Completed bounded-history rounds that fetched at least one object this node did not
-    /// already hold. Kept separately so status says which side moved history.
+    /// Completed outbound bounded-history rounds on which this node was the requester.
+    pub fetched_completed: u64,
+    /// Completed outbound bounded-history rounds that fetched nothing.
+    pub fetched_empty: u64,
+    /// Completed inbound bounded-history rounds on which this node was the server.
+    pub served_completed: u64,
+    /// Completed inbound bounded-history rounds that served nothing and accepted no new hint.
+    pub served_empty: u64,
+    /// Worker turns that committed or accepted at least one history item this node did not
+    /// already hold. Counted at the commit edge even if the enclosing attempt is later stale,
+    /// cancelled, superseded or failed, so zero means no durable fetched-side work occurred.
     pub history_fetched: u64,
     /// Completed bounded-history rounds in which this node served at least one object or newly
     /// accepted a peer inventory hint.
@@ -1212,6 +1221,10 @@ pub struct PortCounters {
     /// New exact advertised-head decisions durably remembered after this peer could not serve
     /// an unavailable newest body. Repeating an unchanged standing refusal does not increment it.
     pub history_declined: u64,
+    /// Scalar history hints this lane accepted as newly eligible work.
+    pub history_offered: u64,
+    /// Exact durable refusal relationships invalidated by changed relevant inventory.
+    pub history_rearmed: u64,
     /// Sessions that ended without error but left requested entries unreceived (a bounded serve).
     pub partial: u64,
     /// Sessions that failed.
@@ -1656,8 +1669,10 @@ impl SyncBook {
             let _ = write!(
                 s,
                 "{{\"room\":\"{}\",\"peer\":\"{}\",\"opened\":{},\"admitted\":{},\"busy_refused\":{},\
-                 \"completed\":{},\"reasons\":{},\"empty\":{},\"history_fetched\":{},\"history_served\":{},\
-                 \"history_declined\":{},\"partial\":{},\"failed\":{},\"last_failure\":{},\
+                 \"completed\":{},\"reasons\":{},\"empty\":{},\"fetched_completed\":{},\"fetched_empty\":{},\
+                 \"served_completed\":{},\"served_empty\":{},\"history_fetched\":{},\"history_served\":{},\
+                 \"history_declined\":{},\"history_offered\":{},\"history_rearmed\":{},\
+                 \"partial\":{},\"failed\":{},\"last_failure\":{},\
                  \"stale\":{},\"refused\":{},\"skipped_at_cap\":{},\"queued\":{},\"backoff\":{},\
                  \"running\":[{}]}}",
                 b32_encode(room),
@@ -1668,9 +1683,15 @@ impl SyncBook {
                 c.completed,
                 c.reasons.json(),
                 c.empty,
+                c.fetched_completed,
+                c.fetched_empty,
+                c.served_completed,
+                c.served_empty,
                 c.history_fetched,
                 c.history_served,
                 c.history_declined,
+                c.history_offered,
+                c.history_rearmed,
                 c.partial,
                 c.failed,
                 c.last_failure

@@ -113,7 +113,15 @@ pub(crate) async fn serve(
     departure_receipt: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> (Result<Status>, bool, bool) {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-    let source = source::Source::new(room, store, preamble.epoch, peer, fence.clone(), deadline);
+    let source = source::Source::new(
+        room,
+        store,
+        preamble.epoch,
+        peer,
+        fence.clone(),
+        deadline,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    );
     let mut io = transport::Transport::new(send, recv, job, fence, deadline);
     let generation = inbox.generation(preamble.room, peer);
     let mut inventory_added = false;
