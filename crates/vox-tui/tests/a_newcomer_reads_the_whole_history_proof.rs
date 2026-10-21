@@ -81,6 +81,7 @@ mod optional_proof;
 optional_proof::not_run!(
     a_newcomer_trusted_before_every_post_reads_all_of_them,
     a_newcomer_talks_both_ways_at_one_wait_fresh_or_behind_a_backlog,
+    a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once,
 );
 
 #[path = "support/test_knobs.rs"]
@@ -350,89 +351,202 @@ fn held(dir: &Path, room: &str, page: usize) -> Held {
     }
 }
 
-/// Every text a person reads, oldest first, in one exact JSON read. This journey's staged rows
-/// fit below the product's 128-row live window; reaching the limit is an apparatus fault because
-/// it would turn the claimed one read into a paged history request. A malformed row or a refused
-/// read is a product red because both are what the shipped command returned.
-fn room_texts(dir: &Path, room: &str) -> Vec<String> {
-    const LIMIT: usize = 128;
-    let limit = LIMIT.to_string();
-    let (ok, out, err) = vox(
-        dir,
-        &["room", "read", room, "--json", "--limit", &limit],
-        None,
-    );
-    assert!(
-        ok,
-        "PRODUCT: `vox room read --json --limit {LIMIT}` refused: {out}{err}"
-    );
-    let rows: Vec<serde_json::Value> = out
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| {
-            serde_json::from_str(line).unwrap_or_else(|error| {
+/// Every row a person reads, oldest first, in one exact paged JSON observation. A malformed row
+/// or a refused read is a product red because both are what the shipped command returned.
+fn room_rows(dir: &Path, room: &str) -> Vec<serde_json::Value> {
+    let limit = PAGE.to_string();
+    let mut before: Option<String> = None;
+    let mut pages_newest_first = Vec::new();
+    loop {
+        let mut args = vec!["room", "read", room, "--json", "--limit", &limit];
+        if let Some(cursor) = before.as_deref() {
+            args.extend(["--before", cursor]);
+        }
+        let (ok, out, err) = vox(dir, &args, None);
+        assert!(
+            ok,
+            "PRODUCT: paged `vox room read --json` refused before {before:?}: {out}{err}"
+        );
+        let rows: Vec<serde_json::Value> = out
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                serde_json::from_str(line).unwrap_or_else(|error| {
+                    panic!(
+                        "PRODUCT: `vox room read --json` printed a row that is not JSON \
+                         ({error}): {line}"
+                    )
+                })
+            })
+            .collect();
+        if rows.is_empty() {
+            break;
+        }
+        let short = rows.len() < PAGE;
+        let next = rows[0]["entry_hash"]
+            .as_str()
+            .unwrap_or_else(|| {
                 panic!(
-                    "PRODUCT: `vox room read --json` printed a row that is not JSON ({error}): \
-                     {line}"
+                    "PRODUCT: a `vox room read --json` row carries no entry_hash: {}",
+                    rows[0]
                 )
             })
-        })
-        .collect();
-    assert!(
-        rows.len() < LIMIT,
-        "APPARATUS: the FX-22 room filled the one-read live window ({LIMIT} rows); the exact \
-         late-render verdict needs a smaller staging"
-    );
-    rows.into_iter()
+            .to_owned();
+        assert_ne!(
+            before.as_deref(),
+            Some(next.as_str()),
+            "PRODUCT: paged `vox room read --json` repeated cursor {next}"
+        );
+        before = Some(next);
+        pages_newest_first.push(rows);
+        if short {
+            break;
+        }
+    }
+    pages_newest_first.into_iter().rev().flatten().collect()
+}
+
+fn room_texts(dir: &Path, room: &str) -> Vec<String> {
+    room_rows(dir, room)
+        .into_iter()
         .filter_map(|row| row["text"].as_str().map(str::to_owned))
         .collect()
 }
 
-/// The status facts that establish the late-render verdict's apparatus: the room's entry count,
-/// accepted sender-key generations and authors whose consent to this reader has folded.
-fn room_readiness(status: &str, room: &str) -> Option<(u64, u64, usize)> {
-    let value: serde_json::Value = serde_json::from_str(status).ok()?;
-    value["rooms"].as_array()?.iter().find_map(|row| {
-        row["id"]
-            .as_str()
-            .filter(|id| id.starts_with(room))
-            .map(|_| {
-                (
-                    row["entries"].as_u64().unwrap_or(0),
-                    row["received_key_generations"].as_u64().unwrap_or(0),
-                    row["consenting"].as_array().map_or(0, Vec::len),
-                )
+/// Wait until the exact rows Alice posted are visibly present in Bob's paged log, while none has
+/// text he can read. That is the user-visible evidence that those rows were accepted before their
+/// missing prerequisite; counts alone could be satisfied by Bob's own join records.
+fn wait_for_held_rows(dir: &Path, room: &str, expected_hashes: &[String], hold: &str) {
+    loop {
+        let rows = room_rows(dir, room);
+        let staged: Vec<&serde_json::Value> = rows
+            .iter()
+            .filter(|row| {
+                row["entry_hash"]
+                    .as_str()
+                    .is_some_and(|hash| expected_hashes.iter().any(|expected| expected == hash))
             })
-    })
+            .collect();
+        if staged.len() < expected_hashes.len() {
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        }
+        let actual_hashes: Vec<&str> = staged
+            .iter()
+            .filter_map(|row| row["entry_hash"].as_str())
+            .collect();
+        assert_eq!(
+            actual_hashes, expected_hashes,
+            "APPARATUS: the exact late rows were not staged once each in source order while the \
+             {hold} hold was engaged in room {room}; all rows: {rows:?}"
+        );
+        assert!(
+            staged.iter().all(|row| row["text"].as_str().is_none()),
+            "APPARATUS: an exact late row was already readable while the {hold} hold was engaged \
+             in room {room}; staged rows: {staged:?}"
+        );
+        return;
+    }
 }
 
-/// Two immediate status observations must agree on the entry count and show both the author's
-/// key and consent. This does not poll or turn a made-up duration into a product contract: the
-/// journey reaches its existing delivery boundary first. An unmet prerequisite is apparatus.
-fn room_still_with_key_and_consent(dir: &Path, reader: &str, room: &str) -> (u64, u64, usize) {
-    let first = vox(dir, &["status", "--json"], None);
-    let second = vox(dir, &["status", "--json"], None);
-    let a = first.0.then(|| room_readiness(&first.1, room)).flatten();
-    let b = second.0.then(|| room_readiness(&second.1, room)).flatten();
+#[derive(Clone, Copy, Debug)]
+struct RoomStatus {
+    log_entries: u64,
+    received_key_generations: u64,
+}
+
+/// What the shipped status command says about one room. A refused or malformed observation is an
+/// apparatus fault while the proof is arranging its two deliberate holds.
+fn room_status(dir: &Path, reader: &str, room: &str) -> RoomStatus {
+    let (ok, out, err) = vox(dir, &["status", "--json"], None);
     assert!(
-        first.0 && second.0 && a.is_some() && b.is_some(),
-        "APPARATUS: {reader}'s two `vox status --json` observations did not both contain room \
-         {room}; first success {}, room {a:?}, stdout: {}, stderr: {}; second success {}, room \
-         {b:?}, stdout: {}, stderr: {}",
-        first.0,
-        first.1,
-        first.2,
-        second.0,
-        second.1,
-        second.2
+        ok,
+        "APPARATUS: {reader}'s `vox status --json` was unavailable while staging room {room}: \
+         {out}{err}"
     );
-    let (a, b) = (a.unwrap(), b.unwrap());
-    assert!(
-        a.0 == b.0 && b.1 >= 1 && b.2 >= 1,
-        "APPARATUS: {reader}'s room {room} was not stable with an accepted sender key and folded \
-         author consent at the verdict boundary; consecutive room status: {a:?}, {b:?}"
-    );
-    b
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|error| {
+        panic!(
+            "APPARATUS: {reader}'s `vox status --json` was malformed while staging room {room} \
+             ({error}): {out}"
+        )
+    });
+    let row = value["rooms"]
+        .as_array()
+        .and_then(|rooms| {
+            rooms
+                .iter()
+                .find(|row| row["id"].as_str().is_some_and(|id| id.starts_with(room)))
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "APPARATUS: {reader}'s `vox status --json` did not contain staged room {room}: \
+                 {out}"
+            )
+        });
+    RoomStatus {
+        log_entries: row["log_entries"].as_u64().unwrap_or(0),
+        received_key_generations: row["received_key_generations"].as_u64().unwrap_or(0),
+    }
+}
+
+/// Wait for a causal product observation, with only the proof's global APPARATUS watchdog as a
+/// bound. A key arriving while its marker hold exists means the staging itself was not achieved.
+fn wait_room_status(
+    dir: &Path,
+    reader: &str,
+    room: &str,
+    key_must_stay_held: bool,
+    ready: impl Fn(RoomStatus) -> bool,
+) -> RoomStatus {
+    loop {
+        let status = room_status(dir, reader, room);
+        assert!(
+            !key_must_stay_held || status.received_key_generations == 0,
+            "APPARATUS: {reader} accepted a sender key in room {room} while the package hold \
+             marker still existed: {status:?}"
+        );
+        if ready(status) {
+            return status;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The product's trust sentence for a room member. Doctor may exit non-zero because another
+/// check warns; its JSON is still the user-visible observation this staging needs.
+fn trust_detail(dir: &Path, reader: &str, room: &str, member: &str) -> String {
+    let (_, out, err) = vox(dir, &["agent", "doctor", "--room", room, "--json"], None);
+    let report: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|error| {
+        panic!(
+            "APPARATUS: {reader}'s `vox agent doctor --json` was malformed while staging room \
+             {room} ({error}): {out}{err}"
+        )
+    });
+    let trust_check = format!("trust {member}");
+    report["checks"]
+        .as_array()
+        .and_then(|checks| {
+            checks
+                .iter()
+                .find(|check| check["check"].as_str().is_some_and(|id| id == trust_check))
+        })
+        .and_then(|check| check["detail"].as_str())
+        .unwrap_or_else(|| {
+            panic!(
+                "APPARATUS: {reader}'s doctor reported no `trust {member}` detail for staged \
+                 room {room}: {report}"
+            )
+        })
+        .to_owned()
+}
+
+fn wait_trust_detail(dir: &Path, reader: &str, room: &str, member: &str, expected: &str) {
+    loop {
+        if trust_detail(dir, reader, room, member) == expected {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// The post numbers in `1..=posts` that `seen` lacks, as a few ranges for a failure message.
@@ -678,9 +792,12 @@ const AT_WORK: Duration = Duration::from_secs(60);
 /// Rooms the two agents share while they work: each publication of the daemon's status covers
 /// every open room, so the cost under test grows with this.
 const WORK_ROOMS: usize = 3;
-/// Rows Alice seals in each work room before Bob joins it. Bob cannot hold that room's sender
-/// key or folded consent yet, so these stage the late-render half of FX-22 without a test knob.
+/// Rows Alice seals in each work room before Bob joins it. The fold and package marker holds below
+/// make Bob accept these rows before their author's consent and sender key, respectively.
 const BEFORE_KEY: usize = 8;
+/// Releasing a newly admitted reader through the room log appends its consent and the sealed key
+/// package. Seeing both positions is the shipped status observation that store-and-forward ran.
+const CONSENT_AND_KEY_PACKAGE_ROWS: u64 = 2;
 /// CPU time a daemon may spend over [`AT_WORK`] of two agents posting into [`WORK_ROOMS`] rooms:
 /// Activity Monitor's number. Measured 2026-10-20 on the decider's work Mac (v0.4.7, four nodes,
 /// four rooms, agents working): ~180% of a core, that is 108 s per minute. In this staging the
@@ -700,10 +817,10 @@ const ANSWER_WITHIN: Duration = Duration::from_millis(200);
 /// `vox status --json` asked meanwhile MUST answer within [`ANSWER_WITHIN`], and the work MUST be
 /// real: each reads the other's last post within [`READY_WITHIN`] of the end. Alice also seals
 /// [`BEFORE_KEY`] rows in each room before Bob joins, when he cannot yet hold its sender key or
-/// folded consent. Once Bob's room has held still and accepted Alice's key
-/// (`received_key_generations` in `vox status --json`), one `vox room read --json` MUST show those
-/// rows exactly once and in order, with no re-ask. The same exact read checks every work post,
-/// not only the last (ADR-038 FX-22, #1007).
+/// folded consent. The shipped status and doctor commands prove each marker hold is engaged. Once
+/// both holds are released and Bob has accepted Alice's key, one paged `vox room read --json`
+/// observation MUST show those rows exactly once and in order, with no re-ask. The same paged
+/// observation checks every work post, not only the last (ADR-038 FX-22, #1007).
 ///
 /// Mutants: rebuilding the semantic consent projection for every unchanged question turns the
 /// FX-22 CPU claim red on its own number; suppressing the render backfill for rows accepted before
@@ -713,6 +830,7 @@ const ANSWER_WITHIN: Duration = Duration::from_millis(200);
 #[test]
 #[ignore = "a minute of two real vox daemons at work; optional, run it in release"]
 fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
+    test_knobs::require(&["VOX_TEST_FOLD_HOLD_FILE", "VOX_TEST_HOLD_PACKAGES_FILE"]);
     watchdog::arm();
     let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("APPARATUS: no temp dir: {e}"));
     let root = tmp.path();
@@ -732,11 +850,23 @@ fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
         let (ok, _, err) = vox(dir, &["trust", "add", fp, "--name", name], None);
         assert!(ok, "PRODUCT: `vox trust add` of {name} failed: {err}");
     }
-    let alice_daemon = daemon(&alice, "alice");
+    let fold_hold = root.join("fx22-fold-hold");
+    let package_hold = root.join("fx22-package-hold");
+    let fold_hold_path = fold_hold
+        .to_str()
+        .expect("APPARATUS: a UTF-8 fold-hold path")
+        .to_owned();
+    let package_hold_path = package_hold
+        .to_str()
+        .expect("APPARATUS: a UTF-8 package-hold path")
+        .to_owned();
+    let fold_knob = [("VOX_TEST_FOLD_HOLD_FILE", fold_hold_path.as_str())];
+    let package_knob = [("VOX_TEST_HOLD_PACKAGES_FILE", package_hold_path.as_str())];
+    let alice_daemon = daemon_env(&alice, "alice", &fold_knob);
     attached(&alice, "alice");
-    let bob_daemon = daemon(&bob, "bob");
-    attached(&bob, "bob");
     let mut rooms = Vec::with_capacity(WORK_ROOMS);
+    let mut links = Vec::with_capacity(WORK_ROOMS);
+    let mut late_hashes = Vec::with_capacity(WORK_ROOMS);
     for i in 1..=WORK_ROOMS {
         let name = format!("work-{i}");
         let (ok, _, err) = vox(
@@ -754,22 +884,139 @@ fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
             .to_owned();
         let (ok, link, err) = vox(&alice, &["room", "link", &room], None);
         assert!(ok, "PRODUCT: `vox room link` failed: {err}");
+        let mut room_late_hashes = Vec::with_capacity(BEFORE_KEY);
         for row in 0..BEFORE_KEY {
             let text = format!("alice before key room {i} row {row}");
-            let (ok, out, err) = vox(&alice, &["room", "post", &room, &text], None);
+            let (ok, out, err) = vox(&alice, &["room", "post", &room, "--json", "-"], Some(&text));
             assert!(ok, "PRODUCT: Alice's pre-key post was refused: {out}{err}");
+            let posted: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|error| {
+                panic!(
+                    "PRODUCT: Alice's `vox room post --json` answer was malformed ({error}): \
+                     {out}{err}"
+                )
+            });
+            room_late_hashes.push(
+                posted["entry_hash"]
+                    .as_str()
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "PRODUCT: Alice's `vox room post --json` answer named no entry_hash: \
+                             {posted}"
+                        )
+                    })
+                    .to_owned(),
+            );
         }
-        let (ok, _, err) = vox(
+        rooms.push(room);
+        links.push(link.trim().to_owned());
+        late_hashes.push(room_late_hashes);
+    }
+
+    // Alice may accept Bob's admission but cannot fold it, so she cannot consent or release her
+    // key. Bob nevertheless accepts Alice's existing LogDb prefix. The product itself says that
+    // the prefix is present, no sender key is held, Alice has not consented, and none of the named
+    // content is readable: those are the APPARATUS preconditions for the late-render verdict.
+    std::fs::write(&fold_hold, b"")
+        .unwrap_or_else(|error| panic!("APPARATUS: could not engage the fold hold: {error}"));
+    std::fs::write(&package_hold, b"")
+        .unwrap_or_else(|error| panic!("APPARATUS: could not engage the package hold: {error}"));
+    let bob_before_key = daemon_env(&bob, "bob", &package_knob);
+    attached(&bob, "bob");
+    for (i, (room, link)) in rooms.iter().zip(&links).enumerate() {
+        let (ok, out, err) = vox(
             &bob,
-            &["room", "join", "--passphrase-file", "-", link.trim()],
+            &["room", "join", "--passphrase-file", "-", link],
             Some(&format!("{ROOMPASS}\n")),
         );
         assert!(
             ok,
-            "PRODUCT: bob's `vox room join {name}` was refused: {err}"
+            "PRODUCT: bob's `vox room join work-{}` was refused: {out}{err}",
+            i + 1
         );
-        rooms.push(room);
+        wait_room_status(&bob, "bob", room, true, |status| status.log_entries > 0);
+        wait_for_held_rows(&bob, room, &late_hashes[i], "governance-fold");
+        let held_trust = trust_detail(&bob, "bob", room, "alice");
+        assert_eq!(
+            held_trust, "you trust it, but it has not trusted you: it cannot read you",
+            "APPARATUS: Alice's governance fold was not visibly held after Bob accepted her \
+             existing LogDb prefix in room {room}"
+        );
+        // Alice has durably accepted Bob's join-side rows before he goes offline; only her held
+        // governance fold keeps the release from being issued. Take Bob's count after the paged
+        // observation above, so any read record it made is before this causal sync boundary too.
+        let bob_log = room_status(&bob, "bob", room).log_entries;
+        wait_room_status(&alice, "alice", room, false, |status| {
+            status.log_entries >= bob_log
+        });
     }
+    let before_release: Vec<u64> = rooms
+        .iter()
+        .map(|room| room_status(&alice, "alice", room).log_entries)
+        .collect();
+    bob_before_key.stop();
+
+    // With Bob offline, releasing Alice's fold makes the product append the consent and its
+    // store-and-forward key package. The two appended log rows are a causal product observation,
+    // not a sleep or a duration contract.
+    std::fs::remove_file(&fold_hold)
+        .unwrap_or_else(|error| panic!("APPARATUS: could not release the fold hold: {error}"));
+    let mut released_log_entries = Vec::with_capacity(WORK_ROOMS);
+    for (i, room) in rooms.iter().enumerate() {
+        wait_trust_detail(&alice, "alice", room, "bob", "you trust each other");
+        let released = wait_room_status(&alice, "alice", room, false, |status| {
+            status.log_entries >= before_release[i].saturating_add(CONSENT_AND_KEY_PACKAGE_ROWS)
+        });
+        released_log_entries.push(released.log_entries);
+    }
+
+    // Bob now receives Alice's consent and the sealed package row, but the package marker keeps
+    // the shipped daemon from opening it. Doctor says consent is mutual while status still says
+    // zero received generations: the second hold is visibly engaged.
+    let bob_daemon = daemon_env(&bob, "bob", &package_knob);
+    attached(&bob, "bob");
+    for (i, room) in rooms.iter().enumerate() {
+        wait_trust_detail(&bob, "bob", room, "alice", "you trust each other");
+        let held = wait_room_status(&bob, "bob", room, true, |status| {
+            status.log_entries >= released_log_entries[i]
+        });
+        wait_for_held_rows(&bob, room, &late_hashes[i], "logged-key-package");
+        assert_eq!(
+            held.received_key_generations, 0,
+            "APPARATUS: Bob accepted Alice's sender key while its package hold was engaged in \
+             room {room}: {held:?}"
+        );
+    }
+
+    // Alice now stops, so removing the package marker cannot be confused with a fresh direct key
+    // delivery. Once Bob's status says the key landed from his retained log, one exact paged
+    // observation proves all rows accepted before key and consent were rendered exactly once and
+    // in order.
+    alice_daemon.stop();
+    std::fs::remove_file(&package_hold)
+        .unwrap_or_else(|error| panic!("APPARATUS: could not release the package hold: {error}"));
+    for (index, room) in rooms.iter().enumerate() {
+        let ready = wait_room_status(&bob, "bob", room, false, |status| {
+            status.received_key_generations >= 1
+        });
+        let expected_before: Vec<String> = (0..BEFORE_KEY)
+            .map(|row| format!("alice before key room {} row {row}", index + 1))
+            .collect();
+        let texts = room_texts(&bob, room);
+        let actual_before: Vec<String> = texts
+            .iter()
+            .filter(|text| text.starts_with("alice before key room "))
+            .cloned()
+            .collect();
+        assert_eq!(
+            actual_before, expected_before,
+            "PRODUCT: Bob's paged `vox room read --json` observation did not show every row \
+             accepted before Alice's key and consent exactly once and in order after both landed \
+             (ADR-038 FX-22, #1007); room status {ready:?}; all text rows: {texts:?}"
+        );
+    }
+    let alice_daemon = daemon(&alice, "alice");
+    attached(&alice, "alice");
+
     // Both have read each other in every room before the clock starts.
     let joined = Instant::now();
     for room in &rooms {
@@ -793,26 +1040,6 @@ fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
             said(&alice, "alice")
         );
     }
-    for (index, room) in rooms.iter().enumerate() {
-        let readiness = room_still_with_key_and_consent(&bob, "bob", room);
-        let expected_before: Vec<String> = (0..BEFORE_KEY)
-            .map(|row| format!("alice before key room {} row {row}", index + 1))
-            .collect();
-        let texts = room_texts(&bob, room);
-        let actual_before: Vec<String> = texts
-            .iter()
-            .filter(|text| text.starts_with("alice before key room "))
-            .cloned()
-            .collect();
-        assert_eq!(
-            actual_before, expected_before,
-            "PRODUCT: Bob's one `vox room read --json` did not show every row Alice sealed \
-             before he joined exactly once and in order after her key and consent landed \
-             (ADR-038 FX-22, #1007); room status {readiness:?}; all text rows: {texts:?}"
-        );
-    }
-    std::thread::sleep(Duration::from_secs(5));
-
     // ---- the agents work -----------------------------------------------------------------------
     let cpu0 = (cpu_time(alice_daemon.0.id()), cpu_time(bob_daemon.0.id()));
     let started = Instant::now();
@@ -910,10 +1137,9 @@ fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
         said(&alice, "alice"),
         said(&bob, "bob")
     );
-    // Every post is readable, not only the last (ADR-038 FX-22, #1007). Per room, first establish
-    // as apparatus that the reader's entry count is still and the author's key is held. A single
-    // exact JSON read must then show every work row once and in order. Bob must additionally see
-    // the rows Alice sealed before he joined and could hold her key/consent, with no re-ask.
+    // Every post is readable, not only the last (ADR-038 FX-22, #1007). Reading the author's last
+    // post above is the causal delivery boundary; one exact paged JSON observation must now show
+    // every work row once and in order.
     for (reader, dir, author, posted) in [
         ("bob", &bob, "alice", posted_a),
         ("alice", &alice, "bob", posted_b),
@@ -923,7 +1149,6 @@ fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
                 .filter(|i| i % rooms.len() == index)
                 .map(|i| format!("{author} step {i}"))
                 .collect();
-            let readiness = room_still_with_key_and_consent(dir, reader, room);
             let texts = room_texts(dir, room);
             let actual: Vec<String> = texts
                 .iter()
@@ -932,27 +1157,10 @@ fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
                 .collect();
             assert_eq!(
                 actual, expected,
-                "PRODUCT: {reader}'s one `vox room read --json` did not show every {author} work \
-                 post exactly once and in order after the room held still with the key accepted \
-                 (ADR-038 FX-22, #1007); room status {readiness:?}; all text rows: {texts:?}"
+                "PRODUCT: {reader}'s paged `vox room read --json` observation did not show every \
+                 {author} work post exactly once and in order after their last post arrived \
+                 (ADR-038 FX-22, #1007); all text rows: {texts:?}"
             );
-            if reader == "bob" {
-                let expected_before: Vec<String> = (0..BEFORE_KEY)
-                    .map(|row| format!("alice before key room {} row {row}", index + 1))
-                    .collect();
-                let actual_before: Vec<String> = texts
-                    .iter()
-                    .filter(|text| text.starts_with("alice before key room "))
-                    .cloned()
-                    .collect();
-                assert_eq!(
-                    actual_before, expected_before,
-                    "PRODUCT: Bob's one `vox room read --json` did not show every row Alice \
-                     sealed before he joined exactly once and in order after her key and consent \
-                     landed (ADR-038 FX-22, #1007); room status {readiness:?}; all text rows: \
-                     {texts:?}"
-                );
-            }
         }
     }
     assert!(
