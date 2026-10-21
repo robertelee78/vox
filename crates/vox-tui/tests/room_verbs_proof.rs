@@ -916,6 +916,10 @@ fn a_debug_daemon_makes_a_room_takes_a_post_and_keeps_running() {
         .find(|line| line.ends_with(" posted in debug"))
         .and_then(|line| line.split_whitespace().next())
         .expect("PRODUCT: room read did not print the posted entry hash");
+    assert!(
+        root.len() >= 8,
+        "PRODUCT: room read printed a reply selector shorter than eight characters: {root:?}"
+    );
     let post = |args: &[&str]| {
         let mut argv = vec!["room", "post", &room, "--json"];
         argv.extend_from_slice(args);
@@ -954,33 +958,83 @@ fn a_debug_daemon_makes_a_room_takes_a_post_and_keeps_running() {
         None,
     );
     assert!(
-        !ok && err.contains("no readable message matches"),
+        !ok && err.contains("no message printed by room read matches"),
         "PRODUCT: a missing reply prefix must name the problem: {out}{err}"
     );
-    // More than 32 posts guarantee two hashes with the same first base32 character.
-    let mut first_chars = std::collections::HashSet::new();
-    let ambiguous = (0..33)
-        .find_map(|i| {
-            let entry = post(&[&format!("PREFIX-COLLISION-{i}")]);
-            let first = entry[..1].to_owned();
-            (!first_chars.insert(first.clone())).then_some(first)
-        })
-        .expect("APPARATUS: 33 base32 hashes must share a first character");
-    let (read_ok, collision_rows, read_err) =
+    let (read_ok, after_missing, read_err) =
         vox(&data, &cfg, &["room", "read", &room, "--json"], None);
     assert!(
         read_ok,
-        "APPARATUS: could not read the staged ambiguous-prefix entries: {collision_rows}{read_err}"
+        "APPARATUS: could not read after the missing-prefix refusal: {after_missing}{read_err}"
     );
-    let collision_ids: Vec<_> = collision_rows
-        .lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .filter_map(|row| row["entry_hash"].as_str().map(str::to_owned))
+    assert!(
+        !after_missing.contains("PREFIX-MISSING"),
+        "PRODUCT: the missing-prefix refusal posted the rejected text: {after_missing}"
+    );
+
+    // Cross the daemon's real bounded page size. The ambiguous prefix is selected only after
+    // one matching entry is observed in the newest page and another in its older page, so a
+    // first-page-only resolver and an incomplete ambiguity report each die on this assertion.
+    for i in 0..(vox_core::node::ipc::SESSION_PAGE_ROWS + 33) {
+        post(&[&format!("PREFIX-PAGED-COLLISION-{i}")]);
+    }
+    let (newest_ok, newest_rows, newest_err) =
+        vox(&data, &cfg, &["room", "read", &room, "--json"], None);
+    assert!(
+        newest_ok,
+        "APPARATUS: could not read the newest collision page: {newest_rows}{newest_err}"
+    );
+    let entry_ids = |rows: &str| {
+        rows.lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter_map(|row| row["entry_hash"].as_str().map(str::to_owned))
+            .collect::<Vec<_>>()
+    };
+    let newest_ids = entry_ids(&newest_rows);
+    assert!(
+        newest_ids.len() == vox_core::node::ipc::SESSION_PAGE_ROWS,
+        "APPARATUS: newest room page held {} entries instead of the product bound {}: {newest_rows}",
+        newest_ids.len(),
+        vox_core::node::ipc::SESSION_PAGE_ROWS
+    );
+    let boundary = newest_ids
+        .first()
+        .expect("APPARATUS: the full newest room page had no first entry");
+    let (older_ok, older_rows, older_err) = vox(
+        &data,
+        &cfg,
+        &["room", "read", &room, "--json", "--before", boundary],
+        None,
+    );
+    assert!(
+        older_ok,
+        "APPARATUS: could not read the older collision page: {older_rows}{older_err}"
+    );
+    let older_ids = entry_ids(&older_rows);
+    assert!(
+        !older_ids.is_empty(),
+        "APPARATUS: the staged room did not cross its bounded page: {older_rows}"
+    );
+    let older_first: std::collections::BTreeSet<_> = older_ids
+        .iter()
+        .filter_map(|entry| entry.chars().next())
+        .collect();
+    let ambiguous = newest_ids
+        .iter()
+        .filter_map(|entry| entry.chars().next())
+        .find(|first| older_first.contains(first))
+        .map(|first| first.to_string())
+        .expect("APPARATUS: staged newest and older pages shared no base32 prefix");
+    let collision_ids: Vec<_> = newest_ids
+        .iter()
+        .chain(&older_ids)
         .filter(|entry| entry.starts_with(&ambiguous))
+        .cloned()
         .collect();
     assert!(
-        collision_ids.len() >= 2,
-        "APPARATUS: the staged prefix {ambiguous} no longer names multiple readable entries: {collision_rows}"
+        collision_ids.iter().any(|entry| newest_ids.contains(entry))
+            && collision_ids.iter().any(|entry| older_ids.contains(entry)),
+        "APPARATUS: the staged prefix {ambiguous} did not span newest and older pages"
     );
     let (ok, out, err) = vox(
         &data,
@@ -1000,6 +1054,16 @@ fn a_debug_daemon_makes_a_room_takes_a_post_and_keeps_running() {
             && err.contains("entry prefix is ambiguous")
             && collision_ids.iter().all(|entry| err.contains(entry)),
         "PRODUCT: an ambiguous reply prefix must name every matching entry {collision_ids:?}: {out}{err}"
+    );
+    let (read_ok, after_ambiguous, read_err) =
+        vox(&data, &cfg, &["room", "read", &room, "--json"], None);
+    assert!(
+        read_ok,
+        "APPARATUS: could not read after the ambiguous-prefix refusal: {after_ambiguous}{read_err}"
+    );
+    assert!(
+        !after_ambiguous.contains("PREFIX-AMBIGUOUS"),
+        "PRODUCT: the ambiguous-prefix refusal posted the rejected text: {after_ambiguous}"
     );
     let exited = node.0.try_wait().ok().flatten();
     assert!(

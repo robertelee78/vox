@@ -1672,10 +1672,21 @@ async fn reply_entry(
             "cannot reply to {typed}: expected an entry hash or its unique base32 prefix"
         )));
     }
+    let display_revision = match client
+        .request(&Request::RoomDisplayRevision { channel_id: cid })
+        .await?
+    {
+        Frame::RoomDisplayRevision { revision } => revision,
+        Frame::Error { reason } => return Err(AppError::Usage(reason)),
+        other => return Err(crate::client::unexpected(&other)),
+    };
     let mut before = None;
     let mut found = std::collections::BTreeSet::new();
+    let mut rows_seen = std::collections::BTreeSet::new();
+    let mut cursors_seen = std::collections::BTreeSet::new();
+    let mut expected_rows = None;
     loop {
-        let (rows, older) = match client
+        let (rows, older, provisional) = match client
             .request(&Request::RoomPage {
                 channel_id: cid,
                 before,
@@ -1683,21 +1694,57 @@ async fn reply_entry(
             })
             .await?
         {
-            Frame::RoomPage { rows, older, .. } => (rows, older),
+            Frame::RoomPage {
+                rows,
+                older,
+                provisional,
+            } => (rows, older, provisional),
             Frame::Error { reason } => return Err(AppError::Usage(reason)),
             other => return Err(crate::client::unexpected(&other)),
         };
-        for row in rows.iter().filter(|row| !row.owed) {
+        let current_revision = match client
+            .request(&Request::RoomDisplayRevision { channel_id: cid })
+            .await?
+        {
+            Frame::RoomDisplayRevision { revision } => revision,
+            Frame::Error { reason } => return Err(AppError::Usage(reason)),
+            other => return Err(crate::client::unexpected(&other)),
+        };
+        if provisional || current_revision != display_revision {
+            return Err(AppError::Usage(
+                "cannot resolve reply prefix: the room changed while its entries were read; read the room and retry"
+                    .into(),
+            ));
+        }
+        for row in &rows {
+            if !rows_seen.insert(row.entry_hash) {
+                return Err(AppError::Usage(
+                    "cannot resolve reply prefix: a room page repeated an entry; read the room and retry"
+                        .into(),
+                ));
+            }
             let hash = b32_encode(&row.entry_hash);
             if hash.starts_with(&prefix) {
                 found.insert(hash);
             }
         }
+        let counted = u64::try_from(rows_seen.len()).unwrap_or(u64::MAX);
+        let total = counted.saturating_add(older);
+        match expected_rows {
+            None => expected_rows = Some(total),
+            Some(expected) if total != expected => {
+                return Err(AppError::Usage(
+                    "cannot resolve reply prefix: the room page count changed; read the room and retry"
+                        .into(),
+                ));
+            }
+            Some(_) => {}
+        }
         if older == 0 {
             break;
         }
         let next = rows.first().map(|row| row.entry_hash);
-        if next.is_none() || next == before {
+        if next.is_none() || next == before || next.is_some_and(|next| !cursors_seen.insert(next)) {
             return Err(AppError::Usage(
                 "cannot resolve reply prefix: the room page changed; read the room and retry"
                     .into(),
@@ -1707,7 +1754,7 @@ async fn reply_entry(
     }
     match found.len() {
         0 => Err(AppError::Usage(format!(
-            "cannot reply to {typed}: no readable message matches that entry prefix; nothing was posted"
+            "cannot reply to {typed}: no message printed by room read matches that entry prefix; nothing was posted"
         ))),
         1 => found.into_iter().next().ok_or_else(|| {
             AppError::Usage("cannot resolve reply prefix; read the room and retry".into())
